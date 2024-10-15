@@ -1,0 +1,4 @@
+build/**
+dist/**
+.pypirc
+*.egg-info
