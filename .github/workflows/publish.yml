@@ -18,6 +18,7 @@ permissions:
 
 jobs:
   release:
+    name: build && release
     runs-on: ubuntu-latest
 
     steps:
@@ -37,7 +38,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.ACCESS_TOKEN }}
-          body_path: ./CHANGELOG.md
+          body: |
+            ## Release Notes for ${{ github.ref_name }}
+
+            - This is an automatically generated release note.
+            - You can customize this section in the GitHub Actions workflow.
+            - Version: ${{ github.ref_name }}
           files: |
             ./dist/**
             ./CHANGELOG.md
@@ -49,7 +55,7 @@ jobs:
           path: dist/
 
   pypi-publish:
-    name: release to PyPI
+    name: upload to PyPI
     runs-on: ubuntu-latest
     environment: pub
     permissions:
