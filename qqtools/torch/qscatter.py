@@ -17,7 +17,13 @@ def broadcast(src: Tensor, ref: Tensor, dim: int) -> Tensor:
 
 
 @torch.jit.script
-def scatter(ref: Tensor, index: Tensor, dim: int, dim_size: Optional[int] = None, reduce: str = "sum") -> Tensor:
+def scatter(
+    ref: Tensor,
+    index: Tensor,
+    dim: int,
+    dim_size: Optional[int] = None,
+    reduce: str = "sum",
+) -> Tensor:
     if dim < 0:
         dim = torch.add(ref.dim(), dim)
 

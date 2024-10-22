@@ -24,4 +24,4 @@ def ensureNumber(x):
     elif isinstance(x, np.ndarray):
         return x.item()
     else:
-        raise TypeError(f"type(x)")
+        raise TypeError(f"type({x})")

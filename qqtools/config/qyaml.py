@@ -26,7 +26,7 @@ def _str2science_number(v):
         try:
             num = float(v)
             return num
-        except:
+        except Exception:
             pass
     return v
 
@@ -54,7 +54,7 @@ def _str2userhome(v):
             USER_HOME = os.environ["HOME"]
             v_ = v.replace("$USER_HOME", USER_HOME)
             return v_
-        except:
+        except Exception:
             pass
     return v
 
