@@ -50,7 +50,12 @@ class qDict(dict):
         if isinstance(d, dict):
             for k, v in d.items():
                 if recursive and isinstance(v, dict):
-                    v = qDict(v, default_function=default_function, allow_notexist=allow_notexist, recursive=True)
+                    v = qDict(
+                        v,
+                        default_function=default_function,
+                        allow_notexist=allow_notexist,
+                        recursive=True,
+                    )
                 self.__setitem__(k, v)
         else:
             try:

@@ -1,13 +1,13 @@
+from typing import Dict
+
 import torch
 
 
 class CompositeOptim(torch.optim.Optimizer):
     """qq: corresponds to ani model"""
 
-    def __init__(self, optim_dict):
-        self._optim_dict = {}
-        for key, optim in optim_dict.items():
-            self._optim_dict[key] = optim
+    def __init__(self, optim_dict: Dict[str, torch.optim.Optimizer]):
+        self._optim_dict = optim_dict.copy()
 
     def zero_grad(self):
         for key, optim in self._optim_dict.items():
@@ -28,25 +28,47 @@ class CompositeOptim(torch.optim.Optimizer):
         return len(self.param_groups)
 
     def state_dict(self):
-        pass
-        raise NotImplementedError()
+        dd = dict()
+        for key, optim in self._optim_dict.items():
+            dd[key] = optim.state_dict()
+        return dd
 
     def load_state_dict(self, state_dict):
-        pass
-        # self.__setstate__({'state': state, 'param_groups': param_groups})
-        raise NotImplementedError()
+        miss_keys = set()
+        for key, optim in self._optim_dict.items():
+            if key in state_dict:
+                optim.load_state_dict(state_dict[key])
+            else:
+                miss_keys.add(key)
+        print(f"missing optimizer state_dict for: {miss_keys}")
 
 
 class CompositeScheduler(torch.optim.lr_scheduler.LRScheduler):
-    def __init__(self, scheduler_dict, last_epoch=-1):
+    def __init__(
+        self,
+        scheduler_dict: Dict[str, torch.optim.lr_scheduler.LRScheduler],
+        last_epoch=-1,
+    ):
         self._scheduler_dict = scheduler_dict.copy()
 
-    def step(self, epoch=None):
+    def step(self, metrics=None, epoch=None):
         for scheduler in self._scheduler_dict.values():
-            scheduler.step(epoch)
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(metrics=metrics, epoch=epoch)
+            else:
+                scheduler.step(epoch=epoch)
 
     def state_dict(self):
-        pass
+        dd = dict()
+        for key, scheduler in self._scheduler_dict.items():
+            dd[key] = scheduler.state_dict()
+        return dd
 
     def load_state_dict(self, state_dict):
-        pass
+        miss_keys = set()
+        for key, scheduler in self._scheduler_dict.items():
+            if key in state_dict:
+                scheduler.load_state_dict(state_dict[key])
+            else:
+                miss_keys.add(key)
+        print(f"missing optimizer state_dict for: {miss_keys}")

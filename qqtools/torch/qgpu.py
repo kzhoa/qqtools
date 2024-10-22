@@ -23,13 +23,13 @@ def parse_device(dev: Union[str, int]):
     elif isinstance(dev, str) and "cuda" in dev:
         try:
             device = torch.device(dev)  # Parse 'cuda:1'
-        except ValueError as e:
+        except ValueError:
             print(traceback.print_exc())
     elif isinstance(dev, int) or str.isnumeric(str(dev)):
         idx = int(dev)
         device = torch.device("cuda", idx)
     elif dev is None:
-        raise ValueError(f"input device is None, you must assign a device")
+        raise ValueError("input device is None, you must assign a device")
     else:
         raise NotImplementedError(f"Unsupported device: {dev}")
     return device

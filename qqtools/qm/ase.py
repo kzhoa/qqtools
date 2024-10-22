@@ -39,7 +39,7 @@ class Calculator(ase.calculators.calculator.Calculator):
 
     def __init__(self, species, model, overwrite=False):
         super().__init__()
-        self.species_to_tensor = utils.ChemicalSymbolsToInts(species) # relative_z
+        self.species_to_tensor = utils.ChemicalSymbolsToInts(species)  # relative_z
         self.model = model
         # Since ANI is used in inference mode, no gradients on model parameters are required here
         for p in self.model.parameters():
@@ -58,9 +58,18 @@ class Calculator(ase.calculators.calculator.Calculator):
         except AttributeError:
             self.periodic_table_index = False
 
-    def calculate(self, atoms=None, properties=["energy"], system_changes=ase.calculators.calculator.all_changes):
+    def calculate(
+        self,
+        atoms=None,
+        properties=["energy"],
+        system_changes=ase.calculators.calculator.all_changes,
+    ):
         super().calculate(atoms, properties, system_changes)
-        cell = torch.tensor(self.atoms.get_cell(complete=True).array, dtype=self.dtype, device=self.device)
+        cell = torch.tensor(
+            self.atoms.get_cell(complete=True).array,
+            dtype=self.dtype,
+            device=self.device,
+        )
         pbc = torch.tensor(self.atoms.get_pbc(), dtype=torch.bool, device=self.device)
         pbc_enabled = pbc.any().item()
 

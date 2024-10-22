@@ -43,7 +43,13 @@ def save_ckp(model, optimizer, lr_scheduler=None, save_dir=None, save_file=None,
     print("Saving checkpoint Done.")
 
 
-def recover(model: torch.nn.Module, optimizer=None, restore_file: str = None, strict=True, exclude=[]):
+def recover(
+    model: torch.nn.Module,
+    optimizer=None,
+    restore_file: str = None,
+    strict=True,
+    exclude=[],
+):
     """recover a model from checkpoint
     Returns
     -------
@@ -68,7 +74,7 @@ def recover(model: torch.nn.Module, optimizer=None, restore_file: str = None, st
     else:
         k = list(checkpoint["model_state_dict"].keys())[0]
         if k.startswith("module."):
-            pattern = "module.([\s\S]*)"
+            pattern = "module.([\s\S]*)"  # noqa
             # remove prefix
             model_state_dict = {re.findall(pattern, k)[0]: v for k, v in checkpoint["model_state_dict"].items()}
             checkpoint["model_state_dict"] = model_state_dict
