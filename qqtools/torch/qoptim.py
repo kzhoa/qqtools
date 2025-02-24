@@ -1,6 +1,15 @@
-from typing import Dict
+from typing import Dict, Protocol, Type
 
 import torch
+import torch.optim.lr_scheduler as lr_scheduler
+
+# qq: the name changed after torch 2.x
+# https://github.com/pytorch/pytorch/blob/v1.13.1/torch/optim/lr_scheduler.py
+# https://github.com/pytorch/pytorch/blob/v2.0.0/torch/optim/lr_scheduler.py
+if torch.__version__ < "2":
+    LRScheduler: Type[object] = torch.optim.lr_scheduler._LRScheduler
+else:
+    LRScheduler: Type[object] = torch.optim.lr_scheduler.LRScheduler
 
 
 class CompositeOptim(torch.optim.Optimizer):
@@ -43,7 +52,7 @@ class CompositeOptim(torch.optim.Optimizer):
         print(f"missing optimizer state_dict for: {miss_keys}")
 
 
-class CompositeScheduler(torch.optim.lr_scheduler.LRScheduler):
+class CompositeScheduler(LRScheduler):  # type: ignore
     def __init__(
         self,
         scheduler_dict: Dict[str, torch.optim.lr_scheduler.LRScheduler],
@@ -54,7 +63,7 @@ class CompositeScheduler(torch.optim.lr_scheduler.LRScheduler):
     def step(self, metrics=None, epoch=None):
         for scheduler in self._scheduler_dict.values():
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(metrics=metrics, epoch=epoch)
+                scheduler.step(metrics=metrics, epoch=epoch)  # type: ignore
             else:
                 scheduler.step(epoch=epoch)
 

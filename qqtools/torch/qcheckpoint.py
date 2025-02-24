@@ -74,7 +74,7 @@ def recover(
     else:
         k = list(checkpoint["model_state_dict"].keys())[0]
         if k.startswith("module."):
-            pattern = "module.([\s\S]*)"  # noqa
+            pattern = r"module.([\s\S]*)"  # noqa
             # remove prefix
             model_state_dict = {re.findall(pattern, k)[0]: v for k, v in checkpoint["model_state_dict"].items()}
             checkpoint["model_state_dict"] = model_state_dict
