@@ -20,6 +20,7 @@ jobs:
   release:
     name: build && tmp-upload
     runs-on: ubuntu-latest
+    environment: pub
     permissions:
       id-token: write # IMPORTANT: this permission is mandatory for trusted publishing
 
