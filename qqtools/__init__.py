@@ -1,6 +1,6 @@
 # first-class class
 from .config.qyaml import dump_yaml, load_yaml
-from .config.qssert import batch_assert
+from .config.qssert import batch_assert_type
 from .qdict import qDict
 from .qtimer import Timer
 
