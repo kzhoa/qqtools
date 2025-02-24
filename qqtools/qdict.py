@@ -87,13 +87,17 @@ class qDict(dict):
 
     @default_function.setter
     def default_function(self, default_function):
-        self.__dict__["_default_function"] = default_function
+        print("default_function.setter", default_function)
+        if default_function is None:
+            del self.__dict__["_default_function"]
+        else:
+            self.__dict__["_default_function"] = default_function
 
     def __getattr__(self, key):
         try:
             return self.__getitem__(key)
         except Exception:
-            if "_default_function" in self.__dict__ and self.__dict__["_default_function"]:
+            if "_default_function" in self.__dict__ and self.__dict__["_default_function"] is not None:
                 self.__setitem__(key, self.__dict__["_default_function"]())
                 return self.__getitem__(key)
             elif "_allow_notexist" in self.__dict__ and self.__dict__["_allow_notexist"]:
@@ -107,7 +111,7 @@ class qDict(dict):
         try:
             return super().__getitem__(key)
         except Exception:
-            if "_default_function" in self.__dict__ and self.__dict__["_default_function"]:
+            if "_default_function" in self.__dict__ and self.__dict__["_default_function"] is not None:
                 self.__setitem__(key, self.__dict__["_default_function"]())
                 return self.__getitem__(key)
             elif "_allow_notexist" in self.__dict__ and self.__dict__["_allow_notexist"]:
