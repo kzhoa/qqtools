@@ -67,6 +67,8 @@ jobs:
         with:
           name: package-dist
           path: dist/
+      - name: Display structure of downloaded files
+        run: ls -R dist/
 
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
