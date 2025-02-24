@@ -31,7 +31,15 @@ def is_open_file_handler(var):
 # TODO
 # end pattern for non-fixed nlines , to be implemented
 class ReadRule(object):
-    def __init__(self, name: str, pattern: str, nlines: int, skip_when_meet=0, callback=None, end_pattern=None):
+    def __init__(
+        self,
+        name: str,
+        pattern: str,
+        nlines: int,
+        skip_when_meet=0,
+        callback=None,
+        end_pattern=None,
+    ):
         """__init__ _summary_
 
         Args:
