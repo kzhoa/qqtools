@@ -1,13 +1,16 @@
 import time
+
 import torch
 
 
 class Timer:
-    def __init__(self, enter_msg=None, cuda=False, logger=None, prefix=None):
+    def __init__(self, enter_msg=None, cuda=False, logger=None, prefix=None, precision=2):
+        assert isinstance(precision, int) and precision >= 0
         self.enter_msg = enter_msg
         self.cuda = cuda
         self.logger = None
         self.prefix = prefix + " " if prefix is not None else str()
+        self.precision = precision
 
     def __enter__(self):
         if self.cuda:
@@ -26,7 +29,7 @@ class Timer:
             torch.cuda.synchronize()
         end_time = time.perf_counter()
         execution_time = end_time - self.start_time
-        msg = f">>>>>{self.prefix}Execution time: {execution_time:.2f} seconds"
+        msg = f">>>>>{self.prefix}Execution time: {execution_time:.{self.precision}f} seconds"
         if self.logger is None:
             print(msg)
         else:
