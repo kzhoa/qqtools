@@ -6,3 +6,5 @@ v1.0.3
     add assert 
 v1.0.5
     refactor torch ops
+v1.0.6
+    enhance timer
