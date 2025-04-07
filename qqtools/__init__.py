@@ -8,6 +8,7 @@ from .qtimer import Timer
 from .torch import qcheckpoint, qdist, qscatter, qsparse
 
 # first-class funciton
+from .torch.qrand import freeze_rand
 from .torch.qcheckpoint import recover, save_ckp
 from .torch.qdataset import qData, qDictDataloader, qDictDataset
 from .torch.qgpu import parse_device
