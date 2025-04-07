@@ -2,6 +2,7 @@ import os
 
 import torch
 import torch.distributed as dist
+from functools import wraps
 
 
 def is_dist_available_and_initialized():
@@ -99,3 +100,21 @@ def ddpCall(fn, /, *args, **kwargs):
         if rank != 0:
             res = fn(*args, **kwargs)
     return res
+
+
+def ddp_safe(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if is_dist_available_and_initialized():
+            rank = get_rank()
+            if rank == 0:
+                result = fn(*args, **kwargs)
+            dist.barrier()
+            if rank != 0:
+                result = fn(*args, **kwargs)
+            dist.barrier()
+            return result
+        else:
+            return fn(*args, **kwargs)
+
+    return wrapper
