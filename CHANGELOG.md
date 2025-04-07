@@ -8,3 +8,5 @@ v1.0.5
     refactor torch ops
 v1.0.6
     enhance timer
+v1.0.7
+    add freeze random seed
