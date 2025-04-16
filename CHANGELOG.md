@@ -10,3 +10,5 @@ v1.0.6
     enhance timer
 v1.0.7
     add freeze random seed
+v1.0.8
+    ddp safe & time format
