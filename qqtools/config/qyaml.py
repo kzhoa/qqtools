@@ -79,15 +79,16 @@ def save_yaml(cfg, path):
     dump_yaml(cfg, path)
 
 
-def dump_yaml(cfg, path):
+def dump_yaml(cfg, path, sort_keys=False, verbose=False):
     if isinstance(cfg, qDict):
-        cfg = cfg.to_dict()  # 否则dump结果会加无法识别的constructor
+        cfg = cfg.to_dict()  # or will cause no constructor ERROR
     elif isinstance(cfg, dict):
         cfg = dict(cfg)
     elif isinstance(cfg, argparse.Namespace):
         cfg = dict(cfg.__dict__)
-    yaml.dump(cfg, open(path, "w"))
-    print(f"yaml dump to : {path} .")
+    yaml.dump(cfg, open(path, "w"), sort_keys=sort_keys)
+    if verbose:
+        print(f"yaml dump to : {path} .")
 
 
 def load_yaml(path, ignore_keys=[]) -> qDict:

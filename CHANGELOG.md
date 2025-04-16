@@ -12,3 +12,5 @@ v1.0.7
     add freeze random seed
 v1.0.8
     ddp safe & time format
+v1.0.9
+    donot sort keys by default when dump yaml 
