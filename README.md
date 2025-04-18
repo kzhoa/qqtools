@@ -4,7 +4,6 @@ A small tool package for qq
 
 
 # TODO
-qlrschedulr
 qyaml
 qargparse
 qfilelogger
