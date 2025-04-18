@@ -12,11 +12,12 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
         "Intended Audience :: Developers",
         "Topic :: Software Development :: Libraries :: Python Modules",
     ],
+    license = "MIT" # SPDX expression
+    license_files = ["LICENSE*"]
     python_requires=">=3.10",
-    install_requires=[],
+    install_requires=["torch>=2.0"],
 )
