@@ -14,3 +14,5 @@ v1.0.8
     ddp safe & time format
 v1.0.9
     donot sort keys by default when dump yaml 
+v1.0.10
+    add find root
