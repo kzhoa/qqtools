@@ -16,3 +16,5 @@ v1.0.9
     donot sort keys by default when dump yaml 
 v1.0.10
     add find root
+v1.0.11
+    add qtyping

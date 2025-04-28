@@ -8,7 +8,7 @@ from .qtimer import Timer
 from .torch import qcheckpoint, qdist, qscatter, qsparse
 from .torch.qdataset import qData, qDictDataloader, qDictDataset
 from .torch.qoptim import CompositeOptim, CompositeScheduler
-
+from .torch.qtyping import Bool, Float16, Float32, Float64, Int32, Int64
 
 # first-class funciton
 from .config.qssert import batch_assert_type
