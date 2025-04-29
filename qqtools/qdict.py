@@ -23,6 +23,7 @@ SOFTWARE.
 """
 
 from typing import Any, Callable, Iterable, Sequence, Union
+from utils import deprecated
 
 
 class qDict(dict):
@@ -122,6 +123,7 @@ class qDict(dict):
     def __setattr__(self, key, value):
         self.__setitem__(key, value)
 
+    @deprecated("since its not implemented", None, ".copy()")
     def __deepcopy__(self):
         """not implemented yet"""
         return self.__copy__()
@@ -164,7 +166,8 @@ class qDict(dict):
             if isinstance(v, dict):
                 if k in self and isinstance(self.__getitem__(k), dict):
                     _old = self.__getitem__(k)
-                    v = _old.recursive_update(v)
+                    v = qDict(_old).recursive_update(v)
+                    v = _old.__class__(v)
             self.__setitem__(k, v)
         return self
 
@@ -215,3 +218,15 @@ class qDict(dict):
 
         s_ += "}"
         return s_
+
+
+if __name__ == "__main__":
+    d = qDict.from_args(a=1, b=2)
+    print(d)
+
+    d0 = qDict({"a": {"aval": 1, "b": 2}, "c": 3}, recursive=True)
+    d1 = qDict({"a": {"aval": 1, "b": 2}, "c": 3}, recursive=False)
+    print(type(d0.a), type(d1.a))  # qDict, dict
+    d0_ = d0.recursive_update({"a": {"new_k": 5}})
+    d1_ = d1.recursive_update({"a": {"new_k": 5}})
+    print(type(d0_.a), type(d1_.a))  # qDict, dict
