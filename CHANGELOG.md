@@ -21,3 +21,7 @@ v1.0.11
 v1.0.12
     add yaml inherit loader
     fix find_root function
+v1.0.13
+    add qDict from_args
+    style typing alias
+    fix qDict subclass copy bug with dataloader while pin_memory is True
