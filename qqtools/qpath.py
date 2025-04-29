@@ -7,5 +7,5 @@ def find_root(start: Union[str, Path], marker="pyproject.toml") -> str:
     while current != current.parent:
         if (current / marker).exists():
             return str(current)
-        current = current.parenst
+        current = current.parent
     raise FileNotFoundError(f"cannot find: {marker}")
