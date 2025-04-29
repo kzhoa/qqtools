@@ -28,27 +28,25 @@ class qData(qDict):
         return self
 
 
-def qbatch_collate(ls_data):
-    """no pad, 默认等长"""
-    v = ls_data[0]
+def qbatch_collate(data_list):
+    """no pad, assume all data have same length"""
+    v = data_list[0]
     if isinstance(v, torch.Tensor):
-        res = torch.stack(ls_data)  # (bz,)
+        res = torch.stack(data_list)  # (bz,)
     elif isinstance(v, (np.ndarray, np.generic)):
-        res = np.stack(ls_data)  # (bz, *)
+        res = np.stack(data_list)  # (bz, *)
         res = torch.as_tensor(res)
     else:
         raise TypeError(f"type {type(v)}")
     return res
 
 
-def qdict_pad_collate_fn(ls_batch: List[dict], padding: dict, target_keys):
-    """TODO qq: 需要写一个batch collate 处理不同类型，现在只能支持tensor 遇到str会报错
-
-    需要一个支持to(device)运算的 自定义 类字典 Data class
-
+def qdict_pad_collate_fn(batch_list: List[dict], padding: dict, target_keys):
+    """
+    maybe need multi type support
     """
     output = qData(default_function=list)
-    for p in ls_batch:
+    for p in batch_list:
         for k, v in p.items():
             if target_keys is not None and k not in target_keys:
                 continue

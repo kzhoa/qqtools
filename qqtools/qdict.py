@@ -123,17 +123,17 @@ class qDict(dict):
         self.__setitem__(key, value)
 
     def __deepcopy__(self):
-        """return new instance"""
-        d_ = qDict(self)
-        return d_
+        """not implemented yet"""
+        return self.__copy__()
 
     def __copy__(self):
         """return new instance"""
-        d_ = qDict(self)
-        return d_
+        _d = self.__class__.__new__(self.__class__)
+        _d.__init__(self, self.allow_notexist, self.allow_notexist)
+        return _d
 
     def copy(self):
-        return self.__deepcopy__()
+        return self.__copy__()
 
     def to_dict(self):
         _d = dict()
