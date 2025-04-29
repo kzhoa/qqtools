@@ -12,7 +12,7 @@ from .torch.qtyping import Bool, Float16, Float32, Float64, Int32, Int64
 
 # first-class funciton
 from .config.qssert import batch_assert_type
-from .config.qyaml import dump_yaml, load_yaml
+from .config.yaml import dump_yaml, load_yaml
 from .qpath import find_root
 from .torch.qcheckpoint import recover, save_ckp
 from .torch.qgpu import parse_device

@@ -5,8 +5,10 @@ from pathlib import Path
 
 import yaml
 
-from ..qdict import qDict
-from ..torch.qgpu import parse_device
+from ...qdict import qDict
+from ...torch.qgpu import parse_device
+
+from .qInheritLoader import InheritLoader
 
 
 def parse_none(cfg):
@@ -91,11 +93,14 @@ def dump_yaml(cfg, path, sort_keys=False, verbose=False):
         print(f"yaml dump to : {path} .")
 
 
-def load_yaml(path, ignore_keys=[]) -> qDict:
+def load_yaml(path, inherit=True, ignore_keys=[]) -> qDict:
+    """load_yaml with qinheritance support"""
     if (path is None) or (not Path(path).exists()):
         warnings.warn(f"file:{path} not exists")
         return qDict()
-    cfg = yaml.load(open(path, "r"), Loader=yaml.UnsafeLoader)
+
+    loader = InheritLoader if inherit else yaml.UnsafeLoader
+    cfg = yaml.load(open(path, "r"), Loader=loader)
     cfg = qDict(cfg)
     for k in ignore_keys:
         if k in cfg:
