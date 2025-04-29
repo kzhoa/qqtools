@@ -201,6 +201,10 @@ class qDict(dict):
             d_.__setitem__(k, v)
         return d_
 
+    @classmethod
+    def from_args(cls, **kwargs):
+        return cls(kwargs)
+
     def __repr__(self):
         if len(self) < 5:
             return super().__repr__()
