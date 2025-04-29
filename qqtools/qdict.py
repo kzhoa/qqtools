@@ -209,9 +209,9 @@ class qDict(dict):
         if len(self) < 5:
             return super().__repr__()
 
-        s_ = "qDict{\n\t"
+        s_ = "qDict{\n"
         for k, v in self.items():
-            s_ += f"{k}:{v}\n\t"
+            s_ += f"\t{k}:{v}\n"
 
         s_ += "}"
         return s_

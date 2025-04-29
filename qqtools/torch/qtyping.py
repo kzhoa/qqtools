@@ -29,6 +29,8 @@ class Float64(TensorType): dtype = "float64"
 class Bool(TensorType): dtype = "bool"
 class Int32(TensorType): dtype = "int32"
 class Int64(TensorType): dtype = "int64"
+Float = Float32
+Long = Int64
 # fmt: on
 
 if __name__ == "__main__":
