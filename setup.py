@@ -2,7 +2,7 @@ import setuptools
 
 setuptools.setup(
     name="qqtools",
-    version="1.0.11",
+    version="1.0.12",
     author="qq",
     author_email="qq@x1q.cc",
     description="A small tool package for qq",

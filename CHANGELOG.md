@@ -18,3 +18,6 @@ v1.0.10
     add find root
 v1.0.11
     add qtyping
+v1.0.12
+    add yaml inherit loader
+    fix find_root function
