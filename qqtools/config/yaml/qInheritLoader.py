@@ -27,13 +27,13 @@ class InheritLoader(QExpandSafeLoader):
     .. code-block:: yaml
         :linenos:
         # simple usage, single path string
-        BASE: ./aa.yaml  # 支持相对路径
+        $BASE: ./aa.yaml  # 支持相对路径
 
 
     .. code-block:: yaml
         :linenos:
         # list usage, multiple path strings
-        BASE:
+        $BASE:
             - ./aa.yaml
             - ../configs/bb.yaml
             - /home/user/cc.yaml
@@ -41,7 +41,7 @@ class InheritLoader(QExpandSafeLoader):
 
     .. code-block:: yaml
         :linenos:
-        BASE:
+        $BASE:
             optim: ./aa.yaml
             model: ./bb.yaml
 
@@ -49,7 +49,7 @@ class InheritLoader(QExpandSafeLoader):
     .. code-block:: yaml
         :linenos:
         # dict + list mixing
-        BASE:
+        $BASE:
             optim:
                 - ./adam.yaml
                 - ./cosine_anneal.yaml
@@ -60,7 +60,7 @@ class InheritLoader(QExpandSafeLoader):
     .. code-block:: yaml
         :linenos:
         # mixing usage
-        BASE:
+        $BASE:
             - ./base_config.yaml
             - model:
                 - ./model_config.yaml
@@ -88,8 +88,8 @@ class InheritLoader(QExpandSafeLoader):
         2. Loading and merging base file(s) recursively
         3. Updating the base data with current data (current overrides base)
         """
-        if "BASE" in data:
-            base_files = data.pop("BASE")
+        if "$BASE" in data:
+            base_files = data.pop("$BASE")
             base_data = self._handle_inheritance(base_files)
             return qt.qDict(base_data).recursive_update(data).to_dict()
         return data
