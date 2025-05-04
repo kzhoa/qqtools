@@ -28,4 +28,5 @@ v1.0.13
 v1.0.14
     add find_root optional return type
     change inherit loader to $base
-    
+v1.0.15
+    add early stop support to ckp save&load

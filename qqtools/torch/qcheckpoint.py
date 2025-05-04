@@ -20,7 +20,7 @@ def now_str():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def save_ckp(model, optimizer, lr_scheduler=None, save_dir=None, save_file=None, **other_params):
+def save_ckp(model, optimizer, lr_scheduler=None, early_stop=None, save_dir=None, save_file=None, **other_params):
     """save checkpoint on rank 0"""
     # only save checkpoint on main process
     if qdist.get_rank() != 0:
@@ -38,6 +38,8 @@ def save_ckp(model, optimizer, lr_scheduler=None, save_dir=None, save_file=None,
     }
     if lr_scheduler is not None:
         checkpoint["lrscheduler_state_dict"] = lr_scheduler.state_dict()
+    if early_stop is not None:
+        checkpoint["earlystop_state_dict"] = early_stop.state_dict()
     checkpoint.update(other_params)
     torch.save(checkpoint, save_path)
     print("Saving checkpoint Done.")
@@ -46,6 +48,7 @@ def save_ckp(model, optimizer, lr_scheduler=None, save_dir=None, save_file=None,
 def recover(
     model: torch.nn.Module,
     optimizer=None,
+    early_stop=None,
     restore_file: str = None,
     strict=True,
     exclude=[],
@@ -102,5 +105,13 @@ def recover(
             except Exception as e:
                 rank = qdist.get_rank()
                 print(f"rank_{rank}: error occurs when load optimizer state dict.")
+                print(repr(e))
+        # early_stop
+        if early_stop is not None:
+            try:
+                early_stop.load_state_dict(checkpoint["earlystop_state_dict"])
+            except Exception as e:
+                rank = qdist.get_rank()
+                print(f"rank_{rank}: error occurs when load early_stop state dict.")
                 print(repr(e))
         return checkpoint
