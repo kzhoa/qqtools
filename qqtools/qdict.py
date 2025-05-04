@@ -23,7 +23,7 @@ SOFTWARE.
 """
 
 from typing import Any, Callable, Iterable, Sequence, Union
-from utils import deprecated
+from .utils import deprecated
 
 
 class qDict(dict):
