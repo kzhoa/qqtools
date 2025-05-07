@@ -214,7 +214,7 @@ class qDict(dict):
 
         s_ = "qDict{\n"
         for k, v in self.items():
-            s_ += f"\t{k}:{v}\n"
+            s_ += f"\t'{k}':{v}\n"
 
         s_ += "}"
         return s_
