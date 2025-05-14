@@ -38,7 +38,7 @@ class LazyImport:
         return getattr(self.module, name)
 
 
-def common_imports():
+def common_import():
     import os
     import pickle
     import sys
