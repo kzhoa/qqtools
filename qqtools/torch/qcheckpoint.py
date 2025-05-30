@@ -8,7 +8,7 @@ friendly adapted with ddp
 import datetime
 import re
 from pathlib import Path
-
+from typing import List
 import torch
 
 from . import qdist
@@ -20,7 +20,15 @@ def now_str():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def save_ckp(model, optimizer, lr_scheduler=None, early_stop=None, save_dir=None, save_file=None, **other_params):
+def save_ckp(
+    model,
+    optimizer,
+    lr_scheduler=None,
+    early_stop=None,
+    save_dir=None,
+    save_file=None,
+    **other_params,
+):
     """save checkpoint on rank 0"""
     # only save checkpoint on main process
     if qdist.get_rank() != 0:
@@ -50,8 +58,9 @@ def recover(
     optimizer=None,
     early_stop=None,
     ckp_file: str = None,
-    strict=True,
-    exclude=[],
+    weights_only: bool = True,
+    strict: bool = True,
+    exclude: List[str] = [],
 ):
     """recover a model from checkpoint
     Returns
@@ -65,21 +74,28 @@ def recover(
         raise FileExistsError(f"file: `{ckp_file}`  not exist or is a directory")
 
     # recover
-    checkpoint = torch.load(ckp_file, map_location=torch.device("cpu"), weights_only=True)
+    checkpoint = torch.load(
+        ckp_file, map_location=torch.device("cpu"), weights_only=weights_only
+    )
 
     # add ddp - state dict convert
     if qdist.is_dist_available_and_initialized():
         k = list(checkpoint["model_state_dict"].keys())[0]
         if not k.startswith("module."):
             # add prefix
-            model_state_dict = {"module." + k: v for k, v in checkpoint["model_state_dict"].items()}
+            model_state_dict = {
+                "module." + k: v for k, v in checkpoint["model_state_dict"].items()
+            }
             checkpoint["model_state_dict"] = model_state_dict
     else:
         k = list(checkpoint["model_state_dict"].keys())[0]
         if k.startswith("module."):
             pattern = r"module.([\s\S]*)"  # noqa
             # remove prefix
-            model_state_dict = {re.findall(pattern, k)[0]: v for k, v in checkpoint["model_state_dict"].items()}
+            model_state_dict = {
+                re.findall(pattern, k)[0]: v
+                for k, v in checkpoint["model_state_dict"].items()
+            }
             checkpoint["model_state_dict"] = model_state_dict
 
     # delete weights that not welcomed
@@ -94,10 +110,12 @@ def recover(
         if strict is False and qdist.get_rank() == 0:
             if len(res.unexpected_keys) > 0:
                 print(
-                    f"{len(res.unexpected_keys)} Unexpected key(s) in state_dict: { ','.join(res.unexpected_keys) }. "
+                    f"{len(res.unexpected_keys)} Unexpected key(s) in state_dict: {','.join(res.unexpected_keys)}. "
                 )
             if len(res.missing_keys) > 0:
-                print(f"{len(res.missing_keys)} Missing key(s) in state_dict: { ','.join(res.missing_keys) }. ")
+                print(
+                    f"{len(res.missing_keys)} Missing key(s) in state_dict: {','.join(res.missing_keys)}. "
+                )
         # optimizer
         if optimizer is not None:
             try:
