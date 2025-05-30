@@ -49,7 +49,7 @@ def recover(
     model: torch.nn.Module,
     optimizer=None,
     early_stop=None,
-    restore_file: str = None,
+    ckp_file: str = None,
     strict=True,
     exclude=[],
 ):
@@ -59,13 +59,13 @@ def recover(
     dict
         checkpoint dict
     """
-    assert restore_file is not None
-    if restore_file == "" or not Path(restore_file).is_file():
+    assert ckp_file is not None
+    if ckp_file == "" or not Path(ckp_file).is_file():
         # `is_file` also return False when file not exist
-        raise FileExistsError(f"file: `{restore_file}`  not exist or is a directory")
+        raise FileExistsError(f"file: `{ckp_file}`  not exist or is a directory")
 
     # recover
-    checkpoint = torch.load(restore_file, map_location=torch.device("cpu"), weights_only=True)
+    checkpoint = torch.load(ckp_file, map_location=torch.device("cpu"), weights_only=True)
 
     # add ddp - state dict convert
     if qdist.is_dist_available_and_initialized():
