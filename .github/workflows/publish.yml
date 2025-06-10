@@ -51,7 +51,6 @@ jobs:
             - Version: ${{ github.ref_name }}
           files: |
             ./dist/**
-            ./CHANGELOG.md
 
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
