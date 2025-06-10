@@ -30,3 +30,5 @@ v1.0.14
     change inherit loader to $base
 v1.0.15
     add early stop support to ckp save&load
+    add pickle i/o
+    add lazyimport for class or function & transfer import common to lazy style 
