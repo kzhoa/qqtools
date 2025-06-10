@@ -54,8 +54,9 @@ class LazyImport:
         return self._target(*args, **kwargs)
 
 
-def import_common():
-    g = globals()
+def import_common(g=None):
+    if g is None:
+        g = globals()
     g["torch"] = LazyImport("torch")
     g["np"] = LazyImport("numpy")
     g["pd"] = LazyImport("pandas")
