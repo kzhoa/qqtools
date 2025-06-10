@@ -11,7 +11,7 @@ name: Upload Python Package
 on:
   push:
     tags:
-      - "v*"
+      - "v*.*.*"
 
 permissions:
   contents: read
@@ -23,6 +23,7 @@ jobs:
     environment: pub
     permissions:
       id-token: write # IMPORTANT: this permission is mandatory for trusted publishing
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +40,7 @@ jobs:
 
       - name: Release
         uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
         with:
           token: ${{ secrets.ACCESS_TOKEN }}
           body: |
@@ -57,30 +59,3 @@ jobs:
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
 
-  #     - name: Upload package artifacts
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: package-dist
-  #         path: dist/
-
-  # pypi-publish:
-  #   name: tmp-down & upload to PyPI
-  #   runs-on: ubuntu-latest
-  #   environment: pub
-  #   permissions:
-  #     id-token: write # IMPORTANT: this permission is mandatory for trusted publishing
-  #   steps:
-  #     # retrieve your distributions here
-  #     - name: Download package artifacts
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         name: package-dist
-  #         path: dist/
-  #     - name: Display structure of downloaded files
-  #       run: ls -R dist
-
-  #     - name: Publish package distributions to PyPI
-  #       uses: pypa/gh-action-pypi-publish@release/v1
-  #       with:
-  #         user: __token__
-  #         password: ${{ secrets.PYPI_API_TOKEN }}
