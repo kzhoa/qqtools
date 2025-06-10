@@ -11,6 +11,7 @@ from .torch.qoptim import CompositeOptim, CompositeScheduler
 from .torch.qtyping import Bool, Float16, Float32, Float64, Int32, Int64
 
 # first-class funciton
+from .qimport import import_common
 from .config.qssert import batch_assert_type
 from .config.yaml import dump_yaml, load_yaml
 from .config.qpickle import load_pickle, save_pickle
