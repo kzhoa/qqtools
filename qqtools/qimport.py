@@ -1,7 +1,7 @@
 import sys
 from importlib import import_module
 
-__all__ = ["LazyImport", "is_imported"]
+__all__ = ["LazyImport", "is_imported", "import_common"]
 
 
 def _try_import(pkg):
@@ -21,42 +21,49 @@ def is_imported(module_name: str):
 class LazyImport:
     """LazyImport
 
-    example:
-        # import numpy as np
+    Examples:
+        # Case 1: Standard module import
         np = LazyImport("numpy")
+        x = np.array([1, 2, 3])
+
+        # Case 2: Direct class import
+        Path = LazyImport("pathlib", object_name="Path")
+        p = Path("file.txt")
     """
 
-    def __init__(self, module_name, fromlist=None):
+    def __init__(self, module_name, object_name=None):
         self.module_name = module_name
-        self.fromlist = fromlist
-        self.module = None
+        self.object_name = object_name
+        self._target = None
+
+    def _load_target(self):
+        module = import_module(self.module_name)
+        if not self.object_name:
+            self._target = module
+        else:
+            self._target = getattr(module, self.object_name)
 
     def __getattr__(self, name):
-        if self.module is None:
-            self.module = import_module(self.module_name)
-            # self.module = __import__(self.module_name)
-        return getattr(self.module, name)
+        if self._target is None:
+            self._load_target()
+        return getattr(self._target, name)
+
+    def __call__(self, *args, **kwargs):
+        if self._target is None:
+            self._load_target()
+        return self._target(*args, **kwargs)
 
 
-def common_import():
-    import os
-    import pickle
-    import sys
-    import time
-    from pathlib import Path
-
-    import numpy as np
-    import pandas as pd
-    import torch
-    from tqdm import tqdm
-
+def import_common():
     g = globals()
-    g["torch"] = torch
-    g["np"] = np
-    g["tqdm"] = tqdm
-    g["pd"] = pd
-    g["pickle"] = pickle
-    g["Path"] = Path
-    g["os"] = os
-    g["sys"] = sys
-    g["time"] = time
+    g["torch"] = LazyImport("torch")
+    g["np"] = LazyImport("numpy")
+    g["pd"] = LazyImport("pandas")
+
+    g["Path"] = LazyImport("pathlib", "Path")
+    g["os"] = LazyImport("os")
+    g["sys"] = LazyImport("sys")
+    g["time"] = LazyImport("time")
+    g["json"] = LazyImport("json")
+    g["pickle"] = LazyImport("pickle")
+    g["tqdm"] = LazyImport("tqdm", "tqdm")
