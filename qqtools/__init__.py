@@ -15,7 +15,7 @@ from .qimport import import_common
 from .config.qssert import batch_assert_type
 from .config.yaml import dump_yaml, load_yaml
 from .config.qpickle import load_pickle, save_pickle
-from .qpath import find_root
+from .config.qsyspath import find_root, update_sys
 from .torch.qcheckpoint import recover, save_ckp
 from .torch.qgpu import parse_device
 from .torch.qrand import freeze_rand
