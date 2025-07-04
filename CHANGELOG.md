@@ -32,3 +32,6 @@ v1.0.15
     add early stop support to ckp save&load
     add pickle i/o
     add lazyimport for class or function & transfer import common to lazy style 
+v1.0.0
+    feat import common support custom global
+    feat save ckp allow verbose control
