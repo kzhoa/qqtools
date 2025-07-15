@@ -8,6 +8,12 @@ class DoNothing:
     def __getattr__(self, *args):
         return self.passby
 
+    def __enter__(self, *args, **kwargs):
+        pass
+
+    def __exit__(self, *args, **kwargs):
+        pass
+
 
 class Donothing(DoNothing):
     """Poka-yoke"""
