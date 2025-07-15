@@ -42,3 +42,6 @@ v1.1.1
     feat add nn submdule
     feat add nn.DoNothing
     feat add qcontextprovider
+v1.1.2
+    feat add functional donothing
+    fix qcontextprovider apply to general object instance 
