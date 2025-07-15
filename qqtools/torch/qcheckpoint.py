@@ -60,6 +60,7 @@ def save_ckp(
 def recover(
     model: torch.nn.Module,
     optimizer=None,
+    lr_scheduler=None,
     early_stop=None,
     ckp_file: str = None,
     weights_only: bool = True,
@@ -116,6 +117,14 @@ def recover(
             except Exception as e:
                 rank = qdist.get_rank()
                 print(f"rank_{rank}: error occurs when load optimizer state dict.")
+                print(repr(e))
+        # lr_scheduler
+        if lr_scheduler is not None:
+            try:
+                lr_scheduler.load_state_dict(checkpoint["lrscheduler_state_dict"])
+            except Exception as e:
+                rank = qdist.get_rank()
+                print(f"rank_{rank}: error occurs when load lr_scheduler state dict.")
                 print(repr(e))
         # early_stop
         if early_stop is not None:
