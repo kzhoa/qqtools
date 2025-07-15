@@ -35,7 +35,10 @@ v1.0.15
 v1.0.0
     feat import common support custom global
     feat save ckp allow verbose control
-v1.0.1
+v1.1.0
+    refactor module organization
+v1.1.1
     feat global import nn.funtional as F
     feat add nn submdule
     feat add nn.DoNothing
+    feat add qcontextprovider
