@@ -23,3 +23,4 @@ from .torch.qgpu import parse_device
 from .torch.qrand import freeze_rand
 from .torch.qscatter import scatter
 from .torch.qsplit import random_split_train_valid
+from .torch.nn.donothing import donothing

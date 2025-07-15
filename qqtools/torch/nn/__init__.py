@@ -1,1 +1,1 @@
-from .donothing import DoNothing, Donothing
+from .donothing import DoNothing, Donothing, donothing
