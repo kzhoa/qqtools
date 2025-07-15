@@ -5,10 +5,12 @@ from .qdict import qDict
 from .qtimer import Timer
 
 # first-class module
+from .torch import nn
 from .torch import qcheckpoint, qdist, qscatter, qsparse
 from .torch.qdataset import qData, qDictDataloader, qDictDataset
 from .torch.qoptim import CompositeOptim, CompositeScheduler
 from .torch.qtyping import Bool, Float16, Float32, Float64, Int32, Int64
+
 
 # first-class funciton
 from .qimport import import_common
