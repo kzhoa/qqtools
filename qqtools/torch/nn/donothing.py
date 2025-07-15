@@ -19,3 +19,7 @@ class Donothing(DoNothing):
     """Poka-yoke"""
 
     pass
+
+
+def donothing(*args, **kwargs):
+    return
