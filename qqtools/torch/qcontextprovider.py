@@ -74,9 +74,6 @@ def _qContextProvider(cls: torch.nn.Module, context_dict: qt.qDict):
     def patch_instance(instance):
         assert is_instance(instance)
 
-        orignal_getattr = instance.__getattr__
-        orignal_setattr = instance.__setattr__
-
         def __hook_getattr__(self, name: str):
             if name == "qtx":
                 return self.__dict__["qtx"]
@@ -99,10 +96,16 @@ def _qContextProvider(cls: torch.nn.Module, context_dict: qt.qDict):
         if "_qtx_patched" in instance.__dict__:
             return instance
 
+        if hasattr(instance, "__getattr__"):
+            orignal_getattr = instance.__getattr__
+            instance.__getattr__ = types.MethodType(__hook_getattr__, instance)
+            instance._orignal_getattr = orignal_getattr
+        if hasattr(instance, "__setattr__"):
+            orignal_setattr = instance.__setattr__
+            instance.__setattr__ = types.MethodType(__hook_setattr__, instance)
+            instance._orignal_setattr = orignal_setattr
         instance.__dict__["qtx"] = context_dict
         instance.__dict__["_qtx_patched"] = True
-        instance.__getattr__ = types.MethodType(__hook_getattr__, instance)
-        instance.__setattr__ = types.MethodType(__hook_setattr__, instance)
 
         # tail recursive
         submodules = instance.__dict__.get("_modules")
