@@ -45,3 +45,4 @@ v1.1.1
 v1.1.2
     feat add functional donothing
     fix qcontextprovider apply to general object instance 
+    feat recover support lr scheduler
