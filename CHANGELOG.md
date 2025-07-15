@@ -35,3 +35,7 @@ v1.0.15
 v1.0.0
     feat import common support custom global
     feat save ckp allow verbose control
+v1.0.1
+    feat global import nn.funtional as F
+    feat add nn submdule
+    feat add nn.DoNothing
