@@ -58,6 +58,7 @@ def import_common(g=None):
     if g is None:
         g = globals()
     g["torch"] = LazyImport("torch")
+    g["F"] = LazyImport("torch.nn.functional")
     g["np"] = LazyImport("numpy")
     g["pd"] = LazyImport("pandas")
 
