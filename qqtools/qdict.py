@@ -23,6 +23,7 @@ SOFTWARE.
 """
 
 from typing import Any, Callable, Iterable, Sequence, Union
+
 from .utils import deprecated
 
 
@@ -168,6 +169,8 @@ class qDict(dict):
                     _old = self.__getitem__(k)
                     v = qDict(_old).recursive_update(v)
                     v = _old.__class__(v)
+                else:
+                    v = qDict(v)
             self.__setitem__(k, v)
         return self
 
