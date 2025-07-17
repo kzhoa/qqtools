@@ -49,3 +49,5 @@ v1.1.2
     feat add freeze_module
     fix qcontextprovider apply to general object instance 
     refactor find root return Path by default 
+v1.1.3
+    fix qdataset fetch logics
