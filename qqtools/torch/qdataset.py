@@ -140,9 +140,14 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
             or (isinstance(idx, torch.Tensor) and idx.dim() == 0)
             or (isinstance(idx, np.ndarray) and np.isscalar(idx))
         ):
-            return self.data_list[idx]
+            if self._indices is not None:
+                idx = self._indices[idx]
+            return self.get(idx)
         else:
             return self.index_select(idx)
+
+    def get(self, true_idx):
+        return self.data_list[true_idx]
 
     def len(self):
         return len(self.data_list)
