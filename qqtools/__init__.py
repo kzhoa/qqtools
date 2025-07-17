@@ -20,6 +20,7 @@ from .config.yaml import dump_yaml, load_yaml
 from .config.qpickle import load_pickle, save_pickle
 from .config.qsyspath import find_root, update_sys
 from .torch.qcheckpoint import recover, save_ckp
+from .torch.qdataset import get_data_splits
 from .torch.qgpu import parse_device
 from .torch.qrand import freeze_rand
 from .torch.qscatter import scatter

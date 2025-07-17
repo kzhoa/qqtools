@@ -7,16 +7,38 @@ from collections import defaultdict
 from pathlib import Path
 from typing import List, Sequence, Union
 
-import h5py
 import numpy as np
-import qqtools as qt
 import torch
 import torch.utils
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+import qqtools as qt
+
 from ..qdict import qDict
+
+
+def get_data_splits(
+    total_num,
+    ratio=[0.8, 0.1, 0.1],
+    seed=None,
+):
+    rng = np.random.RandomState(seed)
+    indices = rng.permutation(total_num)
+
+    assert sum(ratio) <= 1
+
+    train_end = int(ratio[0] * total_num)
+    valid_end = train_end + int(ratio[1] * total_num)
+    train_idx = indices[:train_end]
+    valid_idx = indices[train_end:valid_end]
+    if len(ratio) > 2:
+        test_end = valid_end + int(ratio[2] * total_num)
+        test_idx = indices[valid_end:test_end]
+    else:
+        test_idx = None
+    return train_idx, valid_idx, test_idx
 
 
 class qData(qDict):
@@ -219,6 +241,10 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
         mean = torch.mean(val).item()
         std = torch.std(val).item()
         return (mean, std)
+
+    def get_splits(self, ratio=[0.8, 0.1, 0.1], seed=None):
+        total_num = self.__len__()
+        return get_data_splits(total_num, seed)
 
 
 class qDictDataloader(torch.utils.data.DataLoader):
