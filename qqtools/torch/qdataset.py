@@ -97,6 +97,8 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
     self.datalist : List[dict]
 
     We employ the same filepath convention with the pyg package.
+
+    override `get()` and `len()` to customize the dataset.
     """
 
     def __init__(self, root):
