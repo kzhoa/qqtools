@@ -46,5 +46,6 @@ v1.1.2
     feat add functional donothing
     feat recover support lr scheduler
     feat add get_data_splits tool function
+    feat add freeze_module
     fix qcontextprovider apply to general object instance 
     refactor find root return Path by default 
