@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Union
 
 
-def find_root(start: Union[str, Path], return_str=True, marker="pyproject.toml") -> Union[str, Path]:
+def find_root(start: Union[str, Path], return_str=False, marker="pyproject.toml") -> Union[str, Path]:
     current = Path(start).absolute()
     while current != current.parent:
         if (current / marker).exists():
