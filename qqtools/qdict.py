@@ -125,8 +125,10 @@ class qDict(dict):
         self.__setitem__(key, value)
 
     @deprecated("since its not implemented", None, ".copy()")
-    def __deepcopy__(self):
+    def __deepcopy__(self, memo):
         """not implemented yet"""
+        if id(self) in memo:
+            return memo[id(self)]
         return self.__copy__()
 
     def __copy__(self):

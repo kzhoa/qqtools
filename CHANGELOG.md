@@ -51,3 +51,5 @@ v1.1.2
     refactor find root return Path by default 
 v1.1.3
     fix qdataset fetch logics
+v1.1.4
+    fix qdict deepcopy memo 
