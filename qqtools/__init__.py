@@ -5,6 +5,7 @@ from .qdict import qDict
 from .qtimer import Timer
 
 # first-class module
+from .config import qtime
 from .torch import nn
 from .torch import qcheckpoint, qdist, qscatter, qsparse
 from .torch.qdataset import qData, qDictDataloader, qDictDataset
