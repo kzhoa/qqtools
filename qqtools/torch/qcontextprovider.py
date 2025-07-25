@@ -77,6 +77,8 @@ def patch_instance(instance, context_dict):
     instance.__setattr__ = types.MethodType(__hook_setattr__, instance)
     instance._orignal_getattr = orignal_getattr
     instance._orignal_setattr = orignal_setattr
+    if hasattr(instance, "post_init") and callable(getattr(instance, "post_init")):
+        instance.post_init()
 
     # tail recursive
     submodules = instance.__dict__.get("_modules", {})
@@ -111,6 +113,10 @@ def patch_cls(cls, context_dict):
         if name == "qtx":
             self.__dict__["qtx"] = value
             return
+        if isinstance(value, torch.nn.Module):
+            _value = patch_instance(value, context_dict)
+            # in this case original_setattr exists
+            orignal_setattr(self, name, _value)
         elif orignal_setattr is not None:
             orignal_setattr(self, name, value)
         else:
@@ -132,13 +138,13 @@ def patch_cls(cls, context_dict):
 def _qContextProvider(cls: torch.nn.Module, context_dict: qt.qDict):
     """"""
 
-    # global hook
-    def _global_regist_module_hook(module, name, submodule):
-        if "_qtx_patched" in module.__dict__:
-            return patch_instance(submodule, context_dict)
+    # # global hook
+    # def _global_regist_module_hook(module, name, submodule):
+    #     if "_qtx_patched" in module.__dict__:
+    #         return patch_instance(submodule, context_dict)
 
-    hooks_dict = torch.nn.modules.module._global_module_registration_hooks
-    if _global_regist_module_hook not in hooks_dict.values():
-        torch.nn.modules.module.register_module_module_registration_hook(_global_regist_module_hook)
+    # hooks_dict = torch.nn.modules.module._global_module_registration_hooks
+    # if _global_regist_module_hook not in hooks_dict.values():
+    #     torch.nn.modules.module.register_module_module_registration_hook(_global_regist_module_hook)
 
     return patch_cls(cls, context_dict)
