@@ -52,4 +52,5 @@ v1.1.2
 v1.1.3
     fix qdataset fetch logics
 v1.1.4
+    add qmlp
     fix qdict deepcopy memo 
