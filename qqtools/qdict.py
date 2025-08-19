@@ -22,7 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-from typing import Any, Callable, Iterable, Sequence, Union
+from typing import Any, Callable, Iterable, List, Sequence, Union
 
 from .utils import deprecated
 
@@ -123,6 +123,9 @@ class qDict(dict):
 
     def __setattr__(self, key, value):
         self.__setitem__(key, value)
+
+    def fetch(self, keys: List[str]):
+        return [self.__getitem__(k) for k in keys]
 
     @deprecated("since its not implemented", None, ".copy()")
     def __deepcopy__(self, memo):
