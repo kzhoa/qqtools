@@ -23,7 +23,7 @@ from .config.qsyspath import find_root, update_sys
 from .torch.qcheckpoint import recover, save_ckp
 from .torch.qdataset import get_data_splits
 from .torch.qgpu import parse_device
-from .torch.qfreeze import freeze_rand, freeze_module
+from .torch.qfreeze import freeze_rand, freeze_module, unfreeze_module
 from .torch.qscatter import scatter
 from .torch.qsplit import random_split_train_valid
 from .torch.nn.donothing import donothing
