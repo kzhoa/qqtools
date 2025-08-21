@@ -13,6 +13,11 @@ def freeze_rand(seed):
     torch.cuda.manual_seed(seed)
 
 
-def freeze_module(module):
-    for param in module.parameters():
-        param.requires_grad_(False)
+def freeze_module(module: torch.nn.Module):
+    for p in module.parameters():
+        p.requires_grad_(False)
+
+
+def unfreeze_module(module: torch.nn.Module):
+    for p in module.parameters():
+        p.requires_grad_(True)

@@ -54,3 +54,6 @@ v1.1.3
 v1.1.4
     add qmlp
     fix qdict deepcopy memo 
+v1.1.5
+    add qdict fetch
+    add unfreeze module
