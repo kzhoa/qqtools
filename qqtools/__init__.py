@@ -20,6 +20,8 @@ from .config.qssert import batch_assert_type
 from .config.yaml import dump_yaml, load_yaml
 from .config.qpickle import load_pickle, save_pickle
 from .config.qsyspath import find_root, update_sys
+
+# training
 from .torch.qcheckpoint import recover, save_ckp
 from .torch.qdataset import get_data_splits
 from .torch.qgpu import parse_device
@@ -27,3 +29,6 @@ from .torch.qfreeze import freeze_rand, freeze_module, unfreeze_module
 from .torch.qscatter import scatter
 from .torch.qsplit import random_split_train_valid
 from .torch.nn.donothing import donothing
+
+# type
+from .torch.qtypecheck import ensure_number, ensure_numpy
