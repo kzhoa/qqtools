@@ -33,7 +33,7 @@ def ensure_numpy(x):
     if isinstance(x, np.ndarray):
         return x
     elif isinstance(x, torch.Tensor):
-        return x.numpy()
+        return x.detach().cpu().numpy()
     elif isinstance(x, (int, float)):
         return x
     elif isinstance(x, (list, tuple)):
