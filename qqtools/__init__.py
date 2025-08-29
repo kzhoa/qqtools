@@ -32,3 +32,4 @@ from .torch.nn.donothing import donothing
 
 # type
 from .torch.qtypecheck import ensure_number, ensure_numpy
+from .utils.check import check_value_in
