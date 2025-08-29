@@ -57,3 +57,6 @@ v1.1.4
 v1.1.5
     add qdict fetch
     add unfreeze module
+v1.1.6
+    add ensure numpy
+    fix unfreeze import relationship
