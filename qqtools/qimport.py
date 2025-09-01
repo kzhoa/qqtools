@@ -69,3 +69,12 @@ def import_common(g=None):
     g["json"] = LazyImport("json")
     g["pickle"] = LazyImport("pickle")
     g["tqdm"] = LazyImport("tqdm", "tqdm")
+
+    # typing
+    g["Any"] = LazyImport("typing", "Any")
+    g["Dict"] = LazyImport("typing", "Dict")
+    g["Iterable"] = LazyImport("typing", "Iterable")
+    g["Optional"] = LazyImport("typing", "Optional")
+    g["Sequence"] = LazyImport("typing", "Sequence")
+    g["Tuple"] = LazyImport("typing", "Tuple")
+    g["Union"] = LazyImport("typing", "Union")
