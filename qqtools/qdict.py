@@ -70,10 +70,8 @@ class qDict(dict):
                 pass
 
         # be compatible with `getattr(qDict, key, defaultVal)`
-        if allow_notexist:
-            self.__dict__["_allow_notexist"] = allow_notexist
-        if default_function:
-            self.__dict__["_default_function"] = default_function
+        self.__dict__["_allow_notexist"] = allow_notexist
+        self.__dict__["_default_function"] = default_function if default_function is not None else None
 
     @property
     def allow_notexist(self):

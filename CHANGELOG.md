@@ -59,4 +59,6 @@ v1.1.5
     add unfreeze module
 v1.1.6
     add ensure numpy
+    add more import common packages
     fix unfreeze import relationship
+    fix qdict `__copy__` compatible with copy.copy()
