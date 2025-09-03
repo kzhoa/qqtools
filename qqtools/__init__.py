@@ -31,5 +31,5 @@ from .torch.qsplit import random_split_train_valid
 from .torch.nn.donothing import donothing
 
 # type
-from .torch.qtypecheck import ensure_number, ensure_numpy
+from .utils.qtypecheck import ensure_scala, ensure_numpy, str2number, is_number
 from .utils.check import check_values_allowed, is_alias_exists
