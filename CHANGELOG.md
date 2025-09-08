@@ -65,3 +65,4 @@ v1.1.7
     fix qdict _copy_ compatible with copy.copy()
 v1.1.9
     add numeric check and convert from str input
+    add alias for scatter mean&add
