@@ -1,6 +1,5 @@
 """
 torch.jit friendly implementation of scatter()
-can be a substantiate of `from torch_scatter import scatter`
 from torch_geoemtric.utils
 """
 
@@ -61,3 +60,21 @@ def scatter(
         return out / broadcast(count, out, dim)
 
     raise ValueError(f"Encountered invalid `reduce` argument '{reduce}'")
+
+
+def scatter_sum(
+    ref: Tensor,
+    index: Tensor,
+    dim: int,
+    dim_size: Optional[int] = None,
+):
+    return scatter(ref, index, dim, dim_size, reduce="sum")
+
+
+def scatter_mean(
+    ref: Tensor,
+    index: Tensor,
+    dim: int,
+    dim_size: Optional[int] = None,
+):
+    return scatter(ref, index, dim, dim_size, reduce="mean")
