@@ -66,3 +66,4 @@ v1.1.7
 v1.1.9
     add numeric check and convert from str input
     add alias for scatter mean&add
+    add staticmethod qData.get_data_splits
