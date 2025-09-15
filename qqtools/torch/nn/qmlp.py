@@ -35,7 +35,11 @@ def build_qmlp_layers(
 
         if not is_last or last_activation:
             if activation is not None and activation != "":
-                modules.append(get_nonlinear(activation))
+                if isinstance(activation, str):
+                    activation = get_nonlinear(activation)
+                else:
+                    assert callable(activation), f"activation {activation} is not callable"
+                modules.append(activation)
 
     return torch.nn.Sequential(*modules)
 
