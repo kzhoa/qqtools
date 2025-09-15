@@ -1,6 +1,5 @@
 """
 torch.jit friendly implementation of scatter()
-from torch_geoemtric.utils
 """
 
 from typing import Optional
@@ -33,7 +32,7 @@ def scatter(
     assert index.numel() > 0, "expect _index not empty"
 
     if dim_size is None:
-        dim_size = torch.add(int(torch.max(index)), 1)
+        dim_size = torch.add(torch.max(index).to(torch.int64), 1)
 
     # handle output _size
     _size = list(ref.shape)
