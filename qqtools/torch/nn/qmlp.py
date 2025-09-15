@@ -1,6 +1,6 @@
 import torch
 
-from .utils import get_nonlinear
+from .nonlinear import get_nonlinear
 
 
 def build_qmlp_layers(
