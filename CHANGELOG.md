@@ -68,3 +68,7 @@ v1.1.9
     add alias for scatter mean&add
     add staticmethod qData.get_data_splits
     fix get nonlinearity discriminate str and callable activation
+v1.1.10
+    add qlistdata 
+    add avgbank
+    more qimports
