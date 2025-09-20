@@ -1,7 +1,8 @@
 """
 qq:
-starts with "check", raise Error if not satisfied
-starts with "is", return False if not satisfied
+For functions here, must obey:
+- those starts with "check_", raise Error if not satisfied;
+- those starts with "is_", return False if not satisfied;
 """
 
 from typing import Iterable

@@ -1,5 +1,5 @@
 """
-handle list of dict
+handle list of dict datas
 """
 
 from typing import Dict, List, Optional, Tuple, Union

@@ -61,6 +61,7 @@ def import_common(g=None):
     g["F"] = LazyImport("torch.nn.functional")
     g["np"] = LazyImport("numpy")
     g["pd"] = LazyImport("pandas")
+    g["plt"] = LazyImport("matplotlib", "plot")
 
     g["Path"] = LazyImport("pathlib", "Path")
     g["os"] = LazyImport("os")
@@ -69,11 +70,13 @@ def import_common(g=None):
     g["json"] = LazyImport("json")
     g["pickle"] = LazyImport("pickle")
     g["tqdm"] = LazyImport("tqdm", "tqdm")
+    g["trange"] = LazyImport("tqdm", "trange")
 
     # typing
     g["Any"] = LazyImport("typing", "Any")
     g["Dict"] = LazyImport("typing", "Dict")
     g["Iterable"] = LazyImport("typing", "Iterable")
+    g["List"] = LazyImport("typing", "List")
     g["Optional"] = LazyImport("typing", "Optional")
     g["Sequence"] = LazyImport("typing", "Sequence")
     g["Tuple"] = LazyImport("typing", "Tuple")
