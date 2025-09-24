@@ -1,6 +1,6 @@
 import warnings
 
-from qqtools import qdist
+from ..torch import qdist
 
 
 class AverageMeter:
