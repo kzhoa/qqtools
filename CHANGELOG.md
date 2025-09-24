@@ -69,6 +69,8 @@ v1.1.9
     add staticmethod qData.get_data_splits
     fix get nonlinearity discriminate str and callable activation
 v1.1.10
-    add qlistdata 
-    add avgbank
-    more qimports
+    feat qlistdata 
+    feat avgbank
+    feat more qimports
+    feat set seed argument to naive split implementations
+    refactor get_data_split moved to qsplit module
