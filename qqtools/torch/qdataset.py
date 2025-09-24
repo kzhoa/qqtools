@@ -239,7 +239,7 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
 
     def get_splits(self, ratio=[0.8, 0.1, 0.1], seed=None):
         total_num = self.__len__()
-        return _get_data_splits(total_num, seed)
+        return get_data_splits(total_num, seed)
 
 
 class qDictDataloader(torch.utils.data.DataLoader):
