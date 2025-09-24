@@ -1,7 +1,5 @@
 import copy
 import functools
-import os
-import pickle
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from pathlib import Path
@@ -11,16 +9,13 @@ import numpy as np
 import torch
 import torch.utils
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
 
 import qqtools as qt
 
-from ..qdict import qDict
 from .qsplit import get_data_splits
 
 
-class qData(qDict):
+class qData(qt.qDict):
 
     def to(self, device):
         for k, v in self.items():
@@ -38,17 +33,160 @@ class qData(qDict):
         return get_data_splits(total_num, sizes, ratios, seed)
 
 
-def qbatch_collate(data_list):
+def naive_values_collate(ls_values):
     """no pad, assume all data have same length"""
-    v = data_list[0]
+    v = ls_values[0]
     if isinstance(v, torch.Tensor):
-        res = torch.stack(data_list)  # (bz,)
+        res = torch.stack(ls_values)  # (bz, *)
+    elif isinstance(v, (float, int)):
+        res = torch.stack([torch.tensor(val) for val in ls_values], dim=0)  # (bz,)
     elif isinstance(v, (np.ndarray, np.generic)):
-        res = np.stack(data_list)  # (bz, *)
-        res = torch.as_tensor(res)
+        res = torch.from_numpy(np.stack(ls_values))  # (bz, *)
+    elif isinstance(v, str):
+        res = ls_values
     else:
         raise TypeError(f"type {type(v)}")
     return res
+
+
+def collate_dict_samples(batch_list: List[dict]):
+    """
+    Merge a list of dicts into a batch, supporting various data types.
+
+    Args:
+        batch: List of samples (dicts), each with the same keys
+
+    Returns:
+        A dict where each key corresponds to a merged batch of values
+    """
+    if not batch_list:
+        return {}
+
+    # Verify all samples have the same keys
+    first_keys = set(batch_list[0].keys())
+    for i, sample in enumerate(batch_list[1:], 1):
+        sample_keys = set(sample.keys())
+        if sample_keys != first_keys:
+            missing = first_keys - sample_keys
+            extra = sample_keys - first_keys
+            raise AssertionError(f"Sample {i} has inconsistent keys. Missing: {missing}, Extra: {extra}")
+
+    merged = qt.qDict()
+    for key in batch_list[0].keys():
+        values = [sample[key] for sample in batch_list]
+        v = values[0]
+
+        try:
+            # Handle different data types
+            if isinstance(v, torch.Tensor):
+                merged[key] = torch.stack(values)  # (bz, *)
+            elif isinstance(v, (float, int)):
+                merged[key] = torch.tensor(values)  # (bz,)
+            elif isinstance(v, (np.ndarray, np.generic)):
+                merged[key] = torch.from_numpy(np.stack(values))  # (bz, *)
+            elif isinstance(v, str):
+                merged[key] = values  # Keep as list of strings
+            else:
+                raise TypeError(f"Unsupported type {type(v)} for key '{key}'")
+        except Exception as e:
+            raise RuntimeError(f"Failed to collate key '{key}': {str(e)}") from e
+
+    return merged
+
+
+def collate_graph_samples(batch_list):
+    """
+    Collates a list of graph samples into a single batch.
+
+    Args:
+        batch_list: List of dictionaries, each representing a graph sample.
+                   Each sample should have consistent keys.
+                   Expected keys may include "edge_index" and others.
+
+    Returns:
+        A dictionary containing the batched data with:
+        - All node features concatenated
+        - Edge indices adjusted with offsets
+        - Batch indices indicating which sample each node belongs to
+    """
+    reserved_keys = ["edge_index", "batch"]
+    batch_indices = []
+    node_count = 0
+    graph_data = defaultdict(list)
+    edge_index_list = []
+
+    _keys = list(batch_list[0].keys())
+    assert all(k in sample for sample in batch_list for k in _keys), "Not all keys are the same in the batch"
+
+    attr_keys = set(_keys) - set(reserved_keys)
+    has_edge_index = "edge_index" in _keys
+
+    #  classify attribute types based on first sample
+    sample0 = batch_list[0]
+    num_edges0 = sample0["edge_index"].shape[1] if has_edge_index else 0
+    edge_attr_keys = set()
+    for k in attr_keys:
+        value = sample0[k]
+        if isinstance(value, (torch.Tensor, np.ndarray)) and value.ndim >= 1:
+            if has_edge_index and value.shape[0] == num_edges0:
+                edge_attr_keys.add(k)
+
+    # handle
+    for i, sample in enumerate(batch_list):
+        num_nodes = None
+        for k in attr_keys:
+            if k not in edge_attr_keys:  # skip edge attributes
+                value = sample[k]
+                # single node graph is not considered
+                if isinstance(value, (torch.Tensor, np.ndarray)) and value.ndim >= 1 and value.shape[0] > 1:
+                    if num_nodes is None:
+                        num_nodes = value.shape[0]
+                    else:
+                        assert (
+                            num_nodes == value.shape[0]
+                        ), f"Node count of key {k} mismatch for sample {i}, got {num_nodes} and {value.shape[0]}"
+
+        num_edges = None
+        if has_edge_index:
+            edge_index = sample["edge_index"]
+            num_edges = edge_index.shape[1]
+            if num_nodes is None:
+                # infer num_nodes from edge_index if no node attributes
+                num_nodes = edge_index.max().item() + 1
+            # adjust edge indices with cumulative offset
+            adjusted_edge_index = edge_index.clone()
+            adjusted_edge_index += node_count
+            edge_index_list.append(adjusted_edge_index)
+
+        # store all data
+        for key in attr_keys:
+            value = sample[key]
+            if key not in reserved_keys:
+                graph_data[key].append(value)
+
+        # create batch indices
+        # consider situation that only graph attributes provided
+        if num_nodes is not None:
+            batch_indices.append(torch.full((num_nodes,), i, dtype=torch.long))
+            node_count += num_nodes
+
+    # Concatenate all data
+    for key, value_list in graph_data.items():
+        if isinstance(value_list[0], np.ndarray):
+            graph_data[key] = torch.cat([torch.from_numpy(v) for v in value_list], dim=0)
+        elif isinstance(value_list[0], torch.Tensor):
+            graph_data[key] = torch.cat(value_list, dim=0)
+        elif isinstance(value_list[0], (int, float)):
+            graph_data[key] = torch.tensor(value_list)
+        else:
+            graph_data[key] = value_list  # Strings and other types
+
+    batch_combined = torch.cat(batch_indices, dim=0)
+    result = qt.qDict({"batch": batch_combined, **graph_data})
+    if has_edge_index:
+        result["edge_index"] = torch.cat(edge_index_list, dim=1)
+
+    return result
 
 
 def qdict_pad_collate_fn(batch_list: List[dict], padding: dict, target_keys):
@@ -80,49 +218,97 @@ def qdict_pad_collate_fn(batch_list: List[dict], padding: dict, target_keys):
     return output
 
 
+def has_override(parent, obj, method_name):
+    """ """
+    if not hasattr(obj, method_name):
+        return False
+
+    if not hasattr(parent, method_name):
+        return True
+
+    obj_method = getattr(obj, method_name)
+    parent_method = getattr(parent, method_name)
+
+    obj_func = getattr(obj_method, "__func__", obj_method)
+    parent_func = getattr(parent_method, "__func__", parent_method)
+
+    return obj_func != parent_func
+
+
 class qDictDataset(torch.utils.data.Dataset, ABC):
+    """A dataset class that works with series of dictionaries.
+
+
+    This class accepts 3 usage patterns:
+
+    1. Naive:
+        Simply input a datalist: qDictDataset(data_list=[{}])
+        Override `get()` and `len()` to customize the dataset
+
+    2. Advanced:
+        Initialize with qDictDataset(root='/path/to/root')
+        Override `self.processed_file_names` and `self.process`
+        We employ the same filepath convention with the pyg package
+
+    3. Custom:
+        Initialize with empty input: qDictDataset()
     """
-    self.datalist : List[dict]
 
-    We employ the same filepath convention with the pyg package.
+    def __init__(self, data_list=None, root=None):
 
-    override `get()` and `len()` to customize the dataset.
-    """
-
-    def __init__(self, root):
-        self.root = root
         self.data_list: List[dict] = []
         self._indices = None
-        self.processed_dir.mkdir(exist_ok=True, parents=True)
-        if not self.processed_files_exists():
-            with qt.Timer("Process raw files", prefix="[qDataset]"):
-                self._process()
+        self.root = root
+
+        # naive init
+        if data_list is not None:
+            self.data_list = data_list
+
+        # advanced init
+        if self.root is not None:
+            self.processed_dir.mkdir(exist_ok=True, parents=True)
+            self.maybe_process()
 
     @property
-    @abstractmethod
     def raw_file_names(self):
-        raise NotImplementedError()
+        raise []
 
     @property
-    @abstractmethod
     def processed_file_names(self):
-        raise NotImplementedError()
+        raise []
 
     @property
     def raw_dir(self):
+        if self.root is None:
+            return None
         return Path(self.root).joinpath("raw").absolute()
 
     @property
     def processed_dir(self):
+        if self.root is None:
+            return None
         return Path(self.root).joinpath("processed").absolute()
 
     @property
     def raw_paths(self):
+        if self.root is None:
+            return None
         return [str(self.raw_dir / fn) for fn in self.raw_file_names]
 
     @property
     def processed_paths(self):
+        if self.root is None:
+            return None
         return [str(self.processed_dir / fn) for fn in self.processed_file_names]
+
+    def maybe_process(self):
+        if not has_override(qDictDataset, self, "processed_file_names"):
+            return
+        self._process()
+
+    def _process(self):
+        if hasattr(self, "process"):
+            self.process()
 
     def __getitem__(self, idx) -> Union[dict, torch.utils.data.Dataset]:
         if (
@@ -192,10 +378,6 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
     def raw_files_exists(self):
         return all([Path(f).exists() for f in self.raw_paths])
 
-    def _process(self):
-        if hasattr(self, "process"):
-            self.process()
-
     def shuffle(
         self,
     ) -> "torch.utils.data.Dataset":
@@ -204,59 +386,77 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
         return dataset
 
     def collate(self, batch_size, target_keys=None, padding: dict = None):
-        """prepare"""
+        """prepare fixed batches. Only recommended for small dataset."""
         if padding is None:
             padding = self.padding if hasattr(self, "padding") else defaultdict(lambda: 0)
 
-        def yield_batch_data(iterable_sequence: List[dict], batch_size, target_keys, padding):
-            batch = []
-            i = 0
-            for d in iterable_sequence:
-                batch.append(d)
-                i += 1
-                if i == batch_size:
-                    i = 0
-                    yield qdict_pad_collate_fn(batch, padding, target_keys)
-                    batch = []
+        if target_keys is None:
+            target_keys = list(self.data_list[0].keys()) if len(self.data_list) > 0 else []
 
-            if len(batch) > 0:
-                yield qdict_pad_collate_fn(batch, padding, target_keys)
-
-        yield_fn = functools.partial(
-            yield_batch_data,
-            batch_size=batch_size,
-            target_keys=target_keys,
-            padding=padding,
-        )
-        return qDictDataloader(self, batch_size, yield_fn)
+        batches = []
+        current_batch = []
+        for data in self.data_list:
+            current_batch.append(data)
+            if len(current_batch) == batch_size:
+                batches.append(qdict_pad_collate_fn(current_batch, padding, target_keys))
+                current_batch = []
+        if current_batch:  # last batch
+            batches.append(qdict_pad_collate_fn(current_batch, padding, target_keys))
+        return batches
 
     def get_norm_factor(self, target):
         vs = [self.data_list[i][target] for i in self.indices()]
-        val = qbatch_collate(vs)
+        val = naive_values_collate(vs)
         mean = torch.mean(val).item()
         std = torch.std(val).item()
         return (mean, std)
 
-    def get_splits(self, ratio=[0.8, 0.1, 0.1], seed=None):
-        total_num = self.__len__()
-        return get_data_splits(total_num, seed)
+    def get_splits(self, ratios=[0.8, 0.1, 0.1], seed=None):
+        return get_data_splits(total_num=self.__len__(), ratios=ratios, seed=seed)
 
 
 class qDictDataloader(torch.utils.data.DataLoader):
-    def __init__(self, dataset, batch_size, yield_fn=None, shuffle=False, **kwargs):
-        self.yield_fn = yield_fn
-        self.batch_list = None
-        super().__init__(dataset, batch_size, shuffle=shuffle, collate_fn=qdict_pad_collate_fn, **kwargs)
+    """
+    A specialized DataLoader for handling dictionary-based datasets with automatic collation.
 
-    def __iter__(self):
-        if self.batch_list is not None:
-            return iter(self.batch_list)
-        elif self.yield_fn is not None:
-            return self.yield_fn(iter(self.dataset))
-        else:
-            return super().__iter__()
+    Examples:
+        >>> # For regular dictionary data
+        >>> loader = qDictDataloader(dataset, batch_size=32, shuffle=True)
 
-    def cache(self):
-        assert self.yield_fn is not None
-        self.batch_list = list(self.yield_fn(iter(self.dataset)))
-        return self
+        >>> # For graph data (automatically uses graph collation)
+        >>> loader = qDictDataloader(graph_dataset, batch_size=16, is_graph=True)
+
+        >>> # With custom collation function
+        >>> loader = qDictDataloader(dataset, batch_size=8, collate_fn=my_collate_fn)
+    """
+
+    def __init__(self, dataset, batch_size, shuffle=False, collate_fn=None, is_graph=False, **kwargs):
+        """
+        Initialize the qDictDataloader.
+
+        Args:
+            dataset (Dataset): Dataset from which to load the data. Should return dictionaries
+                             when indexed. For graph data, dictionaries should contain
+                             'edge_index' and node/edge attributes.
+            batch_size (int): Number of samples per batch.
+            shuffle (bool, optional): Whether to shuffle the data at every epoch.
+                                    Default: False.
+            collate_fn (callable, optional): Custom function to collate samples into batches.
+                                           If None, automatically selects based on is_graph.
+            is_graph (bool, optional): Whether the dataset contains graph data. If True and
+                                     no collate_fn is provided, uses graph-specific collation
+                                     that handles edge index offsets and batch indices.
+                                     Default: False.
+            **kwargs: Additional keyword arguments passed to the parent DataLoader.
+
+        Note:
+            When is_graph=True, the collation function will:
+            - Adjust edge indices with cumulative node offsets
+            - Create batch indices indicating sample origin for each node
+            - Concatenate node features along the node dimension
+            - Handle both node-level and edge-level attributes appropriately
+        """
+        # If no collate_fn is provided, use the default behavior
+        if collate_fn is None:
+            collate_fn = collate_graph_samples if is_graph else collate_dict_samples
+        super().__init__(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, **kwargs)
