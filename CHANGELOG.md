@@ -73,4 +73,6 @@ v1.1.10
     feat avgbank
     feat more qimports
     feat set seed argument to naive split implementations
+    feat naive initialization for qdictdataset
+    feat naive& graph collate fn for qdictdataloader
     refactor get_data_split moved to qsplit module
