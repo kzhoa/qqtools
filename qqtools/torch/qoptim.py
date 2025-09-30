@@ -1,7 +1,7 @@
-from typing import Dict, Protocol, Type
+from typing import Dict, Type
 
 import torch
-import torch.optim.lr_scheduler as lr_scheduler
+import torch.optim.lr_scheduler
 
 # qq: the name changed after torch 2.x
 # https://github.com/pytorch/pytorch/blob/v1.13.1/torch/optim/lr_scheduler.py
