@@ -71,7 +71,7 @@ def collate_dict_samples(batch_list: List[dict]):
             extra = sample_keys - first_keys
             raise AssertionError(f"Sample {i} has inconsistent keys. Missing: {missing}, Extra: {extra}")
 
-    merged = qt.qDict()
+    merged = qt.qData()
     for key in batch_list[0].keys():
         values = [sample[key] for sample in batch_list]
         v = values[0]
@@ -182,7 +182,7 @@ def collate_graph_samples(batch_list):
             graph_data[key] = value_list  # Strings and other types
 
     batch_combined = torch.cat(batch_indices, dim=0)
-    result = qt.qDict({"batch": batch_combined, **graph_data})
+    result = qt.qData({"batch": batch_combined, **graph_data})
     if has_edge_index:
         result["edge_index"] = torch.cat(edge_index_list, dim=1)
 
@@ -460,3 +460,14 @@ class qDictDataloader(torch.utils.data.DataLoader):
         if collate_fn is None:
             collate_fn = collate_graph_samples if is_graph else collate_dict_samples
         super().__init__(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, **kwargs)
+
+
+# class qBlockDataset(torch.utils.data.Dataset, ABC):
+#     def __init__(self):
+#         super().__init__()
+
+#     def __getitem__(self, index):
+#         return super().__getitem__(index)
+
+#     def __len__(self):
+#         pass

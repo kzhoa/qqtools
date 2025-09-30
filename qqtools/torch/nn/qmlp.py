@@ -28,8 +28,12 @@ def build_qmlp_layers(
         if not is_last or last_norm:
             if norm == "ln":
                 modules.append(torch.nn.LayerNorm(to_dim))
+            elif norm == "bn":
+                modules.append(torch.nn.BatchNorm1d(to_dim))
             elif norm is None or norm == "":
                 pass
+            elif callable(norm):
+                modules.append(norm)
             else:
                 raise ValueError(f"Invalid norm type: {norm}")
 
