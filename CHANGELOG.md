@@ -76,3 +76,5 @@ v1.1.10
     feat naive initialization for qdictdataset
     feat naive& graph collate fn for qdictdataloader
     refactor get_data_split moved to qsplit module
+v1,1.12
+    add numpy type annotation in qtyping

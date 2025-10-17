@@ -10,9 +10,9 @@ from .torch import nn
 from .torch import qcheckpoint, qdist, qscatter, qsparse
 from .torch.qdataset import qData, qDictDataloader, qDictDataset
 from .torch.qoptim import CompositeOptim, CompositeScheduler
-from .torch.qtyping import Bool, Float16, Float32, Float64, Int32, Int64
 from .torch import qcontextprovider
 from .torch.qcontextprovider import qContextProvider
+from .utils.qtyping import Bool, Float16, Float32, Float64, Int32, Int64, Float32Array, Float64Array, BoolArray, Int32Array, Int64Array # fmt: skip
 
 # first-class funciton
 from .qimport import import_common
