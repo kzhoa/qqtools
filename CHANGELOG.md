@@ -76,5 +76,7 @@ v1.1.10
     feat naive initialization for qdictdataset
     feat naive& graph collate fn for qdictdataloader
     refactor get_data_split moved to qsplit module
-v1,1.12
+v1.1.12
     add numpy type annotation in qtyping
+    refactor change qData __init__ into kwargs style
+    refactor change qDictDataset interject name to raw_files_exist 
