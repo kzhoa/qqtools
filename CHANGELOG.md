@@ -82,3 +82,5 @@ v1.1.12
     refactor change qDictDataset interject name to raw_files_exist 
 v1.1.13
     fix qtyping np.bool_ 
+v1.1.14
+    fix qData initialize for backward compatibility

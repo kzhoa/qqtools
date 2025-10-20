@@ -17,8 +17,18 @@ from .qsplit import get_data_splits
 
 class qData(qt.qDict):
 
-    def __init__(self, **kwargs):
-        super().__init__(kwargs, allow_notexist=False)
+    def __init__(self, d=None, /, **kwargs):
+        if d is not None and kwargs:
+            raise ValueError(
+                "Conflicting arguments: "
+                "Either pass a dictionary `d` OR keyword arguments, "
+                "but not both.\n"
+                "Example:\n"
+                "  qData({'key': value}) \n"
+                "  qData(key=value)      "
+            )
+        d = d if d is not None else kwargs
+        super().__init__(d, allow_notexist=False)
 
     def to(self, device):
         for k, v in self.items():
