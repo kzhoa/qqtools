@@ -17,6 +17,9 @@ from .qsplit import get_data_splits
 
 class qData(qt.qDict):
 
+    def __init__(self, **kwargs):
+        super().__init__(kwargs, allow_notexist=False)
+
     def to(self, device):
         for k, v in self.items():
             if isinstance(v, torch.Tensor):
@@ -304,7 +307,9 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
     def maybe_process(self):
         if not has_override(qDictDataset, self, "processed_file_names"):
             return
-        self._process()
+
+        if not self.processed_files_exist():
+            self._process()
 
     def _process(self):
         if hasattr(self, "process"):
@@ -372,10 +377,10 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
         dataset._indices = indices
         return dataset
 
-    def processed_files_exists(self):
+    def processed_files_exist(self):
         return all([Path(f).exists() for f in self.processed_paths])
 
-    def raw_files_exists(self):
+    def raw_files_exist(self):
         return all([Path(f).exists() for f in self.raw_paths])
 
     def shuffle(
