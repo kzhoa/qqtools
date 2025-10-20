@@ -68,7 +68,7 @@ class Array(Generic[Unpack[ShapeT]]):
 # fmt: off
 class Float32Array(npt.NDArray[np.float32], Array): pass
 class Float64Array(npt.NDArray[np.float64], Array): pass
-class BoolArray(npt.NDArray[np.bool], Array): pass
+class BoolArray(npt.NDArray[np.bool_], Array): pass
 class Int32Array(npt.NDArray[np.int32], Array): pass
 class Int64Array(npt.NDArray[np.int64], Array): pass
 # alias
