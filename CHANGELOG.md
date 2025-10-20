@@ -84,3 +84,5 @@ v1.1.13
     fix qtyping np.bool_ 
 v1.1.14
     fix qData initialize for backward compatibility
+V1.1.16
+    fix qData init signature inconsist with parent which causes copy.copy() problem

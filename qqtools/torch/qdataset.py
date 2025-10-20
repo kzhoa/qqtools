@@ -17,14 +17,30 @@ from .qsplit import get_data_splits
 
 class qData(qt.qDict):
 
-    def __init__(self, **kwargs):
-        super().__init__(kwargs, allow_notexist=False)
+    def __init__(self, d=None, /, **kwargs):
+        if d is not None and kwargs:
+            raise ValueError(
+                "Conflicting arguments: "
+                "Either pass a dictionary `d` OR keyword arguments, "
+                "but not both.\n"
+                "Example:\n"
+                "  qData({'key': value}) \n"
+                "  qData(key=value)      "
+            )
+        d = d if d is not None else kwargs
+        super().__init__(d, allow_notexist=False)
 
     def to(self, device):
         for k, v in self.items():
             if isinstance(v, torch.Tensor):
                 self[k] = v.to(device)
         return self
+
+    def __copy__(self):
+        """return new instance"""
+        _d = self.__class__.__new__(self.__class__)
+        _d.__init__(self)
+        return _d
 
     @staticmethod
     def get_splits(
