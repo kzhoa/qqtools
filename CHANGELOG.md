@@ -85,6 +85,6 @@ V1.1.16
     fix qData initialize for backward compatibility
     fix qData init signature inconsist with parent which causes copy.copy() problem
 v1.1.17
-    feat qdatalist plot_counts
+    feat qdatalist plot_counts, support iter
     refactor data.qdatalist
     fix qimport for matplotlib.pyplot
