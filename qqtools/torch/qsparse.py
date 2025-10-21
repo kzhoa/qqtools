@@ -61,9 +61,10 @@ def scipy2sparsetensor(A):
 
 
 def sparsetensor2scipy(A):
-    """返回的scipy.sparse取决于torch.sparse.tensor的layout"""
+    """
+    return sparse_matrix depends on input's layout"""
     assert isinstance(A, torch.Tensor)
-    # A = A.coalesce()
+
     if A.layout == torch.sparse_csr:
         vals = A.values().numpy()
         indices = A.col_indices().numpy()
