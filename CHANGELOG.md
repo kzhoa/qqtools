@@ -80,9 +80,11 @@ v1.1.12
     add numpy type annotation in qtyping
     refactor change qData __init__ into kwargs style
     refactor change qDictDataset interject name to raw_files_exist 
-v1.1.13
-    fix qtyping np.bool_ 
-v1.1.14
-    fix qData initialize for backward compatibility
 V1.1.16
+    fix qtyping np.bool_ 
+    fix qData initialize for backward compatibility
     fix qData init signature inconsist with parent which causes copy.copy() problem
+v1.1.17
+    feat qdatalist plot_counts
+    refactor data.qdatalist
+    fix qimport for matplotlib.pyplot
