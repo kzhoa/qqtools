@@ -436,7 +436,7 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
 
     def get_norm_factor(self, target):
         vs = [self.data_list[i][target] for i in self.indices()]
-        val = naive_values_collate(vs)
+        val = smart_combine(vs)
         mean = torch.mean(val).item()
         std = torch.std(val).item()
         return (mean, std)
