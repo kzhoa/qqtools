@@ -160,7 +160,7 @@ class qDataList:
         rng.shuffle(shuffled_list)
         return shuffled_list
 
-    def plot_counts(self,key):
+    def plot_counts(self, key):
         cnt_dict = self.counts()
         names = list(cnt_dict.keys())
         counts = list(cnt_dict.values())
@@ -211,4 +211,5 @@ class qDataList:
     def __getitem__(self, key):
         return qList([d[key] for d in self.data_list])
 
-    def __iter__(self,)
+    def __iter__(self):
+        return iter(self.data_list)
