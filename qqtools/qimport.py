@@ -61,7 +61,7 @@ def import_common(g=None):
     g["F"] = LazyImport("torch.nn.functional")
     g["np"] = LazyImport("numpy")
     g["pd"] = LazyImport("pandas")
-    g["plt"] = LazyImport("matplotlib", "plot")
+    g["plt"] = LazyImport("matplotlib", "pyplot")
 
     g["Path"] = LazyImport("pathlib", "Path")
     g["os"] = LazyImport("os")

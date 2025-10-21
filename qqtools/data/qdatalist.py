@@ -59,7 +59,7 @@ class qList(list):
             raise TypeError("Comparison not supported between instances of 'MyList' and '{}'".format(type(other)))
 
 
-class qListData:
+class qDataList:
     """
     List of dict:
 
@@ -160,6 +160,19 @@ class qListData:
         rng.shuffle(shuffled_list)
         return shuffled_list
 
+    def plot_counts(self,key):
+        cnt_dict = self.counts()
+        names = list(cnt_dict.keys())
+        counts = list(cnt_dict.values())
+        plt.bar(names, counts)
+
+        plt.title("Frequency of Values ")
+        plt.xlabel("Value")
+        plt.ylabel("Count")
+
+        plt.tight_layout()
+        plt.show()
+
     def plot_count_distribution(self, key):
         cnt_dist = self.count_distribution(key)
         names = list(cnt_dist.keys())
@@ -171,6 +184,7 @@ class qListData:
         plt.xlabel("Cout Values")
         plt.ylabel("Count")
 
+        plt.tight_layout()
         plt.show()
 
     def loc(self, indices: Sequence[int | bool]):
@@ -187,12 +201,14 @@ class qListData:
         """
         if all(isinstance(i, int) for i in indices):
             # If all indices are integers, select by index
-            return qListData([self.data_list[i] for i in indices])
+            return qDataList([self.data_list[i] for i in indices])
         elif all(isinstance(i, bool) for i in indices):
             # If all indices are booleans, select by boolean mask
-            return qListData([item for item, include in zip(self.data_list, indices) if include])
+            return qDataList([item for item, include in zip(self.data_list, indices) if include])
         else:
             raise ValueError("Indices must be either all integers or all booleans.")
 
     def __getitem__(self, key):
         return qList([d[key] for d in self.data_list])
+
+    def __iter__(self,)
