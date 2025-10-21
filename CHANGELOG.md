@@ -86,5 +86,7 @@ V1.1.16
     fix qData init signature inconsist with parent which causes copy.copy() problem
 v1.1.17
     feat qdatalist plot_counts, support iter
-    refactor data.qdatalist
+    feat add smart_combine for qDictDataset's collate fn
+    refactor data.qdatalist filename
+    refactor add staticmethod collate_dict_samples & graph in qDictDataset for convenience
     fix qimport for matplotlib.pyplot
