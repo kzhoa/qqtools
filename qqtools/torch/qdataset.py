@@ -52,20 +52,45 @@ class qData(qt.qDict):
         return get_data_splits(total_num, sizes, ratios, seed)
 
 
-def naive_values_collate(ls_values):
-    """no pad, assume all data have same length"""
-    v = ls_values[0]
+def smart_combine(value_list, prefer_stack=False):
+    v = value_list[0]
     if isinstance(v, torch.Tensor):
-        res = torch.stack(ls_values)  # (bz, *)
+        if v.dim() == 0:  # scala
+            res = torch.stack(value_list)  # have to use torch.stack
+        elif prefer_stack:
+            res = torch.stack(value_list)  # (bz, *)
+        else:
+            res = torch.cat(value_list, dim=0)
     elif isinstance(v, (float, int)):
-        res = torch.stack([torch.tensor(val) for val in ls_values], dim=0)  # (bz,)
+        res = torch.tensor(value_list)  #
     elif isinstance(v, (np.ndarray, np.generic)):
-        res = torch.from_numpy(np.stack(ls_values))  # (bz, *)
+        if prefer_stack:
+            val = np.stack(value_list)  # (bz, *)
+        else:
+            val = np.concatenate(value_list, dim=0)
+        res = torch.from_numpy(val)
     elif isinstance(v, str):
-        res = ls_values
+        res = value_list
     else:
-        raise TypeError(f"type {type(v)}")
+        raise TypeError(f"Unsupported type: {type(v)}")
+
     return res
+
+
+# def naive_values_collate(ls_values):
+#     """no pad, assume all data have same length"""
+#     v = ls_values[0]
+#     if isinstance(v, torch.Tensor):
+#         res = torch.stack(ls_values)  # (bz, *)
+#     elif isinstance(v, (float, int)):
+#         res = torch.stack([torch.tensor(val) for val in ls_values], dim=0)  # (bz,)
+#     elif isinstance(v, (np.ndarray, np.generic)):
+#         res = torch.from_numpy(np.stack(ls_values))  # (bz, *)
+#     elif isinstance(v, str):
+#         res = ls_values
+#     else:
+#         raise TypeError(f"type {type(v)}")
+#     return res
 
 
 def collate_dict_samples(batch_list: List[dict]):
@@ -97,16 +122,7 @@ def collate_dict_samples(batch_list: List[dict]):
 
         try:
             # Handle different data types
-            if isinstance(v, torch.Tensor):
-                merged[key] = torch.stack(values)  # (bz, *)
-            elif isinstance(v, (float, int)):
-                merged[key] = torch.tensor(values)  # (bz,)
-            elif isinstance(v, (np.ndarray, np.generic)):
-                merged[key] = torch.from_numpy(np.stack(values))  # (bz, *)
-            elif isinstance(v, str):
-                merged[key] = values  # Keep as list of strings
-            else:
-                raise TypeError(f"Unsupported type {type(v)} for key '{key}'")
+            merged[key] = smart_combine(values, prefer_stack=True)
         except Exception as e:
             raise RuntimeError(f"Failed to collate key '{key}': {str(e)}") from e
 
@@ -191,14 +207,7 @@ def collate_graph_samples(batch_list):
 
     # Concatenate all data
     for key, value_list in graph_data.items():
-        if isinstance(value_list[0], np.ndarray):
-            graph_data[key] = torch.cat([torch.from_numpy(v) for v in value_list], dim=0)
-        elif isinstance(value_list[0], torch.Tensor):
-            graph_data[key] = torch.cat(value_list, dim=0)
-        elif isinstance(value_list[0], (int, float)):
-            graph_data[key] = torch.tensor(value_list)
-        else:
-            graph_data[key] = value_list  # Strings and other types
+        graph_data[key] = smart_combine(value_list, prefer_stack=False)
 
     batch_combined = torch.cat(batch_indices, dim=0)
     result = qt.qData({"batch": batch_combined, **graph_data})
@@ -434,6 +443,14 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
 
     def get_splits(self, ratios=[0.8, 0.1, 0.1], seed=None):
         return get_data_splits(total_num=self.__len__(), ratios=ratios, seed=seed)
+
+    @staticmethod
+    def collate_dict_samples(self, *args, **kwargs):
+        return collate_dict_samples(*args, **kwargs)
+
+    @staticmethod
+    def collate_graph_samples(self, *args, **kwargs):
+        return collate_graph_samples(*args, **kwargs)
 
 
 class qDictDataloader(torch.utils.data.DataLoader):
