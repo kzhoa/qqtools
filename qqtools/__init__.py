@@ -7,9 +7,11 @@ from .qtimer import Timer
 from .data.qdatalist import qDataList
 from .torch.qdataset import qData, qDictDataloader, qDictDataset
 from .torch.qoptim import CompositeOptim, CompositeScheduler
+
+
+# first-class module
+from .torch import qcheckpoint, qdist, qscatter, qsparse
 from .torch import qcontextprovider
-from .torch.qcontextprovider import qContextProvider
-from .utils.qtyping import Bool, Float16, Float32, Float64, Int32, Int64, Float32Array, Float64Array, BoolArray, Int32Array, Int64Array # fmt: skip
 
 # first-class funciton
 from .qimport import import_common
@@ -17,6 +19,7 @@ from .config.qssert import batch_assert_type
 from .config.yaml import dump_yaml, load_yaml
 from .config.qpickle import load_pickle, save_pickle
 from .config.qsyspath import find_root, update_sys
+from .torch.qcontextprovider import qContextProvider
 
 # training
 from .torch.qcheckpoint import recover, save_ckp
@@ -26,6 +29,7 @@ from .torch.qscatter import scatter
 from .torch.qsplit import random_split_train_valid, random_split_train_valid_test, get_data_splits
 from .torch.nn.donothing import donothing
 
-# type
+# type & check
+from .utils.qtyping import Bool, Float16, Float32, Float64, Int32, Int64, Float32Array, Float64Array, BoolArray, Int32Array, Int64Array # fmt: skip
 from .utils.qtypecheck import ensure_scala, ensure_numpy, str2number, is_number
 from .utils.check import check_values_allowed, is_alias_exists
