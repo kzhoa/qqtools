@@ -10,7 +10,9 @@ from .torch.qoptim import CompositeOptim, CompositeScheduler
 
 
 # first-class module
-from .torch import qcheckpoint, qdist, qscatter, qsparse
+from .torch import nn
+from .torch import qdist
+from .torch import qcheckpoint, qscatter, qsparse
 from .torch import qcontextprovider
 
 # first-class funciton
