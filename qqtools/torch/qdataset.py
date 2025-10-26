@@ -1,5 +1,4 @@
 import copy
-import functools
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from pathlib import Path
@@ -52,7 +51,25 @@ class qData(qt.qDict):
         return get_data_splits(total_num, sizes, ratios, seed)
 
 
-def smart_combine(value_list, prefer_stack=False):
+def smart_combine(value_list: List, prefer_stack=False):
+    """Intelligently combines a list of values using either stack or concatenation.
+
+    Args:
+        value_list (List[Union[torch.Tensor, float, int, np.ndarray, str]]):
+            List of values to combine. All elements must be of the same type.
+        prefer_stack (bool, optional):
+            If True, prioritizes stacking (adding new dimension).
+            If False, prioritizes concatenation (along existing dimension).
+            Defaults to False.
+
+            Examples:
+                - prefer_stack=True:  [(3,3), (3,3)] -> stack -> (2,3,3)
+                - prefer_stack=False: [(3,3), (3,3)] -> cat  -> (6,3)
+
+    Returns:
+        Union[torch.Tensor, List[str]]:
+            Combined result. Returns original list if input contains strings.
+    """
     v = value_list[0]
     if isinstance(v, torch.Tensor):
         if v.dim() == 0:  # scala
@@ -75,22 +92,6 @@ def smart_combine(value_list, prefer_stack=False):
         raise TypeError(f"Unsupported type: {type(v)}")
 
     return res
-
-
-# def naive_values_collate(ls_values):
-#     """no pad, assume all data have same length"""
-#     v = ls_values[0]
-#     if isinstance(v, torch.Tensor):
-#         res = torch.stack(ls_values)  # (bz, *)
-#     elif isinstance(v, (float, int)):
-#         res = torch.stack([torch.tensor(val) for val in ls_values], dim=0)  # (bz,)
-#     elif isinstance(v, (np.ndarray, np.generic)):
-#         res = torch.from_numpy(np.stack(ls_values))  # (bz, *)
-#     elif isinstance(v, str):
-#         res = ls_values
-#     else:
-#         raise TypeError(f"type {type(v)}")
-#     return res
 
 
 def collate_dict_samples(batch_list: List[dict]):
@@ -498,14 +499,3 @@ class qDictDataloader(torch.utils.data.DataLoader):
         if collate_fn is None:
             collate_fn = collate_graph_samples if is_graph else collate_dict_samples
         super().__init__(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, **kwargs)
-
-
-# class qBlockDataset(torch.utils.data.Dataset, ABC):
-#     def __init__(self):
-#         super().__init__()
-
-#     def __getitem__(self, index):
-#         return super().__getitem__(index)
-
-#     def __len__(self):
-#         pass
