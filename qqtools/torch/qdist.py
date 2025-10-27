@@ -1,8 +1,9 @@
+import functools
 import os
+from typing import Callable
 
 import torch
 import torch.distributed as dist
-from functools import wraps
 
 
 def is_dist_available_and_initialized():
@@ -59,17 +60,18 @@ def init_distributed_mode(args):
         init_method=args.dist_url,
         world_size=args.world_size,
         rank=args.rank,
+        device_id=args.local_rank,
     )
     torch.distributed.barrier()
 
 
 def all_reduce(value, device, ReduceOp=dist.ReduceOp.SUM):
-    if not torch.is_tensor(value):
-        value = torch.Tensor([value]).to(device, non_blocking=True)
-    if value.device != device:
-        value.device = device
+    is_orig_tensor = torch.is_tensor(value)
+    if not is_orig_tensor:
+        value = torch.Tensor([value])
+    value = value.to(device, non_blocking=True)
     dist.all_reduce(value, ReduceOp, async_op=False)
-    return value.item()
+    return value if is_orig_tensor else value.item()
 
 
 class qBarrier(object):
@@ -103,7 +105,7 @@ def ddpCall(fn, /, *args, **kwargs):
 
 
 def ddp_safe(fn):
-    @wraps(fn)
+    @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         if is_dist_available_and_initialized():
             rank = get_rank()
@@ -116,5 +118,16 @@ def ddp_safe(fn):
             return result
         else:
             return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def rank_zero_only(fn: Callable) -> Callable:
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if dist.get_rank() == 0:
+            return fn(*args, **kwargs)
+        else:
+            return None
 
     return wrapper

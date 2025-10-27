@@ -90,3 +90,5 @@ v1.1.17
     refactor data.qdatalist filename
     refactor add staticmethod collate_dict_samples & graph in qDictDataset for convenience
     fix qimport for matplotlib.pyplot
+v1.1.19
+    feat rank zero only
