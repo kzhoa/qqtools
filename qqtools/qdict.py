@@ -69,8 +69,16 @@ class qDict(dict):
                     self.__setitem__(k, v)
 
             elif isinstance(d, collections.abc.Iterable):
-                _d = dict(d)  # maybe k-v tuple list
-                self.__init__(_d, default_function, allow_notexist, recursive)
+                d = dict(d)  # maybe k-v tuple list
+                for k, v in d.items():
+                    if recursive and isinstance(v, dict):
+                        v = qDict(
+                            v,
+                            default_function=default_function,
+                            allow_notexist=allow_notexist,
+                            recursive=True,
+                        )
+                    self.__setitem__(k, v)
 
         # be compatible with `getattr(qDict, key, defaultVal)`
         self.__dict__["_allow_notexist"] = allow_notexist
