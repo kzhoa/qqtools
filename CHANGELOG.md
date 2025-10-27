@@ -92,3 +92,4 @@ v1.1.17
     fix qimport for matplotlib.pyplot
 v1.1.19
     feat rank zero only
+    fix qdict init for kv tuple list
