@@ -5,12 +5,23 @@ import torch
 
 
 def parse_device(dev: Union[str, int]):
-    """
-    :param dev:
-    :1. cuda
-    :2. cuda:number
-    :3. number
-    :4. cuda:0,1,3,4,5
+    """Parse a device string or integer into a torch.device object.
+
+    Args:
+        dev: Device identifier, which can be one of the following formats:
+            - 'cuda'              # Use default CUDA device (cuda:0)
+            - 'cuda:<number>'     # Use specific CUDA device (e.g., 'cuda:1')
+            - <int>               # Alias for 'cuda:<number>' (e.g., 1 → 'cuda:1')
+            - 'cuda:<i,j,k,...>'  # Use multiple CUDA devices (e.g., 'cuda:0,1,3')
+
+    Returns:
+        torch.device: Parsed device object.
+
+    Examples:
+        >>> parse_device('cuda')     # device(type='cuda', index=0)
+        >>> parse_device('cuda:1')  # device(type='cuda', index=1)
+        >>> parse_device(2)         # device(type='cuda', index=2)
+        >>> parse_device('cuda:0,1,3')  # Multi-device case (implementation-dependent)
     """
     if isinstance(dev, torch.device):
         return dev
