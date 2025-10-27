@@ -22,6 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
+import collections.abc
 from typing import Any, Callable, Iterable, List, Sequence, Union
 
 from .utils import deprecated
@@ -66,6 +67,10 @@ class qDict(dict):
                 if isinstance(d, argparse.Namespace):
                     for k, v in d.__dict__.items():
                         self.__setitem__(k, v)
+                elif isinstance(d, collections.abc.Iterable):
+                    _d = dict(d)  # maybe k-v tuple list
+                    self.__init__(_d, default_function, allow_notexist, recursive)
+
             except Exception:
                 pass
 

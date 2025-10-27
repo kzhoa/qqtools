@@ -5,6 +5,14 @@ from typing import Callable
 import torch
 import torch.distributed as dist
 
+REDUCE_OPS = {
+    "sum": dist.ReduceOp.SUM,
+    "mean": dist.ReduceOp.AVG,
+    "avg": dist.ReduceOp.AVG,
+    "min": dist.ReduceOp.MIN,
+    "max": dist.ReduceOp.MAX,
+}
+
 
 def is_dist_available_and_initialized():
     if not dist.is_available():
@@ -65,12 +73,24 @@ def init_distributed_mode(args):
     torch.distributed.barrier()
 
 
-def all_reduce(value, device, ReduceOp=dist.ReduceOp.SUM):
+def all_reduce(value, device, reduceOp="sum"):
+    """Perform an all-reduce operation across distributed processes.
+
+    Args:
+        value: Input tensor or value to be reduced.
+        device: Target device for the operation (e.g., 'cuda:0' or 'cpu').
+        reduceOp: Reduction operation to apply. Must be one of:
+            - 'sum': Sum of all values (default)
+            - 'mean': Average of all values
+            - 'min': Minimum value
+            - 'max': Maximum value
+    """
+    op = REDUCE_OPS[reduceOp]
     is_orig_tensor = torch.is_tensor(value)
     if not is_orig_tensor:
         value = torch.Tensor([value])
     value = value.to(device, non_blocking=True)
-    dist.all_reduce(value, ReduceOp, async_op=False)
+    dist.all_reduce(value, op, async_op=False)
     return value if is_orig_tensor else value.item()
 
 
@@ -131,3 +151,8 @@ def rank_zero_only(fn: Callable) -> Callable:
             return None
 
     return wrapper
+
+
+@rank_zero_only
+def main_print(*args, **kwargs):
+    print(*args, **kwargs)
