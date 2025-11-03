@@ -1,6 +1,6 @@
 import random
 from collections import Counter
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Sequence
 
 import matplotlib.pyplot as plt
 
@@ -8,6 +8,8 @@ from .qscaladict import qScalaDict
 
 
 class qList(list):
+    """list of basic elements"""
+
     def __gt__(self, other):
         """Greater than: returns a boolean list where each element in the list is greater than the corresponding element in other."""
         if isinstance(other, qList):

@@ -93,3 +93,6 @@ v1.1.17
 v1.1.19
     feat rank zero only
     fix qdict init for kv tuple list
+v1.1.20
+    feat add BatchList class
+    

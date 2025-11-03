@@ -11,6 +11,7 @@ from torch import Tensor
 
 import qqtools as qt
 
+from ..data.qdatalist import qList
 from .qsplit import get_data_splits
 
 
@@ -49,6 +50,16 @@ class qData(qt.qDict):
         seed=1,
     ):
         return get_data_splits(total_num, sizes, ratios, seed)
+
+
+class qBatchList(qList):
+    def to(self, device):
+        """
+        This is a no-operation method that allows qBatchList to be used
+        in pipelines expecting PyTorch's `.to(device)` interface while
+        preserving the list-of-dicts structure without tensor conversion.
+        """
+        return
 
 
 def smart_combine(value_list: List, prefer_stack=False):
@@ -446,12 +457,45 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
         return get_data_splits(total_num=self.__len__(), ratios=ratios, seed=seed)
 
     @staticmethod
-    def collate_dict_samples(self, *args, **kwargs):
+    def collate_dict_samples(*args, **kwargs):
         return collate_dict_samples(*args, **kwargs)
 
     @staticmethod
-    def collate_graph_samples(self, *args, **kwargs):
+    def collate_graph_samples(*args, **kwargs):
         return collate_graph_samples(*args, **kwargs)
+
+    @staticmethod
+    def collate_keep_list_of_dict(batch_list) -> qBatchList:
+        """
+        Custom collate function that preserves list of dictionaries structure.
+
+        qq:
+        In NLP scenarios where each sample is a dictionary (e.g., containing tokens,
+        labels, etc.), this function keeps the original list-of-dicts structure
+        instead of batching into tensors. This enables the model to handle padding
+        and tensor conversion individually for each sample on the model side.
+
+        Example:
+            >>> batch = [{'tokens': ['hello', 'world'], 'labels': [0, 1]},
+                {'tokens': ['test'], 'labels': [1]}]
+            >>> collated = collate_keep_list_of_dict(batch)
+            >>> collated.to(device)  # Compatible with device transfer
+
+        Args:
+            batch_list: List of dictionaries, where each dict represents one sample
+
+        Returns:
+            qList: The input list of dictionaries, unchanged. Compatible with batch_data.to(device) usage。
+        """
+        return qBatchList(batch_list)
+
+    def to_list_dataloader(self, batch_size, **kwargs):
+        return qDictDataloader(
+            dataset=self,
+            batch_size=batch_size,
+            collate_fn=qDictDataset.collate_keep_list_of_dict,
+            **kwargs,
+        )
 
 
 class qDictDataloader(torch.utils.data.DataLoader):

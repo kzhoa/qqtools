@@ -7,7 +7,7 @@ from .qtimer import Timer
 from .data.qdatalist import qDataList
 from .torch.qdataset import qData, qDictDataloader, qDictDataset
 from .torch.qoptim import CompositeOptim, CompositeScheduler
-
+from .torch.nn.donothing import Donothing
 
 # first-class module
 from .torch import nn
