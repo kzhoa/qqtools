@@ -15,10 +15,7 @@ class DoNothing:
         pass
 
 
-class Donothing(DoNothing):
-    """Poka-yoke"""
-
-    pass
+Donothing = DoNothing  # Poka-yoke
 
 
 def donothing(*args, **kwargs):

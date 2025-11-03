@@ -98,7 +98,6 @@ class qDict(dict):
 
     @default_function.setter
     def default_function(self, default_function):
-        print("default_function.setter", default_function)
         if default_function is None:
             del self.__dict__["_default_function"]
         else:

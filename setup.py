@@ -2,7 +2,7 @@ import setuptools
 
 setuptools.setup(
     name="qqtools",
-    version="1.1.19",
+    version="1.1.20",
     author="qq",
     author_email="qq@x1q.cc",
     description="A small tool package for qq",
@@ -19,5 +19,5 @@ setuptools.setup(
     license="MIT",  # SPDX expression
     license_files=["LICENSE*"],
     python_requires=">=3.10",
-    install_requires=["torch>=2.0"],
+    install_requires=["torch>=2.0", "PyYAML>=6.0"],
 )

@@ -2,6 +2,14 @@
 
 A small tool package for qq
 
+# Requirements
+
+- torch>=2.0 for full functionality 
+  - Some components maintain backward compatibility with torch==1.x
+  - Recommended: torch>=2.4
+- pyyaml>=6.0
+  - We recommend using YAML format for all configuration files.
+This provides a unified approach to drive and manage all workflow operations.
 
 # Data Format Support
 
@@ -15,6 +23,7 @@ qListData : List[dict]. A list of dicts.
 Torch-related data formats
 ```bash
 qData
+qBatchList
 ```
 
 
