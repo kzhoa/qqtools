@@ -19,5 +19,5 @@ setuptools.setup(
     license="MIT",  # SPDX expression
     license_files=["LICENSE*"],
     python_requires=">=3.10",
-    install_requires=["torch>=2.0", "PyYAML>=6.0"],
+    install_requires=["torch>=2.0", "PyYAML>=6.0", "scikit-learn"],
 )

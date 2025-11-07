@@ -95,4 +95,5 @@ v1.1.19
     fix qdict init for kv tuple list
 v1.1.20
     feat add BatchList class
-    
+v1.1.21
+    feat add fn binary_metrics for a set of useful indicators 
