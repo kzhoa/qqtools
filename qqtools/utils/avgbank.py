@@ -1,22 +1,23 @@
 import warnings
 
-from ..torch import qdist
+import qqtools as qt
+from qqtools import qdist
 
 
 class AverageMeter:
-    """Computes and stores the average and current value"""
+    """Computes and stores the average value"""
 
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self.val = 0
         self.avg = 0
         self.sum = 0
         self.count = 0
 
     def update(self, val, n=1):
-        self.val = val
+        if n <= 0:
+            return
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
@@ -28,9 +29,10 @@ class AverageMeter:
             return self.avg
 
     def ddp_average(self):
-        ddp_sum = qdist.all_reduce(self.sum, "cpu")
-        ddp_count = qdist.all_reduce(self.count, "cpu")
-        ddp_avg = ddp_sum / ddp_count
+        device = qt.parse_device(qdist.get_rank())
+        ddp_sum = qdist.all_reduce(self.sum, device, "mean")
+        ddp_count = qdist.all_reduce(self.count, device, "mean")
+        ddp_avg = ddp_sum / ddp_count if ddp_count > 0 else 0
         return ddp_avg
 
 
@@ -80,3 +82,11 @@ class AvgBank(object):
 
     def to_dict(self, ddp) -> dict:
         return self.gather_average(ddp)
+
+    def toString(self) -> str:
+        """For compatibility"""
+        return self.to_string()
+
+    def toDict(self, ddp) -> dict:
+        """For compatibility"""
+        return self.to_dict(ddp)
