@@ -60,6 +60,9 @@ class qList(list):
         else:
             raise TypeError("Comparison not supported between instances of 'MyList' and '{}'".format(type(other)))
 
+    def to_list(self):
+        return list(self)
+
 
 class qDataList:
     """
@@ -163,7 +166,7 @@ class qDataList:
         return shuffled_list
 
     def plot_counts(self, key):
-        cnt_dict = self.counts()
+        cnt_dict = self.counts(key)
         names = list(cnt_dict.keys())
         counts = list(cnt_dict.values())
         plt.bar(names, counts)
@@ -201,12 +204,13 @@ class qDataList:
         Returns:
         - qList: A new qList containing the selected elements.
         """
-        if all(isinstance(i, int) for i in indices):
-            # If all indices are integers, select by index
-            return qDataList([self.data_list[i] for i in indices])
-        elif all(isinstance(i, bool) for i in indices):
+
+        if all(isinstance(i, bool) for i in indices):
             # If all indices are booleans, select by boolean mask
             return qDataList([item for item, include in zip(self.data_list, indices) if include])
+        elif all(isinstance(i, int) for i in indices):
+            # If all indices are integers, select by index
+            return qDataList([self.data_list[i] for i in indices])
         else:
             raise ValueError("Indices must be either all integers or all booleans.")
 
@@ -215,3 +219,17 @@ class qDataList:
 
     def __iter__(self):
         return iter(self.data_list)
+
+    def __repr__(self):
+        return f"qDataList({len(self.data_list)})"
+
+    def __len__(self):
+        return len(self.data_list)
+
+    @property
+    def length(self):
+        return len(self.data_list)
+
+    @classmethod
+    def from_list(cls, scala_list, key):
+        return cls({key: v for v in scala_list})
