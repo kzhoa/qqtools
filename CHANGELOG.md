@@ -97,3 +97,4 @@ v1.1.20
     feat add BatchList class
 v1.1.21
     feat add fn binary_metrics for a set of useful indicators 
+    fix qDataList check bool before int

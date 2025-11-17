@@ -20,7 +20,7 @@ def scatter(
     index: Tensor,
     dim: int,
     dim_size: Optional[int] = None,
-    reduce: str = "sum",
+    reduce: str = "sum",  # or 'mean'
 ) -> Tensor:
     if dim < 0:
         dim = torch.add(ref.dim(), dim)
@@ -77,3 +77,19 @@ def scatter_mean(
     dim_size: Optional[int] = None,
 ):
     return scatter(ref, index, dim, dim_size, reduce="mean")
+
+
+def softmax(
+    src: torch.Tensor,
+    index: torch.Tensor,
+    dim: int = 0,
+    dim_size: Optional[int] = None,
+) -> torch.Tensor:
+    if dim_size is None:
+        dim_size = torch.add(int(torch.max(index)), 1)
+    src_max = scatter(src.detach(), index, dim, dim_size=dim_size, reduce="max")
+    out = src - src_max.index_select(dim, index)
+    out = torch.exp(out)
+    out_sum = scatter(out, index, dim, dim_size=dim_size, reduce="sum") + 1e-9
+    out_sum = out_sum.index_select(dim, index)
+    return out / out_sum
