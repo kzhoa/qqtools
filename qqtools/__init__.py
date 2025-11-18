@@ -1,5 +1,5 @@
 # isort:skip_file
-
+from .version import __version__
 
 # first-class class
 from .qdict import qDict

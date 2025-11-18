@@ -1,7 +1,6 @@
 import warnings
 
 import qqtools as qt
-from qqtools import qdist
 
 
 class AverageMeter:
@@ -29,9 +28,9 @@ class AverageMeter:
             return self.avg
 
     def ddp_average(self):
-        device = qt.parse_device(qdist.get_rank())
-        ddp_sum = qdist.all_reduce(self.sum, device, "mean")
-        ddp_count = qdist.all_reduce(self.count, device, "mean")
+        device = qt.parse_device(qt.qdist.get_rank())
+        ddp_sum = qt.qdist.all_reduce(self.sum, device, "mean")
+        ddp_count = qt.qdist.all_reduce(self.count, device, "mean")
         ddp_avg = ddp_sum / ddp_count if ddp_count > 0 else 0
         return ddp_avg
 
