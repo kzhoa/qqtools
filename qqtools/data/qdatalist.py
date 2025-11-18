@@ -18,7 +18,7 @@ class qList(list):
         elif isinstance(other, (int, float)):  # If comparing with a scalar
             return [a > other for a in self]
         else:
-            raise TypeError("Comparison not supported between instances of 'MyList' and '{}'".format(type(other)))
+            raise TypeError("Comparison not supported between instances of 'qList' and '{}'".format(type(other)))
 
     def __lt__(self, other):
         """Less than: returns a boolean list where each element in the list is less than the corresponding element in other."""
@@ -28,7 +28,7 @@ class qList(list):
         elif isinstance(other, (int, float)):  # If comparing with a scalar
             return [a < other for a in self]
         else:
-            raise TypeError("Comparison not supported between instances of 'MyList' and '{}'".format(type(other)))
+            raise TypeError("Comparison not supported between instances of 'qList' and '{}'".format(type(other)))
 
     def __eq__(self, other):
         """Equal to: returns a boolean list where each element in the list is equal to the corresponding element in other."""
@@ -38,7 +38,7 @@ class qList(list):
         elif isinstance(other, (int, float)):  # If comparing with a scalar
             return [a == other for a in self]
         else:
-            raise TypeError("Comparison not supported between instances of 'MyList' and '{}'".format(type(other)))
+            raise TypeError("Comparison not supported between instances of 'qList' and '{}'".format(type(other)))
 
     def __ge__(self, other):
         """Greater than or equal to: returns a boolean list where each element in the list is greater than or equal to the corresponding element in other."""
@@ -48,7 +48,7 @@ class qList(list):
         elif isinstance(other, (int, float)):  # If comparing with a scalar
             return [a >= other for a in self]
         else:
-            raise TypeError("Comparison not supported between instances of 'MyList' and '{}'".format(type(other)))
+            raise TypeError("Comparison not supported between instances of 'qList' and '{}'".format(type(other)))
 
     def __le__(self, other):
         """Less than or equal to: returns a boolean list where each element in the list is less than or equal to the corresponding element in other."""
@@ -58,7 +58,16 @@ class qList(list):
         elif isinstance(other, (int, float)):  # If comparing with a scalar
             return [a <= other for a in self]
         else:
-            raise TypeError("Comparison not supported between instances of 'MyList' and '{}'".format(type(other)))
+            raise TypeError("Comparison not supported between instances of 'qList' and '{}'".format(type(other)))
+
+    def __ne__(self, other):
+        if isinstance(other, qList):
+            # Compare each element in self with the corresponding element in other
+            return [a != b for a, b in zip(self, other)]
+        elif isinstance(other, (int, float)):  # If comparing with a scalar
+            return [a != other for a in self]
+        else:
+            raise TypeError("Comparison not supported between instances of 'qList' and '{}'".format(type(other)))
 
     def to_list(self):
         return list(self)
@@ -204,11 +213,11 @@ class qDataList:
         Returns:
         - qList: A new qList containing the selected elements.
         """
-
-        if all(isinstance(i, bool) for i in indices):
+        v = indices[0]
+        if isinstance(v, bool):
             # If all indices are booleans, select by boolean mask
             return qDataList([item for item, include in zip(self.data_list, indices) if include])
-        elif all(isinstance(i, int) for i in indices):
+        elif isinstance(v, int):
             # If all indices are integers, select by index
             return qDataList([self.data_list[i] for i in indices])
         else:
@@ -225,6 +234,9 @@ class qDataList:
 
     def __len__(self):
         return len(self.data_list)
+
+    def to_list(self):
+        return list(self.data_list)
 
     @property
     def length(self):
