@@ -98,3 +98,6 @@ v1.1.20
 v1.1.21
     feat add fn binary_metrics for a set of useful indicators 
     fix qDataList check bool before int
+v1.1.22
+    feat to device support for qData, automatically adapt single/double precision
+    doc qDataset init 
