@@ -31,7 +31,7 @@ class qData(qt.qDict):
                 "  qData(key=value)      "
             )
         d = d if d is not None else kwargs
-        super().__init__(d, allow_notexist=False)
+        super().__init__(d, allow_notexist=False, recursive=False)
 
     def to(self, target):
         """inplace operation"""
