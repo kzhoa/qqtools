@@ -42,7 +42,7 @@ def is_main_process():
     return get_rank() == 0
 
 
-def init_distributed_mode(args):
+def init_distributed_mode(args, verbose=True):
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ["WORLD_SIZE"])
@@ -51,7 +51,8 @@ def init_distributed_mode(args):
         args.rank = int(os.environ["SLURM_PROCID"])
         args.local_rank = args.rank % torch.cuda.device_count()
     else:
-        print("Not using distributed mode")
+        if verbose:
+            print(f"{ '*' * 40}\nNot using distributed mode\n{'*' * 40}")
         args.distributed = False
         args.rank = 0
         args.local_rank = 0

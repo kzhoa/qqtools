@@ -1,6 +1,12 @@
 import warnings
 from functools import wraps
-from typing import Optional, Callable
+from typing import Callable, Optional
+
+
+class QDataWarning(UserWarning):
+    """qData package specific warnings"""
+
+    pass
 
 
 def deprecated(
@@ -15,7 +21,7 @@ def deprecated(
         if reason:
             message += f".  {reason}"
         if replacement:
-            message += f", use `{replacement}` instead."
+            message += f". Use `{replacement}` instead."
 
         @wraps(obj)
         def wrapper(*args, **kwargs):

@@ -1,4 +1,5 @@
 import copy
+import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from pathlib import Path
@@ -12,10 +13,12 @@ from torch import Tensor
 import qqtools as qt
 
 from ..data.qdatalist import qList
+from ..utils.warning import QDataWarning
 from .qsplit import get_data_splits
 
 
 class qData(qt.qDict):
+    """A simple data container adheres to torch dataloader"""
 
     def __init__(self, d=None, /, **kwargs):
         if d is not None and kwargs:
@@ -30,11 +33,58 @@ class qData(qt.qDict):
         d = d if d is not None else kwargs
         super().__init__(d, allow_notexist=False)
 
-    def to(self, device):
+    def to(self, target):
+        """inplace operation"""
+        if isinstance(target, torch.dtype):
+            for k, v in self.items():
+                if not isinstance(v, torch.Tensor):
+                    continue
+                if target.is_floating_point and (not v.dtype.is_floating_point):
+                    warnings.warn(
+                        f"[qData] Converting tensor '{k}' ({v.dtype}) to {target}. "
+                        f"Integer-to-float conversion may lose precision. "
+                        f"Use qData.float()/double() to only convert floating-point tensors.",
+                        QDataWarning,
+                    )
+                self[k] = v.to(target)
+        else:
+            # assume the device
+            for k, v in self.items():
+                if isinstance(v, torch.Tensor):
+                    self[k] = v.to(target)
+        return self
+
+    def to_dtype(self, target):
+        """
+        safely handle floating tensors
+        """
+        assert isinstance(target, torch.dtype), f"expect torch.dtype but got {type(target)}"
+        if target.is_floating_point:
+            self._convert_floating_tensors(target=target)
+
         for k, v in self.items():
             if isinstance(v, torch.Tensor):
-                self[k] = v.to(device)
-        return self
+                if target.is_floating_point and (not v.dtype.is_floating_point):
+                    warnings.warn(
+                        f"[qData] Converting tensor '{k}' ({v.dtype}) to {target}. "
+                        f"Integer-to-float conversion may lose precision. "
+                        f"Use qData.float()/double() to only convert floating-point tensors.",
+                        QDataWarning,
+                    )
+                self[k] = v.to(target)
+
+    def _convert_floating_tensors(self, target: torch.dtype):
+        for k, v in self.items():
+            if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+                self[k] = v.to(target)
+
+    def float(self):
+        self._convert_floating_tensors(torch.float32)
+
+    def double(
+        self,
+    ):
+        self._convert_floating_tensors(torch.float64)
 
     def __copy__(self):
         """return new instance"""
@@ -98,6 +148,8 @@ def smart_combine(value_list: List, prefer_stack=False):
             val = np.concatenate(value_list, dim=0)
         res = torch.from_numpy(val)
     elif isinstance(v, str):
+        res = value_list
+    elif isinstance(v, (list, tuple)):
         res = value_list
     else:
         raise TypeError(f"Unsupported type: {type(v)}")

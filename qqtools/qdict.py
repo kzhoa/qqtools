@@ -25,7 +25,7 @@ SOFTWARE.
 import collections.abc
 from typing import Any, Callable, Iterable, List, Sequence, Union
 
-from .utils import deprecated
+from .utils.warning import deprecated
 
 
 class qDict(dict):
