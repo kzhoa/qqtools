@@ -1,0 +1,45 @@
+[project]
+name = "qqtools"
+version = "1.1.24"
+description = "A small tool package for qq"
+readme = "README.md"
+readme-content-type = "text/markdown"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "qq", email = "qq@x1q.cc"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "torch",
+    "PyYAML",
+    "scikit-learn",
+    "rich",
+    "matplotlib",
+    "numpy",
+    "pandas"
+]
+
+# === build settings ===
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+
+# === dev settings ===
+[tool.black]
+line-length = 120
+
+[tool.isort]
+profile = "black"
+line_length = 120
+
+[tool.flake8]
+max-line-length = 120
+ignore = "F401,E402,E501"

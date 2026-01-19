@@ -35,5 +35,5 @@ from .torch.qscatter import scatter, softmax
 
 # type & check
 from .utils.qtyping import Bool, Float,Long, Float16, Float32, Float64, Int32, Int64, Float32Array, Float64Array, BoolArray, Int32Array, Int64Array # fmt: skip
-from .utils.qtypecheck import ensure_scala, ensure_numpy, str2number, is_number
+from .utils.qtypecheck import ensure_scala, ensure_numpy, str2number, is_number, is_inf
 from .utils.check import check_values_allowed, is_alias_exists

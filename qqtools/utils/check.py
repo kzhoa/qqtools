@@ -1,8 +1,7 @@
 """
-qq:
-For functions here, must obey:
-- those starts with "check_", raise Error if not satisfied;
-- those starts with "is_", return False if not satisfied;
+Naming/behavior convention:
+- `is_*()` functions: Return False on failure.
+- `ensure_*()` functions: Raise an exception on failure.
 """
 
 from typing import Iterable
