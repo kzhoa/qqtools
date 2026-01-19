@@ -1,0 +1,2 @@
+recursive-include qqtools *
+recursive-exclude tests *

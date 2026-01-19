@@ -101,3 +101,5 @@ v1.1.21
 v1.1.22
     feat to device support for qData, automatically adapt single/double precision
     doc qDataset init 
+v1.1.25
+    chore switch to pyproject.toml build system
