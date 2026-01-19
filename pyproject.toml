@@ -1,20 +1,12 @@
 [project]
 name = "qqtools"
-version = "1.1.24"
 description = "A small tool package for qq"
+dynamic = ["version"]
 readme = "README.md"
-readme-content-type = "text/markdown"
-requires-python = ">=3.10"
-license = {text = "MIT"}
-authors = [
-    {name = "qq", email = "qq@x1q.cc"}
-]
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
-    "Intended Audience :: Developers",
-    "Topic :: Software Development :: Libraries :: Python Modules",
-]
+license = "MIT"
+license-files = ["LICENSE*"]
+requires-python = ">=3.11"
+authors = [{ name = "qq", email = "qq@x1q.cc" }]
 dependencies = [
     "torch",
     "PyYAML",
@@ -22,15 +14,28 @@ dependencies = [
     "rich",
     "matplotlib",
     "numpy",
-    "pandas"
+    "pandas",
 ]
+
+[project.urls]
+Homepage = "https://github.com/kzhoa/qqtools"
+Repository = "https://github.com/kzhoa/qqtools.git"
+
 
 # === build settings ===
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=64.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qqtools*"]
+exclude = ["tests*"]
+
+
+[tool.setuptools.dynamic]
+version = { attr = "qqtools.version.__version__" }
 
 # === dev settings ===
 [tool.black]
