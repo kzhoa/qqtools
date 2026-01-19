@@ -1,3 +1,10 @@
+"""
+Naming/behavior convention:
+- `is_*()` functions: Return False on failure.
+- `ensure_*()` functions: Raise an exception on failure.
+"""
+
+import math
 from typing import List
 
 import numpy as np
@@ -19,6 +26,26 @@ def is_number(inpt) -> bool:
             return integ.isnumeric() and frac.isnumeric()
         else:
             return inpt.isnumeric()
+
+    return False
+
+
+def is_inf(x) -> bool:
+
+    if isinstance(x, torch.Tensor):
+        return torch.isinf(x).any().item()  # 返回 bool
+
+    elif isinstance(x, (int, float)):
+        return math.isinf(x)
+
+    elif isinstance(x, (list, tuple)):
+        return any(is_inf(item) for item in x)
+
+    elif isinstance(x, np.ndarray):
+        return np.isinf(x).any()
+
+    else:
+        raise TypeError(f"Unsupported type: {type(x)}")
 
 
 def str2number(inpt):

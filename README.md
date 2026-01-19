@@ -1,4 +1,12 @@
+
+
+![qqtools-banner](static/banner_1920.png)
+
+
+
 # qqtools
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/qqtools?period=total&units=ABBREVIATION&left_color=GREY&right_color=BRIGHTGREEN&left_text=PyPI+Downloads)](https://pepy.tech/projects/qqtools)  ![Python version](https://img.shields.io/badge/python->=3.11-blue)  
+
 
 A small tool package for qq
 
@@ -66,3 +74,11 @@ for epoch in range(100):
         optimizer.step()
     print(f"{epoch} {loss.item():4.6f}")
 ```
+
+
+# Individual Modules
+
+The following modules are consumers of the core functionality provided by this package. Each is designed to be independent, allowing for sole import.
+
+- chem
+- pipeline

@@ -317,6 +317,8 @@ def ensureSymbol(inpt_elements):
                 raise ValueError(f"Convert Error: element {element} is not a single symbol or integer")
         elif isinstance(element, int):
             res = mp_index2symbol[str(element)]
+        elif isinstance(element, np.generic):
+            res = mp_index2symbol[str(element.item())]
         else:
             raise ValueError(f"Convert Error: element {element} is not a single symbol or integer")
         ret.append(res)

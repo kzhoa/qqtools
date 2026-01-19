@@ -146,7 +146,7 @@ def ddp_safe(fn):
 def rank_zero_only(fn: Callable) -> Callable:
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        if dist.get_rank() == 0:
+        if get_rank() == 0:
             return fn(*args, **kwargs)
         else:
             return None
