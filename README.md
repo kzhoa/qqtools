@@ -1,4 +1,4 @@
-![qqtools-banner](static/banner_1920.png)
+![qqtools-banner](static/banner_1920.jpg)
 
 # qqtools
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/qqtools?period=total&units=ABBREVIATION&left_color=GREY&right_color=BRIGHTGREEN&left_text=PyPI+Downloads)](https://pepy.tech/projects/qqtools)  ![Python version](https://img.shields.io/badge/python->=3.11-blue)  
