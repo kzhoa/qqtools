@@ -2,7 +2,7 @@ import argparse
 
 import pytest
 
-from src.qqtools.qdict import qDict
+from qqtools.qdict import qDict
 
 # -------------------------------------------------------------------
 # 1. 初始化与基本访问测试 (Init & Basic Access)
