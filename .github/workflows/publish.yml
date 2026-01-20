@@ -39,16 +39,17 @@ jobs:
         run: python -m build --sdist --wheel
 
       - name: Release
-        # uses: softprops/action-gh-release@v2
-        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631
+        uses: softprops/action-gh-release@v2
+        # uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631
         if: github.ref_type == 'tag'
         with:
+          draft: false
+          generate_release_notes: true
           token: ${{ secrets.ACCESS_TOKEN }}
           body: |
             ## Release Notes for ${{ github.ref_name }}
 
             - This is an automatically generated release note.
-            - You can customize this section in the GitHub Actions workflow.
             - Version: ${{ github.ref_name }}
           files: |
             ./dist/**
