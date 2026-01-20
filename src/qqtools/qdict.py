@@ -202,7 +202,9 @@ class qDict(dict):
         """Accept keys as list.
         v can be either a list or a callable function,
         if a function is given, v() will be used as the default value."""
-        assert len(k) == len(v)
+        if isinstance(v, Iterable):
+            assert len(k) == len(v)
+
         d_ = cls()
         if callable(v):
             for k_ in k:

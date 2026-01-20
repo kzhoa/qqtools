@@ -5,3 +5,6 @@ dist/
 dist/**
 .pypirc
 *.egg-info
+.coverage
+.pytest_cache
+.tox

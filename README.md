@@ -1,8 +1,4 @@
-
-
 ![qqtools-banner](static/banner_1920.png)
-
-
 
 # qqtools
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/qqtools?period=total&units=ABBREVIATION&left_color=GREY&right_color=BRIGHTGREEN&left_text=PyPI+Downloads)](https://pepy.tech/projects/qqtools)  ![Python version](https://img.shields.io/badge/python->=3.11-blue)  
@@ -17,7 +13,19 @@ A small tool package for qq
   - Recommended: torch>=2.4
 - pyyaml>=6.0
   - We recommend using YAML format for all configuration files.
+
 This provides a unified approach to drive and manage all workflow operations.
+
+For simplicity install 
+```bash
+pip install qqtools
+```
+
+For full support, run:
+```bash
+pip install qqtools[full]
+```
+
 
 # Data Format Support
 
@@ -82,3 +90,11 @@ The following modules are consumers of the core functionality provided by this p
 
 - chem
 - pipeline
+
+
+
+# Test
+
+```bash
+tox
+```

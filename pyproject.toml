@@ -6,16 +6,16 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE*"]
 requires-python = ">=3.11"
-authors = [{ name = "qq", email = "qq@x1q.cc" }]
-dependencies = [
-    "torch",
-    "PyYAML",
-    "scikit-learn",
-    "rich",
-    "matplotlib",
-    "numpy",
-    "pandas",
-]
+authors = [{ name = "qq" }]
+dependencies = ["torch", "PyYAML", "matplotlib", "pandas", "scipy"]
+
+# qq:
+# scipy requires: numpy
+
+[project.optional-dependencies]
+full = ["rich", "scikit-learn"]
+dev = ["pytest", "black", "isort", "flake8"]
+
 
 [project.urls]
 Homepage = "https://github.com/kzhoa/qqtools"
@@ -29,7 +29,7 @@ build-backend = "setuptools.build_meta"
 
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["qqtools*"]
 exclude = ["tests*"]
 
