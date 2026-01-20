@@ -10,7 +10,7 @@
 <div style="
   position: relative;
   width: 100%;
-  padding-top: 559px; 
+  padding-top: 66.66%; 
   margin-bottom: 20px;
   background: #f0f0f0 url('static/banner_960.jpg') center/contain no-repeat;
   background-size: cover;
