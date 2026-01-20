@@ -1,4 +1,31 @@
-![qqtools-banner](static/banner_1920.jpg)
+
+
+<!-- <div>
+  <img src="static/banner_1960.jpg" width="400" height="300" alt="">
+</div> -->
+<!-- <pre style="margin: 0; padding: 0; height: 552px; visibility: hidden;"></pre> -->
+
+<!-- ![qqtools-banner](static/banner_960.jpg) -->
+
+<div style="
+  position: relative;
+  width: 100%;
+  padding-top: 559px; 
+  margin-bottom: 20px;
+  background: #f0f0f0 url('static/banner_960.jpg') center/contain no-repeat;
+  background-size: cover;
+">
+  <img src="static/banner_960.jpg" 
+       alt="" 
+       style="
+         position: absolute;
+         top: 0;
+         left: 0;
+         width: 100%;
+         height: 100%;
+         opacity: 0;
+       ">
+</div>
 
 # qqtools
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/qqtools?period=total&units=ABBREVIATION&left_color=GREY&right_color=BRIGHTGREEN&left_text=PyPI+Downloads)](https://pepy.tech/projects/qqtools)  ![Python version](https://img.shields.io/badge/python->=3.11-blue)  
