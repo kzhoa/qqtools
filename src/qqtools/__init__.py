@@ -15,6 +15,7 @@ from .torch import qdist
 from .torch import qcheckpoint, qscatter, qsparse
 from .torch import qcontextprovider
 from . import data
+from .plugins import qpipeline
 
 # first-class funciton
 from .qimport import import_common
@@ -37,3 +38,6 @@ from .torch.qscatter import scatter, softmax
 from .utils.qtyping import Bool, Float,Long, Float16, Float32, Float64, Int32, Int64, Float32Array, Float64Array, BoolArray, Int32Array, Int64Array # fmt: skip
 from .utils.qtypecheck import ensure_scala, ensure_numpy, str2number, is_number, is_inf
 from .utils.check import check_values_allowed, is_alias_exists
+
+# attr
+from .utils.attr import hasattr_safe, getmultiattr, is_override

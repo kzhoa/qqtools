@@ -103,3 +103,6 @@ v1.1.22
     doc qDataset init 
 v1.1.25
     chore switch to pyproject.toml build system
+v1.1.26
+    feat add attr-related functions is_override
+    feat under test: add plugin qpipeline

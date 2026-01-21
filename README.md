@@ -115,8 +115,10 @@ for epoch in range(100):
 
 The following modules are consumers of the core functionality provided by this package. Each is designed to be independent, allowing for sole import.
 
-- chem
-- pipeline
+under `plugins/`
+
+- qchem
+- qpipeline
 
 
 
