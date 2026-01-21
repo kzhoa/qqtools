@@ -4,7 +4,7 @@ Naming/behavior convention:
 - `ensure_*()` functions: Raise an exception on failure.
 """
 
-from typing import Iterable
+from typing import Iterable, Optional
 
 
 def check_values_allowed(givens: Iterable, allows: Iterable) -> bool:
