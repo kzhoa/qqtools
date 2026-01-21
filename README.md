@@ -31,7 +31,10 @@
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/qqtools?period=total&units=ABBREVIATION&left_color=GREY&right_color=BRIGHTGREEN&left_text=PyPI+Downloads)](https://pepy.tech/projects/qqtools)  ![Python version](https://img.shields.io/badge/python->=3.11-blue)  
 
 
-A small tool package for qq
+A lightweight utility library crafted and used daily by qq to streamline PyTorch workflows. 
+Designed to simplify ML development with utilities for data handling, model training, and experiment management.
+
+
 
 # Requirements
 
