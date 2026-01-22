@@ -106,3 +106,5 @@ v1.1.25
 v1.1.26
     feat add attr-related functions is_override
     feat under test: add plugin qpipeline
+v1.1.27
+    feat add plugin qchem

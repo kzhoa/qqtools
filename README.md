@@ -34,7 +34,7 @@
 A lightweight library, crafted and battle-tested daily by *qq*, to make PyTorch life a little easier. 
 
 I’ve gathered the repetitive parts of my day-to-day work and refined them into this slim utility library.
-It serves as my personal toolkit for handling data, training, and experiments, designed to keep projects moving fast with cleaner code and smoother workflows(and hopefully yours too!).
+It serves as my personal toolkit for handling data, training, and experiments, designed to keep projects moving fast with cleaner code and smoother workflows (and hopefully yours too!).
 
 >Built for me, shared for you. 
 
@@ -46,7 +46,7 @@ It serves as my personal toolkit for handling data, training, and experiments, d
   - Some components maintain backward compatibility with torch==1.x
   - Recommended: torch>=2.4
 - pyyaml>=6.0
-  - We recommend using YAML format for all configuration files.
+  - Recommended to use YAML format for all configuration files.
 
 This provides a unified approach to drive and manage all workflow operations.
 
