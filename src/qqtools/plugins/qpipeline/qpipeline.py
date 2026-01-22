@@ -74,10 +74,6 @@ class qPipeline:
         self.task = task
         self.model = model
 
-        # convention
-        if "pipe_middle_ware" in task._opt_impl:
-            task.pipe_middle_ware(self)
-
         if train:
             self.init_for_train()
 
@@ -93,6 +89,10 @@ class qPipeline:
             self.task = task
         else:
             self.task = self.prepare_task(args)
+
+        # convention
+        if task is not None and "pipe_middle_ware" in task._opt_impl:
+            task.pipe_middle_ware(self)
 
         if model is None:
             model = self.prepare_model(args)
