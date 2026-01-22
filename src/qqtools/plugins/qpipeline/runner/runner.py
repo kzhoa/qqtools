@@ -251,7 +251,7 @@ class EpochAgent(object):
 
             # hook metric after loss
             # maybe we need to write down some loss value
-            if hasattr(task, "extra_batch_metric"):
+            if "extra_batch_metric" in task._opt_impl:
                 extra_metrics = task.extra_batch_metric(out, batch_data, losses, model, epoch_cache)  # convention
                 metrics.update(extra_metrics)
 
