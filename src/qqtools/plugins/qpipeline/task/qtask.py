@@ -2,10 +2,11 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-import qqtools as qt
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
+
+import qqtools as qt
 
 __all__ = ["qTaskBase", "PotentialTaskBase"]
 
@@ -14,6 +15,8 @@ OPTIONAL_METHODS = [
     "get_loss_fn",
     "extra_batch_metric",
     "epoch_metric",
+    "pipe_middle_ware",
+    "to",
     # === lifetime hook ===
     "onEpochStart",
     "onEpochEnd",

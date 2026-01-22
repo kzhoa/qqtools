@@ -4,9 +4,10 @@ from abc import abstractmethod
 from pathlib import Path
 from typing import Optional
 
-import qqtools as qt
 import torch
 import yaml
+
+import qqtools as qt
 
 from . import entry_utils
 from .entry_utils.qema import qEMA
@@ -74,7 +75,7 @@ class qPipeline:
         self.model = model
 
         # convention
-        if hasattr(task, "pipe_middle_ware"):
+        if "pipe_middle_ware" in task._opt_impl:
             task.pipe_middle_ware(self)
 
         if train:
@@ -120,7 +121,7 @@ class qPipeline:
             main_print(f"model with DDP already wrapped on {next(model.parameters()).device}")
 
         # convention: task device check
-        if hasattr(self.task, "to"):
+        if "to" in self.task._opt_impl:
             self.task.to(args.device)
 
         # train-only
