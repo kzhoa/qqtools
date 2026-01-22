@@ -1,1 +1,1 @@
-from .qhyperconnect import qhyperconnect
+from .qhc import qhyperconnect
