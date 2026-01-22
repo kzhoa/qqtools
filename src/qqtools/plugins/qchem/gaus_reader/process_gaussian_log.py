@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-高斯Log文件处理器
-从高斯log文件中提取关键信息并保存为JSON格式
+Gaussian Log File Processor
+Extract key information from Gaussian log files and save as JSON format
 """
 
 import argparse
@@ -13,21 +13,14 @@ from pathlib import Path
 
 import numpy as np
 
-file_dir = Path(__file__).resolve().parent
-sys.path.insert(0, str(file_dir))
+from .gaus_reader import create_g16_reader
 
-# 导入您的模块
-try:
-    from gaus_reader import create_g16_reader
-except ImportError as e:
-    print("错误：无法从 gaus_reader 模块导入 create_g16_reader。请确保gaus_reader.py在Python路径中。")
-    print(e)
-    sys.exit(1)
+__all__ = ["process_gaussian_log"]
 
 
 def convert_numpy_types(obj):
     """
-    递归地将numpy数据类型转换为Python原生类型，使其可JSON序列化
+    Recursively convert numpy data types to native Python types for JSON serialization
     """
     if isinstance(obj, np.ndarray):
         return obj.tolist()
@@ -53,93 +46,96 @@ def convert_numpy_types(obj):
 
 def process_gaussian_log(input_file, output_file=None):
     """
-    处理高斯log文件并提取信息
+    Process Gaussian log file and extract information
 
     Args:
-        input_file (str): 输入的log文件路径
-        output_file (str, optional): 输出的JSON文件路径
+        input_file (str): Path to input log file
+        output_file (str, optional): Path to output JSON file
 
     Returns:
-        dict: 提取的结果数据
+        dict: Extracted result data
     """
 
-    # 验证输入文件
+    # Validate input file
     input_path = Path(input_file)
     if not input_path.exists():
-        raise FileNotFoundError(f"输入文件不存在: {input_file}")
+        raise FileNotFoundError(f"Input file does not exist: {input_file}")
 
     if not input_path.suffix.lower() in [".log", ".out"]:
-        print(f"警告：输入文件扩展名不是.log或.out，但仍将尝试处理: {input_file}")
+        print(f"Warning: Input file extension is not .log or .out, but will attempt to process anyway: {input_file}")
 
-    print(f"正在处理文件: {input_file}")
+    print(f"Processing file: {input_file}")
 
-    # 创建读取器并处理文件
+    # Create reader and process file
     try:
         reader = create_g16_reader(False)
         results = reader.read_file(str(input_path))
 
         results = convert_numpy_types(results)
-        print(f"成功提取 {len(results)} 个数据项")
+        print(f"Successfully extracted {len(results)} data items")
 
         # for k, v in results.items():
         #     print(k, " ", v)
 
     except Exception as e:
-        print(f"处理文件时出错: {e}")
+        print(f"Error processing file: {e}")
         traceback.print_exc()
 
-    # 确定输出文件路径
+    # Determine output file path
     if output_file is None:
-        # 自动生成输出文件名（与输入文件同名，扩展名为.json）
+        # Auto-generate output filename (same as input file with .json extension)
         output_path = input_path.parent / (input_path.stem + ".json")
-        print(f"未指定输出文件，将保存到: {output_path}")
+        print(f"No output file specified, will save to: {output_path}")
     else:
         output_path = Path(output_file)
-        # 确保输出目录存在
+        # Ensure output directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
-        print(f"结果已保存到: {output_path}")
-        print(f"文件大小: {output_path.stat().st_size} bytes")
+        print(f"Results saved to: {output_path}")
+        print(f"File size: {output_path.stat().st_size} bytes")
 
     except Exception as e:
-        print(f"保存结果时出错")
+        print(f"Error saving results")
         raise e
 
     return results
 
 
 def main():
-    """主函数"""
+    """Main function"""
     parser = argparse.ArgumentParser(
-        description="处理高斯log文件并提取关键信息为JSON格式",
+        description="Process Gaussian log files and extract key information as JSON format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例用法:
+Examples:
   %(prog)s calculation.log
   %(prog)s calculation.log results.json
   %(prog)s /path/to/calculation.log /output/path/results.json
         """,
     )
 
-    parser.add_argument("input_file", help="输入的高斯log文件路径")
+    parser.add_argument("input_file", help="Path to input Gaussian log file")
     parser.add_argument(
-        "output_file", nargs="?", default=None, help="输出的JSON文件路径（可选，默认生成同名.json文件）"
+        "output_file",
+        nargs="?",
+        default=None,
+        help="Path to output JSON file (optional, defaults to same name with .json extension)",
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="详细输出模式")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output mode")
 
     args = parser.parse_args()
 
     try:
-        # 处理文件
+        # Process file
         results = process_gaussian_log(args.input_file, args.output_file)
-        print("\n处理完成！")
+        print("\nProcessing complete!")
 
     except Exception as e:
-        print(f"错误: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
