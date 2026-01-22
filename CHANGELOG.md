@@ -108,3 +108,5 @@ v1.1.26
     feat under test: add plugin qpipeline
 v1.1.27
     feat add plugin qchem
+    feat add hyperconnect
+    fix pipeline task opt impl check

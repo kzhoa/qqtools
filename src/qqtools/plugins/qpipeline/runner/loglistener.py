@@ -4,6 +4,7 @@ log message formart:
     [epoch] [batch] [train/val/test] [loss] [metric] [lr] [time]
 """
 
+import signal
 import sys
 import traceback
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
@@ -48,6 +49,19 @@ class LiveDisplayer:
         self.enable = enable
         if self.enable:
             self.init_live()
+
+        self._setup_signal_handlers()
+
+    def _setup_signal_handlers(self):
+        """设置信号处理器，确保异常时恢复光标"""
+
+        def restore_cursor(signum, frame):
+            if hasattr(self, "console"):
+                self.console.show_cursor()
+            sys.exit(1)
+
+        signal.signal(signal.SIGINT, restore_cursor)  # Ctrl+C
+        signal.signal(signal.SIGTERM, restore_cursor)  # 终止信号
 
     def init_live(self):
         self.console = rich.get_console()
