@@ -48,7 +48,6 @@ def get_init_state() -> runnerState:
     return state
 
 
-# @qContextProvider(qt.qDict())
 class EpochAgent(object):
     """
     define task interface convention
@@ -652,7 +651,6 @@ def infer_only_runner(model, task, dataloader, args, ddp, print_freq):
 
     """logger"""
     logger = ConsoleLogger(None, logger_name="infer")
-    # loglisitener = LogListener("val", logger, print_freq)
 
     if args.ckp_file is not None:
         logger.info(f"recovering from: {args.ckp_file}")
@@ -665,7 +663,6 @@ def infer_only_runner(model, task, dataloader, args, ddp, print_freq):
 
     epoch_start_time = time.perf_counter()
     # core
-    # with torch.no_grad():
     result = epoch_agent.__run__(dataloader, model, train=False)
 
     epoch_end_time = time.perf_counter()
