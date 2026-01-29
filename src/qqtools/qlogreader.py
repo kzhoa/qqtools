@@ -48,6 +48,7 @@ class ReadRule(object):
         skip_when_meet=0,
         callback=None,
         end_pattern=None,
+        required=True,
     ):
         """__init__ _summary_
 
@@ -64,6 +65,7 @@ class ReadRule(object):
         self.skip_when_meet = skip_when_meet
         self.callback = callback
         self.end_pattern = end_pattern
+        self.required = required
         self.name = name
         if isinstance(nlines, int):
             assert nlines >= -1
@@ -102,7 +104,9 @@ class ReadRule(object):
         # only welcome one stop method
         if self.end_pattern is not None:
             assert self.nlines == -1
-        else:
+            return
+
+        if isinstance(self.nlines, int):
             assert (
                 self.nlines >= 0
             ), f"expect non-negative value, but found {self.nlines} in {self.name}"  # 0 means some temp Transit Station
@@ -118,10 +122,27 @@ class ReadRule(object):
             "nlines": self._nlines,
             "skip_when_meet": self.skip_when_meet,
             "end_pattern": self.end_pattern,
+            "required": self.required,
         }
 
     def __repr__(self):
         return str(self.to_dict())
+
+
+def _build_jump_table(rules: List[ReadRule]) -> List[List[int]]:
+    """
+    Precomputation: At each rule index, which subsequent rules can be legally searched.
+    """
+    table = []
+    n = len(rules)
+    for i in range(n):
+        j = i
+        candidates = [j]
+        while not rules[j].required:
+            j = j + 1
+            candidates.append(j)
+        table.append(candidates)
+    return table
 
 
 class GeneralLogReader(object):
@@ -130,6 +151,7 @@ class GeneralLogReader(object):
     def __init__(self, rules: List[dict]):
         self.rules = [ReadRule(**rule) for rule in rules]
         self.cur_rule_idx = -1
+        self.jump_table = _build_jump_table(self.rules)
 
     def get_rule(self, idx):
         if idx < len(self.rules):
@@ -145,6 +167,11 @@ class GeneralLogReader(object):
     def next_rule(self) -> ReadRule:
         return self.get_rule(self.cur_rule_idx + 1)
 
+    def to_rule(self, idx, results):
+        self.cur_rule_idx = idx
+        self.cur_rule.activateNLines(results)
+        return self.cur_rule
+
     def to_next_rule(self, results):
         self.cur_rule_idx += 1
         self.cur_rule.activateNLines(results)
@@ -159,6 +186,24 @@ class GeneralLogReader(object):
         else:
             raise TypeError(f"Input TypeError: {type(file)}")
 
+    def _try_match_rules(self, line: str, results: dict) -> int:
+        """
+        Try to match current or subsequent candidate rules based on jump_table.
+        No side effect here.
+
+        Returns:
+            int: The index of the matched rule, or -1 if no match is found.
+        """
+        # Get all candidate rule indices that can be considered at current position
+        candidates = self.jump_table[self.cur_rule_idx]
+
+        for idx in candidates:
+            rule = self.rules[idx]
+            if rule.pattern is not None and rule.pattern in line:
+                # Match successful
+                return idx
+        return -1
+
     def read_lines(self, lines: Union[list, Iterable]):
         results = {}
         self.cur_rule_idx = -1
@@ -171,18 +216,22 @@ class GeneralLogReader(object):
         for i, line in enumerate(lines):
             if cur_rule.pattern is None or cur_rule.nlines == 0:
                 # exit door
-                if self.cur_rule_idx == len(self.rules):
+                if self.cur_rule_idx >= len(self.rules):
                     break
                 # empty rule
                 if cur_rule.callback is None:
-                    warnings.warn("Unexpected None or empty rule", UserWarning)
-
-            if not has_meet and cur_rule.pattern in line:
-                has_meet = True
+                    warnings.warn(f"Unexpected None or empty rule: {cur_rule}", UserWarning)
 
             # meet check
             if not has_meet:
-                continue
+                matched_idx = self._try_match_rules(line, results)
+                if matched_idx != -1:
+                    # Match successful, Move to the matched rule
+                    if matched_idx != self.cur_rule_idx:
+                        cur_rule = self.to_rule(matched_idx, results)
+                    has_meet = True
+                else:
+                    continue
 
             # skip check
             if skip_count < cur_rule.skip_when_meet:

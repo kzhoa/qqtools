@@ -21,6 +21,9 @@ dev = ["pytest", "black", "isort", "flake8"]
 Repository = "https://github.com/kzhoa/qqtools.git"
 
 
+[project.scripts]
+qread = "qqtools.cli.qread:main"
+
 # === build settings ===
 [build-system]
 requires = ["setuptools>=64.0", "wheel"]

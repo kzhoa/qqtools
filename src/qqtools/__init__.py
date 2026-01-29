@@ -41,3 +41,12 @@ from .utils.check import check_values_allowed, is_alias_exists
 
 # attr
 from .utils.attr import hasattr_safe, getmultiattr, is_override
+
+
+# plugins
+def __getattr__(name):
+    if name == "plugins":
+        import importlib
+
+        return importlib.import_module(".plugins", __name__)
+    raise AttributeError(f"module {__name__} has no attribute {name}")
