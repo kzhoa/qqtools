@@ -110,3 +110,6 @@ v1.1.27
     feat add plugin qchem
     feat add hyperconnect
     fix pipeline task opt impl check
+v1.1.28
+    feat add qread script under cli, support g16 mode
+    fix g16 reader now support jump table with optional rules

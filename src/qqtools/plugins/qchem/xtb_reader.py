@@ -21,7 +21,7 @@ import re
 
 import numpy as np
 
-from ..qlogreader import GeneralLogReader, extract_float
+from qqtools.qlogreader import GeneralLogReader, extract_float
 
 __all__ = ["xtbLogReader", "xtbEnGradReader"]
 

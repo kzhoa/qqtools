@@ -167,6 +167,7 @@ g16_singlepoint_rules = [
         "end_pattern": "-----",
         "skip_when_meet": 5,
         "callback": handle_g16_coordinates,
+        "required": False,  # input orientation does not always exist
     },
     {
         "name": "coords_standard",
@@ -241,6 +242,7 @@ g16_opt_rules = [
         "end_pattern": "-----",
         "skip_when_meet": 5,
         "callback": handle_g16_coordinates,
+        "required": False,  # input orientation does not always exist
     },
     {
         "name": "coords_standard",

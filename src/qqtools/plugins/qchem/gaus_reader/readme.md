@@ -9,7 +9,11 @@ qq:
 
 This module has been tested with the following task types:
 - Single Point (SP):`#SP theory/basis force`  
-- Optimization + Single Point: `#P theory/basis opt freq` 
+- Optimization + Single Point: 
+  - `#P theory/basis opt freq` 
+  - We only return the last structure after optimization is completed.
+
+
 
 # Quick Start
 
