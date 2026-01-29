@@ -1,12 +1,4 @@
 
-
-<!-- <div>
-  <img src="static/banner_1960.jpg" width="400" height="300" alt="">
-</div> -->
-<!-- <pre style="margin: 0; padding: 0; height: 552px; visibility: hidden;"></pre> -->
-
-<!-- ![qqtools-banner](static/banner_960.jpg) -->
-
 <div style="
   position: relative;
   width: 100%;
