@@ -1,7 +1,8 @@
-import qqtools as qt
 import torch
 from torch.utils.data.dataloader import DataLoader
-from torch_geometric.loader.dataloader import Collater
+
+import qqtools as qt
+from qqtools.torch.qdataset import collate_dict_samples
 
 __all__ = ["prepare_dataloder"]
 
@@ -18,7 +19,7 @@ def build_loader_trival(
 
     if not collate_fn:
         # use pyg as default
-        collate_fn = Collater(ds)
+        collate_fn = collate_dict_samples
 
     loader = DataLoader(
         ds,
@@ -44,8 +45,7 @@ def build_loader_ddp(
 ):
 
     if not collate_fn:
-        # use pyg as default
-        collate_fn = Collater(ds)
+        collate_fn = collate_dict_samples
 
     sampler = torch.utils.data.DistributedSampler(
         ds,

@@ -14,8 +14,8 @@ from .torch import nn
 from .torch import qdist
 from .torch import qcheckpoint, qscatter, qsparse
 from .torch import qcontextprovider
-from . import data
-from .plugins import qpipeline
+from . import data, plugins
+
 
 # first-class funciton
 from .qimport import import_common

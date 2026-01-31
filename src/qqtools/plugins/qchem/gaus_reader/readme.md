@@ -13,6 +13,10 @@ This module has been tested with the following task types:
   - `#P theory/basis opt freq` 
   - We only return the last structure after optimization is completed.
 
+Note on Electronic State:
+- All calculations assume closed-shell systems​ (multiplicity = 1, singlet state).
+- This applies to both neutral and charged systems where all electrons are paired.
+- For open-shell systems (multiplicity ≥ 2), additional customized handling would be required.
 
 
 # Quick Start
