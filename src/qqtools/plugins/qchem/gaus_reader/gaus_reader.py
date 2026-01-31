@@ -13,7 +13,7 @@ from typing import Dict, List
 
 import numpy as np
 
-from qqtools.qlogreader import GeneralLogReader
+from qqtools.qlogreader import GeneralLogReader, extract_float
 
 __all__ = ["create_g16_reader"]
 
@@ -43,12 +43,14 @@ def handle_g16_coord_lines(lines):
     return coords, elements
 
 
-def handle_g16_coordinates(lines):
+def handle_g16_input_coords(lines):
+    lines = lines[:-1]  # remove end line
     coords, elements = handle_g16_coord_lines(lines)
     return coords
 
 
-def handle_g16_std_output(lines, results):
+def handle_g16_std_coords(lines, results):
+    lines = lines[:-1]  # remove end line
     coords, elements = handle_g16_coord_lines(lines)
     results["coords_standard"] = coords
     results["elements"] = elements
@@ -93,6 +95,14 @@ def extract_scf_energy(lines):
     return None
 
 
+def extract_homo_lumo(lines: List[str], results: dict):
+    HOMO = extract_float(lines[-2])[-1]
+    LUMO = extract_float(lines[-1])[0]
+    results["HOMO"] = HOMO
+    results["LUMO"] = LUMO
+    return results
+
+
 def extract_zpe_correction(lines: List[str]) -> float:
     for line in lines:
         if "Zero-point correction=" in line:
@@ -128,6 +138,8 @@ def extract_forces(lines: List[str]) -> dict:
          "1        8          -0.000451775    0.000736685   -0.000457916"
     return: {'forces': [[fx, fy, fz], ...]}
     """
+
+    lines = lines[:-1]  # remove end line
     forces = []
 
     for line in lines:
@@ -143,6 +155,47 @@ def extract_forces(lines: List[str]) -> dict:
             forces.append([fx, fy, fz])
 
     return forces
+
+
+def extract_dipole_moment_final(lines):
+    """
+    Parse dipole moment data.
+
+    Args:
+        lines: List of four lines containing Tot, x, y, z dipole moment data
+               Format example:
+               Tot        0.153584D+01      0.390371D+01      0.130214D+02
+               x          0.151568D+01      0.385248D+01      0.128505D+02
+               y          0.442014D-01      0.112349D+00      0.374755D+00
+               z          0.244027D+00      0.620254D+00      0.206895D+01
+
+    Returns:
+        Dictionary containing x, y, z components and total value in Debye units
+        Example: {'total': 3.90371, 'x': 3.85248, 'y': 0.112349, 'z': 0.620254}
+    """
+    dipole_data = {}
+
+    for line in lines:
+        if not line.strip():
+            continue
+
+        # Split the line into columns
+        parts = line.split()
+
+        # parts[0] contains label (Tot, x, y, z)
+        # parts[1] contains value in atomic units (au)
+        # parts[2] contains value in Debye units
+        # parts[3] contains value in SI units (10^-30 C·m)
+
+        label = parts[0].lower()  # Convert label to lowercase for consistency
+
+        # Convert Fortran scientific notation (D) to Python (E) and parse to float
+        value_debye = float(parts[2].replace("D", "E"))
+
+        # Store in dictionary
+        dipole_data[label] = value_debye
+
+    return (dipole_data["x"], dipole_data["y"], dipole_data["z"])
 
 
 # sp without optimization
@@ -161,12 +214,13 @@ g16_singlepoint_rules = [
         "nlines": 1,
         "callback": extract_molecule_charge_multiplicity,
     },
+    # --- enter l202
     {
         "name": "coords_input",
         "pattern": "Input orientation:",
         "end_pattern": "-----",
         "skip_when_meet": 5,
-        "callback": handle_g16_coordinates,
+        "callback": handle_g16_input_coords,
         "required": False,  # input orientation does not always exist
     },
     {
@@ -174,7 +228,7 @@ g16_singlepoint_rules = [
         "pattern": "Standard orientation:",
         "end_pattern": "-----",
         "skip_when_meet": 5,
-        "callback": handle_g16_std_output,
+        "callback": handle_g16_std_coords,
     },
     {
         "name": "nAtoms",
@@ -182,6 +236,8 @@ g16_singlepoint_rules = [
         "nlines": 1,
         "callback": extract_number_of_atoms,
     },
+    # --- leave l202 ---
+    # --- enter l508
     {
         "name": "scf_energy",
         "pattern": "SCF Done:",  # Match lines containing SCF Done
@@ -189,6 +245,48 @@ g16_singlepoint_rules = [
         "skip_when_meet": 0,  # Don't skip any lines
         "callback": extract_scf_energy,  # Use custom callback function to extract energy
     },
+    # --- leave l508 ---
+    # --- enetr l1002
+    {
+        "name": "isotropic_polarizability",
+        "pattern": "Isotropic polarizability for W=",
+        "nlines": 1,
+        "skip_when_meet": 0,
+        "callback": lambda lines: extract_float(lines[0])[1],
+        "required": True,
+    },
+    # --- leave l1002
+    # --- enter l601 ---
+    {
+        "name": "population_analysis_sign",
+        "pattern": "Population analysis using the SCF Density",
+        "nlines": 0,
+        "skip_when_meet": 0,
+        "callback": lambda lines, results: results,
+    },
+    {
+        "name": "HOMO-LUMO",
+        "pattern": "Alpha  occ. eigenvalues",
+        "nlines": -1,
+        "end_pattern": "Alpha virt. eigenvalues",
+        "skip_when_meet": 0,
+        "callback": extract_homo_lumo,
+    },
+    # Electronic spatial extent R^2
+    {
+        "name": "elec_spatial_extent",
+        "pattern": "Electronic spatial extent (au):",
+        "nlines": 1,
+        "callback": lambda lines: extract_float(lines[0])[-1],
+    },
+    #  Dipole Moment `μ`
+    {
+        "name": "dipole_moment",
+        "pattern": "Dipole moment (field-independent basis, Debye):",
+        "nlines": 2,
+        "callback": lambda lines: extract_float(lines[1])[:3],
+    },
+    # --- leave l601 ---
     # frequencies, maybe later
     {
         "name": "zpe_correction",
@@ -210,7 +308,15 @@ g16_singlepoint_rules = [
         "skip_when_meet": 3,
         "callback": extract_forces,
     },
-    # {"name": "homo_lumo", "pattern": "Alpha  occ. eigenvalues", "nlines": 1, "callback": extract_homo_lumo_energies},
+    # --- enter l19999
+    {
+        "name": "dipole_moment_inpt_orient",
+        "pattern": "Electric dipole moment (input orientation)",
+        "skip_when_meet": 3,
+        "nlines": 4,
+        "callback": extract_dipole_moment_final,
+    },
+    # --- leave l19999
 ]
 
 # sp with optimization
@@ -234,14 +340,15 @@ g16_opt_rules = [
         "name": "opt_complete_sign",
         "pattern": "Optimization completed",
         "nlines": 0,
-        "callback": lambda lines: True,
+        "callback": lambda lines, results: results,
     },
+    # --- enter l202
     {
         "name": "coords_input",
         "pattern": "Input orientation:",
         "end_pattern": "-----",
         "skip_when_meet": 5,
-        "callback": handle_g16_coordinates,
+        "callback": handle_g16_input_coords,
         "required": False,  # input orientation does not always exist
     },
     {
@@ -249,8 +356,10 @@ g16_opt_rules = [
         "pattern": "Standard orientation:",
         "end_pattern": "-----",
         "skip_when_meet": 5,
-        "callback": handle_g16_std_output,
+        "callback": handle_g16_std_coords,
     },
+    # --- leave l202 ---
+    # --- enter l508
     {
         "name": "scf_energy",
         "pattern": "SCF Done:",  # Match lines containing SCF Done
@@ -258,6 +367,50 @@ g16_opt_rules = [
         "skip_when_meet": 0,  # Don't skip any lines
         "callback": extract_scf_energy,  # Use custom callback function to extract energy
     },
+    # --- leave l508 ---
+    # --- enetr l1002
+    # Isotropic Polarizability
+    {
+        "name": "isotropic_polarizability",
+        "pattern": "Isotropic polarizability for W=",
+        "nlines": 1,
+        "skip_when_meet": 0,
+        "callback": lambda lines: extract_float(lines[0])[1],
+        "required": True,
+    },
+    # --- leave l1002
+    # --- enter l601 ---
+    {
+        "name": "population_analysis_sign",
+        "pattern": "Population analysis using the SCF Density",
+        "nlines": 0,
+        "skip_when_meet": 0,
+        "callback": lambda lines, results: results,
+    },
+    {
+        "name": "HOMO-LUMO",
+        "pattern": "Alpha  occ. eigenvalues",
+        "nlines": -1,
+        "end_pattern": "Alpha virt. eigenvalues",
+        "skip_when_meet": 0,
+        "callback": extract_homo_lumo,
+    },
+    # Electronic spatial extent R^2
+    {
+        "name": "elec_spatial_extent",
+        "pattern": "Electronic spatial extent (au):",
+        "nlines": 1,
+        "callback": lambda lines: extract_float(lines[0])[-1],
+    },
+    #  Dipole Moment `μ`
+    {
+        "name": "dipole_moment_std_orient",
+        "pattern": "Dipole moment (field-independent basis, Debye):",
+        "nlines": 2,
+        "callback": lambda lines: extract_float(lines[1])[:3],
+    },
+    # --- leave l601 ---
+    # --- enter l716
     # frequencies, maybe later
     {
         "name": "zpe_correction",
@@ -275,11 +428,20 @@ g16_opt_rules = [
     {
         "name": "forces",
         "pattern": "Forces (Hartrees/Bohr)",
-        "end_pattern": "-----",
         "skip_when_meet": 3,
+        "end_pattern": "-----",
         "callback": extract_forces,
     },
-    # {"name": "homo_lumo", "pattern": "Alpha  occ. eigenvalues", "nlines": 1, "callback": extract_homo_lumo_energies},
+    # --- leave l716 ---
+    # --- enter l19999
+    {
+        "name": "dipole_moment_inpt_orient",
+        "pattern": "Electric dipole moment (input orientation)",
+        "skip_when_meet": 3,
+        "nlines": 4,
+        "callback": extract_dipole_moment_final,
+    },
+    # --- leave l19999
 ]
 
 

@@ -58,6 +58,7 @@ class ReadRule(object):
             nlines (int or str): read nlines when meet pattern string. If str given, use eval().
             skip_when_meet (int): Defaults to 0.
             callback (optional): callback(read_lines)->parsedValue. Defaults to None.
+            end_pattern (optional): Defaults to None. The endline will be included.
         """
         self.pattern = pattern
         self._nlines = nlines  # original pattern, -1 means read til end
@@ -178,7 +179,7 @@ class GeneralLogReader(object):
         return self.cur_rule
 
     def read_file(self, file):
-        if isinstance(file, (str, pathlib.PosixPath)):
+        if isinstance(file, (str, pathlib.Path)):
             with open(file, "r") as f:
                 return self.read_lines(f)
         elif is_open_file_handler(file):
@@ -247,6 +248,8 @@ class GeneralLogReader(object):
                     continue
 
                 # End pattern matched
+                read_lines.append(line.strip())  # append last line
+
                 # callback and update result
                 results = cur_rule.evoke_callback(read_lines, results)
 

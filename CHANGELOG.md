@@ -112,4 +112,6 @@ v1.1.27
     fix pipeline task opt impl check
 v1.1.28
     feat add qread script under cli, support g16 mode
+    feat g16 support electro properties 
     fix g16 reader now support jump table with optional rules
+    fix g16 reader now add end line to read lines
