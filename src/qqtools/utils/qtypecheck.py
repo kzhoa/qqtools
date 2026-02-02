@@ -10,7 +10,14 @@ from typing import List
 import numpy as np
 import torch
 
-__all__ = ["ensure_scala"]
+__all__ = [
+    "is_number",
+    "is_inf",
+    "str2number",
+    "ensure_scala",
+    "ensure_numpy",
+    "numpy_to_native",
+]
 
 
 def is_number(inpt) -> bool:
@@ -85,3 +92,29 @@ def ensure_numpy(x):
         return np.array(x)
     else:
         raise TypeError(f"type({x})")
+
+
+def numpy_to_native(obj):
+    """
+    Recursively convert numpy data types to native Python types
+    """
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.complex64, np.complex128)):
+        return complex(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.bytes_):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {key: numpy_to_native(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [numpy_to_native(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(numpy_to_native(item) for item in obj)
+    else:
+        return obj
