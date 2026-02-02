@@ -4,36 +4,11 @@ import json
 import numpy as np
 
 from qqtools.plugins.qchem.gaus_reader import create_g16_reader
-
-
-def convert_numpy_types(obj):
-    """
-    Recursively convert numpy data types to native Python types for JSON serialization
-    """
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64)):
-        return int(obj)
-    elif isinstance(obj, (np.float16, np.float32, np.float64)):
-        return float(obj)
-    elif isinstance(obj, (np.complex64, np.complex128)):
-        return complex(obj)
-    elif isinstance(obj, np.bool_):
-        return bool(obj)
-    elif isinstance(obj, np.bytes_):
-        return str(obj)
-    elif isinstance(obj, dict):
-        return {key: convert_numpy_types(value) for key, value in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_numpy_types(item) for item in obj]
-    elif isinstance(obj, tuple):
-        return tuple(convert_numpy_types(item) for item in obj)
-    else:
-        return obj
+from qqtools.utils.qtypecheck import numpy_to_native
 
 
 def write_json(data, file_path):
-    data = convert_numpy_types(data)
+    data = numpy_to_native(data)
     with open(file_path, "w") as f:
         json.dump(data, f, indent=4)
 
