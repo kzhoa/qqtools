@@ -1,7 +1,7 @@
 import sys
 from importlib import import_module
 
-__all__ = ["LazyImport", "is_imported", "import_common"]
+__all__ = ["LazyImport", "LazyImportErrorProxy" "is_imported", "import_common"]
 
 
 def _try_import(pkg):
@@ -52,6 +52,32 @@ class LazyImport:
         if self._target is None:
             self._load_target()
         return self._target(*args, **kwargs)
+
+
+class LazyImportErrorProxy:
+    """
+    A proxy class that delays raising an ImportError until the object is actually
+    called or instantiated. This allows the code to run as long as the missing
+    library's features are not invoked.
+    """
+
+    def __init__(self, module_name):
+        self._module_name = module_name
+
+    def __getattr__(self, name):
+        # Support chained attribute access (e.g., rich.console.Console)
+        # By returning 'self', any sub-attribute will also be a proxy instance.
+        return self
+
+    def __call__(self, *args, **kwargs):
+        # Raise the error only when the code tries to actually USE the object
+        raise ImportError(
+            f"Error: The '{self._module_name}' library is required but not installed. "
+            f"Please install it by running 'pip install {self._module_name}'."
+        )
+
+    def __repr__(self):
+        return f"<Missing module proxy for '{self._module_name}'>"
 
 
 def import_common(g=None):

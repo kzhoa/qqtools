@@ -6,19 +6,29 @@ log message formart:
 
 import signal
 import sys
-import traceback
-from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Literal
 
-import rich
-from rich import box
-from rich.console import Console
-from rich.emoji import Emoji
-from rich.layout import Layout
-from rich.live import Live
-from rich.progress import BarColumn, Progress, ProgressColumn, SpinnerColumn, TextColumn
-from rich.style import Style
-from rich.table import Table
-from rich.text import Text
+from qqtools.qimport import LazyImportErrorProxy
+
+try:
+    import rich
+    from rich import box
+    from rich.console import Console
+    from rich.emoji import Emoji
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.progress import BarColumn, Progress, ProgressColumn, SpinnerColumn, TextColumn
+    from rich.style import Style
+    from rich.table import Table
+    from rich.text import Text
+except:
+    rich_proxy = LazyImportErrorProxy("rich")
+    rich = rich_proxy
+    # fmt: off
+    box = Console = Emoji = Layout = Live = \
+    BarColumn = Progress = ProgressColumn = SpinnerColumn = TextColumn = \
+    Style = Table = Text = rich_proxy
+    # fmt: on
 
 
 class CustomBarColumn(BarColumn):
@@ -37,7 +47,7 @@ class CustomBarColumn(BarColumn):
 
 
 class CustomETAColumn(ProgressColumn):
-    def render(self, task) -> Text:
+    def render(self, task):
         custom_eta = task.elapsed * (task.total / (task.completed + 1e-8) - 1.0)
         return Text(f"ETA: {custom_eta:.1f}s", style="italic blue")
 
