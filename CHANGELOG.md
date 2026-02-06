@@ -116,4 +116,6 @@ v1.1.28
     feat g16 support electro properties 
     fix g16 reader now support jump table with optional rules
     fix g16 reader now add end line to read lines
-   
+v1.1.29
+    feat add to_graph_dataloader for qdictdataset
+#TODO qlmdbDataset
