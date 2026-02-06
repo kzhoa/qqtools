@@ -549,6 +549,14 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
             **kwargs,
         )
 
+    def to_graph_dataloader(self, batch_size, **kwargs):
+        return qDictDataloader(
+            dataset=self,
+            batch_size=batch_size,
+            collate_fn=qDictDataset.collate_graph_samples,
+            **kwargs,
+        )
+
 
 class qDictDataloader(torch.utils.data.DataLoader):
     """
