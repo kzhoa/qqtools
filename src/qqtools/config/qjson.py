@@ -23,16 +23,20 @@ def save_json(
             print(f"File already exists: {fpath}")
         return False
 
-    with open(fpath, "w", encoding="utf-8") as f:
-        json.dump(
-            obj,
-            f,
-            indent=indent,
-            sort_keys=sort_keys,
-            default=default_serializer,
-        )
-
-    return True
+    try:
+        with open(fpath, "w", encoding="utf-8") as f:
+            json.dump(
+                obj,
+                f,
+                indent=indent,
+                sort_keys=sort_keys,
+                default=default_serializer,
+            )
+        return True
+    except Exception as e:
+        if verbose:
+            print(f"Error saving json to {fpath}: {e}")
+        return False
 
 
 def load_json(
@@ -40,16 +44,21 @@ def load_json(
     verbose: bool = True,
     encoding: str = "utf-8",
 ) -> Any:
-
+    fpath = Path(fpath)
     if not fpath.exists():
         raise FileNotFoundError(f"File not found: {fpath}")
 
     if fpath.stat().st_size == 0:
         if verbose:
             print(f"File is empty: {fpath}")
-        return dict()
+        return {}
 
-    with open(fpath, "r", encoding=encoding) as f:
-        data = json.load(f)
+    try:
+        with open(fpath, "r", encoding=encoding) as f:
+            data = json.load(f)
+        return data
 
-    return data
+    except Exception as e:
+        if verbose:
+            print(f"Error loading json from {fpath}: {e}")
+        raise e
