@@ -12,17 +12,12 @@ from torch import Tensor
 
 import qqtools as qt
 
-try:
-    import lmdb
-except Exception as e:
-    from ..qimport import LazyImportErrorProxy
-
-    lmdb = LazyImportErrorProxy("lmdb", str(e))
-
-
 from ..data.qdatalist import qList
+from ..qimport import LazyImport
 from ..utils.warning import QDataWarning
 from .qsplit import get_data_splits
+
+lmdb = LazyImport("lmdb")
 
 
 class qData(qt.qDict):
@@ -651,7 +646,7 @@ class qLmdbDataset(qDictDataset):
 
     def __init__(
         self,
-        lmdb_path,
+        lmdb_path: Union[str, Path],
         is_subdir=False,
         max_readers=128,
         map_size=1024 * 1024 * 1024 * 100,  # 100GB
@@ -660,7 +655,7 @@ class qLmdbDataset(qDictDataset):
         super().__init__(root=None)
 
         # we only save the params here
-        self.lmdb_path = lmdb_path
+        self.lmdb_path = str(lmdb_path)
         self.is_subdir = is_subdir
         self.max_readers = max_readers
         self.map_size = map_size
@@ -722,7 +717,8 @@ class qLmdbDataset(qDictDataset):
             self._initialized = False
 
     def __del__(self):
-        self.close()
+        if hasattr(self, "_initialized"):
+            self.close()
 
     def __getitem__(self, idx):
         if not self._initialized:

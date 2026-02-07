@@ -1,19 +1,9 @@
 from contextlib import contextmanager
 
-from ..qimport import LazyImportErrorProxy
+from ..qimport import LazyImport
 
-try:
-    import lmdb
-except Exception as e:
-
-    lmdb = LazyImportErrorProxy("lmdb", str(e))
-
-try:
-    from tqdm import tqdm
-except Exception as e:
-
-    tqdm = LazyImportErrorProxy("tqdm", str(e))
-
+lmdb = LazyImport("lmdb")
+tqdm = LazyImport("tqdm", "tqdm")
 
 MAP_SIZE = 100 * 1024 * 1024 * 1024
 
