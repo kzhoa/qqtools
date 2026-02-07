@@ -48,6 +48,11 @@ class LazyImport:
             self._load_target()
         return getattr(self._target, name)
 
+    def __getitem__(self, key):
+        if self._target is None:
+            self._load_target()
+        return self._target.__getitem__(key)
+
     def __call__(self, *args, **kwargs):
         if self._target is None:
             self._load_target()
