@@ -48,15 +48,47 @@ def scatter(
         return out
 
     if reduce == "mean":
-        count = ref.new_zeros(dim_size)
-        count.scatter_add_(0, index, ref.new_ones(ref.size(dim)))
-        count = count.clamp(min=1)
-
         index = broadcast(index, ref, dim)
         out = ref.new_zeros(_size)
         out = out.scatter_add_(dim, index, ref)
 
-        return out / broadcast(count, out, dim)
+        # out.scatter_reduce_(dim, index, ref, reduce='mean', include_self=False)
+        # return out
+
+        ones = ref.new_ones(ref.shape)
+        count = ref.new_zeros(_size)
+        count.scatter_add_(dim, index, ones)
+        count.clamp_(min=1)
+
+        return out / count
+
+    if reduce == "min":
+        if ref.is_floating_point():
+            init_value = float("inf")
+        else:
+            init_value = torch.iinfo(ref.dtype).max
+
+        out = ref.new_full(_size, init_value)
+        index = broadcast(index, ref, dim)
+        out.scatter_reduce_(dim, index, ref, reduce="amin", include_self=False)
+        return out
+
+    if reduce == "max":
+        if ref.is_floating_point():
+            init_value = float("-inf")
+        else:
+            init_value = torch.iinfo(ref.dtype).min
+
+        out = ref.new_full(_size, init_value)
+        index = broadcast(index, ref, dim)
+        out.scatter_reduce_(dim, index, ref, reduce="amax", include_self=False)
+        return out
+
+    if reduce == "prod":
+        out = ref.new_ones(_size)
+        index = broadcast(index, ref, dim)
+        out.scatter_reduce_(dim, index, ref, reduce="prod", include_self=False)
+        return out
 
     raise ValueError(f"Encountered invalid `reduce` argument '{reduce}'")
 
