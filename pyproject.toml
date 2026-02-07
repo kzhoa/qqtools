@@ -13,7 +13,7 @@ dependencies = ["torch", "PyYAML", "matplotlib", "pandas", "scipy", "rich"]
 # scipy requires: numpy
 
 [project.optional-dependencies]
-full = ["rich", "scikit-learn"]
+full = ["rich", "scikit-learn", "lmdb"]
 dev = ["pytest", "black", "isort", "flake8"]
 
 

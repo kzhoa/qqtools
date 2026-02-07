@@ -61,8 +61,9 @@ class LazyImportErrorProxy:
     library's features are not invoked.
     """
 
-    def __init__(self, module_name):
+    def __init__(self, module_name: str, msg: str):
         self._module_name = module_name
+        self._msg = msg
 
     def __getattr__(self, name):
         # Support chained attribute access (e.g., rich.console.Console)
@@ -74,6 +75,7 @@ class LazyImportErrorProxy:
         raise ImportError(
             f"Error: The '{self._module_name}' library is required but not installed. "
             f"Please install it by running 'pip install {self._module_name}'."
+            f" {self._msg}"
         )
 
     def __repr__(self):

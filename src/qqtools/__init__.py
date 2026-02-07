@@ -5,7 +5,7 @@ from .version import __version__
 from .qdict import qDict
 from .qtimer import Timer
 from .data.qdatalist import qDataList, qList
-from .torch.qdataset import qData, qDictDataloader, qDictDataset
+from .torch.qdataset import qData, qDictDataloader, qDictDataset, qLmdbDataset
 from .torch.qoptim import CompositeOptim, CompositeScheduler
 from .torch.nn.donothing import Donothing
 
