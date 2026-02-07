@@ -1,3 +1,5 @@
+# History
+
 v1.0.0
     first version
 v1.0.2
@@ -120,3 +122,16 @@ v1.1.29
     feat add to_graph_dataloader for qdictdataset
     feat: getitem support for lazyimport
     feat: add qLmdbDataset
+
+
+# TODO
+
+Feature:
+- plugin/mol
+  - is there a need to retain a unified intermediate form class?
+
+Tests
+- tests/unit/timer
+- tests/unit/lazyimporterrorproxy
+- tests/functional/qlmdbdataset
+

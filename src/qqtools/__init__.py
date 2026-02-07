@@ -25,6 +25,7 @@ from .config.yaml import dump_yaml, load_yaml
 from .config.qpickle import load_pickle, save_pickle
 from .config.qjson import load_json, save_json
 from .config.qsyspath import find_root, update_sys
+from .config.qlmdb import operate_lmdb, open_lmdb, count_lmdb, iter_lmdb
 from .torch.qcontextprovider import qContextProvider
 
 
