@@ -239,8 +239,9 @@ def collate_graph_samples(batch_list):
         for k in attr_keys:
             if k not in edge_attr_keys:  # skip edge attributes
                 value = sample[k]
-                # single node graph is not considered
-                if isinstance(value, (torch.Tensor, np.ndarray)) and value.ndim >= 1 and value.shape[0] > 1:
+                # qq: have to consider single node graph
+                # fix a bug relatvie to skipped batch-index
+                if isinstance(value, (torch.Tensor, np.ndarray)) and value.ndim >= 1:
                     if num_nodes is None:
                         num_nodes = value.shape[0]
                     else:
