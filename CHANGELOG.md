@@ -118,4 +118,5 @@ v1.1.28
     fix g16 reader now add end line to read lines
 v1.1.29
     feat add to_graph_dataloader for qdictdataset
-#TODO qlmdbDataset
+    feat: getitem support for lazyimport
+    feat: add qLmdbDataset
