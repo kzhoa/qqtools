@@ -616,6 +616,7 @@ class qDictDataloader(torch.utils.data.DataLoader):
 class qLmdbDataset(qDictDataset):
     """
     LMDB dataset that acts like a dictionary.
+    A consumer of qDictDataset, keep the storage behavior the same.
 
     Default Behavior:
         - Dataset Length: The number of entries in the dataset (`len(self)`)
@@ -639,6 +640,13 @@ class qLmdbDataset(qDictDataset):
           Parses the raw value (bytes) retrieved from
           LMDB into a usable Python object.
 
+    Example Usage:
+        class MyLmdbDataset(qLmdbDataset):
+            def get_key(self, idx):
+                return f"image_{idx}".encode()
+
+            def parse_value(self, v):
+                return torch.load(io.BytesIO(v))
     """
 
     def __init__(
@@ -646,7 +654,7 @@ class qLmdbDataset(qDictDataset):
         lmdb_path,
         is_subdir=False,
         max_readers=128,
-        map_size=1024 * 1024 * 1024 * 50,  # 50GB
+        map_size=1024 * 1024 * 1024 * 100,  # 100GB
     ):
 
         super().__init__(root=None)
