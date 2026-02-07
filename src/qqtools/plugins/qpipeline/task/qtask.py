@@ -187,6 +187,7 @@ class PotentialTaskBase(qTaskBase):
     Conventions:
         - implement `batch_forward`, `batch_loss`, `batch_metric`, `post_metrics_to_value` following qTaskBase;
         - implement `init_loader()` to set `train_loader`, `val_loader`, `test_loader`;
+        - implement `norm_factor` to set `self.meta["norm_factor"]`;
         - call `super().__init__(args)` in `__init__()`;
         - `args` should follow `qargs-convention`;
     """
@@ -196,6 +197,10 @@ class PotentialTaskBase(qTaskBase):
 
         if hasattr(self, "init_loader"):
             self.init_loader()
+
+    @abstractmethod
+    def norm_factor(self) -> Tuple[float, float]:
+        raise NotImplementedError
 
     def extract_args(self, args):
         self.args = args.copy()
@@ -226,6 +231,14 @@ class PotentialTaskBase(qTaskBase):
 
         self.standarize = standarize
         self.with_force = with_force
+
+        prefix = self.__class__.__name__
+        print(f"[{prefix}] loader_meta: {self.loader_meta}")
+        if self.standarize:
+            self.meta["norm_factor"] = self.norm_factor
+        else:
+            self.meta["norm_factor"] = (0, 1)
+        print(f"[{prefix}] standarize: {self.standarize} norm_factor: {self.meta["norm_factor"]}")
 
     def batch_forward(self, model, batch_data, **meta) -> Dict[str, Tensor]:
         with_force = self.with_force

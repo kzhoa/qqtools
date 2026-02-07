@@ -37,7 +37,11 @@ class LazyImport:
         self._target = None
 
     def _load_target(self):
-        module = import_module(self.module_name)
+        try:
+            module = import_module(self.module_name)
+        except Exception as e:
+            raise ImportError(f"Failed to import {self.module_name}") from e
+
         if not self.object_name:
             self._target = module
         else:
