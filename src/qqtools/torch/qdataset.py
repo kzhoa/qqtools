@@ -12,6 +12,12 @@ from torch import Tensor
 
 import qqtools as qt
 
+try:
+    import lmdb
+except Exception as e:
+    lmdb = qt.qimport.LazyImportErrorProxy("lmdb", str(e))
+
+
 from ..data.qdatalist import qList
 from ..utils.warning import QDataWarning
 from .qsplit import get_data_splits
@@ -603,3 +609,134 @@ class qDictDataloader(torch.utils.data.DataLoader):
         if collate_fn is None:
             collate_fn = collate_graph_samples if is_graph else collate_dict_samples
         super().__init__(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, **kwargs)
+
+
+class qLmdbDataset(qDictDataset):
+    """
+    LMDB dataset that acts like a dictionary.
+
+    Default Behavior:
+        - Dataset Length: The number of entries in the dataset (`len(self)`)
+          is automatically determined by querying `self.env.stat()["entries"]`.
+          If this default behavior is unsuitable, users can provide a custom
+          implementation by overriding the `def len(self) -> int` method.
+
+        - Data Caching Strategy: For optimized repeated access, data retrieved
+          from LMDB is cached in an internal list (`self.data_list`). Please be
+          aware that this strategy can lead to increased memory usage, especially
+          with large datasets. If memory efficiency is a priority and caching is
+          undesired, override the `get(self, idx)` method to fetch and return
+          data directly without storing it internally.
+
+    Implementation Requirements:
+        Subclasses must implement the following methods:
+        - `get_key(self, idx)->bytes`: C
+          Converts a given index `idx` into the corresponding key (as bytes)
+          to be used for retrieving data from LMDB.
+        - `parse_value(self, v)`:
+          Parses the raw value (bytes) retrieved from
+          LMDB into a usable Python object.
+
+    """
+
+    def __init__(
+        self,
+        lmdb_path,
+        is_subdir=False,
+        max_readers=128,
+        map_size=1024 * 1024 * 1024 * 50,  # 50GB
+    ):
+
+        super().__init__(root=None)
+
+        # we only save the params here
+        self.lmdb_path = lmdb_path
+        self.is_subdir = is_subdir
+        self.max_readers = max_readers
+        self.map_size = map_size
+
+        self.env = None
+        self.txn = None
+
+        self._initialized = False
+        self._num_entries = None
+        self._pre_load()
+
+    @abstractmethod
+    def get_key(self, idx) -> bytes:
+        pass
+
+    @abstractmethod
+    def parse_value(self, v):
+        pass
+
+    def len(self) -> int:
+        return self._num_entries
+
+    def _pre_load(
+        self,
+    ):
+        with lmdb.open(
+            self.lmdb_path,
+            readonly=True,
+            subdir=self.is_subdir,
+            max_readers=self.max_readers,
+            map_size=self.map_size,
+            lock=False,
+            readahead=False,
+            meminit=False,
+        ) as env:
+            self._num_entries = env.stat()["entries"]
+
+        self.data_list = [None] * self._num_entries
+
+    def _init_db(self):
+        if not self._initialized:
+            self.env = lmdb.open(
+                self.lmdb_path,
+                readonly=True,
+                subdir=self.is_subdir,
+                max_readers=self.max_readers,
+                map_size=self.map_size,
+                lock=False,
+                readahead=False,
+                meminit=False,
+            )
+            self.txn = self.env.begin(write=False)
+            self._initialized = True
+
+    def close(self):
+        if self._initialized:
+            self.txn.close()
+            self.env.close()
+            self._initialized = False
+
+    def __del__(self):
+        self.close()
+
+    def __getitem__(self, idx):
+        if not self._initialized:
+            self._init_db()
+
+        if (
+            isinstance(idx, (int, np.integer))
+            or (isinstance(idx, torch.Tensor) and idx.dim() == 0)
+            or (isinstance(idx, np.ndarray) and np.isscalar(idx))
+        ):
+            if self._indices is not None:
+                idx = self._indices[idx]
+            return self.get(idx)
+        else:
+            return self.index_select(idx)
+
+    def get(self, idx):
+        # behavior: cache the data list
+        if self.data_list[idx] is not None:
+            return self.data_list[idx]
+
+        key = self.get_key(idx)
+        v = self.txn.get(key)
+        v = self.parse_value(v)
+
+        self.data_list[idx] = v
+        return v
