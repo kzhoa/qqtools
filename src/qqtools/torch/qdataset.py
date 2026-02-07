@@ -15,7 +15,9 @@ import qqtools as qt
 try:
     import lmdb
 except Exception as e:
-    lmdb = qt.qimport.LazyImportErrorProxy("lmdb", str(e))
+    from ..qimport import LazyImportErrorProxy
+
+    lmdb = LazyImportErrorProxy("lmdb", str(e))
 
 
 from ..data.qdatalist import qList
