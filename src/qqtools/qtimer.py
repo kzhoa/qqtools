@@ -20,21 +20,35 @@ class Timer:
         self._end_time = None
         self.duration = None
 
+        # cuda specific
+        self.start_event = None
+        self.end_event = None
+        if self.cuda is True:
+            self.start_event = torch.cuda.Event(enable_timing=True)
+            self.end_event = torch.cuda.Event(enable_timing=True)
+
     def __enter__(self):
-        if self.cuda:
-            torch.cuda.synchronize()
-        self._start_time = time.perf_counter()
         if self.enter_msg is not None:
             msg = f"{self.prefix}{self.enter_msg}"
             end = "\n" if self.wrap else str()
             self.print_message(msg, end)
+
+        if self.cuda:
+            torch.cuda.synchronize()
+            self.start_event.record()
+        else:
+            self._start_time = time.perf_counter()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self.cuda:
+            self.end_event.record()
             torch.cuda.synchronize()
-        self._end_time = time.perf_counter()
-        self.duration = self._end_time - self._start_time
+            # ms -> s
+            self.duration = self.start_event.elapsed_time(self.end_event) / 1000.0
+        else:
+            self._end_time = time.perf_counter()
+            self.duration = self._end_time - self._start_time
         if self.verbose:
             self.show_duration()
 
