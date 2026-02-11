@@ -193,6 +193,7 @@ class PotentialTaskBase(qTaskBase):
     """
 
     def __init__(self, args, training=True):
+        super().__init__()
         self.extract_args(args)
 
         if training and hasattr(self, "init_loader"):
