@@ -25,6 +25,7 @@ def open_lmdb(fpath, write=False, is_subdir=False, map_size=MAP_SIZE):
     Raises:
         Exception: If an error occurs while closing the environment.
     """
+    fpath = str(fpath)
     env = lmdb.open(
         fpath,
         readonly=not write,
@@ -40,7 +41,7 @@ def open_lmdb(fpath, write=False, is_subdir=False, map_size=MAP_SIZE):
 
 
 @contextmanager
-def operate_lmdb(fpath, write=False, map_size=MAP_SIZE):
+def operate_lmdb(fpath, write=False, is_subdir=False, map_size=MAP_SIZE):
     """
     Context manager for operating on an LMDB database.
 
@@ -55,11 +56,12 @@ def operate_lmdb(fpath, write=False, map_size=MAP_SIZE):
     Raises:
         Exception: If an error occurs while committing or aborting the transaction.
     """
+    fpath = str(fpath)
     env = lmdb.open(
         fpath,
         readonly=not write,
         map_size=map_size,
-        subdir=False,
+        subdir=is_subdir,
     )
     txn = env.begin(write=write)
     try:
@@ -85,6 +87,7 @@ def count_lmdb(fpath, is_subdir=False) -> int:
     Returns:
         The number of entries in the LMDB database.
     """
+    fpath = str(fpath)
     with lmdb.open(fpath, readonly=True, subdir=is_subdir) as env:
         return env.stat()["entries"]
 
