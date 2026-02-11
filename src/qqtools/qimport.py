@@ -108,6 +108,7 @@ def import_common(g=None):
     g["pickle"] = LazyImport("pickle")
     g["tqdm"] = LazyImport("tqdm", "tqdm")
     g["trange"] = LazyImport("tqdm", "trange")
+    g["lmdb"] = LazyImport("lmdb")
 
     # typing
     g["Any"] = LazyImport("typing", "Any")
@@ -118,3 +119,4 @@ def import_common(g=None):
     g["Sequence"] = LazyImport("typing", "Sequence")
     g["Tuple"] = LazyImport("typing", "Tuple")
     g["Union"] = LazyImport("typing", "Union")
+    g["Tensor"] = LazyImport("torch", "Tensor")
