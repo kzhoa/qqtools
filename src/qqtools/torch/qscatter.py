@@ -63,22 +63,14 @@ def scatter(
         return out / count
 
     if reduce == "min":
-        if ref.is_floating_point():
-            init_value = float("inf")
-        else:
-            init_value = torch.iinfo(ref.dtype).max
-
+        init_value = float("inf")
         out = ref.new_full(_size, init_value)
         index = broadcast(index, ref, dim)
         out.scatter_reduce_(dim, index, ref, reduce="amin", include_self=False)
         return out
 
     if reduce == "max":
-        if ref.is_floating_point():
-            init_value = float("-inf")
-        else:
-            init_value = torch.iinfo(ref.dtype).min
-
+        init_value = float("inf")
         out = ref.new_full(_size, init_value)
         index = broadcast(index, ref, dim)
         out.scatter_reduce_(dim, index, ref, reduce="amax", include_self=False)
