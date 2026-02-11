@@ -1,3 +1,22 @@
+"""
+usage demo:
+
+# iterate all key-value pairs in the LMDB database
+for k,v in iter_lmdb('data.lmdb'):
+    k = k.decode('utf-8')
+    v = pickle.loads(v)
+    print(k, v)
+
+# auto commit after context exit
+with qt.operate_lmdb('data.lmdb', write=True) as txn:
+    # write
+    txn.put(b"key1", b"value1")
+
+# read only
+with qt.operate_lmdb('data.lmdb', write=False) as txn:
+    v = txn.get(b"key1")
+"""
+
 from contextlib import contextmanager
 
 from ..qimport import LazyImport

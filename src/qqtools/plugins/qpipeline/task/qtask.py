@@ -55,13 +55,13 @@ class qTaskBase(ABC):
             - self.test_loader
         """
         for name in OPTIONAL_METHODS:
-            if qt.is_overriden(self, name, qTaskBase):
+            if qt.is_override(self, name, qTaskBase):
                 self._opt_impl.add(name)
             else:
                 self._opt_todo.add(name)
 
         for name in REQUIRED_METHODS:
-            assert qt.is_overriden(self, name, qTaskBase)
+            assert qt.is_override(self, name, qTaskBase)
 
     @abstractmethod
     def batch_forward(self, model, batch_data) -> Dict[str, Tensor]:
@@ -192,10 +192,10 @@ class PotentialTaskBase(qTaskBase):
         - `args` should follow `qargs-convention`;
     """
 
-    def __init__(self, args):
+    def __init__(self, args, training=True):
         self.extract_args(args)
 
-        if hasattr(self, "init_loader"):
+        if training and hasattr(self, "init_loader"):
             self.init_loader()
 
     @abstractmethod
