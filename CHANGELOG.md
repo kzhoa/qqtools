@@ -122,7 +122,8 @@ v1.1.29
     feat add to_graph_dataloader for qdictdataset
     feat: getitem support for lazyimport
     feat: add qLmdbDataset
-
+v1.1.32
+    fix: qtimer cuda mode record end before sync 
 
 # TODO
 

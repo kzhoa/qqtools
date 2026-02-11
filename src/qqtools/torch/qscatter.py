@@ -48,19 +48,22 @@ def scatter(
         return out
 
     if reduce == "mean":
+        # qq:
+        # This custom implementation is slightly faster than native `torch.scatter_reduce(..., reduce="mean")`
+        # in the following scenarios:
+        #   - When num_nodes < 500  on CPU
+        #   - When num_nodes > 10000 on GPU
+        # Performance is comparable in intermediate scenarios.
+        # see tests/speed/test_qscatter.py for details.
+        count = ref.new_zeros(dim_size)
+        count.scatter_add_(0, index, ref.new_ones(ref.size(dim)))
+        count = count.clamp(min=1)
+
         index = broadcast(index, ref, dim)
         out = ref.new_zeros(_size)
         out = out.scatter_add_(dim, index, ref)
 
-        # out.scatter_reduce_(dim, index, ref, reduce='mean', include_self=False)
-        # return out
-
-        ones = ref.new_ones(ref.shape)
-        count = ref.new_zeros(_size)
-        count.scatter_add_(dim, index, ones)
-        count.clamp_(min=1)
-
-        return out / count
+        return out / broadcast(count, out, dim)
 
     if reduce == "min":
         init_value = float("inf")
