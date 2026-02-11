@@ -192,8 +192,6 @@ def benchmark_scatter(num_nodes=1_0000, feature_dim=256, target_groups=32, n_ite
         print("CUDA not available, skipping GPU benchmarks.")
         gpu_times = {name: float("inf") for name in ["scatter_mean0", "scatter_mean1", "scatter_mean2"]}
 
-    # print(f"CPU times (ms): {cpu_times}")
-    # print(f"GPU times (ms): {gpu_times}")
     return cpu_times, gpu_times
 
 

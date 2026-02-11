@@ -124,6 +124,7 @@ v1.1.29
     feat: add qLmdbDataset
 v1.1.32
     fix: qtimer cuda mode record end before sync 
+    test: add speed test for scatter mean operator
 
 # TODO
 
