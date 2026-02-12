@@ -3,7 +3,9 @@ from collections import Counter
 from typing import Sequence
 
 import matplotlib.pyplot as plt
+import numpy as np
 
+from .plot_utils import plot_dict_distribution, plot_list_histogram
 from .qscaladict import qScalaDict
 
 
@@ -72,6 +74,34 @@ class qList(list):
     def to_list(self):
         return list(self)
 
+    def count(self):
+        return qScalaDict(Counter(self))
+
+    def count_count(self):
+        return qScalaDict(Counter(Counter(self).values()))
+
+    def stats(self):
+        """assume List of numbers"""
+        return {
+            "len": len(self),
+            "mean": sum(self) / len(self),
+            "min": min(self),
+            "max": max(self),
+            "25%": np.percentile(self, 25),
+            "50%": np.percentile(self, 50),
+            "75%": np.percentile(self, 75),
+        }
+
+    def plot_histogram(self, bins=10):
+        """"""
+        plot_list_histogram(self, bins=bins)
+
+    def plot_count(self):
+        plot_dict_distribution(self.count().to_dict())
+
+    def plot_count_count(self):
+        plot_dict_distribution(self.count_count().to_dict())
+
 
 class qDataList:
     """
@@ -127,7 +157,7 @@ class qDataList:
         self.cnt_cache[key] = counts
         return counts
 
-    def count_distribution(self, key, skip_none=False):
+    def count_count(self, key, skip_none=False):
         """
         Computes and returns the distribution of the counts of values for the specified key.
 
@@ -188,7 +218,7 @@ class qDataList:
         plt.show()
 
     def plot_count_distribution(self, key):
-        cnt_dist = self.count_distribution(key)
+        cnt_dist = self.count_count(key)
         names = list(cnt_dist.keys())
         counts = list(cnt_dist.values())
 

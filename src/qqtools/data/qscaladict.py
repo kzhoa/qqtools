@@ -1,5 +1,9 @@
 from typing import Dict, List, Optional, Tuple, Union
 
+import matplotlib.pyplot as plt
+
+from .plot_utils import plot_dict_distribution
+
 
 class qScalaDict:
     """
@@ -72,3 +76,27 @@ class qScalaDict:
 
     def items(self):
         return self.d.items()
+
+    def to_dict(self):
+        return self.d
+
+    def plot(self, terminal_width=80, sort_by="value", show_percentage=True, show_bar=True):
+        """Plot the qScalaDict using a smart distribution chart."""
+        plot_dict_distribution(
+            self.d,
+            terminal_width=terminal_width,
+            sort_by=sort_by,
+            show_percentage=show_percentage,
+            show_bar=show_bar,
+        )
+
+    def plot_bar(self, *args, **kwargs):
+        """Plot the qScalaDict using matplotlib."""
+
+        keys = list(self.d.keys())
+        values = list(self.d.values())
+        plt.bar(keys, values, *args, **kwargs)
+        plt.xlabel("Keys")
+        plt.ylabel("Values")
+        plt.tight_layout()
+        plt.show()
