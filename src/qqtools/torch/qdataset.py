@@ -2,6 +2,7 @@ import copy
 import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from functools import partial
 from pathlib import Path
 from typing import List, Sequence, Union
 
@@ -12,7 +13,6 @@ from torch import Tensor
 
 import qqtools as qt
 
-from ..data.qdatalist import qList
 from ..qimport import LazyImport
 from ..utils.warning import QDataWarning
 from .qsplit import get_data_splits
@@ -105,14 +105,14 @@ class qData(qt.qDict):
         return get_data_splits(total_num, sizes, ratios, seed)
 
 
-class qBatchList(qList):
-    def to(self, device):
-        """
-        This is a no-operation method that allows qBatchList to be used
-        in pipelines expecting PyTorch's `.to(device)` interface while
-        preserving the list-of-dicts structure without tensor conversion.
-        """
-        return
+# class qBatchList(qDataList):
+#     def to(self, device):
+#         """
+#         This is a no-operation method that allows qBatchList to be used
+#         in pipelines expecting PyTorch's `.to(device)` interface while
+#         preserving the list-of-dicts structure without tensor conversion.
+#         """
+#         return self
 
 
 def smart_combine(value_list: List, prefer_stack=False):
@@ -196,9 +196,111 @@ def collate_dict_samples(batch_list: List[dict]):
     return merged
 
 
-def collate_graph_samples(batch_list):
+def determine_graph_key_types(batch_list):
+    """
+    Determines the type (node, edge, or graph attribute) for each key in the graph samples.
+
+    Args:
+        batch_list: A list of graph sample dictionaries. Assumes all samples have consistent keys.
+
+
+    Returns:
+        A dictionary mapping attribute type ('node', 'edge', 'graph') to a set of keys.
+        Returns None if batch_list is empty or invalid.
+    """
+
+    reserved_keys = ["num_nodes", "edge_index", "batch"]
+
+    if not batch_list:
+        return None, None, None  # Return None if batch is empty
+
+    # ================= Determine Key Types =================
+    sample0 = batch_list[0]
+    _keys = list(sample0.keys())
+    assert all(k in sample for sample in batch_list for k in _keys), "Not all keys are the same in the batch"
+
+    attr_keys = set(_keys) - set(reserved_keys)
+    has_edge_index = "edge_index" in _keys
+
+    num_nodes0 = sample0.get("num_nodes", -1)
+    num_edges0 = 0
+    if has_edge_index and sample0["edge_index"].numel() > 0:
+        num_edges0 = sample0["edge_index"].shape[1]
+        if num_nodes0 == -1:
+            num_nodes0 = sample0["edge_index"].max().item() + 1
+
+    edge_attr_keys = set()
+    graph_attr_keys = set()
+    node_attr_keys = set()
+
+    for k in attr_keys:
+        value = sample0[k]
+
+        if not isinstance(value, (torch.Tensor, np.ndarray)) or value.ndim < 1:
+            continue
+
+        shape0 = value.shape[0]
+        # 1. Edge Attribute Identification (with cross-sample validation)
+        if has_edge_index and shape0 == num_edges0 and num_edges0 != num_nodes0:
+            is_consistent_edge_attr = True
+            for other_sample in batch_list[1:]:
+                n_edges_other = other_sample["edge_index"].shape[1]
+                if other_sample[k].shape[0] != n_edges_other:
+                    is_consistent_edge_attr = False
+                    break
+
+            if is_consistent_edge_attr:
+                edge_attr_keys.add(k)
+                continue
+
+        # 2. Node Attribute Identification (Primary Check)
+        # Check if the attribute's dimension varies across samples.
+        is_shape_constant = True
+        for other_sample in batch_list[1:]:
+            if other_sample[k].shape[0] != shape0:
+                is_shape_constant = False
+                break
+
+        if not is_shape_constant:
+            node_attr_keys.add(k)
+            continue
+        elif num_nodes0 != -1 and shape0 == num_nodes0:
+            # If shape matches num_nodes and is constant, it's likely a node attribute.
+            node_attr_keys.add(k)
+            continue
+
+        # 3. Graph Attribute Identification
+        # Treat attributes with constant shape across samples as graph attributes.
+        # This handles unknown/constant num_nodes. Misclassified node attributes
+        # can be recovered later if needed.
+        # If a constant-shape node attribute is misclassified as a graph attribute,
+        # its stacked form [B, C, ...] can be later reshaped to [B*C, ...]
+        # to function correctly as a node attribute [nA, ...].
+        graph_attr_keys.add(k)
+
+    if len(node_attr_keys) == 0:
+        # If edge_index exists, num_nodes can be inferred later, so okay to proceed.
+        if not has_edge_index and num_nodes0 == -1:
+            raise ValueError(
+                "No node attributes identified. Please check your data format. "
+                "If your graph has no node attributes, please add a dummy node attribute with shape (num_nodes, 1) to avoid ambiguity."
+            )
+
+    key_types = {
+        "node": node_attr_keys,
+        "edge": edge_attr_keys,
+        "graph": graph_attr_keys,
+    }
+    return key_types
+
+
+def collate_graph_samples(batch_list, key_types=None):
     """
     Collates a list of graph samples into a single batch.
+
+    Reserved keys:
+        - 'num_nodes': int
+        - 'edge_index': Tensor[2,E]
 
     Args:
         batch_list: List of dictionaries, each representing a graph sample.
@@ -211,7 +313,10 @@ def collate_graph_samples(batch_list):
         - Edge indices adjusted with offsets
         - Batch indices indicating which sample each node belongs to
     """
-    reserved_keys = ["edge_index", "batch"]
+    if not batch_list:
+        return {}  # Return empty dict for empty batch
+
+    reserved_keys = ["num_nodes", "edge_index", "batch"]
     batch_indices = []
     node_count = 0
     graph_data = defaultdict(list)
@@ -223,31 +328,43 @@ def collate_graph_samples(batch_list):
     attr_keys = set(_keys) - set(reserved_keys)
     has_edge_index = "edge_index" in _keys
 
-    #  classify attribute types based on first sample
-    sample0 = batch_list[0]
-    num_edges0 = sample0["edge_index"].shape[1] if has_edge_index else 0
-    edge_attr_keys = set()
-    for k in attr_keys:
-        value = sample0[k]
-        if isinstance(value, (torch.Tensor, np.ndarray)) and value.ndim >= 1:
-            if has_edge_index and value.shape[0] == num_edges0:
-                edge_attr_keys.add(k)
+    # Determine key types if not provided, or convert input format to sets
+    if key_types is None:
+        determined_key_types = determine_graph_key_types(batch_list)
+        if determined_key_types is None:  # Handle case where determine_key_types returns None
+            return {}
+        node_attr_keys = determined_key_types["node"]
+        edge_attr_keys = determined_key_types["edge"]
+        graph_attr_keys = determined_key_types["graph"]
+    else:
+        # Convert input types to sets if they aren't already
+        node_attr_keys = set(key_types.get("node", set()))
+        edge_attr_keys = set(key_types.get("edge", set()))
+        graph_attr_keys = set(key_types.get("graph", set()))
+        # Basic validation: Ensure provided keys are actually present attributes
+        all_provided_attrs = node_attr_keys.union(edge_attr_keys).union(graph_attr_keys)
+        unclassified_attrs = attr_keys - all_provided_attrs
+        if unclassified_attrs:
+            # Raise an error instead of a warning if attributes are unclassified.
+            # This enforces that every attribute must be assigned a type.
+            raise ValueError(
+                f"The following attributes were found in the batch but not classified "
+                f"as node, edge, or graph attributes: {unclassified_attrs}. "
+                f"Please ensure they are correctly identified or included in key_types."
+            )
 
-    # handle
+    # ================= Handle Loop =================
     for i, sample in enumerate(batch_list):
-        num_nodes = None
-        for k in attr_keys:
-            if k not in edge_attr_keys:  # skip edge attributes
-                value = sample[k]
-                # qq: have to consider single node graph
-                # fix a bug relatvie to skipped batch-index
-                if isinstance(value, (torch.Tensor, np.ndarray)) and value.ndim >= 1:
-                    if num_nodes is None:
-                        num_nodes = value.shape[0]
-                    else:
-                        assert (
-                            num_nodes == value.shape[0]
-                        ), f"Node count of key {k} mismatch for sample {i}, got {num_nodes} and {value.shape[0]}"
+        num_nodes = None if "num_nodes" not in sample else sample["num_nodes"]
+        for k in node_attr_keys:
+            value = sample[k]
+            if isinstance(value, (torch.Tensor, np.ndarray)) and value.ndim >= 1:
+                if num_nodes is None:
+                    num_nodes = value.shape[0]
+                else:
+                    assert (
+                        num_nodes == value.shape[0]
+                    ), f"Node count of key `{k}` mismatch for sample {i}, got {num_nodes} and {value.shape[0]}"
 
         num_edges = None
         if has_edge_index:
@@ -273,15 +390,26 @@ def collate_graph_samples(batch_list):
             batch_indices.append(torch.full((num_nodes,), i, dtype=torch.long))
             node_count += num_nodes
 
-    # Concatenate all data
+    # ================= Concatenate Data =================
     for key, value_list in graph_data.items():
-        graph_data[key] = smart_combine(value_list, prefer_stack=False)
+        if key in graph_attr_keys:
+            graph_data[key] = smart_combine(value_list, prefer_stack=True)
+        elif key in node_attr_keys or key in edge_attr_keys:
+            graph_data[key] = smart_combine(value_list, prefer_stack=False)
+        else:
+            # Should not happen if classification is correct
+            raise KeyError(f"Attribute '{key}' was not classified as node, edge, or graph attribute.")
 
-    batch_combined = torch.cat(batch_indices, dim=0)
+    if len(batch_indices) > 0:
+        batch_combined = torch.cat(batch_indices, dim=0)
+    else:
+        batch_combined = torch.empty(0, dtype=torch.long)  # keep consistent type even if empty
+
     result = qt.qData({"batch": batch_combined, **graph_data})
     if has_edge_index:
         result["edge_index"] = torch.cat(edge_index_list, dim=1)
 
+    # TODO maybe if has_num_nodes?
     return result
 
 
@@ -521,7 +649,7 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
         return collate_graph_samples(*args, **kwargs)
 
     @staticmethod
-    def collate_keep_list_of_dict(batch_list) -> qBatchList:
+    def collate_keep_list_of_dict(batch_list):
         """
         Custom collate function that preserves list of dictionaries structure.
 
@@ -543,7 +671,7 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
         Returns:
             qList: The input list of dictionaries, unchanged. Compatible with batch_data.to(device) usage。
         """
-        return qBatchList(batch_list)
+        return batch_list
 
     def to_list_dataloader(self, batch_size, **kwargs):
         return qDictDataloader(
@@ -603,10 +731,31 @@ class qDictDataloader(torch.utils.data.DataLoader):
             - Concatenate node features along the node dimension
             - Handle both node-level and edge-level attributes appropriately
         """
-        # If no collate_fn is provided, use the default behavior
+
+        _collate_fn_to_use = collate_fn
+
         if collate_fn is None:
-            collate_fn = collate_graph_samples if is_graph else collate_dict_samples
-        super().__init__(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, **kwargs)
+            if is_graph:
+                # Create the stateful collate fn that caches key type inference results for efficiency
+                _collate_fn_to_use = self._create_stateful_graph_collate()
+                print(f"qDictDataloader: is_graph=True. Using stateful graph collator: {_collate_fn_to_use.__name__}")
+            else:
+                _collate_fn_to_use = collate_dict_samples
+                print("qDictDataloader: is_graph=False. Using default collate_dict_samples.")
+
+        super().__init__(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=_collate_fn_to_use, **kwargs)
+
+    def _create_stateful_graph_collate(self):
+        self._cached_key_types = None
+
+        def stateful_graph_collate(batch_list):
+            if self._cached_key_types is None:
+                inferred_types = determine_graph_key_types(batch_list)
+                self._cached_key_types = inferred_types
+            return collate_graph_samples(batch_list, key_types=self._cached_key_types)
+
+        stateful_graph_collate.__name__ = "_stateful_graph_collate_internal"
+        return stateful_graph_collate
 
 
 class qLmdbDataset(qDictDataset):
