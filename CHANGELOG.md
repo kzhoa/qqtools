@@ -129,7 +129,8 @@ v1.1.32
     test: add speed test for calc refe implementations
 v1.1.33
     feat: add lmdb env proxy
-    
+    feat: enhance qlist with plot
+
 
 # TODO
 
