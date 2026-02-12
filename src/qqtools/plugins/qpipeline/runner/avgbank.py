@@ -1,7 +1,8 @@
 import warnings
 
-import qqtools as qt
 import torch
+
+import qqtools as qt
 from qqtools import qdist
 
 
@@ -33,13 +34,9 @@ class AverageMeter:
 
     def ddp_average(self):
         device = qt.parse_device(qdist.get_rank())
-
-        _sum = torch.tensor(self.sum, dtype=torch.float64, device=device)
-        _cnt = torch.tensor(self.count, dtype=torch.float64, device=device)
-        ddp_sum = qdist.all_reduce(_sum, device, "mean").item()
-        ddp_count = qdist.all_reduce(_cnt, device, "mean").item()
-
-        ddp_avg = ddp_sum / ddp_count if ddp_count > 0 else 0
+        data = torch.tensor([self.sum, self.count], dtype=torch.float64, device=device)
+        data = qdist.all_reduce(data, device, "mean")
+        ddp_avg = (data[0] / data[1]).item() if data[1] > 0 else 0
         return ddp_avg
 
 

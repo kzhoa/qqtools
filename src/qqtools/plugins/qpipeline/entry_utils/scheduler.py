@@ -1,8 +1,9 @@
 from typing import Dict, Protocol, Type
 
-import qqtools as qt
 import torch
 from torch.optim.lr_scheduler import LambdaLR, LinearLR, LRScheduler, ReduceLROnPlateau
+
+import qqtools as qt
 
 __all__ = ["prepare_scheduler"]
 
@@ -149,6 +150,10 @@ class qWarmupScheduler(LRScheduler):
 
         # should be called after everthing is initialized
         super().__init__(optimizer, last_epoch)
+
+    def _initial_step(self) -> None:
+        """Initialize step counts and perform a step."""
+        pass
 
     def step(self, metrics=None, epoch=None):
         """backward compatibility"""
