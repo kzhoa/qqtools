@@ -11,10 +11,14 @@ dependencies = ["torch", "PyYAML", "matplotlib", "pandas", "scipy", "rich"]
 
 # note:
 # scipy requires: numpy
-# seaborn requires: matplotlib
+# matplotlib requires: numpy
+# seaborn requires: matplotlib, pandas
 
 [project.optional-dependencies]
-full = ["rich", "scikit-learn", "lmdb", "tqdm", "requests"]
+# optionally required by standard distribution
+std = ["lmdb", "tqdm", "requests"]
+plugins = ["rich", "scikit-learn"]
+full = ["qqtools[std]", "qqtools[plugins]"]  # all optional dependencies
 dev = ["pytest", "black", "isort", "flake8"]
 
 
