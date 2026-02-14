@@ -43,7 +43,12 @@ from .utils.qtypecheck import ensure_scala, ensure_numpy, str2number, is_number,
 from .utils.check import check_values_allowed, is_alias_exists
 
 # attr
-from .utils.attr import hasattr_safe, getmultiattr, is_override
+from .utils.qattr import hasattr_safe, getmultiattr, is_override
+
+
+# --- optional dependencies ---
+# net IO rely on `requests`
+from .config.fetch.gdown import download_from_gdrive_sharelink
 
 
 # plugins

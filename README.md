@@ -118,7 +118,7 @@ under `plugins/`
 
 - qchem
 - qpipeline
-
+- qhyperconnect
 
 
 # Test
