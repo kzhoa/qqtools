@@ -39,13 +39,12 @@ class LazyImport:
     def _load_target(self):
         try:
             module = import_module(self.module_name)
+            if not self.object_name:
+                self._target = module
+            else:
+                self._target = getattr(module, self.object_name)
         except Exception as e:
             raise ImportError(f"Failed to import {self.module_name}") from e
-
-        if not self.object_name:
-            self._target = module
-        else:
-            self._target = getattr(module, self.object_name)
 
     def __getattr__(self, name):
         if self._target is None:
@@ -55,12 +54,15 @@ class LazyImport:
     def __getitem__(self, key):
         if self._target is None:
             self._load_target()
-        return self._target.__getitem__(key)
+        return self._target[key]
 
     def __call__(self, *args, **kwargs):
         if self._target is None:
             self._load_target()
         return self._target(*args, **kwargs)
+
+    def __repr__(self):
+        return f"<qLazyImport {self.module_name}.{self.object_name or ''}>"
 
 
 class LazyImportErrorProxy:
@@ -110,7 +112,7 @@ def import_common(g=None):
     g["trange"] = LazyImport("tqdm", "trange")
     g["lmdb"] = LazyImport("lmdb")
 
-    # typing
+    # typing, `__class_getitem__` only supported by python >= 3.7 PEP 560
     g["Any"] = LazyImport("typing", "Any")
     g["Dict"] = LazyImport("typing", "Dict")
     g["Iterable"] = LazyImport("typing", "Iterable")

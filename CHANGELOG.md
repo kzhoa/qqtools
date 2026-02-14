@@ -132,7 +132,8 @@ v1.1.33
     feat: enhance qlist with plot
     feat: separate key types inference from graph collate fn 
     feat: allow qdictdataloader to cached key types for graph data
-
+    feat: add gdown into fetch module
+    fix: LazyImport support subscription operator for typing annotations
 
 # TODO
 
