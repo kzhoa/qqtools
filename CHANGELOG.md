@@ -130,6 +130,8 @@ v1.1.32
 v1.1.33
     feat: add lmdb env proxy
     feat: enhance qlist with plot
+    feat: separate key types inference from graph collate fn 
+    feat: allow qdictdataloader to cached key types for graph data
 
 
 # TODO

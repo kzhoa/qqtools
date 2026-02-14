@@ -14,7 +14,7 @@ dependencies = ["torch", "PyYAML", "matplotlib", "pandas", "scipy", "rich"]
 # seaborn requires: matplotlib
 
 [project.optional-dependencies]
-full = ["rich", "scikit-learn", "lmdb", "tqdm"]
+full = ["rich", "scikit-learn", "lmdb", "tqdm", "requests"]
 dev = ["pytest", "black", "isort", "flake8"]
 
 
