@@ -4,7 +4,7 @@
 ## 1 Common Functionals 
 
 - √ qdict 
--  qtimer
+- √ qtimer
 -  qdata
 -  qlogreader
 
