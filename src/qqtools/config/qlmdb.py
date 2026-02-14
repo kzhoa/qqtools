@@ -25,11 +25,16 @@ with qt.operate_lmdb('data.lmdb', write=False) as txn:
 """
 
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 from ..qimport import LazyImport
 
-lmdb = LazyImport("lmdb")
-tqdm = LazyImport("tqdm", "tqdm")
+if TYPE_CHECKING:
+    import lmdb
+    from tqdm import tqdm
+else:
+    lmdb = LazyImport("lmdb")
+    tqdm = LazyImport("tqdm", "tqdm")
 
 MAP_SIZE = 100 * 1024 * 1024 * 1024
 
