@@ -134,6 +134,9 @@ v1.1.33
     feat: allow qdictdataloader to cached key types for graph data
     feat: add gdown into fetch module
     fix: LazyImport support subscription operator for typing annotations
+v1.1.34
+    refactor: 
+
 
 # TODO
 

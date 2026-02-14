@@ -1,5 +1,8 @@
 """
 torch.jit friendly implementation of scatter()
+
+start from v1.1.34, we use torch.compile because of warning:
+>> `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
 """
 
 from typing import Optional
@@ -14,7 +17,7 @@ def broadcast(src: Tensor, ref: Tensor, dim: int) -> Tensor:
     return src.view(size).expand_as(ref)
 
 
-@torch.jit.script
+@torch.compile
 def scatter(
     ref: Tensor,
     index: Tensor,
@@ -54,7 +57,7 @@ def scatter(
         #   - When num_nodes < 500  on CPU
         #   - When num_nodes > 10000 on GPU
         # Performance is comparable in intermediate scenarios.
-        # see tests/speed/qscatter/test_qscatter_mean.py for details.
+        # see `tests/speed/qscatter/test_qscatter_mean.py` for details.
         count = ref.new_zeros(dim_size)
         count.scatter_add_(0, index, ref.new_ones(ref.size(dim)))
         count = count.clamp(min=1)
