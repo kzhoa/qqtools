@@ -135,8 +135,10 @@ v1.1.33
     feat: add gdown into fetch module
     fix: LazyImport support subscription operator for typing annotations
 v1.1.34
+    feat: add qconfiggen and cli command
     refactor: change jit.script to compile for qscatter
-
+    docs: qconfig schema to qcgen
+    docs: qconfig format under docs/ 
 
 # TODO
 

@@ -1,0 +1,53 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "earlystopper.json",
+    "type": "object",
+    "description": "Early stopping configuration to monitor a metric and stop training when it stops improving",
+    "properties": {
+        "target": {
+            "type": "string",
+            "description": "The name of the metric to monitor (e.g., 'val_mae', 'val_loss')"
+        },
+        "patience": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Number of epochs with no improvement after which training will be stopped"
+        },
+        "mode": {
+            "type": "string",
+            "enum": [
+                "min",
+                "max"
+            ],
+            "default": "min",
+            "description": "In 'min' mode, training stops if metric stops decreasing. In 'max' mode, training stops if metric stops increasing"
+        },
+        "min_delta": {
+            "type": "number",
+            "minimum": 0,
+            "default": 0.0,
+            "description": "Minimum change in the monitored metric to qualify as an improvement"
+        },
+        "lower_bound": {
+            "type": [
+                "number",
+                "null"
+            ],
+            "default": null,
+            "description": "If provided, training stops if metric goes below this value"
+        },
+        "upper_bound": {
+            "type": [
+                "number",
+                "null"
+            ],
+            "default": null,
+            "description": "If provided, training stops if metric goes above this value"
+        }
+    },
+    "required": [
+        "target",
+        "patience"
+    ],
+    "additionalProperties": false
+}

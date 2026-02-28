@@ -1,0 +1,121 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "optim.json",
+    "type": "object",
+    "properties": {
+        "loss": {
+            "type": [
+                "string",
+                "object"
+            ],
+            "description": "Loss function"
+        },
+        "loss_params": {
+            "type": "object",
+            "description": "Loss function parameters",
+            "additionalProperties": true
+        },
+        "optimizer": {
+            "type": "string",
+            "enum": [
+                "adamw",
+                "sgd",
+                "adam",
+                "rmsprop"
+            ],
+            "description": "Optimizer type"
+        },
+        "optimizer_params": {
+            "type": "object",
+            "properties": {
+                "betas": {
+                    "type": "array",
+                    "items": [
+                        {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1
+                        },
+                        {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1
+                        }
+                    ],
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "Adam beta parameters (0.9, 0.999)"
+                },
+                "eps": {
+                    "type": "number",
+                    "minimum": 1e-10,
+                    "description": "Numerical stability term"
+                },
+                "lr": {
+                    "type": "number",
+                    "minimum": 1e-8,
+                    "description": "Learning rate"
+                },
+                "weight_decay": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "L2 regularization"
+                },
+                "momentum": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "sgd momentum"
+                },
+                "amsgrad": {
+                    "type": "boolean"
+                }
+            },
+            "required": [
+                "lr"
+            ],
+            "additionalProperties": false
+        },
+        "scheduler": {
+            "type": "string",
+            "enum": [
+                "step",
+                "cosine",
+                "plateau"
+            ],
+            "description": "Learning rate scheduler"
+        },
+        "scheduler_params": {
+            "$ref": "./scheduler.json"
+        },
+        "ema_params": {
+            "type": "object",
+            "properties": {
+                "ema_decay": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.99,
+                    "description": "Decay rate for exponential moving average (EMA)"
+                },
+                "ema": {
+                    "type": "boolean",
+                    "description": "Enable exponential moving average (EMA) of model parameters"
+                }
+            },
+            "description": "controls for exponential moving average (EMA) of model parameters"
+        },
+        "use_warmup": {
+            "type": "boolean",
+            "description": "Enable learning rate warmup"
+        },
+        "warmup_params": {
+            "$ref": "./warmup.json"
+        }
+    },
+    "required": [
+        "loss",
+        "optimizer",
+        "optimizer_params"
+    ],
+    "additionalProperties": false
+}

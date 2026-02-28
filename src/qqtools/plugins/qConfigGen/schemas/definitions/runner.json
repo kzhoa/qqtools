@@ -1,0 +1,95 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "runner.json",
+    "type": "object",
+    "properties": {
+        "run_mode": {
+            "type": "string",
+            "enum": [
+                "epoch",
+                "step"
+            ],
+            "default": "epoch",
+            "description": "Training running mode. 'epoch' means evaluation/saving happens at epoch end, 'step' means at specific step intervals"
+        },
+        "max_epochs": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of training epochs"
+        },
+        "max_steps": {
+            "type": [
+                "integer",
+                "null"
+            ],
+            "minimum": 1,
+            "default": null,
+            "description": "Maximum number of training steps. Used when run_mode='step'. Ignored when run_mode='epoch'. If null, no step limit is applied and training relies solely on max_epochs."
+        },
+        "eval_interval": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1,
+            "description": "Evaluation interval. Interpreted as epochs if run_mode='epoch', steps if run_mode='step'"
+        },
+        "save_interval": {
+            "type": [
+                "integer",
+                "null"
+            ],
+            "minimum": 1,
+            "default": null,
+            "description": "Regular checkpoint saving interval in steps. null disables regular saving"
+        },
+        "clip_grad": {
+            "type": [
+                "number",
+                "null"
+            ],
+            "minimum": 0.1,
+            "default": null,
+            "description": "Gradient clipping threshold (null disables clipping)"
+        },
+        "early_stop": {
+            "$ref": "./earlystop.json"
+        }
+    },
+    "oneOf": [
+        {
+            "properties": {
+                "run_mode": {
+                    "const": "epoch"
+                }
+            },
+            "required": [
+                "run_mode",
+                "max_epochs",
+                "early_stop"
+            ]
+        },
+        {
+            "properties": {
+                "run_mode": {
+                    "const": "step"
+                }
+            },
+            "required": [
+                "run_mode",
+                "early_stop"
+            ],
+            "anyOf": [
+                {
+                    "required": [
+                        "max_epochs"
+                    ]
+                },
+                {
+                    "required": [
+                        "max_steps"
+                    ]
+                }
+            ]
+        }
+    ],
+    "additionalProperties": false
+}

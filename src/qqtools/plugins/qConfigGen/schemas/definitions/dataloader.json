@@ -1,0 +1,25 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "dataloader.json",
+    "type": "object",
+    "description": "Configuration for the data loader.",
+    "properties": {
+        "batch_size": {
+            "type": "integer",
+            "description": "Batch size for data loading.",
+            "minimum": 1
+        },
+        "num_workers": {
+            "type": "integer",
+            "description": "Number of worker threads for data loading.",
+            "minimum": 0
+        },
+        "pin_memory": {
+            "type": "boolean",
+            "description": "Whether to pin memory for faster GPU transfer."
+        }
+    },
+    "required": [
+        "batch_size"
+    ]
+}
