@@ -7,223 +7,6 @@ import torch
 import qqtools as qt
 from qqtools.torch.qdataset import collate_graph_samples, determine_graph_key_types, smart_combine
 
-# def determine_graph_key_types(batch_list):
-#     """
-#     Determines the type (node, edge, or graph attribute) for each key in the graph samples.
-
-#     Args:
-#         batch_list: A list of graph sample dictionaries. Assumes all samples have consistent keys.
-
-
-#     Returns:
-#         A dictionary mapping attribute type ('node', 'edge', 'graph') to a set of keys.
-#         Returns None if batch_list is empty or invalid.
-#     """
-
-#     reserved_keys = ["num_nodes", "edge_index", "batch"]
-
-#     if not batch_list:
-#         return None, None, None  # Return None if batch is empty
-
-#     # ================= Determine Key Types =================
-#     sample0 = batch_list[0]
-#     _keys = list(sample0.keys())
-#     assert all(k in sample for sample in batch_list for k in _keys), "Not all keys are the same in the batch"
-
-#     attr_keys = set(_keys) - set(reserved_keys)
-#     has_edge_index = "edge_index" in _keys
-
-#     num_nodes0 = sample0.get("num_nodes", -1)
-#     num_edges0 = 0
-#     if has_edge_index and sample0["edge_index"].numel() > 0:
-#         num_edges0 = sample0["edge_index"].shape[1]
-#         if num_nodes0 == -1:
-#             num_nodes0 = sample0["edge_index"].max().item() + 1
-
-#     edge_attr_keys = set()
-#     graph_attr_keys = set()
-#     node_attr_keys = set()
-
-#     for k in attr_keys:
-#         value = sample0[k]
-
-#         if not isinstance(value, (torch.Tensor, np.ndarray)) or value.ndim < 1:
-#             continue
-
-#         shape0 = value.shape[0]
-#         # 1. Edge Attribute Identification (with cross-sample validation)
-#         if has_edge_index and shape0 == num_edges0 and num_edges0 != num_nodes0:
-#             is_consistent_edge_attr = True
-#             for other_sample in batch_list[1:]:
-#                 n_edges_other = other_sample["edge_index"].shape[1]
-#                 if other_sample[k].shape[0] != n_edges_other:
-#                     is_consistent_edge_attr = False
-#                     break
-
-#             if is_consistent_edge_attr:
-#                 edge_attr_keys.add(k)
-#                 continue
-
-#         # 2. Node Attribute Identification (Primary Check)
-#         # Check if the attribute's dimension varies across samples.
-#         is_shape_constant = True
-#         for other_sample in batch_list[1:]:
-#             if other_sample[k].shape[0] != shape0:
-#                 is_shape_constant = False
-#                 break
-
-#         if not is_shape_constant:
-#             node_attr_keys.add(k)
-#             continue
-#         elif num_nodes0 != -1 and shape0 == num_nodes0:
-#             # If shape matches num_nodes and is constant, it's likely a node attribute.
-#             node_attr_keys.add(k)
-#             continue
-
-#         # 3. Graph Attribute Identification
-#         # Treat attributes with constant shape across samples as graph attributes.
-#         # This handles unknown/constant num_nodes. Misclassified node attributes
-#         # can be recovered later if needed.
-#         # If a constant-shape node attribute is misclassified as a graph attribute,
-#         # its stacked form [B, C, ...] can be later reshaped to [B*C, ...]
-#         # to function correctly as a node attribute [nA, ...].
-#         graph_attr_keys.add(k)
-
-#     if len(node_attr_keys) == 0:
-#         # If edge_index exists, num_nodes can be inferred later, so okay to proceed.
-#         if not has_edge_index and num_nodes0 == -1:
-#             raise ValueError(
-#                 "No node attributes identified. Please check your data format. "
-#                 "If your graph has no node attributes, please add a dummy node attribute with shape (num_nodes, 1) to avoid ambiguity."
-#             )
-
-#     key_types = {
-#         "node": node_attr_keys,
-#         "edge": edge_attr_keys,
-#         "graph": graph_attr_keys,
-#     }
-#     return key_types
-
-
-# def collate_graph_samples(batch_list, key_types=None):
-#     """
-#     Collates a list of graph samples into a single batch.
-
-#     Reserved keys:
-#         - 'num_nodes': int
-#         - 'edge_index': Tensor[2,E]
-
-#     Args:
-#         batch_list: List of dictionaries, each representing a graph sample.
-#                    Each sample should have consistent keys.
-#                    Expected keys may include "edge_index" and others.
-
-#     Returns:
-#         A dictionary containing the batched data with:
-#         - All node features concatenated
-#         - Edge indices adjusted with offsets
-#         - Batch indices indicating which sample each node belongs to
-#     """
-#     if not batch_list:
-#         return {}  # Return empty dict for empty batch
-
-#     reserved_keys = ["num_nodes", "edge_index", "batch"]
-#     batch_indices = []
-#     node_count = 0
-#     graph_data = defaultdict(list)
-#     edge_index_list = []
-
-#     _keys = list(batch_list[0].keys())
-#     assert all(k in sample for sample in batch_list for k in _keys), "Not all keys are the same in the batch"
-
-#     attr_keys = set(_keys) - set(reserved_keys)
-#     has_edge_index = "edge_index" in _keys
-
-#     # Determine key types if not provided, or convert input format to sets
-#     if key_types is None:
-#         determined_key_types = determine_graph_key_types(batch_list)
-#         if determined_key_types is None:  # Handle case where determine_key_types returns None
-#             return {}
-#         node_attr_keys = determined_key_types["node"]
-#         edge_attr_keys = determined_key_types["edge"]
-#         graph_attr_keys = determined_key_types["graph"]
-#     else:
-#         # Convert input types to sets if they aren't already
-#         node_attr_keys = set(key_types.get("node", set()))
-#         edge_attr_keys = set(key_types.get("edge", set()))
-#         graph_attr_keys = set(key_types.get("graph", set()))
-#         # Basic validation: Ensure provided keys are actually present attributes
-#         all_provided_attrs = node_attr_keys.union(edge_attr_keys).union(graph_attr_keys)
-#         unclassified_attrs = attr_keys - all_provided_attrs
-#         if unclassified_attrs:
-#             # Raise an error instead of a warning if attributes are unclassified.
-#             # This enforces that every attribute must be assigned a type.
-#             raise ValueError(
-#                 f"The following attributes were found in the batch but not classified "
-#                 f"as node, edge, or graph attributes: {unclassified_attrs}. "
-#                 f"Please ensure they are correctly identified or included in key_types."
-#             )
-
-#     # ================= Handle Loop =================
-#     for i, sample in enumerate(batch_list):
-#         num_nodes = None if "num_nodes" not in sample else sample["num_nodes"]
-#         for k in node_attr_keys:
-#             value = sample[k]
-#             if isinstance(value, (torch.Tensor, np.ndarray)) and value.ndim >= 1:
-#                 if num_nodes is None:
-#                     num_nodes = value.shape[0]
-#                 else:
-#                     assert (
-#                         num_nodes == value.shape[0]
-#                     ), f"Node count of key `{k}` mismatch for sample {i}, got {num_nodes} and {value.shape[0]}"
-
-#         num_edges = None
-#         if has_edge_index:
-#             edge_index = sample["edge_index"]
-#             num_edges = edge_index.shape[1]
-#             if num_nodes is None:
-#                 # infer num_nodes from edge_index if no node attributes
-#                 num_nodes = edge_index.max().item() + 1
-#             # adjust edge indices with cumulative offset
-#             adjusted_edge_index = edge_index.clone()
-#             adjusted_edge_index += node_count
-#             edge_index_list.append(adjusted_edge_index)
-
-#         # store all data
-#         for key in attr_keys:
-#             value = sample[key]
-#             if key not in reserved_keys:
-#                 graph_data[key].append(value)
-
-#         # create batch indices
-#         # consider situation that only graph attributes provided
-#         if num_nodes is not None:
-#             batch_indices.append(torch.full((num_nodes,), i, dtype=torch.long))
-#             node_count += num_nodes
-
-#     # ================= Concatenate Data =================
-#     for key, value_list in graph_data.items():
-#         if key in graph_attr_keys:
-#             graph_data[key] = smart_combine(value_list, prefer_stack=True)
-#         elif key in node_attr_keys or key in edge_attr_keys:
-#             graph_data[key] = smart_combine(value_list, prefer_stack=False)
-#         else:
-#             # Should not happen if classification is correct
-#             raise KeyError(f"Attribute '{key}' was not classified as node, edge, or graph attribute.")
-
-#     if len(batch_indices) > 0:
-#         batch_combined = torch.cat(batch_indices, dim=0)
-#     else:
-#         batch_combined = torch.empty(0, dtype=torch.long)  # keep consistent type even if empty
-
-#     result = qt.qData({"batch": batch_combined, **graph_data})
-#     if has_edge_index:
-#         result["edge_index"] = torch.cat(edge_index_list, dim=1)
-
-#     # TODO maybe if has_num_nodes?
-#     return result
-
-
 # --- Pytest Test Cases ---
 
 
@@ -529,3 +312,177 @@ def test_node_attribute_missing_in_one_sample():
 
     # If you wanted it to handle missing attributes, you'd need to modify the code
     # to use sample.get(k) more broadly and potentially add padding logic.
+
+
+def test_determine_graph_key_types_raises_when_variable_keys_cannot_be_disambiguated():
+    """Variable-length attributes without node/edge anchors should raise explicit error."""
+    batch_list = [
+        {
+            "x": torch.randn(3, 4),
+            "aux": torch.randn(3, 2),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "x": torch.randn(5, 4),
+            "aux": torch.randn(5, 2),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    with pytest.raises(ValueError, match="Cannot determine attribute types"):
+        determine_graph_key_types(batch_list)
+
+
+def test_special_named_edge_index_offsets_like_edge_index():
+    batch_list = [
+        {
+            "num_nodes": 3,
+            "x": torch.randn(3, 2),
+            "edge_d_index": torch.tensor([[0, 1, 2], [1, 2, 0]], dtype=torch.long),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 2),
+            "edge_d_index": torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+
+    assert "edge_d_index" in result
+    expected = torch.tensor([[0, 1, 2, 3, 4], [1, 2, 0, 4, 3]], dtype=torch.long)
+    assert torch.equal(result["edge_d_index"], expected)
+
+
+def test_special_named_edge_index_infers_num_nodes_without_edge_index():
+    batch_list = [
+        {
+            "edge_d_index": torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "edge_d_index": torch.tensor([[0], [2]], dtype=torch.long),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+
+    # sample0 infers 2 nodes, sample1 infers 3 nodes
+    assert torch.equal(result["batch"], torch.tensor([0, 0, 1, 1, 1]))
+    expected = torch.tensor([[0, 1, 2], [1, 0, 4]], dtype=torch.long)
+    assert torch.equal(result["edge_d_index"], expected)
+
+
+def test_special_named_edge_attr_concatenate_1d():
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 1),
+            "edge_d_attr": torch.tensor([0.1, 0.2, 0.3, 0.4]),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "num_nodes": 3,
+            "x": torch.randn(3, 1),
+            "edge_d_attr": torch.tensor([0.5] * 9),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+
+    assert "edge_d_attr" in result
+    assert result["edge_d_attr"].shape == (13,)
+    assert torch.allclose(result["edge_d_attr"][:4], torch.tensor([0.1, 0.2, 0.3, 0.4]))
+
+
+def test_special_named_edge_attr_concatenate_2d():
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 1),
+            "edge_d_attr": torch.randn(4, 3),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "num_nodes": 3,
+            "x": torch.randn(3, 1),
+            "edge_d_attr": torch.randn(9, 3),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+    assert result["edge_d_attr"].shape == (13, 3)
+
+
+def test_special_named_edge_index_and_attr_together():
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 2),
+            "edge_d_index": torch.tensor([[0, 1, 0, 1], [0, 0, 1, 1]], dtype=torch.long),
+            "edge_d_attr": torch.arange(4, dtype=torch.float32),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "num_nodes": 3,
+            "x": torch.randn(3, 2),
+            "edge_d_index": torch.tensor([[0, 1, 2, 0, 1, 2, 0, 1, 2], [0, 0, 0, 1, 1, 1, 2, 2, 2]], dtype=torch.long),
+            "edge_d_attr": torch.arange(9, dtype=torch.float32) + 10,
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+
+    assert result["edge_d_index"].shape == (2, 13)
+    assert result["edge_d_attr"].shape == (13,)
+    # First 4 attrs come from sample0, next 9 from sample1
+    assert torch.equal(result["edge_d_attr"][:4], torch.arange(4, dtype=torch.float32))
+    assert torch.equal(result["edge_d_attr"][4:], torch.arange(9, dtype=torch.float32) + 10)
+
+
+def test_special_named_edge_index_invalid_shape_raises():
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 1),
+            "edge_d_index": torch.tensor([0, 1, 1, 0], dtype=torch.long),
+            "graph_attr": torch.tensor([1.0]),
+        }
+    ]
+
+    with pytest.raises(ValueError, match=r"must have shape \[2, E\]"):
+        collate_graph_samples(batch_list)
+
+
+def test_special_named_edge_index_invalid_dtype_raises():
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 1),
+            "edge_d_index": torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float32),
+            "graph_attr": torch.tensor([1.0]),
+        }
+    ]
+
+    with pytest.raises(TypeError, match="must be an integer tensor"):
+        collate_graph_samples(batch_list)
+
+
+def test_special_named_edge_attr_invalid_scalar_raises():
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 1),
+            "edge_d_attr": torch.tensor(1.0),
+            "graph_attr": torch.tensor([1.0]),
+        }
+    ]
+
+    with pytest.raises(ValueError, match="must have at least 1 dimension"):
+        collate_graph_samples(batch_list)

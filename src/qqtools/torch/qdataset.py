@@ -222,16 +222,25 @@ def determine_graph_key_types(batch_list):
     attr_keys = set(_keys) - set(reserved_keys)
     has_edge_index = "edge_index" in _keys
 
-    num_nodes0 = sample0.get("num_nodes", -1)
-    num_edges0 = 0
-    if has_edge_index and sample0["edge_index"].numel() > 0:
-        num_edges0 = sample0["edge_index"].shape[1]
-        if num_nodes0 == -1:
-            num_nodes0 = sample0["edge_index"].max().item() + 1
+    num_nodes_by_sample = []
+    num_edges_by_sample = []
+    for sample in batch_list:
+        num_nodes = sample.get("num_nodes", None)
+        num_edges = None
+        if has_edge_index:
+            edge_index = sample["edge_index"]
+            num_edges = edge_index.shape[1]
+            if num_nodes is None and edge_index.numel() > 0:
+                num_nodes = edge_index.max().item() + 1
+
+        num_nodes_by_sample.append(num_nodes)
+        num_edges_by_sample.append(num_edges)
 
     edge_attr_keys = set()
     graph_attr_keys = set()
     node_attr_keys = set()
+    pending_attr_keys = set()
+    key_length_signature = {}
 
     for k in attr_keys:
         value = sample0[k]
@@ -239,34 +248,47 @@ def determine_graph_key_types(batch_list):
         if not isinstance(value, (torch.Tensor, np.ndarray)) or value.ndim < 1:
             continue
 
-        shape0 = value.shape[0]
-        # 1. Edge Attribute Identification (with cross-sample validation)
-        if has_edge_index and shape0 == num_edges0 and num_edges0 != num_nodes0:
-            is_consistent_edge_attr = True
-            for other_sample in batch_list[1:]:
-                n_edges_other = other_sample["edge_index"].shape[1]
-                if other_sample[k].shape[0] != n_edges_other:
-                    is_consistent_edge_attr = False
-                    break
-
-            if is_consistent_edge_attr:
-                edge_attr_keys.add(k)
-                continue
-
-        # 2. Node Attribute Identification (Primary Check)
-        # Check if the attribute's dimension varies across samples.
-        is_shape_constant = True
-        for other_sample in batch_list[1:]:
-            if other_sample[k].shape[0] != shape0:
-                is_shape_constant = False
+        lengths = []
+        for sample in batch_list:
+            sample_value = sample[k]
+            if not isinstance(sample_value, (torch.Tensor, np.ndarray)) or sample_value.ndim < 1:
+                lengths = []
                 break
+            lengths.append(sample_value.shape[0])
 
-        if not is_shape_constant:
+        if not lengths:
+            continue
+
+        key_length_signature[k] = tuple(lengths)
+        is_shape_constant = all(length == lengths[0] for length in lengths)
+
+        node_match_all = all(
+            num_nodes is not None and length == num_nodes for length, num_nodes in zip(lengths, num_nodes_by_sample)
+        )
+        edge_match_all = has_edge_index and all(
+            num_edges is not None and length == num_edges for length, num_edges in zip(lengths, num_edges_by_sample)
+        )
+
+        if edge_match_all and (not node_match_all):
+            edge_attr_keys.add(k)
+            continue
+
+        if node_match_all and (not edge_match_all):
             node_attr_keys.add(k)
             continue
-        elif num_nodes0 != -1 and shape0 == num_nodes0:
-            # If shape matches num_nodes and is constant, it's likely a node attribute.
-            node_attr_keys.add(k)
+
+        # Ambiguous case: length can match both node and edge counts.
+        # Keep backward-compatible behavior for constant shapes by preferring
+        # node attributes; leave varying shapes for second-pass disambiguation.
+        if node_match_all and edge_match_all:
+            if is_shape_constant:
+                node_attr_keys.add(k)
+            else:
+                pending_attr_keys.add(k)
+            continue
+
+        if not is_shape_constant:
+            pending_attr_keys.add(k)
             continue
 
         # 3. Graph Attribute Identification
@@ -278,9 +300,56 @@ def determine_graph_key_types(batch_list):
         # to function correctly as a node attribute [nA, ...].
         graph_attr_keys.add(k)
 
+    # second pass: resolve pending keys by comparing their per-sample shape signature
+    # with already confirmed node/edge keys
+    node_signatures = {key_length_signature[k] for k in node_attr_keys if k in key_length_signature}
+    edge_signatures = {key_length_signature[k] for k in edge_attr_keys if k in key_length_signature}
+
+    unresolved_pending_keys = []
+    for k in sorted(pending_attr_keys):
+        signature = key_length_signature.get(k)
+        is_node_signature = signature in node_signatures
+        is_edge_signature = signature in edge_signatures
+
+        if is_node_signature and (not is_edge_signature):
+            node_attr_keys.add(k)
+        elif is_edge_signature and (not is_node_signature):
+            edge_attr_keys.add(k)
+        else:
+            unresolved_pending_keys.append(k)
+
+    if unresolved_pending_keys:
+        reason_text_map = {
+            "no_anchor_signature": "no confirmed node/edge anchor signatures available",
+            "ambiguous_signature_matches_both_node_and_edge": "signature matches both confirmed node and edge signatures",
+            "no_matching_anchor_signature": "signature does not match any confirmed node/edge signature",
+        }
+        unresolved_details = []
+        for k in unresolved_pending_keys:
+            signature = key_length_signature.get(k)
+            if (not node_signatures) and (not edge_signatures):
+                reason = "no_anchor_signature"
+            elif (signature in node_signatures) and (signature in edge_signatures):
+                reason = "ambiguous_signature_matches_both_node_and_edge"
+            else:
+                reason = "no_matching_anchor_signature"
+            reason_text = reason_text_map[reason]
+            unresolved_details.append(f"{k} (signature={signature}, reason={reason}: {reason_text})")
+
+        unresolved_details_text = "; ".join(unresolved_details)
+
+        raise ValueError(
+            "Cannot determine attribute types for keys: "
+            f"{unresolved_pending_keys}. "
+            "Reason: these keys vary across samples and remain unresolved after second-pass signature matching. "
+            f"Details: {unresolved_details_text}. "
+            "Please provide `num_nodes` or `edge_index` fields to enable automatic inference, "
+            "or pass explicit `key_types`."
+        )
+
     if len(node_attr_keys) == 0:
         # If edge_index exists, num_nodes can be inferred later, so okay to proceed.
-        if not has_edge_index and num_nodes0 == -1:
+        if (not has_edge_index) and all(num_nodes is None for num_nodes in num_nodes_by_sample):
             raise ValueError(
                 "No node attributes identified. Please check your data format. "
                 "If your graph has no node attributes, please add a dummy node attribute with shape (num_nodes, 1) to avoid ambiguity."
@@ -328,9 +397,39 @@ def collate_graph_samples(batch_list, key_types=None):
     attr_keys = set(_keys) - set(reserved_keys)
     has_edge_index = "edge_index" in _keys
 
+    # Naming-convention based specialized keys.
+    # Only keys matching these patterns use the custom path:
+    #   - edge_*_index: treated like edge_index (shape [2, E]), with node-index offset during collation
+    #   - edge_*_attr : treated like edge attributes (shape [E] or [E, ...]), concatenated on dim=0
+    # All other keys continue to use the original inference + combine flow.
+    named_edge_index_keys = {
+        key for key in attr_keys if key.startswith("edge_") and key.endswith("_index") and key != "edge_index"
+    }
+    named_edge_attr_keys = {key for key in attr_keys if key.startswith("edge_") and key.endswith("_attr")}
+    specialized_edge_keys = named_edge_index_keys.union(named_edge_attr_keys)
+
     # Determine key types if not provided, or convert input format to sets
     if key_types is None:
-        determined_key_types = determine_graph_key_types(batch_list)
+        # Specialized keys are handled by naming convention and should not be sent to
+        # the generic key-type inference to avoid false unresolved-key errors.
+        if specialized_edge_keys:
+            batch_list_for_infer = [
+                {k: v for k, v in sample.items() if k not in specialized_edge_keys} for sample in batch_list
+            ]
+            infer_attr_keys = set(batch_list_for_infer[0].keys()) - set(reserved_keys)
+            if infer_attr_keys:
+                has_num_nodes_hint = any(sample.get("num_nodes", None) is not None for sample in batch_list_for_infer)
+                has_edge_index_hint = "edge_index" in batch_list_for_infer[0]
+                if has_num_nodes_hint or has_edge_index_hint:
+                    determined_key_types = determine_graph_key_types(batch_list_for_infer)
+                else:
+                    # Without node/edge hints, remaining non-special attrs are treated as graph attrs.
+                    determined_key_types = {"node": set(), "edge": set(), "graph": set(infer_attr_keys)}
+            else:
+                determined_key_types = {"node": set(), "edge": set(), "graph": set()}
+        else:
+            determined_key_types = determine_graph_key_types(batch_list)
+
         if determined_key_types is None:  # Handle case where determine_key_types returns None
             return {}
         node_attr_keys = determined_key_types["node"]
@@ -343,7 +442,7 @@ def collate_graph_samples(batch_list, key_types=None):
         graph_attr_keys = set(key_types.get("graph", set()))
         # Basic validation: Ensure provided keys are actually present attributes
         all_provided_attrs = node_attr_keys.union(edge_attr_keys).union(graph_attr_keys)
-        unclassified_attrs = attr_keys - all_provided_attrs
+        unclassified_attrs = (attr_keys - specialized_edge_keys) - all_provided_attrs
         if unclassified_attrs:
             # Raise an error instead of a warning if attributes are unclassified.
             # This enforces that every attribute must be assigned a type.
@@ -352,6 +451,9 @@ def collate_graph_samples(batch_list, key_types=None):
                 f"as node, edge, or graph attributes: {unclassified_attrs}. "
                 f"Please ensure they are correctly identified or included in key_types."
             )
+
+    specialized_edge_index_data = defaultdict(list)
+    specialized_edge_attr_data = defaultdict(list)
 
     # ================= Handle Loop =================
     for i, sample in enumerate(batch_list):
@@ -378,8 +480,54 @@ def collate_graph_samples(batch_list, key_types=None):
             adjusted_edge_index += node_count
             edge_index_list.append(adjusted_edge_index)
 
+        # edge_*_index specialized path:
+        # treat as index tensor [2, E], apply node-index offset exactly like edge_index.
+        named_edge_index_values = {}
+        max_index_from_named_edge_index = None
+        for key in named_edge_index_keys:
+            raw_value = sample[key]
+            tensor_value = torch.as_tensor(raw_value)
+            if tensor_value.ndim != 2 or tensor_value.shape[0] != 2:
+                raise ValueError(
+                    f"Key '{key}' is matched as edge_*_index and must have shape [2, E], "
+                    f"but got {tuple(tensor_value.shape)} in sample {i}."
+                )
+            if tensor_value.dtype == torch.bool or torch.is_floating_point(tensor_value):
+                raise TypeError(
+                    f"Key '{key}' is matched as edge_*_index and must be an integer tensor, "
+                    f"but got dtype={tensor_value.dtype} in sample {i}."
+                )
+
+            named_edge_index_values[key] = tensor_value
+            if tensor_value.numel() > 0:
+                current_max = int(tensor_value.max().item())
+                if max_index_from_named_edge_index is None or current_max > max_index_from_named_edge_index:
+                    max_index_from_named_edge_index = current_max
+
+        # If num_nodes is still unknown, infer from edge_*_index keys.
+        if num_nodes is None and max_index_from_named_edge_index is not None:
+            num_nodes = max_index_from_named_edge_index + 1
+
+        for key, tensor_value in named_edge_index_values.items():
+            adjusted_value = tensor_value.clone()
+            adjusted_value += node_count
+            specialized_edge_index_data[key].append(adjusted_value)
+
+        # edge_*_attr specialized path:
+        # concatenate on dim=0, with no index offset.
+        for key in named_edge_attr_keys:
+            tensor_value = torch.as_tensor(sample[key])
+            if tensor_value.ndim < 1:
+                raise ValueError(
+                    f"Key '{key}' is matched as edge_*_attr and must have at least 1 dimension, "
+                    f"but got {tuple(tensor_value.shape)} in sample {i}."
+                )
+            specialized_edge_attr_data[key].append(tensor_value)
+
         # store all data
         for key in attr_keys:
+            if key in specialized_edge_keys:
+                continue
             value = sample[key]
             if key not in reserved_keys:
                 graph_data[key].append(value)
@@ -399,6 +547,12 @@ def collate_graph_samples(batch_list, key_types=None):
         else:
             # Should not happen if classification is correct
             raise KeyError(f"Attribute '{key}' was not classified as node, edge, or graph attribute.")
+
+    for key, value_list in specialized_edge_attr_data.items():
+        graph_data[key] = torch.cat(value_list, dim=0)
+
+    for key, value_list in specialized_edge_index_data.items():
+        graph_data[key] = torch.cat(value_list, dim=1)
 
     if len(batch_indices) > 0:
         batch_combined = torch.cat(batch_indices, dim=0)

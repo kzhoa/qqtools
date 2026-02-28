@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Handle batch & epoch callbacks with live progress bar.
 Supports:
@@ -16,7 +18,7 @@ import sys
 import time
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Protocol
 
 from .types import EventContext
 
@@ -44,6 +46,22 @@ except ImportError:
     tqdm = None
 
 __all__ = ["ProgressTracker", "RunnerListener"]
+
+
+class ProgressStrategy(Protocol):
+    """Common protocol for progress rendering strategies."""
+
+    def on_epoch_start(self, context: EventContext) -> None: ...
+
+    def on_batch_end(self, context: EventContext) -> None: ...
+
+    def on_epoch_end(self, context: EventContext) -> None: ...
+
+    def on_run_end(self) -> None: ...
+
+    def on_eval_start(self, context: EventContext) -> None: ...
+
+    def on_eval_end(self, context: EventContext) -> None: ...
 
 
 # Only define Rich-specific classes if rich is available
@@ -396,9 +414,7 @@ def resolve_render_mode(requested_mode: Optional[str], has_rich: bool, has_tqdm:
     return "plain"
 
 
-def create_progress_strategy(
-    render_mode: str, logger: Any, print_freq: int
-) -> Union[RichProgress, TqdmProgress, PlainProgress]:
+def create_progress_strategy(render_mode: str, logger: Any, print_freq: int) -> ProgressStrategy:
     """Factory to create the appropriate progress strategy."""
     if render_mode == "rich":
         return RichProgress(print_freq)

@@ -1,0 +1,10 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python -c \"import json; d=json\\.load\\(open\\('coverage_unit_local\\.json','r',encoding='utf-8'\\)\\); fs=d\\['files'\\]; targets=\\['src\\\\\\\\qqtools\\\\\\\\config\\\\\\\\qlmdb\\.py','src\\\\\\\\qqtools\\\\\\\\qimport\\.py','src\\\\\\\\qqtools\\\\\\\\torch\\\\\\\\qdataset\\.py'\\];\nfor t in targets:\n v=fs\\.get\\(t\\); print\\(t, '->', \\(None if v is None else v\\['summary'\\]\\['percent_covered'\\]\\)\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    },
+    "editor.fontSize": 16,
+    "chat.editor.fontSize": 16
+}

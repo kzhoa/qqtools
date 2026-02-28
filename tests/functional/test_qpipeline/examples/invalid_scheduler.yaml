@@ -1,0 +1,23 @@
+seed: 42
+log_dir: ./logs/example_invalid
+optim:
+  loss: mse
+  optimizer: adamw
+  optimizer_params:
+    lr: 1.0e-3
+  scheduler: unknown_scheduler
+  scheduler_params: {}
+runner:
+  run_mode: epoch
+  max_epochs: 2
+  eval_interval: 1
+  early_stop:
+    target: val_metric
+    patience: 2
+    mode: min
+task:
+  dataset: mock
+  dataloader:
+    batch_size: 4
+    num_workers: 0
+    pin_memory: false

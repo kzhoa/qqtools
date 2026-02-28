@@ -1,0 +1,27 @@
+seed: 42
+log_dir: ./logs/example_epoch
+print_freq: 10
+optim:
+  loss: mse
+  optimizer: adamw
+  optimizer_params:
+    lr: 1.0e-3
+  scheduler: cosine
+  scheduler_params:
+    T_max: 3
+    eta_min: 1.0e-6
+runner:
+  run_mode: epoch
+  max_epochs: 3
+  eval_interval: 1
+  early_stop:
+    target: val_metric
+    patience: 3
+    mode: min
+task:
+  dataset: mock
+  dataloader:
+    batch_size: 8
+    eval_batch_size: 8
+    num_workers: 0
+    pin_memory: false

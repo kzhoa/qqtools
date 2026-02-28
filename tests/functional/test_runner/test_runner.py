@@ -158,24 +158,37 @@ class TestTrainingAgent:
 
 
 class TestTrainRunner:
-    def setup_method(self):
-        """Setup for each test"""
-        self.args = argparse.Namespace(
+    @staticmethod
+    def _make_args() -> argparse.Namespace:
+        return argparse.Namespace(
             device=torch.device("cpu"),
             rank=0,
-            checkpoint={},
-            early_stop={},
+            distributed=False,
+            runner=argparse.Namespace(
+                checkpoint={},
+                early_stop={},
+            ),
             ckp_file=None,
             init_file=None,
+            render_type="plain",
         )
+
+    @staticmethod
+    def _create_training_components(num_samples: int = 50, num_features: int = 10, lr: float = 0.001):
+        task = SimpleTask(num_samples=num_samples, num_features=num_features)
+        model = SimpleModel(input_dim=num_features)
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        return task, model, loss_fn, optimizer
+
+    def setup_method(self):
+        """Setup for each test"""
+        self.args = self._make_args()
 
     def test_train_runner_epoch_mode(self):
         """Test train_runner in epoch mode"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            task = SimpleTask(num_samples=50, num_features=10)
-            model = SimpleModel(input_dim=10)
-            loss_fn = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            task, model, loss_fn, optimizer = self._create_training_components()
 
             result = train_runner(
                 model=model,
@@ -196,10 +209,7 @@ class TestTrainRunner:
     def test_train_runner_step_mode(self):
         """Test train_runner in step mode"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            task = SimpleTask(num_samples=50, num_features=10)
-            model = SimpleModel(input_dim=10)
-            loss_fn = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            task, model, loss_fn, optimizer = self._create_training_components()
 
             result = train_runner(
                 model=model,
@@ -219,11 +229,8 @@ class TestTrainRunner:
     def test_train_runner_with_early_stopping(self):
         """Test train_runner with early stopping"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            task = SimpleTask(num_samples=50, num_features=10)
-            model = SimpleModel(input_dim=10)
-            loss_fn = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
-            self.args.early_stop = {
+            task, model, loss_fn, optimizer = self._create_training_components()
+            self.args.runner.early_stop = {
                 "target": "val_metric",
                 "patience": 2,
                 "mode": "min",
@@ -247,10 +254,7 @@ class TestTrainRunner:
     def test_train_runner_with_checkpoint(self):
         """Test train_runner with checkpoint save and load"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            task = SimpleTask(num_samples=50, num_features=10)
-            model = SimpleModel(input_dim=10)
-            loss_fn = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            task, model, loss_fn, optimizer = self._create_training_components()
 
             # First run
             train_runner(
@@ -273,8 +277,7 @@ class TestTrainRunner:
             self.args.ckp_file = str(sorted(checkpoint_files)[0])
 
             # Create new model and resume training
-            model2 = SimpleModel(input_dim=10)
-            optimizer2 = optim.Adam(model2.parameters(), lr=0.001)
+            _, model2, _, optimizer2 = self._create_training_components()
 
             result2 = train_runner(
                 model=model2,
@@ -292,10 +295,7 @@ class TestTrainRunner:
     def test_train_runner_with_gradient_clipping(self):
         """Test train_runner with gradient clipping"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            task = SimpleTask(num_samples=50, num_features=10)
-            model = SimpleModel(input_dim=10)
-            loss_fn = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.1)
+            task, model, loss_fn, optimizer = self._create_training_components(lr=0.1)
 
             result = train_runner(
                 model=model,
@@ -314,10 +314,7 @@ class TestTrainRunner:
     def test_train_runner_with_lrscheduler(self):
         """Test train_runner with a learning rate scheduler"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            task = SimpleTask(num_samples=50, num_features=10)
-            model = SimpleModel(input_dim=10)
-            loss_fn = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.01)
+            task, model, loss_fn, optimizer = self._create_training_components(lr=0.01)
             scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.1)
 
             result = train_runner(
@@ -342,10 +339,7 @@ class TestTrainRunner:
     def test_train_runner_with_warmup_cosine_lrscheduler(self):
         """Test train_runner with a warmup cosine learning rate scheduler"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            task = SimpleTask(num_samples=50, num_features=10)
-            model = SimpleModel(input_dim=10)
-            loss_fn = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.01)
+            task, model, loss_fn, optimizer = self._create_training_components(lr=0.01)
 
             # Native PyTorch way to do warmup + cosine
             warmup_epochs = 1
@@ -391,10 +385,7 @@ class TestTrainRunner:
     def test_train_runner_with_cosine_lrscheduler(self):
         """Test train_runner with a standard CosineAnnealingLR scheduler"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            task = SimpleTask(num_samples=50, num_features=10)
-            model = SimpleModel(input_dim=10)
-            loss_fn = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.01)
+            task, model, loss_fn, optimizer = self._create_training_components(lr=0.01)
 
             # Using standard PyTorch CosineAnnealingLR
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5, eta_min=0.0001)
@@ -420,10 +411,7 @@ class TestTrainRunner:
     def test_train_runner_with_plateau_lrscheduler(self):
         """Test train_runner with a ReduceLROnPlateau scheduler"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            task = SimpleTask(num_samples=50, num_features=10)
-            model = SimpleModel(input_dim=10)
-            loss_fn = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.01)
+            task, model, loss_fn, optimizer = self._create_training_components(lr=0.01)
 
             # Using standard PyTorch ReduceLROnPlateau
             # We'll set a small patience to trigger reduction quickly
@@ -456,10 +444,7 @@ class TestTrainRunner:
     def test_train_runner_with_distributed_flag(self):
         """Test train_runner with distributed flag"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            task = SimpleTask(num_samples=50, num_features=10)
-            model = SimpleModel(input_dim=10)
-            loss_fn = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            task, model, loss_fn, optimizer = self._create_training_components()
             self.args.distributed = False
             self.args.rank = 0
 
@@ -475,6 +460,29 @@ class TestTrainRunner:
             )
 
             assert result["best_val_metric"] is not None
+
+    def test_train_runner_without_runner_config_raises(self):
+        """Test train_runner raises when args.runner is missing"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components()
+            args_without_runner = argparse.Namespace(
+                device=torch.device("cpu"),
+                rank=0,
+                ckp_file=None,
+                init_file=None,
+            )
+
+            with pytest.raises(AttributeError):
+                train_runner(
+                    model=model,
+                    task=task,
+                    loss_fn=loss_fn,
+                    optimizer=optimizer,
+                    args=args_without_runner,
+                    max_epochs=1,
+                    eval_interval=1,
+                    save_dir=tmpdir,
+                )
 
 
 # ============================================================================

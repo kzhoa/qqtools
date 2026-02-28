@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+
 from qqtools import qdist
 
 
@@ -142,6 +143,8 @@ def prepare_loss(args):
     if isinstance(loss, str):
         if loss.lower() in ["comboloss", "combo_loss", "composite", "combination"]:
             loss_params = args.optim.loss_params
+            if loss_params is None:
+                raise ValueError("optim.loss_params is required when optim.loss is 'comboloss'.")
             loss_fn = parse_comboloss_params(loss_params, ddp)
         else:
             loss_fn = parse_loss_name(loss, ddp)
