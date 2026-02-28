@@ -2,7 +2,7 @@
 
 from collections import OrderedDict
 from copy import deepcopy
-from typing import Mapping, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 class EarlyStopper:
@@ -22,13 +22,13 @@ class EarlyStopper:
 
     Example:
         >>> stopper = EarlyStopper(
-                    patiences = {'val_mae': 10},
-                    mode = {'val_mae': 'min' },
-                    min_delta = {'val_mae': 1e-6},
-        )
+        ...             patiences = {'val_mae': 10},
+        ...             mode = {'val_mae': 'min' },
+        ...             min_delta = {'val_mae': 1e-6},
+        ... )
         >>> stop, stop_args, debug_args = stopper.step({"val_mae": 0.02})
         >>> if stop:
-        >>>     print(stop_args)
+        ...     print(stop_args)
 
         >>> # we also provide a small helper function `singleTargetEarlyStopper` for convenience
         >>> singleTargetEarlyStopper
@@ -81,6 +81,8 @@ class EarlyStopper:
 
         # check whether key in metrics hasn't reduced for x epochs
         for key, pat in self.patiences.items():
+            if key not in metrics:
+                continue
 
             value = metrics[key]
             extremum = self.extremums[key]
@@ -109,12 +111,12 @@ class EarlyStopper:
                 self.counters[key] = 0
 
         for key, bound in self.lower_bounds.items():
-            if metrics[key] < bound:
+            if key in metrics and metrics[key] < bound:
                 stop_args += f" {key} is smaller than {bound}"
                 stop = True
 
         for key, bound in self.upper_bounds.items():
-            if metrics[key] > bound:
+            if key in metrics and metrics[key] > bound:
                 stop_args += f" {key} is larger than {bound}"
                 stop = True
 
@@ -136,6 +138,39 @@ class EarlyStopper:
     def load_state_dict(self, state_dict: Mapping) -> None:
         self.counters = state_dict["counters"]
         self.extremums = state_dict["extremums"]
+
+    @classmethod
+    def from_config(cls, early_stop_config: Dict[str, Any]) -> "EarlyStopper":
+        """
+        Create a single-target EarlyStopper instance from a configuration dictionary.
+
+        Args:
+            early_stop_config (dict): Configuration dictionary containing:
+                - target (str): The name of the metric to monitor.
+                - patience (int): Number of epochs with no improvement.
+                - mode (str): 'min' or 'max'.
+                - min_delta (float): Minimum change to qualify as improvement.
+                - lower_bound (float, optional): Lower bound for early stopping.
+                - upper_bound (float, optional): Upper bound for early stopping.
+
+        Returns:
+            EarlyStopper: Configured instance.
+        """
+        target = early_stop_config.get("target", "val_metric")
+        patience = early_stop_config.get("patience", 10)
+        mode = early_stop_config.get("mode", "min")
+        min_delta = early_stop_config.get("min_delta", 0.0)
+        lower_bound = early_stop_config.get("lower_bound", None)
+        upper_bound = early_stop_config.get("upper_bound", None)
+
+        return singleTargetEarlyStopper(
+            target=target,
+            patience=patience,
+            mode=mode,
+            min_delta=min_delta,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+        )
 
 
 def singleTargetEarlyStopper(
@@ -163,11 +198,11 @@ def singleTargetEarlyStopper(
 
     Example:
         >>> stopper = singleTargetEarlyStopper(
-            targe='fmae',
-            patience=10,
-            mode='min',
-            min_delta=1e-6,
-        )
+        ...     target='fmae',
+        ...     patience=10,
+        ...     mode='min',
+        ...     min_delta=1e-6,
+        ... )
         >>>
     """
     patiences = {target: patience}

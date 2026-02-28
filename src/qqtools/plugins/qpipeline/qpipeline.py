@@ -11,7 +11,7 @@ import qqtools as qt
 
 from . import entry_utils
 from .entry_utils.qema import qEMA
-from .runner import epoch_runner, infer_only_runner
+from .runner.runner import infer_runner, train_runner
 from .task.qtask import qTaskBase
 
 
@@ -201,7 +201,11 @@ class qPipeline:
 
         extra_log_keys = None
 
-        epoch_runner(
+        # interval run configs
+        run_mode = args.runner.get("run_mode", "epoch")
+        run_interval = args.runner.get("run_interval", 1)
+
+        train_runner(
             model,
             task,
             loss_fn,
@@ -217,6 +221,8 @@ class qPipeline:
             extra_ckp_caches=extra_ckp_caches,
             use_profiler=use_profiler,
             ema_model=self.ema_model,
+            run_mode=run_mode,
+            run_interval=run_interval,
         )
 
     def infer(self, dataloader=None):
@@ -231,12 +237,13 @@ class qPipeline:
         args = self.args
 
         distributed = args.distributed
-        print_freq = args.print_freq or 100
-        infer_only_runner(
-            model,
-            task,
-            dataloader,
-            args,
-            distributed,
-            print_freq,
+        # print_freq = args.print_freq or 100
+
+        infer_runner(
+            model=model,
+            task=task,
+            dataloader=dataloader,
+            args=args,
+            distributed=distributed,
+            # print_freq=print_freq,
         )

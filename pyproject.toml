@@ -16,9 +16,9 @@ dependencies = ["torch", "PyYAML", "matplotlib", "pandas", "scipy", "rich"]
 
 [project.optional-dependencies]
 # optionally required by standard distribution
-std = ["lmdb", "tqdm", "requests"]
+std = ["lmdb", "tqdm", "requests", "prompt_toolkit"]
 plugins = ["rich", "scikit-learn"]
-full = ["qqtools[std]", "qqtools[plugins]"]  # all optional dependencies
+full = ["qqtools[std]", "qqtools[plugins]"]          # all optional dependencies
 dev = ["pytest", "black", "isort", "flake8"]
 
 
@@ -28,6 +28,7 @@ Repository = "https://github.com/kzhoa/qqtools.git"
 
 [project.scripts]
 qread = "qqtools.cli.qread:main"
+qcgen = "qqtools.cli.qcgen:main"
 
 # === build settings ===
 [build-system]

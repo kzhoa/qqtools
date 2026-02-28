@@ -1,0 +1,74 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://qq.qaq.cc/qConfigSchema.json",
+    "type": "object",
+    "properties": {
+        "$BASE": {
+            "oneOf": [
+                {
+                    "type": "object"
+                },
+                {
+                    "type": "array"
+                },
+                {
+                    "type": "string"
+                }
+            ]
+        },
+        "optim": {
+            "$ref": "./definitions/optim.json"
+        },
+        "runner": {
+            "$ref": "./definitions/runner.json"
+        },
+        "task": {
+            "type": "object",
+            "properties": {
+                "dataset": {
+                    "type": "string",
+                    "description": "Dataset name"
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Target predict label"
+                },
+                "dataloader": {
+                    "$ref": "./definitions/dataloader.json"
+                }
+            }
+        },
+        "model": {
+            "type": "object"
+        },
+        "seed": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Random seed"
+        },
+        "log_dir": {
+            "type": "string",
+            "description": "Log directory"
+        },
+        "init_file": {
+            "type": "string",
+            "description": "Initialization checkpoint file path to recover from"
+        },
+        "ckp_file": {
+            "type": "string",
+            "description": "Checkpoint file path to recover from"
+        },
+        "print_freq": {
+            "type": "integer",
+            "min": 0,
+            "description": "Number of batches between console information updates"
+        }
+    },
+    "required": [
+        "optim",
+        "runner",
+        "seed",
+        "log_dir"
+    ],
+    "additionalProperties": false
+}

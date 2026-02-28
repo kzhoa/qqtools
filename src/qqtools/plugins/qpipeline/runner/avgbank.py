@@ -1,8 +1,7 @@
 import warnings
 
-import torch
-
 import qqtools as qt
+import torch
 from qqtools import qdist
 
 

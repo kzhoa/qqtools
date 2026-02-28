@@ -1,0 +1,27 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "warmup.json",
+    "type": "object",
+    "properties": {
+        "warmup_steps": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Absolute number of warmup steps. If > 0, this overrides warmup_epochs. If <= 0 and warmup_epochs > 0, will be converted to steps (requires batches_per_epoch to be provided)."
+        },
+        "warmup_epochs": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Number of warmup epochs. Only used when warmup_steps <= 0. Converted to steps by multiplying with batches_per_epoch. Ignored if warmup_steps > 0."
+        },
+        "warmup_factor": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.1,
+            "description": "Starting learning rate factor (0.0-1.0). E.g., 0.1 means start from 0.1x of base learning rate."
+        }
+    },
+    "additionalProperties": false
+}

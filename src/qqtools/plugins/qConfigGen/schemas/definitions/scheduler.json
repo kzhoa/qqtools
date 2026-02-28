@@ -1,0 +1,231 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "scheduler.json",
+    "oneOf": [
+        {
+            "type": "object",
+            "properties": {
+                "step_size": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 30
+                },
+                "gamma": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.1
+                }
+            },
+            "required": [
+                "step_size",
+                "gamma"
+            ],
+            "additionalProperties": false,
+            "description": "StepLR scheduler parameters"
+        },
+        {
+            "type": "object",
+            "properties": {
+                "milestones": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    "minItems": 1,
+                    "default": [
+                        30,
+                        60,
+                        90
+                    ]
+                },
+                "gamma": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.1
+                }
+            },
+            "required": [
+                "milestones",
+                "gamma"
+            ],
+            "additionalProperties": false,
+            "description": "MultiStepLR scheduler parameters"
+        },
+        {
+            "type": "object",
+            "properties": {
+                "gamma": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.1
+                }
+            },
+            "required": [
+                "gamma"
+            ],
+            "additionalProperties": false,
+            "description": "ExponentialLR scheduler parameters"
+        },
+        {
+            "type": "object",
+            "properties": {
+                "T_max": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 10
+                },
+                "eta_min": {
+                    "type": "number",
+                    "minimum": 0,
+                    "default": 0
+                }
+            },
+            "required": [
+                "T_max"
+            ],
+            "additionalProperties": false,
+            "description": "CosineAnnealingLR scheduler parameters"
+        },
+        {
+            "type": "object",
+            "properties": {
+                "lr_lambda": {
+                    "type": "string",
+                    "description": "Python lambda function as string (e.g., 'lambda epoch: 0.95 ** epoch')"
+                }
+            },
+            "required": [
+                "lr_lambda"
+            ],
+            "additionalProperties": false,
+            "description": "LambdaLR scheduler parameters"
+        },
+        {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": [
+                        "min",
+                        "max"
+                    ],
+                    "default": "min"
+                },
+                "factor": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.1
+                },
+                "patience": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 10
+                },
+                "threshold": {
+                    "type": "number",
+                    "minimum": 0,
+                    "default": 1e-4
+                },
+                "min_lr": {
+                    "type": "number",
+                    "minimum": 0,
+                    "default": 1e-6
+                }
+            },
+            "required": [
+                "mode",
+                "factor",
+                "patience"
+            ],
+            "additionalProperties": false,
+            "description": "ReduceLROnPlateau scheduler parameters"
+        },
+        {
+            "type": "object",
+            "properties": {
+                "base_lr": {
+                    "type": "number",
+                    "minimum": 0,
+                    "default": 0.001
+                },
+                "max_lr": {
+                    "type": "number",
+                    "minimum": 0,
+                    "default": 0.1
+                },
+                "step_size_up": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 2000
+                },
+                "step_size_down": {
+                    "type": [
+                        "integer",
+                        "null"
+                    ],
+                    "default": null
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": [
+                        "triangular",
+                        "triangular2",
+                        "exp_range"
+                    ],
+                    "default": "triangular"
+                }
+            },
+            "required": [
+                "base_lr",
+                "max_lr"
+            ],
+            "additionalProperties": false,
+            "description": "CyclicLR scheduler parameters"
+        },
+        {
+            "type": "object",
+            "properties": {
+                "max_lr": {
+                    "type": "number",
+                    "minimum": 0,
+                    "default": 0.1
+                },
+                "total_steps": {
+                    "type": [
+                        "integer",
+                        "null"
+                    ],
+                    "default": null
+                },
+                "pct_start": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.3
+                },
+                "anneal_strategy": {
+                    "type": "string",
+                    "enum": [
+                        "cos",
+                        "linear"
+                    ],
+                    "default": "cos"
+                },
+                "cycle_momentum": {
+                    "type": "boolean",
+                    "default": true
+                }
+            },
+            "required": [
+                "max_lr"
+            ],
+            "additionalProperties": false,
+            "description": "OneCycleLR scheduler parameters"
+        }
+    ]
+}
