@@ -7,7 +7,6 @@ import yaml
 
 from ...qdict import qDict
 from ...torch.qgpu import parse_device
-
 from .qInheritLoader import InheritLoader
 
 
@@ -88,7 +87,8 @@ def dump_yaml(cfg, path, sort_keys=False, verbose=False):
         cfg = dict(cfg)
     elif isinstance(cfg, argparse.Namespace):
         cfg = dict(cfg.__dict__)
-    yaml.dump(cfg, open(path, "w"), sort_keys=sort_keys)
+    with open(path, "w") as f:
+        yaml.dump(cfg, f, sort_keys=sort_keys)
     if verbose:
         print(f"yaml dump to : {path} .")
 
@@ -100,7 +100,8 @@ def load_yaml(path, inherit=True, ignore_keys=[]) -> qDict:
         return qDict()
 
     loader = InheritLoader if inherit else yaml.UnsafeLoader
-    cfg = yaml.load(open(path, "r"), Loader=loader)
+    with open(path, "r") as f:
+        cfg = yaml.load(f, Loader=loader)
     cfg = qDict(cfg)
     for k in ignore_keys:
         if k in cfg:

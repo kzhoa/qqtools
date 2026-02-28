@@ -26,6 +26,7 @@ import qqtools as qt
 
 from ..entry_utils.qema import qEMA
 from ..entry_utils.scheduler import qWarmupScheduler
+from ..entry_utils.type_qconfig import CheckpointConfig, EarlyStopConfig, qConfig
 from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import qTaskBase
 from .avgbank import AvgBank
@@ -35,7 +36,7 @@ from .earlystop import EarlyStopper
 from .progress import ProgressTracker
 from .types import EventContext, RunConfig, RunMode, RunningState
 
-__all__ = ["train_runner", "infer_runner", "RunningAgent", "RunConfig", "RunMode", "RunningState"]
+__all__ = ["train_runner", "infer_runner"]
 
 
 # ============================================================================
@@ -66,6 +67,17 @@ def move_batch_to_device(batch_data, device: torch.device):
         return batch_data.to(device)
     else:
         return batch_data
+
+
+def _getattr_or_default(obj: Any, key: str, default: Any = None) -> Any:
+    """Get attribute value and fallback when missing or None.
+
+    If ``default`` is callable (e.g., ``dict``), it will be called lazily.
+    """
+    value = getattr(obj, key, None)
+    if value is not None:
+        return value
+    return default() if callable(default) else default
 
 
 class RunningAgent:
@@ -500,12 +512,20 @@ class RunningAgent:
             self.config.run_mode == RunMode.STEP and self.state.global_step % self.config.eval_interval == 0
         )
         is_epoch_trigger = self.config.run_mode == RunMode.EPOCH and is_epoch_end
+        is_eval_trigger = is_step_trigger or is_epoch_trigger
 
         should_stop = False
-        if is_step_trigger or is_epoch_trigger:
+        if is_eval_trigger:
             should_stop = self._run_evaluation_and_update()
 
-        if self.config.save_interval and self.state.global_step % self.config.save_interval == 0:
+        should_save = False
+        if self.config.save_interval:
+            should_save = self.state.global_step % self.config.save_interval == 0
+        else:
+            # if no save_interval is set, default to saving at the same time as evaluation
+            should_save = is_eval_trigger
+
+        if should_save:
             self._save_regular_checkpoint()
 
         return should_stop
@@ -618,7 +638,7 @@ def train_runner(
     loss_fn: Callable,
     optimizer: torch.optim.Optimizer,
     scheduler: Optional[qWarmupScheduler] = None,
-    args: Optional[Any] = None,
+    args: Optional[qConfig] = None,
     max_epochs: Optional[int] = None,
     max_steps: Optional[int] = None,
     clip_grad: Optional[float] = None,
@@ -666,13 +686,21 @@ def train_runner(
         raise ValueError("The 'args' parameter is required to configure the runner.")
 
     # Extract configuration from args
-    device = getattr(args, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    rank = getattr(args, "rank", 0)
-    checkpoint_config = getattr(args, "checkpoint", {})
-    early_stop_config = getattr(args, "early_stop", {})
-    ckp_file = getattr(args, "ckp_file", None)
-    init_file = getattr(args, "init_file", None)
-    render_type = getattr(args, "render_type", "auto")
+    device = _getattr_or_default(args, "device", lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    rank = _getattr_or_default(args, "rank", 0)
+    runner_config = _getattr_or_default(args, "runner")
+    if runner_config is None:
+        raise AttributeError("args.runner is required")
+
+    checkpoint_config: CheckpointConfig = _getattr_or_default(runner_config, "checkpoint", dict)
+    early_stop_config: EarlyStopConfig = _getattr_or_default(runner_config, "early_stop", dict)
+    ckp_file = _getattr_or_default(args, "ckp_file")
+    init_file = _getattr_or_default(args, "init_file")
+    render_type = _getattr_or_default(args, "render_type", "auto")
+
+    if run_mode is None:
+        raise ValueError("run_mode cannot be None. Supported values are 'epoch' and 'step'.")
+    eval_interval = 1 if eval_interval is None else eval_interval
 
     # Configuration fallback logic
     if not checkpoint_config:
@@ -889,10 +917,10 @@ def infer_runner(
         raise ValueError("The 'args' parameter is required to configure the runner.")
 
     # Extract configuration from args
-    device = getattr(args, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    rank = getattr(args, "rank", 0)
-    ckp_file = getattr(args, "ckp_file", None)
-    render_type = getattr(args, "render_type", "auto")
+    device = _getattr_or_default(args, "device", lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    rank = _getattr_or_default(args, "rank", 0)
+    ckp_file = _getattr_or_default(args, "ckp_file")
+    render_type = _getattr_or_default(args, "render_type", "auto")
 
     # Setup logger (rank 0 only)
     logger = None

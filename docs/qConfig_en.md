@@ -524,6 +524,7 @@ runner:
 | `save_interval` | ❌        | Integer | ≥ 1        | null    | Regular save interval (steps) |
 | `clip_grad`     | ❌        | Float   | ≥ 0.1      | null    | Gradient clipping threshold   |
 | `early_stop`    | ✅        | Object  | -          | -       | Early stopping configuration  |
+| `checkpoint`    | ❌        | Object  | -          | -       | Best checkpoint configuration |
 
 ### max_epochs / max_steps (Training Boundaries)
 
@@ -641,6 +642,26 @@ runner:
   - Ranking: `mode: min, target: val_ndcg`
 
 - **Relation**: Works best with `ReduceLROnPlateau` scheduler
+
+### checkpoint (Best Checkpoint Configuration)
+
+```yaml
+runner:
+  checkpoint:
+    target: val_metric # Monitored metric for best model
+    mode: min # Optimization direction
+    min_delta: 0.0 # Improvement threshold
+```
+
+| Parameter   | Type   | Range   | Default    | Description                                         |
+| ----------- | ------ | ------- | ---------- | --------------------------------------------------- |
+| `target`    | String | -       | val_metric | Monitored metric name (e.g., `val_loss`, `val_mae`) |
+| `mode`      | String | min/max | min        | min=lower is better, max=higher is better           |
+| `min_delta` | Float  | ≥ 0     | 0.0        | Minimum change to qualify as improvement            |
+
+- **Effect**:
+  - Automatically saves the best model checkpoint based on the specified `target` metric.
+  - If `checkpoint` is not explicitly set, the framework will fall back to using the same `target`, `mode`, and `min_delta` as configured in `early_stop`.
 
 ---
 

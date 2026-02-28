@@ -51,7 +51,33 @@
             "description": "Gradient clipping threshold (null disables clipping)"
         },
         "early_stop": {
-            "$ref": "./earlystop.json"
+            "$ref": "./earlystopper.json"
+        },
+        "checkpoint": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "default": "val_metric",
+                    "description": "The metric to monitor for saving the best checkpoint"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": [
+                        "min",
+                        "max"
+                    ],
+                    "default": "min",
+                    "description": "Whether the monitored metric should be minimized or maximized"
+                },
+                "min_delta": {
+                    "type": "number",
+                    "default": 0.0,
+                    "description": "Minimum change in the monitored quantity to qualify as an improvement"
+                }
+            },
+            "additionalProperties": false,
+            "description": "Configuration for saving the best checkpoint. If omitted, falls back to early_stop configuration."
         }
     },
     "oneOf": [

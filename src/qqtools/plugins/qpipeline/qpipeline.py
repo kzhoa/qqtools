@@ -25,12 +25,14 @@ def prepare_logdir(args):
     if args.config_file is None and args.ckp_file is None:
         assert args.log_dir is not None
         args.config_file = str(Path(args["log_dir"], "config.yaml"))
-        yaml.dump(args.to_dict(), open(args.config_file, "w"))
+        with open(args.config_file, "w") as f:
+            yaml.dump(args.to_dict(), f)
 
     elif args.ckp_file is not None:
         assert args.log_dir is not None
         args.config_file = str(Path(args["log_dir"], "config_ckprecover.yaml"))
-        yaml.dump(args.to_dict(), open(args.config_file, "w"))
+        with open(args.config_file, "w") as f:
+            yaml.dump(args.to_dict(), f)
 
 
 def rank_zero_only(fn):

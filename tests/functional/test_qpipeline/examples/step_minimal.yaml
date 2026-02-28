@@ -1,0 +1,29 @@
+seed: 42
+log_dir: ./logs/example_step
+print_freq: 10
+optim:
+  loss: mse
+  optimizer: adam
+  optimizer_params:
+    lr: 1.0e-3
+  scheduler: step
+  scheduler_params:
+    step_size: 2
+    gamma: 0.5
+runner:
+  run_mode: step
+  max_steps: 8
+  max_epochs: 4
+  eval_interval: 2
+  save_interval: 3
+  early_stop:
+    target: val_metric
+    patience: 3
+    mode: min
+task:
+  dataset: mock
+  dataloader:
+    batch_size: 4
+    eval_batch_size: 4
+    num_workers: 0
+    pin_memory: false

@@ -23,9 +23,8 @@ SOFTWARE.
 """
 
 import collections.abc
+import copy
 from typing import Any, Callable, Iterable, List, Sequence, Union
-
-from .utils.warning import deprecated
 
 
 class qDict(dict):
@@ -53,12 +52,7 @@ class qDict(dict):
         if isinstance(d, dict):
             for k, v in d.items():
                 if recursive and isinstance(v, dict):
-                    v = qDict(
-                        v,
-                        default_function=default_function,
-                        allow_notexist=allow_notexist,
-                        recursive=True,
-                    )
+                    v = self._build_recursive_value(v, default_function, allow_notexist)
                 self.__setitem__(k, v)
         else:
 
@@ -72,17 +66,22 @@ class qDict(dict):
                 d = dict(d)  # maybe k-v tuple list
                 for k, v in d.items():
                     if recursive and isinstance(v, dict):
-                        v = qDict(
-                            v,
-                            default_function=default_function,
-                            allow_notexist=allow_notexist,
-                            recursive=True,
-                        )
+                        v = self._build_recursive_value(v, default_function, allow_notexist)
                     self.__setitem__(k, v)
 
         # be compatible with `getattr(qDict, key, defaultVal)`
         self.__dict__["_allow_notexist"] = allow_notexist
         self.__dict__["_default_function"] = default_function if default_function is not None else None
+
+    def _build_recursive_value(self, value: Any, default_function: Callable, allow_notexist: bool):
+        if isinstance(value, dict):
+            return self.__class__(
+                value,
+                default_function=default_function,
+                allow_notexist=allow_notexist,
+                recursive=True,
+            )
+        return value
 
     @property
     def allow_notexist(self):
@@ -118,6 +117,7 @@ class qDict(dict):
     def __getitem__(self, key):
         if key == "_default_function":
             return self.__dict__["_default_function"]
+
         try:
             return super().__getitem__(key)
         except Exception:
@@ -130,22 +130,37 @@ class qDict(dict):
                 raise KeyError(str(key))
 
     def __setattr__(self, key, value):
+        descriptor = getattr(type(self), key, None)
+        if isinstance(descriptor, property) and descriptor.fset is not None:
+            descriptor.fset(self, value)
+            return
         self.__setitem__(key, value)
 
     def fetch(self, keys: List[str]):
         return [self.__getitem__(k) for k in keys]
 
-    @deprecated("since its not implemented", None, ".copy()")
     def __deepcopy__(self, memo):
-        """not implemented yet"""
-        if id(self) in memo:
-            return memo[id(self)]
-        return self.__copy__()
+        """return a deep-copied instance"""
+        self_id = id(self)
+        if self_id in memo:
+            return memo[self_id]
+
+        _d = self.__class__.__new__(self.__class__)
+        memo[self_id] = _d
+        _d.__init__(default_function=self.default_function, allow_notexist=self.allow_notexist, recursive=False)
+
+        for key, value in self.items():
+            copied_key = copy.deepcopy(key, memo)
+            copied_value = copy.deepcopy(value, memo)
+            _d.__setitem__(copied_key, copied_value)
+        return _d
 
     def __copy__(self):
-        """return new instance"""
+        """return a shallow-copied instance"""
         _d = self.__class__.__new__(self.__class__)
-        _d.__init__(self, default_function=self.default_function, allow_notexist=self.allow_notexist)
+        _d.__init__(default_function=self.default_function, allow_notexist=self.allow_notexist, recursive=False)
+        for key, value in self.items():
+            _d.__setitem__(key, value)
         return _d
 
     def copy(self):
