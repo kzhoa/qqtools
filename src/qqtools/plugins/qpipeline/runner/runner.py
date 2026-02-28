@@ -35,7 +35,7 @@ from .earlystop import EarlyStopper
 from .progress import ProgressTracker
 from .types import EventContext, RunConfig, RunMode, RunningState
 
-__all__ = ["train_runner", "infer_runner"]
+__all__ = ["train_runner", "infer_runner", "RunningAgent", "RunConfig", "RunMode", "RunningState"]
 
 
 # ============================================================================
