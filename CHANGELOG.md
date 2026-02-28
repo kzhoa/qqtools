@@ -137,6 +137,7 @@ v1.1.33
 v1.1.34
     feat: add qconfiggen and cli command
     refactor: change jit.script to compile for qscatter
+    fix: qdict copy now correctly pass defaultfunction 
     docs: qconfig schema to qcgen
     docs: qconfig format under docs/ 
 

@@ -145,7 +145,7 @@ class qDict(dict):
     def __copy__(self):
         """return new instance"""
         _d = self.__class__.__new__(self.__class__)
-        _d.__init__(self, self.allow_notexist, self.allow_notexist)
+        _d.__init__(self, default_function=self.default_function, allow_notexist=self.allow_notexist)
         return _d
 
     def copy(self):
