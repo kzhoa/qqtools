@@ -11,7 +11,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from qqtools.plugins.qpipeline.runner.runner import RunConfig, RunMode, RunningAgent, RunningState, train_runner
+from qqtools.plugins.qpipeline.runner.runner import RunningAgent, train_runner
+from qqtools.plugins.qpipeline.runner.types import RunConfig, RunMode, RunningState
 
 from .conftest import SimpleModel, SimpleTask
 
@@ -104,7 +105,7 @@ class TestTrainingAgent:
             config=config,
         )
         assert agent.optimizer is optimizer
-        assert agent.early_stopping_manager is not None
+        assert agent.early_stopper is None  # Optional dependency, None if not injected
 
     def test_train_batch(self):
         """Test train_batch method"""
