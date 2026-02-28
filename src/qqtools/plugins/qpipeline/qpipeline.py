@@ -203,7 +203,8 @@ class qPipeline:
 
         # interval run configs
         run_mode = args.runner.get("run_mode", "epoch")
-        run_interval = args.runner.get("run_interval", 1)
+        eval_interval = args.runner.get("eval_interval", 1)
+        save_interval = args.runner.get("save_interval", None)
 
         train_runner(
             model,
@@ -222,7 +223,8 @@ class qPipeline:
             use_profiler=use_profiler,
             ema_model=self.ema_model,
             run_mode=run_mode,
-            run_interval=run_interval,
+            eval_interval=eval_interval,
+            save_interval=save_interval,
         )
 
     def infer(self, dataloader=None):

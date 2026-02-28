@@ -565,9 +565,9 @@ runner:
 
 - **Type**: Integer, ≥ 1
 - **Default**: 1
-- **Description**: Evaluation frequency
-  - `run_mode='epoch'`: Evaluate every 5 epochs
-  - `run_mode='step'`: Evaluate every 5000 steps
+- **Description**: Evaluation frequency. The unit of this interval is automatically determined by `run_mode`:
+  - If `run_mode='epoch'`: Specifies the number of **epochs** between evaluations.
+  - If `run_mode='step'`: Specifies the number of **steps** between evaluations.
 - **Effect**: Triggers validation evaluation, best model checking, early stopping check
 - **Recommendation**:
   - Small datasets: 1-5
@@ -581,10 +581,10 @@ runner:
 ```
 
 - **Type**: Integer or null
-- **Default**: null (Periodic saving disabled)
+- **Default**: null (Follows evaluation frequency)
 - **Description**: Regular checkpoint saving interval (always in steps, unaffected by `run_mode`)
 - **Effect**:
-  - null: No periodic saving
+  - null: Automatically saves a regular checkpoint every time an evaluation is triggered based on `eval_interval` (whether by epoch or step).
   - Positive integer: Save checkpoint every N steps
 
 - **Note**:
@@ -652,8 +652,8 @@ Task configuration defines the dataset, target variable, and data loading parame
 
 ```yaml
 task:
-  dataset: qm9 # Dataset identifier
-  target: u0 # Target variable (optional)
+  dataset: maceoff # Dataset identifier
+  target: energy # Target variable (optional)
   dataloader:
     batch_size: 32
     eval_batch_size: 64
@@ -713,7 +713,7 @@ print_freq: 10
 
 task:
   dataset: qm9
-  target: u0
+  target: homo
   dataloader:
     batch_size: 32
     eval_batch_size: 64
@@ -759,8 +759,8 @@ log_dir: ./logs/ema_experiment
 print_freq: 50
 
 task:
-  dataset: qm9
-  target: u0
+  dataset: maceoff
+  target: energy
   dataloader:
     batch_size: 64
     eval_batch_size: 128
@@ -863,7 +863,7 @@ ckp_file: ./logs/previous_experiment/checkpoint_epoch_50.pt
 
 task:
   dataset: qm9
-  target: u0
+  target: homo
   dataloader:
     batch_size: 32
     eval_batch_size: 64
@@ -984,6 +984,29 @@ runner:
 
 - `run_mode=epoch`: Counted in epochs
 - `run_mode=step`: Counted in steps
+
+#### Impact of run_mode on save_interval Meaning
+
+```yaml
+# Epoch mode: Follows eval trigger
+runner:
+  run_mode: epoch
+  eval_interval: 5 
+  save_interval: null # Will save every 5 epochs
+
+# Step mode: Specific interval overrides eval follow behavior
+runner:
+  run_mode: step
+  eval_interval: 2000
+  save_interval: 10000 # Will strictly save every 10000 steps
+```
+
+**Key Interactions**:
+
+- If `save_interval` is `null` (default), it automatically matches the evaluation frequency. The actual intervals will adapt to the `run_mode`:
+  - `run_mode=epoch`: Saves a regular checkpoint along with validation every `eval_interval` epochs.
+  - `run_mode=step`: Saves a regular checkpoint along with validation every `eval_interval` steps.
+- If `save_interval` is set to a specific positive Integer, it is explicitly executed in **steps**, entirely independent of the `run_mode` and the evaluation trigger.
 
 ### 2. Priority Between warmup_steps and warmup_epochs in warmup_params
 
@@ -1145,22 +1168,7 @@ pin_memory: false           # Disable to save memory
 - Users do not need to manually specify `distributed` (framework auto-detects)
 - `pin_memory` should be manually adjusted based on hardware configuration
 
-### 9. Independence Between save_interval and eval_interval
-
-```yaml
-runner:
-  eval_interval: 5 # Evaluate every 5 epochs/steps (triggers best model checkpoint)
-  save_interval: 1000 # Save regularly every 1000 steps (prevents interruptions)
-```
-
-**Independence**:
-
-- `eval_interval`: Controls evaluation frequency, triggers best model saving
-- `save_interval`: Controls regular checkpoint frequency, independent of evaluation
-- `save_interval` is counted only in **steps**, unaffected by `run_mode`
-- Both can be configured independently without interference
-
-### 10. Boundary Behaviors in Special Scenarios
+### 9. Boundary Behaviors in Special Scenarios
 
 #### Scenario A: step mode + Both max_epochs and max_steps Specified
 
