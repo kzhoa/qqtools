@@ -18,8 +18,12 @@ dependencies = ["torch", "PyYAML", "matplotlib", "pandas", "scipy", "rich"]
 # optionally required by standard distribution
 std = ["lmdb", "tqdm", "requests"]
 plugins = ["rich", "scikit-learn", "prompt_toolkit"]
-full = ["qqtools[std]", "qqtools[plugins]"]          # all optional dependencies
-dev = ["pytest", "black", "isort", "flake8"]
+dev = ["tox", "pytest", "black", "isort", "flake8"]
+full = [
+    "qqtools[std]",
+    "qqtools[plugins]",
+    "qqtools[dev]",
+] # all optional dependencies
 
 
 [project.urls]
