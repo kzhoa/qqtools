@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import qqtools.plugins.qpipeline.runner.runner as runner_module
 from qqtools.plugins.qpipeline.runner.runner import train_runner
 
 
@@ -294,3 +295,61 @@ def test_train_runner_none_render_type_falls_back_to_auto(base_args, tiny_task, 
 
     assert result["final_epoch"] == 2
     assert result["best_val_metric"] is not None
+
+
+def test_train_runner_exception_still_cleans_progress_tracker(base_args, tiny_task, tiny_model, monkeypatch):
+    tracker_instances = []
+
+    class DummyProgressTracker:
+        def __init__(self, logger, print_freq, render_type=None):
+            self.on_run_end_called = False
+            tracker_instances.append(self)
+
+        def on_epoch_start(self, context):
+            return None
+
+        def on_progress_tick(self, context):
+            return None
+
+        def on_batch_end(self, context):
+            return None
+
+        def on_epoch_end(self, context):
+            return None
+
+        def on_eval_start(self, context):
+            return None
+
+        def on_eval_end(self, context):
+            return None
+
+        def on_run_end(self):
+            self.on_run_end_called = True
+            raise RuntimeError("cleanup failure")
+
+    def _failing_run(self):
+        self._start_new_epoch()
+        raise ValueError("run failure")
+
+    monkeypatch.setattr(runner_module, "ProgressTracker", DummyProgressTracker)
+    monkeypatch.setattr(runner_module.RunningAgent, "run", _failing_run)
+
+    loss_fn = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(tiny_model.parameters(), lr=1.0e-3)
+
+    with pytest.raises(ValueError, match="run failure"):
+        train_runner(
+            model=tiny_model,
+            task=tiny_task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            args=base_args,
+            run_mode="epoch",
+            max_epochs=2,
+            eval_interval=1,
+            save_dir=base_args.log_dir,
+            print_freq=5,
+        )
+
+    assert tracker_instances
+    assert tracker_instances[0].on_run_end_called is True

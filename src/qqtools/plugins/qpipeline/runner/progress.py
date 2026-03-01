@@ -16,7 +16,6 @@ Features:
 
 import sys
 import time
-import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Literal, Optional, Protocol
 
@@ -53,7 +52,7 @@ class ProgressStrategy(Protocol):
 
     def on_epoch_start(self, context: EventContext) -> None: ...
 
-    def on_batch_end(self, context: EventContext) -> None: ...
+    def on_progress_tick(self, context: EventContext) -> None: ...
 
     def on_epoch_end(self, context: EventContext) -> None: ...
 
@@ -104,6 +103,7 @@ if HAS_RICH:
             self.layout = None
             self.live = None
             self.is_started = False
+            self._has_table_layout = False
 
             if self.enable:
                 self._init_live()
@@ -125,9 +125,20 @@ if HAS_RICH:
             self.layout = Layout()
             self.layout.split_column(
                 Layout(self.progress, name="progress", size=3),
+            )
+            self._has_table_layout = False
+            self.live = Live(self.layout, auto_refresh=True, refresh_per_second=4, transient=False)
+
+        def _ensure_table_layout(self):
+            if not self.layout or self._has_table_layout:
+                return
+
+            progress_layout = self.layout["progress"]
+            self.layout.split_column(
+                progress_layout,
                 Layout(name="table", ratio=1),
             )
-            self.live = Live(self.layout, auto_refresh=True, refresh_per_second=4, transient=False)
+            self._has_table_layout = True
 
         def reset_progressbar(self, num_batches: int, epoch_idx: int, max_epochs: int):
             if not self.enable or not self.progress:
@@ -169,6 +180,7 @@ if HAS_RICH:
             if lr is not None:
                 table.add_row("LR", f"{lr:.8f}", "")
 
+            self._ensure_table_layout()
             self.layout["table"].update(table)
 
         def start(self):
@@ -193,6 +205,7 @@ if HAS_RICH:
                     sys.stdout.flush()
 
                 self.is_started = False
+                self._has_table_layout = False
 
     class RichProgress:
         """Strategy for Rich Live logging."""
@@ -207,7 +220,7 @@ if HAS_RICH:
             self.displayer.reset_progressbar(context.total_batches, context.state.epoch, context.state.max_epochs)
             self.displayer.start()
 
-        def on_batch_end(
+        def on_progress_tick(
             self,
             context: EventContext,
         ):
@@ -216,6 +229,7 @@ if HAS_RICH:
                 "avg_bank": context.avg_bank,
                 "lr": context.lr,
             }
+
             self.displayer.update_batch(context.batch_metrics, context.avg_bank, context.lr)
 
         def on_epoch_end(self, context: EventContext):
@@ -298,19 +312,23 @@ if HAS_TQDM:
             desc = f"[{self.current_stage.capitalize()}] Epoch {context.state.epoch}"
             self.pbar = tqdm(total=context.total_batches, desc=desc, leave=False, dynamic_ncols=True)
 
-        def on_batch_end(
+        def on_progress_tick(
             self,
             context: EventContext,
         ):
             if not self.pbar:
                 return
 
-            self.pbar.update(1)
-            if context.batch_idx % self.print_freq == 0:
-                postfix = {k: f"{v:.4f}" for k, v in context.avg_bank.items() if isinstance(v, (int, float))}
-                if context.lr is not None:
-                    postfix["lr"] = f"{context.lr:.6f}"
-                self.pbar.set_postfix(postfix)
+            target_n = min((context.batch_idx or 0) + 1, int(context.total_batches or 0))
+            current_n = int(getattr(self.pbar, "n", 0))
+            advance_n = max(0, target_n - current_n)
+            if advance_n > 0:
+                self.pbar.update(advance_n)
+
+            postfix = {k: f"{v:.4f}" for k, v in context.avg_bank.items() if isinstance(v, (int, float))}
+            if context.lr is not None:
+                postfix["lr"] = f"{context.lr:.6f}"
+            self.pbar.set_postfix(postfix)
 
         def on_epoch_end(self, context: EventContext):
             if self.pbar:
@@ -354,17 +372,16 @@ class PlainProgress:
     def on_epoch_start(self, context: EventContext):
         self.current_stage = context.stage or "train"
 
-    def on_batch_end(
+    def on_progress_tick(
         self,
         context: EventContext,
     ):
-        if context.batch_idx % self.print_freq == 0 or context.batch_idx == context.total_batches - 1:
-            stage = context.stage or self.current_stage or "training"
-            msg_parts = [f"{k}: {v:.4f}" for k, v in context.batch_metrics.items() if isinstance(v, (int, float))]
-            msg = f"[{stage.capitalize()}] Batch {context.batch_idx}/{context.total_batches} " + " ".join(msg_parts)
-            if context.lr is not None:
-                msg += f" LR: {context.lr:.6f}"
-            self.logger.info(msg)
+        stage = context.stage or self.current_stage or "training"
+        msg_parts = [f"{k}: {v:.4f}" for k, v in context.batch_metrics.items() if isinstance(v, (int, float))]
+        msg = f"[{stage.capitalize()}] Batch {context.batch_idx}/{context.total_batches} " + " ".join(msg_parts)
+        if context.lr is not None:
+            msg += f" LR: {context.lr:.6f}"
+        self.logger.info(msg)
 
     def on_epoch_end(self, context: EventContext):
         pass
@@ -379,39 +396,50 @@ class PlainProgress:
         pass
 
 
-def resolve_render_mode(requested_mode: Optional[str], has_rich: bool, has_tqdm: bool) -> str:
+def resolve_render_mode(requested_mode: Optional[str], has_rich: bool, has_tqdm: bool) -> tuple[str, Optional[str]]:
     """
     Resolve the final render mode based on request and availability.
-    Auto-downgrades with warnings if the requested mode is unavailable.
-    """
-    # 1. Auto-detect if no specific mode requested (or explicitly requested as auto)
-    if requested_mode is None or requested_mode == "auto":
-        if has_rich:
-            return "rich"
-        if has_tqdm:
-            return "tqdm"
-        return "plain"
 
-    # 2. Check if requested mode is available
-    if requested_mode == "rich":
-        if has_rich:
-            return "rich"
-        else:
-            warnings.warn("Rich library not found. Downgrading...", RuntimeWarning)
-            # Try downgrade to tqdm
+    Returns:
+        A tuple of (resolved_mode, mode_change_message).
+        mode_change_message is only provided when input mode differs from output mode.
+    """
+    input_mode = requested_mode or "auto"
+
+    def _resolve() -> str:
+        # 1. Auto-detect if no specific mode requested (or explicitly requested as auto)
+        if requested_mode is None or requested_mode == "auto":
+            if has_rich:
+                return "rich"
             if has_tqdm:
                 return "tqdm"
             return "plain"
 
-    if requested_mode == "tqdm":
-        if has_tqdm:
-            return "tqdm"
-        else:
-            warnings.warn("Tqdm library not found. Downgrading to plain text.", RuntimeWarning)
+        # 2. Check if requested mode is available
+        if requested_mode == "rich":
+            if has_rich:
+                return "rich"
+            else:
+                # Try downgrade to tqdm
+                if has_tqdm:
+                    return "tqdm"
+                return "plain"
+
+        if requested_mode == "tqdm":
+            if has_tqdm:
+                return "tqdm"
+            else:
+                return "plain"
+
+        if requested_mode == "plain":
             return "plain"
 
-    # Default fallback
-    return "plain"
+        # Default fallback
+        return "plain"
+
+    resolved_mode = _resolve()
+    message = f"Mode {input_mode} -> {resolved_mode}" if input_mode != resolved_mode else None
+    return resolved_mode, message
 
 
 def create_progress_strategy(render_mode: str, logger: Any, print_freq: int) -> ProgressStrategy:
@@ -439,24 +467,25 @@ class ProgressTracker:
         self.print_freq = print_freq
 
         # Resolve render type
-        self.render_type = resolve_render_mode(render_type, HAS_RICH, HAS_TQDM)
+        self.render_type, mode_change_message = resolve_render_mode(render_type, HAS_RICH, HAS_TQDM)
 
         # Create strategy
         self.strategy = create_progress_strategy(self.render_type, self.logger, self.print_freq)
 
-        # Log warning if we had to downgrade from a specific request
-        if render_type and render_type != self.render_type:
-            self.logger.warning(
-                f"Requested '{render_type}' output not available. " f"Using '{self.render_type}' instead."
-            )
+        # Log selection details
+        if mode_change_message:
+            if render_type in (None, "auto"):
+                self.logger.info(mode_change_message)
+            else:
+                self.logger.warning(mode_change_message)
 
     def on_epoch_start(self, context: EventContext):
         """Callback at the start of an epoch."""
         self.strategy.on_epoch_start(context)
 
-    def on_batch_end(self, context: EventContext):
-        """Callback at the end of a batch."""
-        self.strategy.on_batch_end(context)
+    def on_progress_tick(self, context: EventContext):
+        """Callback when a progress update should be rendered."""
+        self.strategy.on_progress_tick(context)
 
     def on_epoch_end(self, context: EventContext):
         """Callback at the end of an epoch."""

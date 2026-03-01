@@ -127,6 +127,7 @@ class EventType(Enum):
     ON_EPOCH_END = "on_epoch_end"
     ON_BATCH_START = "on_batch_start"
     ON_BATCH_END = "on_batch_end"
+    ON_PROGRESS_TICK = "on_progress_tick"
     ON_TRAIN_BATCH_END = "on_train_batch_end"
     ON_EVAL_START = "on_eval_start"
     ON_EVAL_END = "on_eval_end"
