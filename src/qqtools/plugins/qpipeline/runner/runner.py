@@ -146,6 +146,7 @@ class RunningAgent:
             "on_epoch_end": [],
             "on_batch_start": [],
             "on_batch_end": [],
+            "on_progress_tick": [],
             "on_train_batch_end": [],
             "on_eval_start": [],
             "on_eval_end": [],
@@ -202,6 +203,31 @@ class RunningAgent:
         out = self.task.post_batch_forward(out, batch_data)
         return out, batch_data
 
+    @staticmethod
+    def _scalarize_batch_metrics(batch_metrics: Dict[str, Any]) -> Dict[str, float]:
+        """Convert batch metric payload into scalar-only dict for logging/progress.
+
+        Supports both:
+        - {name: scalar_or_tensor}
+        - {name: (value, count)}
+        """
+        scalar_metrics: Dict[str, float] = {}
+
+        for key, value in batch_metrics.items():
+            metric_value = value
+            if isinstance(value, tuple) and len(value) > 0:
+                metric_value = value[0]
+
+            if torch.is_tensor(metric_value):
+                if metric_value.numel() != 1:
+                    continue
+                metric_value = metric_value.item()
+
+            if isinstance(metric_value, (int, float)):
+                scalar_metrics[key] = float(metric_value)
+
+        return scalar_metrics
+
     def _start_new_epoch(self):
         """Initialize a new epoch: create iterator and setup distributed sampling."""
         self._train_iter = iter(self.train_loader)
@@ -211,7 +237,10 @@ class RunningAgent:
             self.train_loader.sampler.set_epoch(self.state.epoch)
 
         # Trigger epoch start event
-        self._trigger("on_epoch_start", context=EventContext(state=self.state, stage="train"))
+        self._trigger(
+            "on_epoch_start",
+            context=EventContext(state=self.state, total_batches=len(self.train_loader), stage="train"),
+        )
 
     def _get_next_batch(self) -> Tuple[Any, bool]:
         """
@@ -284,11 +313,12 @@ class RunningAgent:
         out, batch_data = self._forward_batch(self.model, batch_data)
 
         # Calculate metrics
-        batch_metrics = self.task.batch_metric(out, batch_data)
+        raw_batch_metrics = self.task.batch_metric(out, batch_data)
+        batch_metrics = self._scalarize_batch_metrics(raw_batch_metrics)
 
         # Training mode: calculate loss and backward propagation
         losses = self.task.batch_loss(out, batch_data, self.loss_fn)
-        loss_tensor, loss_cnt = losses.get("loss", (None, 1))
+        loss_tensor, _loss_cnt = losses.get("loss", (None, 1))
 
         if loss_tensor is not None:
             self.optimizer.zero_grad()
@@ -580,12 +610,27 @@ class RunningAgent:
                     batch_idx=self.state.global_step % len(self.train_loader),
                     total_batches=len(self.train_loader),
                     batch_metrics=batch_metrics,
-                    avg_bank=self.avg_bank.to_dict(self.config.distributed),
                     lr=self.optimizer.param_groups[0]["lr"] if self.optimizer else None,
                     stage="train",
                 )
                 self._trigger("on_batch_end", context=batch_context)
                 self._trigger("on_train_batch_end", context=batch_context)
+
+                freq = max(1, self.config.print_freq)
+                is_progress_tick = batch_context.batch_idx % freq == 0 or batch_context.batch_idx == (
+                    batch_context.total_batches - 1
+                )
+                if is_progress_tick:
+                    progress_context = EventContext(
+                        state=self.state,
+                        batch_idx=batch_context.batch_idx,
+                        total_batches=batch_context.total_batches,
+                        batch_metrics=batch_metrics,
+                        avg_bank=self.avg_bank.to_dict(self.config.distributed),
+                        lr=batch_context.lr,
+                        stage=batch_context.stage,
+                    )
+                    self._trigger("on_progress_tick", context=progress_context)
 
                 # Handle periodic events (evaluation, checkpointing, etc.)
                 if self._handle_periodic_events(is_epoch_end):
@@ -616,6 +661,7 @@ class RunningAgent:
         self.logger.info(
             f"Starting training (mode={self.config.run_mode.value}, "
             f"eval_interval={self.config.eval_interval}, "
+            f"save_interval={self.config.save_interval}, "
             f"max_epochs={self.state.max_epochs}, "
             f"max_steps={self.state.max_steps})"
         )
@@ -836,7 +882,7 @@ def train_runner(
     # Unified LogListener handling
     progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type)
     agent.add_listener("on_epoch_start", progress_tracker.on_epoch_start)
-    agent.add_listener("on_batch_end", progress_tracker.on_batch_end)
+    agent.add_listener("on_progress_tick", progress_tracker.on_progress_tick)
     agent.add_listener("on_epoch_end", progress_tracker.on_epoch_end)
     # Ensure progress tracker can pause/resume during mid-epoch evaluations
     agent.add_listener("on_eval_start", progress_tracker.on_eval_start)
@@ -874,6 +920,16 @@ def train_runner(
             if isinstance(profiler, profile):
                 logger.info("Profiler results:")
                 logger.info(profiler.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+
+        # Ensure progress renderer resources are always released, even on exceptions.
+        try:
+            progress_tracker.on_run_end()
+        except Exception as progress_cleanup_error:
+            logger.debug(
+                "ProgressTracker cleanup failed: %s",
+                progress_cleanup_error,
+                exc_info=True,
+            )
 
         logger.close()
         logging.shutdown()

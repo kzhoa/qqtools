@@ -1,9 +1,11 @@
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import qqtools as qt
+import qqtools.plugins.qpipeline.runner.progress as progress_module
 from qqtools.plugins.qpipeline.entry import create_pipeline_class
 from qqtools.plugins.qpipeline.qpipeline import prepare_logdir
 from qqtools.plugins.qpipeline.runner.runner import infer_runner
@@ -85,3 +87,66 @@ def test_infer_runner_args_required(tiny_task, tiny_model):
             args=None,
             distributed=False,
         )
+
+
+def test_progress_tracker_auto_mode_logs_info(monkeypatch):
+    logger = Mock()
+
+    class _DummyStrategy:
+        def on_epoch_start(self, context):
+            return None
+
+        def on_progress_tick(self, context):
+            return None
+
+        def on_epoch_end(self, context):
+            return None
+
+        def on_run_end(self):
+            return None
+
+        def on_eval_start(self, context):
+            return None
+
+        def on_eval_end(self, context):
+            return None
+
+    monkeypatch.setattr(progress_module, "HAS_RICH", True)
+    monkeypatch.setattr(progress_module, "HAS_TQDM", True)
+    monkeypatch.setattr(progress_module, "create_progress_strategy", lambda mode, logger, freq: _DummyStrategy())
+
+    progress_module.ProgressTracker(logger=logger, print_freq=5, render_type="auto")
+
+    logger.info.assert_called_with("Mode auto -> rich")
+    logger.warning.assert_not_called()
+
+
+def test_progress_tracker_explicit_unavailable_mode_logs_warning(monkeypatch):
+    logger = Mock()
+
+    class _DummyStrategy:
+        def on_epoch_start(self, context):
+            return None
+
+        def on_progress_tick(self, context):
+            return None
+
+        def on_epoch_end(self, context):
+            return None
+
+        def on_run_end(self):
+            return None
+
+        def on_eval_start(self, context):
+            return None
+
+        def on_eval_end(self, context):
+            return None
+
+    monkeypatch.setattr(progress_module, "HAS_RICH", False)
+    monkeypatch.setattr(progress_module, "HAS_TQDM", True)
+    monkeypatch.setattr(progress_module, "create_progress_strategy", lambda mode, logger, freq: _DummyStrategy())
+
+    progress_module.ProgressTracker(logger=logger, print_freq=5, render_type="rich")
+
+    logger.warning.assert_called_with("Mode rich -> tqdm")

@@ -477,6 +477,18 @@ def collate_graph_samples(batch_list, key_types=None):
         - `batch` indices indicating sample origin for each node
                 - Non-tensor graph-level attributes aggregated by `smart_combine`
                     (e.g., `str`/`dict` values remain as lists in sample order)
+
+    Graph-level tensor/ndarray shape normalization:
+        Before graph-level stacking, values are normalized by compressing consecutive
+        leading singleton dimensions (size == 1).
+        - raw `()`            -> normalized `()`        -> batched `(bz,)`
+        - raw `(1,)`          -> normalized `()`        -> batched `(bz,)`
+        - raw `(1, 19)`       -> normalized `(19,)`     -> batched `(bz, 19)`
+        - raw `(1, 1, 19)`    -> normalized `(19,)`     -> batched `(bz, 19)`
+        - raw `(2, 1, 19)`    -> unchanged `(2, 1, 19)` -> batched `(bz, 2, 1, 19)`
+
+        This normalization is only applied to graph-level tensor-like attributes.
+        Node/edge collation rules remain unchanged.
     """
     if not batch_list:
         return {}  # Return empty dict for empty batch
@@ -495,6 +507,38 @@ def collate_graph_samples(batch_list, key_types=None):
 
     def _is_tensor_like_1d_plus(value):
         return isinstance(value, (torch.Tensor, np.ndarray)) and value.ndim >= 1
+
+    def _normalize_graph_value(value):
+        """Compress consecutive leading singleton dims for graph-level tensor-like values."""
+        if isinstance(value, torch.Tensor):
+            if value.ndim == 0:
+                return value
+            leading_singleton_dims = 0
+            for dim_size in value.shape:
+                if dim_size == 1:
+                    leading_singleton_dims += 1
+                else:
+                    break
+            if leading_singleton_dims == 0:
+                return value
+            target_shape = value.shape[leading_singleton_dims:]
+            return value.reshape(target_shape) if len(target_shape) > 0 else value.reshape(())
+
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                return value
+            leading_singleton_dims = 0
+            for dim_size in value.shape:
+                if dim_size == 1:
+                    leading_singleton_dims += 1
+                else:
+                    break
+            if leading_singleton_dims == 0:
+                return value
+            target_shape = value.shape[leading_singleton_dims:]
+            return value.reshape(target_shape) if len(target_shape) > 0 else value.reshape(())
+
+        return value
 
     # Naming-convention specialized keys:
     # - edge_*_index: handled as edge indices [2, X], with node-index offset and dim=1 concat.
@@ -649,7 +693,8 @@ def collate_graph_samples(batch_list, key_types=None):
     # ================= Concatenate Data =================
     for key, value_list in graph_data.items():
         if key in graph_attr_keys:
-            graph_data[key] = smart_combine(value_list, prefer_stack=True)
+            normalized_value_list = [_normalize_graph_value(value) for value in value_list]
+            graph_data[key] = smart_combine(normalized_value_list, prefer_stack=True)
         elif key in node_attr_keys or key in edge_attr_keys:
             graph_data[key] = smart_combine(value_list, prefer_stack=False)
         else:

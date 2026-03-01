@@ -17,7 +17,6 @@ def broadcast(src: Tensor, ref: Tensor, dim: int) -> Tensor:
     return src.view(size).expand_as(ref)
 
 
-@torch.compile
 def scatter(
     ref: Tensor,
     index: Tensor,
