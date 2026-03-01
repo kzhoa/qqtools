@@ -44,17 +44,19 @@ def create_sample(
 
 
 # --- Test Suite ---
+# Section: Anchored Paths
+# Validate common collation paths with num_nodes and/or edge_index, including basic edge cases.
 
 
 def test_empty_batch():
-    """Test collating an empty list."""
+    """Validate collation for an empty batch."""
     batch_list = []
     result = collate_graph_samples(batch_list)
     assert result == {}
 
 
 def test_single_graph_no_edge_index():
-    """Test collating a single graph without edge_index but with num_nodes."""
+    """Validate collation for a single graph without edge_index but with num_nodes."""
     nodes = 3
     sample = create_sample(num_nodes=nodes, edge_index=None, node_features=[[1], [2], [3]], graph_features=[10])
     batch_list = [sample]
@@ -70,7 +72,7 @@ def test_single_graph_no_edge_index():
 
 
 def test_single_graph_with_edge_index():
-    """Test collating a single graph with edge_index."""
+    """Validate collation for a single graph with edge_index."""
     edge_index = [[0, 1, 1], [1, 0, 2]]  # 3 edges, max node index 2 -> 3 nodes
     sample = create_sample(
         num_nodes=3,
@@ -96,7 +98,7 @@ def test_single_graph_with_edge_index():
 
 
 def test_two_graphs_different_nodes_no_edge_index():
-    """Test two graphs, varying nodes, no edge_index, relying on num_nodes."""
+    """Validate batching for two graphs with varying nodes and no edge_index."""
     sample1 = create_sample(num_nodes=3, edge_index=None, node_features=[[1], [2], [3]], graph_features=[10])
     sample2 = create_sample(num_nodes=2, edge_index=None, node_features=[[4], [5]], graph_features=[20])
     batch_list = [sample1, sample2]
@@ -112,7 +114,7 @@ def test_two_graphs_different_nodes_no_edge_index():
 
 
 def test_two_graphs_different_nodes_with_edge_index():
-    """Test two graphs, varying nodes, with edge_index."""
+    """Validate batching for two graphs with varying nodes and edge_index."""
     sample1 = create_sample(
         num_nodes=3,
         edge_index=[[0, 1], [1, 2]],
@@ -144,31 +146,8 @@ def test_two_graphs_different_nodes_with_edge_index():
     assert torch.equal(result["edge_index"], expected_edge_index)
 
 
-def test_graphs_with_varying_edge_attributes():
-    """Test graphs where edge attributes might be misidentified if not careful."""
-    sample1 = create_sample(
-        num_nodes=3,
-        edge_index=[[0, 1], [1, 2]],
-        node_features=[[1], [2], [3]],
-        edge_features=[[10], [11]],
-        graph_features=[100],
-    )
-    sample2 = create_sample(
-        num_nodes=2,
-        edge_index=[[0, 1], [1, 0]],
-        node_features=[[4], [5]],
-        edge_features=[[20], [21]],
-        graph_features=[200],
-    )  # Same number of edges as sample1
-    batch_list = [sample1, sample2]
-    result = collate_graph_samples(batch_list)
-
-    assert "edge_attr" in result
-    assert torch.equal(result["edge_attr"], torch.tensor([[10], [11], [20], [21]]))
-
-
 def test_graphs_with_only_graph_attributes_and_num_nodes():
-    """Test graphs with only graph attributes and num_nodes specified."""
+    """Validate graphs containing only graph attributes with explicit num_nodes."""
     sample1 = {"num_nodes": 2, "graph_attr": torch.tensor([10.0])}
     sample2 = {"num_nodes": 3, "graph_attr": torch.tensor([20.0])}
     batch_list = [sample1, sample2]
@@ -192,7 +171,7 @@ def test_graphs_with_only_graph_attributes_and_num_nodes():
 
 
 def test_graphs_with_edge_index_but_no_node_attributes():
-    """Test when edge_index is present, inferring nodes, but no explicit node attributes."""
+    """Validate node-count inference from edge_index when node attributes are absent."""
     sample1 = {"edge_index": torch.tensor([[0, 1], [1, 0]]), "graph_attr": torch.tensor([10.0])}  # Implies 2 nodes
     sample2 = {"edge_index": torch.tensor([[0], [0]]), "graph_attr": torch.tensor([20.0])}  # Implies 1 node
     batch_list = [sample1, sample2]
@@ -208,17 +187,65 @@ def test_graphs_with_edge_index_but_no_node_attributes():
     assert "edge_index" in result
     # Expected edge_index: G1 edges [[0, 1], [1, 0]], G2 edges shifted [[2], [2]]
     # Combined: [[0, 1, 2], [1, 0, 2]]
-    print(result["edge_index"])  # Added print for debugging if needed
     assert torch.equal(result["edge_index"], torch.tensor([[0, 1, 2], [1, 0, 2]]))
     assert "x" not in result
     assert "num_nodes" not in result
 
 
+def test_determine_graph_key_types_marks_non_tensor_as_graph():
+    """Validate non-tensor attributes are directly classified as graph attributes."""
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 3),
+            "graph_note": "g0",
+            "graph_meta": {"split": "train", "id": 1},
+        },
+        {
+            "num_nodes": 3,
+            "x": torch.randn(3, 3),
+            "graph_note": "g1",
+            "graph_meta": {"split": "val", "id": 2},
+        },
+    ]
+
+    key_types = determine_graph_key_types(batch_list)
+    assert key_types is not None
+    assert "x" in key_types["node"]
+    assert "graph_note" in key_types["graph"]
+    assert "graph_meta" in key_types["graph"]
+
+
+def test_collate_graph_samples_keeps_non_tensor_graph_attrs_as_list():
+    """Validate str/dict graph attributes are aggregated as ordered lists."""
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.tensor([[1.0], [2.0]]),
+            "graph_note": "first",
+            "graph_meta": {"stage": "train", "epoch": 1},
+        },
+        {
+            "num_nodes": 1,
+            "x": torch.tensor([[3.0]]),
+            "graph_note": "second",
+            "graph_meta": {"stage": "val", "epoch": 2},
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+
+    assert torch.equal(result["batch"], torch.tensor([0, 0, 1]))
+    assert torch.equal(result["x"], torch.tensor([[1.0], [2.0], [3.0]]))
+    assert result["graph_note"] == ["first", "second"]
+    assert result["graph_meta"] == [
+        {"stage": "train", "epoch": 1},
+        {"stage": "val", "epoch": 2},
+    ]
+
+
 def test_graphs_with_ambiguous_shape_constant_but_different_meaning():
-    """
-    Test case where an attribute has constant shape across batch but should be node attr.
-    This relies on the `is_shape_constant` check within determine_graph_key_types.
-    """
+    """Validate node-attribute classification when shapes are constant across samples."""
     # Sample 1: 3 nodes, node feature dim 2
     sample1 = create_sample(
         num_nodes=3, edge_index=[[0, 1], [2, 0]], node_features=[[1, 1], [2, 2], [3, 3]], graph_features=[10]
@@ -247,42 +274,8 @@ def test_graphs_with_ambiguous_shape_constant_but_different_meaning():
     assert torch.equal(result["edge_index"], torch.tensor([[0, 1, 3, 4], [2, 0, 4, 5]]))
 
 
-def test_graph_attribute_misclassification_recovery():
-    """
-    Test case simulating misclassification of a node attribute as graph attribute
-    and verifying it can be recovered (though the current implementation aims to prevent this).
-    This test asserts the *expected* behavior (correct classification) rather than
-    testing the recovery mechanism directly, as the goal is correct initial classification.
-    """
-    # Scenario: 2 graphs, both with 3 nodes. Node feature 'x' is [3, 10]. Graph feature 'g' is [].
-    # If 'x' is mistakenly classified as graph attribute (because shape is constant [3, 10] across batch)
-    # it would be stacked to [2, 3, 10].
-    # The correct classification should make it node attribute, concatenated to [6, 10].
-
-    sample1 = create_sample(
-        num_nodes=3, edge_index=[[0, 1], [2, 0]], node_features=[[1.0] * 10] * 3, graph_features=[10.0]
-    )
-    sample2 = create_sample(
-        num_nodes=3, edge_index=[[0, 1], [1, 2]], node_features=[[2.0] * 10] * 3, graph_features=[20.0]
-    )
-    batch_list = [sample1, sample2]
-
-    result = collate_graph_samples(batch_list)
-
-    # Assert that 'x' is treated as a node attribute (concatenated)
-    assert "x" in result
-    assert result["x"].shape == (6, 10)  # Should be (num_nodes1 + num_nodes2, feature_dim)
-    assert torch.equal(result["x"][:3, :], torch.tensor([[1.0] * 10] * 3))
-    assert torch.equal(result["x"][3:, :], torch.tensor([[2.0] * 10] * 3))
-
-    # Assert 'graph_attr' is treated as a graph attribute (stacked)
-    assert "graph_attr" in result
-    assert result["graph_attr"].shape == (2, 1)  # Should be (num_graphs,)
-    assert torch.equal(result["graph_attr"], torch.tensor([[10.0], [20.0]]))
-
-
 def test_edge_case_empty_edge_index():
-    """Test when edge_index is present but empty."""
+    """Validate behavior when edge_index exists but is empty."""
     sample1 = {"edge_index": torch.empty((2, 0), dtype=torch.long), "num_nodes": 2, "x": torch.randn(2, 5)}
     sample2 = {"edge_index": torch.empty((2, 0), dtype=torch.long), "num_nodes": 3, "x": torch.randn(3, 5)}
     batch_list = [sample1, sample2]
@@ -298,7 +291,7 @@ def test_edge_case_empty_edge_index():
 
 
 def test_node_attribute_missing_in_one_sample():
-    """Test when a node attribute is missing in one sample (should ideally error or handle gracefully)."""
+    """Validate error behavior when a required node attribute is missing in one sample."""
     sample1 = create_sample(num_nodes=3, edge_index=[[0, 1], [1, 0]], node_features=[[1], [2], [3]])
     sample2 = {"edge_index": torch.tensor([[0, 1], [1, 0]]), "num_nodes": 2}  # Missing 'x'
     batch_list = [sample1, sample2]
@@ -314,8 +307,147 @@ def test_node_attribute_missing_in_one_sample():
     # to use sample.get(k) more broadly and potentially add padding logic.
 
 
-def test_determine_graph_key_types_raises_when_variable_keys_cannot_be_disambiguated():
-    """Variable-length attributes without node/edge anchors should raise explicit error."""
+# Section: No-Anchor Paths
+# Validate daily no-anchor workloads with fallback behavior and strict-mode failure expectations.
+
+
+def test_determine_graph_key_types_default_fallback_marks_variable_keys_as_node_attr():
+    """Validate default no-anchor inference maps variable keys to node attributes."""
+    batch_list = [
+        {
+            "x": torch.randn(3, 4),
+            "aux": torch.randn(3, 2),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "x": torch.randn(5, 4),
+            "aux": torch.randn(5, 2),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    key_types = determine_graph_key_types(batch_list)
+    assert key_types is not None
+    assert key_types["node"] == {"x", "aux"}
+    assert key_types["edge"] == set()
+    assert key_types["graph"] == {"graph_attr"}
+
+
+def test_collate_graph_samples_default_fallback_without_num_nodes_and_edge_index():
+    """Validate default no-anchor collation for variable-length attributes."""
+    batch_list = [
+        {
+            "x": torch.randn(3, 4),
+            "aux": torch.randn(3, 2),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "x": torch.randn(5, 4),
+            "aux": torch.randn(5, 2),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+
+    assert "batch" in result
+    assert torch.equal(result["batch"], torch.tensor([0, 0, 0, 1, 1, 1, 1, 1]))
+    assert "x" in result and result["x"].shape == (8, 4)
+    assert "aux" in result and result["aux"].shape == (8, 2)
+    assert "graph_attr" in result and result["graph_attr"].shape == (2, 1)
+    assert "edge_index" not in result
+
+
+def test_no_anchor_default_mixed_variable_and_constant_attrs():
+    """Validate mixed variable and constant attributes under default no-anchor flow."""
+    batch_list = [
+        {
+            "x": torch.tensor([[1.0, 1.0], [2.0, 2.0]]),
+            "aux": torch.tensor([[10.0], [20.0]]),
+            "meta": torch.tensor([100.0]),
+        },
+        {
+            "x": torch.tensor([[3.0, 3.0], [4.0, 4.0], [5.0, 5.0]]),
+            "aux": torch.tensor([[30.0], [40.0], [50.0]]),
+            "meta": torch.tensor([200.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+
+    assert torch.equal(result["batch"], torch.tensor([0, 0, 1, 1, 1]))
+    assert torch.equal(result["x"], torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0], [5.0, 5.0]]))
+    assert torch.equal(result["aux"], torch.tensor([[10.0], [20.0], [30.0], [40.0], [50.0]]))
+    assert torch.equal(result["meta"], torch.tensor([[100.0], [200.0]]))
+    assert "edge_index" not in result
+
+
+def test_no_anchor_default_all_constant_attrs_graph_only():
+    """Validate graph-only output when all no-anchor attributes are constant-length."""
+    batch_list = [
+        {
+            "graph_attr": torch.tensor([1.0]),
+            "global_feat": torch.tensor([10.0, 11.0]),
+        },
+        {
+            "graph_attr": torch.tensor([2.0]),
+            "global_feat": torch.tensor([20.0, 21.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+
+    assert result["batch"].numel() == 0
+    assert result["batch"].dtype == torch.long
+    assert torch.equal(result["graph_attr"], torch.tensor([[1.0], [2.0]]))
+    assert torch.equal(result["global_feat"], torch.tensor([[10.0, 11.0], [20.0, 21.0]]))
+    assert "edge_index" not in result
+
+
+def test_no_anchor_default_multiple_variable_keys_same_signature():
+    """Validate stable fallback for multiple no-anchor variable keys sharing signatures."""
+    batch_list = [
+        {
+            "x": torch.tensor([[1.0], [2.0]]),
+            "z": torch.tensor([[7.0, 8.0], [9.0, 10.0]]),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "x": torch.tensor([[3.0], [4.0], [5.0], [6.0]]),
+            "z": torch.tensor([[11.0, 12.0], [13.0, 14.0], [15.0, 16.0], [17.0, 18.0]]),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+
+    assert torch.equal(result["batch"], torch.tensor([0, 0, 1, 1, 1, 1]))
+    assert result["x"].shape == (6, 1)
+    assert result["z"].shape == (6, 2)
+    assert torch.equal(result["x"][:2], torch.tensor([[1.0], [2.0]]))
+    assert torch.equal(result["x"][2:], torch.tensor([[3.0], [4.0], [5.0], [6.0]]))
+    assert torch.equal(result["graph_attr"], torch.tensor([[1.0], [2.0]]))
+
+
+def test_no_anchor_strict_raises_for_mixed_attrs():
+    """Validate strict no-anchor mode raises on unresolved variable-length attributes."""
+    batch_list = [
+        {
+            "x": torch.randn(2, 3),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "x": torch.randn(4, 3),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    with pytest.raises(ValueError, match="Cannot determine attribute types"):
+        determine_graph_key_types(batch_list, strict=True)
+
+
+def test_determine_graph_key_types_strict_raises_when_variable_keys_cannot_be_disambiguated():
+    """Validate strict mode raises when variable-length attributes have no anchors."""
     batch_list = [
         {
             "x": torch.randn(3, 4),
@@ -330,10 +462,15 @@ def test_determine_graph_key_types_raises_when_variable_keys_cannot_be_disambigu
     ]
 
     with pytest.raises(ValueError, match="Cannot determine attribute types"):
-        determine_graph_key_types(batch_list)
+        determine_graph_key_types(batch_list, strict=True)
+
+
+# Section: Specialized Edge Keys
+# Validate naming-convention keys (edge_*_index / edge_*_attr), offsets, concatenation, and validation errors.
 
 
 def test_special_named_edge_index_offsets_like_edge_index():
+    """Validate named edge-index keys apply node-offset collation like edge_index."""
     batch_list = [
         {
             "num_nodes": 3,
@@ -356,7 +493,8 @@ def test_special_named_edge_index_offsets_like_edge_index():
     assert torch.equal(result["edge_d_index"], expected)
 
 
-def test_special_named_edge_index_infers_num_nodes_without_edge_index():
+def test_special_named_edge_index_without_node_hints_raises():
+    """Validate specialized edge-index keys raise when no node hints are available."""
     batch_list = [
         {
             "edge_d_index": torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
@@ -368,15 +506,29 @@ def test_special_named_edge_index_infers_num_nodes_without_edge_index():
         },
     ]
 
-    result = collate_graph_samples(batch_list)
+    with pytest.raises(ValueError, match="specialized edge keys were provided"):
+        collate_graph_samples(batch_list)
 
-    # sample0 infers 2 nodes, sample1 infers 3 nodes
-    assert torch.equal(result["batch"], torch.tensor([0, 0, 1, 1, 1]))
-    expected = torch.tensor([[0, 1, 2], [1, 0, 4]], dtype=torch.long)
-    assert torch.equal(result["edge_d_index"], expected)
+
+def test_special_named_edge_attr_without_node_hints_raises():
+    """Validate specialized edge-attr keys raise when no node hints are available."""
+    batch_list = [
+        {
+            "edge_d_attr": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "edge_d_attr": torch.tensor([[5.0, 6.0]]),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    with pytest.raises(ValueError, match="specialized edge keys were provided"):
+        collate_graph_samples(batch_list)
 
 
 def test_special_named_edge_attr_concatenate_1d():
+    """Validate 1D specialized edge attributes concatenate in sample order."""
     batch_list = [
         {
             "num_nodes": 2,
@@ -400,6 +552,7 @@ def test_special_named_edge_attr_concatenate_1d():
 
 
 def test_special_named_edge_attr_concatenate_2d():
+    """Validate 2D specialized edge attributes concatenate along dim=0."""
     batch_list = [
         {
             "num_nodes": 2,
@@ -420,6 +573,7 @@ def test_special_named_edge_attr_concatenate_2d():
 
 
 def test_special_named_edge_index_and_attr_together():
+    """Validate coexisting specialized edge index and attr keys collate correctly."""
     batch_list = [
         {
             "num_nodes": 2,
@@ -447,6 +601,7 @@ def test_special_named_edge_index_and_attr_together():
 
 
 def test_special_named_edge_index_invalid_shape_raises():
+    """Validate invalid specialized edge-index shape raises ValueError."""
     batch_list = [
         {
             "num_nodes": 2,
@@ -456,11 +611,12 @@ def test_special_named_edge_index_invalid_shape_raises():
         }
     ]
 
-    with pytest.raises(ValueError, match=r"must have shape \[2, E\]"):
+    with pytest.raises(ValueError, match=r"must have shape \[2, X\]"):
         collate_graph_samples(batch_list)
 
 
 def test_special_named_edge_index_invalid_dtype_raises():
+    """Validate invalid specialized edge-index dtype raises TypeError."""
     batch_list = [
         {
             "num_nodes": 2,
@@ -475,6 +631,7 @@ def test_special_named_edge_index_invalid_dtype_raises():
 
 
 def test_special_named_edge_attr_invalid_scalar_raises():
+    """Validate scalar specialized edge-attr input raises ValueError."""
     batch_list = [
         {
             "num_nodes": 2,
@@ -486,3 +643,156 @@ def test_special_named_edge_attr_invalid_scalar_raises():
 
     with pytest.raises(ValueError, match="must have at least 1 dimension"):
         collate_graph_samples(batch_list)
+
+
+def test_edge_index_and_named_edge_index_coexist_with_correct_offsets():
+    """Validate standard and named edge-index keys coexist with correct offsets."""
+    batch_list = [
+        {
+            "num_nodes": 3,
+            "x": torch.randn(3, 1),
+            "edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+            "edge_d_index": torch.tensor([[0, 2, 1], [2, 1, 0]], dtype=torch.long),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 1),
+            "edge_index": torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+            "edge_d_index": torch.tensor([[0, 1], [0, 1]], dtype=torch.long),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+
+    expected_edge_index = torch.tensor([[0, 1, 3, 4], [1, 2, 4, 3]], dtype=torch.long)
+    expected_edge_d_index = torch.tensor([[0, 2, 1, 3, 4], [2, 1, 0, 3, 4]], dtype=torch.long)
+    assert torch.equal(result["edge_index"], expected_edge_index)
+    assert torch.equal(result["edge_d_index"], expected_edge_d_index)
+
+
+def test_named_edge_attr_keeps_order_with_coexisting_edge_index():
+    """Validate specialized edge-attr order is preserved with standard edge_index."""
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 1),
+            "edge_index": torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+            "edge_d_index": torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]], dtype=torch.long),
+            "edge_d_attr": torch.tensor([1.0, 2.0, 3.0, 4.0]),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "num_nodes": 3,
+            "x": torch.randn(3, 1),
+            "edge_index": torch.tensor([[0, 2], [2, 1]], dtype=torch.long),
+            "edge_d_index": torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long),
+            "edge_d_attr": torch.tensor([10.0, 20.0, 30.0]),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+    assert torch.equal(result["edge_d_attr"], torch.tensor([1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0]))
+
+
+def test_multiple_named_edge_index_keys_are_independently_collated():
+    """Validate multiple named edge-index keys are collated independently."""
+    batch_list = [
+        {
+            "num_nodes": 3,
+            "x": torch.randn(3, 1),
+            "edge_d_index": torch.tensor([[0, 1], [2, 0]], dtype=torch.long),
+            "edge_k_index": torch.tensor([[0, 2], [1, 1]], dtype=torch.long),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 1),
+            "edge_d_index": torch.tensor([[0], [1]], dtype=torch.long),
+            "edge_k_index": torch.tensor([[1], [0]], dtype=torch.long),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+
+    expected_d = torch.tensor([[0, 1, 3], [2, 0, 4]], dtype=torch.long)
+    expected_k = torch.tensor([[0, 2, 4], [1, 1, 3]], dtype=torch.long)
+    assert torch.equal(result["edge_d_index"], expected_d)
+    assert torch.equal(result["edge_k_index"], expected_k)
+
+
+def test_plain_edge_attr_not_treated_as_named_special_key():
+    """Validate plain edge_attr stays on the generic edge-attribute path."""
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.randn(2, 1),
+            "edge_attr": torch.tensor([[1.0], [2.0]]),
+            "graph_attr": torch.tensor([1.0]),
+        },
+        {
+            "num_nodes": 3,
+            "x": torch.randn(3, 1),
+            "edge_attr": torch.tensor([[3.0], [4.0], [5.0]]),
+            "graph_attr": torch.tensor([2.0]),
+        },
+    ]
+
+    result = collate_graph_samples(batch_list)
+    # edge_attr stays on the original path and should still concatenate as edge attribute.
+    assert result["edge_attr"].shape == (5, 1)
+    assert torch.equal(result["edge_attr"], torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]]))
+
+
+def test_collate_graph_samples_with_explicit_key_types_keeps_non_tensor_attrs():
+    """Validate explicit key_types does not require non-tensor attrs to be pre-classified."""
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.tensor([[1.0], [2.0]]),
+            "graph_note": "first",
+            "graph_meta": {"split": "train", "id": 1},
+        },
+        {
+            "num_nodes": 1,
+            "x": torch.tensor([[3.0]]),
+            "graph_note": "second",
+            "graph_meta": {"split": "val", "id": 2},
+        },
+    ]
+    key_types = {"node": {"x"}, "edge": set(), "graph": set()}
+
+    result = collate_graph_samples(batch_list, key_types=key_types)
+
+    assert torch.equal(result["batch"], torch.tensor([0, 0, 1]))
+    assert torch.equal(result["x"], torch.tensor([[1.0], [2.0], [3.0]]))
+    assert result["graph_note"] == ["first", "second"]
+    assert result["graph_meta"] == [
+        {"split": "train", "id": 1},
+        {"split": "val", "id": 2},
+    ]
+
+
+def test_collate_graph_samples_with_explicit_key_types_requires_tensor_classification():
+    """Validate explicit key_types still enforces classification coverage for tensor attrs."""
+    batch_list = [
+        {
+            "num_nodes": 2,
+            "x": torch.tensor([[1.0], [2.0]]),
+            "aux": torch.tensor([[10.0], [20.0]]),
+            "graph_note": "first",
+        },
+        {
+            "num_nodes": 1,
+            "x": torch.tensor([[3.0]]),
+            "aux": torch.tensor([[30.0]]),
+            "graph_note": "second",
+        },
+    ]
+    key_types = {"node": {"x"}, "edge": set(), "graph": set()}
+
+    with pytest.raises(ValueError, match="not classified"):
+        collate_graph_samples(batch_list, key_types=key_types)
