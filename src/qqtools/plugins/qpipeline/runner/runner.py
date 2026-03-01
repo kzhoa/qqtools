@@ -57,14 +57,14 @@ def move_batch_to_device(batch_data, device: torch.device):
     if batch_data is None:
         return batch_data
 
-    if isinstance(batch_data, torch.Tensor):
+    if hasattr(batch_data, "to"):
+        return batch_data.to(device)
+    elif isinstance(batch_data, torch.Tensor):
         return batch_data.to(device)
     elif isinstance(batch_data, dict):
-        return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch_data.items()}
+        return qt.qDict({k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch_data.items()})
     elif isinstance(batch_data, (tuple, list)):
         return type(batch_data)(v.to(device) if isinstance(v, torch.Tensor) else v for v in batch_data)
-    elif hasattr(batch_data, "to"):
-        return batch_data.to(device)
     else:
         return batch_data
 
@@ -183,8 +183,8 @@ class RunningAgent:
             Prepared batch data
         """
         batch_data = move_batch_to_device(batch_data, self.device)
-        if hasattr(batch_data, "to_dtype") and self.config.dtype is not None:
-            batch_data = batch_data.to_dtype(self.config.dtype)
+        # if hasattr(batch_data, "to_dtype") and self.config.dtype is not None:
+        #     batch_data = batch_data.to_dtype(self.config.dtype)
         return batch_data
 
     def _forward_batch(self, model: nn.Module, batch_data):

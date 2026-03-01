@@ -195,7 +195,8 @@ class qPipeline:
 
         # unpack
         args = self.args
-        max_epochs = args.runner.epochs
+        max_epochs = args.runner.max_epochs
+        max_steps = args.runner.max_steps
         clip_grad = args.runner.clip_grad
         distributed = args.distributed
         log_dir = args.log_dir
@@ -209,15 +210,16 @@ class qPipeline:
         save_interval = args.runner.get("save_interval", None)
 
         train_runner(
-            model,
-            task,
-            loss_fn,
-            optimizer,
-            scheduler,
-            args,
-            max_epochs,
-            clip_grad,
-            distributed,
+            model=model,
+            task=task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            args=args,
+            max_epochs=max_epochs,
+            max_steps=max_steps,
+            clip_grad=clip_grad,
+            distributed=distributed,
             save_dir=log_dir,
             print_freq=print_freq,
             extra_log_keys=extra_log_keys,

@@ -384,8 +384,8 @@ def resolve_render_mode(requested_mode: Optional[str], has_rich: bool, has_tqdm:
     Resolve the final render mode based on request and availability.
     Auto-downgrades with warnings if the requested mode is unavailable.
     """
-    # 1. Auto-detect if no specific mode requested
-    if requested_mode is None:
+    # 1. Auto-detect if no specific mode requested (or explicitly requested as auto)
+    if requested_mode is None or requested_mode == "auto":
         if has_rich:
             return "rich"
         if has_tqdm:
@@ -431,7 +431,7 @@ class ProgressTracker:
         self,
         logger: Any,
         print_freq: int = 10,
-        render_type: Optional[Literal["rich", "tqdm", "plain"]] = None,
+        render_type: Optional[Literal["auto", "rich", "tqdm", "plain"]] = None,
     ):
         """Initialize the LogListener with automatic fallback."""
 
