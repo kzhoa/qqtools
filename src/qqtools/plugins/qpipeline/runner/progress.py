@@ -173,8 +173,8 @@ if HAS_RICH:
             for k, v in batch_metrics.items():
                 if isinstance(v, (int, float)):
                     avg_val = avg_bank.get(k, "")
-                    avg_str = f"{avg_val:.6f}" if isinstance(avg_val, (int, float)) else ""
-                    table.add_row(k, f"{v:.6f}", avg_str)
+                    avg_str = f"{avg_val:.8f}" if isinstance(avg_val, (int, float)) else ""
+                    table.add_row(k, f"{v:.8f}", avg_str)
 
             # Add learning rate if available
             if lr is not None:

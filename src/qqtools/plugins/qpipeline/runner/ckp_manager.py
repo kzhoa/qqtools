@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from ..entry_utils.qema import qEMA
 from .types import RunningState
+from ..task.qtask import qTaskBase
 
 
 def generate_checkpoint_filename(epoch: int, global_step: int, is_best: bool = False) -> str:
@@ -34,12 +35,12 @@ class CheckpointManager:
         self,
         state: RunningState,
         model: nn.Module,
+        task: qTaskBase,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[Any] = None,
         ema_model: Optional[qEMA] = None,
         early_stopper: Optional[Any] = None,
         best_model_manager: Optional[Any] = None,  # Add this
-        task: Optional[Any] = None,
         is_best: bool = False,
     ) -> str:
         """Save checkpoint to file"""
@@ -47,7 +48,7 @@ class CheckpointManager:
             return ""
 
         checkpoint = self._create_checkpoint_dict(
-            state, model, optimizer, scheduler, ema_model, early_stopper, best_model_manager, task
+            state, model, task, optimizer, scheduler, ema_model, early_stopper, best_model_manager
         )
         filename = generate_checkpoint_filename(state.epoch, state.global_step, is_best)
 
@@ -76,13 +77,13 @@ class CheckpointManager:
         checkpoint_path: str,
         device: torch.device,
         model: nn.Module,
+        task: qTaskBase,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[Any] = None,
         ema_model: Optional[qEMA] = None,
         state: Optional[RunningState] = None,
         early_stopper: Optional[Any] = None,
         best_model_manager: Optional[Any] = None,
-        task: Optional[Any] = None,
     ):
         """Load checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -114,7 +115,7 @@ class CheckpointManager:
             best_model_manager.load_state_dict(checkpoint["best_model_state_dict"])
 
         # Load task state
-        if "task_state_dict" in checkpoint and hasattr(task, "load_state_dict"):
+        if "task_state_dict" in checkpoint and task.has_implemented("load_state_dict"):
             task.load_state_dict(checkpoint["task_state_dict"])
 
         return checkpoint
@@ -123,12 +124,12 @@ class CheckpointManager:
         self,
         state: RunningState,
         model: nn.Module,
+        task: qTaskBase,
         optimizer: Optional[torch.optim.Optimizer],
         scheduler: Optional[Any],
         ema_model: Optional[qEMA],
         early_stopper: Optional[Any],
         best_model_manager: Optional[Any],
-        task: Optional[Any],
     ) -> Dict[str, Any]:
         """Create checkpoint dictionary with current model state."""
         checkpoint = {
@@ -150,7 +151,7 @@ class CheckpointManager:
             checkpoint["ema_state_dict"] = ema_model.state_dict()
 
         # Save task-specific state
-        if hasattr(task, "state_dict"):
+        if task.has_implemented("state_dict"):
             checkpoint["task_state_dict"] = task.state_dict()
 
         return checkpoint

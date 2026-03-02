@@ -95,6 +95,61 @@ def all_reduce(value, device, reduceOp="sum"):
     return value if is_orig_tensor else value.item()
 
 
+def all_gather_tensor(tensor: torch.Tensor, device: torch.device = None) -> torch.Tensor:
+    """Gather a tensor from all distributed processes.
+
+    Supports gathering tensors of different sizes across the first dimension (e.g. batch size).
+    If not in distributed mode, simply returns the input tensor.
+
+    Args:
+        tensor: The tensor to gather (can be on CPU, but will be moved to device for NCCL)
+        device: The device to use for communication (defaults to current CUDA device)
+
+    Returns:
+        Concatenated tensor from all processes
+    """
+    if not is_dist_available_and_initialized():
+        return tensor
+
+    if device is None:
+        device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+
+    world_size = get_world_size()
+
+    # Needs to be on GPU for NCCL backend
+    tensor_device = tensor.device
+    dist_tensor = tensor.to(device)
+
+    # 1. Gather sizes to handle different batch sizes at the end of epoch
+    local_size = torch.tensor([dist_tensor.shape[0]], dtype=torch.long, device=device)
+    size_list = [torch.empty_like(local_size) for _ in range(world_size)]
+    dist.all_gather(size_list, local_size)
+
+    # 2. Pad local tensor to max size
+    max_size = torch.max(torch.stack(size_list)).item()
+    pad_size = max_size - local_size.item()
+
+    if pad_size > 0:
+        pad_shape = list(dist_tensor.shape)
+        pad_shape[0] = pad_size
+        padding = torch.zeros(pad_shape, dtype=dist_tensor.dtype, device=device)
+        dist_tensor = torch.cat([dist_tensor, padding], dim=0)
+
+    # 3. Gather the padded tensors
+    tensor_list = [torch.empty_like(dist_tensor) for _ in range(world_size)]
+    dist.all_gather(tensor_list, dist_tensor)
+
+    # 4. Remove padding and concatenate
+    result_tensors = []
+    for i, size in enumerate(size_list):
+        result_tensors.append(tensor_list[i][: size.item()])
+
+    result = torch.cat(result_tensors, dim=0)
+
+    # Return onto the original device (e.g. CPU)
+    return result.to(tensor_device)
+
+
 class qBarrier(object):
     def __init__(self):
         pass

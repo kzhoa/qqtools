@@ -13,7 +13,7 @@ __all__ = ["qTaskBase", "PotentialTaskBase"]
 OPTIONAL_METHODS = [
     # === functional hook ===
     "get_loss_fn",
-    "extra_batch_metric",
+    "batch_cache",
     "epoch_metric",
     "pipe_middle_ware",
     "to",
@@ -34,8 +34,8 @@ class qTaskBase(ABC):
     Optional methods (can be implemented by users):
 
     - def get_loss_fn(self, args) -> Callable:
-    - def extra_batch_metric
-    - def epoch_metric(epoch_cache)
+    - def batch_cache(out, batch_data) -> Dict[str, Tensor]: For cross-batch caching
+    - def epoch_metric(gathered_cache: Dict[str, Tensor]) -> Dict: For cross-batch metrics calculation
     """
 
     train_loader: DataLoader
@@ -62,6 +62,10 @@ class qTaskBase(ABC):
 
         for name in REQUIRED_METHODS:
             assert qt.is_override(self, name, qTaskBase)
+
+    def has_implemented(self, method_name: str) -> bool:
+        """Check if an optional method has been overridden by the subclass."""
+        return method_name in self._opt_impl
 
     @abstractmethod
     def batch_forward(self, model, batch_data) -> Dict[str, Tensor]:
@@ -128,39 +132,39 @@ class qTaskBase(ABC):
     def get_loss_fn(self, args) -> Callable:
         raise NotImplementedError
 
-    def extra_batch_metric(self, out, batch_data, losses, model, epoch_cache):
-        """Compute extended metrics that require cross-batch information.
+    def batch_cache(self, out, batch_data) -> Dict[str, Union[Tensor, float]]:
+        """Return tensors that need to be cached across the epoch.
 
-        Some metrics need information more than current batch
-        (e.g., running statistics, cumulative performance, sequence-aware metrics).
-        This hook provides access to the current training state and epoch-level
-        cache to compute such cross-batch metrics.
+        Use this to collect metrics like true/predicted labels that need
+        to be aggregated at the end of an epoch (e.g., for AUC, Global MAE).
+        The framework will safely detach and move them to CPU automatically.
 
-        Note:
-            Currently modifies `epoch_cache` in-place for state persistence
-            across batches. TODO this is not elegant
-            This implementation may be refined in future versions for better encapsulation.
+        Warning:
+            Do NOT cache high-dimensional tensors (e.g., full feature maps)
+            as this will cause system RAM Out-Of-Memory errors!
 
         Args:
             out (dict): Model outputs
             batch_data (dict-like qData): Batch input data
-            losses (dict): Computed losses
-            model (nn.Module): Model instance
-            epoch_cache (dict): Shared epoch state cache
 
         Returns:
-            dict: Additional batch-level metric names and values
+            dict: `{'key_name': tensor_or_scalar}`
         """
         raise NotImplementedError
 
-    def epoch_metric(self, epoch_cache) -> Dict:
+    def epoch_metric(self, gathered_cache: Dict[str, Tensor]) -> Dict:
         """
-        take epoch cache and calculate epoch-wise metrics.
+        Receive combined tensors across all batches and specific DDP nodes
+        at the end of an epoch, and calculate global metrics.
 
-        `epoch_cache` can be revised through `extra_batch_metric`.
+        `gathered_cache` contains the concatenated tensors provided by `batch_cache`.
+        Tensors will be aggregated across all GPUs if in DDP mode.
 
-        Return:
-            dict of epoch metrics
+        Args:
+            gathered_cache (dict): Combined dictionary of cached tensors
+
+        Returns:
+            dict: dict of epoch level metrics `{'metric_name': value}`
         """
         raise NotImplementedError
 
