@@ -58,6 +58,8 @@ class RunConfig:
             object.__setattr__(self, "run_mode", RunMode(self.run_mode))
         if isinstance(self.device, str):
             object.__setattr__(self, "device", torch.device(self.device))
+        if not isinstance(self.print_freq, int) or self.print_freq <= 0:
+            raise ValueError("print_freq must be a positive integer")
 
 
 class RunningState:

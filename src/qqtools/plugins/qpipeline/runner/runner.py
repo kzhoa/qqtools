@@ -34,6 +34,7 @@ from .best_model import BestModelManager
 from .ckp_manager import CheckpointManager
 from .earlystop import EarlyStopper
 from .progress import ProgressTracker
+from .tensorbank import TensorBank
 from .types import EventContext, RunConfig, RunMode, RunningState
 
 __all__ = ["train_runner", "infer_runner"]
@@ -159,6 +160,23 @@ class RunningAgent:
         self._train_iter = None
         self.avg_bank = avg_bank or AvgBank()
 
+        # Check TensorBank capability hooks
+        has_batch_cache = self.task.has_implemented("batch_cache")
+        has_epoch_metric = self.task.has_implemented("epoch_metric")
+
+        self.use_tensor_bank = has_batch_cache and has_epoch_metric
+        self.tensor_bank = TensorBank(logger=self.logger) if self.use_tensor_bank else None
+        if has_batch_cache and not has_epoch_metric:
+            self.logger.warning(
+                "Task implements 'batch_cache' but missing companion 'epoch_metric'. "
+                "Tensor caching feature is disabled. Please implement both hooks to enable."
+            )
+        elif has_epoch_metric and not has_batch_cache:
+            self.logger.warning(
+                "Task implements 'epoch_metric' but missing companion 'batch_cache'. "
+                "Tensor caching feature is disabled. Please implement both hooks to enable."
+            )
+
     def add_listener(self, event: str, listener: Callable):
         if event in self.listeners:
             self.listeners[event].append(listener)
@@ -230,7 +248,10 @@ class RunningAgent:
 
     def _start_new_epoch(self):
         """Initialize a new epoch: create iterator and setup distributed sampling."""
+        # Set iterator and reset metrics
         self._train_iter = iter(self.train_loader)
+        if self.use_tensor_bank:
+            self.tensor_bank.reset()
 
         # Update distributed sampler epoch for proper shuffling
         if self.config.distributed and hasattr(self.train_loader.sampler, "set_epoch"):
@@ -293,6 +314,14 @@ class RunningAgent:
         """
         # Calculate the average metrics of the current epoch
         epoch_metrics = self.avg_bank.gather_average(self.config.distributed)
+
+        # Add tasks's cross-batch metrics if implemented
+        if self.use_tensor_bank:
+            gathered_cache = self.tensor_bank.gather(self.config.distributed, self.device)
+            task_epoch_metrics = self.task.epoch_metric(gathered_cache)
+            if task_epoch_metrics:
+                epoch_metrics.update(task_epoch_metrics)
+
         self.state.update_current_metrics(epoch_metrics)
 
         # Trigger epoch end event for listeners
@@ -315,6 +344,10 @@ class RunningAgent:
         # Calculate metrics
         raw_batch_metrics = self.task.batch_metric(out, batch_data)
         batch_metrics = self._scalarize_batch_metrics(raw_batch_metrics)
+
+        # Cache tensors if implemented
+        if self.use_tensor_bank:
+            self.tensor_bank.add(self.task.batch_cache(out, batch_data))
 
         # Training mode: calculate loss and backward propagation
         losses = self.task.batch_loss(out, batch_data, self.loss_fn)
@@ -362,6 +395,7 @@ class RunningAgent:
         was_training = model.training
         model.eval()
         avg_bank = AvgBank()
+        tensor_bank = TensorBank(self.logger) if self.use_tensor_bank else None
 
         # Setup evaluation progress bar for rank 0
         is_rank_zero = getattr(self.config, "rank", 0) == 0
@@ -394,6 +428,10 @@ class RunningAgent:
                         value = value.item()
                     avg_bank.add(key, value, cnt)
 
+                # Cache tensors into tensor_bank if implemented
+                if self.use_tensor_bank:
+                    tensor_bank.add(self.task.batch_cache(out, batch_data))
+
                 # Trigger batch end event with eval stage info
                 batch_context = EventContext(
                     state=self.state,
@@ -407,6 +445,13 @@ class RunningAgent:
 
         # Calculate average
         avg_metrics = avg_bank.gather_average(self.config.distributed)
+
+        # Add tasks's cross-batch metrics if implemented
+        if self.use_tensor_bank:
+            gathered_cache = tensor_bank.gather(self.config.distributed, self.device)
+            task_epoch_metrics = self.task.epoch_metric(gathered_cache)
+            if task_epoch_metrics:
+                avg_metrics.update(task_epoch_metrics)
 
         # Add prefix
         prefixed_metrics = {f"{prefix}_{key}": value for key, value in avg_metrics.items()}
@@ -492,12 +537,12 @@ class RunningAgent:
             ckp_path = self.checkpoint_manager.save(
                 self.state,
                 self.model,
+                self.task,
                 self.optimizer,
                 self.scheduler,
                 self.ema_model,
                 self.early_stopper,
                 self.best_model_manager,
-                self.task,
                 is_best=True,
             )
             self.state.best_ckp_file = ckp_path
@@ -514,12 +559,12 @@ class RunningAgent:
         ckp_path = self.checkpoint_manager.save(
             self.state,
             self.model,
+            self.task,
             self.optimizer,
             self.scheduler,
             self.ema_model,
             self.early_stopper,
             self.best_model_manager,
-            self.task,
             is_best=False,
         )
         self._trigger(
@@ -616,7 +661,7 @@ class RunningAgent:
                 self._trigger("on_batch_end", context=batch_context)
                 self._trigger("on_train_batch_end", context=batch_context)
 
-                freq = max(1, self.config.print_freq)
+                freq = self.config.print_freq
                 is_progress_tick = batch_context.batch_idx % freq == 0 or batch_context.batch_idx == (
                     batch_context.total_batches - 1
                 )
@@ -833,13 +878,13 @@ def train_runner(
             config.ckp_file,
             device,
             model,
+            task,
             optimizer,
             effective_scheduler,
             ema_model,
             agent.state,
             agent.early_stopper,
             agent.best_model_manager,
-            task,
         )
         logger.info(f"Loaded checkpoint from {config.ckp_file}")
         checkpoint_loaded = True
