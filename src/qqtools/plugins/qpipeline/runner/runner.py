@@ -399,7 +399,23 @@ class RunningAgent:
 
         # Setup evaluation progress bar for rank 0
         is_rank_zero = getattr(self.config, "rank", 0) == 0
-        use_tqdm = is_rank_zero and getattr(self.config, "render_type", "auto") != "plain"
+        render_type = (getattr(self.config, "render_type", "auto") or "auto").lower()
+
+        has_rich = False
+        if render_type == "auto":
+            try:
+                import rich  # noqa: F401
+
+                has_rich = True
+            except ImportError:
+                has_rich = False
+
+        use_tqdm = False
+        if is_rank_zero:
+            if render_type == "tqdm":
+                use_tqdm = True
+            elif render_type == "auto":
+                use_tqdm = not has_rich
 
         if use_tqdm:
             try:
@@ -443,6 +459,16 @@ class RunningAgent:
                 )
                 self._trigger("on_batch_end", context=batch_context)
 
+                progress_context = EventContext(
+                    state=self.state,
+                    batch_idx=batch_idx,
+                    total_batches=len(data_loader),
+                    batch_metrics=self._scalarize_batch_metrics(batch_metrics),
+                    avg_bank=avg_bank.to_dict(self.config.distributed),
+                    stage=stage,
+                )
+                self._trigger("on_progress_tick", context=progress_context)
+
         # Calculate average
         avg_metrics = avg_bank.gather_average(self.config.distributed)
 
@@ -470,7 +496,19 @@ class RunningAgent:
         Returns:
             bool: True if training should stop, False otherwise.
         """
-        self._trigger("on_eval_start", context=EventContext(state=self.state))
+        total_eval_batches = 0
+        for loader in (self.val_loader, self.test_loader):
+            if loader is None:
+                continue
+            try:
+                total_eval_batches += len(loader)
+            except TypeError:
+                pass
+
+        self._trigger(
+            "on_eval_start",
+            context=EventContext(state=self.state, stage="eval", total_batches=total_eval_batches),
+        )
 
         # Evaluate the original model
         eval_results = self.evaluate(self.model, use_ema=False)
@@ -486,7 +524,10 @@ class RunningAgent:
         self.state.update_current_metrics(eval_results)
 
         # Trigger evaluation end event
-        self._trigger("on_eval_end", context=EventContext(state=self.state, eval_results=eval_results))
+        self._trigger(
+            "on_eval_end",
+            context=EventContext(state=self.state, stage="eval", eval_results=eval_results),
+        )
 
         # Learning rate update (epoch-wise scheduler)
         if self.scheduler is not None:
@@ -640,14 +681,15 @@ class RunningAgent:
                 if self.scheduler is not None:
                     self.scheduler.step_warmup()
 
+                # Record batch time and update total training time
+                batch_time = time.time() - batch_start_time
+                self.state.total_train_time += batch_time
+                batch_metrics["batch_time"] = batch_time
+
                 # Update average bank for epoch-level metrics
                 for k, v in batch_metrics.items():
                     if isinstance(v, (int, float)):
                         self.avg_bank.add(k, v)
-
-                # Record batch time and update total training time
-                batch_time = time.time() - batch_start_time
-                self.state.total_train_time += batch_time
 
                 # Trigger batch end event for listeners (e.g., progress bars, loggers)
                 batch_context = EventContext(

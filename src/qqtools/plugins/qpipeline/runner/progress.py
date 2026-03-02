@@ -97,7 +97,8 @@ if HAS_RICH:
 
         def __init__(self, enable: bool = True):
             self.enable = enable and HAS_RICH
-            self.progress_task_id = None
+            self.train_task_id = None
+            self.eval_task_id = None
             self.console = Console() if self.enable else None
             self.progress = None
             self.layout = None
@@ -124,7 +125,7 @@ if HAS_RICH:
             )
             self.layout = Layout()
             self.layout.split_column(
-                Layout(self.progress, name="progress", size=3),
+                Layout(self.progress, name="progress", size=6),
             )
             self._has_table_layout = False
             self.live = Live(self.layout, auto_refresh=True, refresh_per_second=4, transient=False)
@@ -145,10 +146,39 @@ if HAS_RICH:
                 return
 
             desc = f"[cyan]Epoch {epoch_idx}/{max_epochs}[/]"
-            if self.progress_task_id is None or self.progress_task_id not in self.progress.task_ids:
-                self.progress_task_id = self.progress.add_task(desc, total=num_batches)
+            if self.train_task_id is None or self.train_task_id not in self.progress.task_ids:
+                self.train_task_id = self.progress.add_task(desc, total=num_batches)
             else:
-                self.progress.update(self.progress_task_id, total=num_batches, description=desc, completed=0)
+                self.progress.update(self.train_task_id, total=num_batches, description=desc, completed=0)
+
+            if self.eval_task_id is not None and self.eval_task_id in self.progress.task_ids:
+                self.progress.remove_task(self.eval_task_id)
+                self.eval_task_id = None
+
+        def start_eval_progressbar(self, num_batches: int, eval_stage: str = "eval"):
+            if not self.enable or not self.progress:
+                return
+
+            stage_label = eval_stage.capitalize() if eval_stage else "Eval"
+            desc = f"[magenta]Eval ({stage_label})[/]"
+            if self.eval_task_id is None or self.eval_task_id not in self.progress.task_ids:
+                self.eval_task_id = self.progress.add_task(desc, total=num_batches)
+            else:
+                self.progress.update(self.eval_task_id, total=num_batches, description=desc, completed=0)
+
+            if self.live and self.is_started:
+                self.live.refresh()
+
+        def end_eval_progressbar(self):
+            if not self.enable or not self.progress:
+                return
+
+            if self.eval_task_id is not None and self.eval_task_id in self.progress.task_ids:
+                self.progress.remove_task(self.eval_task_id)
+                self.eval_task_id = None
+
+            if self.live and self.is_started:
+                self.live.refresh()
 
         def update_batch(
             self,
@@ -157,11 +187,11 @@ if HAS_RICH:
             lr: Optional[float],
             advance: bool = True,
         ):
-            if not self.enable or not self.progress or self.progress_task_id is None:
+            if not self.enable or not self.progress or self.train_task_id is None:
                 return
 
             if advance:
-                self.progress.advance(self.progress_task_id)
+                self.progress.advance(self.train_task_id)
 
             # Create metrics table
             table = Table(box=box.HORIZONTALS, show_header=True, padding=(0, 1))
@@ -182,6 +212,27 @@ if HAS_RICH:
 
             self._ensure_table_layout()
             self.layout["table"].update(table)
+
+        def update_eval(self, completed: int, total: int, eval_stage: str = "eval"):
+            if not self.enable or not self.progress:
+                return
+
+            if self.eval_task_id is None or self.eval_task_id not in self.progress.task_ids:
+                self.start_eval_progressbar(total, eval_stage)
+
+            if self.eval_task_id is None:
+                return
+
+            stage_label = eval_stage.capitalize() if eval_stage else "Eval"
+            desc = f"[magenta]Eval ({stage_label})[/]"
+            clamped_total = max(1, int(total or 1))
+            clamped_completed = max(0, min(int(completed), clamped_total))
+            self.progress.update(
+                self.eval_task_id,
+                total=clamped_total,
+                completed=clamped_completed,
+                description=desc,
+            )
 
         def start(self):
             if self.enable and self.live and not self.is_started:
@@ -206,6 +257,8 @@ if HAS_RICH:
 
                 self.is_started = False
                 self._has_table_layout = False
+                self.train_task_id = None
+                self.eval_task_id = None
 
     class RichProgress:
         """Strategy for Rich Live logging."""
@@ -214,9 +267,12 @@ if HAS_RICH:
             self.print_freq = print_freq
             self.displayer = LiveDisplayer()
             self.current_stage = None
+            self._last_batch_state = None
+            self._eval_active = False
 
         def on_epoch_start(self, context: EventContext):
             self.current_stage = context.stage or "train"
+            self._eval_active = False
             self.displayer.reset_progressbar(context.total_batches, context.state.epoch, context.state.max_epochs)
             self.displayer.start()
 
@@ -224,6 +280,15 @@ if HAS_RICH:
             self,
             context: EventContext,
         ):
+            stage = (context.stage or self.current_stage or "train").lower()
+            is_eval_stage = stage.startswith("eval") or stage.startswith("val") or stage.startswith("test")
+
+            if is_eval_stage:
+                total = int(context.total_batches or 0)
+                completed = min((context.batch_idx or 0) + 1, total) if total > 0 else 0
+                self.displayer.update_eval(completed=completed, total=total, eval_stage=stage)
+                return
+
             self._last_batch_state = {
                 "batch_metrics": context.batch_metrics,
                 "avg_bank": context.avg_bank,
@@ -242,56 +307,24 @@ if HAS_RICH:
             self.displayer.stop()
 
         def on_eval_start(self, context: EventContext):
-            # Record the current progress and task info before tearing down Live
-            if getattr(self, "displayer", None) and self.displayer.progress:
-                pid = self.displayer.progress_task_id
-                if pid is not None:
-                    task = self.displayer.progress.tasks[pid]
-                    # Save completed count, total, and description
-                    self._saved_rich_state = {
-                        "completed": task.completed,
-                        "total": task.total,
-                        "description": task.description,
-                    }
-            # Fully stop Live to ensure evaluation output stays visible
-            self.displayer.stop()
-
-            # Print an empty line to prevent the cursor from jumping back
-            if self.displayer.console:
-                self.displayer.console.print("")
+            self._eval_active = True
+            eval_stage = (context.stage or "eval").lower()
+            self.displayer.start_eval_progressbar(context.total_batches, eval_stage)
 
         def on_eval_end(self, context: EventContext):
-            state = getattr(self, "_saved_rich_state", None)
-            if state:
-                # Reinitialize the Live layout and progress bar to create a fresh
-                # display area at the latest cursor position
-                self.displayer._init_live()
-                desc = state.get("description", f"[cyan]Epoch {context.state.epoch}[/]")
-                total = state.get("total", context.total_batches)
-                completed = state.get("completed", 0)
+            self._eval_active = False
+            self.displayer.end_eval_progressbar()
 
-                # Recreate the task and advance it to the previously saved progress
-                self.displayer.progress_task_id = self.displayer.progress.add_task(desc, total=total)
-                self.displayer.progress.update(self.displayer.progress_task_id, completed=completed)
+            if self._last_batch_state:
+                self.displayer.update_batch(
+                    self._last_batch_state["batch_metrics"],
+                    self._last_batch_state["avg_bank"],
+                    self._last_batch_state["lr"],
+                    advance=False,
+                )
 
-                # Restore previous metrics table if available
-                last_batch_state = getattr(self, "_last_batch_state", None)
-                if last_batch_state:
-                    self.displayer.update_batch(
-                        last_batch_state["batch_metrics"],
-                        last_batch_state["avg_bank"],
-                        last_batch_state["lr"],
-                        advance=False,
-                    )
-
-                # Restart the newly created Live display
-                self.displayer.start()
-
-                # Force an immediate refresh to draw the resurrected table immediately
-                if self.displayer.live:
-                    self.displayer.live.refresh()
-            else:
-                self.displayer.start()
+            if self.displayer.live and self.displayer.is_started:
+                self.displayer.live.refresh()
 
 
 # Tqdm progress if available
