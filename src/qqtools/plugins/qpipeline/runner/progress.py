@@ -255,6 +255,32 @@ if HAS_RICH:
                 self.live.start()
                 self.is_started = True
 
+        def clear_display(self):
+            """Clear progress tasks and table content without stopping Live."""
+            if not self.enable or not self.progress:
+                return
+
+            # Remove train task
+            if self.train_task_id is not None:
+                try:
+                    self.progress.remove_task(self.train_task_id)
+                except Exception:
+                    pass
+                self.train_task_id = None
+
+            # Clear table
+            # Check if self.layout has "table" by catching exception or careful check.
+            # Rich Layout is tree-like and supports get but might raise KeyError on __getitem__
+            if self.layout and self._has_table_layout:
+                try:
+                    if self.layout["table"]:
+                        self.layout["table"].update(Text(""))
+                except (KeyError, TypeError):
+                    pass
+
+            if self.live and self.is_started:
+                self.live.refresh()
+
         def stop(self):
             if self.enable and self.live and self.is_started:
                 self.live.stop()
@@ -331,7 +357,7 @@ if HAS_RICH:
                 )
 
         def on_epoch_end(self, context: EventContext):
-            self.displayer.stop()
+            self.displayer.clear_display()
 
         def on_run_end(self):
             self.displayer.stop()
