@@ -141,6 +141,10 @@ v1.1.34
     refactor: update runner package to support step mode
     docs: qconfig schema to qcgen
     docs: qconfig format under docs/ 
+v1.2.0
+    refactor: handly refresh live progresstracker
+    fix: evaluation now trigger correctly with eval_interval under epoch mode
+    
 
 # TODO
 

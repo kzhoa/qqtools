@@ -11,12 +11,11 @@ Supports:
 Features:
 - auto downgrade strategy
 - pbar suspend/recover during evaluation
-
+- handly refresh rich progressbar and table if needed
 """
 
 import sys
 import time
-from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Literal, Optional, Protocol
 
 from .types import EventContext
@@ -128,7 +127,7 @@ if HAS_RICH:
                 Layout(self.progress, name="progress", size=6),
             )
             self._has_table_layout = False
-            self.live = Live(self.layout, auto_refresh=True, refresh_per_second=4, transient=False)
+            self.live = Live(self.layout, auto_refresh=False, transient=False)
 
         def _ensure_table_layout(self):
             if not self.layout or self._has_table_layout:
@@ -154,6 +153,9 @@ if HAS_RICH:
             if self.eval_task_id is not None and self.eval_task_id in self.progress.task_ids:
                 self.progress.remove_task(self.eval_task_id)
                 self.eval_task_id = None
+
+            if self.live and self.is_started:
+                self.live.refresh()
 
         def start_eval_progressbar(self, num_batches: int, eval_stage: str = "eval"):
             if not self.enable or not self.progress:
@@ -212,6 +214,8 @@ if HAS_RICH:
 
             self._ensure_table_layout()
             self.layout["table"].update(table)
+            if self.live and self.is_started:
+                self.live.refresh()
 
         def update_eval(self, completed: int, total: int, eval_stage: str = "eval"):
             if not self.enable or not self.progress:
@@ -233,6 +237,8 @@ if HAS_RICH:
                 completed=clamped_completed,
                 description=desc,
             )
+            if self.live and self.is_started:
+                self.live.refresh()
 
         def start(self):
             if self.enable and self.live and not self.is_started:
