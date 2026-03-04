@@ -147,6 +147,7 @@ fix: evaluation now trigger correctly with eval_interval under epoch mode
 v1.2.1
 feat: add sheet log listener
 feat: auto offload model when evaluation
+feat: progress bar slide to bottom
 refactor: max epochs and steps remove from runstate while preserve in config
 refactor: qema update fn
 fix: separate progress tick with update table to keep real batch idx as completed
