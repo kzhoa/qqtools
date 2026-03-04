@@ -152,7 +152,8 @@ class ConsoleLogger:
         if self.filepath:
             os.makedirs(os.path.dirname(os.path.abspath(self.filepath)), exist_ok=True)
             mode = "a" if self.recover else "w"
-            file_handler = logging.FileHandler(self.filepath, mode=mode)
+            # Explicitly set encoding to UTF-8 to handle Unicode characters like emojis
+            file_handler = logging.FileHandler(self.filepath, mode=mode, encoding="utf-8")
             file_handler.setLevel(level)
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)

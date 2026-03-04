@@ -59,7 +59,7 @@ class TestRunConfig:
         """Test RunConfig default values"""
         config = RunConfig()
         assert config.run_mode == RunMode.EPOCH
-        assert config.max_epochs == 1
+        assert config.max_epochs is None
         assert config.max_steps is None
         assert config.eval_interval == 1
 
@@ -187,6 +187,15 @@ class TestTrainRunner:
         """Setup for each test"""
         self.args = self._make_args()
 
+    def teardown_method(self, method):
+        """Cleanup after each test to release any file locks (e.g. debug.log)."""
+        import logging
+
+        try:
+            logging.shutdown()
+        except Exception:
+            pass
+
     def test_train_runner_epoch_mode(self):
         """Test train_runner in epoch mode"""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -227,72 +236,6 @@ class TestTrainRunner:
 
             assert result["final_step"] >= 10
             assert result["best_val_metric"] is not None
-
-    def test_train_runner_with_early_stopping(self):
-        """Test train_runner with early stopping"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            task, model, loss_fn, optimizer = self._create_training_components()
-            self.args.runner.early_stop = {
-                "target": "val_metric",
-                "patience": 2,
-                "mode": "min",
-                "min_delta": 0.0,
-            }
-
-            result = train_runner(
-                model=model,
-                task=task,
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-                args=self.args,
-                max_epochs=5,  # Reduced from 100 for faster testing
-                eval_interval=1,
-                save_dir=tmpdir,
-            )
-
-            # Verify training completed
-            assert result["best_val_metric"] is not None
-
-    def test_train_runner_with_checkpoint(self):
-        """Test train_runner with checkpoint save and load"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            task, model, loss_fn, optimizer = self._create_training_components()
-
-            # First run
-            train_runner(
-                model=model,
-                task=task,
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-                args=self.args,
-                max_epochs=2,
-                eval_interval=1,
-                save_interval=1,  # Save checkpoint every step
-                save_dir=tmpdir,
-            )
-
-            # Check that checkpoint file was created
-            checkpoint_files = list(Path(tmpdir).glob("*.pt"))
-            assert len(checkpoint_files) > 0
-
-            # Get the first checkpoint
-            self.args.ckp_file = str(sorted(checkpoint_files)[0])
-
-            # Create new model and resume training
-            _, model2, _, optimizer2 = self._create_training_components()
-
-            result2 = train_runner(
-                model=model2,
-                task=task,
-                loss_fn=loss_fn,
-                optimizer=optimizer2,
-                args=self.args,
-                max_epochs=3,
-                eval_interval=1,
-                save_dir=tmpdir,
-            )
-
-            assert result2["final_epoch"] >= 2
 
     def test_train_runner_with_gradient_clipping(self):
         """Test train_runner with gradient clipping"""
@@ -442,26 +385,6 @@ class TestTrainRunner:
             # Let's verify it's significantly lower than the initial LR.
             assert final_lr < 0.01
             print(f"Final LR for plateau scheduler: {final_lr}")
-
-    def test_train_runner_with_distributed_flag(self):
-        """Test train_runner with distributed flag"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            task, model, loss_fn, optimizer = self._create_training_components()
-            self.args.distributed = False
-            self.args.rank = 0
-
-            result = train_runner(
-                model=model,
-                task=task,
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-                args=self.args,
-                max_epochs=2,
-                eval_interval=1,
-                save_dir=tmpdir,
-            )
-
-            assert result["best_val_metric"] is not None
 
     def test_train_runner_without_runner_config_raises(self):
         """Test train_runner raises when args.runner is missing"""

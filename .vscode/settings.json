@@ -3,7 +3,9 @@
         "/^(.*;\\s*)?(python(\\.exe)?\\s+-m\\s+pytest|pytest)(\\s+.*)?$/": {
             "approve": true,
             "matchCommandLine": true
-        }
+        },
+        "python": true,
+        "exit()": true,
     },
     "editor.fontSize": 16,
     "chat.editor.fontSize": 16

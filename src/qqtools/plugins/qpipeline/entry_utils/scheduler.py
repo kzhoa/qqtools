@@ -553,7 +553,7 @@ class qWarmupScheduler(LRScheduler):
         Returns:
             List of learning rates for each parameter group.
         """
-        if self.current_step <= self.warmup_steps:
+        if self.current_step < self.warmup_steps:
             if self._is_donothing(self.warmup_scheduler):
                 return self.base_lrs
             warmup_lr = self.warmup_scheduler.get_last_lr()
