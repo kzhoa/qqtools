@@ -311,6 +311,9 @@ def test_train_runner_exception_still_cleans_progress_tracker(base_args, tiny_ta
         def on_progress_tick(self, context):
             return None
 
+        def on_table_update(self, context):
+            return None
+
         def on_batch_end(self, context):
             return None
 

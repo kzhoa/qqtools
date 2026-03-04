@@ -1,43 +1,44 @@
 import copy
 import functools
 import traceback
+from typing import Optional, Union
 
 import torch
 from torch.optim.swa_utils import AveragedModel
 
 
 def _avg_fn(avg_params, model_params, num_averaged, decay):
-    return decay * avg_params + (1 - decay) * model_params.data
+    """Efficient EMA update using linear interpolation."""
+    return avg_params.lerp_(model_params.detach(), 1 - decay)
 
 
 class qEMA(AveragedModel):
     def __init__(
         self,
-        model,
-        decay=0.99,
-        device=None,
+        model: torch.nn.Module,
+        decay: float = 0.99,
+        device: Optional[Union[str, torch.device]] = None,
+        use_buffers: bool = False,
     ):
-        self._cache_dict = {"model": model}
-        self.device = device
+        super(AveragedModel, self).__init__()  # Call nn.Module.__init__
 
-        # init
-        avg_fn = functools.partial(_avg_fn, decay=decay)
-        if device is None:
-            device = next(model.parameters()).device
+        # qq: Use a dictionary to store the reference model.
+        # Assigning it directly as an attribute (e.g., self.model = model)
+        # would cause nn.Module to automatically register it as a submodule,
+        # resulting in duplicated parameters when calling .parameters().
+        self._cache_dict = {"reference_model": model}
 
-        multi_avg_fn = None
-        use_buffers = False
-        torch.nn.Module.__init__(self)
+        # Determine and normalize device
+        self.device = torch.device(device) if device else next(model.parameters()).device
 
-        assert avg_fn is None or multi_avg_fn is None, "Only one of avg_fn and multi_avg_fn should be provided"
-        self.module = self._create_safe_model_copy(model)
-
-        if device is not None:
-            self.module = self.module.to(device)
-        self.register_buffer("n_averaged", torch.tensor(0, dtype=torch.long, device=device))
-        self.avg_fn = avg_fn
-        self.multi_avg_fn = multi_avg_fn
+        # Initialize core AveragedModel attributes manually to avoid redundant deepcopy
+        self.module = self._create_safe_model_copy(model).to(self.device)
+        self.register_buffer("n_averaged", torch.tensor(0, dtype=torch.long, device=self.device))
+        self.avg_fn = functools.partial(_avg_fn, decay=decay)
+        self.multi_avg_fn = None
         self.use_buffers = use_buffers
+
+        print(f"[qEMA] initialized with decay: {decay} on device: {self.device}")
 
     def _create_safe_model_copy(self, model):
         try:
@@ -59,5 +60,6 @@ class qEMA(AveragedModel):
         return self.module(*args, **kwargs)
 
     def update(self):
+        """Update EMA parameters using the reference model."""
         with torch.no_grad():
-            self.update_parameters(self._cache_dict["model"])
+            self.update_parameters(self._cache_dict["reference_model"])

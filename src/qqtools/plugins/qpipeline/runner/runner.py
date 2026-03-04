@@ -23,6 +23,7 @@ from torch.profiler import ProfilerActivity, profile
 from torch.utils.data import DataLoader
 
 import qqtools as qt
+import copy
 
 from ..entry_utils.qema import qEMA
 from ..entry_utils.scheduler import qWarmupScheduler
@@ -115,7 +116,7 @@ class SheetLoggerListener:
             is_epoch_trigger = (
                 self.config.run_mode == RunMode.EPOCH
                 and is_epoch_end
-                and (context.state.epoch % self.config.eval_interval == 0)
+                and (context.state.epoch + 1) % self.config.eval_interval == 0
             )
             if is_step_trigger or is_epoch_trigger:
                 return  # Suppress write, on_eval_end will handle it
@@ -207,13 +208,18 @@ class RunningAgent:
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.config = config or RunConfig()
+
+        # Use the provided config object directly, or create a default one if none is given.
+        # This prevents overwriting specific settings like `save_interval=None` with defaults.
+        self.config = config if config is not None else RunConfig()
+
         self.device = device or self.config.device
         self.ema_model = ema_model
         self.logger = logger or ConsoleLogger()
 
         # initialization
         self.state = state or RunningState()
+
         self.train_loader = task.train_loader
         self.val_loader = task.val_loader
         self.test_loader = task.test_loader
@@ -231,6 +237,7 @@ class RunningAgent:
             "on_batch_end": [],
             "on_progress_tick": [],
             "on_train_batch_end": [],
+            "on_table_update": [],
             "on_eval_start": [],
             "on_eval_end": [],
             "on_checkpoint_save": [],
@@ -260,6 +267,20 @@ class RunningAgent:
                 "Tensor caching feature is disabled. Please implement both hooks to enable."
             )
 
+        # Check for model offloading (EMA on GPU, Main Model on CPU during eval)
+        self._use_model_offload = False
+        if self.device.type == "cuda" and self.ema_model is not None:
+            from ..entry_utils.info import get_model_size_bytes
+
+            m_size = get_model_size_bytes(self.model)
+            gpu_cap = torch.cuda.get_device_properties(self.device).total_memory
+            if m_size > (gpu_cap * 0.5):
+                self._use_model_offload = True
+                self.logger.info(
+                    f"Model size ({m_size / 1024**2:.2f} MB) > 50% of GPU capacity. "
+                    "Enabling mutual offloading during evaluation."
+                )
+
     def add_listener(self, event: str, listener: Callable):
         if event in self.listeners:
             self.listeners[event].append(listener)
@@ -267,9 +288,20 @@ class RunningAgent:
             warnings.warn(f"Unknown event: {event}")
 
     def _trigger(self, event: str, context: EventContext):
+        # Create a snapshot of the state for this event to prevent listeners
+        # from getting a mutable state object that changes later.
+        context_snapshot = copy.copy(context)
+        context_snapshot.state = copy.copy(context.state)
+        # Inject run limits into the context so listeners can access them
+        try:
+            context_snapshot.max_epochs = self.config.max_epochs
+            context_snapshot.max_steps = self.config.max_steps
+        except Exception:
+            pass
+
         for listener in self.listeners.get(event, []):
             try:
-                listener(context)
+                listener(context_snapshot)
             except Exception as e:
                 self.logger.error(f"Listener error for event '{event}' in {listener.__name__}: {type(e).__name__}: {e}")
                 raise
@@ -347,13 +379,12 @@ class RunningAgent:
 
     def _get_next_batch(self) -> Tuple[Any, bool]:
         """
-        Gets the next batch from the training data loader. Also detects when an epoch ends.
-        Supports resuming from mid-epoch checkpoints by skipping already-processed batches.
+        Gets the next batch from the training data loader.
 
         Returns:
             A tuple containing:
-            - The batch data.
-            - A boolean flag that is True if the batch is the first of a new epoch.
+            - The batch data (or None if epoch ends).
+            - A boolean flag that is True if the current batch marks the end of an epoch.
         """
         is_epoch_end = False
 
@@ -361,29 +392,24 @@ class RunningAgent:
             self._start_new_epoch()
 
             # If resuming from a checkpoint at mid-epoch, skip already-processed batches
-            batches_to_skip = self.state.batch_idx_in_epoch
-            for _ in range(batches_to_skip):
+            for _ in range(self.state.batch_idx_in_epoch):
                 try:
                     next(self._train_iter)
                 except StopIteration:
-                    # This shouldn't happen, but handle it defensively
-                    self._handle_epoch_end()
+                    # If the entire epoch was skipped, reset batch_idx_in_epoch and break.
+                    # _training_loop will detect the exhausted iterator and handle epoch end.
                     self.state.batch_idx_in_epoch = 0
-                    self._start_new_epoch()
                     break
 
         try:
             batch_data = next(self._train_iter)
-            # Increment batch index after successfully getting the batch
             self.state.batch_idx_in_epoch += 1
+            if self.state.batch_idx_in_epoch == len(self.train_loader):
+                is_epoch_end = True
         except StopIteration:
+            # Data loader exhausted for this epoch
             is_epoch_end = True
-            # At epoch end, reset batch index before starting new epoch
-            self._handle_epoch_end()
-            self._start_new_epoch()
-            batch_data = next(self._train_iter)
-            # First batch of new epoch
-            self.state.batch_idx_in_epoch = 1
+            batch_data = None  # Signal to _training_loop that epoch has ended
 
         return batch_data, is_epoch_end
 
@@ -453,20 +479,58 @@ class RunningAgent:
         return batch_metrics
 
     def evaluate(self, model: nn.Module = None, use_ema: bool = False) -> Dict[str, Any]:
-        """Evaluate the model"""
-        eval_model = self.ema_model if use_ema and self.ema_model is not None else (model or self.model)
+        """Evaluate the model.
+
+        If use_ema is True and offloading is enabled, the main model will be moved to CPU
+        to free up GPU memory for the EMA model.
+        """
+        eval_model = model or self.model
+        ema_original_device = None
+        offloaded = False
+
+        if use_ema and self.ema_model is not None:
+            eval_model = self.ema_model
+
+            # Offload main model if needed to free GPU memory
+            if self._use_model_offload:
+                self.logger.debug("Offloading main model to CPU for EMA evaluation.")
+                self.model.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                offloaded = True
+
+            # Temporarily move EMA model to target device for evaluation speed
+            try:
+                # Get current device of EMA model
+                ema_original_device = next(eval_model.parameters()).device
+                if ema_original_device != self.device:
+                    self.logger.debug(f"Moving EMA model from {ema_original_device} to {self.device} for evaluation.")
+                    eval_model.to(self.device)
+            except (StopIteration, Exception):
+                ema_original_device = None
 
         results = {}
 
-        # Validation set
-        if self.val_loader is not None:
-            val_metrics = self._run_evaluation(eval_model, self.val_loader, "val", stage="val")
-            results.update(val_metrics)
+        try:
+            # Validation set
+            if self.val_loader is not None:
+                val_metrics = self._run_evaluation(eval_model, self.val_loader, "val", stage="val")
+                results.update(val_metrics)
 
-        # Test set
-        if self.test_loader is not None:
-            test_metrics = self._run_evaluation(eval_model, self.test_loader, "test", stage="test")
-            results.update(test_metrics)
+            # Test set
+            if self.test_loader is not None:
+                test_metrics = self._run_evaluation(eval_model, self.test_loader, "test", stage="test")
+                results.update(test_metrics)
+        finally:
+            # Restore EMA model to its original device
+            if ema_original_device is not None and ema_original_device != self.device:
+                self.logger.debug(f"Moving EMA model back to {ema_original_device} after evaluation.")
+                eval_model.to(ema_original_device)
+
+            # Restore main model to GPU if it was offloaded
+            if offloaded:
+                self.logger.debug(f"Restoring main model to {self.device} after evaluation.")
+                self.model.to(self.device)
 
         return results
 
@@ -677,7 +741,7 @@ class RunningAgent:
         # Save best checkpoint if manager is available
         if self.checkpoint_manager is not None:
             ckp_path = self.checkpoint_manager.save(
-                self.state,
+                copy.copy(self.state),
                 self.model,
                 self.task,
                 self.optimizer,
@@ -698,7 +762,7 @@ class RunningAgent:
             return
 
         ckp_path = self.checkpoint_manager.save(
-            self.state,
+            copy.copy(self.state),
             self.model,
             self.task,
             self.optimizer,
@@ -725,31 +789,43 @@ class RunningAgent:
             bool: True if training should stop, False otherwise.
         """
         is_step_trigger = (
-            self.config.run_mode == RunMode.STEP and self.state.global_step % self.config.eval_interval == 0
+            self.config.run_mode == RunMode.STEP and (self.state.global_step + 1) % self.config.eval_interval == 0
         )
         is_epoch_trigger = (
             self.config.run_mode == RunMode.EPOCH
-            and is_epoch_end
-            and (self.state.epoch % self.config.eval_interval == 0)
+            and is_epoch_end  # This is true when _get_next_batch signals epoch end
+            and (self.state.epoch + 1) % self.config.eval_interval == 0  # Check interval for just completed epoch
         )
         is_eval_trigger = is_step_trigger or is_epoch_trigger
 
         should_stop = False
         if is_eval_trigger:
+            self.logger.debug(
+                f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
+                f"\n eval_interval={self.config.eval_interval} save_interval={self.config.save_interval}"
+                f"\nis_step_trigger={is_step_trigger}, is_epoch_trigger={is_epoch_trigger}"
+            )
             should_stop = self._run_evaluation_and_update()
 
         # Check for regular checkpoint saving
-        is_save_step_trigger = (
-            self.config.run_mode == RunMode.STEP and self.state.global_step % self.config.save_interval == 0
-        )
-        is_save_epoch_trigger = (
-            self.config.run_mode == RunMode.EPOCH
-            and is_epoch_end
-            and (self.state.epoch % self.config.save_interval == 0)
-        )
-        should_save = is_save_step_trigger or is_save_epoch_trigger
+        should_save = False
+        if self.config.save_interval and self.config.save_interval > 0:
+            is_save_step_trigger = (
+                self.config.run_mode == RunMode.STEP and (self.state.global_step + 1) % self.config.save_interval == 0
+            )
+            is_save_epoch_trigger = (
+                self.config.run_mode == RunMode.EPOCH
+                and is_epoch_end
+                and (self.state.epoch + 1) % self.config.save_interval == 0
+            )
+
+            should_save = is_save_step_trigger or is_save_epoch_trigger
 
         if should_save:
+            # self.loggr.debug(
+            #     f"PeriodicEvents Debug: run_mode={self.config.run_mode}, save_interval={self.config.save_interval}, global_step={self.state.global_step}, is_epoch_end={is_epoch_end}",
+            #     f"\nComputed save triggers: is_save_step_trigger={is_save_step_trigger}, is_save_epoch_trigger={is_save_epoch_trigger}",
+            # )
             self._save_regular_checkpoint()
 
         return should_stop
@@ -768,9 +844,27 @@ class RunningAgent:
         # Initialize training iterator
         self._train_iter = None
 
-        while self.state.global_step < self.state.max_steps and self.state.epoch < self.state.max_epochs:
+        while True:
+            # Check for overall stopping conditions at the beginning of each potential epoch/step
+            max_steps_limit = self.config.max_steps if self.config.max_steps is not None else float("inf")
+            max_epochs_limit = self.config.max_epochs if self.config.max_epochs is not None else float("inf")
+            if self.state.global_step >= max_steps_limit or self.state.epoch >= max_epochs_limit:
+                self.logger.info(f"Training loop stopping at epoch {self.state.epoch}, step {self.state.global_step}.")
+                return False  # Completed normally
+
+            # This marks the start of an actual training iteration for a batch.
+            # Evaluation/Checkpointing for the *previous* epoch happens just before epoch increment.
+            # For step-mode, evaluation can happen mid-epoch.
+
             try:
                 batch_data, is_epoch_end = self._get_next_batch()
+
+                if batch_data is None:  # Epoch has truly ended, handle epoch-level events
+                    # The event handling (eval, save) is triggered after the last batch is processed.
+                    # This block now only handles the state update for the next epoch.
+                    self._handle_epoch_end()  # Increment epoch, reset avg_bank, etc.
+                    self._train_iter = None  # Force new iterator creation for next epoch
+                    continue  # Start next iteration of while loop to check new state boundaries
 
                 # Train a single batch
                 batch_start_time = time.time()
@@ -778,7 +872,7 @@ class RunningAgent:
                     "on_batch_start",
                     context=EventContext(
                         state=self.state,
-                        batch_idx=self.state.global_step % len(self.train_loader),
+                        batch_idx=self.state.batch_idx_in_epoch - 1,  # Use 0-indexed batch_idx
                         total_batches=len(self.train_loader),
                     ),
                 )
@@ -803,7 +897,7 @@ class RunningAgent:
                 # Trigger batch end event for listeners (e.g., progress bars, loggers)
                 batch_context = EventContext(
                     state=self.state,
-                    batch_idx=self.state.global_step % len(self.train_loader),
+                    batch_idx=self.state.batch_idx_in_epoch - 1,
                     total_batches=len(self.train_loader),
                     batch_metrics=batch_metrics,
                     lr=self.optimizer.param_groups[0]["lr"] if self.optimizer else None,
@@ -812,40 +906,57 @@ class RunningAgent:
                 self._trigger("on_batch_end", context=batch_context)
                 self._trigger("on_train_batch_end", context=batch_context)
 
-                freq = self.config.print_freq
-                is_progress_tick = batch_context.batch_idx % freq == 0 or batch_context.batch_idx == (
-                    batch_context.total_batches - 1
+                # Trigger progress tick every batch for smooth progress bar updates
+                progress_context = EventContext(
+                    state=self.state,
+                    batch_idx=self.state.batch_idx_in_epoch - 1,
+                    total_batches=len(self.train_loader),
+                    batch_metrics=self._scalarize_batch_metrics(batch_metrics),
+                    avg_bank=self.avg_bank.to_dict(self.config.distributed),
+                    lr=batch_context.lr,
+                    stage=batch_context.stage,
                 )
-                if is_progress_tick:
-                    progress_context = EventContext(
-                        state=self.state,
-                        batch_idx=batch_context.batch_idx,
-                        total_batches=batch_context.total_batches,
-                        batch_metrics=batch_metrics,
-                        avg_bank=self.avg_bank.to_dict(self.config.distributed),
-                        lr=batch_context.lr,
-                        stage=batch_context.stage,
-                    )
-                    self._trigger("on_progress_tick", context=progress_context)
+                self._trigger("on_progress_tick", context=progress_context)
 
-                # Handle periodic events (evaluation, checkpointing, etc.)
-                if self._handle_periodic_events(is_epoch_end):
+                # Trigger table update based on print frequency
+                freq = self.config.print_freq
+                is_update_tick = self.state.batch_idx_in_epoch % freq == 0 or self.state.batch_idx_in_epoch == len(
+                    self.train_loader
+                )
+                if is_update_tick:
+                    self._trigger("on_table_update", context=progress_context)
+
+                # Check periodic events that are tied to global_step, or epoch-end if not yet handled
+                should_stop_mid_epoch = self._handle_periodic_events(is_epoch_end=is_epoch_end)
+                if should_stop_mid_epoch:
                     return True  # Early stopping was triggered
 
                 # Increment global step *after* all step-based logic is complete
                 self.state.global_step += 1
 
                 # Periodically clean up memory
-                if self.state.global_step % 100 == 0:
+                if self.state.global_step % self.config.gc_freq == 0:  # Using config.gc_freq
                     gc.collect()
-                    # if torch.cuda.is_available():
-                    #     torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             except KeyboardInterrupt:
                 self.logger.info("Training interrupted by user.")
                 return True  # Treat as early stop
-
-        return False  # Completed normally
+            except StopIteration:
+                # This should ideally be handled by `batch_data is None` check from _get_next_batch
+                # but as a defensive measure, if StopIteration happens here, it means the loader
+                # was exhausted in a way not caught by `_get_next_batch` or it was the very last batch.
+                self.logger.warning(
+                    "StopIteration caught in _training_loop. This might be unexpected and could prematurely trigger "
+                    "end-of-epoch events like evaluation. Forcing is_epoch_end=True."
+                )
+                should_stop_after_eval = self._handle_periodic_events(is_epoch_end=True)
+                if should_stop_after_eval:
+                    return True
+                self._handle_epoch_end()
+                self._train_iter = None
+                continue  # Re-enter loop to check state boundaries
 
     def run(self) -> bool:
         """
@@ -854,22 +965,24 @@ class RunningAgent:
         Returns:
             bool: True if training was stopped early, False otherwise.
         """
+        max_epochs_limit = self.config.max_epochs if self.config.max_epochs is not None else float("inf")
+        max_steps_limit = self.config.max_steps if self.config.max_steps is not None else float("inf")
         self.logger.info(
             f"Starting training (mode={self.config.run_mode.value}, "
             f"eval_interval={self.config.eval_interval}, "
             f"save_interval={self.config.save_interval}, "
-            f"max_epochs={self.state.max_epochs}, "
-            f"max_steps={self.state.max_steps})"
+            f"max_epochs={max_epochs_limit}, "
+            f"max_steps={max_steps_limit})"
         )
 
         early_stopped = self._training_loop()
 
         # Final log message
         if not early_stopped:
-            if self.state.global_step >= self.state.max_steps:
-                self.logger.info(f"Reached max_steps={self.state.max_steps}")
-            elif self.state.epoch >= self.state.max_epochs:
-                self.logger.info(f"Reached max_epochs={self.state.max_epochs}")
+            if self.state.global_step >= max_steps_limit:
+                self.logger.info(f"Reached max_steps={max_steps_limit}")
+            elif self.state.epoch >= max_epochs_limit:
+                self.logger.info(f"Reached max_epochs={max_epochs_limit}")
 
         return early_stopped
 
@@ -1041,35 +1154,29 @@ def train_runner(
         logger.info(f"Loaded checkpoint from {config.ckp_file}")
         checkpoint_loaded = True
 
-    # Initialize/Override state AFTER checkpoint loading
-    # This allows explicit overrides of max_epochs/max_steps if needed
-    if max_epochs is not None:
-        agent.state.max_epochs = max_epochs
-    elif not checkpoint_loaded:
-        agent.state.max_epochs = float("inf")
-    # If checkpoint_loaded and max_epochs is None, keep the value from checkpoint
-
-    if max_steps is not None:
-        agent.state.max_steps = max_steps
-    elif not checkpoint_loaded:
-        agent.state.max_steps = float("inf")
-    # If checkpoint_loaded and max_steps is None, keep the value from checkpoint
+    # A training run must have a finite stopping condition.
+    max_epochs_val = agent.config.max_epochs if agent.config.max_epochs is not None else float("inf")
+    max_steps_val = agent.config.max_steps if agent.config.max_steps is not None else float("inf")
+    if max_epochs_val == float("inf") and max_steps_val == float("inf"):
+        # This can happen if the config has no boundaries and no explicit args are passed.
+        # We check this after applying overrides to have the final picture.
+        raise ValueError("Either max_epochs or max_steps must be specified for the training run.")
 
     # Validate run_mode and max_epochs/max_steps consistency
     if config.run_mode == RunMode.STEP:
         # In STEP mode, both max_epochs and max_steps can be used as stopping conditions
-        if agent.state.max_epochs != float("inf") and agent.state.max_steps != float("inf"):
+        if max_epochs_val != float("inf") and max_steps_val != float("inf"):
             logger.warning(
-                f"[run_mode=STEP] Both max_epochs={agent.state.max_epochs} and "
-                f"max_steps={agent.state.max_steps} are specified. "
+                f"[run_mode=STEP] Both max_epochs={max_epochs_val} and "
+                f"max_steps={max_steps_val} are specified. "
                 f"Training will stop when either condition is reached."
             )
     elif config.run_mode == RunMode.EPOCH:
         # In EPOCH mode, max_steps is ignored
-        if agent.state.max_steps != float("inf"):
+        if max_steps_val != float("inf"):
             logger.warning(
-                f"[run_mode=EPOCH] max_steps={agent.state.max_steps} is specified but will be ignored "
-                f"in EPOCH mode. Training will be controlled by max_epochs={agent.state.max_epochs}."
+                f"[run_mode=EPOCH] max_steps={max_steps_val} is specified but will be ignored "
+                f"in EPOCH mode. Training will be controlled by max_epochs={max_epochs_val}."
             )
     else:
         # Should not happen due to RunMode enum, but handl, config, log_granularitye defensively
@@ -1080,6 +1187,7 @@ def train_runner(
     progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type)
     agent.add_listener("on_epoch_start", progress_tracker.on_epoch_start)
     agent.add_listener("on_progress_tick", progress_tracker.on_progress_tick)
+    agent.add_listener("on_table_update", progress_tracker.on_table_update)
     agent.add_listener("on_epoch_end", progress_tracker.on_epoch_end)
     # Ensure progress tracker can pause/resume during mid-epoch evaluations
     agent.add_listener("on_eval_start", progress_tracker.on_eval_start)

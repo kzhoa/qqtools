@@ -53,6 +53,8 @@ class ProgressStrategy(Protocol):
 
     def on_progress_tick(self, context: EventContext) -> None: ...
 
+    def on_table_update(self, context: EventContext) -> None: ...
+
     def on_epoch_end(self, context: EventContext) -> None: ...
 
     def on_run_end(self) -> None: ...
@@ -182,18 +184,26 @@ if HAS_RICH:
             if self.live and self.is_started:
                 self.live.refresh()
 
-        def update_batch(
+        def update_progress(self, completed: int, total: int):
+            """Update only the progress bar position."""
+            if not self.enable or not self.progress or self.train_task_id is None:
+                return
+
+            clamped_total = max(1, int(total or 1))
+            clamped_completed = max(0, min(int(completed), clamped_total))
+            self.progress.update(self.train_task_id, total=clamped_total, completed=clamped_completed)
+
+            if self.live and self.is_started:
+                self.live.refresh()
+
+        def update_table(
             self,
             batch_metrics: Dict[str, Any],
             avg_bank: Dict[str, Any],
             lr: Optional[float],
-            advance: bool = True,
         ):
             if not self.enable or not self.progress or self.train_task_id is None:
                 return
-
-            if advance:
-                self.progress.advance(self.train_task_id)
 
             # Create metrics table
             table = Table(box=box.HORIZONTALS, show_header=True, padding=(0, 1))
@@ -279,7 +289,8 @@ if HAS_RICH:
         def on_epoch_start(self, context: EventContext):
             self.current_stage = context.stage or "train"
             self._eval_active = False
-            self.displayer.reset_progressbar(context.total_batches, context.state.epoch, context.state.max_epochs)
+            # `max_epochs` moved out of RunningState and is injected into EventContext
+            self.displayer.reset_progressbar(context.total_batches, context.state.epoch, context.max_epochs)
             self.displayer.start()
 
         def on_progress_tick(
@@ -289,19 +300,35 @@ if HAS_RICH:
             stage = (context.stage or self.current_stage or "train").lower()
             is_eval_stage = stage.startswith("eval") or stage.startswith("val") or stage.startswith("test")
 
+            total = int(context.total_batches or 0)
+            completed = min((context.batch_idx or 0) + 1, total) if total > 0 else (context.batch_idx or 0) + 1
+
             if is_eval_stage:
-                total = int(context.total_batches or 0)
-                completed = min((context.batch_idx or 0) + 1, total) if total > 0 else 0
                 self.displayer.update_eval(completed=completed, total=total, eval_stage=stage)
-                return
+            else:
+                self.displayer.update_progress(completed=completed, total=total)
 
-            self._last_batch_state = {
-                "batch_metrics": context.batch_metrics,
-                "avg_bank": context.avg_bank,
-                "lr": context.lr,
-            }
+        def on_table_update(self, context: EventContext):
+            # Update metrics table (only for training stage to avoid table flickering during eval)
+            stage = (context.stage or self.current_stage or "train").lower()
+            is_eval_stage = stage.startswith("eval") or stage.startswith("val") or stage.startswith("test")
 
-            self.displayer.update_batch(context.batch_metrics, context.avg_bank, context.lr)
+            if not is_eval_stage:
+                # Save last batch state for potential recovery after evaluation
+                total = int(context.total_batches or 0)
+                completed = min((context.batch_idx or 0) + 1, total) if total > 0 else (context.batch_idx or 0) + 1
+                self._last_batch_state = {
+                    "batch_metrics": context.batch_metrics,
+                    "avg_bank": context.avg_bank,
+                    "lr": context.lr,
+                    "completed": completed,
+                    "total": total,
+                }
+                self.displayer.update_table(
+                    context.batch_metrics,
+                    context.avg_bank,
+                    context.lr,
+                )
 
         def on_epoch_end(self, context: EventContext):
             self.displayer.stop()
@@ -322,11 +349,11 @@ if HAS_RICH:
             self.displayer.end_eval_progressbar()
 
             if self._last_batch_state:
-                self.displayer.update_batch(
+                # re-render last batch metrics without advancing the progress
+                self.displayer.update_table(
                     self._last_batch_state["batch_metrics"],
                     self._last_batch_state["avg_bank"],
                     self._last_batch_state["lr"],
-                    advance=False,
                 )
 
             if self.displayer.live and self.displayer.is_started:
@@ -363,6 +390,10 @@ if HAS_TQDM:
             advance_n = max(0, target_n - current_n)
             if advance_n > 0:
                 self.pbar.update(advance_n)
+
+        def on_table_update(self, context: EventContext):
+            if not self.pbar:
+                return
 
             postfix = {k: f"{v:.4f}" for k, v in context.avg_bank.items() if isinstance(v, (int, float))}
             if context.lr is not None:
@@ -415,6 +446,9 @@ class PlainProgress:
         self,
         context: EventContext,
     ):
+        pass
+
+    def on_table_update(self, context: EventContext):
         stage = context.stage or self.current_stage or "training"
         msg_parts = [f"{k}: {v:.4f}" for k, v in context.batch_metrics.items() if isinstance(v, (int, float))]
         msg = f"[{stage.capitalize()}] Batch {context.batch_idx}/{context.total_batches} " + " ".join(msg_parts)
@@ -525,6 +559,11 @@ class ProgressTracker:
     def on_progress_tick(self, context: EventContext):
         """Callback when a progress update should be rendered."""
         self.strategy.on_progress_tick(context)
+
+    def on_table_update(self, context: EventContext):
+        """Callback when the metrics table should be updated."""
+        if hasattr(self.strategy, "on_table_update"):
+            self.strategy.on_table_update(context)
 
     def on_epoch_end(self, context: EventContext):
         """Callback at the end of an epoch."""

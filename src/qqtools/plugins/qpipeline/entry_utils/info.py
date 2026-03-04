@@ -30,5 +30,10 @@ def get_param_stats(model):
     return msg
 
 
+def get_model_size_bytes(model):
+    """Calculate the total size of model parameters in bytes."""
+    return sum(p.numel() * p.element_size() for p in model.parameters())
+
+
 def count_trainable_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

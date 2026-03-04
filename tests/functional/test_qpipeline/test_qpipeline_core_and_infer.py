@@ -100,6 +100,9 @@ def test_progress_tracker_auto_mode_logs_info(monkeypatch):
         def on_progress_tick(self, context):
             return None
 
+        def on_table_update(self, context):
+            return None
+
         def on_epoch_end(self, context):
             return None
 
@@ -130,6 +133,9 @@ def test_progress_tracker_explicit_unavailable_mode_logs_warning(monkeypatch):
             return None
 
         def on_progress_tick(self, context):
+            return None
+
+        def on_table_update(self, context):
             return None
 
         def on_epoch_end(self, context):
@@ -165,6 +171,9 @@ def test_train_runner_progress_tick_contains_batch_time(monkeypatch, base_args, 
 
         def on_progress_tick(self, context):
             captured_progress_contexts.append(context)
+
+        def on_table_update(self, context):
+            return None
 
         def on_epoch_end(self, context):
             return None

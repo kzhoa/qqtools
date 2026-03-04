@@ -21,7 +21,9 @@ class RunConfig:
     save_interval: Optional[int] = None  # depending on run_mode, this is either epoch interval or step interval
 
     # boundary
-    max_epochs: Optional[int] = 1
+    # When not specified, max_epochs should be unlimited by default so that
+    # STEP mode can rely on `max_steps` as the primary stopping condition.
+    max_epochs: Optional[int] = None
     max_steps: Optional[int] = None
 
     # optimizer
@@ -34,6 +36,7 @@ class RunConfig:
     # I/O
     save_dir: str = "./logs"
     print_freq: int = 10
+    gc_freq: int = 1000  # Frequency of garbage collection and CUDA cache clearing
 
     # recover
     ckp_file: Optional[str] = None
@@ -69,36 +72,35 @@ class RunConfig:
             object.__setattr__(self, "save_interval", self.eval_interval)
 
 
+@dataclass
 class RunningState:
+    # current state
+    epoch: int = 0
+    global_step: int = 0
+    max_epochs: int = 0
+    max_steps: int = 0
 
-    def __init__(self):
-        # current state
-        self.epoch: int = 0
-        self.global_step: int = 0
-        self.max_epochs: int = 0
-        self.max_steps: int = 0
+    # best state
+    best_epoch: int = 0
+    best_step: int = 0
+    best_train_metric: Optional[float] = None
+    best_val_metric: Optional[float] = None
+    best_test_metric: Optional[float] = None
+    best_ckp_file: Optional[str] = None
 
-        # best state
-        self.best_epoch: int = 0
-        self.best_step: int = 0
-        self.best_train_metric: Optional[float] = None
-        self.best_val_metric: Optional[float] = None
-        self.best_test_metric: Optional[float] = None
-        self.best_ckp_file: Optional[str] = None
+    # current metrics
+    current_train_loss: Optional[float] = None
+    current_train_metric: Optional[float] = None
+    current_val_metric: Optional[float] = None
+    current_test_metric: Optional[float] = None
 
-        # curretn metrics
-        self.current_train_loss: Optional[float] = None
-        self.current_train_metric: Optional[float] = None
-        self.current_val_metric: Optional[float] = None
-        self.current_test_metric: Optional[float] = None
+    # time related
+    epoch_start_time: float = 0.0
+    step_start_time: float = 0.0
+    total_train_time: float = 0.0
 
-        # time related
-        self.epoch_start_time: float = 0.0
-        self.step_start_time: float = 0.0
-        self.total_train_time: float = 0.0
-
-        # Batch tracking for resuming from mid-epoch checkpoints
-        self.batch_idx_in_epoch: int = 0
+    # Batch tracking for resuming from mid-epoch checkpoints
+    batch_idx_in_epoch: int = 0
 
     def update_current_metrics(self, metrics: Dict[str, Any]):
         if "train_metric" in metrics:
@@ -114,8 +116,6 @@ class RunningState:
         return {
             "epoch": self.epoch,
             "global_step": self.global_step,
-            "max_epochs": self.max_epochs,
-            "max_steps": self.max_steps,
             "best_epoch": self.best_epoch,
             "best_step": self.best_step,
             "best_train_metric": self.best_train_metric,
@@ -156,3 +156,7 @@ class EventContext:
     checkpoint_path: Optional[str] = None
     checkpoint_type: Optional[str] = None
     stage: Optional[str] = None  # Current stage: "training", "validation", "testing"
+    # Provide run limits on the context so listeners can access them without
+    # coupling to RunningState (which no longer carries these fields).
+    max_epochs: Optional[int] = None
+    max_steps: Optional[int] = None
