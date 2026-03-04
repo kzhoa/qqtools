@@ -126,7 +126,7 @@ if HAS_RICH:
             # Remove layout usage
             # self.layout = Layout() ...
             # self._has_table_layout = False
-            
+
             # Initial renderable is just the progress bar
             self.live = Live(
                 self.progress,
@@ -212,8 +212,8 @@ if HAS_RICH:
             # Always recreate table to refresh content
             self.table = Table(box=box.HORIZONTALS, show_header=True, padding=(0, 1))
             self.table.add_column("Metric", style="dim")
-            self.table.add_column("Step", style="cyan")
-            self.table.add_column("Avg", style="green")
+            self.table.add_column("Step", style="cyan", justify="right", min_width=12)
+            self.table.add_column("Avg", style="green", justify="right", min_width=12)
 
             # Add metric rows
             for k, v in batch_metrics.items():
