@@ -25,11 +25,11 @@ try:
     import rich
     from rich import box
     from rich.console import Console
-    from rich.layout import Layout
     from rich.live import Live
     from rich.progress import BarColumn, Progress, ProgressColumn, SpinnerColumn, TextColumn
     from rich.table import Table
     from rich.text import Text
+    from rich.console import Group
 
     HAS_RICH = True
 except ImportError:
@@ -100,12 +100,11 @@ if HAS_RICH:
             self.enable = enable and HAS_RICH
             self.train_task_id = None
             self.eval_task_id = None
-            self.console = Console() if self.enable else None
+            self.console = rich.get_console() if self.enable else None
             self.progress = None
-            self.layout = None
             self.live = None
             self.is_started = False
-            self._has_table_layout = False
+            self.table = None
 
             if self.enable:
                 self._init_live()
@@ -124,23 +123,27 @@ if HAS_RICH:
                 console=self.console,
                 transient=True,
             )
-            self.layout = Layout()
-            self.layout.split_column(
-                Layout(self.progress, name="progress", size=6),
+            # Remove layout usage
+            # self.layout = Layout() ...
+            # self._has_table_layout = False
+            
+            # Initial renderable is just the progress bar
+            self.live = Live(
+                self.progress,
+                auto_refresh=False,
+                transient=False,
+                console=self.console,
+                redirect_stdout=True,
+                redirect_stderr=True,
             )
-            self._has_table_layout = False
-            self.live = Live(self.layout, auto_refresh=False, transient=False)
 
-        def _ensure_table_layout(self):
-            if not self.layout or self._has_table_layout:
+        def _update_renderable(self):
+            if not self.live:
                 return
-
-            progress_layout = self.layout["progress"]
-            self.layout.split_column(
-                progress_layout,
-                Layout(name="table", ratio=1),
-            )
-            self._has_table_layout = True
+            if self.table:
+                self.live.update(Group(self.progress, self.table))
+            else:
+                self.live.update(self.progress)
 
         def reset_progressbar(self, num_batches: int, epoch_idx: int, max_epochs: int):
             if not self.enable or not self.progress:
@@ -206,24 +209,24 @@ if HAS_RICH:
                 return
 
             # Create metrics table
-            table = Table(box=box.HORIZONTALS, show_header=True, padding=(0, 1))
-            table.add_column("Metric", style="dim")
-            table.add_column("Step", style="cyan")
-            table.add_column("Avg", style="green")
+            # Always recreate table to refresh content
+            self.table = Table(box=box.HORIZONTALS, show_header=True, padding=(0, 1))
+            self.table.add_column("Metric", style="dim")
+            self.table.add_column("Step", style="cyan")
+            self.table.add_column("Avg", style="green")
 
             # Add metric rows
             for k, v in batch_metrics.items():
                 if isinstance(v, (int, float)):
                     avg_val = avg_bank.get(k, "")
                     avg_str = f"{avg_val:.8f}" if isinstance(avg_val, (int, float)) else ""
-                    table.add_row(k, f"{v:.8f}", avg_str)
+                    self.table.add_row(k, f"{v:.8f}", avg_str)
 
             # Add learning rate if available
             if lr is not None:
-                table.add_row("LR", f"{lr:.8f}", "")
+                self.table.add_row("LR", f"{lr:.8f}", "")
 
-            self._ensure_table_layout()
-            self.layout["table"].update(table)
+            self._update_renderable()
             if self.live and self.is_started:
                 self.live.refresh()
 
@@ -268,15 +271,9 @@ if HAS_RICH:
                     pass
                 self.train_task_id = None
 
-            # Clear table
-            # Check if self.layout has "table" by catching exception or careful check.
-            # Rich Layout is tree-like and supports get but might raise KeyError on __getitem__
-            if self.layout and self._has_table_layout:
-                try:
-                    if self.layout["table"]:
-                        self.layout["table"].update(Text(""))
-                except (KeyError, TypeError):
-                    pass
+            # Clear table by setting it to None
+            self.table = None
+            self._update_renderable()
 
             if self.live and self.is_started:
                 self.live.refresh()
@@ -358,6 +355,7 @@ if HAS_RICH:
 
         def on_epoch_end(self, context: EventContext):
             self.displayer.clear_display()
+            pass
 
         def on_run_end(self):
             self.displayer.stop()
