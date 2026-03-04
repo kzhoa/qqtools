@@ -159,6 +159,7 @@ class RunningAgent:
         # Internal variables
         self._train_iter = None
         self.avg_bank = avg_bank or AvgBank()
+        self.interval_avg_bank = AvgBank()
 
         # Check TensorBank capability hooks
         has_batch_cache = self.task.has_implemented("batch_cache")
@@ -397,38 +398,8 @@ class RunningAgent:
         avg_bank = AvgBank()
         tensor_bank = TensorBank(self.logger) if self.use_tensor_bank else None
 
-        # Setup evaluation progress bar for rank 0
-        is_rank_zero = getattr(self.config, "rank", 0) == 0
-        render_type = (getattr(self.config, "render_type", "auto") or "auto").lower()
-
-        has_rich = False
-        if render_type == "auto":
-            try:
-                import rich  # noqa: F401
-
-                has_rich = True
-            except ImportError:
-                has_rich = False
-
-        use_tqdm = False
-        if is_rank_zero:
-            if render_type == "tqdm":
-                use_tqdm = True
-            elif render_type == "auto":
-                use_tqdm = not has_rich
-
-        if use_tqdm:
-            try:
-                from tqdm import tqdm
-
-                eval_loader = tqdm(data_loader, desc=f"Eval ({prefix})", dynamic_ncols=True, leave=False)
-            except ImportError:
-                eval_loader = data_loader
-        else:
-            eval_loader = data_loader
-
         with torch.no_grad():
-            for batch_idx, batch_data in enumerate(eval_loader):
+            for batch_idx, batch_data in enumerate(data_loader):
                 # Prepare batch
                 batch_data = self._prepare_batch(batch_data)
 
@@ -510,8 +481,18 @@ class RunningAgent:
             context=EventContext(state=self.state, stage="eval", total_batches=total_eval_batches),
         )
 
+        # Gather and reset interval train metrics
+        interval_metrics = self.interval_avg_bank.gather_average(self.config.distributed)
+        self.interval_avg_bank = AvgBank()
+
         # Evaluate the original model
         eval_results = self.evaluate(self.model, use_ema=False)
+
+        # Add train metrics to results
+        if interval_metrics:
+            train_metric = self.task.post_metrics_to_value(interval_metrics)
+            eval_results.update({f"train_{k}": v for k, v in interval_metrics.items()})
+            eval_results["train_metric"] = train_metric
 
         # Evaluate EMA model (if exists)
         if self.ema_model is not None:
@@ -557,12 +538,51 @@ class RunningAgent:
 
             if debug_msg is not None:
                 self.logger.info(debug_msg)
-            if should_stop:
-                self.logger.info(stop_msg)
-                self._trigger("on_early_stop", context=EventContext(state=self.state))
-                return True
+
+        # Log formatted summary
+        self._log_eval_summary(eval_results, is_best)
+
+        if self.early_stopper is not None and should_stop:
+            self.logger.info(stop_msg)
+            self._trigger("on_early_stop", context=EventContext(state=self.state))
+            return True
 
         return False
+
+    def _log_eval_summary(self, eval_results: Dict[str, Any], is_best: bool):
+        """Log a formatted summary of evaluation results."""
+        summary = [f"\n[Eval Summary] Epoch: {self.state.epoch}, Step: {self.state.global_step}"]
+
+        # Metrics sorted by key
+        summary.append("  - Metrics:")
+        for key in sorted(eval_results.keys()):
+            val = eval_results[key]
+            if isinstance(val, float):
+                summary.append(f"    - {key}: {val:.4f}")
+            else:
+                summary.append(f"    - {key}: {val}")
+
+        # Monitored target
+        target_key = self.config.checkpoint.get("target", "val_metric")
+        target_val = eval_results.get(target_key)
+        if target_val is not None:
+            val_str = f"{target_val:.4f}" if isinstance(target_val, float) else str(target_val)
+            summary.append(f"  - Monitored Target ('{target_key}'): {val_str}")
+
+        # Best model status
+        if is_best:
+            val_str = f"{target_val:.4f}" if isinstance(target_val, float) else str(target_val)
+            summary.append(f"  - ✨ New best model found and saved! (Best score: {val_str})")
+        elif self.best_model_manager is not None:
+            best_val = getattr(self.best_model_manager, "best_val", None)
+            best_epoch = getattr(self.best_model_manager, "best_epoch", 0)
+            best_step = getattr(self.best_model_manager, "best_step", 0)
+
+            if best_val is not None:
+                val_str = f"{best_val:.4f}" if isinstance(best_val, float) else str(best_val)
+                summary.append(f"  - Best score so far: {val_str} (from Epoch {best_epoch}, Step {best_step})")
+
+        self.logger.info("\n".join(summary))
 
     def _save_best_checkpoint(self):
         """Saves the best model checkpoint and updates best metrics."""
@@ -586,7 +606,6 @@ class RunningAgent:
                 self.best_model_manager,
                 is_best=True,
             )
-            self.state.best_ckp_file = ckp_path
             self._trigger(
                 "on_checkpoint_save",
                 context=EventContext(state=self.state, checkpoint_type="best", checkpoint_path=ckp_path),
@@ -686,10 +705,11 @@ class RunningAgent:
                 self.state.total_train_time += batch_time
                 batch_metrics["batch_time"] = batch_time
 
-                # Update average bank for epoch-level metrics
+                # Update average banks
                 for k, v in batch_metrics.items():
                     if isinstance(v, (int, float)):
                         self.avg_bank.add(k, v)
+                        self.interval_avg_bank.add(k, v)
 
                 # Trigger batch end event for listeners (e.g., progress bars, loggers)
                 batch_context = EventContext(

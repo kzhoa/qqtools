@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 
 from ..entry_utils.qema import qEMA
-from .types import RunningState
 from ..task.qtask import qTaskBase
+from .types import RunningState
 
 
 def generate_checkpoint_filename(epoch: int, global_step: int, is_best: bool = False) -> str:
@@ -27,9 +27,11 @@ def generate_checkpoint_filename(epoch: int, global_step: int, is_best: bool = F
 
 
 class CheckpointManager:
-    def __init__(self, save_dir: str, rank: int = 0):
+    def __init__(self, save_dir: str, rank: int = 0, keep_only_latest_regular: bool = False):
         self.save_dir = Path(save_dir)
         self.rank = rank
+        self.keep_only_latest_regular = keep_only_latest_regular
+        self.latest_regular_ckp_file: Optional[str] = None
 
     def save(
         self,
@@ -40,37 +42,60 @@ class CheckpointManager:
         scheduler: Optional[Any] = None,
         ema_model: Optional[qEMA] = None,
         early_stopper: Optional[Any] = None,
-        best_model_manager: Optional[Any] = None,  # Add this
+        best_model_manager: Optional[Any] = None,
         is_best: bool = False,
     ) -> str:
         """Save checkpoint to file"""
         if self.rank != 0:  # Only save in main process
             return ""
 
-        checkpoint = self._create_checkpoint_dict(
-            state, model, task, optimizer, scheduler, ema_model, early_stopper, best_model_manager
-        )
         filename = generate_checkpoint_filename(state.epoch, state.global_step, is_best)
+        checkpoint = self._create_checkpoint_dict(
+            state,
+            model,
+            task,
+            optimizer,
+            scheduler,
+            ema_model,
+            early_stopper,
+            best_model_manager,
+            filename=filename,
+            is_best=is_best,
+        )
 
-        # Save
+        # Save the checkpoint to a file
         save_path = self.save_dir / filename
         save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(checkpoint, str(save_path))
 
-        # If it's the best model, delete the old one
-        if is_best and state.best_ckp_file:
-            # Convert best_ckp_file to Path object and handle both absolute and relative paths
-            old_ckp_path = Path(state.best_ckp_file)
-            # If it's an absolute path, use it directly; otherwise, it's relative to save_dir
-            if not old_ckp_path.is_absolute():
-                old_ckp_path = self.save_dir / old_ckp_path
-            if old_ckp_path.exists():
-                old_ckp_path.unlink()
-
-        # Store only the filename (relative path) in state for portability
-        state.best_ckp_file = filename
+        # Manage checkpoint rotation to keep only the latest one if configured
+        if is_best:
+            self._rotate_checkpoint(state.best_ckp_file, save_path)
+            # Store only the filename (relative path) in state for portability
+            state.best_ckp_file = filename
+        elif self.keep_only_latest_regular:
+            self._rotate_checkpoint(self.latest_regular_ckp_file, save_path)
+            self.latest_regular_ckp_file = filename
 
         return str(save_path)
+
+    def _rotate_checkpoint(self, old_ckp_file_or_path: Optional[str], new_ckp_path: Path):
+        """Delete the old checkpoint file."""
+        if not old_ckp_file_or_path:
+            return
+
+        # Handle both absolute and relative paths for the old checkpoint
+        old_ckp_path = Path(old_ckp_file_or_path)
+        if not old_ckp_path.is_absolute():
+            old_ckp_path = self.save_dir / old_ckp_path
+
+        # Avoid deleting the file we just saved if names happen to collide
+        if old_ckp_path.exists() and old_ckp_path.resolve() != new_ckp_path.resolve():
+            try:
+                old_ckp_path.unlink()
+            except Exception:
+                # Silently fail deletion (e.g., file locked on Windows)
+                pass
 
     def load(
         self,
@@ -114,6 +139,9 @@ class CheckpointManager:
         if "best_model_state_dict" in checkpoint and best_model_manager is not None:
             best_model_manager.load_state_dict(checkpoint["best_model_state_dict"])
 
+        if "latest_regular_ckp_file" in checkpoint and self.keep_only_latest_regular:
+            self.latest_regular_ckp_file = checkpoint["latest_regular_ckp_file"]
+
         # Load task state
         if "task_state_dict" in checkpoint and task.has_implemented("load_state_dict"):
             task.load_state_dict(checkpoint["task_state_dict"])
@@ -130,6 +158,8 @@ class CheckpointManager:
         ema_model: Optional[qEMA],
         early_stopper: Optional[Any],
         best_model_manager: Optional[Any],
+        filename: str,
+        is_best: bool,
     ) -> Dict[str, Any]:
         """Create checkpoint dictionary with current model state."""
         checkpoint = {
@@ -149,6 +179,12 @@ class CheckpointManager:
 
         if ema_model is not None:
             checkpoint["ema_state_dict"] = ema_model.state_dict()
+
+        if self.keep_only_latest_regular:
+            if not is_best:
+                checkpoint["latest_regular_ckp_file"] = filename
+            else:
+                checkpoint["latest_regular_ckp_file"] = self.latest_regular_ckp_file
 
         # Save task-specific state
         if task.has_implemented("state_dict"):
