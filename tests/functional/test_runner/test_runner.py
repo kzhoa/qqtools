@@ -167,6 +167,8 @@ class TestTrainRunner:
             runner=argparse.Namespace(
                 checkpoint={},
                 early_stop={},
+                # Provide a default to ensure tests are consistent
+                log_granularity=["eval"],
             ),
             ckp_file=None,
             init_file=None,

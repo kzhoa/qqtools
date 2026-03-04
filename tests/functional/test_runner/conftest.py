@@ -112,3 +112,18 @@ def simple_model():
 def simple_optimizer(simple_model):
     """Fixture for optimizer"""
     return optim.Adam(simple_model.parameters(), lr=0.001)
+
+
+import logging
+
+
+@pytest.fixture(autouse=True, scope="session")
+def cleanup_logging_handlers():
+    yield
+    logging.shutdown()
+    # Remove all handlers from all loggers
+    for logger_name in list(logging.Logger.manager.loggerDict.keys()):
+        logger = logging.getLogger(logger_name)
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)

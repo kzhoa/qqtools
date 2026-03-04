@@ -144,7 +144,9 @@ v1.1.34
 v1.2.0
     refactor: handly refresh live progresstracker
     fix: evaluation now trigger correctly with eval_interval under epoch mode
-    
+v1.2.1
+    feat: add sheet log listener
+
 
 # TODO
 
