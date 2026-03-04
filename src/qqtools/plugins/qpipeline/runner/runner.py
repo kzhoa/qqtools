@@ -14,7 +14,7 @@ import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -40,11 +40,93 @@ from .types import EventContext, RunConfig, RunMode, RunningState
 __all__ = ["train_runner", "infer_runner"]
 
 
+class SheetLoggerListener:
+    """
+    A listener that writes metrics to a sheet logger (e.g., CSV) based on training events.
+    It has distinct methods for different event types, allowing flexible attachment.
+    """
+
+    def __init__(self, logger: qLogger, run_config: RunConfig, log_granularity: List[str]):
+        """
+        Args:
+            logger: An instance of qLogger.
+            run_config: The overall run configuration to check for eval intervals.
+            log_granularity: A list containing "eval" and/or "batch".
+        """
+        self.logger = logger
+        self.config = run_config
+        self.log_granularity = log_granularity
+        self._warned_keys = set()
+
+    def _prepare_data(self, context: EventContext, mode: str) -> Dict[str, Any]:
+        """Prepares a flat dictionary of metrics for logging. Robust to missing metrics."""
+        state = context.state
+        data = {"epoch": state.epoch, "global_step": state.global_step}
+
+        source_metrics = {}
+        if mode == "eval":
+            # 优先 context.eval_results，其次 state.current_val_metric/test_metric/train_metric
+            if getattr(context, "eval_results", None):
+                source_metrics.update(context.eval_results)
+            else:
+                # 兼容性兜底：尝试从 state 拿常用指标
+                for k in ["current_val_metric", "current_test_metric", "current_train_metric", "current_train_loss"]:
+                    v = getattr(state, k, None)
+                    if v is not None:
+                        key = k.replace("current_", "")
+                        source_metrics[key] = v
+                if not source_metrics:
+                    self.logger.warning("No eval metrics found in context or state; writing empty row.")
+        elif mode == "batch":
+            if getattr(context, "batch_metrics", None):
+                source_metrics.update(context.batch_metrics)
+            else:
+                self.logger.warning("No batch_metrics found in context; writing empty row.")
+
+        # Ensure all logger columns are present, fill with None if missing
+        if self.logger.columns:
+            for key in self.logger.columns:
+                if key in data:
+                    continue
+                value = source_metrics.get(key)
+                # Fallback for batch-level train metrics (e.g., train_loss -> loss)
+                if value is None and mode == "batch" and key.startswith("train_"):
+                    fallback_key = key[len("train_") :]
+                    value = source_metrics.get(fallback_key)
+                data[key] = value
+        else:
+            data.update(source_metrics)
+        return data
+
+    def on_eval_end(self, context: EventContext):
+        """Callback for the end of an evaluation phase."""
+        data = self._prepare_data(context, mode="eval")
+        self.logger.write(data)
+
+    def on_train_batch_end(self, context: EventContext):
+        """Callback for the end of a training batch."""
+        # If eval-level logging is also active, suppress batch logging on eval steps
+        # to avoid duplicate entries for the same global_step.
+        if "eval" in self.log_granularity:
+            is_epoch_end = context.batch_idx == context.total_batches - 1
+            is_step_trigger = (
+                self.config.run_mode == RunMode.STEP and context.state.global_step % self.config.eval_interval == 0
+            )
+            is_epoch_trigger = (
+                self.config.run_mode == RunMode.EPOCH
+                and is_epoch_end
+                and (context.state.epoch % self.config.eval_interval == 0)
+            )
+            if is_step_trigger or is_epoch_trigger:
+                return  # Suppress write, on_eval_end will handle it
+
+        data = self._prepare_data(context, mode="batch")
+        self.logger.write(data)
+
+
 # ============================================================================
 # Pure Functions for Light-weight Agent
 # ============================================================================
-
-
 def move_batch_to_device(batch_data, device: torch.device):
     """Move batch data to device, handling various data structures.
 
@@ -190,8 +272,7 @@ class RunningAgent:
                 listener(context)
             except Exception as e:
                 self.logger.error(f"Listener error for event '{event}' in {listener.__name__}: {type(e).__name__}: {e}")
-                if self.config.fail_on_listener_error:
-                    raise
+                raise
 
     def _prepare_batch(self, batch_data):
         """Prepare batch data: move to device and convert dtype if needed.
@@ -813,6 +894,7 @@ def train_runner(
     run_mode: Union[str, RunMode] = "epoch",
     eval_interval: int = 1,
     save_interval: Optional[int] = None,
+    log_granularity: Optional[List[Literal["eval", "batch"]]] = ["eval"],
 ) -> Dict[str, Any]:
     """
     Unified training runner
@@ -896,7 +978,7 @@ def train_runner(
         early_stop=early_stop_config,
     )
 
-    # Create logger
+    # Create loggerloss", "train_metric", "val_metric", "test_metric
     log_keys = ["epoch", "global_step", "train_metric", "val_metric", "test_metric", "train_loss"]
     if extra_log_keys:
         log_keys.extend(extra_log_keys)
@@ -990,7 +1072,7 @@ def train_runner(
                 f"in EPOCH mode. Training will be controlled by max_epochs={agent.state.max_epochs}."
             )
     else:
-        # Should not happen due to RunMode enum, but handle defensively
+        # Should not happen due to RunMode enum, but handl, config, log_granularitye defensively
         logger.warning(f"Unknown run_mode: {config.run_mode}. Defaulting to EPOCH mode.")
         config.run_mode = RunMode.EPOCH
 
@@ -1002,6 +1084,14 @@ def train_runner(
     # Ensure progress tracker can pause/resume during mid-epoch evaluations
     agent.add_listener("on_eval_start", progress_tracker.on_eval_start)
     agent.add_listener("on_eval_end", progress_tracker.on_eval_end)
+
+    # Sheet logger listener for structured data
+    if log_granularity:
+        sheet_logger_listener = SheetLoggerListener(logger, config, log_granularity)
+        if "eval" in log_granularity:
+            agent.add_listener("on_eval_end", sheet_logger_listener.on_eval_end)
+        if "batch" in log_granularity:
+            agent.add_listener("on_train_batch_end", sheet_logger_listener.on_train_batch_end)
 
     # Start profiler
     profiler = None

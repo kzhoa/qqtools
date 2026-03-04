@@ -138,7 +138,7 @@ class qLogger:
         """Log a warning message."""
         self.debuglogger.warning(msg, *args, **kwargs)
 
-    def log(self, data: dict):
+    def write(self, data: dict):
         """Log structured metrics data to the CSV sheet."""
         self.sheetlogger.write(data)
 
