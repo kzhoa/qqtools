@@ -13,14 +13,14 @@ from .earlystopPt import prompt_early_stop
 RUN_MODE_DEFAULTS = {
     "epoch": {
         "run_mode": "epoch",
-        "max_epochs": 100,
+        "max_epochs": 1000,
         "eval_interval": 1,
         "clip_grad": None,
     },
     "step": {
         "run_mode": "step",
-        "max_steps": 100000,
-        "eval_interval": 5000,
+        "max_steps": 1000000,
+        "eval_interval": 2000,
         "clip_grad": None,
     },
 }
@@ -200,7 +200,17 @@ def prompt_runner_params():
         except ValueError:
             print_formatted_text("❌ Must be an integer.")
 
-    # Step 5: Early stopping configuration
+    # Step 5: Keep only latest regular checkpoint
+    while True:
+        ans = prompt("\nKeep only latest regular checkpoint (deletes old ones)? [y/n] (default: n): ").strip().lower()
+        if not ans or ans in ("n", "no"):
+            break
+        if ans in ("y", "yes"):
+            params["keep_latest_ckp"] = True
+            break
+        print_formatted_text("❌ Invalid input. Please enter 'y' or 'n'.")
+
+    # Step 6: Early stopping configuration
     early_stop_config = prompt_early_stop()
     if early_stop_config:
         params["early_stop"] = early_stop_config

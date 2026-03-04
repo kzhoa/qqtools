@@ -515,16 +515,17 @@ runner:
 
 ### Fields Summary
 
-| Field           | Required | Type    | Range      | Default | Description                   |
-| --------------- | -------- | ------- | ---------- | ------- | ----------------------------- |
-| `run_mode`      | ✅        | String  | epoch/step | epoch   | Training mode                 |
-| `max_epochs`    | ⚠️        | Integer | ≥ 1        | None    | Maximum epochs                |
-| `max_steps`     | ⚠️        | Integer | ≥ 1        | null    | Maximum steps                 |
-| `eval_interval` | ❌        | Integer | ≥ 1        | 1       | Evaluation interval           |
-| `save_interval` | ❌        | Integer | ≥ 1        | null    | Regular save interval (steps) |
-| `clip_grad`     | ❌        | Float   | ≥ 0.1      | null    | Gradient clipping threshold   |
-| `early_stop`    | ✅        | Object  | -          | -       | Early stopping configuration  |
-| `checkpoint`    | ❌        | Object  | -          | -       | Best checkpoint configuration |
+| Field             | Required | Type    | Range      | Default | Description                   |
+| ----------------- | -------- | ------- | ---------- | ------- | ----------------------------- |
+| `run_mode`        | ✅        | String  | epoch/step | epoch   | Training mode                 |
+| `max_epochs`      | ⚠️        | Integer | ≥ 1        | None    | Maximum epochs                |
+| `max_steps`       | ⚠️        | Integer | ≥ 1        | null    | Maximum steps                 |
+| `eval_interval`   | ❌        | Integer | ≥ 1        | 1       | Evaluation interval           |
+| `save_interval`   | ❌        | Integer | ≥ 1        | null    | Regular save interval (steps) |
+| `keep_latest_ckp` | ❌        | Boolean | true/false | false   | Keep only latest regular ckp  |
+| `clip_grad`       | ❌        | Float   | ≥ 0.1      | null    | Gradient clipping threshold   |
+| `early_stop`      | ✅        | Object  | -          | -       | Early stopping configuration  |
+| `checkpoint`      | ❌        | Object  | -          | -       | Best checkpoint configuration |
 
 ### max_epochs / max_steps (Training Boundaries)
 
@@ -591,6 +592,22 @@ runner:
 - **Note**:
   - Separate from best model checkpoint
   - Protects against interruption during long training
+
+### keep_latest_ckp (Keep Latest Regular Checkpoint Only)
+
+```yaml
+runner:
+  save_interval: 1000
+  keep_latest_ckp: true
+```
+
+- **Type**: Boolean
+- **Default**: `false`
+- **Description**: If `true`, only the most recent regular checkpoint (saved based on `save_interval`) will be kept. Older regular checkpoints will be automatically deleted.
+- **Effect**:
+  - `false`: All regular checkpoints are kept.
+  - `true`: Saves disk space by removing stale checkpoints.
+- **Note**: This setting only affects regular checkpoints, not the "best model" checkpoint, which is always preserved.
 
 ### clip_grad (Gradient Clipping)
 
@@ -810,7 +827,7 @@ optim:
 
   ema_params:
     ema: true
-    ema_decay: 0.999
+    ema_decay: 0.99
 
 runner:
   run_mode: step
