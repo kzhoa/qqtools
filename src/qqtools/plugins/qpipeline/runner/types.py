@@ -18,7 +18,7 @@ class RunConfig:
     # main loop
     run_mode: RunMode = RunMode.EPOCH
     eval_interval: int = 1  # depending on run_mode, this is either epoch interval or step interval
-    save_interval: Optional[int] = None  # Regular checkpoint saving interval (steps), None means no regular saving
+    save_interval: Optional[int] = None  # depending on run_mode, this is either epoch interval or step interval
 
     # boundary
     max_epochs: Optional[int] = 1
@@ -60,6 +60,13 @@ class RunConfig:
             object.__setattr__(self, "device", torch.device(self.device))
         if not isinstance(self.print_freq, int) or self.print_freq <= 0:
             raise ValueError("print_freq must be a positive integer")
+
+        # Validate eval_interval
+        if not isinstance(self.eval_interval, int) or self.eval_interval < 1:
+            raise ValueError("eval_interval must be a positive integer (>=1)")
+        # Initialize save_interval if None
+        if self.save_interval is None:
+            object.__setattr__(self, "save_interval", self.eval_interval)
 
 
 class RunningState:

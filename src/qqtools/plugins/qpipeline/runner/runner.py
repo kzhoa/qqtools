@@ -646,19 +646,27 @@ class RunningAgent:
         is_step_trigger = (
             self.config.run_mode == RunMode.STEP and self.state.global_step % self.config.eval_interval == 0
         )
-        is_epoch_trigger = self.config.run_mode == RunMode.EPOCH and is_epoch_end
+        is_epoch_trigger = (
+            self.config.run_mode == RunMode.EPOCH
+            and is_epoch_end
+            and (self.state.epoch % self.config.eval_interval == 0)
+        )
         is_eval_trigger = is_step_trigger or is_epoch_trigger
 
         should_stop = False
         if is_eval_trigger:
             should_stop = self._run_evaluation_and_update()
 
-        should_save = False
-        if self.config.save_interval:
-            should_save = self.state.global_step % self.config.save_interval == 0
-        else:
-            # if no save_interval is set, default to saving at the same time as evaluation
-            should_save = is_eval_trigger
+        # Check for regular checkpoint saving
+        is_save_step_trigger = (
+            self.config.run_mode == RunMode.STEP and self.state.global_step % self.config.save_interval == 0
+        )
+        is_save_epoch_trigger = (
+            self.config.run_mode == RunMode.EPOCH
+            and is_epoch_end
+            and (self.state.epoch % self.config.save_interval == 0)
+        )
+        should_save = is_save_step_trigger or is_save_epoch_trigger
 
         if should_save:
             self._save_regular_checkpoint()
@@ -829,7 +837,7 @@ def train_runner(
         ema_model: EMA model
         run_mode: Running mode ("epoch" or "step")
         eval_interval: Evaluation interval (interpreted as epochs or steps depending on run_mode)
-        save_interval: Regular checkpoint saving interval (steps), None means no regular saving
+        save_interval: Regular checkpoint saving interval (interpreted as epochs or steps depending on run_mode)
 
     Returns:
         Dictionary with training results
