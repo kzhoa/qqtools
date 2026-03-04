@@ -136,8 +136,9 @@ v1.1.33
     fix: LazyImport support subscription operator for typing annotations
 v1.1.34
     feat: add qconfiggen and cli command
-    refactor: change jit.script to compile for qscatter
     fix: qdict copy now correctly pass defaultfunction 
+    refactor: change jit.script to compile for qscatter
+    refactor: update runner package to support step mode
     docs: qconfig schema to qcgen
     docs: qconfig format under docs/ 
 
