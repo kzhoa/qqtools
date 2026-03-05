@@ -8,9 +8,9 @@ Design Philosophy:
 
 import gc
 import time
-import warnings
+import copy
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -191,9 +191,8 @@ class RunningAgent:
         self.listeners = {event.value: [] for event in EventType}
         if listeners:
             for event, callbacks in listeners.items():
-                if event not in self.listeners:
-                    self.listeners[event] = []
-                self.listeners[event].extend(list(callbacks))
+                event_name = self._validate_event_name(event)
+                self.listeners[event_name].extend(list(callbacks))
 
         self.train_metric_tracker = TaskMetricTracker(
             task=self.task,
@@ -208,16 +207,29 @@ class RunningAgent:
         if self.ema_model is not None:
             self._use_model_offload = _should_enable_offload(self.device, self.model, self.logger)
 
-    def add_listener(self, event: str, listener: Callable):
-        if event in self.listeners:
-            self.listeners[event].append(listener)
-        else:
-            warnings.warn(f"Unknown event: {event}")
+    def _validate_event_name(self, event: Union[str, EventType]) -> str:
+        event_name = event.value if isinstance(event, EventType) else str(event)
+        if event_name not in self.listeners:
+            allowed_events = ", ".join(sorted(self.listeners.keys()))
+            raise ValueError(
+                f"Unknown event: {event_name}. Register it in EventType first. "
+                f"Allowed events: {allowed_events}"
+            )
+        return event_name
+
+    def add_listener(self, event: Union[str, EventType], listener: Callable):
+        event_name = self._validate_event_name(event)
+        self.listeners[event_name].append(listener)
 
     def _trigger(self, event: str, context: EventContext, snapshot: bool = True) -> EventContext:  # noqa: ARG002
         listeners = self.listeners.get(event)
         if not listeners:
             return context
+
+        if snapshot:
+            # Snapshot state to avoid post-hook mutations affecting already-emitted event records.
+            context = copy.copy(context)
+            context.state = copy.deepcopy(context.state)
 
         context.max_epochs = self.config.max_epochs
         context.max_steps = self.config.max_steps

@@ -23,7 +23,14 @@ from qqtools.plugins.qpipeline.runner.runner import (
     train_runner,
 )
 from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointListener
-from qqtools.plugins.qpipeline.runner.runner_utils.types import EventContext, LoopSignal, RunConfig, RunMode, RunningState
+from qqtools.plugins.qpipeline.runner.runner_utils.types import (
+    EventContext,
+    EventType,
+    LoopSignal,
+    RunConfig,
+    RunMode,
+    RunningState,
+)
 
 from .conftest import SimpleModel, SimpleTask
 
@@ -215,6 +222,39 @@ class TestTrainingAgent:
         assert agent.state.epoch == 999
         assert signal.should_stop is True
         assert signal.stop_message == "stop now"
+
+    def test_add_listener_rejects_unknown_event(self):
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            config=RunConfig(),
+            device=self.device,
+        )
+
+        with pytest.raises(ValueError, match="Unknown event: on_custom_event"):
+            agent.add_listener("on_custom_event", lambda context: None)
+
+    def test_constructor_rejects_unknown_listener_event(self):
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+
+        with pytest.raises(ValueError, match="Unknown event: on_custom_event"):
+            RunningAgent(
+                model=self.model,
+                task=self.task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                config=RunConfig(),
+                device=self.device,
+                listeners={"on_custom_event": [lambda context: None]},
+            )
+
+    def test_event_type_registers_on_table_update(self):
+        assert EventType.ON_TABLE_UPDATE.value == "on_table_update"
 
     def test_save_regular_checkpoint_calls_manager_with_regular_flag(self):
         loss_fn = nn.MSELoss()

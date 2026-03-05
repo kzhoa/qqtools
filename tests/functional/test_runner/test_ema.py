@@ -62,8 +62,8 @@ class SimpleTask(qTaskBase):
         return {"pred": pred}
 
     def post_metrics_to_value(self, metrics):
-        # Simple pass-through for testing
-        return metrics
+        # Follow qTaskBase contract: must return scalar.
+        return float(metrics.get("dummy_metric", 0.0))
 
 
 # --- Test Functions ---
