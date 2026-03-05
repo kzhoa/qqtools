@@ -5,8 +5,8 @@ import pytest
 import torch
 import torch.optim as optim
 
-from qqtools.plugins.qpipeline.runner.ckp_manager import CheckpointManager
-from qqtools.plugins.qpipeline.runner.types import RunningState
+from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointManager
+from qqtools.plugins.qpipeline.runner.runner_utils.types import RunningState
 
 from .conftest import SimpleModel, SimpleTask
 

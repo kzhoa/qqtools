@@ -1,7 +1,7 @@
 import time
 import logging
-from qqtools.plugins.qpipeline.runner.progress import ProgressTracker
-from qqtools.plugins.qpipeline.runner.types import EventContext, RunningState
+from qqtools.plugins.qpipeline.runner.runner_utils.progress import ProgressTracker
+from qqtools.plugins.qpipeline.runner.runner_utils.types import EventContext, RunningState
 from qqtools.plugins.qpipeline.qlogger import ConsoleLogger
 
 

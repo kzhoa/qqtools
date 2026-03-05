@@ -19,7 +19,8 @@ from qqtools.plugins.qpipeline.runner.runner import (
     _resolve_train_runner_policy,
     train_runner,
 )
-from qqtools.plugins.qpipeline.runner.types import EventContext, RunConfig, RunMode, RunningState
+from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointListener
+from qqtools.plugins.qpipeline.runner.runner_utils.types import EventContext, LoopSignal, RunConfig, RunMode, RunningState
 
 from .conftest import SimpleModel, SimpleTask
 
@@ -118,7 +119,6 @@ class TestTrainingAgent:
             config=config,
         )
         assert agent.optimizer is optimizer
-        assert agent.early_stopper is None  # Optional dependency, None if not injected
 
     def test_train_batch(self):
         """Test train_batch method"""
@@ -164,6 +164,38 @@ class TestTrainingAgent:
         assert "test_mse" in results
         assert "test_metric" in results
 
+    def test_trigger_freezes_state_but_keeps_signal_mutable(self):
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            config=RunConfig(),
+            device=self.device,
+        )
+
+        def _listener(context: EventContext):
+            with pytest.raises(AttributeError):
+                context.state.epoch = 999
+            assert context.state.epoch == agent.state.epoch
+            context.signal.should_stop = True
+            context.signal.stop_message = "stop now"
+
+        signal = LoopSignal()
+        agent.add_listener("on_validation_end", _listener)
+        agent._trigger(
+            "on_validation_end",
+            context=EventContext(state=agent.state, signal=signal, eval_results={"val_metric": 1.0}),
+            snapshot=False,
+        )
+
+        assert agent.state.epoch == 0
+        assert signal.should_stop is True
+        assert signal.stop_message == "stop now"
+
     def test_save_regular_checkpoint_calls_manager_with_regular_flag(self):
         loss_fn = nn.MSELoss()
         optimizer = optim.Adam(self.model.parameters(), lr=0.001)
@@ -172,6 +204,13 @@ class TestTrainingAgent:
         logger = Mock()
         on_checkpoint_save = Mock()
 
+        checkpoint_listener = CheckpointListener(
+            checkpoint_manager=checkpoint_manager,
+            model=self.model,
+            task=self.task,
+            optimizer=optimizer,
+        )
+
         agent = RunningAgent(
             model=self.model,
             task=self.task,
@@ -180,11 +219,12 @@ class TestTrainingAgent:
             config=RunConfig(),
             device=self.device,
             logger=logger,
-            checkpoint_manager=checkpoint_manager,
         )
+        agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
         agent.add_listener("on_checkpoint_save", on_checkpoint_save)
 
-        agent._save_regular_checkpoint()
+        agent._request_checkpoint("regular")
+        agent._flush_checkpoint_requests()
 
         save_kwargs = checkpoint_manager.save.call_args.kwargs
         assert save_kwargs["is_best"] is False
@@ -193,13 +233,20 @@ class TestTrainingAgent:
         assert checkpoint_context.checkpoint_type == "regular"
         assert checkpoint_context.checkpoint_path == "regular.pt"
 
-    def test_save_best_checkpoint_updates_state_and_calls_manager_with_best_flag(self):
+    def test_save_best_checkpoint_calls_manager_with_best_flag(self):
         loss_fn = nn.MSELoss()
         optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         checkpoint_manager = Mock()
         checkpoint_manager.save.return_value = "best.pt"
         logger = Mock()
         on_checkpoint_save = Mock()
+
+        checkpoint_listener = CheckpointListener(
+            checkpoint_manager=checkpoint_manager,
+            model=self.model,
+            task=self.task,
+            optimizer=optimizer,
+        )
 
         agent = RunningAgent(
             model=self.model,
@@ -209,25 +256,19 @@ class TestTrainingAgent:
             config=RunConfig(),
             device=self.device,
             logger=logger,
-            checkpoint_manager=checkpoint_manager,
         )
+        agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
         agent.add_listener("on_checkpoint_save", on_checkpoint_save)
 
-        eval_results = {"val_metric": 0.123, "val_loss": 0.234}
-        agent._save_best_checkpoint("val_metric", 0.123, eval_results)
+        agent._request_checkpoint("best")
+        agent._flush_checkpoint_requests()
 
         save_kwargs = checkpoint_manager.save.call_args.kwargs
         assert save_kwargs["is_best"] is True
-        assert agent.state.best_monitored_key == "val_metric"
-        assert agent.state.best_monitored_metric == 0.123
-        assert agent.state.best_model_metrics_snapshot == eval_results
-        assert agent.state.best_model_metrics_snapshot is not eval_results
         on_checkpoint_save.assert_called_once()
         checkpoint_context = on_checkpoint_save.call_args[0][0]
         assert checkpoint_context.checkpoint_type == "best"
         assert checkpoint_context.checkpoint_path == "best.pt"
-
-
 # ============================================================================
 # Integration Tests for train_runner
 # ============================================================================

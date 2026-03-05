@@ -5,7 +5,7 @@ import pytest
 import torch
 
 import qqtools as qt
-import qqtools.plugins.qpipeline.runner.progress as progress_module
+import qqtools.plugins.qpipeline.runner.runner_utils.progress as progress_module
 import qqtools.plugins.qpipeline.runner.runner as runner_module
 from qqtools.plugins.qpipeline.entry import create_pipeline_class
 from qqtools.plugins.qpipeline.qpipeline import prepare_logdir

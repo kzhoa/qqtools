@@ -10,7 +10,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
 from qqtools.plugins.qpipeline.runner.runner import RunningAgent
-from qqtools.plugins.qpipeline.runner.types import RunConfig, RunMode, RunningState
+from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMode, RunningState
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
 
 

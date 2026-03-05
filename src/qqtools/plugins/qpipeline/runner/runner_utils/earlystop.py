@@ -4,6 +4,8 @@ from collections import OrderedDict
 from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from .types import EventContext
+
 
 class EarlyStopper:
     """
@@ -223,3 +225,36 @@ def singleTargetEarlyStopper(
         lower_bounds=lower_bounds,
         upper_bounds=upper_bounds,
     )
+
+
+class EarlyStopListener:
+    """Listener that writes early-stop intent into loop signal."""
+
+    def __init__(
+        self,
+        early_stopper: Optional[EarlyStopper],
+        target: str = "val_metric",
+        logger: Optional[Any] = None,
+    ) -> None:
+        self.early_stopper = early_stopper
+        self.target = target
+        self.logger = logger
+
+    def on_validation_end(self, context: EventContext) -> None:
+        if self.early_stopper is None:
+            return
+
+        eval_results = context.eval_results or {}
+        current_metric = eval_results.get(self.target)
+        metrics_for_early_stop = {}
+        if current_metric is not None:
+            metrics_for_early_stop[self.target] = current_metric
+
+        should_stop, stop_msg, debug_msg = self.early_stopper(metrics_for_early_stop)
+
+        if debug_msg is not None and self.logger is not None:
+            self.logger.info(debug_msg)
+
+        if should_stop and context.signal is not None:
+            context.signal.should_stop = True
+            context.signal.stop_message = stop_msg
