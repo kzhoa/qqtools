@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from qqtools.plugins.qpipeline.runner.eval_summary_formatter import EvalSummaryFormatter
+from qqtools.plugins.qpipeline.runner.runner_utils.eval_formatter import EvalFormatter
 
 
 def test_table_marks_time_target_in_main_cell():
@@ -11,7 +11,7 @@ def test_table_marks_time_target_in_main_cell():
         "val_metric": 0.5,
     }
 
-    _, _, table_lines, _ = EvalSummaryFormatter.format_all(
+    _, _, table_lines, _ = EvalFormatter.format_all(
         eval_results=eval_results,
         epoch=1,
         step=10,
@@ -39,7 +39,7 @@ def test_table_marks_non_stage_target_in_others():
         "val_metric": 0.5,
     }
 
-    _, _, table_lines, _ = EvalSummaryFormatter.format_all(
+    _, _, table_lines, _ = EvalFormatter.format_all(
         eval_results=eval_results,
         epoch=2,
         step=20,

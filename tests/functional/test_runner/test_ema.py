@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from qqtools.plugins.qpipeline.entry_utils.qema import qEMA
 from qqtools.plugins.qpipeline.runner.runner import RunningAgent, train_runner
-from qqtools.plugins.qpipeline.runner.types import RunConfig, RunningState
+from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunningState
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
 
 # --- Mocking necessary classes and functions for isolated testing ---
@@ -99,9 +99,6 @@ def setup_agent_with_ema(request):
         device=device,
         ema_model=ema_model,
         logger=MagicMock(),  # Mock logger
-        checkpoint_manager=None,
-        early_stopper=None,
-        best_model_manager=None,
     )
     return agent, model, ema_model, device
 

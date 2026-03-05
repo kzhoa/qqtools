@@ -28,14 +28,14 @@ from ..entry_utils.scheduler import qWarmupScheduler
 from ..entry_utils.type_qconfig import CheckpointConfig, EarlyStopConfig, qConfig
 from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import qTaskBase
-from .avgbank import AvgBank
-from .best_model import BestModelTracker
-from .ckp_manager import CheckpointManager
-from .earlystop import EarlyStopper
-from .eval_summary_formatter import EvalSummaryFormatter
-from .progress import ProgressTracker
-from .tensorbank import TensorBank
-from .types import EventContext, RunConfig, RunMode, RunningState
+from .runner_utils.avgbank import AvgBank
+from .runner_utils.best_model import BestModelTracker
+from .runner_utils.ckp_manager import CheckpointListener, CheckpointManager
+from .runner_utils.earlystop import EarlyStopListener, EarlyStopper
+from .runner_utils.eval_formatter import EvalSummaryListener
+from .runner_utils.progress import ProgressTracker
+from .runner_utils.tensorbank import TensorBank
+from .runner_utils.types import EventContext, FrozenRunningState, LoopSignal, RunConfig, RunMode, RunningState
 
 __all__ = ["train_runner", "infer_runner"]
 
@@ -240,6 +240,252 @@ def _resolve_train_runner_policy(
         policy_warnings,
     )
 
+
+class EMAOffloadContext:
+    """Context manager that temporarily moves models for EMA evaluation."""
+
+    def __init__(
+        self,
+        main_model: nn.Module,
+        ema_model: Optional[qEMA],
+        device: torch.device,
+        use_ema: bool,
+        use_offload: bool,
+        logger: Optional[qLogger] = None,
+    ):
+        self.main_model = main_model
+        self.ema_model = ema_model
+        self.device = device
+        self.use_ema = use_ema
+        self.use_offload = use_offload
+        self.logger = logger
+
+        self.ema_original_device = None
+        self.offloaded = False
+
+    def __enter__(self) -> nn.Module:
+        if not self.use_ema or self.ema_model is None:
+            return self.main_model
+
+        if self.use_offload:
+            if self.logger is not None:
+                self.logger.debug("Offloading main model to 'cpu' for EMA evaluation.")
+            self.main_model.cpu()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.offloaded = True
+
+        try:
+            self.ema_original_device = next(self.ema_model.parameters()).device
+            if self.ema_original_device != self.device:
+                if self.logger is not None:
+                    self.logger.debug(
+                        f"Moving EMA model from '{self.ema_original_device}' to '{self.device}' for evaluation."
+                    )
+                self.ema_model.to(self.device)
+        except (StopIteration, Exception):
+            self.ema_original_device = None
+
+        return self.ema_model
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self.use_ema and self.ema_model is not None:
+            if self.ema_original_device is not None and self.ema_original_device != self.device:
+                if self.logger is not None:
+                    self.logger.debug(f"Moving EMA model back to '{self.ema_original_device}' after evaluation.")
+                self.ema_model.to(self.ema_original_device)
+
+            if self.offloaded:
+                if self.logger is not None:
+                    self.logger.debug(f"Restoring main model to '{self.device}' after evaluation.")
+                self.main_model.to(self.device)
+
+
+def _scalarize_batch_metrics(batch_metrics: Dict[str, Any]) -> Dict[str, float]:
+    """Convert batch metric payload into scalar-only dict for logging/progress.
+
+    Supports both:
+    - {name: scalar_or_tensor}
+    - {name: (value, count)}
+    """
+    scalar_metrics: Dict[str, float] = {}
+
+    for key, value in batch_metrics.items():
+        metric_value = value
+        if isinstance(value, tuple) and len(value) > 0:
+            metric_value = value[0]
+
+        try:
+            val = qt.ensure_scala(metric_value)
+            scalar_metrics[key] = float(val)
+        except (TypeError, ValueError, RuntimeError):
+            # Ignore metrics that cannot be converted to scalar (e.g. multi-element tensors)
+            continue
+
+    return scalar_metrics
+
+
+class TaskMetricTracker:
+    """Collects batch metrics and optional tensor caches for epoch-level aggregation."""
+
+    def __init__(
+        self,
+        task: qTaskBase,
+        config: RunConfig,
+        device: torch.device,
+        logger: Optional[qLogger],
+        use_tensor_bank: bool = None,
+        avg_bank: Optional[AvgBank] = None,
+    ):
+        self.task = task
+        self.config = config
+        self.device = device
+        self.logger = logger
+
+        # Auto-detect tensor bank capability if not explicitly specified
+        if use_tensor_bank is None:
+            has_batch_cache = self.task.has_implemented("batch_cache")
+            has_epoch_metric = self.task.has_implemented("epoch_metric")
+            self.use_tensor_bank = has_batch_cache and has_epoch_metric
+
+            if has_batch_cache and not has_epoch_metric:
+                if self.logger:
+                    self.logger.warning(
+                        "Task implements 'batch_cache' but missing companion 'epoch_metric'. "
+                        "Tensor caching feature is disabled. Please implement both hooks to enable."
+                    )
+            elif has_epoch_metric and not has_batch_cache:
+                if self.logger:
+                    self.logger.warning(
+                        "Task implements 'epoch_metric' but missing companion 'batch_cache'. "
+                        "Tensor caching feature is disabled. Please implement both hooks to enable."
+                    )
+        else:
+            self.use_tensor_bank = use_tensor_bank
+
+        self.avg_bank = avg_bank or AvgBank()
+        self.tensor_bank = TensorBank(logger=logger) if self.use_tensor_bank else None
+
+    @staticmethod
+    def _parse_metric_item(metric_item: Any) -> Tuple[Optional[float], float]:
+        value = metric_item
+        count = 1.0
+
+        if isinstance(metric_item, tuple) and len(metric_item) > 0:
+            value = metric_item[0]
+            if len(metric_item) > 1:
+                count = metric_item[1]
+
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                return None, count
+            value = value.item()
+
+        if torch.is_tensor(count):
+            if count.numel() != 1:
+                return None, 1.0
+            count = count.item()
+
+        if not isinstance(value, (int, float)):
+            return None, count
+
+        if not isinstance(count, (int, float)):
+            count = 1.0
+
+        return float(value), float(count)
+
+    def update_metrics(self, metrics: Dict[str, Any]) -> None:
+        for key, metric_item in metrics.items():
+            metric_value, metric_count = self._parse_metric_item(metric_item)
+            if metric_value is None:
+                continue
+            self.avg_bank.add(key, metric_value, metric_count)
+
+    def update_cache(self, out: Any, batch_data: Any) -> None:
+        if not self.use_tensor_bank or self.tensor_bank is None:
+            return
+        self.tensor_bank.add(self.task.batch_cache(out, batch_data))
+
+    def compute_epoch_metrics(self, reset_after_compute: bool = True) -> Dict[str, Any]:
+        epoch_metrics = self.avg_bank.gather_average(self.config.distributed)
+
+        if self.use_tensor_bank and self.tensor_bank is not None:
+            gathered_cache = self.tensor_bank.gather(self.config.distributed, self.device)
+            task_epoch_metrics = self.task.epoch_metric(gathered_cache)
+            if task_epoch_metrics:
+                epoch_metrics.update(task_epoch_metrics)
+
+        if reset_after_compute:
+            self.reset()
+
+        return epoch_metrics
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.avg_bank.to_dict(self.config.distributed)
+
+    def reset(self) -> None:
+        self.avg_bank = AvgBank()
+        self.reset_tensor_cache()
+
+    def reset_tensor_cache(self) -> None:
+        if self.tensor_bank is not None:
+            self.tensor_bank.reset()
+
+
+class SystemMaintenanceListener:
+    """Run periodic GC and CUDA cache cleanup on completed-step cadence."""
+
+    def __init__(self, gc_freq: int):
+        self.gc_freq = gc_freq
+
+    def on_train_batch_end(self, context: EventContext) -> None:
+        if not isinstance(self.gc_freq, int) or self.gc_freq <= 0:
+            return
+
+        completed_step = context.state.global_step + 1
+        if completed_step % self.gc_freq != 0:
+            return
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+class WarmupSchedulerListener:
+    """Step warmup scheduler on every training batch end."""
+
+    def __init__(self, scheduler: Optional[qWarmupScheduler]):
+        self.scheduler = scheduler
+
+    def on_train_batch_end(self, context: EventContext) -> None:  # noqa: ARG002
+        if self.scheduler is None:
+            return
+        self.scheduler.step_warmup()
+
+
+def _should_enable_offload(device: torch.device, model: nn.Module, logger: Optional[qLogger]) -> bool:
+    """Check if model offloading should be enabled based on GPU capacity."""
+    if device.type != "cuda":
+        return False
+
+    from ..entry_utils.info import get_model_size_bytes
+
+    m_size = get_model_size_bytes(model)
+    try:
+        gpu_cap = torch.cuda.get_device_properties(device).total_memory
+    except Exception:
+        return False
+
+    if m_size > (gpu_cap * 0.5):
+        if logger:
+            logger.info(
+                f"Model size ({m_size / 1024**2:.2f} MB) > 50% of GPU capacity. "
+                "Enabling mutual offloading during evaluation."
+            )
+        return True
+    return False
+
+
 class RunningAgent:
 
     def __init__(
@@ -253,16 +499,14 @@ class RunningAgent:
         device: torch.device = None,
         ema_model: Optional[qEMA] = None,
         logger: Optional[qLogger] = None,
-        checkpoint_manager: Optional[CheckpointManager] = None,
-        early_stopper: Optional[EarlyStopper] = None,
-        best_model_tracker: Optional[BestModelTracker] = None,
-        best_model_manager: Optional[BestModelTracker] = None,
         listeners: Optional[Dict[str, List[Callable]]] = None,
         state: Optional[RunningState] = None,
         avg_bank: Optional[AvgBank] = None,
+        best_model_tracker: Optional[BestModelTracker] = None,
     ):
         """
-        Training Agent with dependency injection support for better testability and extensibility.
+        Training agent that only focuses on core loop and event triggering.
+
         Args:
             model: Model instance
             task: Task instance
@@ -273,10 +517,6 @@ class RunningAgent:
             device: Device
             ema_model: EMA model
             logger: Logger instance
-            checkpoint_manager: Checkpoint manager (optional, None to skip checkpoint functionality)
-            early_stopper: Early stopping manager (optional, None to disable early stopping)
-            best_model_tracker: Best model tracker (optional, None to skip best model tracking)
-            best_model_manager: Deprecated alias of best_model_tracker
             listeners: Event listeners dictionary
             state: Running state
             avg_bank: Average metrics manager
@@ -288,7 +528,7 @@ class RunningAgent:
         self.scheduler = scheduler
 
         # Use the provided config object directly, or create a default one if none is given.
-        # This prevents overwriting specific settings like `save_interval=None` with defaults.
+        # This prevents overwriting specific settings like save_interval=None with defaults.
         self.config = config if config is not None else RunConfig()
 
         self.device = device or self.config.device
@@ -297,94 +537,95 @@ class RunningAgent:
 
         # initialization
         self.state = state or RunningState()
+        self.best_model_tracker = best_model_tracker or BestModelTracker(
+            target=self.config.checkpoint.get("target", "val_metric"),
+            mode=self.config.checkpoint.get("mode", "min"),
+            min_delta=self.config.checkpoint.get("min_delta", 0.0),
+        )
+        self._ad_hoc_signal = LoopSignal()
 
         self.train_loader = task.train_loader
         self.val_loader = task.val_loader
         self.test_loader = task.test_loader
 
-        # Managers (Add-ons) - must be injected externally
-        self.checkpoint_manager = checkpoint_manager
-        self.early_stopper = early_stopper
-        self.best_model_tracker = best_model_tracker or best_model_manager
-        # Backward-compatibility alias.
-        self.best_model_manager = self.best_model_tracker
-
-        # Listeners for extensibility
-        default_listeners = {
-            "on_epoch_start": [],
-            "on_epoch_end": [],
-            "on_batch_start": [],
-            "on_batch_end": [],
-            "on_progress_tick": [],
-            "on_train_batch_end": [],
-            "on_table_update": [],
-            "on_eval_start": [],
-            "on_eval_end": [],
-            "on_checkpoint_save": [],
-            "on_early_stop": [],
-        }
-        self.listeners = listeners or default_listeners
-
         # Internal variables
         self._train_iter = None
-        self.avg_bank = avg_bank or AvgBank()
         self.interval_avg_bank = AvgBank()
 
-        # Check TensorBank capability hooks
-        has_batch_cache = self.task.has_implemented("batch_cache")
-        has_epoch_metric = self.task.has_implemented("epoch_metric")
+        # Listeners for extensibility
+        self.listeners = {
+            k: []
+            for k in [
+                "on_epoch_start",
+                "on_epoch_end",
+                "on_batch_start",
+                "on_batch_end",
+                "on_progress_tick",
+                "on_train_batch_end",
+                "on_table_update",
+                "on_eval_start",
+                "on_eval_end",
+                "on_validation_end",
+                "on_checkpoint_request",
+                "on_checkpoint_save",
+                "on_early_stop",
+            ]
+        }
 
-        self.use_tensor_bank = has_batch_cache and has_epoch_metric
-        self.tensor_bank = TensorBank(logger=self.logger) if self.use_tensor_bank else None
-        if has_batch_cache and not has_epoch_metric:
-            self.logger.warning(
-                "Task implements 'batch_cache' but missing companion 'epoch_metric'. "
-                "Tensor caching feature is disabled. Please implement both hooks to enable."
-            )
-        elif has_epoch_metric and not has_batch_cache:
-            self.logger.warning(
-                "Task implements 'epoch_metric' but missing companion 'batch_cache'. "
-                "Tensor caching feature is disabled. Please implement both hooks to enable."
-            )
+        # Add default internal listeners
+        self._warmup_listener = WarmupSchedulerListener(self.scheduler)
+        self._maintenance_listener = SystemMaintenanceListener(self.config.gc_freq)
+        self.add_listener("on_train_batch_end", self._warmup_listener.on_train_batch_end)
+        self.add_listener("on_train_batch_end", self._maintenance_listener.on_train_batch_end)
+
+        if listeners:
+            for event, callbacks in listeners.items():
+                if event not in self.listeners:
+                    self.listeners[event] = []
+                self.listeners[event].extend(list(callbacks))
+
+        # Metrics tracker with auto-detected tensor bank capability
+        self.train_metric_tracker = TaskMetricTracker(
+            task=self.task,
+            config=self.config,
+            device=self.device,
+            logger=self.logger,
+            avg_bank=avg_bank,
+        )
+        self.use_tensor_bank = self.train_metric_tracker.use_tensor_bank
 
         # Check for model offloading (EMA on GPU, Main Model on CPU during eval)
         self._use_model_offload = False
-        if self.device.type == "cuda" and self.ema_model is not None:
-            from ..entry_utils.info import get_model_size_bytes
-
-            m_size = get_model_size_bytes(self.model)
-            gpu_cap = torch.cuda.get_device_properties(self.device).total_memory
-            if m_size > (gpu_cap * 0.5):
-                self._use_model_offload = True
-                self.logger.info(
-                    f"Model size ({m_size / 1024**2:.2f} MB) > 50% of GPU capacity. "
-                    "Enabling mutual offloading during evaluation."
-                )
+        if self.ema_model is not None:
+            self._use_model_offload = _should_enable_offload(self.device, self.model, self.logger)
 
     def add_listener(self, event: str, listener: Callable):
+
         if event in self.listeners:
             self.listeners[event].append(listener)
         else:
             warnings.warn(f"Unknown event: {event}")
 
-    def _trigger(self, event: str, context: EventContext):
-        # Create a snapshot of the state for this event to prevent listeners
-        # from getting a mutable state object that changes later.
-        context_snapshot = copy.copy(context)
-        context_snapshot.state = copy.copy(context.state)
+    def _trigger(self, event: str, context: EventContext, snapshot: bool = True) -> EventContext:
+        context_used = copy.copy(context) if snapshot else context
+        context_used.state = FrozenRunningState.from_state(context.state)
+
         # Inject run limits into the context so listeners can access them
         try:
-            context_snapshot.max_epochs = self.config.max_epochs
-            context_snapshot.max_steps = self.config.max_steps
+            context_used.max_epochs = self.config.max_epochs
+            context_used.max_steps = self.config.max_steps
         except Exception:
             pass
 
         for listener in self.listeners.get(event, []):
             try:
-                listener(context_snapshot)
+                listener(context_used)
             except Exception as e:
-                self.logger.error(f"Listener error for event '{event}' in {listener.__name__}: {type(e).__name__}: {e}")
+                listener_name = getattr(listener, "__name__", listener.__class__.__name__)
+                self.logger.error(f"Listener error for event '{event}' in {listener_name}: {type(e).__name__}: {e}")
                 raise
+
+        return context_used
 
     def _prepare_batch(self, batch_data):
         """Prepare batch data: move to device and convert dtype if needed.
@@ -414,31 +655,6 @@ class RunningAgent:
         out = self.task.batch_forward(model, batch_data)
         out = self.task.post_batch_forward(out, batch_data)
         return out, batch_data
-
-    @staticmethod
-    def _scalarize_batch_metrics(batch_metrics: Dict[str, Any]) -> Dict[str, float]:
-        """Convert batch metric payload into scalar-only dict for logging/progress.
-
-        Supports both:
-        - {name: scalar_or_tensor}
-        - {name: (value, count)}
-        """
-        scalar_metrics: Dict[str, float] = {}
-
-        for key, value in batch_metrics.items():
-            metric_value = value
-            if isinstance(value, tuple) and len(value) > 0:
-                metric_value = value[0]
-
-            if torch.is_tensor(metric_value):
-                if metric_value.numel() != 1:
-                    continue
-                metric_value = metric_value.item()
-
-            if isinstance(metric_value, (int, float)):
-                scalar_metrics[key] = float(metric_value)
-
-        return scalar_metrics
 
     def _emit_batch_events(
         self,
@@ -485,8 +701,7 @@ class RunningAgent:
         """Initialize a new epoch: create iterator and setup distributed sampling."""
         # Set iterator and reset metrics
         self._train_iter = iter(self.train_loader)
-        if self.use_tensor_bank:
-            self.tensor_bank.reset()
+        self.train_metric_tracker.reset_tensor_cache()
 
         # Update distributed sampler epoch for proper shuffling
         if self.config.distributed and hasattr(self.train_loader.sampler, "set_epoch"):
@@ -542,14 +757,7 @@ class RunningAgent:
         3. Reset metrics accumulator and increment epoch counter
         """
         # Calculate the average metrics of the current epoch
-        epoch_metrics = self.avg_bank.gather_average(self.config.distributed)
-
-        # Add tasks's cross-batch metrics if implemented
-        if self.use_tensor_bank:
-            gathered_cache = self.tensor_bank.gather(self.config.distributed, self.device)
-            task_epoch_metrics = self.task.epoch_metric(gathered_cache)
-            if task_epoch_metrics:
-                epoch_metrics.update(task_epoch_metrics)
+        epoch_metrics = self.train_metric_tracker.compute_epoch_metrics(reset_after_compute=True)
 
         self.state.update_current_metrics(epoch_metrics)
 
@@ -560,7 +768,6 @@ class RunningAgent:
         self.state.epoch += 1
         # Reset batch index at epoch boundary for mid-epoch checkpoint recovery
         self.state.batch_idx_in_epoch = 0
-        self.avg_bank = AvgBank()  # Reset for next epoch
 
     def train_batch(self, batch_data) -> Dict[str, Any]:
         """Train a single batch"""
@@ -575,8 +782,7 @@ class RunningAgent:
         batch_metrics = self._scalarize_batch_metrics(raw_batch_metrics)
 
         # Cache tensors if implemented
-        if self.use_tensor_bank:
-            self.tensor_bank.add(self.task.batch_cache(out, batch_data))
+        self.train_metric_tracker.update_cache(out, batch_data)
 
         # Training mode: calculate loss and backward propagation
         losses = self.task.batch_loss(out, batch_data, self.loss_fn)
@@ -600,130 +806,129 @@ class RunningAgent:
         return batch_metrics
 
     def evaluate(self, model: nn.Module = None, use_ema: bool = False) -> Dict[str, Any]:
-        """Evaluate the model.
+        """Evaluate model on configured validation and test loaders."""
+        base_model = model or self.model
+        use_offload = self._use_model_offload and (base_model is self.model)
 
-        If use_ema is True and offloading is enabled, the main model will be moved to CPU
-        to free up GPU memory for the EMA model.
-        """
-        eval_model = model or self.model
-        ema_original_device = None
-        offloaded = False
+        with EMAOffloadContext(
+            main_model=base_model,
+            ema_model=self.ema_model,
+            device=self.device,
+            use_ema=use_ema,
+            use_offload=use_offload,
+            logger=self.logger,
+        ) as eval_model:
+            return self._evaluate_loaders(eval_model)
 
-        if use_ema and self.ema_model is not None:
-            eval_model = self.ema_model
+    def _evaluate_loaders(self, model: nn.Module) -> Dict[str, Any]:
+        """Evaluate val/test loaders for a specific model instance."""
+        results: Dict[str, Any] = {}
 
-            # Offload main model if needed to free GPU memory
-            if self._use_model_offload:
-                self.logger.debug("Offloading main model to 'cpu' for EMA evaluation.")
-                self.model.cpu()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                offloaded = True
+        if self.val_loader is not None:
+            results.update(self._run_evaluation_loop(model, self.val_loader, prefix="val", stage="val"))
 
-            # Temporarily move EMA model to target device for evaluation speed
-            try:
-                # Get current device of EMA model
-                ema_original_device = next(eval_model.parameters()).device
-                if ema_original_device != self.device:
-                    self.logger.debug(
-                        f"Moving EMA model from '{ema_original_device}' to '{self.device}' for evaluation."
-                    )
-                    eval_model.to(self.device)
-            except (StopIteration, Exception):
-                ema_original_device = None
-
-        results = {}
-
-        try:
-            # Validation set
-            if self.val_loader is not None:
-                val_metrics = self._run_evaluation(eval_model, self.val_loader, "val", stage="val")
-                results.update(val_metrics)
-
-            # Test set
-            if self.test_loader is not None:
-                test_metrics = self._run_evaluation(eval_model, self.test_loader, "test", stage="test")
-                results.update(test_metrics)
-        finally:
-            # Restore EMA model to its original device
-            if ema_original_device is not None and ema_original_device != self.device:
-                self.logger.debug(f"Moving EMA model back to '{ema_original_device}' after evaluation.")
-                eval_model.to(ema_original_device)
-
-            # Restore main model to GPU if it was offloaded
-            if offloaded:
-                self.logger.debug(f"Restoring main model to '{self.device}' after evaluation.")
-                self.model.to(self.device)
+        if self.test_loader is not None:
+            results.update(self._run_evaluation_loop(model, self.test_loader, prefix="test", stage="test"))
 
         return results
+
+    def evaluate_all_models(self) -> Dict[str, Any]:
+        """Evaluate main model and EMA model (if present)."""
+        eval_results = self.evaluate(self.model, use_ema=False)
+
+        if self.ema_model is not None:
+            ema_results = self.evaluate(self.model, use_ema=True)
+            eval_results.update({f"ema_{key}": value for key, value in ema_results.items()})
+
+        return eval_results
 
     def _run_evaluation(
         self, model: nn.Module, data_loader: DataLoader, prefix: str = "", stage: str = "val"
     ) -> Dict[str, Any]:
-        """Run evaluation"""
+        """Compatibility wrapper for the public evaluation-loop helper."""
+        return self._run_evaluation_loop(model=model, data_loader=data_loader, prefix=prefix, stage=stage)
+
+    def _run_evaluation_loop(
+        self, model: nn.Module, data_loader: DataLoader, prefix: str = "", stage: str = "val"
+    ) -> Dict[str, Any]:
+        """Run one evaluation loop and return prefixed aggregated metrics."""
         was_training = model.training
         model.eval()
-        avg_bank = AvgBank()
-        tensor_bank = TensorBank(self.logger) if self.use_tensor_bank else None
+
+        eval_tracker = TaskMetricTracker(
+            task=self.task,
+            config=self.config,
+            device=self.device,
+            logger=self.logger,
+        )
 
         with torch.no_grad():
             for batch_idx, batch_data in enumerate(data_loader):
-                # Prepare batch
                 batch_data = self._prepare_batch(batch_data)
-
-                # Forward pass
                 out, batch_data = self._forward_batch(model, batch_data)
 
-                # Calculate metrics
                 batch_metrics = self.task.batch_metric(out, batch_data)
+                eval_tracker.update_metrics(batch_metrics)
+                eval_tracker.update_cache(out, batch_data)
 
-                # Accumulate metrics into avg_bank
-                for key, (value, cnt) in batch_metrics.items():
-                    if torch.is_tensor(value):
-                        value = value.item()
-                    avg_bank.add(key, value, cnt)
-
-                # Cache tensors into tensor_bank if implemented
-                if self.use_tensor_bank:
-                    tensor_bank.add(self.task.batch_cache(out, batch_data))
-
-                avg_metrics = avg_bank.to_dict(self.config.distributed)
+                avg_metrics = eval_tracker.to_dict()
                 self._emit_batch_events(
                     batch_idx=batch_idx,
                     total_batches=len(data_loader),
                     batch_metrics=batch_metrics,
-                    scalar_batch_metrics=self._scalarize_batch_metrics(batch_metrics),
+                    scalar_batch_metrics=_scalarize_batch_metrics(batch_metrics),
                     stage=stage,
                     batch_avg_metrics=avg_metrics,
                     progress_avg_metrics=avg_metrics,
                 )
 
-        # Calculate average
-        avg_metrics = avg_bank.gather_average(self.config.distributed)
-
-        # Add tasks's cross-batch metrics if implemented
-        if self.use_tensor_bank:
-            gathered_cache = tensor_bank.gather(self.config.distributed, self.device)
-            task_epoch_metrics = self.task.epoch_metric(gathered_cache)
-            if task_epoch_metrics:
-                avg_metrics.update(task_epoch_metrics)
-
-        # Add prefix
+        avg_metrics = eval_tracker.compute_epoch_metrics(reset_after_compute=True)
         prefixed_metrics = {f"{prefix}_{key}": value for key, value in avg_metrics.items()}
 
-        # Convert to task metrics
         task_metric = self.task.post_metrics_to_value(avg_metrics)
         prefixed_metrics[f"{prefix}_metric"] = task_metric
 
         model.train(was_training)
         return prefixed_metrics
 
-    def _run_evaluation_and_update(self) -> bool:
-        """
-        Runs the full evaluation process and updates the best model/early stopping state.
+    def _update_best_model_state(self, eval_results: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        if self.best_model_tracker is None:
+            return False, None
 
-        Returns:
-            bool: True if training should stop, False otherwise.
+        previous_best = {
+            "metric": getattr(self.best_model_tracker, "best_metric", None),
+            "epoch": getattr(self.best_model_tracker, "best_epoch", 0),
+            "step": getattr(self.best_model_tracker, "best_step", 0),
+        }
+
+        target_key = getattr(self.best_model_tracker, "target", None)
+        if not target_key:
+            return False, previous_best
+
+        current_val = eval_results.get(target_key)
+        if current_val is None:
+            return False, previous_best
+
+        try:
+            monitored_metric = qt.ensure_scala(current_val)
+        except Exception:
+            # Skip best-model update when monitored target is non-scalar.
+            return False, previous_best
+
+        is_best = self.best_model_tracker.update(monitored_metric, self.state.epoch, self.state.global_step)
+        if not is_best:
+            return False, previous_best
+
+        self.state.best_epoch = self.state.epoch
+        self.state.best_step = self.state.global_step
+        self.state.best_monitored_key = target_key
+        self.state.best_monitored_metric = monitored_metric
+        self.state.best_model_metrics_snapshot = copy.deepcopy(eval_results)
+        return True, previous_best
+
+    def _run_evaluation_and_update(self, signal: LoopSignal) -> None:
+        """
+        Run evaluation, update state, and dispatch validation callbacks.
         """
         total_eval_batches = 0
         for loader in (self.val_loader, self.test_loader):
@@ -736,15 +941,15 @@ class RunningAgent:
 
         self._trigger(
             "on_eval_start",
-            context=EventContext(state=self.state, stage="eval", total_batches=total_eval_batches),
+            context=EventContext(state=self.state, stage="eval", total_batches=total_eval_batches, signal=signal),
         )
 
         # Gather and reset interval train metrics
         interval_metrics = self.interval_avg_bank.gather_average(self.config.distributed)
         self.interval_avg_bank = AvgBank()
 
-        # Evaluate the original model
-        eval_results = self.evaluate(self.model, use_ema=False)
+        # 1) Run evaluation (main + EMA if available)
+        eval_results = self.evaluate_all_models()
 
         # Add train metrics to results
         if interval_metrics:
@@ -752,147 +957,70 @@ class RunningAgent:
             eval_results.update({f"train_{k}": v for k, v in interval_metrics.items()})
             eval_results["train_metric"] = train_metric
 
-        # Evaluate EMA model (if exists)
-        if self.ema_model is not None:
-            ema_results = self.evaluate(self.model, use_ema=True)
-            # Merge results and add ema prefix
-            for key, value in ema_results.items():
-                eval_results[f"ema_{key}"] = value
-
-        # Update state
+        # 2) Update state
         self.state.update_current_metrics(eval_results)
 
-        # Trigger evaluation end event
+        # Keep compatibility listeners for progress/sheet loggers
         self._trigger(
             "on_eval_end",
-            context=EventContext(state=self.state, stage="eval", eval_results=eval_results),
+            context=EventContext(state=self.state, stage="eval", eval_results=eval_results, signal=signal),
         )
 
-        # Learning rate update (epoch-wise scheduler)
-        if self.scheduler is not None:
-            self.scheduler.step_main(metrics=eval_results.get("val_metric"))
-
-        # Determine if best
-        target = self.config.checkpoint.get("target", "val_metric")
-        current_val = eval_results.get(target)
-
-        is_best = False
-        previous_best = None
-        if self.best_model_tracker is not None:
-            previous_best = {
-                "metric": getattr(self.best_model_tracker, "best_metric", None),
-                "epoch": getattr(self.best_model_tracker, "best_epoch", 0),
-                "step": getattr(self.best_model_tracker, "best_step", 0),
-            }
-        if current_val is not None and self.best_model_tracker is not None:
-            is_best = self.best_model_tracker.update(current_val, self.state.epoch, self.state.global_step)
-
+        # 3) Update best-model state before dispatching callbacks
+        is_best, previous_best = self._update_best_model_state(eval_results)
         if is_best:
-            self._save_best_checkpoint(
-                monitored_key=target,
-                monitored_metric=current_val,
-                eval_results=eval_results,
-            )
+            self._request_checkpoint("best", signal=signal)
 
-        # Early stop check
-        if self.early_stopper is not None:
-            early_stop_target = self.config.early_stop.get("target", "val_metric")
-
-            metrics_for_early_stop = {}
-            current_early_stop_metric = eval_results.get(early_stop_target)
-            if current_early_stop_metric is not None:
-                metrics_for_early_stop[early_stop_target] = current_early_stop_metric
-
-            should_stop, stop_msg, debug_msg = self.early_stopper(metrics_for_early_stop)
-
-            if debug_msg is not None:
-                self.logger.info(debug_msg)
-
-        # Log formatted summary
-        self._log_eval_summary(eval_results, is_best, previous_best=previous_best)
-
-        if self.early_stopper is not None and should_stop:
-            self.logger.info(stop_msg)
-            self._trigger("on_early_stop", context=EventContext(state=self.state))
-            return True
-
-        return False
-
-    def _log_eval_summary(
-        self,
-        eval_results: Dict[str, Any],
-        is_best: bool,
-        previous_best: Optional[Dict[str, Any]] = None,
-    ):
-        """Log evaluation summary in both hierarchical and table-friendly formats."""
-        target_key = self.config.checkpoint.get("target", "val_metric")
-        target_mode = self.config.checkpoint.get("mode", "min")
-        summary_lines, summary_has_markup, table_lines, table_has_markup = EvalSummaryFormatter.format_all(
+        # 4) Trigger validation-end callbacks with frozen state + mutable signal
+        validation_context = EventContext(
+            state=self.state,
+            stage="eval",
             eval_results=eval_results,
-            epoch=self.state.epoch,
-            step=self.state.global_step,
-            target_key=target_key,
-            target_mode=target_mode,
-            is_best=is_best,
             previous_best=previous_best,
+            is_best=is_best,
             best_model_tracker=self.best_model_tracker,
-            color_new_best=True,
+            signal=signal,
         )
+        self._trigger("on_validation_end", context=validation_context, snapshot=False)
 
-        if summary_has_markup:
-            self.logger.info("\n".join(summary_lines), extra={"markup": True})
-        else:
-            self.logger.info("\n".join(summary_lines))
+    def _request_checkpoint(
+        self,
+        checkpoint_type: Literal["best", "regular"],
+        signal: Optional[LoopSignal] = None,
+    ) -> None:
+        target_signal = signal or self._ad_hoc_signal
+        target_signal.request_checkpoint(checkpoint_type)
 
-        if table_has_markup:
-            self.logger.info("\n".join(table_lines), extra={"markup": True})
-        else:
-            self.logger.info("\n".join(table_lines))
+    def _flush_checkpoint_requests(self, signal: Optional[LoopSignal] = None) -> None:
+        target_signal = signal or self._ad_hoc_signal
+        while target_signal.pending_checkpoint_types:
+            checkpoint_type = target_signal.pending_checkpoint_types.pop(0)
+            request_context = EventContext(
+                state=self.state,
+                checkpoint_type=checkpoint_type,
+                signal=target_signal,
+            )
+            self._trigger("on_checkpoint_request", context=request_context, snapshot=False)
 
-    def _save_best_checkpoint(self, monitored_key: str, monitored_metric: Any, eval_results: Dict[str, Any]):
-        """Saves the best model checkpoint and updates best metrics."""
-        # Update best metrics
-        self.state.best_epoch = self.state.epoch
-        self.state.best_step = self.state.global_step
-        self.state.best_monitored_key = monitored_key
+            if request_context.checkpoint_path is None:
+                continue
 
-        if monitored_metric is not None:
-            monitored_metric = qt.ensure_scala(monitored_metric)
-        self.state.best_monitored_metric = monitored_metric
-        self.state.best_model_metrics_snapshot = copy.deepcopy(eval_results)
+            if checkpoint_type == "best":
+                self.state.best_ckp_file = Path(request_context.checkpoint_path).name
 
-        self._save_checkpoint(checkpoint_type="best")
-
-    def _save_regular_checkpoint(self):
-        """Saves a checkpoint of the current state, not contingent on performance."""
-        self._save_checkpoint(checkpoint_type="regular")
-
-    def _save_checkpoint(self, checkpoint_type: Literal["best", "regular"]) -> Optional[str]:
-        """Save a checkpoint and emit checkpoint event."""
-        if self.checkpoint_manager is None:
-            return None
-
-        ckp_path = self.checkpoint_manager.save(
-            copy.copy(self.state),
-            self.model,
-            self.task,
-            self.optimizer,
-            self.scheduler,
-            self.ema_model,
-            self.early_stopper,
-            self.best_model_tracker,
-            is_best=(checkpoint_type == "best"),
-        )
-        self._trigger(
-            "on_checkpoint_save",
-            context=EventContext(state=self.state, checkpoint_type=checkpoint_type, checkpoint_path=ckp_path),
-        )
-        return ckp_path
+            self._trigger(
+                "on_checkpoint_save",
+                context=EventContext(
+                    state=self.state,
+                    checkpoint_type=checkpoint_type,
+                    checkpoint_path=request_context.checkpoint_path,
+                    signal=target_signal,
+                ),
+            )
 
     def _handle_periodic_events(self, is_epoch_end: bool) -> bool:
         """
-        Handles all periodic events like evaluation, checkpointing, and early stopping.
-        This is the central place for managing the training lifecycle based on run_mode.
+        Handles all periodic events like evaluation and checkpointing.
 
         Args:
             is_epoch_end: Flag indicating if the current step is the last in an epoch.
@@ -900,6 +1028,8 @@ class RunningAgent:
         Returns:
             bool: True if training should stop, False otherwise.
         """
+        signal = LoopSignal()
+
         is_eval_trigger = _is_periodic_trigger(
             run_mode=self.config.run_mode,
             interval=self.config.eval_interval,
@@ -908,13 +1038,12 @@ class RunningAgent:
             is_epoch_end=is_epoch_end,
         )
 
-        should_stop = False
         if is_eval_trigger:
             self.logger.debug(
                 f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
                 f"\n eval_interval={self.config.eval_interval} save_interval={self.config.save_interval}"
             )
-            should_stop = self._run_evaluation_and_update()
+            self._run_evaluation_and_update(signal)
 
         is_save_trigger = _is_periodic_trigger(
             run_mode=self.config.run_mode,
@@ -924,9 +1053,70 @@ class RunningAgent:
             is_epoch_end=is_epoch_end,
         )
         if is_save_trigger:
-            self._save_regular_checkpoint()
+            self._request_checkpoint("regular", signal=signal)
 
-        return should_stop
+        self._flush_checkpoint_requests(signal)
+
+        if signal.should_stop:
+            stop_message = signal.stop_message or "Early stopping triggered."
+            self.logger.info(stop_message)
+            self._trigger("on_early_stop", context=EventContext(state=self.state, signal=signal))
+            return True
+
+        return False
+
+    def _reached_run_limits(self) -> bool:
+        max_steps_limit = self.config.max_steps if self.config.max_steps is not None else float("inf")
+        max_epochs_limit = self.config.max_epochs if self.config.max_epochs is not None else float("inf")
+
+        is_reached = self.state.global_step >= max_steps_limit or self.state.epoch >= max_epochs_limit
+        if is_reached:
+            self.logger.info(f"Training loop stopping at epoch {self.state.epoch}, step {self.state.global_step}.")
+
+        return is_reached
+
+    def _train_one_batch(self, batch_data: Any) -> None:
+        total_batches = len(self.train_loader)
+        batch_idx = self.state.batch_idx_in_epoch - 1
+        batch_start_time = time.time()
+
+        self._trigger(
+            "on_batch_start",
+            context=EventContext(
+                state=self.state,
+                batch_idx=batch_idx,
+                total_batches=total_batches,
+            ),
+        )
+
+        batch_metrics = self.train_batch(batch_data)
+
+        batch_time = time.time() - batch_start_time
+        self.state.total_train_time += batch_time
+        batch_metrics["batch_time"] = batch_time
+
+        self.train_metric_tracker.update_metrics(batch_metrics)
+        for key, metric_item in batch_metrics.items():
+            metric_value, metric_count = TaskMetricTracker._parse_metric_item(metric_item)
+            if metric_value is None:
+                continue
+            self.interval_avg_bank.add(key, metric_value, metric_count)
+
+        freq = self.config.print_freq
+        is_update_tick = self.state.batch_idx_in_epoch % freq == 0 or self.state.batch_idx_in_epoch == total_batches
+
+        current_lr = self.optimizer.param_groups[0]["lr"] if self.optimizer else None
+        self._emit_batch_events(
+            batch_idx=batch_idx,
+            total_batches=total_batches,
+            batch_metrics=batch_metrics,
+            scalar_batch_metrics=_scalarize_batch_metrics(batch_metrics),
+            stage="train",
+            lr=current_lr,
+            progress_avg_metrics=self.train_metric_tracker.to_dict(),
+            emit_train_batch_end=True,
+            emit_table_update=is_update_tick,
+        )
 
     def _training_loop(self) -> bool:
         """
@@ -943,73 +1133,18 @@ class RunningAgent:
         self._train_iter = None
 
         while True:
-            # Check for overall stopping conditions at the beginning of each potential epoch/step
-            max_steps_limit = self.config.max_steps if self.config.max_steps is not None else float("inf")
-            max_epochs_limit = self.config.max_epochs if self.config.max_epochs is not None else float("inf")
-            if self.state.global_step >= max_steps_limit or self.state.epoch >= max_epochs_limit:
-                self.logger.info(f"Training loop stopping at epoch {self.state.epoch}, step {self.state.global_step}.")
+            if self._reached_run_limits():
                 return False  # Completed normally
-
-            # This marks the start of an actual training iteration for a batch.
-            # Evaluation/Checkpointing for the *previous* epoch happens just before epoch increment.
-            # For step-mode, evaluation can happen mid-epoch.
 
             try:
                 batch_data, is_epoch_end = self._get_next_batch()
 
                 if batch_data is None:  # Epoch has truly ended, handle epoch-level events
-                    # The event handling (eval, save) is triggered after the last batch is processed.
-                    # This block now only handles the state update for the next epoch.
-                    self._handle_epoch_end()  # Increment epoch, reset avg_bank, etc.
+                    self._handle_epoch_end()  # Increment epoch, reset epoch-level accumulators
                     self._train_iter = None  # Force new iterator creation for next epoch
                     continue  # Start next iteration of while loop to check new state boundaries
 
-                # Train a single batch
-                batch_start_time = time.time()
-                self._trigger(
-                    "on_batch_start",
-                    context=EventContext(
-                        state=self.state,
-                        batch_idx=self.state.batch_idx_in_epoch - 1,  # Use 0-indexed batch_idx
-                        total_batches=len(self.train_loader),
-                    ),
-                )
-
-                batch_metrics = self.train_batch(batch_data)
-
-                # Unconditionally step warmup scheduler every batch
-                if self.scheduler is not None:
-                    self.scheduler.step_warmup()
-
-                # Record batch time and update total training time
-                batch_time = time.time() - batch_start_time
-                self.state.total_train_time += batch_time
-                batch_metrics["batch_time"] = batch_time
-
-                # Update average banks
-                for k, v in batch_metrics.items():
-                    if isinstance(v, (int, float)):
-                        self.avg_bank.add(k, v)
-                        self.interval_avg_bank.add(k, v)
-
-                # Trigger batch end event for listeners (e.g., progress bars, loggers)
-                # Trigger table update based on print frequency
-                freq = self.config.print_freq
-                is_update_tick = self.state.batch_idx_in_epoch % freq == 0 or self.state.batch_idx_in_epoch == len(
-                    self.train_loader
-                )
-                current_lr = self.optimizer.param_groups[0]["lr"] if self.optimizer else None
-                self._emit_batch_events(
-                    batch_idx=self.state.batch_idx_in_epoch - 1,
-                    total_batches=len(self.train_loader),
-                    batch_metrics=batch_metrics,
-                    scalar_batch_metrics=self._scalarize_batch_metrics(batch_metrics),
-                    stage="train",
-                    lr=current_lr,
-                    progress_avg_metrics=self.avg_bank.to_dict(self.config.distributed),
-                    emit_train_batch_end=True,
-                    emit_table_update=is_update_tick,
-                )
+                self._train_one_batch(batch_data)
 
                 # Check periodic events that are tied to global_step, or epoch-end if not yet handled
                 should_stop_mid_epoch = self._handle_periodic_events(is_epoch_end=is_epoch_end)
@@ -1018,12 +1153,6 @@ class RunningAgent:
 
                 # Increment global step *after* all step-based logic is complete
                 self.state.global_step += 1
-
-                # Periodically clean up memory
-                if self.state.global_step % self.config.gc_freq == 0:  # Using config.gc_freq
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
 
             except KeyboardInterrupt:
                 self.logger.info("Training interrupted by user.")
@@ -1216,14 +1345,9 @@ def train_runner(
             optimizer=optimizer, warmup_steps=0, warmup_factor=1.0, main_scheduler=qt.nn.DoNothing()
         )
 
-    # Create managers
+    # Create managers and callback listeners
     checkpoint_manager = CheckpointManager(config.save_dir, config.rank)
     early_stopper = EarlyStopper.from_config(config.early_stop)
-    best_model_tracker = BestModelTracker(
-        target=config.checkpoint.get("target", "val_metric"),
-        mode=config.checkpoint.get("mode", "min"),
-        min_delta=config.checkpoint.get("min_delta", 0.0),
-    )
 
     # Create training agent
     agent = RunningAgent(
@@ -1236,15 +1360,33 @@ def train_runner(
         device=device,
         ema_model=ema_model,
         logger=logger,
+    )
+
+    checkpoint_listener = CheckpointListener(
         checkpoint_manager=checkpoint_manager,
+        model=model,
+        task=task,
+        optimizer=optimizer,
+        scheduler=effective_scheduler,
+        ema_model=ema_model,
         early_stopper=early_stopper,
-        best_model_tracker=best_model_tracker,
+        best_model_tracker=agent.best_model_tracker,
+    )
+    early_stop_listener = EarlyStopListener(
+        early_stopper=early_stopper,
+        target=config.early_stop.get("target", "val_metric"),
+        logger=logger,
+    )
+    eval_summary_listener = EvalSummaryListener(
+        logger=logger,
+        target_key=config.checkpoint.get("target", "val_metric"),
+        target_mode=config.checkpoint.get("mode", "min"),
     )
 
     # Load checkpoint FIRST to restore training state
     checkpoint_loaded = False
     if config.ckp_file and Path(config.ckp_file).exists():
-        agent.checkpoint_manager.load(
+        checkpoint_manager.load(
             config.ckp_file,
             device,
             model,
@@ -1253,12 +1395,11 @@ def train_runner(
             effective_scheduler,
             ema_model,
             agent.state,
-            agent.early_stopper,
+            early_stopper,
             agent.best_model_tracker,
         )
         logger.info(f"Loaded checkpoint from {config.ckp_file}")
         checkpoint_loaded = True
-
     # A training run must have a finite stopping condition.
     max_epochs_val = agent.config.max_epochs if agent.config.max_epochs is not None else float("inf")
     max_steps_val = agent.config.max_steps if agent.config.max_steps is not None else float("inf")
@@ -1267,6 +1408,17 @@ def train_runner(
         # We check this after applying overrides to have the final picture.
         raise ValueError("Either max_epochs or max_steps must be specified for the training run.")
 
+    # Callback listeners for loop-external behaviors
+    def _on_validation_end_step_scheduler(context: EventContext) -> None:
+        if effective_scheduler is None:
+            return
+        eval_results = context.eval_results or {}
+        effective_scheduler.step_main(metrics=eval_results.get("val_metric"))
+
+    agent.add_listener("on_validation_end", _on_validation_end_step_scheduler)
+    agent.add_listener("on_validation_end", eval_summary_listener.on_validation_end)
+    agent.add_listener("on_validation_end", early_stop_listener.on_validation_end)
+    agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
     # Unified LogListener handling
     progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type)
     agent.add_listener("on_epoch_start", progress_tracker.on_epoch_start)
@@ -1465,4 +1617,3 @@ def infer_runner(
         raise
 
     return all_results
-

@@ -8,8 +8,9 @@ import torch.optim as optim
 from unittest.mock import MagicMock
 
 from qqtools.plugins.qpipeline.runner.runner import RunningAgent
-from qqtools.plugins.qpipeline.runner.types import RunConfig, RunMode
-from qqtools.plugins.qpipeline.runner.ckp_manager import CheckpointManager
+from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMode
+from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointManager
+from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointListener
 
 # Re-using components from conftest for consistency
 from .conftest import SimpleModel, SimpleTask
@@ -67,9 +68,15 @@ class TestCheckpointTriggerTiming:
             config_params["max_steps"] = max_val
 
         config = RunConfig(**config_params)
-        agent = RunningAgent(
-            model, task, loss_fn, optimizer, config=config, device=device, logger=logger, checkpoint_manager=ckp_manager
+        agent = RunningAgent(model, task, loss_fn, optimizer, config=config, device=device, logger=logger)
+
+        checkpoint_listener = CheckpointListener(
+            checkpoint_manager=ckp_manager,
+            model=model,
+            task=task,
+            optimizer=optimizer,
         )
+        agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
 
         # Clone initial model state before training
         initial_weights = {k: v.clone() for k, v in model.state_dict().items()}

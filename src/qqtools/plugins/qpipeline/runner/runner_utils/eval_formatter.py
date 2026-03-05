@@ -1,9 +1,12 @@
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import qqtools as qt
 
+from .types import EventContext
 
-class EvalSummaryFormatter:
+
+class EvalFormatter:
     """Stateless formatter for evaluation summaries."""
 
     @staticmethod
@@ -394,4 +397,53 @@ class EvalSummaryFormatter:
             color_new_best=color_new_best,
         )
         return summary_lines, summary_has_markup, table_lines, table_has_markup
+
+
+
+class EvalSummaryListener:
+    """Listener that logs formatted evaluation summary on validation end."""
+
+    def __init__(
+        self,
+        logger: Any,
+        target_key: str = "val_metric",
+        target_mode: str = "min",
+        color_new_best: bool = True,
+    ) -> None:
+        self.logger = logger
+        self.target_key = target_key
+        self.target_mode = target_mode
+        self.color_new_best = color_new_best
+
+    def on_validation_end(self, context: EventContext) -> None:
+        eval_results = context.eval_results or {}
+        state = context.state
+        tracker_for_log = context.best_model_tracker or SimpleNamespace(
+            mode=self.target_mode,
+            best_metric=getattr(state, "best_monitored_metric", None),
+            best_epoch=getattr(state, "best_epoch", 0),
+            best_step=getattr(state, "best_step", 0),
+        )
+
+        summary_lines, summary_has_markup, table_lines, table_has_markup = EvalFormatter.format_all(
+            eval_results=eval_results,
+            epoch=getattr(state, "epoch", 0),
+            step=getattr(state, "global_step", 0),
+            target_key=self.target_key,
+            target_mode=self.target_mode,
+            is_best=bool(context.is_best),
+            previous_best=context.previous_best,
+            best_model_tracker=tracker_for_log,
+            color_new_best=self.color_new_best,
+        )
+
+        if summary_has_markup:
+            self.logger.info("\n".join(summary_lines), extra={"markup": True})
+        else:
+            self.logger.info("\n".join(summary_lines))
+
+        if table_has_markup:
+            self.logger.info("\n".join(table_lines), extra={"markup": True})
+        else:
+            self.logger.info("\n".join(table_lines))
 

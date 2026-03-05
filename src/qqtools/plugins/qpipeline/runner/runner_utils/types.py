@@ -1,10 +1,20 @@
+import copy
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from types import MappingProxyType
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 
-__all__ = ["RunMode", "RunConfig", "RunningState", "EventType", "EventContext"]
+__all__ = [
+    "RunMode",
+    "RunConfig",
+    "RunningState",
+    "LoopSignal",
+    "FrozenRunningState",
+    "EventType",
+    "EventContext",
+]
 
 
 class RunMode(Enum):
@@ -128,6 +138,69 @@ class RunningState:
                 setattr(self, key, value)
 
 
+@dataclass
+class LoopSignal:
+    """Mutable signal box consumed by the loop after listeners finish."""
+
+    should_stop: bool = False
+    stop_message: Optional[str] = None
+    pending_checkpoint_types: List[Literal["best", "regular"]] = field(default_factory=list)
+
+    def request_checkpoint(self, checkpoint_type: Literal["best", "regular"]) -> None:
+        if checkpoint_type not in ("best", "regular"):
+            raise ValueError(f"Unsupported checkpoint type: {checkpoint_type}")
+        self.pending_checkpoint_types.append(checkpoint_type)
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
+
+
+def _deep_thaw(value: Any) -> Any:
+    if isinstance(value, MappingProxyType):
+        return {key: _deep_thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_deep_thaw(item) for item in value]
+    if isinstance(value, frozenset):
+        return {_deep_thaw(item) for item in value}
+    return copy.deepcopy(value)
+
+
+class FrozenRunningState:
+    """Read-only state snapshot passed to listeners."""
+
+    def __init__(self, state: RunningState):
+        snapshot = {key: _deep_freeze(copy.deepcopy(value)) for key, value in vars(state).items()}
+        object.__setattr__(self, "_snapshot", snapshot)
+
+    @classmethod
+    def from_state(cls, state: Union["RunningState", "FrozenRunningState"]) -> "FrozenRunningState":
+        if isinstance(state, FrozenRunningState):
+            return state
+        return cls(state)
+
+    def __getattr__(self, item: str) -> Any:
+        snapshot = object.__getattribute__(self, "_snapshot")
+        if item in snapshot:
+            return snapshot[item]
+        raise AttributeError(item)
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        raise AttributeError("FrozenRunningState is read-only")
+
+    def to_running_state(self) -> RunningState:
+        state = RunningState()
+        thawed = {key: _deep_thaw(value) for key, value in self._snapshot.items()}
+        state.from_dict(thawed)
+        return state
+
+
 class EventType(Enum):
     ON_EPOCH_START = "on_epoch_start"
     ON_EPOCH_END = "on_epoch_end"
@@ -137,13 +210,16 @@ class EventType(Enum):
     ON_TRAIN_BATCH_END = "on_train_batch_end"
     ON_EVAL_START = "on_eval_start"
     ON_EVAL_END = "on_eval_end"
+    ON_VALIDATION_END = "on_validation_end"
+    ON_CHECKPOINT_REQUEST = "on_checkpoint_request"
     ON_CHECKPOINT_SAVE = "on_checkpoint_save"
     ON_EARLY_STOP = "on_early_stop"
 
 
 @dataclass
 class EventContext:
-    state: RunningState
+    state: Union[RunningState, FrozenRunningState]
+    signal: Optional[LoopSignal] = None
     batch_idx: Optional[int] = None
     total_batches: Optional[int] = None
     batch_metrics: Optional[Dict[str, Any]] = None
@@ -153,6 +229,9 @@ class EventContext:
     checkpoint_path: Optional[str] = None
     checkpoint_type: Optional[str] = None
     stage: Optional[str] = None  # Current stage: "training", "validation", "testing"
+    previous_best: Optional[Dict[str, Any]] = None
+    is_best: Optional[bool] = None
+    best_model_tracker: Optional[Any] = None
     # Provide run limits on the context so listeners can access them without
     # coupling to RunningState (which no longer carries these fields).
     max_epochs: Optional[int] = None

@@ -1,12 +1,13 @@
+import copy
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-from ..entry_utils.qema import qEMA
-from ..task.qtask import qTaskBase
-from .types import RunningState
+from ...entry_utils.qema import qEMA
+from ...task.qtask import qTaskBase
+from .types import EventContext, RunningState
 
 
 def generate_checkpoint_filename(epoch: int, global_step: int, is_best: bool = False) -> str:
@@ -199,3 +200,52 @@ class CheckpointManager:
             checkpoint["task_state_dict"] = task.state_dict()
 
         return checkpoint
+
+
+class CheckpointListener:
+    """Listener that persists checkpoints when requested by the agent."""
+
+    def __init__(
+        self,
+        checkpoint_manager: Optional[CheckpointManager],
+        model: nn.Module,
+        task: qTaskBase,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        scheduler: Optional[Any] = None,
+        ema_model: Optional[qEMA] = None,
+        early_stopper: Optional[Any] = None,
+        best_model_tracker: Optional[Any] = None,
+    ) -> None:
+        self.checkpoint_manager = checkpoint_manager
+        self.model = model
+        self.task = task
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.ema_model = ema_model
+        self.early_stopper = early_stopper
+        self.best_model_tracker = best_model_tracker
+
+    def _clone_state_for_save(self, context: EventContext):
+        state = context.state
+        if hasattr(state, "to_running_state"):
+            return state.to_running_state()
+        return copy.copy(state)
+
+    def on_checkpoint_request(self, context: EventContext) -> None:
+        if self.checkpoint_manager is None:
+            return
+
+        checkpoint_type = context.checkpoint_type or "regular"
+        state_for_save = self._clone_state_for_save(context)
+        ckp_path = self.checkpoint_manager.save(
+            state_for_save,
+            self.model,
+            self.task,
+            self.optimizer,
+            self.scheduler,
+            self.ema_model,
+            self.early_stopper,
+            self.best_model_tracker,
+            is_best=(checkpoint_type == "best"),
+        )
+        context.checkpoint_path = ckp_path

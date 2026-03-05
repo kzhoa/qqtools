@@ -8,7 +8,7 @@ for module_name in list(sys.modules.keys()):
     if module_name == "qqtools" or module_name.startswith("qqtools."):
         sys.modules.pop(module_name)
 
-from qqtools.plugins.qpipeline.runner.progress import resolve_render_mode
+from qqtools.plugins.qpipeline.runner.runner_utils.progress import resolve_render_mode
 
 
 @pytest.mark.parametrize(
