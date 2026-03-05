@@ -5,6 +5,7 @@ from types import MappingProxyType
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
+from qqtools.torch import qdist
 
 __all__ = [
     "RunMode",
@@ -150,6 +151,21 @@ class LoopSignal:
         if checkpoint_type not in ("best", "regular"):
             raise ValueError(f"Unsupported checkpoint type: {checkpoint_type}")
         self.pending_checkpoint_types.append(checkpoint_type)
+
+    def synchronize_stop(self, device: torch.device, distributed: bool) -> None:
+        """Synchronize the stop signal across all DDP ranks."""
+        if not distributed:
+            return
+
+        # Local decision
+        local_flag = 1 if self.should_stop else 0
+        # Reduce MAX: if anyone wants to stop, everyone stops
+        reduced_flag = qdist.all_reduce(local_flag, device=device, reduceOp="max")
+
+        if reduced_flag > 0:
+            if not self.should_stop:
+                self.stop_message = "Stopping triggered by another rank."
+            self.should_stop = True
 
 
 def _deep_freeze(value: Any) -> Any:
