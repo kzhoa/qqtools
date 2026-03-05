@@ -43,20 +43,29 @@ def _resolve_train_runner_policy(
     save_interval: Optional[int],
 ) -> Tuple[RunMode, int, int, Optional[int], Optional[int], List[str]]:
     """Resolve train-runner-owned policy fields into effective runtime values."""
-    if not isinstance(eval_interval, int) or eval_interval < 1:
-        raise ValueError("eval_interval must be a positive integer (>=1)")
+
+    def _is_positive_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+    if run_mode is None:
+        raise ValueError("run_mode cannot be None")
+
+    if not _is_positive_int(eval_interval):
+        raise ValueError("eval_interval must be a positive integer")
 
     resolved_run_mode = RunMode(run_mode)
     effective_save_interval = save_interval if save_interval is not None else eval_interval
-    if not isinstance(effective_save_interval, int) or effective_save_interval < 1:
-        raise ValueError("save_interval must be a positive integer (>=1)")
+    if not _is_positive_int(effective_save_interval):
+        raise ValueError("save_interval must be a positive integer")
 
     policy_warnings: List[str] = []
     effective_max_epochs: Optional[int] = None
     effective_max_steps: Optional[int] = None
 
     if resolved_run_mode == RunMode.EPOCH:
-        if not isinstance(max_epochs, int) or max_epochs < 1:
+        if max_epochs is None:
+            raise ValueError("max_epochs must be specified when run_mode='epoch'")
+        if not _is_positive_int(max_epochs):
             raise ValueError("max_epochs must be a positive integer when run_mode='epoch'.")
         effective_max_epochs = max_epochs
         if max_steps is not None:
@@ -65,7 +74,9 @@ def _resolve_train_runner_policy(
                 f"training will be controlled by max_epochs={max_epochs}."
             )
     else:  # RunMode.STEP
-        if not isinstance(max_steps, int) or max_steps < 1:
+        if max_steps is None:
+            raise ValueError("max_steps must be specified when run_mode='step'")
+        if not _is_positive_int(max_steps):
             raise ValueError("max_steps must be a positive integer when run_mode='step'.")
         effective_max_steps = max_steps
         if max_epochs is not None:
@@ -170,7 +181,7 @@ def train_runner(
         run_mode=run_mode,
         max_epochs=max_epochs,
         max_steps=max_steps,
-        eval_interval=eval_interval,
+        eval_interval=1 if eval_interval is None else eval_interval,
         save_interval=save_interval,
     )
     # Configuration fallback logic
