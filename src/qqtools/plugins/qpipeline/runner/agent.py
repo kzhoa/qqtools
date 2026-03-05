@@ -46,8 +46,8 @@ def _extract_batch_metric_views(
             metric_value = item
             metric_count = 1.0
 
-        value_float = float(metric_value)
-        count_float = float(metric_count)
+        value_float = qt.ensure_scala(metric_value)
+        count_float = qt.ensure_scala(metric_count)
 
         scalar_metrics[key] = value_float
         weighted_items.append((key, value_float, count_float))
@@ -366,29 +366,26 @@ class RunningAgent:
             model.train(was_training)
 
     def _update_best_model_state(self, eval_results: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        if self.best_model_tracker is None:
+        tracker = self.best_model_tracker
+        if not tracker:
             return False, None
 
         previous_best = {
-            "metric": getattr(self.best_model_tracker, "best_metric", None),
-            "epoch": getattr(self.best_model_tracker, "best_epoch", 0),
-            "step": getattr(self.best_model_tracker, "best_step", 0),
+            "metric": getattr(tracker, "best_metric", None),
+            "epoch": getattr(tracker, "best_epoch", 0),
+            "step": getattr(tracker, "best_step", 0),
         }
 
-        target_key = getattr(self.best_model_tracker, "target", None)
-        if not target_key:
-            return False, previous_best
-
+        target_key = getattr(tracker, "target", None)
         current_val = eval_results.get(target_key)
-        if current_val is None:
+        if not target_key or current_val is None:
             return False, previous_best
 
         monitored_metric = qt.ensure_scala(current_val)
-
-        is_best = self.best_model_tracker.update(monitored_metric, self.state.epoch, self.state.global_step)
-        if not is_best:
+        if not tracker.update(monitored_metric, self.state.epoch, self.state.global_step):
             return False, previous_best
 
+        # It's a new best model, update the state
         self.state.best_epoch = self.state.epoch
         self.state.best_step = self.state.global_step
         self.state.best_monitored_key = target_key
@@ -500,6 +497,7 @@ class RunningAgent:
             self._request_checkpoint("regular", signal=signal)
 
         self._flush_checkpoint_requests(signal)
+        signal.synchronize_stop(self.device, self.config.distributed)
 
         if signal.should_stop:
             stop_message = signal.stop_message or "Early stopping triggered."

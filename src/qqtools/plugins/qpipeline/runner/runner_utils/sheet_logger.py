@@ -1,11 +1,11 @@
 import csv
 import json
-import os
 import queue
 import time
 import warnings
+from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from .common import _is_periodic_trigger
 from .types import EventContext, RunConfig
@@ -21,7 +21,7 @@ class SheetLogger:
 
     def __init__(
         self,
-        file_path: str,
+        file_path: Union[Path, str],
         columns: List[str],
         format: str = "csv",
         max_size: int = 10 * 1024 * 1024,
@@ -33,7 +33,7 @@ class SheetLogger:
         Initialize the SheetLogger for structured data logging.
 
         Parameters:
-            file_path (str):
+            file_path (Union[Path, str]):
                 Path where the log file will be stored (e.g., "logs/training.csv").
                 Parent directory will be automatically created if it doesn't exist.
                 Example: file_path="./logs/metrics.csv"
@@ -75,7 +75,7 @@ class SheetLogger:
                   - False: Write mode. File is cleared and reinitialized with headers
                 When filepath=None, this parameter is ignored (no file operations).
         """
-        self.file_path = os.path.abspath(file_path)
+        self.file_path = Path(file_path).resolve()
         self.columns = columns
         self.format = format.lower()
         if self.format == "json":
@@ -87,14 +87,14 @@ class SheetLogger:
         self._lock = Lock()
 
         assert columns is not None
-        os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
 
         if self.format == "csv":
-            if not recover or not os.path.exists(self.file_path) or os.path.getsize(self.file_path) == 0:
+            if not recover or not self.file_path.exists() or self.file_path.stat().st_size == 0:
                 with open(self.file_path, "w", newline="") as f:
                     writer = csv.writer(f)
                     writer.writerow(columns)
-        elif not recover and os.path.exists(self.file_path):
+        elif not recover and self.file_path.exists():
             # Clear file for jsonl if not recovering
             open(self.file_path, "w").close()
 
@@ -170,17 +170,17 @@ class SheetLogger:
 
     def _rotate_if_needed(self):
         """Rotate the log file if it exceeds the maximum size."""
-        if not os.path.exists(self.file_path) or os.path.getsize(self.file_path) <= self.max_size:
+        if not self.file_path.exists() or self.file_path.stat().st_size <= self.max_size:
             return
 
         timestamp = time.strftime("%Y%m%d%H%M%S")
         backup_path = f"{self.file_path}.{timestamp}"
 
         try:
-            os.rename(self.file_path, backup_path)
+            self.file_path.rename(backup_path)
         except OSError:
             backup_path = f"{self.file_path}.{timestamp}.{int(time.time() * 1000) % 1000}"
-            os.rename(self.file_path, backup_path)
+            self.file_path.rename(backup_path)
 
         if self.format == "csv":
             with open(self.file_path, "w", newline="") as f:

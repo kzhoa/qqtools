@@ -39,60 +39,50 @@ def _resolve_train_runner_policy(
     run_mode: Union[str, RunMode],
     max_epochs: Optional[int],
     max_steps: Optional[int],
-    eval_interval: Optional[int],
+    eval_interval: int,
     save_interval: Optional[int],
 ) -> Tuple[RunMode, int, int, Optional[int], Optional[int], List[str]]:
     """Resolve train-runner-owned policy fields into effective runtime values."""
-
-    def _ensure_positive_int(value: Any, field_name: str) -> int:
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError(f"{field_name} must be a positive integer (>=1)")
-        return value
-
-    if run_mode is None:
-        raise ValueError("run_mode cannot be None. Supported values are 'epoch' and 'step'.")
+    if not isinstance(eval_interval, int) or eval_interval < 1:
+        raise ValueError("eval_interval must be a positive integer (>=1)")
 
     resolved_run_mode = RunMode(run_mode)
+    effective_save_interval = save_interval if save_interval is not None else eval_interval
+    if not isinstance(effective_save_interval, int) or effective_save_interval < 1:
+        raise ValueError("save_interval must be a positive integer (>=1)")
 
-    effective_eval_interval = 1 if eval_interval is None else eval_interval
-    effective_eval_interval = _ensure_positive_int(effective_eval_interval, "eval_interval")
-
-    effective_save_interval = effective_eval_interval if save_interval is None else save_interval
-    effective_save_interval = _ensure_positive_int(effective_save_interval, "save_interval")
-
-    effective_max_epochs = max_epochs
-    effective_max_steps = max_steps
     policy_warnings: List[str] = []
+    effective_max_epochs: Optional[int] = None
+    effective_max_steps: Optional[int] = None
 
     if resolved_run_mode == RunMode.EPOCH:
-        if max_epochs is None:
-            raise ValueError("max_epochs must be specified when run_mode='epoch'.")
-        effective_max_epochs = _ensure_positive_int(max_epochs, "max_epochs")
+        if not isinstance(max_epochs, int) or max_epochs < 1:
+            raise ValueError("max_epochs must be a positive integer when run_mode='epoch'.")
+        effective_max_epochs = max_epochs
         if max_steps is not None:
             policy_warnings.append(
                 f"[run_mode=EPOCH] max_steps={max_steps} is ignored by mutual-exclusion policy; "
                 f"training will be controlled by max_epochs={max_epochs}."
             )
-        effective_max_steps = None
     else:  # RunMode.STEP
-        if max_steps is None:
-            raise ValueError("max_steps must be specified when run_mode='step'.")
-        effective_max_steps = _ensure_positive_int(max_steps, "max_steps")
+        if not isinstance(max_steps, int) or max_steps < 1:
+            raise ValueError("max_steps must be a positive integer when run_mode='step'.")
+        effective_max_steps = max_steps
         if max_epochs is not None:
             policy_warnings.append(
                 f"[run_mode=STEP] max_epochs={max_epochs} is ignored by mutual-exclusion policy; "
                 f"training will be controlled by max_steps={max_steps}."
             )
-        effective_max_epochs = None
 
     return (
         resolved_run_mode,
-        effective_eval_interval,
+        eval_interval,
         effective_save_interval,
         effective_max_epochs,
         effective_max_steps,
         policy_warnings,
     )
+
 
 # Design Rationale: Boundary Policy Ownership
 # The orchestration layer (train_runner) owns the business policy for mutually
@@ -224,7 +214,7 @@ def train_runner(
     logger = qLogger(save_dir, console=True)
     sheet_logger = None
     if log_granularity and config.rank == 0:
-        metrics_file = str(Path(save_dir) / "metrics.csv")
+        metrics_file = Path(save_dir) / "metrics.csv"
         sheet_logger = SheetLogger(metrics_file, columns=log_keys)
     for warning_msg in boundary_policy_warnings:
         logger.warning(warning_msg)
@@ -281,7 +271,6 @@ def train_runner(
     )
 
     # Load checkpoint FIRST to restore training state
-    checkpoint_loaded = False
     if config.ckp_file and Path(config.ckp_file).exists():
         checkpoint_manager.load(
             config.ckp_file,
@@ -296,14 +285,6 @@ def train_runner(
             agent.best_model_tracker,
         )
         logger.info(f"Loaded checkpoint from {config.ckp_file}")
-        checkpoint_loaded = True
-    # A training run must have a finite stopping condition.
-    max_epochs_val = agent.config.max_epochs if agent.config.max_epochs is not None else float("inf")
-    max_steps_val = agent.config.max_steps if agent.config.max_steps is not None else float("inf")
-    if max_epochs_val == float("inf") and max_steps_val == float("inf"):
-        # This can happen if the config has no boundaries and no explicit args are passed.
-        # We check this after applying overrides to have the final picture.
-        raise ValueError("Either max_epochs or max_steps must be specified for the training run.")
 
     # Callback listeners for loop-external behaviors
     def _on_validation_end_step_scheduler(context: EventContext) -> None:
@@ -521,4 +502,3 @@ def infer_runner(
         raise
 
     return all_results
-
