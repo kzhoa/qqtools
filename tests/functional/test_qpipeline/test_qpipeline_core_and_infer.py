@@ -199,6 +199,7 @@ def test_train_runner_progress_tick_contains_batch_time(monkeypatch, base_args, 
         max_steps=1,
         run_mode="step",
         eval_interval=100,
+        save_dir=str(base_args.log_dir),
         print_freq=1,
     )
 

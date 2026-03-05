@@ -67,9 +67,6 @@ class RunConfig:
         # Validate eval_interval
         if not isinstance(self.eval_interval, int) or self.eval_interval < 1:
             raise ValueError("eval_interval must be a positive integer (>=1)")
-        # Initialize save_interval if None
-        if self.save_interval is None:
-            object.__setattr__(self, "save_interval", self.eval_interval)
 
 
 @dataclass
@@ -83,9 +80,9 @@ class RunningState:
     # best state
     best_epoch: int = 0
     best_step: int = 0
-    best_train_metric: Optional[float] = None
-    best_val_metric: Optional[float] = None
-    best_test_metric: Optional[float] = None
+    best_monitored_key: Optional[str] = None
+    best_monitored_metric: Optional[float] = None
+    best_model_metrics_snapshot: Dict[str, Any] = field(default_factory=dict)
     best_ckp_file: Optional[str] = None
 
     # current metrics
@@ -118,9 +115,9 @@ class RunningState:
             "global_step": self.global_step,
             "best_epoch": self.best_epoch,
             "best_step": self.best_step,
-            "best_train_metric": self.best_train_metric,
-            "best_val_metric": self.best_val_metric,
-            "best_test_metric": self.best_test_metric,
+            "best_monitored_key": self.best_monitored_key,
+            "best_monitored_metric": self.best_monitored_metric,
+            "best_model_metrics_snapshot": self.best_model_metrics_snapshot,
             "best_ckp_file": self.best_ckp_file,
             "batch_idx_in_epoch": self.batch_idx_in_epoch,
         }

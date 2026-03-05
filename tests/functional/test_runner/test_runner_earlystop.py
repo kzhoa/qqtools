@@ -60,7 +60,7 @@ class TestTrainRunnerEarlyStop:
                 eval_interval=1,
                 save_dir=tmpdir,
             )
-            assert result["best_val_metric"] is not None
+            assert result["best_monitored_metric"] is not None
             assert result["early_stopped"] is True
 
     def test_early_stop_max_mode(self):
@@ -83,7 +83,7 @@ class TestTrainRunnerEarlyStop:
                 eval_interval=1,
                 save_dir=tmpdir,
             )
-            assert result["best_val_metric"] is not None
+            assert result["best_monitored_metric"] is not None
             assert result["early_stopped"] is True
 
     def test_early_stop_with_min_delta(self):
@@ -106,7 +106,7 @@ class TestTrainRunnerEarlyStop:
                 eval_interval=1,
                 save_dir=tmpdir,
             )
-            assert result["best_val_metric"] is not None
+            assert result["best_monitored_metric"] is not None
             assert result["early_stopped"] is True
 
     def test_early_stop_patience_exceeded(self):
@@ -129,7 +129,7 @@ class TestTrainRunnerEarlyStop:
                 eval_interval=1,
                 save_dir=tmpdir,
             )
-            assert result["best_val_metric"] is not None
+            assert result["best_monitored_metric"] is not None
             assert result["early_stopped"] is True
 
     def test_early_stop_no_trigger(self):
@@ -152,7 +152,7 @@ class TestTrainRunnerEarlyStop:
                 eval_interval=1,
                 save_dir=tmpdir,
             )
-            assert result["best_val_metric"] is not None
+            assert result["best_monitored_metric"] is not None
             assert result["early_stopped"] is False
 
     def test_early_stop_custom_target(self):
@@ -175,7 +175,7 @@ class TestTrainRunnerEarlyStop:
                 eval_interval=1,
                 save_dir=tmpdir,
             )
-            assert result["best_val_metric"] is not None
+            assert result["best_monitored_metric"] is not None
             assert result["early_stopped"] in [True, False]  # depends on metric
 
 

@@ -152,6 +152,9 @@ refactor: max epochs and steps remove from runstate while preserve in config
 refactor: qema update fn
 fix: separate progress tick with update table to keep real batch idx as completed
 tests: cover ckp and evaluation trigger
+v1.2.2
+feat: add eval summary formatter
+
 
 # TODO
 

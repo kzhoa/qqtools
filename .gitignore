@@ -8,5 +8,8 @@ dist/**
 .coverage
 .pytest_cache
 .tox
-.github/agents
 logs/
+.github/agents
+.codex
+tmp*
+.tmp*

@@ -1,50 +1,114 @@
-# Runner
+﻿# Runner PRD (qpipeline plugin)
 
-# Functional Specifications
+## 1. Scope
 
-## 1 Unified Training Loop
+This document defines business-level field relationships for `train_runner` in qpipeline.
+It focuses on:
+- mutual exclusion
+- field coupling
+- precedence and effective-value resolution
 
-- Description: A single training loop that progresses by step. It automatically handles epoch boundaries and data iteration.
-- Key Control Parameters:
-    - run_mode('epoch'| 'step'): Determines how eval_intervalis interpreted.
-    - eval_interval(int): How frequently to run evaluation. Interpreted as epochsif run_mode='epoch', or as stepsif run_mode='step'.
-    - max_epochs/ max_steps(Optional[int]): Stopping conditions.
-- Internal Logic:
-    - Fetch next batch (handles epoch rollover automatically).
-    - Forward/backward pass, optimizer step.
-    - Evaluation Trigger: Checks if epoch % eval_interval == 0(epoch mode) or global_step % eval_interval == 0(step mode).
-    - Regular Save Trigger: Checks if save_intervalis set and global_step % save_interval == 0.
-    - Repeat until max_epochs/ max_stepsreached or early stopping triggers.
+It does not describe low-level loop mechanics in detail.
 
-## 2 Evaluation & Checkpointing
+## 2. Ownership Boundary
 
-- Evaluation: Runs on the validation (and optionally test) dataset when triggered. Can evaluate both the base model and an optional EMA (Exponential Moving Average) model.
-- Checkpoint Types:
-    - Best Model: Saved automatically after evaluation if metrics improve. Only the latest best model is kept.
-    - Regular Checkpoint: Saved at intervals defined by save_interval(in steps). All are kept.
-- Checkpoint Contents: Model state (raw + EMA), optimizer state, scheduler state, full training state (epoch, step, metrics), and task-specific state.
+### 2.1 Policy Owner
 
-## 3 Early Stopping
+Business policy is owned by `train_runner`.
 
-- Configuration: Defined via `early_stop` dict (target, patience, mode, min_delta).
-- Logic: Monitors the target metric (e.g., `val_metric`). Counter increments if no improvement (exceeding min_delta) is seen. Training stops when counter >= patience.
+### 2.2 Execution Owner
 
-## 4 Advanced Features (Integrated)
+`RunningAgent` is downstream and policy-agnostic.
+`RunningAgent` only executes the already-resolved `RunConfig` boundaries and intervals.
 
-- Gradient Clipping: Via clip_gradparameter.
-- EMA Model: Via use_emaand ema_decayparameters.
-- Learning Rate Scheduling: Supports standard torch.optim.lr_schedulerand custom qWarmupScheduler.
-- Distributed Training: Basic support via distributedand rankparameters.
-- Profiling: Integrated PyTorch profiler via use_profiler.
-- Event System: Listener hooks (on_epoch_end, on_batch_end, etc.) for non-invasive extensions.
+### 2.3 Design Rule
 
-# tests
+Any rule like "field A suppresses field B" must be handled in `train_runner`, before creating `RunningAgent`.
 
-- Test basic training loop
-- Test epoch mode
-- Test step mode
-- Test early stopping functionality
-- Test checkpoint save/load
-- Test EMA (Exponential Moving Average)
-- Test the distributedparameter
-- Test profiler
+## 3. Field Relationship Rules
+
+## 3.1 Primary Mode Switch
+
+`run_mode` is the primary switch that controls interpretation of multiple fields.
+Supported values:
+- `epoch`
+- `step`
+
+## 3.2 Boundary Mutual Exclusion (Business Policy)
+
+Resolved in `train_runner`:
+- If `run_mode='epoch'`:
+  - keep `max_epochs`
+  - ignore `max_steps`
+- If `run_mode='step'`:
+  - keep `max_steps`
+  - ignore `max_epochs`
+
+This policy is applied before `RunConfig` is passed to `RunningAgent`.
+
+## 3.3 Interval Coupling
+
+`eval_interval` and `save_interval` are coupled to `run_mode`:
+- In `epoch` mode: interval units are epochs.
+- In `step` mode: interval units are global steps.
+
+## 3.4 Early Stop Coupling
+
+`early_stop` is evaluated on evaluation events, so its effective cadence is indirectly coupled to:
+- `run_mode`
+- `eval_interval`
+
+`early_stop.target` must correspond to a metric key available in evaluation results.
+
+## 3.5 Checkpoint Coupling
+
+`checkpoint.target/mode/min_delta` govern best-checkpoint update logic.
+Regular checkpoint trigger cadence is coupled to:
+- `run_mode`
+- `save_interval`
+
+## 4. Effective Value Resolution Order (train_runner)
+
+1. Read explicit function arguments and `args.runner` fields.
+2. Validate required base fields (`run_mode`, `args.runner`).
+3. Apply business policy (including boundary mutual exclusion).
+4. Apply default/fallback values where needed.
+5. Build effective `RunConfig`.
+6. Instantiate `RunningAgent` with effective config only.
+
+## 5. Conflict Handling
+
+## 5.1 Dual Boundary Input
+
+If both `max_epochs` and `max_steps` are provided:
+- `train_runner` keeps only the boundary compatible with current `run_mode`.
+- `train_runner` logs a warning describing which boundary is ignored.
+
+## 5.2 Missing Boundary
+
+At least one effective boundary must remain after resolution.
+Otherwise, `train_runner` raises an error.
+
+## 6. Behavioral Examples
+
+- Example A:
+  - `run_mode='epoch'`, `max_epochs=10`, `max_steps=1000`
+  - effective boundary: `max_epochs=10`, `max_steps=None`
+
+- Example B:
+  - `run_mode='step'`, `max_epochs=10`, `max_steps=1000`
+  - effective boundary: `max_epochs=None`, `max_steps=1000`
+
+- Example C:
+  - `run_mode='epoch'`, `eval_interval=2`, `save_interval=3`
+  - evaluate every 2 epochs, save regular checkpoint every 3 epochs
+
+## 7. Non-Goals
+
+- Do not push business mutual-exclusion logic into `RunningAgent`.
+- Do not let log semantics diverge from effective behavior.
+
+## 8. References
+
+- ADR rationale and history:
+  - `docs/adr/qpipeline/0001-runner-boundary-ownership.md`

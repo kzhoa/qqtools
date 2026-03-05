@@ -29,7 +29,7 @@ def test_train_runner_epoch_mode_uses_max_epochs(base_args, tiny_task, tiny_mode
     )
 
     assert result["final_epoch"] == 2
-    assert result["best_val_metric"] is not None
+    assert result["best_monitored_metric"] is not None
 
 
 def test_train_runner_step_mode_dual_boundaries(base_args, tiny_task, tiny_model):
@@ -56,7 +56,7 @@ def test_train_runner_step_mode_dual_boundaries(base_args, tiny_task, tiny_model
 
     assert result["final_step"] >= 6
     assert result["final_epoch"] <= 3
-    assert result["best_val_metric"] is not None
+    assert result["best_monitored_metric"] is not None
 
 
 def test_train_runner_regular_checkpoint_saving(base_args, tiny_task, tiny_model, tmp_path):
@@ -151,7 +151,7 @@ def test_train_runner_missing_early_stop_field_uses_defaults(base_args, tiny_tas
     )
 
     assert result["final_epoch"] == 2
-    assert result["best_val_metric"] is not None
+    assert result["best_monitored_metric"] is not None
 
 
 def test_train_runner_missing_checkpoint_and_early_stop_uses_defaults(base_args, tiny_task, tiny_model):
@@ -175,7 +175,7 @@ def test_train_runner_missing_checkpoint_and_early_stop_uses_defaults(base_args,
     )
 
     assert result["final_epoch"] == 2
-    assert result["best_val_metric"] is not None
+    assert result["best_monitored_metric"] is not None
 
 
 def test_train_runner_none_checkpoint_uses_defaults(base_args, tiny_task, tiny_model):
@@ -199,7 +199,7 @@ def test_train_runner_none_checkpoint_uses_defaults(base_args, tiny_task, tiny_m
     )
 
     assert result["final_epoch"] == 2
-    assert result["best_val_metric"] is not None
+    assert result["best_monitored_metric"] is not None
 
 
 def test_train_runner_none_early_stop_uses_defaults(base_args, tiny_task, tiny_model):
@@ -223,7 +223,7 @@ def test_train_runner_none_early_stop_uses_defaults(base_args, tiny_task, tiny_m
     )
 
     assert result["final_epoch"] == 2
-    assert result["best_val_metric"] is not None
+    assert result["best_monitored_metric"] is not None
 
 
 def test_train_runner_none_run_mode_raises_value_error(base_args, tiny_task, tiny_model):
@@ -269,7 +269,7 @@ def test_train_runner_none_eval_interval_falls_back_to_one(base_args, tiny_task,
     )
 
     assert result["final_epoch"] == 2
-    assert result["best_val_metric"] is not None
+    assert result["best_monitored_metric"] is not None
 
 
 def test_train_runner_none_render_type_falls_back_to_auto(base_args, tiny_task, tiny_model):
@@ -294,7 +294,7 @@ def test_train_runner_none_render_type_falls_back_to_auto(base_args, tiny_task, 
     )
 
     assert result["final_epoch"] == 2
-    assert result["best_val_metric"] is not None
+    assert result["best_monitored_metric"] is not None
 
 
 def test_train_runner_exception_still_cleans_progress_tracker(base_args, tiny_task, tiny_model, monkeypatch):

@@ -243,7 +243,7 @@ class PotentialTaskBase(qTaskBase):
             self.meta["norm_factor"] = self.norm_factor
         else:
             self.meta["norm_factor"] = (0, 1)
-        print(f"[{prefix}] standarize: {self.standarize} norm_factor: {self.meta["norm_factor"]}")
+        print(f"[{prefix}] standarize: {self.standarize} norm_factor: {self.meta['norm_factor']}")
 
     def batch_forward(self, model, batch_data, **meta) -> Dict[str, Tensor]:
         with_force = self.with_force

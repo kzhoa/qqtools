@@ -5,14 +5,21 @@ Test cases for runner2.py - Unified Training Runner
 import argparse
 import tempfile
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from qqtools.plugins.qpipeline.runner.runner import RunningAgent, train_runner
-from qqtools.plugins.qpipeline.runner.types import RunConfig, RunMode, RunningState
+from qqtools.plugins.qpipeline.runner.runner import (
+    RunningAgent,
+    SheetLoggerListener,
+    _is_periodic_trigger,
+    _resolve_train_runner_policy,
+    train_runner,
+)
+from qqtools.plugins.qpipeline.runner.types import EventContext, RunConfig, RunMode, RunningState
 
 from .conftest import SimpleModel, SimpleTask
 
@@ -30,19 +37,25 @@ class TestRunningState:
         assert state.epoch == 0
         assert state.global_step == 0
         assert state.best_epoch == 0
-        assert state.best_val_metric is None
+        assert state.best_monitored_key is None
+        assert state.best_monitored_metric is None
+        assert state.best_model_metrics_snapshot == {}
 
     def test_running_state_to_dict(self):
         """Test RunningState to_dict"""
         state = RunningState()
         state.epoch = 5
         state.global_step = 100
-        state.best_val_metric = 0.5
+        state.best_monitored_key = "val_metric"
+        state.best_monitored_metric = 0.5
+        state.best_model_metrics_snapshot = {"val_metric": 0.5, "val_mse": 0.5}
 
         state_dict = state.to_dict()
         assert state_dict["epoch"] == 5
         assert state_dict["global_step"] == 100
-        assert state_dict["best_val_metric"] == 0.5
+        assert state_dict["best_monitored_key"] == "val_metric"
+        assert state_dict["best_monitored_metric"] == 0.5
+        assert state_dict["best_model_metrics_snapshot"]["val_metric"] == 0.5
         # Early stopper is managed separately, not in state dict
         assert "early_stop_counter" not in state_dict
 
@@ -151,6 +164,69 @@ class TestTrainingAgent:
         assert "test_mse" in results
         assert "test_metric" in results
 
+    def test_save_regular_checkpoint_calls_manager_with_regular_flag(self):
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        checkpoint_manager = Mock()
+        checkpoint_manager.save.return_value = "regular.pt"
+        logger = Mock()
+        on_checkpoint_save = Mock()
+
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            config=RunConfig(),
+            device=self.device,
+            logger=logger,
+            checkpoint_manager=checkpoint_manager,
+        )
+        agent.add_listener("on_checkpoint_save", on_checkpoint_save)
+
+        agent._save_regular_checkpoint()
+
+        save_kwargs = checkpoint_manager.save.call_args.kwargs
+        assert save_kwargs["is_best"] is False
+        on_checkpoint_save.assert_called_once()
+        checkpoint_context = on_checkpoint_save.call_args[0][0]
+        assert checkpoint_context.checkpoint_type == "regular"
+        assert checkpoint_context.checkpoint_path == "regular.pt"
+
+    def test_save_best_checkpoint_updates_state_and_calls_manager_with_best_flag(self):
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        checkpoint_manager = Mock()
+        checkpoint_manager.save.return_value = "best.pt"
+        logger = Mock()
+        on_checkpoint_save = Mock()
+
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            config=RunConfig(),
+            device=self.device,
+            logger=logger,
+            checkpoint_manager=checkpoint_manager,
+        )
+        agent.add_listener("on_checkpoint_save", on_checkpoint_save)
+
+        eval_results = {"val_metric": 0.123, "val_loss": 0.234}
+        agent._save_best_checkpoint("val_metric", 0.123, eval_results)
+
+        save_kwargs = checkpoint_manager.save.call_args.kwargs
+        assert save_kwargs["is_best"] is True
+        assert agent.state.best_monitored_key == "val_metric"
+        assert agent.state.best_monitored_metric == 0.123
+        assert agent.state.best_model_metrics_snapshot == eval_results
+        assert agent.state.best_model_metrics_snapshot is not eval_results
+        on_checkpoint_save.assert_called_once()
+        checkpoint_context = on_checkpoint_save.call_args[0][0]
+        assert checkpoint_context.checkpoint_type == "best"
+        assert checkpoint_context.checkpoint_path == "best.pt"
+
 
 # ============================================================================
 # Integration Tests for train_runner
@@ -214,7 +290,9 @@ class TestTrainRunner:
             )
 
             assert result["final_epoch"] == 2
-            assert result["best_val_metric"] is not None
+            assert result["best_monitored_key"] == "val_metric"
+            assert result["best_monitored_metric"] is not None
+            assert "val_metric" in result["best_model_metrics_snapshot"]
             assert result["total_train_time"] > 0
 
     def test_train_runner_step_mode(self):
@@ -235,7 +313,8 @@ class TestTrainRunner:
             )
 
             assert result["final_step"] >= 10
-            assert result["best_val_metric"] is not None
+            assert result["best_monitored_key"] == "val_metric"
+            assert result["best_monitored_metric"] is not None
 
     def test_train_runner_with_gradient_clipping(self):
         """Test train_runner with gradient clipping"""
@@ -254,7 +333,7 @@ class TestTrainRunner:
                 save_dir=tmpdir,
             )
 
-            assert result["best_val_metric"] is not None
+            assert result["best_monitored_metric"] is not None
 
     def test_train_runner_with_lrscheduler(self):
         """Test train_runner with a learning rate scheduler"""
@@ -274,7 +353,7 @@ class TestTrainRunner:
                 save_dir=tmpdir,
             )
 
-            assert result["best_val_metric"] is not None
+            assert result["best_monitored_metric"] is not None
             # Check if learning rate has changed
             # Initial lr is 0.01, after 1 step (1 epoch), it should be 0.001
             # After 2 epochs, it should be 0.0001
@@ -431,5 +510,151 @@ class TestConfigAndMode:
         assert config.run_mode == RunMode.EPOCH
 
 
+
+class TestTrainRunnerPolicy:
+    """Test policy resolution and boundary validation for train_runner."""
+
+    @pytest.mark.parametrize(
+        "run_mode,max_epochs,max_steps,expected_message",
+        [
+            ("epoch", "2", None, "max_epochs must be a positive integer"),
+            ("epoch", 0, None, "max_epochs must be a positive integer"),
+            ("epoch", -1, None, "max_epochs must be a positive integer"),
+            ("step", None, "3", "max_steps must be a positive integer"),
+            ("step", None, 0, "max_steps must be a positive integer"),
+            ("step", None, -2, "max_steps must be a positive integer"),
+        ],
+    )
+    def test_rejects_invalid_active_boundaries(
+        self,
+        run_mode,
+        max_epochs,
+        max_steps,
+        expected_message,
+    ):
+        with pytest.raises(ValueError, match=expected_message):
+            _resolve_train_runner_policy(
+                run_mode=run_mode,
+                max_epochs=max_epochs,
+                max_steps=max_steps,
+                eval_interval=1,
+                save_interval=1,
+            )
+
+    @pytest.mark.parametrize(
+        "run_mode,max_epochs,max_steps,expected_message",
+        [
+            ("epoch", None, 5, "max_epochs must be specified when run_mode='epoch'"),
+            ("step", 5, None, "max_steps must be specified when run_mode='step'"),
+        ],
+    )
+    def test_requires_boundary_for_selected_mode(
+        self,
+        run_mode,
+        max_epochs,
+        max_steps,
+        expected_message,
+    ):
+        with pytest.raises(ValueError, match=expected_message):
+            _resolve_train_runner_policy(
+                run_mode=run_mode,
+                max_epochs=max_epochs,
+                max_steps=max_steps,
+                eval_interval=1,
+                save_interval=1,
+            )
+
+    @pytest.mark.parametrize(
+        "eval_interval,save_interval,expected_message",
+        [
+            (True, 1, "eval_interval must be a positive integer"),
+            (1, True, "save_interval must be a positive integer"),
+        ],
+    )
+    def test_rejects_bool_interval_values(
+        self,
+        eval_interval,
+        save_interval,
+        expected_message,
+    ):
+        with pytest.raises(ValueError, match=expected_message):
+            _resolve_train_runner_policy(
+                run_mode="epoch",
+                max_epochs=2,
+                max_steps=None,
+                eval_interval=eval_interval,
+                save_interval=save_interval,
+            )
+
+    def test_keeps_mutual_exclusion_and_defaults(self):
+        (
+            resolved_run_mode,
+            effective_eval_interval,
+            effective_save_interval,
+            effective_max_epochs,
+            effective_max_steps,
+            policy_warnings,
+        ) = _resolve_train_runner_policy(
+            run_mode="step",
+            max_epochs=5,
+            max_steps=4,
+            eval_interval=2,
+            save_interval=None,
+        )
+
+        assert resolved_run_mode == RunMode.STEP
+        assert effective_eval_interval == 2
+        assert effective_save_interval == 2
+        assert effective_max_epochs is None
+        assert effective_max_steps == 4
+        assert len(policy_warnings) == 1
+
+
+class TestPeriodicTrigger:
+    """Test periodic trigger semantics shared by train loop and listeners."""
+
+    @pytest.mark.parametrize(
+        "run_mode,interval,global_step,epoch,is_epoch_end,expected",
+        [
+            (RunMode.STEP, 2, 0, 0, False, False),
+            (RunMode.STEP, 2, 1, 0, False, True),
+            (RunMode.STEP, 1, 0, 0, False, True),
+            (RunMode.EPOCH, 2, 0, 0, True, False),
+            (RunMode.EPOCH, 2, 0, 1, True, True),
+            (RunMode.EPOCH, 2, 0, 1, False, False),
+            (RunMode.STEP, None, 3, 0, False, False),
+        ],
+    )
+    def test_is_periodic_trigger(self, run_mode, interval, global_step, epoch, is_epoch_end, expected):
+        assert (
+            _is_periodic_trigger(
+                run_mode=run_mode,
+                interval=interval,
+                global_step=global_step,
+                epoch=epoch,
+                is_epoch_end=is_epoch_end,
+            )
+            == expected
+        )
+
+    def test_sheet_logger_listener_uses_completed_step_trigger_semantics(self):
+        logger = Mock()
+        logger.columns = []
+        run_config = RunConfig(run_mode=RunMode.STEP, eval_interval=2, max_steps=4)
+        listener = SheetLoggerListener(logger=logger, run_config=run_config, log_granularity=["eval", "batch"])
+
+        state = RunningState(global_step=1, epoch=0)
+        context = EventContext(
+            state=state,
+            batch_idx=0,
+            total_batches=2,
+            batch_metrics={"loss": 1.0},
+            stage="train",
+        )
+        listener.on_train_batch_end(context)
+
+        logger.write.assert_not_called()
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+

@@ -18,6 +18,13 @@ class TestCheckpointManager:
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.task = SimpleTask(num_samples=10, num_features=10)
         self.state = RunningState(epoch=5, global_step=100)
+        self.state.best_monitored_key = "ema_val_metric"
+        self.state.best_monitored_metric = 0.321
+        self.state.best_model_metrics_snapshot = {
+            "val_metric": 0.456,
+            "ema_val_metric": 0.321,
+            "ema_test_metric": 0.222,
+        }
         self.device = torch.device("cpu")
 
         # Optional components, kept as None for this test
@@ -79,5 +86,32 @@ class TestCheckpointManager:
             # 4. Assert that the states of the new objects match the original ones
             assert state2.epoch == self.state.epoch, "Epoch was not loaded correctly."
             assert state2.global_step == self.state.global_step, "Global step was not loaded correctly."
+            assert state2.best_monitored_key == self.state.best_monitored_key
+            assert state2.best_monitored_metric == self.state.best_monitored_metric
+            assert state2.best_model_metrics_snapshot == self.state.best_model_metrics_snapshot
             assert torch.equal(self.model.fc1.weight, model2.fc1.weight), "Model state was not loaded correctly."
             assert self.optimizer.state_dict() == optimizer2.state_dict(), "Optimizer state was not loaded correctly."
+
+    def test_state_from_legacy_checkpoint_dict(self):
+        """Loading legacy checkpoint state should keep new fields at defaults."""
+        state = RunningState()
+        legacy_state = {
+            "epoch": 3,
+            "global_step": 12,
+            "best_epoch": 2,
+            "best_step": 10,
+            "best_ckp_file": "best_epoch2_step10.pt",
+            "batch_idx_in_epoch": 4,
+            "best_val_metric": 0.5,  # legacy field, should be ignored
+        }
+        state.from_dict(legacy_state)
+
+        assert state.epoch == 3
+        assert state.global_step == 12
+        assert state.best_epoch == 2
+        assert state.best_step == 10
+        assert state.best_ckp_file == "best_epoch2_step10.pt"
+        assert state.batch_idx_in_epoch == 4
+        assert state.best_monitored_key is None
+        assert state.best_monitored_metric is None
+        assert state.best_model_metrics_snapshot == {}

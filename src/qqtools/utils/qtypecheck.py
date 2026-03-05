@@ -5,7 +5,7 @@ Naming/behavior convention:
 """
 
 import math
-from typing import List
+from typing import List, Union
 
 import numpy as np
 import torch
@@ -55,7 +55,7 @@ def is_inf(x) -> bool:
         raise TypeError(f"Unsupported type: {type(x)}")
 
 
-def str2number(inpt):
+def str2number(inpt) -> Union[int, float]:
     if inpt is None or inpt == "":
         return ValueError(f"input should not be None or empty")
     if not isinstance(inpt, str):
@@ -68,7 +68,7 @@ def str2number(inpt):
     return num
 
 
-def ensure_scala(x):
+def ensure_scala(x) -> Union[int, float]:
     if isinstance(x, (int, float)):
         return x
     elif isinstance(x, torch.Tensor):
