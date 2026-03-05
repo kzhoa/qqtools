@@ -42,12 +42,16 @@ class CheckpointManager:
         scheduler: Optional[Any] = None,
         ema_model: Optional[qEMA] = None,
         early_stopper: Optional[Any] = None,
+        best_model_tracker: Optional[Any] = None,
         best_model_manager: Optional[Any] = None,
         is_best: bool = False,
     ) -> str:
         """Save checkpoint to file"""
         if self.rank != 0:  # Only save in main process
             return ""
+
+        if best_model_tracker is None:
+            best_model_tracker = best_model_manager
 
         filename = generate_checkpoint_filename(state.epoch, state.global_step, is_best)
         checkpoint = self._create_checkpoint_dict(
@@ -58,7 +62,7 @@ class CheckpointManager:
             scheduler,
             ema_model,
             early_stopper,
-            best_model_manager,
+            best_model_tracker,
             filename=filename,
             is_best=is_best,
         )
@@ -108,10 +112,14 @@ class CheckpointManager:
         ema_model: Optional[qEMA] = None,
         state: Optional[RunningState] = None,
         early_stopper: Optional[Any] = None,
+        best_model_tracker: Optional[Any] = None,
         best_model_manager: Optional[Any] = None,
     ):
         """Load checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        if best_model_tracker is None:
+            best_model_tracker = best_model_manager
 
         # Load model state
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -136,8 +144,8 @@ class CheckpointManager:
         if "earlystop_state_dict" in checkpoint and early_stopper is not None:
             early_stopper.load_state_dict(checkpoint["earlystop_state_dict"])
 
-        if "best_model_state_dict" in checkpoint and best_model_manager is not None:
-            best_model_manager.load_state_dict(checkpoint["best_model_state_dict"])
+        if "best_model_state_dict" in checkpoint and best_model_tracker is not None:
+            best_model_tracker.load_state_dict(checkpoint["best_model_state_dict"])
 
         if "latest_regular_ckp_file" in checkpoint and self.keep_only_latest_regular:
             self.latest_regular_ckp_file = checkpoint["latest_regular_ckp_file"]
@@ -157,7 +165,7 @@ class CheckpointManager:
         scheduler: Optional[Any],
         ema_model: Optional[qEMA],
         early_stopper: Optional[Any],
-        best_model_manager: Optional[Any],
+        best_model_tracker: Optional[Any],
         filename: str,
         is_best: bool,
     ) -> Dict[str, Any]:
@@ -174,8 +182,8 @@ class CheckpointManager:
         if early_stopper is not None:
             checkpoint["earlystop_state_dict"] = early_stopper.state_dict()
 
-        if best_model_manager is not None:
-            checkpoint["best_model_state_dict"] = best_model_manager.state_dict()
+        if best_model_tracker is not None:
+            checkpoint["best_model_state_dict"] = best_model_tracker.state_dict()
 
         if ema_model is not None:
             checkpoint["ema_state_dict"] = ema_model.state_dict()

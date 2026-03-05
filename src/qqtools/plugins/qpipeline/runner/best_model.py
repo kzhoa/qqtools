@@ -1,8 +1,10 @@
 from typing import Any, Dict, Optional
 
+__all__ = ["BestModelTracker"]
 
-class BestModelManager:
-    """Manages and tracks the best model based on a specific metric."""
+
+class BestModelTracker:
+    """Tracks the best model based on a specific metric."""
 
     def __init__(self, target: str = "val_metric", mode: str = "min", min_delta: float = 0.0):
         """

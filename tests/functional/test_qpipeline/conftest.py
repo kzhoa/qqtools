@@ -113,10 +113,12 @@ def examples_dir():
 
 
 @pytest.fixture
-def cmd_args_from_yaml(examples_dir):
+def cmd_args_from_yaml(examples_dir, tmp_path):
     def _factory(name: str, **overrides):
         config_file = examples_dir / name
         ns = Namespace(config=str(config_file), ckp_file=None, test=False, local_rank=0, ddp_detect=False)
+        if "log_dir" not in overrides:
+            overrides["log_dir"] = str(tmp_path / "logs")
         for k, v in overrides.items():
             setattr(ns, k, v)
         return qt.qDict.from_namespace(ns)

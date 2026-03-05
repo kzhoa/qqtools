@@ -1,3 +1,5 @@
+import argparse
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -7,7 +9,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
 from qqtools.plugins.qpipeline.entry_utils.qema import qEMA
-from qqtools.plugins.qpipeline.runner.runner import RunningAgent
+from qqtools.plugins.qpipeline.runner.runner import RunningAgent, train_runner
 from qqtools.plugins.qpipeline.runner.types import RunConfig, RunningState
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
 
@@ -160,3 +162,55 @@ def test_ema_update_and_evaluation(setup_agent_with_ema):
     assert agent.device == device
     assert next(model.parameters()).device == device
     assert next(ema_model.module.parameters()).device == device
+
+
+def test_best_snapshot_uses_ema_prefixed_metrics_when_target_is_ema_val_metric(tmp_path):
+    class CheckpointSafeTask(SimpleTask):
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state_dict):
+            return None
+
+        def post_metrics_to_value(self, metrics):
+            return float(metrics.get("dummy_metric", 0.0))
+
+    task = CheckpointSafeTask()
+    model = SimpleModel()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    loss_fn = nn.MSELoss()
+    ema_model = qEMA(model, decay=0.999, device=torch.device("cpu"))
+
+    args = argparse.Namespace(
+        device=torch.device("cpu"),
+        rank=0,
+        distributed=False,
+        runner=argparse.Namespace(
+            checkpoint={"target": "ema_val_metric", "mode": "min", "min_delta": 0.0},
+            early_stop={"target": "val_metric", "patience": 999, "mode": "min", "min_delta": 0.0},
+            log_granularity=["eval"],
+        ),
+        ckp_file=None,
+        init_file=None,
+        render_type="plain",
+    )
+
+    result = train_runner(
+        model=model,
+        task=task,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        args=args,
+        max_epochs=2,
+        eval_interval=1,
+        ema_model=ema_model,
+        run_mode="epoch",
+        save_dir=str(tmp_path / "runner_logs"),
+    )
+
+    snapshot = result["best_model_metrics_snapshot"]
+    assert result["best_monitored_key"] == "ema_val_metric"
+    assert result["best_monitored_metric"] is not None
+    assert "ema_val_metric" in snapshot
+    assert any(key.startswith("ema_") for key in snapshot)
+    assert all((not ("ema" in key)) or key.startswith("ema_") for key in snapshot)

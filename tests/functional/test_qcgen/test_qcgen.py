@@ -46,7 +46,7 @@ def test_qcgen_full_workflow():
         mock.patch("qqtools.plugins.qConfigGen.main.prompt_save_location") as mock_save,
     ):
         # Mock return values for configuration steps
-        mock_global.return_value = {"seed": 42, "log_dir": "/tmp/logs", "print_freq": 100}
+        mock_global.return_value = {"seed": 42, "log_dir": "./tmp/logs", "print_freq": 100}
         mock_task.return_value = {"dataset": "imagenet", "dataloader": {"batch_size": 32}}
         mock_loss.return_value = {"loss": "cross_entropy"}
         mock_optim.return_value = {"optimizer": "adamw", "lr": 0.001}
@@ -85,7 +85,7 @@ def test_qcgen_yaml_output_format():
 
     test_config = {
         "seed": 42,
-        "log_dir": "/tmp/logs",
+        "log_dir": "./tmp/logs",
         "task": {"dataset": "imagenet", "dataloader": {"batch_size": 32}},
         "optim": {"loss": "cross_entropy", "optimizer": "adamw"},
         "model": {"model_type": "resnet50"},
@@ -134,7 +134,7 @@ def test_qcgen_cli_entry_point():
     ):
 
         # Set return values for all mocks
-        mock_global.return_value = {"seed": 42, "log_dir": "/tmp"}
+        mock_global.return_value = {"seed": 42, "log_dir": "./tmp"}
         mock_task.return_value = {"dataset": "test"}
         mock_loss.return_value = {"loss": "mse"}
         mock_optim.return_value = {"optimizer": "adam"}

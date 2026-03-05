@@ -7,12 +7,11 @@ Agent
 Special Features
 """
 
+import copy
 import gc
 import logging
 import time
 import warnings
-from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
@@ -23,7 +22,6 @@ from torch.profiler import ProfilerActivity, profile
 from torch.utils.data import DataLoader
 
 import qqtools as qt
-import copy
 
 from ..entry_utils.qema import qEMA
 from ..entry_utils.scheduler import qWarmupScheduler
@@ -31,9 +29,10 @@ from ..entry_utils.type_qconfig import CheckpointConfig, EarlyStopConfig, qConfi
 from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import qTaskBase
 from .avgbank import AvgBank
-from .best_model import BestModelManager
+from .best_model import BestModelTracker
 from .ckp_manager import CheckpointManager
 from .earlystop import EarlyStopper
+from .eval_summary_formatter import EvalSummaryFormatter
 from .progress import ProgressTracker
 from .tensorbank import TensorBank
 from .types import EventContext, RunConfig, RunMode, RunningState
@@ -57,7 +56,6 @@ class SheetLoggerListener:
         self.logger = logger
         self.config = run_config
         self.log_granularity = log_granularity
-        self._warned_keys = set()
 
     def _prepare_data(self, context: EventContext, mode: str) -> Dict[str, Any]:
         """Prepares a flat dictionary of metrics for logging. Robust to missing metrics."""
@@ -66,11 +64,11 @@ class SheetLoggerListener:
 
         source_metrics = {}
         if mode == "eval":
-            # 优先 context.eval_results，其次 state.current_val_metric/test_metric/train_metric
+            # Prefer context.eval_results, then fallback to a few common state metrics.
             if getattr(context, "eval_results", None):
                 source_metrics.update(context.eval_results)
             else:
-                # 兼容性兜底：尝试从 state 拿常用指标
+                # Backward-compatible fallback.
                 for k in ["current_val_metric", "current_test_metric", "current_train_metric", "current_train_loss"]:
                     v = getattr(state, k, None)
                     if v is not None:
@@ -109,16 +107,19 @@ class SheetLoggerListener:
         # If eval-level logging is also active, suppress batch logging on eval steps
         # to avoid duplicate entries for the same global_step.
         if "eval" in self.log_granularity:
-            is_epoch_end = context.batch_idx == context.total_batches - 1
-            is_step_trigger = (
-                self.config.run_mode == RunMode.STEP and context.state.global_step % self.config.eval_interval == 0
+            is_epoch_end = (
+                context.batch_idx is not None
+                and context.total_batches is not None
+                and context.batch_idx == context.total_batches - 1
             )
-            is_epoch_trigger = (
-                self.config.run_mode == RunMode.EPOCH
-                and is_epoch_end
-                and (context.state.epoch + 1) % self.config.eval_interval == 0
+            is_eval_trigger = _is_periodic_trigger(
+                run_mode=self.config.run_mode,
+                interval=self.config.eval_interval,
+                global_step=context.state.global_step,
+                epoch=context.state.epoch,
+                is_epoch_end=is_epoch_end,
             )
-            if is_step_trigger or is_epoch_trigger:
+            if is_eval_trigger:
                 return  # Suppress write, on_eval_end will handle it
 
         data = self._prepare_data(context, mode="batch")
@@ -143,8 +144,6 @@ def move_batch_to_device(batch_data, device: torch.device):
 
     if hasattr(batch_data, "to"):
         return batch_data.to(device)
-    elif isinstance(batch_data, torch.Tensor):
-        return batch_data.to(device)
     elif isinstance(batch_data, dict):
         return qt.qDict({k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch_data.items()})
     elif isinstance(batch_data, (tuple, list)):
@@ -164,6 +163,83 @@ def _getattr_or_default(obj: Any, key: str, default: Any = None) -> Any:
     return default() if callable(default) else default
 
 
+def _is_periodic_trigger(
+    run_mode: RunMode,
+    interval: Optional[int],
+    global_step: int,
+    epoch: int,
+    is_epoch_end: bool,
+) -> bool:
+    """Check if a periodic event should fire for current train state."""
+    if interval is None or interval <= 0:
+        return False
+
+    if run_mode == RunMode.STEP:
+        # global_step is incremented after periodic checks, so use completed-step semantics.
+        return (global_step + 1) % interval == 0
+
+    return is_epoch_end and (epoch + 1) % interval == 0
+
+
+def _resolve_train_runner_policy(
+    run_mode: Union[str, RunMode],
+    max_epochs: Optional[int],
+    max_steps: Optional[int],
+    eval_interval: Optional[int],
+    save_interval: Optional[int],
+) -> Tuple[RunMode, int, int, Optional[int], Optional[int], List[str]]:
+    """Resolve train-runner-owned policy fields into effective runtime values."""
+
+    def _ensure_positive_int(value: Any, field_name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{field_name} must be a positive integer (>=1)")
+        return value
+
+    if run_mode is None:
+        raise ValueError("run_mode cannot be None. Supported values are 'epoch' and 'step'.")
+
+    resolved_run_mode = RunMode(run_mode)
+
+    effective_eval_interval = 1 if eval_interval is None else eval_interval
+    effective_eval_interval = _ensure_positive_int(effective_eval_interval, "eval_interval")
+
+    effective_save_interval = effective_eval_interval if save_interval is None else save_interval
+    effective_save_interval = _ensure_positive_int(effective_save_interval, "save_interval")
+
+    effective_max_epochs = max_epochs
+    effective_max_steps = max_steps
+    policy_warnings: List[str] = []
+
+    if resolved_run_mode == RunMode.EPOCH:
+        if max_epochs is None:
+            raise ValueError("max_epochs must be specified when run_mode='epoch'.")
+        effective_max_epochs = _ensure_positive_int(max_epochs, "max_epochs")
+        if max_steps is not None:
+            policy_warnings.append(
+                f"[run_mode=EPOCH] max_steps={max_steps} is ignored by mutual-exclusion policy; "
+                f"training will be controlled by max_epochs={max_epochs}."
+            )
+        effective_max_steps = None
+    else:  # RunMode.STEP
+        if max_steps is None:
+            raise ValueError("max_steps must be specified when run_mode='step'.")
+        effective_max_steps = _ensure_positive_int(max_steps, "max_steps")
+        if max_epochs is not None:
+            policy_warnings.append(
+                f"[run_mode=STEP] max_epochs={max_epochs} is ignored by mutual-exclusion policy; "
+                f"training will be controlled by max_steps={max_steps}."
+            )
+        effective_max_epochs = None
+
+    return (
+        resolved_run_mode,
+        effective_eval_interval,
+        effective_save_interval,
+        effective_max_epochs,
+        effective_max_steps,
+        policy_warnings,
+    )
+
 class RunningAgent:
 
     def __init__(
@@ -179,7 +255,8 @@ class RunningAgent:
         logger: Optional[qLogger] = None,
         checkpoint_manager: Optional[CheckpointManager] = None,
         early_stopper: Optional[EarlyStopper] = None,
-        best_model_manager: Optional[BestModelManager] = None,
+        best_model_tracker: Optional[BestModelTracker] = None,
+        best_model_manager: Optional[BestModelTracker] = None,
         listeners: Optional[Dict[str, List[Callable]]] = None,
         state: Optional[RunningState] = None,
         avg_bank: Optional[AvgBank] = None,
@@ -198,7 +275,8 @@ class RunningAgent:
             logger: Logger instance
             checkpoint_manager: Checkpoint manager (optional, None to skip checkpoint functionality)
             early_stopper: Early stopping manager (optional, None to disable early stopping)
-            best_model_manager: Best model manager (optional, None to skip best model tracking)
+            best_model_tracker: Best model tracker (optional, None to skip best model tracking)
+            best_model_manager: Deprecated alias of best_model_tracker
             listeners: Event listeners dictionary
             state: Running state
             avg_bank: Average metrics manager
@@ -227,7 +305,9 @@ class RunningAgent:
         # Managers (Add-ons) - must be injected externally
         self.checkpoint_manager = checkpoint_manager
         self.early_stopper = early_stopper
-        self.best_model_manager = best_model_manager
+        self.best_model_tracker = best_model_tracker or best_model_manager
+        # Backward-compatibility alias.
+        self.best_model_manager = self.best_model_tracker
 
         # Listeners for extensibility
         default_listeners = {
@@ -359,6 +439,47 @@ class RunningAgent:
                 scalar_metrics[key] = float(metric_value)
 
         return scalar_metrics
+
+    def _emit_batch_events(
+        self,
+        *,
+        batch_idx: int,
+        total_batches: int,
+        batch_metrics: Dict[str, Any],
+        scalar_batch_metrics: Dict[str, float],
+        stage: str,
+        lr: Optional[float] = None,
+        batch_avg_metrics: Optional[Dict[str, Any]] = None,
+        progress_avg_metrics: Optional[Dict[str, Any]] = None,
+        emit_train_batch_end: bool = False,
+        emit_table_update: bool = False,
+    ) -> None:
+        """Emit batch-related events using shared context assembly."""
+        batch_context = EventContext(
+            state=self.state,
+            batch_idx=batch_idx,
+            total_batches=total_batches,
+            batch_metrics=batch_metrics,
+            avg_bank=batch_avg_metrics,
+            lr=lr,
+            stage=stage,
+        )
+        self._trigger("on_batch_end", context=batch_context)
+        if emit_train_batch_end:
+            self._trigger("on_train_batch_end", context=batch_context)
+
+        progress_context = EventContext(
+            state=self.state,
+            batch_idx=batch_idx,
+            total_batches=total_batches,
+            batch_metrics=scalar_batch_metrics,
+            avg_bank=progress_avg_metrics,
+            lr=lr,
+            stage=stage,
+        )
+        self._trigger("on_progress_tick", context=progress_context)
+        if emit_table_update:
+            self._trigger("on_table_update", context=progress_context)
 
     def _start_new_epoch(self):
         """Initialize a new epoch: create iterator and setup distributed sampling."""
@@ -493,7 +614,7 @@ class RunningAgent:
 
             # Offload main model if needed to free GPU memory
             if self._use_model_offload:
-                self.logger.debug("Offloading main model to CPU for EMA evaluation.")
+                self.logger.debug("Offloading main model to 'cpu' for EMA evaluation.")
                 self.model.cpu()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -504,7 +625,9 @@ class RunningAgent:
                 # Get current device of EMA model
                 ema_original_device = next(eval_model.parameters()).device
                 if ema_original_device != self.device:
-                    self.logger.debug(f"Moving EMA model from {ema_original_device} to {self.device} for evaluation.")
+                    self.logger.debug(
+                        f"Moving EMA model from '{ema_original_device}' to '{self.device}' for evaluation."
+                    )
                     eval_model.to(self.device)
             except (StopIteration, Exception):
                 ema_original_device = None
@@ -524,12 +647,12 @@ class RunningAgent:
         finally:
             # Restore EMA model to its original device
             if ema_original_device is not None and ema_original_device != self.device:
-                self.logger.debug(f"Moving EMA model back to {ema_original_device} after evaluation.")
+                self.logger.debug(f"Moving EMA model back to '{ema_original_device}' after evaluation.")
                 eval_model.to(ema_original_device)
 
             # Restore main model to GPU if it was offloaded
             if offloaded:
-                self.logger.debug(f"Restoring main model to {self.device} after evaluation.")
+                self.logger.debug(f"Restoring main model to '{self.device}' after evaluation.")
                 self.model.to(self.device)
 
         return results
@@ -564,26 +687,16 @@ class RunningAgent:
                 if self.use_tensor_bank:
                     tensor_bank.add(self.task.batch_cache(out, batch_data))
 
-                # Trigger batch end event with eval stage info
-                batch_context = EventContext(
-                    state=self.state,
+                avg_metrics = avg_bank.to_dict(self.config.distributed)
+                self._emit_batch_events(
                     batch_idx=batch_idx,
                     total_batches=len(data_loader),
                     batch_metrics=batch_metrics,
-                    avg_bank=avg_bank.to_dict(self.config.distributed),
+                    scalar_batch_metrics=self._scalarize_batch_metrics(batch_metrics),
                     stage=stage,
+                    batch_avg_metrics=avg_metrics,
+                    progress_avg_metrics=avg_metrics,
                 )
-                self._trigger("on_batch_end", context=batch_context)
-
-                progress_context = EventContext(
-                    state=self.state,
-                    batch_idx=batch_idx,
-                    total_batches=len(data_loader),
-                    batch_metrics=self._scalarize_batch_metrics(batch_metrics),
-                    avg_bank=avg_bank.to_dict(self.config.distributed),
-                    stage=stage,
-                )
-                self._trigger("on_progress_tick", context=progress_context)
 
         # Calculate average
         avg_metrics = avg_bank.gather_average(self.config.distributed)
@@ -664,11 +777,22 @@ class RunningAgent:
         current_val = eval_results.get(target)
 
         is_best = False
-        if current_val is not None and self.best_model_manager is not None:
-            is_best = self.best_model_manager.update(current_val, self.state.epoch, self.state.global_step)
+        previous_best = None
+        if self.best_model_tracker is not None:
+            previous_best = {
+                "metric": getattr(self.best_model_tracker, "best_metric", None),
+                "epoch": getattr(self.best_model_tracker, "best_epoch", 0),
+                "step": getattr(self.best_model_tracker, "best_step", 0),
+            }
+        if current_val is not None and self.best_model_tracker is not None:
+            is_best = self.best_model_tracker.update(current_val, self.state.epoch, self.state.global_step)
 
         if is_best:
-            self._save_best_checkpoint()
+            self._save_best_checkpoint(
+                monitored_key=target,
+                monitored_metric=current_val,
+                eval_results=eval_results,
+            )
 
         # Early stop check
         if self.early_stopper is not None:
@@ -685,7 +809,7 @@ class RunningAgent:
                 self.logger.info(debug_msg)
 
         # Log formatted summary
-        self._log_eval_summary(eval_results, is_best)
+        self._log_eval_summary(eval_results, is_best, previous_best=previous_best)
 
         if self.early_stopper is not None and should_stop:
             self.logger.info(stop_msg)
@@ -694,72 +818,59 @@ class RunningAgent:
 
         return False
 
-    def _log_eval_summary(self, eval_results: Dict[str, Any], is_best: bool):
-        """Log a formatted summary of evaluation results."""
-        summary = [f"\n[Eval Summary] Epoch: {self.state.epoch}, Step: {self.state.global_step}"]
-
-        # Metrics sorted by key
-        summary.append("  - Metrics:")
-        for key in sorted(eval_results.keys()):
-            val = eval_results[key]
-            if isinstance(val, float):
-                summary.append(f"    - {key}: {val:.4f}")
-            else:
-                summary.append(f"    - {key}: {val}")
-
-        # Monitored target
+    def _log_eval_summary(
+        self,
+        eval_results: Dict[str, Any],
+        is_best: bool,
+        previous_best: Optional[Dict[str, Any]] = None,
+    ):
+        """Log evaluation summary in both hierarchical and table-friendly formats."""
         target_key = self.config.checkpoint.get("target", "val_metric")
-        target_val = eval_results.get(target_key)
-        if target_val is not None:
-            val_str = f"{target_val:.4f}" if isinstance(target_val, float) else str(target_val)
-            summary.append(f"  - Monitored Target ('{target_key}'): {val_str}")
+        target_mode = self.config.checkpoint.get("mode", "min")
+        summary_lines, summary_has_markup, table_lines, table_has_markup = EvalSummaryFormatter.format_all(
+            eval_results=eval_results,
+            epoch=self.state.epoch,
+            step=self.state.global_step,
+            target_key=target_key,
+            target_mode=target_mode,
+            is_best=is_best,
+            previous_best=previous_best,
+            best_model_tracker=self.best_model_tracker,
+            color_new_best=True,
+        )
 
-        # Best model status
-        if is_best:
-            val_str = f"{target_val:.4f}" if isinstance(target_val, float) else str(target_val)
-            summary.append(f"  - ✨ New best model found and saved! (Best score: {val_str})")
-        elif self.best_model_manager is not None:
-            best_val = getattr(self.best_model_manager, "best_val", None)
-            best_epoch = getattr(self.best_model_manager, "best_epoch", 0)
-            best_step = getattr(self.best_model_manager, "best_step", 0)
+        if summary_has_markup:
+            self.logger.info("\n".join(summary_lines), extra={"markup": True})
+        else:
+            self.logger.info("\n".join(summary_lines))
 
-            if best_val is not None:
-                val_str = f"{best_val:.4f}" if isinstance(best_val, float) else str(best_val)
-                summary.append(f"  - Best score so far: {val_str} (from Epoch {best_epoch}, Step {best_step})")
+        if table_has_markup:
+            self.logger.info("\n".join(table_lines), extra={"markup": True})
+        else:
+            self.logger.info("\n".join(table_lines))
 
-        self.logger.info("\n".join(summary))
-
-    def _save_best_checkpoint(self):
+    def _save_best_checkpoint(self, monitored_key: str, monitored_metric: Any, eval_results: Dict[str, Any]):
         """Saves the best model checkpoint and updates best metrics."""
         # Update best metrics
         self.state.best_epoch = self.state.epoch
         self.state.best_step = self.state.global_step
-        self.state.best_train_metric = self.state.current_train_metric
-        self.state.best_val_metric = self.state.current_val_metric
-        self.state.best_test_metric = self.state.current_test_metric
+        self.state.best_monitored_key = monitored_key
 
-        # Save best checkpoint if manager is available
-        if self.checkpoint_manager is not None:
-            ckp_path = self.checkpoint_manager.save(
-                copy.copy(self.state),
-                self.model,
-                self.task,
-                self.optimizer,
-                self.scheduler,
-                self.ema_model,
-                self.early_stopper,
-                self.best_model_manager,
-                is_best=True,
-            )
-            self._trigger(
-                "on_checkpoint_save",
-                context=EventContext(state=self.state, checkpoint_type="best", checkpoint_path=ckp_path),
-            )
+        if monitored_metric is not None:
+            monitored_metric = qt.ensure_scala(monitored_metric)
+        self.state.best_monitored_metric = monitored_metric
+        self.state.best_model_metrics_snapshot = copy.deepcopy(eval_results)
+
+        self._save_checkpoint(checkpoint_type="best")
 
     def _save_regular_checkpoint(self):
         """Saves a checkpoint of the current state, not contingent on performance."""
+        self._save_checkpoint(checkpoint_type="regular")
+
+    def _save_checkpoint(self, checkpoint_type: Literal["best", "regular"]) -> Optional[str]:
+        """Save a checkpoint and emit checkpoint event."""
         if self.checkpoint_manager is None:
-            return
+            return None
 
         ckp_path = self.checkpoint_manager.save(
             copy.copy(self.state),
@@ -769,13 +880,14 @@ class RunningAgent:
             self.scheduler,
             self.ema_model,
             self.early_stopper,
-            self.best_model_manager,
-            is_best=False,
+            self.best_model_tracker,
+            is_best=(checkpoint_type == "best"),
         )
         self._trigger(
             "on_checkpoint_save",
-            context=EventContext(state=self.state, checkpoint_type="regular", checkpoint_path=ckp_path),
+            context=EventContext(state=self.state, checkpoint_type=checkpoint_type, checkpoint_path=ckp_path),
         )
+        return ckp_path
 
     def _handle_periodic_events(self, is_epoch_end: bool) -> bool:
         """
@@ -788,44 +900,30 @@ class RunningAgent:
         Returns:
             bool: True if training should stop, False otherwise.
         """
-        is_step_trigger = (
-            self.config.run_mode == RunMode.STEP and (self.state.global_step + 1) % self.config.eval_interval == 0
+        is_eval_trigger = _is_periodic_trigger(
+            run_mode=self.config.run_mode,
+            interval=self.config.eval_interval,
+            global_step=self.state.global_step,
+            epoch=self.state.epoch,
+            is_epoch_end=is_epoch_end,
         )
-        is_epoch_trigger = (
-            self.config.run_mode == RunMode.EPOCH
-            and is_epoch_end  # This is true when _get_next_batch signals epoch end
-            and (self.state.epoch + 1) % self.config.eval_interval == 0  # Check interval for just completed epoch
-        )
-        is_eval_trigger = is_step_trigger or is_epoch_trigger
 
         should_stop = False
         if is_eval_trigger:
             self.logger.debug(
                 f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
                 f"\n eval_interval={self.config.eval_interval} save_interval={self.config.save_interval}"
-                f"\nis_step_trigger={is_step_trigger}, is_epoch_trigger={is_epoch_trigger}"
             )
             should_stop = self._run_evaluation_and_update()
 
-        # Check for regular checkpoint saving
-        should_save = False
-        if self.config.save_interval and self.config.save_interval > 0:
-            is_save_step_trigger = (
-                self.config.run_mode == RunMode.STEP and (self.state.global_step + 1) % self.config.save_interval == 0
-            )
-            is_save_epoch_trigger = (
-                self.config.run_mode == RunMode.EPOCH
-                and is_epoch_end
-                and (self.state.epoch + 1) % self.config.save_interval == 0
-            )
-
-            should_save = is_save_step_trigger or is_save_epoch_trigger
-
-        if should_save:
-            # self.loggr.debug(
-            #     f"PeriodicEvents Debug: run_mode={self.config.run_mode}, save_interval={self.config.save_interval}, global_step={self.state.global_step}, is_epoch_end={is_epoch_end}",
-            #     f"\nComputed save triggers: is_save_step_trigger={is_save_step_trigger}, is_save_epoch_trigger={is_save_epoch_trigger}",
-            # )
+        is_save_trigger = _is_periodic_trigger(
+            run_mode=self.config.run_mode,
+            interval=self.config.save_interval,
+            global_step=self.state.global_step,
+            epoch=self.state.epoch,
+            is_epoch_end=is_epoch_end,
+        )
+        if is_save_trigger:
             self._save_regular_checkpoint()
 
         return should_stop
@@ -895,36 +993,23 @@ class RunningAgent:
                         self.interval_avg_bank.add(k, v)
 
                 # Trigger batch end event for listeners (e.g., progress bars, loggers)
-                batch_context = EventContext(
-                    state=self.state,
-                    batch_idx=self.state.batch_idx_in_epoch - 1,
-                    total_batches=len(self.train_loader),
-                    batch_metrics=batch_metrics,
-                    lr=self.optimizer.param_groups[0]["lr"] if self.optimizer else None,
-                    stage="train",
-                )
-                self._trigger("on_batch_end", context=batch_context)
-                self._trigger("on_train_batch_end", context=batch_context)
-
-                # Trigger progress tick every batch for smooth progress bar updates
-                progress_context = EventContext(
-                    state=self.state,
-                    batch_idx=self.state.batch_idx_in_epoch - 1,
-                    total_batches=len(self.train_loader),
-                    batch_metrics=self._scalarize_batch_metrics(batch_metrics),
-                    avg_bank=self.avg_bank.to_dict(self.config.distributed),
-                    lr=batch_context.lr,
-                    stage=batch_context.stage,
-                )
-                self._trigger("on_progress_tick", context=progress_context)
-
                 # Trigger table update based on print frequency
                 freq = self.config.print_freq
                 is_update_tick = self.state.batch_idx_in_epoch % freq == 0 or self.state.batch_idx_in_epoch == len(
                     self.train_loader
                 )
-                if is_update_tick:
-                    self._trigger("on_table_update", context=progress_context)
+                current_lr = self.optimizer.param_groups[0]["lr"] if self.optimizer else None
+                self._emit_batch_events(
+                    batch_idx=self.state.batch_idx_in_epoch - 1,
+                    total_batches=len(self.train_loader),
+                    batch_metrics=batch_metrics,
+                    scalar_batch_metrics=self._scalarize_batch_metrics(batch_metrics),
+                    stage="train",
+                    lr=current_lr,
+                    progress_avg_metrics=self.avg_bank.to_dict(self.config.distributed),
+                    emit_train_batch_end=True,
+                    emit_table_update=is_update_tick,
+                )
 
                 # Check periodic events that are tied to global_step, or epoch-end if not yet handled
                 should_stop_mid_epoch = self._handle_periodic_events(is_epoch_end=is_epoch_end)
@@ -987,6 +1072,14 @@ class RunningAgent:
         return early_stopped
 
 
+# Design Rationale: Boundary Policy Ownership
+# The orchestration layer (train_runner) owns the business policy for mutually
+# exclusive run boundaries:
+# - EPOCH mode keeps only max_epochs
+# - STEP mode keeps only max_steps
+#
+# RunningAgent remains policy-agnostic and simply stops based on the concrete
+# boundaries passed in via RunConfig.
 def train_runner(
     model: nn.Module,
     task: qTaskBase,
@@ -1054,10 +1147,20 @@ def train_runner(
     init_file = _getattr_or_default(args, "init_file")
     render_type = _getattr_or_default(args, "render_type", "auto")
 
-    if run_mode is None:
-        raise ValueError("run_mode cannot be None. Supported values are 'epoch' and 'step'.")
-    eval_interval = 1 if eval_interval is None else eval_interval
-
+    (
+        resolved_run_mode,
+        effective_eval_interval,
+        effective_save_interval,
+        effective_max_epochs,
+        effective_max_steps,
+        boundary_policy_warnings,
+    ) = _resolve_train_runner_policy(
+        run_mode=run_mode,
+        max_epochs=max_epochs,
+        max_steps=max_steps,
+        eval_interval=eval_interval,
+        save_interval=save_interval,
+    )
     # Configuration fallback logic
     if not checkpoint_config:
         checkpoint_config["target"] = early_stop_config.get("target", "val_metric")
@@ -1071,11 +1174,11 @@ def train_runner(
 
     # Create run configuration
     config = RunConfig(
-        run_mode=RunMode(run_mode),
-        eval_interval=eval_interval,
-        save_interval=save_interval,
-        max_epochs=max_epochs,
-        max_steps=max_steps,
+        run_mode=resolved_run_mode,
+        eval_interval=effective_eval_interval,
+        save_interval=effective_save_interval,
+        max_epochs=effective_max_epochs,
+        max_steps=effective_max_steps,
         clip_grad=clip_grad,
         distributed=distributed,
         rank=rank,
@@ -1097,6 +1200,8 @@ def train_runner(
         log_keys.extend(extra_log_keys)
 
     logger = qLogger(save_dir, columns=log_keys, console=True)
+    for warning_msg in boundary_policy_warnings:
+        logger.warning(warning_msg)
 
     effective_scheduler = None
     if scheduler is not None:
@@ -1114,7 +1219,7 @@ def train_runner(
     # Create managers
     checkpoint_manager = CheckpointManager(config.save_dir, config.rank)
     early_stopper = EarlyStopper.from_config(config.early_stop)
-    best_model_manager = BestModelManager(
+    best_model_tracker = BestModelTracker(
         target=config.checkpoint.get("target", "val_metric"),
         mode=config.checkpoint.get("mode", "min"),
         min_delta=config.checkpoint.get("min_delta", 0.0),
@@ -1133,7 +1238,7 @@ def train_runner(
         logger=logger,
         checkpoint_manager=checkpoint_manager,
         early_stopper=early_stopper,
-        best_model_manager=best_model_manager,
+        best_model_tracker=best_model_tracker,
     )
 
     # Load checkpoint FIRST to restore training state
@@ -1149,7 +1254,7 @@ def train_runner(
             ema_model,
             agent.state,
             agent.early_stopper,
-            agent.best_model_manager,
+            agent.best_model_tracker,
         )
         logger.info(f"Loaded checkpoint from {config.ckp_file}")
         checkpoint_loaded = True
@@ -1161,27 +1266,6 @@ def train_runner(
         # This can happen if the config has no boundaries and no explicit args are passed.
         # We check this after applying overrides to have the final picture.
         raise ValueError("Either max_epochs or max_steps must be specified for the training run.")
-
-    # Validate run_mode and max_epochs/max_steps consistency
-    if config.run_mode == RunMode.STEP:
-        # In STEP mode, both max_epochs and max_steps can be used as stopping conditions
-        if max_epochs_val != float("inf") and max_steps_val != float("inf"):
-            logger.warning(
-                f"[run_mode=STEP] Both max_epochs={max_epochs_val} and "
-                f"max_steps={max_steps_val} are specified. "
-                f"Training will stop when either condition is reached."
-            )
-    elif config.run_mode == RunMode.EPOCH:
-        # In EPOCH mode, max_steps is ignored
-        if max_steps_val != float("inf"):
-            logger.warning(
-                f"[run_mode=EPOCH] max_steps={max_steps_val} is specified but will be ignored "
-                f"in EPOCH mode. Training will be controlled by max_epochs={max_epochs_val}."
-            )
-    else:
-        # Should not happen due to RunMode enum, but handl, config, log_granularitye defensively
-        logger.warning(f"Unknown run_mode: {config.run_mode}. Defaulting to EPOCH mode.")
-        config.run_mode = RunMode.EPOCH
 
     # Unified LogListener handling
     progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type)
@@ -1251,8 +1335,9 @@ def train_runner(
     return {
         "best_epoch": agent.state.best_epoch,
         "best_step": agent.state.best_step,
-        "best_val_metric": agent.state.best_val_metric,
-        "best_test_metric": agent.state.best_test_metric,
+        "best_monitored_key": agent.state.best_monitored_key,
+        "best_monitored_metric": agent.state.best_monitored_metric,
+        "best_model_metrics_snapshot": agent.state.best_model_metrics_snapshot,
         "final_epoch": agent.state.epoch,
         "final_step": agent.state.global_step,
         "total_train_time": agent.state.total_train_time,
@@ -1380,3 +1465,4 @@ def infer_runner(
         raise
 
     return all_results
+

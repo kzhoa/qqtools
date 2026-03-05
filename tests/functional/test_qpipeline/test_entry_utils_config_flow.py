@@ -20,14 +20,14 @@ def test_str2bool_valid_and_invalid():
         str2bool("not_bool")
 
 
-def test_merge_basic_args_reads_yaml_and_keeps_extra(cmd_args_from_yaml):
+def test_merge_basic_args_reads_yaml_and_keeps_extra(cmd_args_from_yaml, tmp_path):
     cmd_args = cmd_args_from_yaml("epoch_minimal.yaml", extra_flag="hello")
     args = merge_basic_args(cmd_args)
 
     assert args.runner.max_epochs == 3
     assert args.runner.run_mode == "epoch"
     assert args.extra_flag == "hello"
-
+    assert args.log_dir == str(tmp_path / "logs")
 
 def test_optimizer_name_invalid_raises_keyerror():
     with pytest.raises(KeyError):
@@ -130,3 +130,4 @@ def test_prepare_scheduler_lambda_scheduler_success(base_args, tiny_model):
     scheduler.step_main(metrics=1.0)
     assert scheduler is not None
     assert hasattr(scheduler, "main_scheduler")
+
