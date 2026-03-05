@@ -4,7 +4,6 @@ import os.path as osp
 from qqtools import qdist
 
 from .consolelogger import ConsoleLogger
-from .sheetlogger import SheetLogger
 
 
 class DoNothing:
@@ -26,101 +25,37 @@ class DoNothing:
 
 class qLogger:
     """
-    Unified logging interface combining console logs and metrics sheets.
+    Console-oriented logger facade for qpipeline.
 
-    Provides a single entry point for all logging needs in the qpipeline training framework.
-    Internally manages both human-readable console output (via ConsoleLogger) and structured
-    metrics logging (via SheetLogger). Automatically handles distributed training scenarios
-    by respecting process rank.
+    This class keeps the historical qLogger interface for debug/info/warning/error
+    methods while structured sheet logging is now managed by runner utilities.
     """
 
-    def __init__(self, log_dir, console=True, columns=None, recover=True):
+    def __init__(self, log_dir, console=True, recover=True):
         """
-        Initialize the unified logger with console and sheet logging capabilities.
+        Initialize the logger.
 
         Parameters:
             log_dir (str):
-                Root directory where all log files will be stored. Parent directories are
-                automatically created if they don't exist. Both console logs and metrics
-                sheets will be written to subdirectories/files within this location.
-                Example: log_dir="./logs/experiment_001"
-
+                Root directory where debug logs are stored.
             console (bool, optional):
-                Whether to enable console logging (default: True). When True, creates a
-                ConsoleLogger that writes debug logs to "debug.log" file and displays them
-                on console (using Rich formatting if available). When False, console logging
-                is disabled and a DoNothing placeholder is used instead.
-                Useful for disabling noisy output in certain scenarios.
-
-            columns (List[str], optional):
-                List of column names for the metrics sheet logger (default: None).
-                When provided, creates a SheetLogger that logs structured metrics to a CSV file
-                named "metrics.csv". Must contain column names like ["epoch", "loss", "val_acc"].
-                When None, metrics logging is disabled.
-                Example: columns=["epoch", "loss", "train_metric", "val_metric"]
-
+                Whether to enable console/debug logging (default: True).
             recover (bool, optional):
-                File handling mode for both console and sheet loggers (default: True).
-                  - True : Append mode. New logs are added to existing files (preserves history)
-                  - False: Write mode. Log files are cleared and overwritten on initialization
-                Applies to both debug.log and metrics.csv files.
-
-        Default Behavior:
-            - Logs are written to console with Rich formatting (if available)
-            - Debug logs are saved to "{log_dir}/debug.log"
-            - Metrics are saved to "{log_dir}/metrics.csv" (only if columns provided)
-            - Only rank 0 process outputs logs in distributed training (via ConsoleLogger/SheetLogger)
-            - Non-console loggers are replaced with DoNothing objects to avoid None checks
-            - Process rank is automatically detected via qdist.get_rank()
-
-        Example Usage:
-            # Basic setup: console logging only
-            logger = qLogger("./logs/run_001")
-            logger.info("Training started")
-            logger.error("Failed to load checkpoint")
-
-            # With metrics tracking
-            logger = qLogger(
-                "./logs/run_001",
-                columns=["epoch", "loss", "val_acc", "learning_rate"]
-            )
-            logger.info("Epoch 1 started")
-            logger.log({"epoch": 1, "loss": 0.5, "val_acc": 0.95, "learning_rate": 0.001})
-
-            # Distributed training (DDP/DistributedDataParallel)
-            logger = qLogger(
-                "./logs/run_001",
-                columns=["epoch", "loss"],
-                recover=True  # Append to previous run
-            )
-            # Only rank 0 will actually output, others use DoNothing
-
-            # No console output, metrics only
-            logger = qLogger(
-                "./logs/run_001",
-                console=False,
-                columns=["step", "metric1", "metric2"]
-            )
+                Whether to append to existing debug log files (default: True).
         """
         self.log_dir = log_dir
-        self.columns = columns
-
-        # Ensure log directory exists
         os.makedirs(log_dir, exist_ok=True)
 
         rank = qdist.get_rank()
 
         if console:
-            # ConsoleLogger already handles rank internally, but we only want one logger per rank 0 usually
-            # Actually, ConsoleLogger handles rank by setting adapter to None if rank != 0
-            self.debuglogger = ConsoleLogger(osp.join(log_dir, "debug.log"), rank=rank, recover=recover)
+            self.debuglogger = ConsoleLogger(
+                osp.join(log_dir, "debug.log"),
+                rank=rank,
+                recover=recover,
+            )
         else:
             self.debuglogger = DoNothing()
-
-        if columns is not None and rank == 0:
-            self.sheetlogger = SheetLogger(osp.join(log_dir, "metrics.csv"), columns, recover=recover)
-        else:
-            self.sheetlogger = DoNothing()
 
     def info(self, msg, *args, **kwargs):
         """Log an informational message."""
@@ -138,11 +73,6 @@ class qLogger:
         """Log a warning message."""
         self.debuglogger.warning(msg, *args, **kwargs)
 
-    def write(self, data: dict):
-        """Log structured metrics data to the CSV sheet."""
-        self.sheetlogger.write(data)
-
     def close(self):
-        """Gracefully close all loggers and flush pending data."""
+        """Gracefully close all logger handlers."""
         self.debuglogger.close()
-        self.sheetlogger.close()

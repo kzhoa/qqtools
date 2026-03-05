@@ -5,7 +5,10 @@ import queue
 import time
 import warnings
 from threading import Lock, Thread
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
+from .common import _is_periodic_trigger
+from .types import EventContext, RunConfig
 
 
 class SheetLogger:
@@ -71,38 +74,6 @@ class SheetLogger:
                   - True : Append mode. New data is added to existing file (preserves history)
                   - False: Write mode. File is cleared and reinitialized with headers
                 When filepath=None, this parameter is ignored (no file operations).
-
-        Default Behavior:
-            - Writes to CSV format (human-readable)
-            - Synchronous writes (blocking, safe)
-            - Appends to existing file if present
-            - Rotates file when size exceeds 10 MB
-            - Buffer size of 1 (write every record immediately in sync mode)
-            - CSV files auto-initialize with column headers
-            - Extra keys in write() calls are silently ignored with a warning
-            - Thread-safe through Lock (safe for multi-threaded access in sync mode)
-
-        Example Usage:
-            # Basic usage: simple CSV logging
-            logger = SheetLogger("logs/training.csv", columns=["epoch", "loss", "val_acc"])
-            logger.write({"epoch": 1, "loss": 0.5, "val_acc": 0.95})
-            logger.write({"epoch": 2, "loss": 0.3, "val_acc": 0.97})
-
-            # JSONL format with async writing (faster for frequent writes)
-            logger = SheetLogger(
-                "logs/results.jsonl",
-                columns=["step", "metric1", "metric2"],
-                format="jsonl",
-                async_write=True,
-                buffer_size=100
-            )
-            for step in range(1000):
-                logger.write({"step": step, "metric1": 0.1, "metric2": 0.2})
-            logger.close()  # Important: flush remaining buffered data
-
-            # Overwrite previous logs instead of appending
-            logger = SheetLogger("logs/debug.csv", columns=["iteration", "debug_val"], recover=False)
-            logger.write({"iteration": 0, "debug_val": 123})
         """
         self.file_path = os.path.abspath(file_path)
         self.columns = columns
@@ -118,8 +89,6 @@ class SheetLogger:
         assert columns is not None
         os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
 
-        mode = "a" if recover else "w"
-
         if self.format == "csv":
             if not recover or not os.path.exists(self.file_path) or os.path.getsize(self.file_path) == 0:
                 with open(self.file_path, "w", newline="") as f:
@@ -130,12 +99,11 @@ class SheetLogger:
             open(self.file_path, "w").close()
 
         if async_write:
-            self._buffer = []
             self._queue = queue.Queue()
             self._thread = Thread(target=self._worker, daemon=True)
             self._thread.start()
 
-    def write(self, data: Dict[str, any]):
+    def write(self, data: Dict[str, Any]):
         """
         Write a record to the log file.
 
@@ -154,7 +122,7 @@ class SheetLogger:
             with self._lock:
                 self._sync_write_data([data])
 
-    def _sync_write_data(self, data_list: List[Dict]):
+    def _sync_write_data(self, data_list: List[Dict[str, Any]]):
         """Write a list of data records to the log file."""
         if not data_list:
             return
@@ -176,7 +144,7 @@ class SheetLogger:
 
     def _worker(self):
         """Background worker thread for asynchronous writing."""
-        buffer = []
+        buffer: List[Dict[str, Any]] = []
         while True:
             try:
                 # Use a timeout to occasionally check if we should flush what we have
@@ -205,21 +173,15 @@ class SheetLogger:
         if not os.path.exists(self.file_path) or os.path.getsize(self.file_path) <= self.max_size:
             return
 
-        # Simple rotation: rename current file to .1, .2, etc.
-        # To be robust on Windows, we need to handle potential file access issues.
         timestamp = time.strftime("%Y%m%d%H%M%S")
         backup_path = f"{self.file_path}.{timestamp}"
 
         try:
-            # On Windows, rename might fail if the file is open.
-            # But since we use 'with open(...)', it should be closed here.
             os.rename(self.file_path, backup_path)
         except OSError:
-            # Fallback to a more unique name if needed
-            backup_path = f"{self.file_path}.{timestamp}.{int(time.time()*1000) % 1000}"
+            backup_path = f"{self.file_path}.{timestamp}.{int(time.time() * 1000) % 1000}"
             os.rename(self.file_path, backup_path)
 
-        # Re-initialize the file with headers if CSV
         if self.format == "csv":
             with open(self.file_path, "w", newline="") as f:
                 writer = csv.writer(f)
@@ -228,8 +190,93 @@ class SheetLogger:
     def close(self):
         """Gracefully close and flush any pending data."""
         if self.async_write:
-            self._queue.put(None)  # Send sentinel
+            self._queue.put(None)
             self._queue.join()
-        elif hasattr(self, "_lock"):
-            # For sync mode, nothing special to do as we write immediately
-            pass
+
+
+class SheetLoggerListener:
+    """
+    Listener that writes metrics to SheetLogger based on train/eval events.
+    """
+
+    def __init__(
+        self,
+        sheet_logger: SheetLogger,
+        run_config: RunConfig,
+        log_granularity: List[str],
+        logger: Optional[Any] = None,
+    ):
+        self.sheet_logger = sheet_logger
+        self.config = run_config
+        self.log_granularity = log_granularity
+        self.logger = logger
+
+    def _warn(self, message: str) -> None:
+        if self.logger is not None:
+            self.logger.warning(message)
+        else:
+            warnings.warn(message)
+
+    def _prepare_data(self, context: EventContext, mode: str) -> Dict[str, Any]:
+        """Prepare a flat dictionary of metrics for logging."""
+        state = context.state
+        data = {"epoch": state.epoch, "global_step": state.global_step}
+
+        source_metrics: Dict[str, Any] = {}
+        if mode == "eval":
+            if getattr(context, "eval_results", None):
+                source_metrics.update(context.eval_results)
+            else:
+                for key in [
+                    "current_val_metric",
+                    "current_test_metric",
+                    "current_train_metric",
+                    "current_train_loss",
+                ]:
+                    value = getattr(state, key, None)
+                    if value is not None:
+                        source_metrics[key.replace("current_", "")] = value
+                if not source_metrics:
+                    self._warn("No eval metrics found in context or state; writing empty row.")
+        elif mode == "batch":
+            if getattr(context, "batch_metrics", None):
+                source_metrics.update(context.batch_metrics)
+            else:
+                self._warn("No batch_metrics found in context; writing empty row.")
+
+        if self.sheet_logger.columns:
+            for key in self.sheet_logger.columns:
+                if key in data:
+                    continue
+                value = source_metrics.get(key)
+                if value is None and mode == "batch" and key.startswith("train_"):
+                    value = source_metrics.get(key[len("train_") :])
+                data[key] = value
+        else:
+            data.update(source_metrics)
+
+        return data
+
+    def on_eval_end(self, context: EventContext):
+        data = self._prepare_data(context, mode="eval")
+        self.sheet_logger.write(data)
+
+    def on_train_batch_end(self, context: EventContext):
+        if "eval" in self.log_granularity:
+            is_epoch_end = (
+                context.batch_idx is not None
+                and context.total_batches is not None
+                and context.batch_idx == context.total_batches - 1
+            )
+            is_eval_trigger = _is_periodic_trigger(
+                run_mode=self.config.run_mode,
+                interval=self.config.eval_interval,
+                global_step=context.state.global_step,
+                epoch=context.state.epoch,
+                is_epoch_end=is_epoch_end,
+            )
+            if is_eval_trigger:
+                return
+
+        data = self._prepare_data(context, mode="batch")
+        self.sheet_logger.write(data)

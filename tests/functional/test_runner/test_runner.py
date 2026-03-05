@@ -3,6 +3,7 @@ Test cases for runner2.py - Unified Training Runner
 """
 
 import argparse
+import csv
 import tempfile
 from pathlib import Path
 from unittest.mock import Mock
@@ -12,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from qqtools.plugins.qpipeline.runner import agent as agent_module
+from qqtools.plugins.qpipeline.qlogger import qLogger
 from qqtools.plugins.qpipeline.runner.runner import (
     RunningAgent,
     SheetLoggerListener,
@@ -91,6 +94,25 @@ class TestRunConfig:
         assert config.early_stop["patience"] == 5
 
 
+class TestQLogger:
+    """Test console-only qLogger behavior after sheet decoupling."""
+
+    def test_qlogger_console_methods(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logger = qLogger(tmpdir, console=True)
+            logger.info("hello")
+            logger.warning("world")
+            logger.close()
+
+            debug_log = Path(tmpdir) / "debug.log"
+            assert debug_log.exists()
+
+    def test_qlogger_columns_parameter_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(TypeError):
+                qLogger(tmpdir, columns=["epoch", "global_step"])
+
+
 # ============================================================================
 # Unit Tests for TrainingAgent
 # ============================================================================
@@ -164,7 +186,7 @@ class TestTrainingAgent:
         assert "test_mse" in results
         assert "test_metric" in results
 
-    def test_trigger_freezes_state_but_keeps_signal_mutable(self):
+    def test_trigger_passes_mutable_state_and_signal(self):
         loss_fn = nn.MSELoss()
         optimizer = optim.Adam(self.model.parameters(), lr=0.001)
 
@@ -178,9 +200,7 @@ class TestTrainingAgent:
         )
 
         def _listener(context: EventContext):
-            with pytest.raises(AttributeError):
-                context.state.epoch = 999
-            assert context.state.epoch == agent.state.epoch
+            context.state.epoch = 999
             context.signal.should_stop = True
             context.signal.stop_message = "stop now"
 
@@ -192,7 +212,7 @@ class TestTrainingAgent:
             snapshot=False,
         )
 
-        assert agent.state.epoch == 0
+        assert agent.state.epoch == 999
         assert signal.should_stop is True
         assert signal.stop_message == "stop now"
 
@@ -304,6 +324,13 @@ class TestTrainRunner:
         """Setup for each test"""
         self.args = self._make_args()
 
+    @staticmethod
+    def _read_metrics_rows(metrics_file: Path):
+        with metrics_file.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        return reader.fieldnames, rows
+
     def teardown_method(self, method):
         """Cleanup after each test to release any file locks (e.g. debug.log)."""
         import logging
@@ -356,6 +383,77 @@ class TestTrainRunner:
             assert result["final_step"] >= 10
             assert result["best_monitored_key"] == "val_metric"
             assert result["best_monitored_metric"] is not None
+
+    def test_train_runner_writes_eval_sheetdata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components()
+
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=2,
+                eval_interval=1,
+                save_dir=tmpdir,
+                run_mode="epoch",
+                log_granularity=["eval"],
+            )
+
+            metrics_file = Path(tmpdir) / "metrics.csv"
+            assert metrics_file.exists()
+
+            fieldnames, rows = self._read_metrics_rows(metrics_file)
+            assert fieldnames == ["epoch", "global_step", "train_metric", "val_metric", "test_metric", "train_loss"]
+            assert len(rows) >= 1
+            assert any(row["val_metric"] != "" for row in rows)
+
+    def test_train_runner_writes_batch_sheetdata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components()
+
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_steps=4,
+                eval_interval=10,
+                save_dir=tmpdir,
+                run_mode="step",
+                log_granularity=["batch"],
+            )
+
+            metrics_file = Path(tmpdir) / "metrics.csv"
+            assert metrics_file.exists()
+
+            _, rows = self._read_metrics_rows(metrics_file)
+            assert len(rows) >= 1
+            assert any(row["train_loss"] != "" for row in rows)
+
+    def test_train_runner_rank_nonzero_skips_sheetdata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components()
+            args = self._make_args()
+            args.rank = 1
+
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=args,
+                max_steps=4,
+                eval_interval=2,
+                save_dir=tmpdir,
+                run_mode="step",
+                log_granularity=["eval", "batch"],
+            )
+
+            metrics_file = Path(tmpdir) / "metrics.csv"
+            assert not metrics_file.exists()
 
     def test_train_runner_with_gradient_clipping(self):
         """Test train_runner with gradient clipping"""
@@ -679,10 +777,16 @@ class TestPeriodicTrigger:
         )
 
     def test_sheet_logger_listener_uses_completed_step_trigger_semantics(self):
+        sheet_logger = Mock()
+        sheet_logger.columns = []
         logger = Mock()
-        logger.columns = []
         run_config = RunConfig(run_mode=RunMode.STEP, eval_interval=2, max_steps=4)
-        listener = SheetLoggerListener(logger=logger, run_config=run_config, log_granularity=["eval", "batch"])
+        listener = SheetLoggerListener(
+            sheet_logger=sheet_logger,
+            run_config=run_config,
+            log_granularity=["eval", "batch"],
+            logger=logger,
+        )
 
         state = RunningState(global_step=1, epoch=0)
         context = EventContext(
@@ -694,7 +798,96 @@ class TestPeriodicTrigger:
         )
         listener.on_train_batch_end(context)
 
-        logger.write.assert_not_called()
+        sheet_logger.write.assert_not_called()
+
+
+class TestRunningAgentPerformanceOptimizations:
+    def setup_method(self):
+        self.task = SimpleTask(num_samples=100, num_features=10)
+        self.model = SimpleModel(input_dim=10)
+        self.loss_fn = nn.MSELoss()
+        self.device = torch.device("cpu")
+
+    def _build_agent(self, max_steps: int = 20) -> RunningAgent:
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        config = RunConfig(
+            run_mode=RunMode.STEP,
+            max_steps=max_steps,
+            eval_interval=10_000,
+            save_interval=10_000,
+            print_freq=10_000,
+        )
+        return RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=self.loss_fn,
+            optimizer=optimizer,
+            config=config,
+            device=self.device,
+        )
+
+    def test_trigger_fast_path_returns_context_when_no_listener(self):
+        agent = self._build_agent(max_steps=1)
+        context = EventContext(state=agent.state)
+        returned_context = agent._trigger("on_batch_end", context)
+        assert returned_context is context
+
+    def test_eval_loop_skips_context_build_when_no_target_listener(self, monkeypatch):
+        agent = self._build_agent(max_steps=1)
+
+        def _event_context_should_not_run(*args, **kwargs):  # noqa: ARG001
+            raise AssertionError("EventContext should not be instantiated for disabled event paths")
+
+        monkeypatch.setattr(agent_module, "EventContext", _event_context_should_not_run)
+        results = agent._run_evaluation_loop(
+            agent.model,
+            self.task.val_loader,
+            prefix="val",
+            stage="val",
+        )
+        assert "val_metric" in results
+
+    def test_eval_loop_emits_scalar_progress_metrics_when_listener_registered(self):
+        agent = self._build_agent(max_steps=1)
+        captured_progress_metrics = []
+
+        def _capture_progress(context: EventContext):
+            captured_progress_metrics.append(context.batch_metrics)
+
+        agent.add_listener("on_progress_tick", _capture_progress)
+        results = agent._run_evaluation_loop(
+            agent.model,
+            self.task.val_loader,
+            prefix="val",
+            stage="val",
+        )
+
+        assert "val_metric" in results
+        assert len(captured_progress_metrics) == len(self.task.val_loader)
+        for progress_metrics in captured_progress_metrics:
+            assert progress_metrics is not None
+            assert all(isinstance(metric_value, float) for metric_value in progress_metrics.values())
+
+    def test_eval_loop_works_with_and_without_progress_listener(self):
+        agent_fast = self._build_agent(max_steps=1)
+        fast_results = agent_fast._run_evaluation_loop(
+            agent_fast.model,
+            self.task.val_loader,
+            prefix="val",
+            stage="val",
+        )
+
+        agent_slow = self._build_agent(max_steps=1)
+        agent_slow.add_listener("on_progress_tick", lambda context: None)
+        slow_results = agent_slow._run_evaluation_loop(
+            agent_slow.model,
+            self.task.val_loader,
+            prefix="val",
+            stage="val",
+        )
+
+        assert "val_metric" in fast_results
+        assert "val_metric" in slow_results
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
