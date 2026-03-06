@@ -6,9 +6,9 @@ Design Philosophy:
 4. Trust qt.ensure_scala: Assume it can handle various input types and raise if it cannot convert to a scalar.
 """
 
+import copy
 import gc
 import time
-import copy
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
@@ -31,118 +31,13 @@ from .runner_utils.tensorbank import TensorBank
 from .runner_utils.types import EventContext, EventType, LoopSignal, RunConfig, RunningState
 
 
-def _extract_batch_metric_views(
-    batch_metrics: Dict[str, Any],
-) -> Tuple[Dict[str, float], List[Tuple[str, float, float]]]:
-    """Extract scalar metrics and weighted items in one pass."""
-    scalar_metrics: Dict[str, float] = {}
-    weighted_items: List[Tuple[str, float, float]] = []
-
+def _get_scalar_metrics(batch_metrics: Dict[str, Any]) -> Dict[str, float]:
+    """Extracts scalar float values from a metric dictionary."""
+    scalar_metrics = {}
     for key, item in batch_metrics.items():
-        if isinstance(item, tuple):
-            metric_value = item[0]
-            metric_count = item[1] if len(item) > 1 else 1.0
-        else:
-            metric_value = item
-            metric_count = 1.0
-
-        value_float = qt.ensure_scala(metric_value)
-        count_float = qt.ensure_scala(metric_count)
-
-        scalar_metrics[key] = value_float
-        weighted_items.append((key, value_float, count_float))
-
-    return scalar_metrics, weighted_items
-
-
-class TaskMetricTracker:
-    """Collects batch metrics and optional tensor caches for epoch-level aggregation."""
-
-    def __init__(
-        self,
-        task: qTaskBase,
-        config: RunConfig,
-        device: torch.device,
-        logger: Optional[qLogger],
-        use_tensor_bank: bool = None,
-        avg_bank: Optional[AvgBank] = None,
-    ):
-        self.task = task
-        self.config = config
-        self.device = device
-        self.logger = logger
-
-        has_batch_cache = self.task.has_implemented("batch_cache")
-        has_epoch_metric = self.task.has_implemented("epoch_metric")
-
-        if use_tensor_bank is None:
-            self.use_tensor_bank = has_batch_cache and has_epoch_metric
-            if self.logger and has_batch_cache != has_epoch_metric:
-                self.logger.warning(
-                    "Task should implement both 'batch_cache' and 'epoch_metric' to enable tensor cache metrics."
-                )
-        else:
-            self.use_tensor_bank = use_tensor_bank
-
-        self.avg_bank = avg_bank or AvgBank()
-        self.tensor_bank = TensorBank(logger=logger) if self.use_tensor_bank else None
-
-    def add_weighted_metrics(self, metric_items: List[Tuple[str, float, float]]) -> None:
-        for key, metric_value, metric_count in metric_items:
-            self.avg_bank.add(key, metric_value, metric_count)
-
-    def update_cache(self, out: Any, batch_data: Any) -> None:
-        if not self.use_tensor_bank or self.tensor_bank is None:
-            return
-        self.tensor_bank.add(self.task.batch_cache(out, batch_data))
-
-    def compute_epoch_metrics(self, reset_after_compute: bool = True) -> Dict[str, Any]:
-        epoch_metrics = self.avg_bank.gather_average(self.config.distributed)
-
-        if self.use_tensor_bank and self.tensor_bank is not None:
-            gathered_cache = self.tensor_bank.gather(self.config.distributed, self.device)
-            task_epoch_metrics = self.task.epoch_metric(gathered_cache)
-            if task_epoch_metrics:
-                epoch_metrics.update(task_epoch_metrics)
-
-        if reset_after_compute:
-            self.reset()
-
-        return epoch_metrics
-
-    def to_dict(self) -> Dict[str, Any]:
-        return self.avg_bank.to_dict(self.config.distributed)
-
-    def reset(self) -> None:
-        self.avg_bank = AvgBank()
-        self.reset_tensor_cache()
-
-    def reset_tensor_cache(self) -> None:
-        if self.tensor_bank is not None:
-            self.tensor_bank.reset()
-
-
-def _should_enable_offload(device: torch.device, model: nn.Module, logger: Optional[qLogger]) -> bool:
-    """Check if model offloading should be enabled based on GPU capacity."""
-    if device.type != "cuda":
-        return False
-
-    from ..entry_utils.info import get_model_size_bytes
-
-    m_size = get_model_size_bytes(model)
-    try:
-        gpu_cap = torch.cuda.get_device_properties(device).total_memory
-    except Exception:
-        return False
-
-    if m_size > (gpu_cap * 0.5):
-        if logger:
-            logger.info(
-                f"Model size ({m_size / 1024**2:.2f} MB) > 50% of GPU capacity. "
-                "Enabling mutual offloading during evaluation."
-            )
-        return True
-    return False
+        value = item[0] if isinstance(item, (tuple, list)) else item
+        scalar_metrics[key] = qt.ensure_scala(value)
+    return scalar_metrics
 
 
 class RunningAgent:
@@ -156,6 +51,7 @@ class RunningAgent:
         config: RunConfig = None,
         device: torch.device = None,
         ema_model: Optional[qEMA] = None,
+        allow_auto_offload: bool = True,
         logger: Optional[qLogger] = None,
         listeners: Optional[Dict[str, List[Callable]]] = None,
         state: Optional[RunningState] = None,
@@ -186,6 +82,18 @@ class RunningAgent:
         self.val_loader = task.val_loader
         self.test_loader = task.test_loader
 
+        self.train_avg_bank = avg_bank or AvgBank()
+
+        has_batch_cache = self.task.has_implemented("batch_cache")
+        has_epoch_metric = self.task.has_implemented("epoch_metric")
+        self.use_tensor_bank = has_batch_cache and has_epoch_metric
+        if self.logger and has_batch_cache != has_epoch_metric:
+            self.logger.warning(
+                "Task should implement both 'batch_cache' and 'epoch_metric' to enable tensor cache metrics."
+            )
+
+        self.train_tensor_bank = TensorBank(logger=logger) if self.use_tensor_bank else None
+
         self.interval_avg_bank = AvgBank()
 
         self.listeners = {event.value: [] for event in EventType}
@@ -194,26 +102,20 @@ class RunningAgent:
                 event_name = self._validate_event_name(event)
                 self.listeners[event_name].extend(list(callbacks))
 
-        self.train_metric_tracker = TaskMetricTracker(
-            task=self.task,
-            config=self.config,
+        self._ema_offload_ctx = EMAOffloadContext(
+            main_model=self.model,
+            ema_model=self.ema_model,
             device=self.device,
             logger=self.logger,
-            avg_bank=avg_bank,
+            allow_auto_offload=allow_auto_offload,
         )
-        self.use_tensor_bank = self.train_metric_tracker.use_tensor_bank
-
-        self._use_model_offload = False
-        if self.ema_model is not None:
-            self._use_model_offload = _should_enable_offload(self.device, self.model, self.logger)
 
     def _validate_event_name(self, event: Union[str, EventType]) -> str:
         event_name = event.value if isinstance(event, EventType) else str(event)
         if event_name not in self.listeners:
             allowed_events = ", ".join(sorted(self.listeners.keys()))
             raise ValueError(
-                f"Unknown event: {event_name}. Register it in EventType first. "
-                f"Allowed events: {allowed_events}"
+                f"Unknown event: {event_name}. Register it in EventType first. " f"Allowed events: {allowed_events}"
             )
         return event_name
 
@@ -221,22 +123,28 @@ class RunningAgent:
         event_name = self._validate_event_name(event)
         self.listeners[event_name].append(listener)
 
-    def _trigger(self, event: str, context: EventContext, snapshot: bool = True) -> EventContext:  # noqa: ARG002
+    def _check_run_period(self, interval: Optional[int], is_epoch_end: bool) -> bool:
+        return _is_periodic_trigger(
+            run_mode=self.config.run_mode,
+            interval=interval,
+            global_step=self.state.global_step,
+            epoch=self.state.epoch,
+            is_epoch_end=is_epoch_end,
+        )
+
+    def _trigger(self, event: str, snapshot: bool = True, **kwargs) -> None:
+        """Trigger an event, building context from kwargs."""
         listeners = self.listeners.get(event)
         if not listeners:
-            return context
+            return
 
-        if snapshot:
-            # Snapshot state to avoid post-hook mutations affecting already-emitted event records.
-            context = copy.copy(context)
-            context.state = copy.deepcopy(context.state)
-
-        context.max_epochs = self.config.max_epochs
-        context.max_steps = self.config.max_steps
+        state_to_pass = copy.deepcopy(self.state) if snapshot else self.state
+        context = EventContext(
+            state=state_to_pass, max_epochs=self.config.max_epochs, max_steps=self.config.max_steps, **kwargs
+        )
 
         for listener in listeners:
             listener(context)
-        return context
 
     def _has_listener(self, event: str) -> bool:
         return bool(self.listeners.get(event))
@@ -252,38 +160,34 @@ class RunningAgent:
         return out, batch_data
 
     def _start_new_epoch(self):
-        self.train_metric_tracker.reset_tensor_cache()
+        if self.train_tensor_bank:
+            self.train_tensor_bank.reset()
 
         if self.config.distributed and hasattr(self.train_loader.sampler, "set_epoch"):
             self.train_loader.sampler.set_epoch(self.state.epoch)
 
-        self._trigger(
-            "on_epoch_start",
-            context=EventContext(state=self.state, total_batches=len(self.train_loader), stage="train"),
-        )
+        self._trigger("on_epoch_start", total_batches=len(self.train_loader), stage="train")
 
     def _handle_epoch_end(self):
-        epoch_metrics = self.train_metric_tracker.compute_epoch_metrics(reset_after_compute=True)
+        epoch_metrics = self.train_avg_bank.gather_average(self.config.distributed)
+        if self.use_tensor_bank and self.train_tensor_bank:
+            gathered_cache = self.train_tensor_bank.gather(self.config.distributed, self.device)
+            task_epoch_metrics = self.task.epoch_metric(gathered_cache)
+            if task_epoch_metrics:
+                epoch_metrics.update(task_epoch_metrics)
+        self.train_avg_bank.reset()
+        if self.train_tensor_bank:
+            self.train_tensor_bank.reset()
+
         self.state.update_current_metrics(epoch_metrics)
-        self._trigger("on_epoch_end", context=EventContext(state=self.state))
+        self._trigger("on_epoch_end")
         self.state.epoch += 1
         self.state.batch_idx_in_epoch = 0
 
-    def train_batch(self, batch_data) -> Dict[str, Any]:
-        return self._train_one_batch(batch_data, emit_events=False)
-
     def evaluate(self, model: nn.Module = None, use_ema: bool = False) -> Dict[str, Any]:
         base_model = model or self.model
-        use_offload = self._use_model_offload and (base_model is self.model)
 
-        with EMAOffloadContext(
-            main_model=base_model,
-            ema_model=self.ema_model,
-            device=self.device,
-            use_ema=use_ema,
-            use_offload=use_offload,
-            logger=self.logger,
-        ) as eval_model:
+        with self._ema_offload_ctx(model=base_model, use_ema=use_ema) as eval_model:
             return self._evaluate_model(eval_model)
 
     def _evaluate_loaders(self, model: nn.Module) -> Dict[str, Any]:
@@ -326,15 +230,14 @@ class RunningAgent:
         model.eval()
         total_batches = len(data_loader)
 
-        eval_tracker = TaskMetricTracker(
-            task=self.task,
-            config=self.config,
-            device=self.device,
-            logger=self.logger,
-        )
+        eval_avg_bank = AvgBank()
+        has_batch_cache = self.task.has_implemented("batch_cache")
+        has_epoch_metric = self.task.has_implemented("epoch_metric")
+        use_tensor_bank_for_eval = has_batch_cache and has_epoch_metric
+        eval_tensor_bank = TensorBank(logger=self.logger) if use_tensor_bank_for_eval else None
+
         has_progress_tick = self._has_listener("on_progress_tick")
-        should_emit_batch = self._has_listener("on_batch_end")
-        should_calc_avg = has_progress_tick or should_emit_batch
+        should_calc_avg = has_progress_tick
 
         try:
             with torch.no_grad():
@@ -343,34 +246,42 @@ class RunningAgent:
                     out, batch_data = self._forward_batch(model, batch_data)
 
                     raw_batch_metrics = self.task.batch_metric(out, batch_data)
-                    scalar_batch_metrics, weighted_items = _extract_batch_metric_views(raw_batch_metrics)
-                    eval_tracker.add_weighted_metrics(weighted_items)
-                    eval_tracker.update_cache(out, batch_data)
+                    eval_avg_bank.update_from_dict(raw_batch_metrics)
+                    if eval_tensor_bank:
+                        eval_tensor_bank.add(self.task.batch_cache(out, batch_data))
 
-                    avg_metrics = eval_tracker.to_dict() if should_calc_avg else None
-                    if should_emit_batch:
-                        batch_context = EventContext(
-                            state=self.state,
-                            batch_idx=batch_idx,
-                            total_batches=total_batches,
-                            batch_metrics=raw_batch_metrics,
-                            avg_bank=avg_metrics,
-                            stage=stage,
-                        )
-                        self._trigger("on_batch_end", context=batch_context)
+                    scalar_batch_metrics = _get_scalar_metrics(raw_batch_metrics)
+                    avg_metrics = eval_avg_bank.to_dict(self.config.distributed) if should_calc_avg else None
+
+                    self._trigger(
+                        "on_batch_end",
+                        batch_idx=batch_idx,
+                        total_batches=total_batches,
+                        batch_metrics=raw_batch_metrics,
+                        avg_bank=avg_metrics,
+                        stage=stage,
+                    )
 
                     if has_progress_tick:
-                        progress_context = EventContext(
-                            state=self.state,
+                        self._trigger(
+                            "on_progress_tick",
                             batch_idx=batch_idx,
                             total_batches=total_batches,
                             batch_metrics=scalar_batch_metrics,
                             avg_bank=avg_metrics,
                             stage=stage,
                         )
-                        self._trigger("on_progress_tick", context=progress_context)
 
-            avg_metrics = eval_tracker.compute_epoch_metrics(reset_after_compute=True)
+            avg_metrics = eval_avg_bank.gather_average(self.config.distributed)
+            if use_tensor_bank_for_eval and eval_tensor_bank:
+                gathered_cache = eval_tensor_bank.gather(self.config.distributed, self.device)
+                task_epoch_metrics = self.task.epoch_metric(gathered_cache)
+                if task_epoch_metrics:
+                    avg_metrics.update(task_epoch_metrics)
+            eval_avg_bank.reset()
+            if eval_tensor_bank:
+                eval_tensor_bank.reset()
+
             prefixed_metrics = {f"{prefix}_{key}": value for key, value in avg_metrics.items()}
             prefixed_metrics[f"{prefix}_metric"] = self.task.post_metrics_to_value(avg_metrics)
             return prefixed_metrics
@@ -408,10 +319,7 @@ class RunningAgent:
     def _run_evaluation_and_update(self, signal: LoopSignal) -> None:
         total_eval_batches = sum(len(loader) for loader in (self.val_loader, self.test_loader) if loader is not None)
 
-        self._trigger(
-            "on_eval_start",
-            context=EventContext(state=self.state, stage="eval", total_batches=total_eval_batches, signal=signal),
-        )
+        self._trigger("on_eval_start", stage="eval", total_batches=total_eval_batches, signal=signal)
 
         interval_metrics = self.interval_avg_bank.gather_average(self.config.distributed)
         self.interval_avg_bank = AvgBank()
@@ -425,17 +333,15 @@ class RunningAgent:
 
         self.state.update_current_metrics(eval_results)
 
-        self._trigger(
-            "on_eval_end",
-            context=EventContext(state=self.state, stage="eval", eval_results=eval_results, signal=signal),
-        )
+        self._trigger("on_eval_end", stage="eval", eval_results=eval_results, signal=signal)
 
         is_best, previous_best = self._update_best_model_state(eval_results)
         if is_best:
             self._request_checkpoint("best", signal=signal)
 
-        validation_context = EventContext(
-            state=self.state,
+        self._trigger(
+            "on_validation_end",
+            snapshot=False,
             stage="eval",
             eval_results=eval_results,
             previous_best=previous_best,
@@ -443,7 +349,6 @@ class RunningAgent:
             best_model_tracker=self.best_model_tracker,
             signal=signal,
         )
-        self._trigger("on_validation_end", context=validation_context, snapshot=False)
 
     def _request_checkpoint(
         self,
@@ -457,40 +362,28 @@ class RunningAgent:
         target_signal = signal or self._ad_hoc_signal
         while target_signal.pending_checkpoint_types:
             checkpoint_type = target_signal.pending_checkpoint_types.pop(0)
-            request_context = EventContext(
-                state=self.state,
-                checkpoint_type=checkpoint_type,
-                signal=target_signal,
-            )
-            self._trigger("on_checkpoint_request", context=request_context, snapshot=False)
 
-            if request_context.checkpoint_path is None:
+            self._trigger(
+                "on_checkpoint_request",
+                snapshot=False,
+                signal=target_signal,
+                checkpoint_type=checkpoint_type,
+            )
+
+            checkpoint_path = target_signal.checkpoint_path
+            if checkpoint_path is None:
                 continue
 
             if checkpoint_type == "best":
-                self.state.best_ckp_file = Path(request_context.checkpoint_path).name
+                self.state.best_ckp_file = Path(checkpoint_path).name
 
-            self._trigger(
-                "on_checkpoint_save",
-                context=EventContext(
-                    state=self.state,
-                    checkpoint_type=checkpoint_type,
-                    checkpoint_path=request_context.checkpoint_path,
-                    signal=target_signal,
-                ),
-            )
+            # Reset checkpoint_path for the next listener to use
+            target_signal.checkpoint_path = None
 
     def _handle_periodic_events(self, is_epoch_end: bool) -> bool:
         signal = LoopSignal()
 
-        is_eval_trigger = _is_periodic_trigger(
-            run_mode=self.config.run_mode,
-            interval=self.config.eval_interval,
-            global_step=self.state.global_step,
-            epoch=self.state.epoch,
-            is_epoch_end=is_epoch_end,
-        )
-
+        is_eval_trigger = self._check_run_period(self.config.eval_interval, is_epoch_end)
         if is_eval_trigger:
             self.logger.debug(
                 f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
@@ -498,13 +391,7 @@ class RunningAgent:
             )
             self._run_evaluation_and_update(signal)
 
-        is_save_trigger = _is_periodic_trigger(
-            run_mode=self.config.run_mode,
-            interval=self.config.save_interval,
-            global_step=self.state.global_step,
-            epoch=self.state.epoch,
-            is_epoch_end=is_epoch_end,
-        )
+        is_save_trigger = self._check_run_period(self.config.save_interval, is_epoch_end)
         if is_save_trigger:
             self._request_checkpoint("regular", signal=signal)
 
@@ -514,7 +401,7 @@ class RunningAgent:
         if signal.should_stop:
             stop_message = signal.stop_message or "Early stopping triggered."
             self.logger.info(stop_message)
-            self._trigger("on_early_stop", context=EventContext(state=self.state, signal=signal))
+            self._trigger("on_early_stop", signal=signal)
             return True
 
         return False
@@ -552,21 +439,15 @@ class RunningAgent:
         batch_start_time = time.time()
 
         if emit_events:
-            self._trigger(
-                "on_batch_start",
-                context=EventContext(
-                    state=state,
-                    batch_idx=batch_idx,
-                    total_batches=total_batches,
-                ),
-            )
+            self._trigger("on_batch_start", batch_idx=batch_idx, total_batches=total_batches)
 
         batch_data = self._prepare_batch(batch_data)
         out, batch_data = self._forward_batch(self.model, batch_data)
 
         raw_batch_metrics = self.task.batch_metric(out, batch_data)
-        batch_metrics, weighted_items = _extract_batch_metric_views(raw_batch_metrics)
-        self.train_metric_tracker.update_cache(out, batch_data)
+        batch_metrics = _get_scalar_metrics(raw_batch_metrics)
+        if self.train_tensor_bank:
+            self.train_tensor_bank.add(self.task.batch_cache(out, batch_data))
 
         losses = self.task.batch_loss(out, batch_data, self.loss_fn)
         loss_tensor, _loss_cnt = losses.get("loss", (None, 1))
@@ -585,7 +466,6 @@ class RunningAgent:
 
             loss_value = float(loss_tensor.item())
             batch_metrics["loss"] = loss_value
-            weighted_items.append(("loss", loss_value, 1.0))
 
         if not emit_events:
             return batch_metrics
@@ -593,40 +473,37 @@ class RunningAgent:
         batch_time = time.time() - batch_start_time
         state.total_train_time += batch_time
         batch_metrics["batch_time"] = batch_time
-        weighted_items.append(("batch_time", float(batch_time), 1.0))
 
-        self.train_metric_tracker.add_weighted_metrics(weighted_items)
-        for key, metric_value, metric_count in weighted_items:
-            self.interval_avg_bank.add(key, metric_value, metric_count)
+        self.train_avg_bank.update_from_dict(raw_batch_metrics)
+        self.interval_avg_bank.update_from_dict(raw_batch_metrics)
+        if "loss" in batch_metrics:
+            self.train_avg_bank.add("loss", batch_metrics["loss"], 1.0)
+            self.interval_avg_bank.add("loss", batch_metrics["loss"], 1.0)
+        self.train_avg_bank.add("batch_time", batch_time, 1.0)
+        self.interval_avg_bank.add("batch_time", batch_time, 1.0)
 
         current_lr = self.optimizer.param_groups[0]["lr"] if self.optimizer else None
         self._step_warmup_and_maintenance()
 
         is_update_tick = state.batch_idx_in_epoch % self.config.print_freq == 0
         is_update_tick = is_update_tick or state.batch_idx_in_epoch == total_batches
-        has_batch_end = self._has_listener("on_batch_end")
-        has_train_batch_end = self._has_listener("on_train_batch_end")
-        if has_batch_end or has_train_batch_end:
-            batch_context = EventContext(
-                state=state,
-                batch_idx=batch_idx,
-                total_batches=total_batches,
-                batch_metrics=batch_metrics,
-                lr=current_lr,
-                stage="train",
-            )
-            if has_batch_end:
-                self._trigger("on_batch_end", context=batch_context)
-            if has_train_batch_end:
-                self._trigger("on_train_batch_end", context=batch_context)
+
+        common_args = dict(
+            batch_idx=batch_idx,
+            total_batches=total_batches,
+            batch_metrics=batch_metrics,
+            lr=current_lr,
+            stage="train",
+        )
+        self._trigger("on_batch_end", **common_args)
+        self._trigger("on_train_batch_end", **common_args)
 
         has_progress_tick = self._has_listener("on_progress_tick")
         has_table_update = is_update_tick and self._has_listener("on_table_update")
         should_need_progress_avg = has_progress_tick or has_table_update
         if should_need_progress_avg:
-            progress_avg_metrics = self.train_metric_tracker.to_dict()
-            progress_context = EventContext(
-                state=state,
+            progress_avg_metrics = self.train_avg_bank.to_dict(self.config.distributed)
+            common_progress_args = dict(
                 batch_idx=batch_idx,
                 total_batches=total_batches,
                 batch_metrics=batch_metrics,
@@ -635,9 +512,9 @@ class RunningAgent:
                 stage="train",
             )
             if has_progress_tick:
-                self._trigger("on_progress_tick", context=progress_context)
+                self._trigger("on_progress_tick", **common_progress_args)
             if has_table_update:
-                self._trigger("on_table_update", context=progress_context)
+                self._trigger("on_table_update", **common_progress_args)
 
         return batch_metrics
 
@@ -692,3 +569,5 @@ class RunningAgent:
                 self.logger.info(f"Reached max_epochs={max_epochs_limit}")
 
         return early_stopped
+
+

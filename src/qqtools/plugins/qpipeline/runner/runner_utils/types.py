@@ -5,6 +5,7 @@ from types import MappingProxyType
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
+
 from qqtools.torch import qdist
 
 __all__ = [
@@ -146,6 +147,7 @@ class LoopSignal:
     should_stop: bool = False
     stop_message: Optional[str] = None
     pending_checkpoint_types: List[Literal["best", "regular"]] = field(default_factory=list)
+    checkpoint_path: Optional[str] = None
 
     def request_checkpoint(self, checkpoint_type: Literal["best", "regular"]) -> None:
         if checkpoint_type not in ("best", "regular"):
@@ -229,7 +231,6 @@ class EventType(Enum):
     ON_EVAL_END = "on_eval_end"
     ON_VALIDATION_END = "on_validation_end"
     ON_CHECKPOINT_REQUEST = "on_checkpoint_request"
-    ON_CHECKPOINT_SAVE = "on_checkpoint_save"
     ON_EARLY_STOP = "on_early_stop"
 
 
@@ -243,7 +244,6 @@ class EventContext:
     avg_bank: Optional[Dict[str, Any]] = None
     lr: Optional[float] = None
     eval_results: Optional[Dict[str, Any]] = None
-    checkpoint_path: Optional[str] = None
     checkpoint_type: Optional[str] = None
     stage: Optional[str] = None  # Current stage: "training", "validation", "testing"
     previous_best: Optional[Dict[str, Any]] = None

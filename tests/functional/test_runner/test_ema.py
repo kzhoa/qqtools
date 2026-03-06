@@ -1,17 +1,22 @@
 import argparse
+from unittest.mock import MagicMock, patch
 
 import pytest
-from unittest.mock import MagicMock
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
+
 from qqtools.plugins.qpipeline.entry_utils.qema import qEMA
-from qqtools.plugins.qpipeline.runner.runner import RunningAgent, train_runner
-from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunningState
+from qqtools.plugins.qpipeline.runner import runner as runner_module
+from qqtools.plugins.qpipeline.runner.runner_utils import ema_context as ema_context_module
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
+
+RunningAgent = runner_module.RunningAgent
+train_runner = runner_module.train_runner
+RunConfig = runner_module.RunConfig
+
 
 # --- Mocking necessary classes and functions for isolated testing ---
 
@@ -64,6 +69,34 @@ class SimpleTask(qTaskBase):
     def post_metrics_to_value(self, metrics):
         # Follow qTaskBase contract: must return scalar.
         return float(metrics.get("dummy_metric", 0.0))
+
+
+def _build_agent_for_offload_tests(
+    allow_auto_offload: bool,
+    device: torch.device = torch.device("cpu"),
+):
+    model = SimpleModel().to(device)
+    optimizer = optim.SGD(model.parameters(), lr=0.01)
+    loss_fn = nn.MSELoss()
+    task = SimpleTask()
+    config = RunConfig(
+        device=device,
+        max_epochs=1,
+        eval_interval=1,
+    )
+    ema_model = qEMA(model, decay=0.999, device=device)
+    agent = RunningAgent(
+        model=model,
+        task=task,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        config=config,
+        device=device,
+        ema_model=ema_model,
+        allow_auto_offload=allow_auto_offload,
+        logger=MagicMock(),
+    )
+    return agent, model, ema_model, device
 
 
 # --- Test Functions ---
@@ -159,6 +192,51 @@ def test_ema_update_and_evaluation(setup_agent_with_ema):
     assert agent.device == device
     assert next(model.parameters()).device == device
     assert next(ema_model.module.parameters()).device == device
+
+
+def test_auto_offload_detector_called_once_on_agent_init(monkeypatch):
+    calls = []
+
+    def _fake_should_enable_offload(device, model, logger):
+        calls.append((device, model, logger))
+        return True
+
+    monkeypatch.setattr(ema_context_module, "_should_enable_offload", _fake_should_enable_offload)
+
+    agent, model, _, device = _build_agent_for_offload_tests(allow_auto_offload=True)
+
+    assert len(calls) == 1
+    assert calls[0][0] == device
+    assert calls[0][1] is model
+    assert calls[0][2] is agent.logger
+    assert agent._ema_offload_ctx._auto_offload_enabled is True
+
+
+def test_disable_auto_offload_skips_detector_and_never_offloads(monkeypatch):
+    def _raise_if_called(*args, **kwargs):
+        raise AssertionError("_should_enable_offload should not be called when auto offload is disabled")
+
+    monkeypatch.setattr(ema_context_module, "_should_enable_offload", _raise_if_called)
+
+    agent, model, _, _ = _build_agent_for_offload_tests(allow_auto_offload=False)
+
+    with patch.object(model, "cpu", wraps=model.cpu) as cpu_spy:
+        agent.evaluate(use_ema=True)
+
+    cpu_spy.assert_not_called()
+    assert agent._ema_offload_ctx._auto_offload_enabled is False
+
+
+def test_non_main_model_eval_does_not_offload_main_model(monkeypatch):
+    monkeypatch.setattr(ema_context_module, "_should_enable_offload", lambda device, model, logger: True)
+
+    agent, model, _, device = _build_agent_for_offload_tests(allow_auto_offload=True)
+    external_model = SimpleModel().to(device)
+
+    with patch.object(model, "cpu", wraps=model.cpu) as cpu_spy:
+        agent.evaluate(model=external_model, use_ema=True)
+
+    cpu_spy.assert_not_called()
 
 
 def test_best_snapshot_uses_ema_prefixed_metrics_when_target_is_ema_val_metric(tmp_path):

@@ -248,4 +248,5 @@ class CheckpointListener:
             self.best_model_tracker,
             is_best=(checkpoint_type == "best"),
         )
-        context.checkpoint_path = ckp_path
+        if context.signal:
+            context.signal.checkpoint_path = ckp_path

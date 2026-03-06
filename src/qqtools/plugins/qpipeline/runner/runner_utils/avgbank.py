@@ -1,7 +1,8 @@
 import warnings
 
-import qqtools as qt
 import torch
+
+import qqtools as qt
 from qqtools import qdist
 
 
@@ -49,11 +50,25 @@ class AvgBank(object):
         self.key_order = None
         self._default_key_order = []
 
+    def reset(self):
+        """Clear all tracked averages and ordering state."""
+        self.avgMeters = dict()
+        self.key_order = None
+        self._default_key_order = []
+
     def add(self, key, value, num=1):
         if key not in self.avgMeters:
             self.avgMeters[key] = AverageMeter()
             self._default_key_order.append(key)  # default: FCFS
         self.avgMeters[key].update(value, num)
+
+    def update_from_dict(self, metrics: dict):
+        """Update metrics from a dict, supporting scalar or (val, count) format."""
+        for k, v in metrics.items():
+            if isinstance(v, (tuple, list)) and len(v) >= 2:
+                self.add(k, v[0], v[1])
+            else:
+                self.add(k, v, 1.0)
 
     def keys(self):
         return list(self.avgMeters.keys())
@@ -93,3 +108,4 @@ class AvgBank(object):
     def toDict(self, ddp) -> dict:
         """For compatibility"""
         return self.to_dict(ddp)
+

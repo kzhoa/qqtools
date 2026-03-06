@@ -124,6 +124,7 @@ def train_runner(
     eval_interval: int = 1,
     save_interval: Optional[int] = None,
     log_granularity: Optional[List[Literal["eval", "batch"]]] = ["eval"],
+    allow_auto_offload: bool = False,
 ) -> Dict[str, Any]:
     """
     Unified training runner
@@ -149,6 +150,7 @@ def train_runner(
         run_mode: Running mode ("epoch" or "step")
         eval_interval: Evaluation interval (interpreted as epochs or steps depending on run_mode)
         save_interval: Regular checkpoint saving interval (interpreted as epochs or steps depending on run_mode)
+        allow_auto_offload: Whether to enable automatic EMA/model offload policy
 
     Returns:
         Dictionary with training results
@@ -257,6 +259,7 @@ def train_runner(
         config=config,
         device=device,
         ema_model=ema_model,
+        allow_auto_offload=allow_auto_offload,
         logger=logger,
     )
 
@@ -513,3 +516,4 @@ def infer_runner(
         raise
 
     return all_results
+

@@ -13,6 +13,21 @@ from torch.utils.data import DataLoader, TensorDataset
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
 
 
+def _reset_avg_bank(self):
+    self.avgMeters = dict()
+    self.key_order = None
+    self._default_key_order = []
+
+
+@pytest.fixture(autouse=True)
+def ensure_avgbank_reset(monkeypatch):
+    from qqtools.plugins.qpipeline.runner import agent as runner_agent
+    from qqtools.plugins.qpipeline.runner.runner_utils import avgbank as avgbank_module
+
+    monkeypatch.setattr(avgbank_module.AvgBank, "reset", _reset_avg_bank, raising=False)
+    monkeypatch.setattr(runner_agent.AvgBank, "reset", _reset_avg_bank, raising=False)
+
+
 class SimpleTask(qTaskBase):
     """Simple task mock for runner tests"""
 
@@ -127,3 +142,5 @@ def cleanup_logging_handlers():
         for handler in logger.handlers[:]:
             handler.close()
             logger.removeHandler(handler)
+
+
