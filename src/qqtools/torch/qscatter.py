@@ -56,7 +56,7 @@ def scatter(
         #   - When num_nodes < 500  on CPU
         #   - When num_nodes > 10000 on GPU
         # Performance is comparable in intermediate scenarios.
-        # see `tests/speed/qscatter/test_qscatter_mean.py` for details.
+        # see `perf/speed/qscatter/test_qscatter_mean.py` for details.
         count = ref.new_zeros(dim_size)
         count.scatter_add_(0, index, ref.new_ones(ref.size(dim)))
         count = count.clamp(min=1)

@@ -13,8 +13,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from qqtools.plugins.qpipeline.runner import agent as agent_module
 from qqtools.plugins.qpipeline.qlogger import qLogger
+from qqtools.plugins.qpipeline.runner import agent as agent_module
 from qqtools.plugins.qpipeline.runner.runner import (
     RunningAgent,
     SheetLoggerListener,
@@ -149,8 +149,50 @@ class TestTrainingAgent:
         )
         assert agent.optimizer is optimizer
 
+    def test_tensor_bank_auto_enabled_when_task_has_both_interfaces(self):
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        logger = Mock()
+        task = SimpleTask(num_samples=16, num_features=10)
+        task.has_implemented = Mock(side_effect=lambda name: name in {"batch_cache", "epoch_metric"})
+
+        agent = RunningAgent(
+            model=self.model,
+            task=task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            config=RunConfig(),
+            device=self.device,
+            logger=logger,
+        )
+
+        assert agent.use_tensor_bank is True
+        assert agent.train_tensor_bank is not None
+        logger.warning.assert_not_called()
+
+    def test_tensor_bank_auto_disabled_when_task_has_partial_interfaces(self):
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        logger = Mock()
+        task = SimpleTask(num_samples=16, num_features=10)
+        task.has_implemented = Mock(side_effect=lambda name: name == "batch_cache")
+
+        agent = RunningAgent(
+            model=self.model,
+            task=task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            config=RunConfig(),
+            device=self.device,
+            logger=logger,
+        )
+
+        assert agent.use_tensor_bank is False
+        assert agent.train_tensor_bank is None
+        logger.warning.assert_called_once()
+
     def test_train_batch(self):
-        """Test train_batch method"""
+        """Test _train_one_batch method"""
         loss_fn = nn.MSELoss()
         optimizer = optim.Adam(self.model.parameters(), lr=0.001)
 
@@ -166,7 +208,7 @@ class TestTrainingAgent:
 
         batch_data, batch_target = next(iter(self.task.train_loader))
         batch = (batch_data, batch_target)
-        metrics = agent.train_batch(batch)
+        metrics = agent._train_one_batch(batch, emit_events=False)
 
         assert "loss" in metrics
         assert metrics["loss"] > 0
@@ -215,8 +257,9 @@ class TestTrainingAgent:
         agent.add_listener("on_validation_end", _listener)
         agent._trigger(
             "on_validation_end",
-            context=EventContext(state=agent.state, signal=signal, eval_results={"val_metric": 1.0}),
             snapshot=False,
+            signal=signal,
+            eval_results={"val_metric": 1.0},
         )
 
         assert agent.state.epoch == 999
@@ -237,6 +280,21 @@ class TestTrainingAgent:
 
         with pytest.raises(ValueError, match="Unknown event: on_custom_event"):
             agent.add_listener("on_custom_event", lambda context: None)
+
+    def test_add_listener_rejects_removed_checkpoint_save_event(self):
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            config=RunConfig(),
+            device=self.device,
+        )
+
+        with pytest.raises(ValueError, match="Unknown event: on_checkpoint_save"):
+            agent.add_listener("on_checkpoint_save", lambda context: None)
 
     def test_constructor_rejects_unknown_listener_event(self):
         loss_fn = nn.MSELoss()
@@ -262,7 +320,6 @@ class TestTrainingAgent:
         checkpoint_manager = Mock()
         checkpoint_manager.save.return_value = "regular.pt"
         logger = Mock()
-        on_checkpoint_save = Mock()
 
         checkpoint_listener = CheckpointListener(
             checkpoint_manager=checkpoint_manager,
@@ -281,17 +338,14 @@ class TestTrainingAgent:
             logger=logger,
         )
         agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
-        agent.add_listener("on_checkpoint_save", on_checkpoint_save)
 
         agent._request_checkpoint("regular")
         agent._flush_checkpoint_requests()
 
         save_kwargs = checkpoint_manager.save.call_args.kwargs
         assert save_kwargs["is_best"] is False
-        on_checkpoint_save.assert_called_once()
-        checkpoint_context = on_checkpoint_save.call_args[0][0]
-        assert checkpoint_context.checkpoint_type == "regular"
-        assert checkpoint_context.checkpoint_path == "regular.pt"
+        assert checkpoint_manager.save.call_count == 1
+        assert agent.state.best_ckp_file is None
 
     def test_save_best_checkpoint_calls_manager_with_best_flag(self):
         loss_fn = nn.MSELoss()
@@ -299,7 +353,6 @@ class TestTrainingAgent:
         checkpoint_manager = Mock()
         checkpoint_manager.save.return_value = "best.pt"
         logger = Mock()
-        on_checkpoint_save = Mock()
 
         checkpoint_listener = CheckpointListener(
             checkpoint_manager=checkpoint_manager,
@@ -318,17 +371,15 @@ class TestTrainingAgent:
             logger=logger,
         )
         agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
-        agent.add_listener("on_checkpoint_save", on_checkpoint_save)
 
         agent._request_checkpoint("best")
         agent._flush_checkpoint_requests()
 
         save_kwargs = checkpoint_manager.save.call_args.kwargs
         assert save_kwargs["is_best"] is True
-        on_checkpoint_save.assert_called_once()
-        checkpoint_context = on_checkpoint_save.call_args[0][0]
-        assert checkpoint_context.checkpoint_type == "best"
-        assert checkpoint_context.checkpoint_path == "best.pt"
+        assert checkpoint_manager.save.call_count == 1
+        assert agent.state.best_ckp_file == "best.pt"
+
 # ============================================================================
 # Integration Tests for train_runner
 # ============================================================================
@@ -423,6 +474,73 @@ class TestTrainRunner:
             assert result["final_step"] >= 10
             assert result["best_monitored_key"] == "val_metric"
             assert result["best_monitored_metric"] is not None
+
+    def test_train_runner_auto_offload_default_is_false(self, monkeypatch):
+        captured = {}
+
+        class _FakeAgent:
+            def __init__(self, *args, allow_auto_offload=True, **kwargs):  # noqa: ARG002
+                captured["allow_auto_offload"] = allow_auto_offload
+                self.state = RunningState()
+                self.best_model_tracker = Mock()
+
+            def add_listener(self, *args, **kwargs):  # noqa: ARG002
+                return None
+
+            def run(self):
+                return False
+
+        monkeypatch.setattr("qqtools.plugins.qpipeline.runner.runner.RunningAgent", _FakeAgent)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components()
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=1,
+                eval_interval=1,
+                save_dir=tmpdir,
+                run_mode="epoch",
+            )
+
+        assert captured["allow_auto_offload"] is False
+
+    def test_train_runner_auto_offload_can_be_enabled(self, monkeypatch):
+        captured = {}
+
+        class _FakeAgent:
+            def __init__(self, *args, allow_auto_offload=True, **kwargs):  # noqa: ARG002
+                captured["allow_auto_offload"] = allow_auto_offload
+                self.state = RunningState()
+                self.best_model_tracker = Mock()
+
+            def add_listener(self, *args, **kwargs):  # noqa: ARG002
+                return None
+
+            def run(self):
+                return False
+
+        monkeypatch.setattr("qqtools.plugins.qpipeline.runner.runner.RunningAgent", _FakeAgent)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components()
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=1,
+                eval_interval=1,
+                save_dir=tmpdir,
+                run_mode="epoch",
+                allow_auto_offload=True,
+            )
+
+        assert captured["allow_auto_offload"] is True
 
     def test_train_runner_writes_eval_sheetdata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -689,7 +807,6 @@ class TestConfigAndMode:
         assert config.run_mode == RunMode.EPOCH
 
 
-
 class TestTrainRunnerPolicy:
     """Test policy resolution and boundary validation for train_runner."""
 
@@ -866,11 +983,10 @@ class TestRunningAgentPerformanceOptimizations:
             device=self.device,
         )
 
-    def test_trigger_fast_path_returns_context_when_no_listener(self):
+    def test_trigger_does_not_return_context(self):
         agent = self._build_agent(max_steps=1)
-        context = EventContext(state=agent.state)
-        returned_context = agent._trigger("on_batch_end", context)
-        assert returned_context is context
+        returned_context = agent._trigger("on_batch_end")
+        assert returned_context is None
 
     def test_eval_loop_skips_context_build_when_no_target_listener(self, monkeypatch):
         agent = self._build_agent(max_steps=1)
@@ -929,6 +1045,11 @@ class TestRunningAgentPerformanceOptimizations:
         assert "val_metric" in fast_results
         assert "val_metric" in slow_results
 
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+
+
 
