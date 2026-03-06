@@ -3,6 +3,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from ...entry_utils.info import get_model_size_bytes
 from ...entry_utils.qema import qEMA
 from ...qlogger import qLogger
 
@@ -11,8 +12,6 @@ def _should_enable_offload(device: torch.device, model: nn.Module, logger: Optio
     """Check if model offloading should be enabled based on GPU capacity."""
     if device.type != "cuda":
         return False
-
-    from ...entry_utils.info import get_model_size_bytes
 
     model_size_bytes = get_model_size_bytes(model)
     try:
