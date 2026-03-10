@@ -45,7 +45,7 @@ def _build_context(
 
 def main():
     logger = ConsoleLogger(level=logging.INFO)
-    listener = EvalSummaryListener(logger=logger, target_key="val_metric", target_mode="min")
+    listener = EvalSummaryListener(logger=logger, target_key="val_metric", target_mode="min", save_dir="./logs")
 
     print("\n========== Scenario 1: NOT_BEST ==========")
     state = RunningState(epoch=23, global_step=82487)

@@ -1,8 +1,10 @@
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import qqtools as qt
 
+from .ckp_manager import generate_checkpoint_filename
 from .types import EventContext
 
 
@@ -250,6 +252,8 @@ class EvalFormatter:
         target_val: Any,
         best_info: Dict[str, Any],
         grouped: Dict[str, Dict[str, Dict[str, Any]]],
+        regular_checkpoint_path: Optional[str],
+        new_best_checkpoint_path: Optional[str],
         color_new_best: bool,
     ) -> Tuple[List[str], bool]:
         target_str = cls._format_metric_value(target_val, target_key) if target_val is not None else "n/a"
@@ -353,6 +357,10 @@ class EvalFormatter:
             lines.append("(*) marks the primary target metric in Others.")
         else:
             lines.append("(*) primary target is unavailable in current eval results.")
+
+        lines.append(f"Regular checkpoint write path: {regular_checkpoint_path or 'n/a'}")
+        if best_info["status"] == "NEW_BEST":
+            lines.append(f"New best checkpoint write path: {new_best_checkpoint_path or 'n/a'}")
         return lines, has_markup
 
     @classmethod
@@ -366,6 +374,8 @@ class EvalFormatter:
         is_best: bool,
         previous_best: Optional[Dict[str, Any]],
         best_model_tracker: Optional[Any],
+        regular_checkpoint_path: Optional[str] = None,
+        new_best_checkpoint_path: Optional[str] = None,
         color_new_best: bool = True,
     ) -> Tuple[List[str], bool, List[str], bool]:
         target_val = eval_results.get(target_key)
@@ -394,6 +404,8 @@ class EvalFormatter:
             target_val=target_val,
             best_info=best_info,
             grouped=grouped,
+            regular_checkpoint_path=regular_checkpoint_path,
+            new_best_checkpoint_path=new_best_checkpoint_path,
             color_new_best=color_new_best,
         )
         return summary_lines, summary_has_markup, table_lines, table_has_markup
@@ -408,16 +420,33 @@ class EvalSummaryListener:
         logger: Any,
         target_key: str = "val_metric",
         target_mode: str = "min",
+        save_dir: Optional[str] = None,
         color_new_best: bool = True,
     ) -> None:
         self.logger = logger
         self.target_key = target_key
         self.target_mode = target_mode
+        self.save_dir = save_dir
         self.color_new_best = color_new_best
 
     def on_validation_end(self, context: EventContext) -> None:
         eval_results = context.eval_results or {}
         state = context.state
+        epoch = getattr(state, "epoch", 0)
+        step = getattr(state, "global_step", 0)
+
+        save_dir = self.save_dir or getattr(self.logger, "log_dir", None)
+        regular_checkpoint_path = None
+        new_best_checkpoint_path = None
+        if save_dir:
+            regular_checkpoint_path = str(
+                Path(save_dir) / generate_checkpoint_filename(epoch=epoch, global_step=step, is_best=False)
+            )
+            if bool(context.is_best):
+                new_best_checkpoint_path = str(
+                    Path(save_dir) / generate_checkpoint_filename(epoch=epoch, global_step=step, is_best=True)
+                )
+
         tracker_for_log = context.best_model_tracker or SimpleNamespace(
             mode=self.target_mode,
             best_metric=getattr(state, "best_monitored_metric", None),
@@ -427,13 +456,15 @@ class EvalSummaryListener:
 
         summary_lines, summary_has_markup, table_lines, table_has_markup = EvalFormatter.format_all(
             eval_results=eval_results,
-            epoch=getattr(state, "epoch", 0),
-            step=getattr(state, "global_step", 0),
+            epoch=epoch,
+            step=step,
             target_key=self.target_key,
             target_mode=self.target_mode,
             is_best=bool(context.is_best),
             previous_best=context.previous_best,
             best_model_tracker=tracker_for_log,
+            regular_checkpoint_path=regular_checkpoint_path,
+            new_best_checkpoint_path=new_best_checkpoint_path,
             color_new_best=self.color_new_best,
         )
 
