@@ -1,13 +1,14 @@
 # Unit Test TODOLIST
 
 Scope: identify modules not covered by `tests/unit` under local source (`PYTHONPATH=src`),
-excluding `src/qqtools/plugins` from this list.
+and track modules that should be covered by `tests/functional`.
 
 ## Classification Rule
 
-- **full**: modules under `src/qqtools/plugins/` (not listed in this file)
-- **standard**: modules that depend on optional std packages in `pyproject.toml` (`lmdb`, `tqdm`, `requests`)
 - **base**: modules that are not `full` and do not depend on the std optional packages above
+- **standard**: modules that depend on optional std packages in `pyproject.toml` (`lmdb`, `tqdm`, `requests`)
+- **full**: modules that require functional/integration tests under `tests/functional`
+  (including plugin-focused tests, multi-module integration tests, and user-side simulation tests)
 
 ## Base modules not covered (`0%` in `tests/unit`)
 
@@ -16,18 +17,21 @@ excluding `src/qqtools/plugins` from this list.
 
 - None
 
-
-## Full Modules not covered
-
-- `src/qqtools/cli/qcgen.py`
-- `src/qqtools/cli/qread.py`
-  - `src/qqtools/qlogreader.py`
+## Unit-scope modules that should be covered by `tests/unit`
 
 - `src/qqtools/qm/ase.py`
 - `src/qqtools/qm/rdkit.py`
 - `src/qqtools/qm/units.py`
 - `src/qqtools/qm/utils.py`
-- 
+
+## Full modules not covered (`tests/functional`)
+
+- `src/qqtools/plugins/**` (plugin module tests + user-side integration scenarios)
+
+- `src/qqtools/cli/qcgen.py`
+- `src/qqtools/cli/qread.py`
+- `src/qqtools/qlogreader.py`
+ 
 ## Notes
 
 - Current `standard` modules detected in source are:

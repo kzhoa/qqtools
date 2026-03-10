@@ -1,55 +1,61 @@
-# Tests Construction Progress​
+# Tests Directory Convention
 
+This document defines how test files should be organized under `tests/` and what
+source scope each test suite is responsible for.
 
-## 1 Common Functionals 
+## Directory Responsibilities
 
-- √ qdict 
-- √ qtimer
--  qdata
--  qlogreader
+- `tests/unit`
+  - Fast, isolated tests for single modules/functions/classes.
+  - Prefer no filesystem/network side effects.
+  - Default home for core modules under `src/qqtools/**` unless explicitly
+    classified as `full` (functional/integration scope).
 
-### 1.1 `config` related
-- dump_yaml, load_yaml
-- load_pickle, save_pickle
-- find_root, update_sys
-- batch_assert_type 
+- `tests/functional`
+  - Integration and user-side behavior tests.
+  - Can cover interactions across multiple modules and realistic workflows.
+  - Includes plugin behavior, plugin-composed flows, and CLI behavior that
+    depends on plugin execution paths.
 
+- `tests/demo`
+  - Runnable examples for logging/format/output demonstration.
+  - Not a substitute for assertions in `tests/unit` or `tests/functional`.
 
+## Coverage Classification Rule
 
-## 2 Torch / DeepLearning Related
+- `base`
+  - Modules that are not `full` and do not rely on optional std deps listed in
+    `pyproject.toml` (`lmdb`, `tqdm`, `requests`).
+  - Expected primary coverage: `tests/unit`.
 
-### auxiliary
-- recover, save_ckp
-- parse_device
-- random_split_train_valid, random_split_train_valid_test, get_data_splits
-- qContextProvider  # TBC
+- `standard`
+  - Modules depending on optional std deps (`lmdb`, `tqdm`, `requests`).
+  - Expected primary coverage: `tests/unit` (with dependency-aware test design).
 
+- `full`
+  - Modules requiring functional/integration tests in `tests/functional`.
+  - Includes:
+    - plugin module tests (`src/qqtools/plugins/**`)
+    - plugin-based multi-module tests or user-side simulation tests
+    - CLI command tests that involve plugin flows (`src/qqtools/cli/**`)
 
-### operator
-- qscatter: scatter, softmax
+## Module-to-Suite Mapping
 
+- `src/qqtools/plugins/**` -> `tests/functional`
+- `src/qqtools/cli/**` -> `tests/functional` (when command path depends on plugins)
+- `src/qqtools/qm/**` -> `tests/unit`
+- other `src/qqtools/**` modules -> `tests/unit` by default, unless promoted to
+  `full` for integration reasons
 
-## 3 General Utilities
+## Tracking and Source of Truth
 
-literally
+- Detailed uncovered-module tracking lives in:
+  - `tests/TODOLIST.md`
+- When rules in this file and TODO entries conflict, this file is the convention
+  source; update TODO entries accordingly.
 
-- from .utils.qtypecheck import ensure_scala, ensure_numpy, str2number, is_number, is_inf
-- from .utils.check import check_values_allowed, is_alias_exists
+## Historical Notes
 
-
-## 4 independent modules
-
-- qchem
-- qpipeline
-
-### 4.1 qchem
-
-
-
-### 4.2 qpipeline
-
-
-
-
-# User Story
-
+- Older rough planning content was replaced by this convention-focused document.
+- Keep future updates here concise and policy-oriented; keep progress snapshots in
+  `tests/TODOLIST.md`.
