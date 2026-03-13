@@ -36,6 +36,21 @@ BENCHMARK_CONFIGS = [
     ("large_dense", 10_000, 40),
 ]
 
+CONSISTENCY_CONFIGS = [
+    ("tiny_sparse_seed0", 16, 2, 0),
+    ("tiny_sparse_seed1", 16, 2, 1),
+    ("tiny_dense_seed2", 16, 8, 2),
+    ("small_sparse_seed3", 32, 4, 3),
+    ("small_dense_seed4", 32, 12, 4),
+    ("medium_sparse_seed5", 64, 6, 5),
+    ("medium_sparse_seed6", 64, 10, 6),
+    ("medium_dense_seed7", 64, 20, 7),
+    ("large_sparse_seed8", 128, 8, 8),
+    ("large_dense_seed9", 128, 24, 9),
+    ("xlarge_sparse_seed10", 256, 12, 10),
+    ("xlarge_dense_seed11", 256, 32, 11),
+]
+
 
 def ensure_runtime_prerequisites():
     if TORCH_SPARSE_IMPORT_ERROR is not None or SparseTensor is None:
@@ -203,6 +218,25 @@ def run_correctness_suite(device):
     print(f"[{device.upper()}] All correctness checks passed.")
 
 
+def run_consistency_regression(device):
+    print(f"\n[{device.upper()}] Running consistency regression sweep...")
+
+    passed_cases = 0
+    total_cases = len(CONSISTENCY_CONFIGS)
+
+    for case_name, num_nodes, avg_degree, seed in CONSISTENCY_CONFIGS:
+        edge_index, cell_offsets, graph_num_nodes = generate_mock_data(
+            num_nodes=num_nodes,
+            avg_degree=avg_degree,
+            device=device,
+            seed=seed,
+        )
+        assert_triplets_match(edge_index, cell_offsets, graph_num_nodes, case_name)
+        passed_cases += 1
+
+    print(f"[{device.upper()}] Consistency regression passed: {passed_cases}/{total_cases} cases matched exactly.")
+
+
 def time_func(func, edge_index, cell_offsets, num_nodes, device, num_warmup, num_iters):
     for _ in range(num_warmup):
         func(edge_index, cell_offsets, num_nodes)
@@ -304,7 +338,11 @@ if __name__ == "__main__":
     results = []
 
     for device in devices:
+        # correctness & consistency
         run_correctness_suite(device)
+        run_consistency_regression(device)
+
+        # speed
         results.extend(run_benchmark_suite(device, num_warmup=5, num_iters=10))
 
     print_results_table(results)
