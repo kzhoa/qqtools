@@ -1,5 +1,9 @@
 # History
 
+Next
+feat: add qbalance_partion helper for fast NumPy-based balanced bucket assignment
+test: add benchmark coverage comparing qbalance_partion against Python, NumPy, and Numba variants
+
 v1.0.0
 first version
 v1.0.2
