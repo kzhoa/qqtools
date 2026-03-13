@@ -76,9 +76,9 @@ if HAS_RICH:
             remaining = self.bar_width - completed - 1
 
             bar_str = (
-                f"[#1BBAE9]{'\U0001f63c' * completed}"
-                f"[#ff00d7]\U0001f638"
-                f"[white]{'\U0001f41f' * max(0, remaining)}"
+                "[#1BBAE9]" + ("😼" * completed) +
+                "[#ff00d7]😸" +
+                "[white]" + ("🐟" * max(0, remaining))
             )
             return Text.from_markup(bar_str)
 
