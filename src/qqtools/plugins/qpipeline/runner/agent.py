@@ -28,7 +28,7 @@ from .runner_utils.best_model import BestModelTracker
 from .runner_utils.common import _is_periodic_trigger, move_batch_to_device
 from .runner_utils.ema_context import EMAOffloadContext
 from .runner_utils.tensorbank import TensorBank
-from .runner_utils.types import EventContext, EventType, LoopSignal, RunConfig, RunningState
+from .runner_utils.types import EventContext, EventType, LoopSignal, RunConfig, RunMode, RunningState
 
 
 def _get_scalar_metrics(batch_metrics: Dict[str, Any]) -> Dict[str, float]:
@@ -109,6 +109,14 @@ class RunningAgent:
             logger=self.logger,
             allow_auto_offload=allow_auto_offload,
         )
+        config_accum_grad = self.config.accum_grad
+        self.accum_grad = 1 if config_accum_grad in (None, 1) else int(config_accum_grad)
+        self.has_accum_grad = self.accum_grad > 1
+        self._apply_train_step_impl = (
+            self._apply_train_step_accum if self.has_accum_grad else self._apply_train_step_plain
+        )
+        self._last_batch_did_optimizer_step = False
+        self._current_accum_loss_count = 0.0
 
     def _validate_event_name(self, event: Union[str, EventType]) -> str:
         event_name = event.value if isinstance(event, EventType) else str(event)
@@ -424,13 +432,105 @@ class RunningAgent:
         if gc_freq is None or gc_freq <= 0:
             return
 
-        completed_step = self.state.global_step + 1
+        completed_step = self.state.global_step
         if completed_step % gc_freq != 0:
             return
 
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _is_accum_window_start(self) -> bool:
+        batch_idx_zero = self.state.batch_idx_in_epoch - 1
+        return batch_idx_zero % self.accum_grad == 0
+
+    def _should_step_optimizer(self, total_batches: int) -> bool:
+        batch_idx_zero = self.state.batch_idx_in_epoch - 1
+        is_accum_boundary = (batch_idx_zero + 1) % self.accum_grad == 0
+        is_epoch_end = self.state.batch_idx_in_epoch >= total_batches
+        return is_accum_boundary or is_epoch_end
+
+    def _apply_train_step_plain(
+        self,
+        loss_tensor: torch.Tensor,
+        loss_count: float,
+        batch_metrics: Dict[str, float],
+        total_batches: int,
+    ) -> None:
+        self.optimizer.zero_grad()
+        loss_tensor.backward()
+
+        if self.config.clip_grad is not None:
+            clip_grad_norm_(self.model.parameters(), self.config.clip_grad)
+
+        self.optimizer.step()
+        self._last_batch_did_optimizer_step = True
+
+        if self.ema_model is not None:
+            self.ema_model.update()
+
+        batch_metrics["loss"] = float(loss_tensor.item())
+
+    def _apply_train_step_accum(
+        self,
+        loss_tensor: torch.Tensor,
+        loss_count: float,
+        batch_metrics: Dict[str, float],
+        total_batches: int,
+    ) -> None:
+        did_optimizer_step = False
+        if self._is_accum_window_start():
+            self.optimizer.zero_grad()
+            self._current_accum_loss_count = 0.0
+
+        self._current_accum_loss_count += loss_count
+        scaled_loss = loss_tensor * loss_count
+        scaled_loss.backward()
+
+        if self._should_step_optimizer(total_batches):
+            if self._current_accum_loss_count <= 0:
+                raise ValueError(
+                    "task.batch_loss['loss'] must provide a positive sample count during training "
+                    f"(epoch={self.state.epoch + 1}, batch_idx={self.state.batch_idx_in_epoch})."
+                )
+
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.div_(self._current_accum_loss_count)
+
+            if self.config.clip_grad is not None:
+                clip_grad_norm_(self.model.parameters(), self.config.clip_grad)
+
+            self.optimizer.step()
+            did_optimizer_step = True
+            self._current_accum_loss_count = 0.0
+
+            if self.ema_model is not None:
+                self.ema_model.update()
+
+        batch_metrics["loss"] = float(loss_tensor.item())
+
+        self._last_batch_did_optimizer_step = did_optimizer_step
+
+    def _extract_training_loss(self, losses: Dict[str, Any]) -> Tuple[torch.Tensor, float]:
+        loss_entry = losses.get("loss")
+        if loss_entry is None:
+            raise ValueError(
+                "task.batch_loss must return a 'loss' entry during training "
+                f"(epoch={self.state.epoch + 1}, batch_idx={self.state.batch_idx_in_epoch})."
+            )
+
+        loss_tensor = loss_entry[0] if isinstance(loss_entry, (tuple, list)) else loss_entry
+        if not isinstance(loss_tensor, torch.Tensor):
+            raise ValueError(
+                "task.batch_loss['loss'] must contain a torch.Tensor during training "
+                f"(epoch={self.state.epoch + 1}, batch_idx={self.state.batch_idx_in_epoch})."
+            )
+
+        loss_count = loss_entry[1] if isinstance(loss_entry, (tuple, list)) and len(loss_entry) >= 2 else 1.0
+        loss_count = float(qt.ensure_scala(loss_count))
+
+        return loss_tensor, loss_count
 
     def _train_one_batch(self, batch_data: Any, emit_events: bool = True) -> Dict[str, float]:
         total_batches = len(self.train_loader)
@@ -450,22 +550,10 @@ class RunningAgent:
             self.train_tensor_bank.add(self.task.batch_cache(out, batch_data))
 
         losses = self.task.batch_loss(out, batch_data, self.loss_fn)
-        loss_tensor, _loss_cnt = losses.get("loss", (None, 1))
-
-        if loss_tensor is not None:
-            self.optimizer.zero_grad()
-            loss_tensor.backward()
-
-            if self.config.clip_grad is not None:
-                clip_grad_norm_(self.model.parameters(), self.config.clip_grad)
-
-            self.optimizer.step()
-
-            if self.ema_model is not None:
-                self.ema_model.update()
-
-            loss_value = float(loss_tensor.item())
-            batch_metrics["loss"] = loss_value
+        loss_tensor, loss_count = self._extract_training_loss(losses)
+        self._apply_train_step_impl(loss_tensor, loss_count, batch_metrics, total_batches)
+        if self._last_batch_did_optimizer_step:
+            self.state.global_step += 1
 
         if not emit_events:
             return batch_metrics
@@ -483,7 +571,8 @@ class RunningAgent:
         self.interval_avg_bank.add("batch_time", batch_time, 1.0)
 
         current_lr = self.optimizer.param_groups[0]["lr"] if self.optimizer else None
-        self._step_warmup_and_maintenance()
+        if self._last_batch_did_optimizer_step:
+            self._step_warmup_and_maintenance()
 
         is_update_tick = state.batch_idx_in_epoch % self.config.print_freq == 0
         is_update_tick = is_update_tick or state.batch_idx_in_epoch == total_batches
@@ -534,15 +623,23 @@ class RunningAgent:
 
                     self.state.batch_idx_in_epoch = batch_idx + 1
                     self._train_one_batch(batch_data, emit_events=True)
+                    did_optimizer_step = self._last_batch_did_optimizer_step
 
                     is_epoch_end = self.state.batch_idx_in_epoch >= total_batches
-                    should_stop_mid_epoch = self._handle_periodic_events(is_epoch_end=is_epoch_end)
-                    if should_stop_mid_epoch:
-                        return True
+                    should_handle_periodic = False
+                    if self.config.run_mode == RunMode.EPOCH:
+                        should_handle_periodic = is_epoch_end
+                    else:
+                        should_handle_periodic = did_optimizer_step
 
-                    self.state.global_step += 1
-                    if self._reached_run_limits():
-                        return False
+                    if should_handle_periodic:
+                        should_stop_mid_epoch = self._handle_periodic_events(is_epoch_end=is_epoch_end)
+                        if should_stop_mid_epoch:
+                            return True
+
+                    if did_optimizer_step:
+                        if self._reached_run_limits():
+                            return False
 
                 self._handle_epoch_end()
         except KeyboardInterrupt:
@@ -556,6 +653,7 @@ class RunningAgent:
             f"Starting training (mode={self.config.run_mode.value}, "
             f"eval_interval={self.config.eval_interval}, "
             f"save_interval={self.config.save_interval}, "
+            f"accum_grad={self.config.accum_grad}, "
             f"max_epochs={max_epochs_limit}, "
             f"max_steps={max_steps_limit})"
         )

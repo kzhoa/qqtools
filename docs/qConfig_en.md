@@ -42,6 +42,7 @@ runner:
   max_epochs: 100
   eval_interval: 1
   clip_grad: 1.0
+  accum_grad: null
   early_stop:
     target: val_loss
     patience: 20
@@ -511,19 +512,20 @@ runner:
 - **Characteristics**: Update every N samples (not limited to complete epochs)
 - **When to Use**: Very large datasets, online learning, precise step control
 - **Key Parameters**: `max_steps`, `eval_interval` (counted in steps)
-- **Note**: In this mode, if `max_epochs` is also specified, it will also become a training stopping condition (training stops when either condition is met)
+- **Note**: In this mode, `max_steps` is the only effective training boundary. If `max_epochs` is also specified, the runner logs a warning and ignores it.
 
 ### Fields Summary
 
 | Field             | Required | Type    | Range      | Default | Description                   |
 | ----------------- | -------- | ------- | ---------- | ------- | ----------------------------- |
 | `run_mode`        | ✅        | String  | epoch/step | epoch   | Training mode                 |
-| `max_epochs`      | ⚠️        | Integer | ≥ 1        | None    | Maximum epochs                |
-| `max_steps`       | ⚠️        | Integer | ≥ 1        | null    | Maximum steps                 |
+| `max_epochs`      | ⚠️        | Integer | ≥ 1        | None    | Effective in epoch mode; ignored in step mode |
+| `max_steps`       | ⚠️        | Integer | ≥ 1        | null    | Effective in step mode; ignored in epoch mode |
 | `eval_interval`   | ❌        | Integer | ≥ 1        | 1       | Evaluation interval           |
-| `save_interval`   | ❌        | Integer | ≥ 1        | null    | Regular save interval (steps) |
+| `save_interval`   | ❌        | Integer | ≥ 1        | null    | Regular save interval (units follow run_mode) |
 | `keep_latest_ckp` | ❌        | Boolean | true/false | false   | Keep only latest regular ckp  |
 | `clip_grad`       | ❌        | Float   | ≥ 0.1      | null    | Gradient clipping threshold   |
+| `accum_grad`      | ❌        | Integer | ≥ 1        | null    | Gradient accumulation factor  |
 | `early_stop`      | ✅        | Object  | -          | -       | Early stopping configuration  |
 | `checkpoint`      | ❌        | Object  | -          | -       | Best checkpoint configuration |
 
@@ -546,17 +548,17 @@ runner:
 - **max_epochs**:
   - Type: Integer, ≥ 1
   - Description: Maximum number of training epochs
-  - Required for epoch mode; optional for step mode
+  - Required for epoch mode; ignored in step mode
 
 - **max_steps**:
   - Type: Integer or null
   - Description: Maximum number of training steps
-  - Recommended for step mode; optional for epoch mode (dual limit)
+  - Required for step mode; ignored in epoch mode
 
 - **Logic**:
-  - `run_mode='epoch'`: Controlled primarily by `max_epochs`
-  - `run_mode='step'`: Controlled primarily by `max_steps` (if specified)
-  - Both specified: Stop when either condition is reached
+  - `run_mode='epoch'`: Controlled by `max_epochs`
+  - `run_mode='step'`: Controlled by `max_steps`
+  - Cross-mode boundary fields are ignored with a warning
 
 ### eval_interval (Evaluation Interval)
 
@@ -584,10 +586,11 @@ runner:
 
 - **Type**: Integer or null
 - **Default**: null (Follows evaluation frequency)
-- **Description**: Regular checkpoint saving interval (always in steps, unaffected by `run_mode`)
+- **Description**: Regular checkpoint saving interval. Units follow `run_mode`.
 - **Effect**:
-  - null: Automatically saves a regular checkpoint every time an evaluation is triggered based on `eval_interval` (whether by epoch or step).
-  - Positive integer: Save checkpoint every N steps
+  - null: Automatically saves a regular checkpoint every time an evaluation is triggered based on `eval_interval`.
+  - Positive integer in epoch mode: Save checkpoint every N epochs
+  - Positive integer in step mode: Save checkpoint every N optimizer steps
 
 - **Note**:
   - Separate from best model checkpoint
@@ -628,6 +631,26 @@ runner:
   - RNN/LSTM: Strongly recommended (prevent gradient explosion)
   - Transformer: Recommended (clip_grad=1.0 usually works)
   - CNN: Optional
+
+### accum_grad (Gradient Accumulation)
+
+```yaml
+runner:
+  accum_grad: 4
+```
+
+- **Type**: Integer or null
+- **Default**: null
+- **Range**: ≥ 1
+- **Description**: Accumulate gradients across multiple micro-batches before a real optimizer update.
+- **Effect**:
+  - null: Disable accumulation
+  - 1: Equivalent to no accumulation
+  - Integer > 1: Run one `optimizer.step()` every `accum_grad` micro-batches
+- **Step-Mode Semantics**:
+  - When `run_mode='step'` and accumulation is enabled, `global_step`, `max_steps`, `eval_interval`, and `save_interval` count completed optimizer updates, not micro-batches.
+- **Epoch-End Flush**:
+  - If the final accumulation window in an epoch is incomplete, the remaining gradients are still applied at epoch end.
 
 ### early_stop (Early Stopping Configuration)
 
@@ -835,6 +858,7 @@ runner:
   eval_interval: 5000
   save_interval: 10000
   clip_grad: 10.0
+  accum_grad: 4
   early_stop:
     target: val_loss
     patience: 3
@@ -996,12 +1020,12 @@ Certain fields in the configuration file have logical relationships with each ot
 | --------------------------- | -------- | ------------- | ------------- | --------------------------- |
 | Standard epoch mode         | epoch    | Specified     | Not specified | Stop at max_epochs          |
 | Standard step mode          | step     | Not specified | Specified     | Stop at max_steps           |
-| Dual condition in step mode | step     | Specified     | Specified     | Stop when either is reached |
-| Misconfiguration            | epoch    | Not specified | Specified     | Warning: max_steps ignored  |
+| Misconfiguration in step mode | step   | Specified     | Specified     | Warning: max_epochs ignored |
+| Misconfiguration in epoch mode | epoch | Not specified | Specified     | Warning: max_steps ignored  |
 
 **Special Behaviors**:
 
-- **max_epochs in step mode**: When `max_epochs` is also specified in step mode, it becomes an **additional stopping condition**. Training stops when either `max_steps` **or** `max_epochs` is reached
+- **max_epochs in step mode**: Specifying `max_epochs` in step mode is **ignored** by the framework; only `max_steps` is effective
 - **max_steps in epoch mode**: Specifying `max_steps` in epoch mode is **ignored** by the framework; only `max_epochs` is effective
 
 #### Impact of run_mode on eval_interval Meaning
@@ -1044,7 +1068,9 @@ runner:
 - If `save_interval` is `null` (default), it automatically matches the evaluation frequency. The actual intervals will adapt to the `run_mode`:
   - `run_mode=epoch`: Saves a regular checkpoint along with validation every `eval_interval` epochs.
   - `run_mode=step`: Saves a regular checkpoint along with validation every `eval_interval` steps.
-- If `save_interval` is set to a specific positive Integer, it is explicitly executed in **steps**, entirely independent of the `run_mode` and the evaluation trigger.
+- If `save_interval` is set to a specific positive Integer, it is executed in the same unit as the current `run_mode`:
+  - `run_mode=epoch`: every N epochs
+  - `run_mode=step`: every N optimizer steps
 
 ### 2. Priority Between warmup_steps and warmup_epochs in warmup_params
 
@@ -1220,9 +1246,9 @@ runner:
 
 **Behavior**:
 
-- Training stops when `global_step >= max_steps` **or** `epoch >= max_epochs`
-- If data is limited, entire epochs may complete in step mode before max_steps, triggering epoch increment
-- Framework logs the actual stopping reason (max_steps vs max_epochs)
+- Training stops when `global_step >= max_steps`
+- `max_epochs` is ignored by the mutual-exclusion policy, and the framework logs a warning about it
+- Epoch counters may still advance while training is step-bounded, but they do not control stopping in this configuration
 
 #### Scenario B: warmup_steps > max_steps
 

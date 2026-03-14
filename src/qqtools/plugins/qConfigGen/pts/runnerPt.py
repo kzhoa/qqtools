@@ -36,11 +36,12 @@ def prompt_runner_params():
        - step mode: requires max_steps; eval_interval is in steps
     2. eval_interval meaning changes based on run_mode
     3. Prompt clip_grad (optional)
-    4. Prompt early_stop (optional)
+    4. Prompt accum_grad (optional)
+    5. Prompt early_stop (optional)
 
     Returns:
         dict: Training config dict with run_mode, max_epochs/max_steps, eval_interval,
-              clip_grad, save_interval, early_stop parameters
+              clip_grad, accum_grad, save_interval, early_stop parameters
     """
     print_formatted_text("\n" + "=" * 60)
     print_formatted_text("[ Training Runner Configuration ]")
@@ -62,6 +63,7 @@ def prompt_runner_params():
     # Step 2: Based on run_mode, prompt different training boundary parameters
     if params["run_mode"] == "epoch":
         print_formatted_text("\n📍 Epoch Mode: Training stops after max_epochs OR early stopping")
+        print_formatted_text("  💡 max_steps is omitted here because epoch mode ignores it.")
 
         # max_epochs (required)
         while True:
@@ -76,21 +78,6 @@ def prompt_runner_params():
                     print_formatted_text("❌ max_epochs must be >= 1.")
                     continue
                 params["max_epochs"] = epochs
-                break
-            except ValueError:
-                print_formatted_text("❌ Must be an integer.")
-
-        # max_steps (optional, for dual limit)
-        while True:
-            value = prompt("  Max Steps (optional, for dual limit, press Enter to skip): ").strip()
-            if not value or value.lower() == "none":
-                break
-            try:
-                steps = int(value)
-                if steps < 1:
-                    print_formatted_text("❌ max_steps must be >= 1.")
-                    continue
-                params["max_steps"] = steps
                 break
             except ValueError:
                 print_formatted_text("❌ Must be an integer.")
@@ -115,6 +102,7 @@ def prompt_runner_params():
 
     else:  # step mode
         print_formatted_text("\n📍 Step Mode: Training stops after max_steps OR early stopping")
+        print_formatted_text("  💡 max_epochs is omitted here because step mode ignores it.")
 
         # max_steps (required)
         while True:
@@ -133,23 +121,8 @@ def prompt_runner_params():
             except ValueError:
                 print_formatted_text("❌ Must be an integer.")
 
-        # max_epochs (optional, for dual limit)
-        while True:
-            value = prompt("  Max Epochs (optional, for dual limit, press Enter to skip): ").strip()
-            if not value or value.lower() == "none":
-                break
-            try:
-                epochs = int(value)
-                if epochs < 1:
-                    print_formatted_text("❌ max_epochs must be >= 1.")
-                    continue
-                params["max_epochs"] = epochs
-                break
-            except ValueError:
-                print_formatted_text("❌ Must be an integer.")
-
         # eval_interval (in steps)
-        print_formatted_text("  💡 Tip: eval_interval will be counted in STEPS")
+        print_formatted_text("  💡 Tip: eval_interval will be counted in optimizer STEPS")
         while True:
             default_val = RUN_MODE_DEFAULTS["step"]["eval_interval"]
             value = prompt(f"  Eval Interval (steps, default: {default_val}): ").strip()
@@ -185,9 +158,30 @@ def prompt_runner_params():
         except ValueError:
             print_formatted_text("❌ Must be a float.")
 
-    # Step 4: save_interval (optional, only counted in steps)
+    # Step 4: accum_grad (optional)
+    print_formatted_text("  💡 Tip: accum_grad controls gradient accumulation in micro-batches.")
+    print_formatted_text("     Leave empty or None to disable accumulation.")
     while True:
-        value = prompt("Save Interval in Steps (optional, press Enter to skip): ").strip()
+        value = prompt("Accumulated Micro-Batches (optional, press Enter to skip): ").strip()
+        if not value or value.lower() == "none":
+            break
+        try:
+            accum_grad = int(value)
+            if accum_grad < 1:
+                print_formatted_text("❌ accum_grad must be >= 1.")
+                continue
+            params["accum_grad"] = accum_grad
+            break
+        except ValueError:
+            print_formatted_text("❌ Must be an integer.")
+
+    # Step 5: save_interval (optional, run_mode-aware)
+    if params["run_mode"] == "epoch":
+        save_interval_prompt = "Save Interval in Epochs (optional, press Enter to follow eval_interval): "
+    else:
+        save_interval_prompt = "Save Interval in Optimizer Steps (optional, press Enter to follow eval_interval): "
+    while True:
+        value = prompt(save_interval_prompt).strip()
         if not value or value.lower() == "none":
             break
         try:
@@ -200,7 +194,7 @@ def prompt_runner_params():
         except ValueError:
             print_formatted_text("❌ Must be an integer.")
 
-    # Step 5: Keep only latest regular checkpoint
+    # Step 6: Keep only latest regular checkpoint
     while True:
         ans = prompt("\nKeep only latest regular checkpoint (deletes old ones)? [y/n] (default: n): ").strip().lower()
         if not ans or ans in ("n", "no"):
@@ -210,7 +204,7 @@ def prompt_runner_params():
             break
         print_formatted_text("❌ Invalid input. Please enter 'y' or 'n'.")
 
-    # Step 6: Early stopping configuration
+    # Step 7: Early stopping configuration
     early_stop_config = prompt_early_stop()
     if early_stop_config:
         params["early_stop"] = early_stop_config

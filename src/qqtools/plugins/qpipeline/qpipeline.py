@@ -198,6 +198,7 @@ class qPipeline:
         max_epochs = args.runner.max_epochs
         max_steps = args.runner.max_steps
         clip_grad = args.runner.clip_grad
+        accum_grad = args.runner.get("accum_grad", None)
         distributed = args.distributed
         log_dir = args.log_dir
         print_freq = args.print_freq or 100
@@ -229,6 +230,7 @@ class qPipeline:
             run_mode=run_mode,
             eval_interval=eval_interval,
             save_interval=save_interval,
+            accum_grad=accum_grad,
         )
 
     def infer(self, dataloader=None):

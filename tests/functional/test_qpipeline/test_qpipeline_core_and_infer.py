@@ -7,7 +7,9 @@ import torch
 import qqtools as qt
 import qqtools.plugins.qpipeline.runner.runner_utils.progress as progress_module
 import qqtools.plugins.qpipeline.runner.runner as runner_module
+import qqtools.plugins.qpipeline.qpipeline as qpipeline_module
 from qqtools.plugins.qpipeline.entry import create_pipeline_class
+from qqtools.plugins.qpipeline.qpipeline import qPipeline
 from qqtools.plugins.qpipeline.qpipeline import prepare_logdir
 from qqtools.plugins.qpipeline.runner.runner import infer_runner
 
@@ -251,3 +253,52 @@ def test_eval_emits_progress_tick_for_val_and_test_stages(tiny_task, tiny_model,
 
     assert len(val_ticks) == len(tiny_task.val_loader)
     assert len(test_ticks) == len(tiny_task.test_loader)
+
+
+def test_qpipeline_fit_forwards_accum_grad(monkeypatch, base_args):
+    captured_kwargs = {}
+
+    class DummyPipeline(qPipeline):
+        @staticmethod
+        def prepare_task(args):
+            raise NotImplementedError
+
+        @staticmethod
+        def prepare_model(args):
+            raise NotImplementedError
+
+    def fake_train_runner(**kwargs):
+        captured_kwargs.update(kwargs)
+        return {"final_step": 0}
+
+    args = base_args.copy()
+    args.runner.update(
+        {
+            "run_mode": "step",
+            "max_steps": 12,
+            "eval_interval": 3,
+            "save_interval": 6,
+            "accum_grad": 4,
+        }
+    )
+
+    monkeypatch.setattr(qpipeline_module, "train_runner", fake_train_runner)
+
+    pipeline = object.__new__(DummyPipeline)
+    pipeline.args = args
+    pipeline.model = Mock()
+    pipeline.task = Mock()
+    pipeline.loss_fn = Mock()
+    pipeline.optimizer = Mock()
+    pipeline.scheduler = Mock()
+    pipeline.extra_ckp_caches = {"cache_key": "cache_value"}
+    pipeline.ema_model = Mock()
+
+    pipeline.fit(use_profiler=True)
+
+    assert captured_kwargs["accum_grad"] == 4
+    assert captured_kwargs["run_mode"] == "step"
+    assert captured_kwargs["max_steps"] == 12
+    assert captured_kwargs["eval_interval"] == 3
+    assert captured_kwargs["save_interval"] == 6
+    assert captured_kwargs["use_profiler"] is True

@@ -1,5 +1,15 @@
 # History
 
+## v1.2.4
+
+- feat: add `runner.accum_grad` support across qpipeline runtime, qConfig schema, and qcgen prompts
+- fix: align step-mode eval/save/global-step semantics with completed optimizer updates under gradient accumulation
+- fix: weight accumulated gradients by loss sample counts so uneven micro-batches match grouped-batch updates
+- refactor: enforce mutual-exclusive runner boundaries so epoch mode uses `max_epochs` and step mode uses `max_steps`
+- refactor: remove unused `qoptim` module exports from package surface
+- docs: document accum-grad semantics, run-boundary policy, and add ADR for optimizer-step semantics
+- test: add functional coverage for accum-grad scheduling, checkpoint/eval triggers, qcgen schema rules, and qpipeline forwarding
+
 ## v1.2.3
 
 - feat: add `qbalanced_partition` as a data helper for fast NumPy-based balanced bucket assignment

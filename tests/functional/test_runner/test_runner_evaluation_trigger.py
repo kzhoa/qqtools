@@ -190,11 +190,11 @@ class TestEvaluationTiming:
     @pytest.mark.parametrize(
         "max_steps, eval_interval, expected_steps",
         [
-            (1, 1, [0]),  # Original test_eval_after_first_step
-            (5, 2, [1, 3]),  # Original test_eval_at_step_interval_multiples
-            (6, 3, [2, 5]),  # New case: eval every 3rd step
+            (1, 1, [1]),  # Eval after the first completed step
+            (5, 2, [2, 4]),  # Eval every 2nd completed step
+            (6, 3, [3, 6]),  # Eval every 3rd completed step
             (2, 3, []),  # New case: interval > max_steps
-            (10, 1, list(range(10))),  # Eval every step
+            (10, 1, list(range(1, 11))),  # Eval every completed step
         ],
     )
     def test_eval_trigger_in_step_mode(self, common_setup, max_steps, eval_interval, expected_steps):

@@ -123,6 +123,7 @@ def train_runner(
     run_mode: Union[str, RunMode] = "epoch",
     eval_interval: int = 1,
     save_interval: Optional[int] = None,
+    accum_grad: Optional[int] = None,
     log_granularity: Optional[List[Literal["eval", "batch"]]] = ["eval"],
     allow_auto_offload: bool = False,
 ) -> Dict[str, Any]:
@@ -150,6 +151,7 @@ def train_runner(
         run_mode: Running mode ("epoch" or "step")
         eval_interval: Evaluation interval (interpreted as epochs or steps depending on run_mode)
         save_interval: Regular checkpoint saving interval (interpreted as epochs or steps depending on run_mode)
+        accum_grad: Optional gradient accumulation factor. `None` disables accumulation.
         allow_auto_offload: Whether to enable automatic EMA/model offload policy
 
     Returns:
@@ -158,6 +160,11 @@ def train_runner(
     # Handle compatibility parameters
     if args is None:
         raise ValueError("The 'args' parameter is required to configure the runner.")
+    if accum_grad is not None:
+        if isinstance(accum_grad, bool) or not isinstance(accum_grad, int):
+            raise ValueError("accum_grad must be an integer when specified")
+        if accum_grad < 1:
+            raise ValueError("accum_grad must be a positive integer when specified")
 
     # Extract configuration from args
     device = _getattr_or_default(args, "device", lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -205,6 +212,7 @@ def train_runner(
         max_epochs=effective_max_epochs,
         max_steps=effective_max_steps,
         clip_grad=clip_grad,
+        accum_grad=accum_grad,
         distributed=distributed,
         rank=rank,
         save_dir=save_dir,

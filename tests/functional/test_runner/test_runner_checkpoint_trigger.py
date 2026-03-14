@@ -44,9 +44,9 @@ class TestCheckpointTriggerTiming:
             (RunMode.EPOCH, 5, 3, [2]),  # Save on the 3rd epoch (epoch index 2)
             (RunMode.EPOCH, 1, 2, []),  # Save interval is larger than max epochs
             # === STEP Mode Cases ===
-            (RunMode.STEP, 5, 1, [0, 1, 2, 3, 4]),  # Save every step
-            (RunMode.STEP, 5, 2, [1, 3]),  # Save every 2nd step
-            (RunMode.STEP, 6, 3, [2, 5]),  # Save every 3rd step
+            (RunMode.STEP, 5, 1, [1, 2, 3, 4, 5]),  # Save every completed step
+            (RunMode.STEP, 5, 2, [2, 4]),  # Save every 2nd completed step
+            (RunMode.STEP, 6, 3, [3, 6]),  # Save every 3rd completed step
             (RunMode.STEP, 2, 3, []),  # Save interval is larger than max steps
         ],
     )
