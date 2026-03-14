@@ -1,6 +1,6 @@
 # History
 
-## next version
+## v1.2.5
 
 - breaking: qpipeline non-plateau schedulers now default to stepping on completed optimizer updates instead of `on_validation_end`
 - feat: add `optim.scheduler_params.step_on` to control non-plateau scheduler stepping with `optimizer_step` or `valid_end`; plateau remains validation-driven
