@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
+from qqtools.plugins.qpipeline.entry_utils.scheduler import qWarmupScheduler
 from qqtools.plugins.qpipeline.entry_utils.type_qconfig import EarlyStopConfig, RunnerConfig
 from qqtools.plugins.qpipeline.runner.agent import RunningAgent
 from qqtools.plugins.qpipeline.runner.runner import train_runner
@@ -99,9 +100,14 @@ class DummyEMA:
 class DummyScheduler:
     def __init__(self):
         self.warmup_calls = 0
+        self.optimizer_update_calls = 0
 
     def step_warmup(self):
         self.warmup_calls += 1
+
+    def step_after_optimizer_update(self):
+        self.optimizer_update_calls += 1
+        self.step_warmup()
 
 
 @pytest.mark.parametrize("invalid_value", [0, -1, 1.5, True])
@@ -356,6 +362,107 @@ def test_scheduler_warmup_counts_optimizer_steps_under_accumulation():
 
     assert scheduler.warmup_calls == 3
     assert agent.state.global_step == 3
+
+
+def test_train_batch_events_report_post_step_lr_for_optimizer_step_scheduler():
+    task = FixedBatchTask(num_batches=3)
+    model = TinyModel()
+    optimizer = optim.SGD(model.parameters(), lr=0.1)
+    loss_fn = nn.MSELoss()
+    scheduler = qWarmupScheduler(
+        optimizer=optimizer,
+        warmup_steps=0,
+        warmup_factor=1.0,
+        main_scheduler=optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5),
+    )
+    batch_end_lrs = []
+    progress_lrs = []
+
+    agent = RunningAgent(
+        model=model,
+        task=task,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        config=RunConfig(run_mode=RunMode.STEP, max_steps=3, eval_interval=10, accum_grad=1, print_freq=1),
+        device=torch.device("cpu"),
+    )
+    agent.add_listener("on_batch_end", lambda context: batch_end_lrs.append(context.lr))
+    agent.add_listener("on_progress_tick", lambda context: progress_lrs.append(context.lr))
+
+    agent.run()
+
+    assert batch_end_lrs == pytest.approx([0.05, 0.025, 0.0125])
+    assert progress_lrs == pytest.approx([0.05, 0.025, 0.0125])
+
+
+def test_train_batch_events_mix_pre_and_post_step_lr_under_accumulation():
+    task = FixedBatchTask(num_batches=4)
+    model = TinyModel()
+    optimizer = optim.SGD(model.parameters(), lr=0.1)
+    loss_fn = nn.MSELoss()
+    scheduler = qWarmupScheduler(
+        optimizer=optimizer,
+        warmup_steps=0,
+        warmup_factor=1.0,
+        main_scheduler=optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5),
+    )
+    batch_end_lrs = []
+    progress_lrs = []
+
+    agent = RunningAgent(
+        model=model,
+        task=task,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        config=RunConfig(run_mode=RunMode.STEP, max_steps=2, eval_interval=10, accum_grad=2, print_freq=1),
+        device=torch.device("cpu"),
+    )
+    agent.add_listener("on_batch_end", lambda context: batch_end_lrs.append(context.lr))
+    agent.add_listener("on_progress_tick", lambda context: progress_lrs.append(context.lr))
+
+    agent.run()
+
+    assert batch_end_lrs == pytest.approx([0.1, 0.05, 0.05, 0.025])
+    assert progress_lrs == pytest.approx([0.1, 0.05, 0.05, 0.025])
+
+
+def test_train_batch_events_do_not_report_early_lr_change_for_valid_end_scheduler():
+    task = FixedBatchTask(num_batches=4)
+    model = TinyModel()
+    optimizer = optim.SGD(model.parameters(), lr=0.1)
+    loss_fn = nn.MSELoss()
+    scheduler = qWarmupScheduler(
+        optimizer=optimizer,
+        warmup_steps=0,
+        warmup_factor=1.0,
+        main_scheduler=optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5),
+        step_on="valid_end",
+    )
+    batch_end_lrs = []
+
+    agent = RunningAgent(
+        model=model,
+        task=task,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        config=RunConfig(run_mode=RunMode.STEP, max_steps=4, eval_interval=2, accum_grad=1, print_freq=1),
+        device=torch.device("cpu"),
+    )
+    agent.add_listener(
+        "on_validation_end",
+        lambda context: scheduler.step_main(metrics=(context.eval_results or {}).get("val_metric")),
+    )
+    agent.add_listener(
+        "on_batch_end",
+        lambda context: batch_end_lrs.append(context.lr) if context.stage == "train" else None,
+    )
+
+    agent.run()
+
+    assert batch_end_lrs == pytest.approx([0.1, 0.1, 0.05, 0.05])
 
 
 def test_ema_updates_once_per_optimizer_step():

@@ -1,5 +1,13 @@
 # History
 
+## next version
+
+- breaking: qpipeline non-plateau schedulers now default to stepping on completed optimizer updates instead of `on_validation_end`
+- feat: add `optim.scheduler_params.step_on` to control non-plateau scheduler stepping with `optimizer_step` or `valid_end`; plateau remains validation-driven
+- fix: align qpipeline train-event LR reporting with post-step scheduler state so batch/progress listeners observe the current learning rate
+- docs: update qConfig docs and add an ADR for scheduler stepping semantics and `step_on`
+- test: add functional coverage for scheduler policy validation/defaulting, qcgen scheduler prompts, and LR event timing under accumulation
+
 ## v1.2.4
 
 - feat: add `runner.accum_grad` support across qpipeline runtime, qConfig schema, and qcgen prompts

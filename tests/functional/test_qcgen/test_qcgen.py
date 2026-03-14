@@ -191,3 +191,52 @@ def test_runner_schema_save_interval_description_matches_runtime_semantics():
 
     assert "eval_interval" in save_interval_desc
     assert "run_mode" in save_interval_desc
+
+
+def test_prompt_lr_scheduler_params_defaults_non_plateau_step_on():
+    from qqtools.plugins.qConfigGen.pts.lrSchedulerPt import prompt_lr_scheduler_params
+
+    prompt_values = [
+        "yes",
+        "step",
+        "",
+        "",
+        "",
+        "no",
+    ]
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.lrSchedulerPt.prompt", side_effect=prompt_values),
+        mock.patch("qqtools.plugins.qConfigGen.pts.lrSchedulerPt.print_formatted_text"),
+    ):
+        result = prompt_lr_scheduler_params()
+
+    assert result["scheduler"] == "step"
+    assert result["scheduler_params"]["step_size"] == 30
+    assert result["scheduler_params"]["gamma"] == 0.1
+    assert result["scheduler_params"]["step_on"] == "optimizer_step"
+
+
+def test_prompt_lr_scheduler_params_plateau_forces_valid_end():
+    from qqtools.plugins.qConfigGen.pts.lrSchedulerPt import prompt_lr_scheduler_params
+
+    prompt_values = [
+        "yes",
+        "plateau",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "no",
+    ]
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.lrSchedulerPt.prompt", side_effect=prompt_values),
+        mock.patch("qqtools.plugins.qConfigGen.pts.lrSchedulerPt.print_formatted_text"),
+    ):
+        result = prompt_lr_scheduler_params()
+
+    assert result["scheduler"] == "plateau"
+    assert result["scheduler_params"]["mode"] == "min"
+    assert result["scheduler_params"]["step_on"] == "valid_end"

@@ -7,7 +7,15 @@ from torch.optim.lr_scheduler import LambdaLR, LinearLR, LRScheduler, ReduceLROn
 
 import qqtools as qt
 
-__all__ = ["prepare_scheduler", "WarmupConfig", "SchedulerConfig"]
+__all__ = [
+    "prepare_scheduler",
+    "WarmupConfig",
+    "SchedulerConfig",
+    "resolve_scheduler_step_on",
+]
+
+SCHEDULER_STEP_ON_OPTIMIZER_STEP = "optimizer_step"
+SCHEDULER_STEP_ON_VALID_END = "valid_end"
 
 
 # ============================================================================
@@ -82,11 +90,13 @@ class SchedulerConfig:
                 lr_lambda: Function or list of functions computing multiplicative factor given epoch.
 
         warmup: Optional WarmupConfig. If None, no warmup is applied.
+        step_on: Scheduler stepping trigger. `None` means resolve by scheduler type.
     """
 
     name: str
     params: Optional[Dict] = None
     warmup: Optional[WarmupConfig] = None
+    step_on: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate configuration."""
@@ -119,7 +129,30 @@ class SchedulerConfig:
         name = config_dict.pop("name")
         params = config_dict.pop("params", {})
 
-        return cls(name=name, params=params, warmup=warmup)
+        step_on = config_dict.pop("step_on", None)
+
+        return cls(name=name, params=params, warmup=warmup, step_on=step_on)
+
+
+def resolve_scheduler_step_on(scheduler_name: str, step_on: Optional[str]) -> str:
+    scheduler_name_lower = scheduler_name.lower()
+    if scheduler_name_lower == "plateau":
+        resolved_step_on = SCHEDULER_STEP_ON_VALID_END if step_on is None else step_on
+        if resolved_step_on != SCHEDULER_STEP_ON_VALID_END:
+            raise ValueError(
+                "scheduler_params.step_on must be 'valid_end' for plateau scheduler, "
+                f"got {resolved_step_on!r}"
+            )
+        return resolved_step_on
+
+    resolved_step_on = SCHEDULER_STEP_ON_OPTIMIZER_STEP if step_on is None else step_on
+    if resolved_step_on not in (SCHEDULER_STEP_ON_OPTIMIZER_STEP, SCHEDULER_STEP_ON_VALID_END):
+        raise ValueError(
+            "scheduler_params.step_on must be one of "
+            f"{SCHEDULER_STEP_ON_OPTIMIZER_STEP!r}, {SCHEDULER_STEP_ON_VALID_END!r} "
+            f"for scheduler {scheduler_name!r}, got {resolved_step_on!r}"
+        )
+    return resolved_step_on
 
 
 CANONICAL_SCHEDULER_NAMES: Dict[str, str] = {
@@ -346,10 +379,13 @@ def prepare_scheduler(args: qt.qDict, optimizer: Optimizer, batches_per_epoch: i
         warmup_config = WarmupConfig(steps=0, epochs=0)
 
     # Build scheduler config from yaml parameters
+    resolved_scheduler_params = dict(scheduler_params) if scheduler_params else {}
+    step_on = resolved_scheduler_params.pop("step_on", None)
     scheduler_config = SchedulerConfig(
         name=scheduler_name,
-        params=dict(scheduler_params) if scheduler_params else {},
+        params=resolved_scheduler_params,
         warmup=warmup_config,
+        step_on=step_on,
     )
 
     # Create main scheduler using the corresponding getter function
@@ -359,6 +395,7 @@ def prepare_scheduler(args: qt.qDict, optimizer: Optimizer, batches_per_epoch: i
 
     getter = SCHEDULER_GETTERS[scheduler_name_lower]
     main_scheduler = getter(scheduler_config.params, optimizer)
+    resolved_step_on = resolve_scheduler_step_on(scheduler_name_lower, scheduler_config.step_on)
 
     # Wrap with warmup scheduler
     return qWarmupScheduler(
@@ -366,6 +403,7 @@ def prepare_scheduler(args: qt.qDict, optimizer: Optimizer, batches_per_epoch: i
         scheduler_config.warmup.steps,
         scheduler_config.warmup.initial_factor,
         main_scheduler,
+        step_on=resolved_step_on,
     )
 
 
@@ -416,8 +454,9 @@ class qWarmupScheduler(LRScheduler):
     2. Main phase: Delegate to the main scheduler after warmup finishes
 
     Typical usage:
-        - Warmup steps are typically taken at batch end during training
-        - Main scheduler steps are taken at epoch end after evaluation
+        - Warmup steps are driven by completed optimizer updates during training
+        - Main scheduler steps are taken either on optimizer updates or validation end,
+          depending on the resolved `step_on` policy
         - Warmup usually finishes within the first epoch
     """
 
@@ -427,6 +466,7 @@ class qWarmupScheduler(LRScheduler):
         warmup_steps: int,
         warmup_factor: float,
         main_scheduler: Union[LRScheduler, ReduceLROnPlateau, object],
+        step_on: Optional[str] = None,
         last_epoch: int = -1,
     ) -> None:
         """
@@ -437,6 +477,7 @@ class qWarmupScheduler(LRScheduler):
             warmup_steps: Number of warmup steps (-1 to disable warmup).
             warmup_factor: Starting learning rate factor (0.0-1.0).
             main_scheduler: The main scheduler to use after warmup phase.
+            step_on: Scheduler trigger policy for the main phase.
             last_epoch: The index of last epoch (default: -1).
 
         Raises:
@@ -469,9 +510,15 @@ class qWarmupScheduler(LRScheduler):
         self.current_step = 0
         self.warmup_steps = warmup_steps
         self._is_plateau = isinstance(main_scheduler, ReduceLROnPlateau)
+        scheduler_name = "plateau" if self._is_plateau else type(main_scheduler).__name__
+        self.step_on = resolve_scheduler_step_on(scheduler_name, step_on)
 
         # Call parent class initializer after all instance variables are set
         super().__init__(optimizer, last_epoch)
+
+    @property
+    def is_plateau(self) -> bool:
+        return self._is_plateau
 
     def _is_donothing(self, obj: object) -> bool:
         """
@@ -524,7 +571,7 @@ class qWarmupScheduler(LRScheduler):
 
     def step_main(self, metrics: Optional[float] = None) -> None:
         """
-        Perform a main scheduler step (typically called at epoch end).
+        Perform a main scheduler step.
 
         After the warmup phase completes, this delegates to the main scheduler.
         For ReduceLROnPlateau, pass the validation metric; for other schedulers,
@@ -543,6 +590,18 @@ class qWarmupScheduler(LRScheduler):
             self.main_scheduler.step(metrics)
         else:
             self.main_scheduler.step()
+
+    def step_after_optimizer_update(self) -> None:
+        """Drive scheduler state after a real optimizer update."""
+        if self.current_step < self.warmup_steps:
+            self.step_warmup()
+            return
+
+        if self._is_plateau:
+            return
+
+        if self.step_on == SCHEDULER_STEP_ON_OPTIMIZER_STEP:
+            self.step_main()
 
     def get_lr(self) -> List[float]:
         """
@@ -581,6 +640,7 @@ class qWarmupScheduler(LRScheduler):
             "main": (self.main_scheduler.state_dict() if not self._is_donothing(self.main_scheduler) else None),
             "current_step": self.current_step,
             "_is_plateau": self._is_plateau,
+            "step_on": self.step_on,
         }
 
     def load_state_dict(self, state_dict: Dict) -> None:
@@ -600,6 +660,10 @@ class qWarmupScheduler(LRScheduler):
 
         self.current_step = state_dict.get("current_step", 0)
         self._is_plateau = state_dict.get("_is_plateau", isinstance(self.main_scheduler, ReduceLROnPlateau))
+        self.step_on = state_dict.get(
+            "step_on",
+            resolve_scheduler_step_on("plateau" if self._is_plateau else type(self.main_scheduler).__name__, None),
+        )
 
     def re_init(self, lr: float) -> None:
         """

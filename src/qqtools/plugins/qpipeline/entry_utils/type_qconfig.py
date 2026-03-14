@@ -42,6 +42,9 @@ class SchedulerParamsConfig:
     # Lambda LR
     lr_lambda: Optional[str] = None
 
+    # Scheduler stepping policy
+    step_on: Optional[str] = None
+
 
 @dataclass
 class WarmupParamsConfig:

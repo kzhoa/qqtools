@@ -19,7 +19,10 @@ from torch.utils.data import DataLoader
 import qqtools as qt
 
 from ..entry_utils.qema import qEMA
-from ..entry_utils.scheduler import qWarmupScheduler
+from ..entry_utils.scheduler import (
+    SCHEDULER_STEP_ON_VALID_END,
+    qWarmupScheduler,
+)
 from ..entry_utils.type_qconfig import CheckpointConfig, EarlyStopConfig, qConfig
 from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import qTaskBase
@@ -312,6 +315,10 @@ def train_runner(
     def _on_validation_end_step_scheduler(context: EventContext) -> None:
         if effective_scheduler is None:
             return
+
+        if effective_scheduler.step_on != SCHEDULER_STEP_ON_VALID_END:
+            return
+
         eval_results = context.eval_results or {}
         effective_scheduler.step_main(metrics=eval_results.get("val_metric"))
 
