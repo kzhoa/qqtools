@@ -305,22 +305,45 @@ optim:
 
 #### scheduler_params (Scheduler Parameters)
 
+##### Common Stepping Policy
+
+Non-plateau schedulers now step on completed `optimizer.step()` calls by default.
+You can override this with `scheduler_params.step_on`.
+
+```yaml
+optim:
+  scheduler: step
+  scheduler_params:
+    step_size: 1000
+    gamma: 0.1
+    step_on: optimizer_step # default for non-plateau schedulers
+```
+
+| Parameter | Type   | Allowed Values                | Default Resolution                          | Description                                        |
+| --------- | ------ | ----------------------------- | ------------------------------------------- | -------------------------------------------------- |
+| `step_on` | String | `optimizer_step`, `valid_end` | `optimizer_step` for non-plateau schedulers | Controls when the scheduler advances               |
+
+- For `plateau`, `step_on` is always `valid_end`
+- For non-plateau schedulers, `step_on=optimizer_step` means scheduler hyperparameters are interpreted in completed optimizer-update units
+- For non-plateau schedulers, `step_on=valid_end` means scheduler hyperparameters are interpreted in validation-trigger units
+
 ##### Cosine Annealing
 
 ```yaml
 optim:
   scheduler: cosine
   scheduler_params:
-    T_max: 100 # Cosine period (usually equals max_epochs)
+    T_max: 10000 # Cosine period in scheduler-step units
     eta_min: 1.0e-6 # Minimum learning rate
 ```
 
 | Parameter | Type    | Range | Default | Description                                |
 | --------- | ------- | ----- | ------- | ------------------------------------------ |
-| `T_max`   | Integer | ≥ 1   | None    | Period length, usually set to `max_epochs` |
+| `T_max`   | Integer | ≥ 1   | None    | Period length in scheduler-step units      |
 | `eta_min` | Float   | ≥ 0   | 0       | Minimum learning rate                      |
 
-- **Effect**: Learning rate decays from initial value to `eta_min` following cosine curve over `T_max` epochs
+- **Effect**: Learning rate decays from initial value to `eta_min` following cosine curve over `T_max` scheduler steps
+- **Default Unit**: completed optimizer updates (`step_on=optimizer_step`)
 - **Applicable For**: Tasks requiring gradual learning rate reduction
 
 ##### Step LR
@@ -329,17 +352,18 @@ optim:
 optim:
   scheduler: step
   scheduler_params:
-    step_size: 30 # Decay every 30 epochs
+    step_size: 1000 # Decay every 1000 scheduler steps
     gamma: 0.1 # Decay factor
 ```
 
 | Parameter   | Type    | Range | Default | Description                             |
 | ----------- | ------- | ----- | ------- | --------------------------------------- |
-| `step_size` | Integer | ≥ 1   | 30      | Decay period (epochs)                   |
+| `step_size` | Integer | ≥ 1   | 30      | Decay period in scheduler-step units    |
 | `gamma`     | Float   | 0-1   | 0.1     | Learning rate multiplied by this factor |
 
-- **Effect**: Every `step_size` epochs, multiply learning rate by `gamma`
-- **Example**: If lr=0.1, step_size=30, gamma=0.1, then at epoch 30, lr becomes 0.01
+- **Effect**: Every `step_size` scheduler steps, multiply learning rate by `gamma`
+- **Default Unit**: completed optimizer updates (`step_on=optimizer_step`)
+- **Example**: If lr=0.1, step_size=1000, gamma=0.1, then after 1000 scheduler steps, lr becomes 0.01
 
 ##### MultiStep LR
 
@@ -347,16 +371,17 @@ optim:
 optim:
   scheduler: multi_step
   scheduler_params:
-    milestones: [30, 60, 90] # Decay epochs
+    milestones: [1000, 2000, 3000] # Decay scheduler steps
     gamma: 0.1 # Decay factor
 ```
 
 | Parameter    | Type          | Description                               |
 | ------------ | ------------- | ----------------------------------------- |
-| `milestones` | Integer Array | List of epochs where learning rate decays |
+| `milestones` | Integer Array | List of scheduler steps where learning rate decays |
 | `gamma`      | Float         | Decay factor                              |
 
-- **Effect**: Adjust learning rate at specified epochs
+- **Effect**: Adjust learning rate at specified scheduler steps
+- **Default Unit**: completed optimizer updates (`step_on=optimizer_step`)
 - **Applicable For**: When optimal decay epochs are known
 
 ##### ReduceLROnPlateau
@@ -375,11 +400,12 @@ optim:
 | ----------- | ------- | ------- | ------- | -------------------------------------------- |
 | `mode`      | String  | min/max | min     | Optimization direction (min=lower is better) |
 | `factor`    | Float   | 0-1     | 0.1     | Decay factor                                 |
-| `patience`  | Integer | ≥ 1     | 10      | Epochs to wait before decaying               |
+| `patience`  | Integer | ≥ 1     | 10      | Validation-end checks to wait before decaying |
 | `threshold` | Float   | ≥ 0     | 1e-4    | Minimum threshold for improvement            |
 | `min_lr`    | Float   | ≥ 0     | 1e-6    | Minimum learning rate lower bound            |
 
-- **Effect**: When monitored metric shows no improvement for `patience` epochs, multiply learning rate by `factor`
+- **Effect**: When monitored metric shows no improvement for `patience` validation-end checks, multiply learning rate by `factor`
+- **Step Policy**: always driven by validation end (`step_on=valid_end`)
 - **Applicable For**: Adaptive learning rate adjustment based on validation metrics (Recommended)
 - **Relation**: Works best with `runner.early_stop.target`
 
@@ -1116,28 +1142,36 @@ runner:
 
 ### 4. Adaptation Between scheduler and run_mode
 
-#### Cosine Annealing (Recommended)
+`run_mode` does not directly decide scheduler units.
+The effective unit is controlled by `scheduler_params.step_on`.
+
+- Default for non-plateau schedulers: `optimizer_step`
+- Required for `plateau`: `valid_end`
+- Optional backward-compatible mode for non-plateau schedulers: `valid_end`
+
+#### Cosine Annealing With Default Optimizer-Step Semantics (Recommended)
 
 ```yaml
-# Epoch mode
 optim:
   scheduler: cosine
   scheduler_params:
-    T_max: 100              # Set to max_epochs
+    T_max: 100000           # Set to total optimizer updates
     eta_min: 1.0e-6
 
-# Step mode
+# Optional validation-driven stepping for backward-compatible behavior
 optim:
-  scheduler: cosine
+  scheduler: step
   scheduler_params:
-    T_max: 100000           # Set to max_steps
-    eta_min: 1.0e-6
+    step_size: 10
+    gamma: 0.1
+    step_on: valid_end
 ```
 
-**Correlation**: T_max should be adjusted based on `run_mode`:
+**Correlation**:
 
-- Epoch mode: T_max ≈ max_epochs
-- Step mode: T_max ≈ max_steps
+- If `step_on=optimizer_step`, set `T_max`, `step_size`, and `milestones` in completed optimizer-update units
+- If gradient accumulation is enabled, one scheduler step still corresponds to one real `optimizer.step()`, not one micro-batch
+- If `step_on=valid_end`, set scheduler hyperparameters in validation-trigger units
 
 #### Plateau Scheduler (Adaptive)
 
@@ -1154,6 +1188,7 @@ optim:
 
 - `scheduler.target` and `early_stop.target` should **remain consistent**
 - Plateau scheduler automatically adjusts learning rate based on metric
+- Plateau always steps on validation end and does not support `optimizer_step`
 - If monitored metric shows no long-term improvement, learning rate gradually decreases
 
 ### 5. Mutual Exclusivity Between ckp_file and init_file

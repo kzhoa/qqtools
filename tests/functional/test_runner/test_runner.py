@@ -209,10 +209,11 @@ class TestTrainingAgent:
 
         batch_data, batch_target = next(iter(self.task.train_loader))
         batch = (batch_data, batch_target)
-        metrics = agent._train_one_batch(batch, emit_events=False)
+        metrics, did_optimizer_step = agent._train_one_batch(batch, emit_events=False)
 
         assert "loss" in metrics
         assert metrics["loss"] > 0
+        assert did_optimizer_step is True
 
     def test_evaluate(self):
         """Test evaluate method"""
@@ -652,9 +653,7 @@ class TestTrainRunner:
             )
 
             assert result["best_monitored_metric"] is not None
-            # Check if learning rate has changed
-            # Initial lr is 0.01, after 1 step (1 epoch), it should be 0.001
-            # After 2 epochs, it should be 0.0001
+            # Default non-plateau schedulers now follow optimizer-step semantics.
             final_lr = optimizer.param_groups[0]["lr"]
             assert final_lr < 0.01
 
@@ -667,7 +666,9 @@ class TestTrainRunner:
             total_epochs = 5
             warmup_steps = len(task.train_loader) * warmup_epochs
             cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=total_epochs - warmup_epochs, eta_min=0.0001
+                optimizer,
+                T_max=(total_epochs - warmup_epochs) * len(task.train_loader),
+                eta_min=0.0001,
             )
             scheduler = qWarmupScheduler(
                 optimizer=optimizer,
@@ -690,16 +691,10 @@ class TestTrainRunner:
                 save_dir=tmpdir,
             )
 
-            # Verify learning rate changes over epochs
-            # Initial LR: 0.01
-            # After 1 epoch (warmup finishes), LR should be close to initial LR (0.01).
-            # After more epochs, it should decay according to cosine.
-
             final_lr = optimizer.param_groups[0]["lr"]
-            # After 3 epochs (1 warmup + 2 cosine), LR should have decayed from 0.01
             initial_lr = 0.01
 
-            assert final_lr < initial_lr  # Should have decayed
+            assert final_lr < initial_lr
             print(f"Final LR for warmup cosine scheduler: {final_lr}")
 
     def test_train_runner_with_cosine_lrscheduler(self):
@@ -708,9 +703,10 @@ class TestTrainRunner:
             task, model, loss_fn, optimizer = self._create_training_components(lr=0.01)
 
             # Using standard PyTorch CosineAnnealingLR
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5, eta_min=0.0001)
-
             max_epochs = 5
+            total_steps = max_epochs * len(task.train_loader)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=0.0001)
+
             train_runner(
                 model=model,
                 task=task,
@@ -727,6 +723,52 @@ class TestTrainRunner:
             # After 5 epochs, the LR should be close to eta_min (0.0001)
             assert final_lr == pytest.approx(0.0001, abs=1e-5)
             print(f"Final LR for cosine scheduler: {final_lr}")
+
+    def test_train_runner_non_plateau_scheduler_defaults_to_optimizer_step(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components(lr=0.01)
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                args=self.args,
+                max_steps=4,
+                eval_interval=3,
+                save_dir=tmpdir,
+                run_mode="step",
+            )
+
+            assert optimizer.param_groups[0]["lr"] == pytest.approx(0.01 * (0.5**4))
+
+    def test_train_runner_non_plateau_scheduler_can_step_on_valid_end(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components(lr=0.01)
+            scheduler = qWarmupScheduler(
+                optimizer=optimizer,
+                warmup_steps=0,
+                warmup_factor=1.0,
+                main_scheduler=optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5),
+                step_on="valid_end",
+            )
+
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                args=self.args,
+                max_steps=4,
+                eval_interval=2,
+                save_dir=tmpdir,
+                run_mode="step",
+            )
+
+            assert optimizer.param_groups[0]["lr"] == pytest.approx(0.01 * (0.5**2))
 
     def test_train_runner_with_plateau_lrscheduler(self):
         """Test train_runner with a ReduceLROnPlateau scheduler"""

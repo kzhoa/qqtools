@@ -58,6 +58,8 @@ WARMUP_DEFAULTS = {
     "warmup_factor": 0.01,
 }
 
+STEP_ON_CHOICES = ["optimizer_step", "valid_end"]
+
 
 def parse_scheduler_input(value: str, default_value) -> any:
     """Parse scheduler parameter input"""
@@ -155,6 +157,24 @@ def prompt_lr_scheduler_params():
                 break
             except (ValueError, SyntaxError) as e:
                 print_formatted_text(f"❌ Invalid input for {param_name}: {e}. Try again.")
+
+    if scheduler == "plateau":
+        params["step_on"] = "valid_end"
+        print_formatted_text("  ✓ step_on is fixed to valid_end for plateau scheduler.")
+    else:
+        step_on_completer = WordCompleter(STEP_ON_CHOICES)
+        while True:
+            value = prompt(
+                "  step_on [optimizer_step/valid_end] (default: optimizer_step): ",
+                completer=step_on_completer,
+            ).strip()
+            if not value:
+                params["step_on"] = "optimizer_step"
+                break
+            if value in STEP_ON_CHOICES:
+                params["step_on"] = value
+                break
+            print_formatted_text("❌ Invalid input. Must be 'optimizer_step' or 'valid_end'.")
 
     result = {"scheduler": scheduler, "scheduler_params": params}
 

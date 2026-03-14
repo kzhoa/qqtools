@@ -115,7 +115,6 @@ class RunningAgent:
         self._apply_train_step_impl = (
             self._apply_train_step_accum if self.has_accum_grad else self._apply_train_step_plain
         )
-        self._last_batch_did_optimizer_step = False
         self._current_accum_loss_count = 0.0
 
     def _validate_event_name(self, event: Union[str, EventType]) -> str:
@@ -424,9 +423,14 @@ class RunningAgent:
 
         return is_reached
 
-    def _step_warmup_and_maintenance(self) -> None:
+    def _get_current_lr(self) -> Optional[float]:
+        if self.optimizer is None:
+            return None
+        return self.optimizer.param_groups[0]["lr"]
+
+    def _handle_post_optimizer_step(self) -> None:
         if self.scheduler is not None:
-            self.scheduler.step_warmup()
+            self.scheduler.step_after_optimizer_update()
 
         gc_freq = self.config.gc_freq
         if gc_freq is None or gc_freq <= 0:
@@ -439,6 +443,15 @@ class RunningAgent:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _finalize_optimizer_step(self) -> bool:
+        self.state.global_step += 1
+
+        if self.ema_model is not None:
+            self.ema_model.update()
+
+        self._handle_post_optimizer_step()
+        return True
 
     def _is_accum_window_start(self) -> bool:
         batch_idx_zero = self.state.batch_idx_in_epoch - 1
@@ -456,7 +469,7 @@ class RunningAgent:
         loss_count: float,
         batch_metrics: Dict[str, float],
         total_batches: int,
-    ) -> None:
+    ) -> bool:
         self.optimizer.zero_grad()
         loss_tensor.backward()
 
@@ -464,12 +477,10 @@ class RunningAgent:
             clip_grad_norm_(self.model.parameters(), self.config.clip_grad)
 
         self.optimizer.step()
-        self._last_batch_did_optimizer_step = True
-
-        if self.ema_model is not None:
-            self.ema_model.update()
+        did_optimizer_step = self._finalize_optimizer_step()
 
         batch_metrics["loss"] = float(loss_tensor.item())
+        return did_optimizer_step
 
     def _apply_train_step_accum(
         self,
@@ -477,7 +488,7 @@ class RunningAgent:
         loss_count: float,
         batch_metrics: Dict[str, float],
         total_batches: int,
-    ) -> None:
+    ) -> bool:
         did_optimizer_step = False
         if self._is_accum_window_start():
             self.optimizer.zero_grad()
@@ -502,15 +513,11 @@ class RunningAgent:
                 clip_grad_norm_(self.model.parameters(), self.config.clip_grad)
 
             self.optimizer.step()
-            did_optimizer_step = True
             self._current_accum_loss_count = 0.0
-
-            if self.ema_model is not None:
-                self.ema_model.update()
+            did_optimizer_step = self._finalize_optimizer_step()
 
         batch_metrics["loss"] = float(loss_tensor.item())
-
-        self._last_batch_did_optimizer_step = did_optimizer_step
+        return did_optimizer_step
 
     def _extract_training_loss(self, losses: Dict[str, Any]) -> Tuple[torch.Tensor, float]:
         loss_entry = losses.get("loss")
@@ -532,7 +539,7 @@ class RunningAgent:
 
         return loss_tensor, loss_count
 
-    def _train_one_batch(self, batch_data: Any, emit_events: bool = True) -> Dict[str, float]:
+    def _train_one_batch(self, batch_data: Any, emit_events: bool = True) -> Tuple[Dict[str, float], bool]:
         total_batches = len(self.train_loader)
         state = self.state
         batch_idx = state.batch_idx_in_epoch - 1
@@ -551,12 +558,10 @@ class RunningAgent:
 
         losses = self.task.batch_loss(out, batch_data, self.loss_fn)
         loss_tensor, loss_count = self._extract_training_loss(losses)
-        self._apply_train_step_impl(loss_tensor, loss_count, batch_metrics, total_batches)
-        if self._last_batch_did_optimizer_step:
-            self.state.global_step += 1
+        did_optimizer_step = self._apply_train_step_impl(loss_tensor, loss_count, batch_metrics, total_batches)
 
         if not emit_events:
-            return batch_metrics
+            return batch_metrics, did_optimizer_step
 
         batch_time = time.time() - batch_start_time
         state.total_train_time += batch_time
@@ -570,9 +575,7 @@ class RunningAgent:
         self.train_avg_bank.add("batch_time", batch_time, 1.0)
         self.interval_avg_bank.add("batch_time", batch_time, 1.0)
 
-        current_lr = self.optimizer.param_groups[0]["lr"] if self.optimizer else None
-        if self._last_batch_did_optimizer_step:
-            self._step_warmup_and_maintenance()
+        current_lr = self._get_current_lr()
 
         is_update_tick = state.batch_idx_in_epoch % self.config.print_freq == 0
         is_update_tick = is_update_tick or state.batch_idx_in_epoch == total_batches
@@ -605,7 +608,7 @@ class RunningAgent:
             if has_table_update:
                 self._trigger("on_table_update", **common_progress_args)
 
-        return batch_metrics
+        return batch_metrics, did_optimizer_step
 
     def _training_loop(self) -> bool:
         try:
@@ -622,8 +625,7 @@ class RunningAgent:
                         continue
 
                     self.state.batch_idx_in_epoch = batch_idx + 1
-                    self._train_one_batch(batch_data, emit_events=True)
-                    did_optimizer_step = self._last_batch_did_optimizer_step
+                    _, did_optimizer_step = self._train_one_batch(batch_data, emit_events=True)
 
                     is_epoch_end = self.state.batch_idx_in_epoch >= total_batches
                     should_handle_periodic = False
