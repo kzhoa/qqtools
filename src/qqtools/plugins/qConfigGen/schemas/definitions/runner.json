@@ -24,7 +24,7 @@
             ],
             "minimum": 1,
             "default": null,
-            "description": "Maximum number of training steps. Used when run_mode='step'. Ignored when run_mode='epoch'. If null, no step limit is applied and training relies solely on max_epochs."
+            "description": "Maximum number of optimizer steps. Required when run_mode='step'. Ignored when run_mode='epoch'."
         },
         "eval_interval": {
             "type": "integer",
@@ -39,7 +39,7 @@
             ],
             "minimum": 1,
             "default": null,
-            "description": "Regular checkpoint saving interval in steps. null disables regular saving"
+            "description": "Regular checkpoint saving interval. null follows eval_interval, and explicit integer values use the same units as run_mode."
         },
         "clip_grad": {
             "type": [
@@ -49,6 +49,15 @@
             "minimum": 0.1,
             "default": null,
             "description": "Gradient clipping threshold (null disables clipping)"
+        },
+        "accum_grad": {
+            "type": [
+                "integer",
+                "null"
+            ],
+            "minimum": 1,
+            "default": null,
+            "description": "Gradient accumulation factor. null disables accumulation."
         },
         "early_stop": {
             "$ref": "./earlystopper.json"
@@ -97,23 +106,16 @@
             "properties": {
                 "run_mode": {
                     "const": "step"
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "minimum": 1
                 }
             },
             "required": [
                 "run_mode",
+                "max_steps",
                 "early_stop"
-            ],
-            "anyOf": [
-                {
-                    "required": [
-                        "max_epochs"
-                    ]
-                },
-                {
-                    "required": [
-                        "max_steps"
-                    ]
-                }
             ]
         }
     ],

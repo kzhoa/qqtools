@@ -3,13 +3,19 @@ Test suite for qcgen CLI command
 Tests the qConfigGen interactive configuration generator
 """
 
-import os
+import json
 import tempfile
 from pathlib import Path
 from unittest import mock
 
 import pytest
 import yaml
+
+
+def _load_runner_schema():
+    schema_path = Path(__file__).resolve().parents[3] / "src/qqtools/plugins/qConfigGen/schemas/definitions/runner.json"
+    with open(schema_path, "r") as f:
+        return json.load(f)
 
 
 def test_qcgen_import():
@@ -53,7 +59,7 @@ def test_qcgen_full_workflow():
         mock_scheduler.return_value = {"scheduler": "cosine"}
         mock_ema.return_value = {"ema_decay": 0.99}
         mock_model.return_value = {"model_type": "resnet50"}
-        mock_runner.return_value = {"run_mode": "train", "num_epochs": 100}
+        mock_runner.return_value = {"run_mode": "epoch", "max_epochs": 100}
 
         with tempfile.TemporaryDirectory() as tmpdir:
             mock_save.return_value = (tmpdir, "config.yaml")
@@ -89,7 +95,7 @@ def test_qcgen_yaml_output_format():
         "task": {"dataset": "imagenet", "dataloader": {"batch_size": 32}},
         "optim": {"loss": "cross_entropy", "optimizer": "adamw"},
         "model": {"model_type": "resnet50"},
-        "runner": {"run_mode": "train", "num_epochs": 100},
+        "runner": {"run_mode": "epoch", "max_epochs": 100},
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -141,7 +147,7 @@ def test_qcgen_cli_entry_point():
         mock_scheduler.return_value = {"scheduler": "cosine"}
         mock_ema.return_value = {}
         mock_model.return_value = {}
-        mock_runner.return_value = {"run_mode": "train"}
+        mock_runner.return_value = {"run_mode": "epoch", "max_epochs": 1}
 
         with tempfile.TemporaryDirectory() as tmpdir:
             mock_save.return_value = (tmpdir, "config.yaml")
@@ -152,3 +158,36 @@ def test_qcgen_cli_entry_point():
             # Verify config was created
             config_file = Path(tmpdir) / "config.yaml"
             assert config_file.exists()
+
+
+def test_runner_schema_supports_accum_grad():
+    schema = _load_runner_schema()
+
+    accum_grad_schema = schema["properties"]["accum_grad"]
+
+    assert accum_grad_schema["type"] == ["integer", "null"]
+    assert accum_grad_schema["minimum"] == 1
+    assert accum_grad_schema["default"] is None
+
+
+def test_runner_schema_requires_mode_specific_boundaries():
+    schema = _load_runner_schema()
+    branches = {branch["properties"]["run_mode"]["const"]: branch for branch in schema["oneOf"]}
+
+    epoch_branch = branches["epoch"]
+    step_branch = branches["step"]
+
+    assert "max_epochs" in epoch_branch["required"]
+    assert "max_steps" not in epoch_branch["required"]
+    assert "max_steps" in step_branch["required"]
+    assert "anyOf" not in step_branch
+    assert step_branch["properties"]["max_steps"]["type"] == "integer"
+    assert step_branch["properties"]["max_steps"]["minimum"] == 1
+
+
+def test_runner_schema_save_interval_description_matches_runtime_semantics():
+    schema = _load_runner_schema()
+    save_interval_desc = schema["properties"]["save_interval"]["description"]
+
+    assert "eval_interval" in save_interval_desc
+    assert "run_mode" in save_interval_desc

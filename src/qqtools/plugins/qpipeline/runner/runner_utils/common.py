@@ -41,7 +41,6 @@ def _is_periodic_trigger(
         return False
 
     if run_mode == RunMode.STEP:
-        # global_step is incremented after periodic checks, so use completed-step semantics.
-        return (global_step + 1) % interval == 0
+        return global_step > 0 and global_step % interval == 0
 
     return is_epoch_end and (epoch + 1) % interval == 0

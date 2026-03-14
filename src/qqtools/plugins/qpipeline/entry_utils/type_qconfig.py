@@ -106,7 +106,15 @@ class RunnerConfig:
     eval_interval: int = 1
     save_interval: Optional[int] = None
     clip_grad: Optional[float] = None
+    accum_grad: Optional[int] = None
     checkpoint: Optional[CheckpointConfig] = None
+
+    def __post_init__(self) -> None:
+        if self.accum_grad is not None:
+            if isinstance(self.accum_grad, bool) or not isinstance(self.accum_grad, int):
+                raise ValueError("runner.accum_grad must be an integer when specified")
+            if self.accum_grad < 1:
+                raise ValueError("runner.accum_grad must be a positive integer (>= 1) when specified")
 
 
 @dataclass

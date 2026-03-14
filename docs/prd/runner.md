@@ -64,6 +64,8 @@ Resolved in `train_runner`:
 - `epoch` mode: units are epochs
 - `step` mode: units are global steps
 
+When gradient accumulation is enabled via `runner.accum_grad`, step-mode global-step semantics are defined in units of completed optimizer updates rather than micro-batches.
+
 ### 3.4 Metric Coupling
 
 - `early_stop` is evaluated only at evaluation points, so effective cadence is coupled to `run_mode + eval_interval`.
@@ -73,10 +75,18 @@ Resolved in `train_runner`:
 
 1. Read explicit function arguments and `args.runner` fields.
 2. Validate required inputs (`run_mode`, `args.runner`, required boundary per mode).
-3. Apply business policy (including boundary mutual exclusion).
+3. Apply business policy (including boundary mutual exclusion and step semantics for `accum_grad`).
 4. Apply fallback/default values.
 5. Build final `RunConfig`.
 6. Instantiate `RunningAgent` with resolved config.
+
+### 3.7 Gradient Accumulation
+
+- `runner.accum_grad` is optional.
+- `None` disables accumulation.
+- Positive integers enable accumulation across that many micro-batches.
+- `train_runner` validates the field and passes the resolved value into `RunConfig`.
+- `RunningAgent` executes accumulation mechanics without re-interpreting the policy.
 
 ### 3.6 Conflict Handling
 
@@ -129,12 +139,19 @@ Listeners may read state and write loop intent through `LoopSignal`, but must no
 5. Runner dispatches `on_validation_end` listeners.
 6. Runner consumes `LoopSignal` and executes loop-control actions (early stop, checkpoint requests).
 
+### 4.6 Step Semantics Under Gradient Accumulation
+
+- batch-level progress and `batch_idx_in_epoch` remain micro-batch oriented
+- `global_step` increments only after a real `optimizer.step()`
+- scheduler warmup, EMA update, gradient clipping, and step-mode periodic triggers are all tied to completed optimizer updates
+- incomplete accumulation windows must be flushed at epoch end
+
 ### 4.5 Checkpoint Sync Rule
 
 Checkpoint persistence is a listener side effect (`checkpoint_path` output).
 After callback completion, `RunningAgent` synchronizes persistent state fields (for example `best_ckp_file`) from callback results.
 
-### 4.6 Listener Responsibilities
+### 4.7 Listener Responsibilities
 
 - `EarlyStopListener`: consumes metrics and writes stop intent into `LoopSignal`
 - `CheckpointListener`: handles save side effect for checkpoint requests
@@ -252,6 +269,5 @@ Notes:
 ## 9. References
 
 - ADR: `docs/adr/qpipeline/0001-runner-boundary-ownership.md`
-
 
 

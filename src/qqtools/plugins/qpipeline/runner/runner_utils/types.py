@@ -40,6 +40,7 @@ class RunConfig:
 
     # optimizer
     clip_grad: Optional[float] = None
+    accum_grad: Optional[int] = None
 
     # ddp
     distributed: bool = False
@@ -79,6 +80,11 @@ class RunConfig:
         # Validate eval_interval
         if not isinstance(self.eval_interval, int) or self.eval_interval < 1:
             raise ValueError("eval_interval must be a positive integer (>=1)")
+        if self.accum_grad is not None:
+            if isinstance(self.accum_grad, bool) or not isinstance(self.accum_grad, int):
+                raise ValueError("accum_grad must be an integer when specified")
+            if self.accum_grad < 1:
+                raise ValueError("accum_grad must be a positive integer (>=1) when specified")
 
 
 @dataclass

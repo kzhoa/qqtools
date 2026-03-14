@@ -15,6 +15,7 @@ import torch.optim as optim
 
 from qqtools.plugins.qpipeline.qlogger import qLogger
 from qqtools.plugins.qpipeline.runner import agent as agent_module
+from qqtools.plugins.qpipeline.entry_utils.scheduler import qWarmupScheduler
 from qqtools.plugins.qpipeline.runner.runner import (
     RunningAgent,
     SheetLoggerListener,
@@ -662,19 +663,17 @@ class TestTrainRunner:
         with tempfile.TemporaryDirectory() as tmpdir:
             task, model, loss_fn, optimizer = self._create_training_components(lr=0.01)
 
-            # Native PyTorch way to do warmup + cosine
             warmup_epochs = 1
             total_epochs = 5
-
-            scheduler1 = optim.lr_scheduler.LinearLR(
-                optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
-            )
-            scheduler2 = optim.lr_scheduler.CosineAnnealingLR(
+            warmup_steps = len(task.train_loader) * warmup_epochs
+            cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=total_epochs - warmup_epochs, eta_min=0.0001
             )
-
-            scheduler = optim.lr_scheduler.SequentialLR(
-                optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_epochs]
+            scheduler = qWarmupScheduler(
+                optimizer=optimizer,
+                warmup_steps=warmup_steps,
+                warmup_factor=0.1,
+                main_scheduler=cosine_scheduler,
             )
 
             # Run for a few epochs to observe LR changes
@@ -913,8 +912,8 @@ class TestPeriodicTrigger:
         "run_mode,interval,global_step,epoch,is_epoch_end,expected",
         [
             (RunMode.STEP, 2, 0, 0, False, False),
-            (RunMode.STEP, 2, 1, 0, False, True),
-            (RunMode.STEP, 1, 0, 0, False, True),
+            (RunMode.STEP, 2, 2, 0, False, True),
+            (RunMode.STEP, 1, 1, 0, False, True),
             (RunMode.EPOCH, 2, 0, 0, True, False),
             (RunMode.EPOCH, 2, 0, 1, True, True),
             (RunMode.EPOCH, 2, 0, 1, False, False),
@@ -945,7 +944,7 @@ class TestPeriodicTrigger:
             logger=logger,
         )
 
-        state = RunningState(global_step=1, epoch=0)
+        state = RunningState(global_step=2, epoch=0)
         context = EventContext(
             state=state,
             batch_idx=0,
