@@ -1,4 +1,5 @@
 from qqtools.plugins.qexp import fsqueue
+from qqtools.plugins.qexp.executor import qExpExecutor
 from qqtools.plugins.qexp.models import qExpTask
 from qqtools.plugins.qexp.scheduler import qExpScheduler
 from qqtools.plugins.qexp.tracker import qExpTracker
@@ -28,6 +29,7 @@ def test_scheduler_uses_fifo_with_backfill(tmp_path, monkeypatch):
     scheduler = qExpScheduler(
         tracker=tracker,
         create_window=lambda task_id, session_name: f"@{task_id}",
+        executor=qExpExecutor(send_command=lambda _window_id, _command: None),
     )
 
     launched = scheduler.run_cycle(root)
@@ -59,6 +61,7 @@ def test_scheduler_kills_window_when_dispatch_races(tmp_path, monkeypatch):
         tracker=tracker,
         create_window=lambda task_id, session_name: "@race",
         kill_window=lambda window_id: killed_windows.append(window_id),
+        executor=qExpExecutor(send_command=lambda _window_id, _command: None),
     )
     original_dispatch = fsqueue.dispatch_task_to_running
 

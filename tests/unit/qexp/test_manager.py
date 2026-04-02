@@ -80,7 +80,17 @@ def test_get_idle_timeout_seconds_reads_env(monkeypatch):
     monkeypatch.setenv("QQTOOLS_DAEMON_IDLE_TIMEOUT", "42")
     assert manager.get_idle_timeout_seconds() == 42
 
+def test_main_accepts_root_only(monkeypatch, tmp_path):
+    expected_root = tmp_path / "daemon-root"
+    captured = {}
 
-def test_main_rejects_conflicting_background_and_foreground_flags():
-    with pytest.raises(RuntimeError, match="Choose either --background or --foreground"):
-        manager.main(["--background", "--foreground"])
+    def _fake_run_daemon_foreground(root=None, **_kwargs):
+        captured["root"] = root
+        return 0
+
+    monkeypatch.setattr(manager, "run_daemon_foreground", _fake_run_daemon_foreground)
+
+    result = manager.main(["--root", str(expected_root)])
+
+    assert result == 0
+    assert captured["root"] == expected_root.resolve()

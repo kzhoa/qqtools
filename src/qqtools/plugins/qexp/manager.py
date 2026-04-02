@@ -7,8 +7,6 @@ import json
 import os
 import platform
 import shutil
-import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -167,21 +165,9 @@ def run_preflight_checks() -> qExpPreflightResult:
     return qExpPreflightResult(gpu_backend=backend_name, visible_gpu_ids=visible_gpu_ids)
 
 
-def start_daemon_background(root: Path | None = None) -> subprocess.Popen:
+def start_daemon_background(root: Path | None = None) -> None:
     root_path = fsqueue.ensure_qexp_layout(root)
-    return subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "qqtools.plugins.qexp.manager",
-            "--background",
-            "--root",
-            str(root_path),
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    tmux.launch_background_daemon(root_path)
 
 
 def reconcile_running_jobs(
@@ -291,14 +277,10 @@ def run_daemon_foreground(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="qexp daemon runner")
-    parser.add_argument("--background", action="store_true")
-    parser.add_argument("--foreground", action="store_true")
     parser.add_argument("--root", type=str, default=None)
     args = parser.parse_args(argv)
 
     root = Path(args.root).expanduser().resolve() if args.root else None
-    if args.background and args.foreground:
-        raise RuntimeError("Choose either --background or --foreground, not both.")
     return run_daemon_foreground(root=root)
 
 

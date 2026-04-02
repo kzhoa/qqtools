@@ -4,6 +4,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from .models import STATE_DIRECTORY_MAP, TASK_STATES, qExpTask, get_state_directory_name, utc_now_iso
 
@@ -78,6 +79,16 @@ def read_task_payload(path: Path) -> dict:
     if not isinstance(payload, dict):
         raise ValueError(f"Task payload at {path} must be a dictionary.")
     return payload
+
+
+def _update_task_file(path: Path, updates: dict[str, Any]) -> qExpTask:
+    task = load_task(path)
+    for field_name, field_value in updates.items():
+        if not hasattr(task, field_name):
+            raise AttributeError(f"Task has no field named '{field_name}'.")
+        setattr(task, field_name, field_value)
+    _write_atomic_json(path, task.to_dict())
+    return task
 
 
 def save_task(task: qExpTask, root: Path | None = None) -> Path:
@@ -195,6 +206,60 @@ def fail_running_task(task_id: str, exit_reason: str, root: Path | None = None) 
     task.exit_reason = exit_reason
     task.finished_at = utc_now_iso()
     destination = get_task_path("failed", task_id, root)
+    _write_atomic_json(source, task.to_dict())
+    os.replace(source, destination)
+    return destination
+
+
+def update_running_task(task_id: str, root: Path | None = None, **updates: Any) -> qExpTask:
+    ensure_qexp_layout(root)
+    path = get_task_path("running", task_id, root)
+    if not path.exists():
+        raise FileNotFoundError(f"Running task file not found for update: {path}")
+    return _update_task_file(path, updates)
+
+
+def cancel_pending_task(task_id: str, root: Path | None = None) -> Path:
+    ensure_qexp_layout(root)
+    source = get_task_path("pending", task_id, root)
+    if not source.exists():
+        raise FileNotFoundError(f"Pending task file not found for cancellation: {source}")
+
+    task = load_task(source)
+    task.status = "cancelled"
+    task.exit_reason = "cancelled_before_start"
+    task.finished_at = utc_now_iso()
+    destination = get_task_path("cancelled", task_id, root)
+    _write_atomic_json(source, task.to_dict())
+    os.replace(source, destination)
+    return destination
+
+
+def complete_running_task(
+    task_id: str,
+    terminal_state: str,
+    root: Path | None = None,
+    *,
+    exit_code: int | None,
+    exit_reason: str | None = None,
+    finished_at: str | None = None,
+) -> Path:
+    ensure_qexp_layout(root)
+    if terminal_state not in {"done", "failed", "cancelled"}:
+        raise ValueError(
+            "terminal_state must be one of done, failed, or cancelled for running completion."
+        )
+
+    source = get_task_path("running", task_id, root)
+    if not source.exists():
+        raise FileNotFoundError(f"Running task file not found for completion: {source}")
+
+    task = load_task(source)
+    task.status = terminal_state
+    task.exit_code = exit_code
+    task.exit_reason = exit_reason
+    task.finished_at = finished_at or utc_now_iso()
+    destination = get_task_path(terminal_state, task_id, root)
     _write_atomic_json(source, task.to_dict())
     os.replace(source, destination)
     return destination

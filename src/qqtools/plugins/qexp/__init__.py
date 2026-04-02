@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .api import submit
+from .api import cancel, get_logs_path, read_logs, submit
 from .models import (
     STATE_DIRECTORY_MAP,
     TASK_CANCELLED,
@@ -14,6 +14,9 @@ from .models import (
 
 __all__ = [
     "submit",
+    "cancel",
+    "get_logs_path",
+    "read_logs",
     "qExpTask",
     "TASK_PENDING",
     "TASK_RUNNING",

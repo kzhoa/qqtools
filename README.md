@@ -118,6 +118,7 @@ under `plugins/`
 - qchem
 - qpipeline
 - qhyperconnect
+- qexp (Linux only)
 
 
 # Test

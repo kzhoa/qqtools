@@ -2,9 +2,11 @@ import sys
 
 import pytest
 
-from qqtools.plugins.qexp import submit
+from qqtools.plugins.qexp import api as qexp_api
+from qqtools.plugins.qexp import cancel, submit
 from qqtools.plugins.qexp import fsqueue
 from qqtools.plugins.qexp import manager
+from qqtools.plugins.qexp.models import qExpTask
 
 
 def test_submit_bootstraps_layout_and_persists_pending_task(tmp_path, monkeypatch):
@@ -59,3 +61,44 @@ def test_submit_reports_daemon_start_failure_after_queueing(tmp_path, monkeypatc
         submit(argv=["python", "train.py"], num_gpus=1, job_id="job_fail")
 
     assert root.joinpath("jobs", "pending", "job_fail.json").is_file()
+
+
+def test_cancel_moves_pending_task_to_cancelled(tmp_path, monkeypatch):
+    root = tmp_path / "cancel-home"
+    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
+    task = qExpTask(task_id="job_pending", argv=["python", "train.py"], num_gpus=1)
+    fsqueue.save_task(task, root)
+
+    cancelled = cancel("job_pending", root=root)
+
+    assert cancelled.status == "cancelled"
+    assert cancelled.exit_reason == "cancelled_before_start"
+
+
+def test_cancel_running_task_signals_process_group_and_escalates(tmp_path, monkeypatch):
+    root = tmp_path / "cancel-home"
+    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
+    task = qExpTask(
+        task_id="job_running",
+        argv=["python", "train.py"],
+        num_gpus=1,
+        status="running",
+        assigned_gpus=[0],
+        tmux_session="experiments",
+        tmux_window_id="@job_running",
+        process_group_id=1234,
+    )
+    fsqueue.save_task(task, root)
+
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(qexp_api.os, "killpg", lambda pgid, sig: signals.append((pgid, sig)))
+    monkeypatch.setattr(qexp_api, "_is_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(qexp_api.time, "sleep", lambda _seconds: None)
+    time_values = iter([0.0, 0.05, 0.1, 0.25])
+    monkeypatch.setattr(qexp_api.time, "time", lambda: next(time_values))
+
+    current = cancel("job_running", root=root, grace_seconds=0.2, poll_interval_seconds=0.01)
+
+    assert current.status == "running"
+    assert signals[0][0] == 1234
+    assert len(signals) == 2
