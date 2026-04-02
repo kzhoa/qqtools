@@ -106,9 +106,12 @@ def _is_process_alive(pid: int) -> bool:
     return True
 
 
-def has_active_daemon_lock(root: Path | None = None) -> bool:
+def _has_active_daemon_lock(root: Path | None = None, *, create_if_missing: bool) -> bool:
     pid_path = fsqueue.ensure_qexp_layout(root).joinpath(DAEMON_PID_FILE)
-    pid_path.touch(exist_ok=True)
+    if not pid_path.exists():
+        if not create_if_missing:
+            return False
+        pid_path.touch(exist_ok=True)
     with pid_path.open("a+", encoding="utf-8") as handle:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -116,6 +119,14 @@ def has_active_daemon_lock(root: Path | None = None) -> bool:
             return True
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         return False
+
+
+def has_active_daemon_lock(root: Path | None = None) -> bool:
+    return _has_active_daemon_lock(root, create_if_missing=True)
+
+
+def has_active_daemon_lock_readonly(root: Path | None = None) -> bool:
+    return _has_active_daemon_lock(root, create_if_missing=False)
 
 
 def is_heartbeat_stale(root: Path | None = None, stale_seconds: int = HEARTBEAT_STALE_SECONDS) -> bool:

@@ -9,7 +9,10 @@ from typing import Any
 
 from . import fsqueue
 from . import manager
-from .models import TASK_PENDING, qExpTask
+from .models import TASK_CANCELLED, TASK_DONE, TASK_FAILED, TASK_PENDING, qExpTask
+from .observer import build_status_snapshot
+
+DEFAULT_CLEAN_OLDER_THAN_SECONDS = 7 * 24 * 60 * 60
 
 
 def _generate_task_id() -> str:
@@ -124,3 +127,58 @@ def read_logs(task_id: str, *, root: Path | None = None) -> str:
     if not log_path.exists():
         raise FileNotFoundError(f"qexp log for task '{task_id}' does not exist.")
     return log_path.read_text(encoding="utf-8")
+
+
+def get_status_snapshot(*, root: Path | None = None) -> dict[str, Any]:
+    return build_status_snapshot(root=root)
+
+
+def _is_task_old_enough(path: Path, older_than_seconds: int) -> bool:
+    age_seconds = time.time() - path.stat().st_mtime
+    return age_seconds >= older_than_seconds
+
+
+def clean(
+    *,
+    root: Path | None = None,
+    dry_run: bool = False,
+    include_failed: bool = False,
+    older_than_seconds: int = DEFAULT_CLEAN_OLDER_THAN_SECONDS,
+) -> dict[str, Any]:
+    state_root = fsqueue.ensure_qexp_layout(root)
+    if older_than_seconds < 0:
+        raise ValueError("older_than_seconds must be >= 0.")
+    target_states = [TASK_DONE, TASK_CANCELLED]
+    if include_failed:
+        target_states.append(TASK_FAILED)
+
+    deleted_task_ids: list[str] = []
+    deleted_task_files: list[str] = []
+    deleted_log_files: list[str] = []
+
+    for state in target_states:
+        for path in fsqueue.get_state_task_paths(state, state_root):
+            if not _is_task_old_enough(path, older_than_seconds):
+                continue
+            task_id = path.stem
+            log_path = fsqueue.get_log_path(task_id, state_root)
+            deleted_task_ids.append(task_id)
+            deleted_task_files.append(str(path))
+            if log_path.exists():
+                deleted_log_files.append(str(log_path))
+
+            if dry_run:
+                continue
+
+            path.unlink(missing_ok=True)
+            if log_path.exists():
+                log_path.unlink()
+
+    return {
+        "dry_run": dry_run,
+        "include_failed": include_failed,
+        "older_than_seconds": older_than_seconds,
+        "task_ids": deleted_task_ids,
+        "deleted_task_files": deleted_task_files,
+        "deleted_log_files": deleted_log_files,
+    }

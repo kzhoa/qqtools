@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -84,6 +85,114 @@ def _tail_log_forever(log_path: Path) -> int:
             time.sleep(0.5)
 
 
+def _render_status_text(snapshot: dict) -> str:
+    lines = [
+        f"Daemon: {snapshot['daemon']['state']}",
+        (
+            "Pending: {pending}  Running: {running}  Done: {done}  Failed: {failed}  "
+            "Cancelled: {cancelled}"
+        ).format(**snapshot["counts"]),
+        "",
+    ]
+
+    columns = [
+        ("STATE", "state"),
+        ("TASK_ID", "task_id"),
+        ("NAME", "name"),
+        ("GPUS", "gpus"),
+        ("ASSIGNED", "assigned"),
+        ("CREATED_AT", "created_at"),
+        ("EXIT_REASON", "exit_reason"),
+    ]
+    rows = snapshot["tasks"]
+    widths: list[int] = []
+    for header, key in columns:
+        cell_width = max((len(str(row[key])) for row in rows), default=0)
+        widths.append(max(len(header), cell_width))
+
+    header_line = "  ".join(header.ljust(width) for (header, _key), width in zip(columns, widths))
+    lines.append(header_line)
+    for row in rows:
+        lines.append(
+            "  ".join(str(row[key]).ljust(width) for (_header, key), width in zip(columns, widths))
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_gpu_slot(slot: dict) -> str:
+    return "\n".join(
+        [
+            f"GPU {slot['gpu_id']}",
+            slot["state"],
+            slot["task_id"],
+        ]
+    )
+
+
+def _render_top(snapshot: dict) -> None:
+    from rich.columns import Columns
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    console = Console()
+    daemon = snapshot["daemon"]
+    daemon_table = Table.grid(padding=(0, 1))
+    daemon_table.add_row("Daemon", daemon["state"])
+    daemon_table.add_row("Host", snapshot["host"]["hostname"] or "-")
+    daemon_table.add_row("Platform", snapshot["host"]["platform"] or "-")
+    daemon_table.add_row("GPU Backend", snapshot["gpus"]["backend"] or daemon["gpu_backend"] or "-")
+    daemon_table.add_row("Visible GPUs", str(len(snapshot["gpus"]["visible_gpu_ids"])))
+
+    gpu_panels = []
+    slots = list(snapshot["gpus"]["slots"])
+    visible_count = max(8, len(slots))
+    for index in range(visible_count):
+        slot = slots[index] if index < len(slots) else {"gpu_id": "-", "state": "-", "task_id": "-"}
+        style = "red" if slot["state"] == "Reserved" else "green"
+        if slot["state"] == "-":
+            style = "dim"
+        gpu_panels.append(Panel(_render_gpu_slot(slot), border_style=style))
+
+    pending_table = Table(show_header=True)
+    pending_table.add_column("TASK_ID")
+    pending_table.add_column("NAME")
+    pending_table.add_column("GPUS")
+    pending_table.add_column("CREATED_AT")
+    for row in snapshot["pending_preview"]:
+        pending_table.add_row(row["task_id"], row["name"], str(row["gpus"]), row["created_at"])
+
+    event_table = Table(show_header=True)
+    event_table.add_column("TIMESTAMP")
+    event_table.add_column("TASK_ID")
+    event_table.add_column("STATE")
+    event_table.add_column("EXIT_REASON")
+    for event in snapshot["events"]:
+        event_table.add_row(
+            event["timestamp"],
+            event["task_id"],
+            event["state"],
+            event["exit_reason"],
+        )
+
+    console.print(Panel(daemon_table, title="Daemon And Host"))
+    console.print(Panel(Columns(gpu_panels, equal=True, expand=True), title="GPU Occupancy"))
+    console.print(Panel(pending_table, title="Pending Preview"))
+    console.print(Panel(event_table, title="Recent Events"))
+
+
+def _render_clean_summary(result: dict) -> str:
+    mode = "Dry run" if result["dry_run"] else "Deleted"
+    lines = [
+        f"{mode}: {len(result['task_ids'])} task files, {len(result['deleted_log_files'])} log files",
+    ]
+    for path in result["deleted_task_files"]:
+        lines.append(path)
+    for path in result["deleted_log_files"]:
+        lines.append(path)
+    return "\n".join(lines) + "\n"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="qexp local experiment scheduler")
     parser.add_argument("--root", type=str, default=None, help="override qexp state root")
@@ -116,6 +225,20 @@ def build_parser() -> argparse.ArgumentParser:
     logs_parser = subparsers.add_parser("logs", help="show persisted logs for a task")
     logs_parser.add_argument("task_id", type=str)
     logs_parser.add_argument("-f", "--follow", action="store_true")
+
+    status_parser = subparsers.add_parser("status", help="show queue and daemon status")
+    status_parser.add_argument("--json", action="store_true", dest="json_output")
+
+    subparsers.add_parser("top", help="show operator dashboard")
+
+    clean_parser = subparsers.add_parser("clean", help="clean completed qexp records")
+    clean_parser.add_argument("--dry-run", action="store_true")
+    clean_parser.add_argument("--include-failed", action="store_true")
+    clean_parser.add_argument(
+        "--older-than-seconds",
+        type=int,
+        default=api.DEFAULT_CLEAN_OLDER_THAN_SECONDS,
+    )
 
     return parser
 
@@ -168,6 +291,33 @@ def handle_logs(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_status(args: argparse.Namespace) -> int:
+    snapshot = api.get_status_snapshot(root=_normalize_root(args.root))
+    if args.json_output:
+        sys.stdout.write(json.dumps(snapshot, indent=2, sort_keys=True))
+        sys.stdout.write("\n")
+        return 0
+
+    sys.stdout.write(_render_status_text(snapshot))
+    return 0
+
+
+def handle_top(args: argparse.Namespace) -> int:
+    _render_top(api.get_status_snapshot(root=_normalize_root(args.root)))
+    return 0
+
+
+def handle_clean(args: argparse.Namespace) -> int:
+    result = api.clean(
+        root=_normalize_root(args.root),
+        dry_run=args.dry_run,
+        include_failed=args.include_failed,
+        older_than_seconds=args.older_than_seconds,
+    )
+    sys.stdout.write(_render_clean_summary(result))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -180,6 +330,12 @@ def main(argv: list[str] | None = None) -> int:
         return handle_cancel(args)
     if args.command == "logs":
         return handle_logs(args)
+    if args.command == "status":
+        return handle_status(args)
+    if args.command == "top":
+        return handle_top(args)
+    if args.command == "clean":
+        return handle_clean(args)
 
     parser.error(f"Unsupported command: {args.command}")
     return 2

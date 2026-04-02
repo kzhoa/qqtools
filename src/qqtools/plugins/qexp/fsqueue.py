@@ -114,20 +114,28 @@ def load_task(path: Path) -> qExpTask:
 
 def iter_tasks(state: str, root: Path | None = None) -> list[qExpTask]:
     ensure_qexp_layout(root)
-    state_dir = get_state_dir(state, root)
     tasks: list[qExpTask] = []
+    for path in get_state_task_paths(state, root):
+        tasks.append(load_task(path))
+    return tasks
+
+
+def get_state_task_paths(state: str, root: Path | None = None) -> list[Path]:
+    ensure_qexp_layout(root)
+    state_dir = get_state_dir(state, root)
+    paths: list[Path] = []
     for path in sorted(state_dir.glob("*.json")):
         if path.name.endswith(".tmp"):
             continue
-        tasks.append(load_task(path))
-    return tasks
+        paths.append(path)
+    return paths
 
 
 def iter_all_task_paths(root: Path | None = None) -> list[Path]:
     ensure_qexp_layout(root)
     task_paths: list[Path] = []
     for state in TASK_STATES:
-        task_paths.extend(sorted(get_state_dir(state, root).glob("*.json")))
+        task_paths.extend(get_state_task_paths(state, root))
     return task_paths
 
 
