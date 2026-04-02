@@ -2,6 +2,7 @@ import pytest
 
 from qqtools.plugins.qexp.models import (
     TASK_PENDING,
+    ensure_valid_task_id,
     qExpTask,
     ensure_valid_task_state,
     get_state_directory_name,
@@ -20,6 +21,18 @@ def test_qexp_task_requires_positive_num_gpus():
 def test_qexp_task_rejects_unknown_state():
     with pytest.raises(ValueError, match="must be one of"):
         ensure_valid_task_state("todo")
+
+
+def test_qexp_task_rejects_path_traversal_task_id():
+    with pytest.raises(ValueError, match="illegal path characters|illegal characters"):
+        ensure_valid_task_id("../../../tmp/pwn")
+
+    with pytest.raises(ValueError, match="illegal path characters|illegal characters"):
+        qExpTask(
+            task_id="job/escape",
+            argv=["python", "train.py"],
+            num_gpus=1,
+        )
 
 
 def test_qexp_task_serializes_required_phase1_fields():

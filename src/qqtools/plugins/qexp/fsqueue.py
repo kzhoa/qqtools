@@ -6,7 +6,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .models import STATE_DIRECTORY_MAP, TASK_STATES, qExpTask, get_state_directory_name, utc_now_iso
+from .models import (
+    STATE_DIRECTORY_MAP,
+    TASK_STATES,
+    ensure_valid_task_id,
+    get_state_directory_name,
+    qExpTask,
+    utc_now_iso,
+)
 
 QQTOOLS_HOME_ENV = "QQTOOLS_HOME"
 LEGAL_STATE_TRANSITIONS = {
@@ -55,11 +62,13 @@ def get_state_dir(state: str, root: Path | str | None = None) -> Path:
 
 def get_log_path(task_id: str, root: Path | str | None = None) -> Path:
     jobs_root = get_jobs_root(root)
-    return jobs_root.joinpath("logs", f"{task_id}.log")
+    safe_task_id = ensure_valid_task_id(task_id)
+    return jobs_root.joinpath("logs", f"{safe_task_id}.log")
 
 
 def get_task_path(state: str, task_id: str, root: Path | str | None = None) -> Path:
-    return get_state_dir(state, root).joinpath(f"{task_id}.json")
+    safe_task_id = ensure_valid_task_id(task_id)
+    return get_state_dir(state, root).joinpath(f"{safe_task_id}.json")
 
 
 def _write_atomic_json(path: Path, payload: dict) -> None:
@@ -145,6 +154,7 @@ def count_tasks(state: str, root: Path | None = None) -> int:
 
 
 def find_task_path(task_id: str, root: Path | None = None) -> Path | None:
+    ensure_valid_task_id(task_id)
     for path in iter_all_task_paths(root):
         if path.stem == task_id:
             return path

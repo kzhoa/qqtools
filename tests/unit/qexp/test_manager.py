@@ -94,3 +94,19 @@ def test_main_accepts_root_only(monkeypatch, tmp_path):
 
     assert result == 0
     assert captured["root"] == expected_root.resolve()
+
+
+def test_main_accepts_foreground_flag_for_tmux_launcher_compatibility(monkeypatch, tmp_path):
+    expected_root = tmp_path / "daemon-root"
+    captured = {}
+
+    def _fake_run_daemon_foreground(root=None, **_kwargs):
+        captured["root"] = root
+        return 0
+
+    monkeypatch.setattr(manager, "run_daemon_foreground", _fake_run_daemon_foreground)
+
+    result = manager.main(["--foreground", "--root", str(expected_root)])
+
+    assert result == 0
+    assert captured["root"] == expected_root.resolve()

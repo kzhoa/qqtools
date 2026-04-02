@@ -66,6 +66,26 @@ def test_submit_reports_daemon_start_failure_after_queueing(tmp_path, monkeypatc
     assert root.joinpath("jobs", "pending", "job_fail.json").is_file()
 
 
+def test_submit_rejects_path_traversal_job_id(tmp_path, monkeypatch):
+    root = tmp_path / "submit-home"
+    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
+    monkeypatch.setattr(manager, "run_preflight_checks", lambda: object())
+    monkeypatch.setattr(manager, "is_daemon_active", lambda _root=None: True)
+
+    with pytest.raises(ValueError, match="illegal path characters|illegal characters"):
+        submit(argv=["python", "train.py"], num_gpus=1, job_id="../../../tmp/pwn")
+
+
+def test_get_logs_path_and_read_logs_reject_path_traversal_task_id(tmp_path):
+    root = tmp_path / "logs-home"
+
+    with pytest.raises(ValueError, match="illegal path characters|illegal characters"):
+        qexp_api.get_logs_path("../../../tmp/pwn", root=root)
+
+    with pytest.raises(ValueError, match="illegal path characters|illegal characters"):
+        qexp_api.read_logs("../../../tmp/pwn", root=root)
+
+
 def test_cancel_moves_pending_task_to_cancelled(tmp_path, monkeypatch):
     root = tmp_path / "cancel-home"
     monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))

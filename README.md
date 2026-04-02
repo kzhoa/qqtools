@@ -148,15 +148,22 @@ qexp clean --older-than-seconds 604800
 Python API:
 
 ```python
-import qqtools as qt
+from qqtools.plugins import qexp
 
-task = qt.plugins.qexp.submit(
+task = qexp.submit(
     argv=["python", "train.py", "--epochs", "10"],
     num_gpus=1,
     job_name="demo",
 )
 print(task.task_id)
 ```
+
+Release validation notes:
+
+- packaged Python API surface: `from qqtools.plugins import qexp`
+- packaged CLI surface: `qexp`
+- actual execution is supported on local Linux GPU hosts with `tmux` installed
+- non-Linux development is limited to parsing, rendering, and test validation flows
 
 
 # Test

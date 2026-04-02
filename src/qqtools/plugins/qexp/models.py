@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any
 
 TASK_PENDING = "pending"
@@ -28,6 +29,7 @@ STATE_DIRECTORY_MAP = {
 }
 
 SUPPORTED_ENV_KINDS = {"conda", "venv", "none"}
+TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def utc_now_iso() -> str:
@@ -88,6 +90,20 @@ def get_state_directory_name(state: str) -> str:
     return STATE_DIRECTORY_MAP[state]
 
 
+def ensure_valid_task_id(task_id: str) -> str:
+    if not task_id or not isinstance(task_id, str):
+        raise ValueError("Task task_id must be a non-empty string.")
+    if "/" in task_id or "\\" in task_id or ".." in task_id:
+        raise ValueError(
+            "Task task_id contains illegal path characters. Only letters, digits, '.', '_', and '-' are allowed."
+        )
+    if not TASK_ID_PATTERN.fullmatch(task_id):
+        raise ValueError(
+            "Task task_id contains illegal characters. Only letters, digits, '.', '_', and '-' are allowed."
+        )
+    return task_id
+
+
 @dataclass(slots=True)
 class qExpTask:
     task_id: str
@@ -111,8 +127,7 @@ class qExpTask:
     exit_reason: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.task_id or not isinstance(self.task_id, str):
-            raise ValueError("Task task_id must be a non-empty string.")
+        self.task_id = ensure_valid_task_id(self.task_id)
 
         if not isinstance(self.argv, list) or not self.argv:
             raise ValueError("Task argv must be a non-empty argv list.")

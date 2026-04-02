@@ -85,3 +85,31 @@ def test_send_command_to_window_targets_primary_pane(monkeypatch):
     tmux.send_command_to_window("@1", "python train.py")
 
     assert window.panes[0].commands == [("python train.py", True)]
+
+
+def test_require_libtmux_reports_install_hint(monkeypatch):
+    def _raise_import_error(_name: str):
+        raise ImportError("missing libtmux")
+
+    monkeypatch.setattr(tmux.importlib, "import_module", _raise_import_error)
+
+    with pytest.raises(RuntimeError, match="pip install qqtools\\[exp\\]"):
+        tmux.require_libtmux()
+
+
+def test_launch_background_daemon_emits_manager_command_compatible_with_parser(monkeypatch, tmp_path):
+    session = _FakeSession("qqtools_internal", role=tmux.QQTOOLS_SESSION_ROLE_INTERNAL)
+    daemon_window = _FakeWindow("@daemon", "daemon")
+    session.windows_list = [daemon_window]
+    session.windows = _FakeCollection(session.windows_list, "window_name")
+    server = _FakeServer(sessions=[session], windows=[daemon_window])
+    monkeypatch.setattr(tmux, "_get_server", lambda: server)
+
+    window_id = tmux.launch_background_daemon(tmp_path)
+
+    assert window_id == "@daemon"
+    command, entered = daemon_window.panes[0].commands[-1]
+    assert entered is True
+    assert "qqtools.plugins.qexp.manager" in command
+    assert "--foreground" in command
+    assert "--root" in command

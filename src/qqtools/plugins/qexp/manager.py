@@ -288,6 +288,7 @@ def run_daemon_foreground(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="qexp daemon runner")
+    parser.add_argument("--foreground", action="store_true")
     parser.add_argument("--root", type=str, default=None)
     args = parser.parse_args(argv)
 
