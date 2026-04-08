@@ -1,5 +1,9 @@
 # History
 
+## v1.2.8
+
+- fix: handle libtmux `ObjectDoesNotExist` exception in tmux session/window lookup to support newer libtmux versions where `.get()` raises instead of returning `None`
+
 ## v1.2.7
 
 - breaking: qexp now defaults to the v2 shared-root engine; the v1 single-machine engine is still available via `--v1` flag or `QEXP_VERSION=1` environment variable

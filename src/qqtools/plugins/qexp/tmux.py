@@ -54,6 +54,13 @@ def _mark_session_role(session, role: str) -> None:
     session.set_option(QQTOOLS_SESSION_ROLE_OPTION, role)
 
 
+def _safe_get(query_list, **kwargs):
+    try:
+        return query_list.get(**kwargs)
+    except Exception:
+        return None
+
+
 def ensure_managed_session(
     session_name: str,
     role: str,
@@ -61,7 +68,7 @@ def ensure_managed_session(
     initial_window_name: str,
 ):
     server = _get_server()
-    session = server.sessions.get(session_name=session_name)
+    session = _safe_get(server.sessions, session_name=session_name)
     if session is None:
         session = server.new_session(
             session_name=session_name,
@@ -100,7 +107,7 @@ def _get_window(window_id: str | None):
     if not window_id:
         return None
     server = _get_server()
-    return server.windows.get(window_id=window_id)
+    return _safe_get(server.windows, window_id=window_id)
 
 
 def _get_primary_pane(window):
@@ -124,7 +131,7 @@ def send_command_to_window(window_id: str, command: str) -> None:
 def launch_background_daemon(root: Path | str) -> str:
     root_path = Path(root).expanduser().resolve()
     session = ensure_internal_session()
-    window = session.windows.get(window_name="daemon")
+    window = _safe_get(session.windows, window_name="daemon")
     if window is None:
         window = session.new_window(window_name="daemon", attach=False)
 
