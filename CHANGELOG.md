@@ -1,5 +1,14 @@
 # History
 
+## v1.2.6
+
+- breaking: `train_runner().early_stopped` is now strictly derived from `terminal_event.reason == "early_stop"`; user interruption is exposed as `terminal_event.status=\"stopped\"` and `reason=\"user_interrupt\"`
+- feat: add explicit `terminal_event` and `TrainRunnerResult` typed return contracts for qpipeline runner exits
+- feat: add explicit epoch-result metric provenance in qpipeline logs with `source=current_eval|latest_eval_reuse|missing`
+- fix: emit one unified terminal event across normal finish, early stop, user interrupt, OOM, and generic exception paths
+- docs: add qpipeline log-format documentation and phase planning notes for terminal-event and epoch-result semantics
+- test: add functional coverage for terminal-event classification and epoch-result provenance reporting
+
 ## v1.2.5
 
 - breaking: `train_runner().early_stopped` now means only `terminal_event.reason == "early_stop"`; user interrupts must be consumed from `terminal_event.status/reason`
