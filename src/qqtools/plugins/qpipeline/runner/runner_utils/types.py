@@ -2,11 +2,13 @@ import copy
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 
 import torch
 
 from qqtools.torch import qdist
+
+TerminalReason = Literal["max_steps", "max_epochs", "early_stop", "user_interrupt", "oom", "exception"]
 
 __all__ = [
     "RunMode",
@@ -16,12 +18,37 @@ __all__ = [
     "FrozenRunningState",
     "EventType",
     "EventContext",
+    "TerminalReason",
+    "TerminalEvent",
+    "TrainRunnerResult",
 ]
 
 
 class RunMode(Enum):
     EPOCH = "epoch"
     STEP = "step"
+
+
+class TerminalEvent(TypedDict):
+    status: Literal["finished", "stopped", "failed"]
+    reason: TerminalReason
+    text: str
+    epoch: int
+    step: int
+    exception_type: NotRequired[str]
+
+
+class TrainRunnerResult(TypedDict):
+    best_epoch: int
+    best_step: int
+    best_monitored_key: Optional[str]
+    best_monitored_metric: Optional[float]
+    best_model_metrics_snapshot: Dict[str, Any]
+    final_epoch: int
+    final_step: int
+    total_train_time: float
+    early_stopped: bool
+    terminal_event: TerminalEvent
 
 
 @dataclass(frozen=True)
