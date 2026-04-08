@@ -6,6 +6,7 @@ import argparse
 import csv
 import tempfile
 from pathlib import Path
+from typing import Dict
 from unittest.mock import Mock
 
 import pytest
@@ -15,6 +16,7 @@ import torch.optim as optim
 
 from qqtools.plugins.qpipeline.qlogger import qLogger
 from qqtools.plugins.qpipeline.runner import agent as agent_module
+from qqtools.plugins.qpipeline.runner import runner as runner_module
 from qqtools.plugins.qpipeline.entry_utils.scheduler import qWarmupScheduler
 from qqtools.plugins.qpipeline.runner.runner import (
     RunningAgent,
@@ -35,6 +37,25 @@ from qqtools.plugins.qpipeline.runner.runner_utils.types import (
 
 from .conftest import SimpleModel, SimpleTask
 
+TERMINAL_LINE_PREFIXES = (
+    "Training finished:",
+    "Training stopped:",
+    "Training failed:",
+)
+
+
+class DeterministicEarlyStopTask(SimpleTask):
+    def __init__(self, val_metric_seq, num_samples=50, num_features=10):
+        super().__init__(num_samples=num_samples, num_features=num_features)
+        self._val_metric_seq = list(val_metric_seq)
+        self._eval_count = 0
+
+    def post_metrics_to_value(self, result: Dict[str, float]) -> float:
+        current_idx = min(self._eval_count, len(self._val_metric_seq) - 1)
+        metric_value = self._val_metric_seq[current_idx]
+        self._eval_count += 1
+        return metric_value
+
 # ============================================================================
 # Unit Tests for RunningState
 # ============================================================================
@@ -52,6 +73,8 @@ class TestRunningState:
         assert state.best_monitored_key is None
         assert state.best_monitored_metric is None
         assert state.best_model_metrics_snapshot == {}
+        assert state.epoch_result_val_metric_source == "missing"
+        assert state.epoch_result_test_metric_source == "missing"
 
     def test_running_state_to_dict(self):
         """Test RunningState to_dict"""
@@ -70,6 +93,30 @@ class TestRunningState:
         assert state_dict["best_model_metrics_snapshot"]["val_metric"] == 0.5
         # Early stopper is managed separately, not in state dict
         assert "early_stop_counter" not in state_dict
+
+    def test_running_state_refresh_epoch_result_metric_sources(self):
+        state = RunningState()
+
+        state.current_val_metric = 0.3
+        state.current_test_metric = 0.4
+        state.mark_epoch_end_eval_trigger(eval_triggered=True)
+        state.refresh_epoch_result_metric_sources()
+
+        assert state.epoch_result_val_metric_source == "current_eval"
+        assert state.epoch_result_test_metric_source == "current_eval"
+
+        state.mark_epoch_end_eval_trigger(eval_triggered=False)
+        state.refresh_epoch_result_metric_sources()
+
+        assert state.epoch_result_val_metric_source == "latest_eval_reuse"
+        assert state.epoch_result_test_metric_source == "latest_eval_reuse"
+
+        state.current_val_metric = None
+        state.current_test_metric = None
+        state.refresh_epoch_result_metric_sources()
+
+        assert state.epoch_result_val_metric_source == "missing"
+        assert state.epoch_result_test_metric_source == "missing"
 
 
 # ============================================================================
@@ -424,6 +471,20 @@ class TestTrainRunner:
             rows = list(reader)
         return reader.fieldnames, rows
 
+    @staticmethod
+    def _read_debug_log(log_dir: str) -> str:
+        return (Path(log_dir) / "debug.log").read_text(encoding="utf-8")
+
+    @staticmethod
+    def _assert_single_terminal_line(log_text: str, expected_text: str) -> None:
+        terminal_lines = [
+            line
+            for line in log_text.splitlines()
+            if any(prefix in line for prefix in TERMINAL_LINE_PREFIXES)
+        ]
+        assert len(terminal_lines) == 1
+        assert expected_text in terminal_lines[0]
+
     def teardown_method(self, method):
         """Cleanup after each test to release any file locks (e.g. debug.log)."""
         import logging
@@ -455,6 +516,20 @@ class TestTrainRunner:
             assert result["best_monitored_metric"] is not None
             assert "val_metric" in result["best_model_metrics_snapshot"]
             assert result["total_train_time"] > 0
+            assert result["early_stopped"] is False
+            assert result["terminal_event"] == {
+                "status": "finished",
+                "reason": "max_epochs",
+                "text": "Training finished: reason=max_epochs",
+                "epoch": result["final_epoch"],
+                "step": result["final_step"],
+            }
+
+            log_text = self._read_debug_log(tmpdir)
+            self._assert_single_terminal_line(log_text, "Training finished: reason=max_epochs")
+            assert "[DEBUG] Reached max_epochs=2" in log_text
+            assert "[DEBUG] Training loop stopping at epoch 2" in log_text
+            assert "Training completed:" not in log_text
 
     def test_train_runner_step_mode(self):
         """Test train_runner in step mode"""
@@ -476,6 +551,241 @@ class TestTrainRunner:
             assert result["final_step"] >= 10
             assert result["best_monitored_key"] == "val_metric"
             assert result["best_monitored_metric"] is not None
+            assert result["early_stopped"] is False
+            assert result["terminal_event"]["status"] == "finished"
+            assert result["terminal_event"]["reason"] == "max_steps"
+            assert result["terminal_event"]["text"] == "Training finished: reason=max_steps"
+            assert result["terminal_event"]["epoch"] == result["final_epoch"]
+            assert result["terminal_event"]["step"] == result["final_step"]
+
+            log_text = self._read_debug_log(tmpdir)
+            self._assert_single_terminal_line(log_text, "Training finished: reason=max_steps")
+            assert "[DEBUG] Reached max_steps=10" in log_text
+            assert "[DEBUG] Training loop stopping at epoch" in log_text
+            assert "Training completed:" not in log_text
+
+    def test_train_runner_emits_early_stop_terminal_event(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task = DeterministicEarlyStopTask([1.0, 0.9, 0.9, 0.9, 0.9])
+            model = SimpleModel(input_dim=10)
+            loss_fn = nn.MSELoss()
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            self.args.runner.early_stop = {
+                "target": "val_metric",
+                "patience": 2,
+                "mode": "min",
+                "min_delta": 0.0,
+            }
+
+            result = train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=10,
+                eval_interval=1,
+                save_dir=tmpdir,
+                run_mode="epoch",
+            )
+
+            assert result["early_stopped"] is True
+            assert result["terminal_event"]["status"] == "finished"
+            assert result["terminal_event"]["reason"] == "early_stop"
+            assert result["terminal_event"]["text"] == "Training finished: reason=early_stop"
+            assert result["terminal_event"]["epoch"] == result["final_epoch"]
+            assert result["terminal_event"]["step"] == result["final_step"]
+
+            log_text = self._read_debug_log(tmpdir)
+            self._assert_single_terminal_line(log_text, "Training finished: reason=early_stop")
+            assert "EarlyStopping: 1/2" in log_text
+            assert "EarlyStopping: 2/2" in log_text
+            assert "Early stopping triggered" not in log_text
+
+    def test_epoch_result_logs_metric_sources_for_missing_current_and_reuse_states(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components(num_samples=50)
+
+            result = train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=3,
+                eval_interval=2,
+                save_dir=tmpdir,
+                run_mode="epoch",
+            )
+
+            assert result["final_epoch"] == 3
+
+            log_text = self._read_debug_log(tmpdir)
+            assert "[val] metric: n/a source=missing" in log_text
+            assert "[test] metric: n/a source=missing" in log_text
+            assert "source=current_eval" in log_text
+            assert "source=latest_eval_reuse" in log_text
+
+    def test_epoch_result_logs_step_mode_mid_epoch_eval_as_reuse_at_epoch_end(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components(num_samples=48)
+
+            result = train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_steps=4,
+                eval_interval=2,
+                save_dir=tmpdir,
+                run_mode="step",
+            )
+
+            assert result["final_epoch"] == 1
+
+            log_text = self._read_debug_log(tmpdir)
+            assert "eval trigger: run_mode=RunMode.STEP" in log_text
+            assert "[val] metric:" in log_text
+            assert "[test] metric:" in log_text
+            assert "source=current_eval" not in log_text
+            assert "source=latest_eval_reuse" in log_text
+
+    def test_train_runner_emits_user_interrupt_terminal_event(self, monkeypatch):
+        captured_terminal_event = {}
+        original_emit = runner_module._emit_terminal_event
+
+        def _capture_terminal_event(logger, terminal_event):
+            captured_terminal_event["event"] = terminal_event
+            return original_emit(logger, terminal_event)
+
+        def _interrupt_run(self):
+            self.state.epoch = 1
+            self.state.global_step = 3
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(runner_module, "_emit_terminal_event", _capture_terminal_event)
+        monkeypatch.setattr(runner_module.RunningAgent, "run", _interrupt_run)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components()
+
+            result = train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=2,
+                eval_interval=1,
+                save_dir=tmpdir,
+                run_mode="epoch",
+            )
+
+            assert result["early_stopped"] is False
+            assert result["terminal_event"] == {
+                "status": "stopped",
+                "reason": "user_interrupt",
+                "text": "Training stopped: reason=user_interrupt",
+                "epoch": 1,
+                "step": 3,
+            }
+            assert captured_terminal_event["event"] == result["terminal_event"]
+
+            log_text = self._read_debug_log(tmpdir)
+            self._assert_single_terminal_line(log_text, "Training stopped: reason=user_interrupt")
+            assert "Training interrupted by user" not in log_text
+
+    def test_train_runner_emits_exception_terminal_event(self, monkeypatch):
+        captured_terminal_event = {}
+        original_emit = runner_module._emit_terminal_event
+
+        def _capture_terminal_event(logger, terminal_event):
+            captured_terminal_event["event"] = terminal_event
+            return original_emit(logger, terminal_event)
+
+        def _failing_run(self):
+            self.state.epoch = 2
+            self.state.global_step = 7
+            raise ValueError("run failure")
+
+        monkeypatch.setattr(runner_module, "_emit_terminal_event", _capture_terminal_event)
+        monkeypatch.setattr(runner_module.RunningAgent, "run", _failing_run)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components()
+
+            with pytest.raises(ValueError, match="run failure"):
+                train_runner(
+                    model=model,
+                    task=task,
+                    loss_fn=loss_fn,
+                    optimizer=optimizer,
+                    args=self.args,
+                    max_epochs=2,
+                    eval_interval=1,
+                    save_dir=tmpdir,
+                    run_mode="epoch",
+                )
+
+            assert captured_terminal_event["event"] == {
+                "status": "failed",
+                "reason": "exception",
+                "text": "Training failed: reason=exception",
+                "epoch": 2,
+                "step": 7,
+                "exception_type": "ValueError",
+            }
+
+            log_text = self._read_debug_log(tmpdir)
+            self._assert_single_terminal_line(log_text, "Training failed: reason=exception")
+            assert "Traceback" not in log_text
+            assert "run failure" not in log_text
+
+    def test_train_runner_emits_oom_terminal_event(self, monkeypatch):
+        captured_terminal_event = {}
+        original_emit = runner_module._emit_terminal_event
+
+        def _capture_terminal_event(logger, terminal_event):
+            captured_terminal_event["event"] = terminal_event
+            return original_emit(logger, terminal_event)
+
+        def _failing_run(self):
+            self.state.epoch = 0
+            self.state.global_step = 5
+            raise RuntimeError("CUDA out of memory. Tried to allocate 1.00 GiB")
+
+        monkeypatch.setattr(runner_module, "_emit_terminal_event", _capture_terminal_event)
+        monkeypatch.setattr(runner_module.RunningAgent, "run", _failing_run)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components()
+
+            with pytest.raises(RuntimeError, match="CUDA out of memory"):
+                train_runner(
+                    model=model,
+                    task=task,
+                    loss_fn=loss_fn,
+                    optimizer=optimizer,
+                    args=self.args,
+                    max_steps=5,
+                    eval_interval=1,
+                    save_dir=tmpdir,
+                    run_mode="step",
+                )
+
+            assert captured_terminal_event["event"] == {
+                "status": "failed",
+                "reason": "oom",
+                "text": "Training failed: reason=oom",
+                "epoch": 0,
+                "step": 5,
+                "exception_type": "RuntimeError",
+            }
+
+            log_text = self._read_debug_log(tmpdir)
+            self._assert_single_terminal_line(log_text, "Training failed: reason=oom")
+            assert "CUDA out of memory. Tried to allocate 1.00 GiB" not in log_text
 
     def test_train_runner_auto_offload_default_is_false(self, monkeypatch):
         captured = {}
@@ -490,6 +800,7 @@ class TestTrainRunner:
                 return None
 
             def run(self):
+                self.state.epoch = 1
                 return False
 
         monkeypatch.setattr("qqtools.plugins.qpipeline.runner.runner.RunningAgent", _FakeAgent)
@@ -523,6 +834,7 @@ class TestTrainRunner:
                 return None
 
             def run(self):
+                self.state.epoch = 1
                 return False
 
         monkeypatch.setattr("qqtools.plugins.qpipeline.runner.runner.RunningAgent", _FakeAgent)

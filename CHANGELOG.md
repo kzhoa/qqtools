@@ -2,6 +2,7 @@
 
 ## v1.2.5
 
+- breaking: `train_runner().early_stopped` now means only `terminal_event.reason == "early_stop"`; user interrupts must be consumed from `terminal_event.status/reason`
 - breaking: qpipeline non-plateau schedulers now default to stepping on completed optimizer updates instead of `on_validation_end`
 - feat: add `optim.scheduler_params.step_on` to control non-plateau scheduler stepping with `optimizer_step` or `valid_end`; plateau remains validation-driven
 - fix: align qpipeline train-event LR reporting with post-step scheduler state so batch/progress listeners observe the current learning rate

@@ -14,3 +14,5 @@ logs/
 .codex
 tmp*
 .tmp*
+
+docs/pitch/

@@ -23,11 +23,11 @@ class EvalFormatter:
         return isinstance(value, (int, float)) and not isinstance(value, bool)
 
     @classmethod
-    def _format_metric_value(cls, value: Any, metric_name: str = "") -> str:
+    def _format_metric_value(cls, value: Any, metric_name: str = "", precision: int = 4) -> str:
         scalar = cls._to_scalar_if_possible(value)
         if cls._is_numeric(scalar):
             suffix = "s" if metric_name.endswith("time") else ""
-            return f"{float(scalar):.4f}{suffix}"
+            return f"{float(scalar):.{precision}f}{suffix}"
         return str(scalar)
 
     @staticmethod
@@ -190,12 +190,16 @@ class EvalFormatter:
         has_markup = False
 
         if target_val is not None:
-            lines.append(f"  - Primary Target: {target_key}: {cls._format_metric_value(target_val, target_key)}")
+            lines.append(
+                f"  - Primary Target: {target_key}: {cls._format_metric_value(target_val, target_key, precision=6)}"
+            )
         else:
             lines.append(f"  - Primary Target: {target_key}: n/a (not found in eval_results)")
 
         best_display = (
-            cls._format_metric_value(best_info["best"], target_key) if best_info["best"] is not None else "n/a"
+            cls._format_metric_value(best_info["best"], target_key, precision=6)
+            if best_info["best"] is not None
+            else "n/a"
         )
         best_epoch_display = best_info["best_epoch"] if best_info["best_epoch"] is not None else "-"
         best_step_display = best_info["best_step"] if best_info["best_step"] is not None else "-"
@@ -215,7 +219,7 @@ class EvalFormatter:
         lines.append(best_line)
 
         if best_info["status"] == "NEW_BEST" and best_info["last_best"] is not None:
-            last_best = cls._format_metric_value(best_info["last_best"], target_key)
+            last_best = cls._format_metric_value(best_info["last_best"], target_key, precision=6)
             last_indent = " " * 14
             lines.append(
                 f"{last_indent}Last: epoch {best_info['last_best_epoch']}, step: {best_info['last_best_step']}, {target_key}: {last_best}"
@@ -256,14 +260,16 @@ class EvalFormatter:
         new_best_checkpoint_path: Optional[str],
         color_new_best: bool,
     ) -> Tuple[List[str], bool]:
-        target_str = cls._format_metric_value(target_val, target_key) if target_val is not None else "n/a"
+        target_str = cls._format_metric_value(target_val, target_key, precision=6) if target_val is not None else "n/a"
         lines = [
             f"\n[Eval Summary Table] Epoch: {best_info['epoch']} | Step: {best_info['step']} | Target: {target_key}({target_str})"
         ]
         has_markup = False
 
         best_display = (
-            cls._format_metric_value(best_info["best"], target_key) if best_info["best"] is not None else "n/a"
+            cls._format_metric_value(best_info["best"], target_key, precision=6)
+            if best_info["best"] is not None
+            else "n/a"
         )
         best_epoch_display = best_info["best_epoch"] if best_info["best_epoch"] is not None else "-"
         best_step_display = best_info["best_step"] if best_info["best_step"] is not None else "-"
@@ -282,7 +288,7 @@ class EvalFormatter:
         lines.append(best_line)
 
         if best_info["status"] == "NEW_BEST" and best_info["last_best"] is not None:
-            last_best = cls._format_metric_value(best_info["last_best"], target_key)
+            last_best = cls._format_metric_value(best_info["last_best"], target_key, precision=6)
             last_label = f"{'Last':<12}"
             lines.append(
                 f"{last_label}: epoch {best_info['last_best_epoch']}, step: {best_info['last_best_step']}, {target_key}: {last_best}"

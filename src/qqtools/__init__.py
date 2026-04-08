@@ -14,7 +14,7 @@ from .torch import nn
 from .torch import qdist
 from .torch import qcheckpoint, qscatter, qsparse
 from .torch import qcontextprovider
-from . import data, plugins
+from . import data
 
 
 # first-class funciton

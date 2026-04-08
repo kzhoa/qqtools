@@ -33,9 +33,251 @@ from .runner_utils.earlystop import EarlyStopListener, EarlyStopper
 from .runner_utils.eval_formatter import EvalSummaryListener
 from .runner_utils.progress import ProgressTracker
 from .runner_utils.sheet_logger import SheetLogger, SheetLoggerListener
-from .runner_utils.types import EventContext, RunConfig, RunMode
+from .runner_utils.types import (
+    EventContext,
+    RunConfig,
+    RunMode,
+    RunningState,
+    TerminalEvent,
+    TerminalReason,
+    TrainRunnerResult,
+)
 
 __all__ = ["train_runner", "infer_runner", "SheetLoggerListener"]
+
+TerminalCause = Literal["normal_finish", "early_stop", "user_interrupt", "exception"]
+
+
+def _is_oom_exception(exception: BaseException) -> bool:
+    if isinstance(exception, torch.cuda.OutOfMemoryError):
+        return True
+
+    exception_message = str(exception).lower()
+    oom_markers = (
+        "out of memory",
+        "cuda out of memory",
+        "mps backend out of memory",
+    )
+    return any(marker in exception_message for marker in oom_markers)
+
+
+def _build_terminal_event(
+    *,
+    status: Literal["finished", "stopped", "failed"],
+    reason: TerminalReason,
+    epoch: int,
+    step: int,
+    exception: Optional[BaseException] = None,
+) -> TerminalEvent:
+    terminal_event: TerminalEvent = {
+        "status": status,
+        "reason": reason,
+        "text": f"Training {status}: reason={reason}",
+        "epoch": epoch,
+        "step": step,
+    }
+    if exception is not None:
+        terminal_event["exception_type"] = type(exception).__name__
+    return terminal_event
+
+
+def _build_terminal_event_for_cause(
+    *,
+    terminal_cause: TerminalCause,
+    state: RunningState,
+    run_config: RunConfig,
+    exception: Optional[BaseException] = None,
+) -> TerminalEvent:
+    if terminal_cause == "user_interrupt":
+        return _build_terminal_event(
+            status="stopped",
+            reason="user_interrupt",
+            epoch=state.epoch,
+            step=state.global_step,
+        )
+
+    if terminal_cause == "exception":
+        if exception is None:
+            raise ValueError("exception must be provided when terminal_cause='exception'")
+        return _build_terminal_event(
+            status="failed",
+            reason="oom" if _is_oom_exception(exception) else "exception",
+            epoch=state.epoch,
+            step=state.global_step,
+            exception=exception,
+        )
+
+    if terminal_cause == "early_stop":
+        return _build_terminal_event(
+            status="finished",
+            reason="early_stop",
+            epoch=state.epoch,
+            step=state.global_step,
+        )
+
+    if terminal_cause == "normal_finish":
+        if run_config.max_steps is not None and state.global_step >= run_config.max_steps:
+            return _build_terminal_event(
+                status="finished",
+                reason="max_steps",
+                epoch=state.epoch,
+                step=state.global_step,
+            )
+
+        if run_config.max_epochs is not None and state.epoch >= run_config.max_epochs:
+            return _build_terminal_event(
+                status="finished",
+                reason="max_epochs",
+                epoch=state.epoch,
+                step=state.global_step,
+            )
+
+    raise RuntimeError(
+        "Unable to classify training terminal state "
+        f"(epoch={state.epoch}, step={state.global_step}, terminal_cause={terminal_cause}, "
+        f"max_steps={run_config.max_steps}, max_epochs={run_config.max_epochs})."
+    )
+
+
+def _emit_terminal_event(
+    logger: qLogger,
+    terminal_event: TerminalEvent,
+) -> None:
+    log_method = logger.error if terminal_event["status"] == "failed" else logger.info
+    log_kwargs: Dict[str, Any] = {"extra": {"terminal_event": terminal_event}}
+    log_method(terminal_event["text"], **log_kwargs)
+
+
+def _build_and_emit_terminal_event(
+    *,
+    logger: qLogger,
+    terminal_cause: TerminalCause,
+    state: RunningState,
+    run_config: RunConfig,
+    exception: Optional[BaseException] = None,
+) -> TerminalEvent:
+    terminal_event = _build_terminal_event_for_cause(
+        terminal_cause=terminal_cause,
+        state=state,
+        run_config=run_config,
+        exception=exception,
+    )
+    _emit_terminal_event(logger, terminal_event)
+    return terminal_event
+
+
+def _finalize_train_runner(
+    *,
+    logger: qLogger,
+    sheet_logger: Optional[SheetLogger],
+    progress_tracker: Optional[ProgressTracker],
+    profiler: Optional[profile],
+) -> None:
+    if profiler is not None:
+        profiler.stop()
+        if isinstance(profiler, profile):
+            logger.info("Profiler results:")
+            logger.info(profiler.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+
+    try:
+        if progress_tracker is not None:
+            progress_tracker.on_run_end()
+    except Exception as progress_cleanup_error:
+        logger.debug(
+            "ProgressTracker cleanup failed: %s",
+            progress_cleanup_error,
+            exc_info=True,
+        )
+
+    if sheet_logger is not None:
+        sheet_logger.close()
+    logger.close()
+    logging.shutdown()
+
+
+def _prepare_training_session(
+    *,
+    config: RunConfig,
+    save_dir: str,
+    logger: qLogger,
+    sheet_logger: Optional[SheetLogger],
+    checkpoint_manager: CheckpointManager,
+    agent: RunningAgent,
+    early_stopper: EarlyStopper,
+    eval_summary_listener: EvalSummaryListener,
+    early_stop_listener: EarlyStopListener,
+    checkpoint_listener: CheckpointListener,
+    effective_scheduler: Optional[qWarmupScheduler],
+    device: torch.device,
+    model: nn.Module,
+    task: qTaskBase,
+    optimizer: torch.optim.Optimizer,
+    ema_model: Optional[qEMA],
+    log_granularity: Optional[List[Literal["eval", "batch"]]],
+) -> Tuple[Optional[ProgressTracker], Optional[profile]]:
+    progress_tracker: Optional[ProgressTracker] = None
+    profiler: Optional[profile] = None
+
+    if config.ckp_file and Path(config.ckp_file).exists():
+        checkpoint_manager.load(
+            config.ckp_file,
+            device,
+            model,
+            task,
+            optimizer,
+            effective_scheduler,
+            ema_model,
+            agent.state,
+            early_stopper,
+            agent.best_model_tracker,
+        )
+        logger.info(f"Loaded checkpoint from {config.ckp_file}")
+
+    def _on_validation_end_step_scheduler(context: EventContext) -> None:
+        if effective_scheduler is None:
+            return
+
+        if effective_scheduler.step_on != SCHEDULER_STEP_ON_VALID_END:
+            return
+
+        eval_results = context.eval_results or {}
+        effective_scheduler.step_main(metrics=eval_results.get("val_metric"))
+
+    agent.add_listener("on_validation_end", _on_validation_end_step_scheduler)
+    agent.add_listener("on_validation_end", eval_summary_listener.on_validation_end)
+    agent.add_listener("on_validation_end", early_stop_listener.on_validation_end)
+    agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
+
+    progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type)
+    agent.add_listener("on_epoch_start", progress_tracker.on_epoch_start)
+    agent.add_listener("on_progress_tick", progress_tracker.on_progress_tick)
+    agent.add_listener("on_table_update", progress_tracker.on_table_update)
+    agent.add_listener("on_epoch_end", progress_tracker.on_epoch_end)
+    agent.add_listener("on_eval_start", progress_tracker.on_eval_start)
+    agent.add_listener("on_eval_end", progress_tracker.on_eval_end)
+
+    if log_granularity and sheet_logger is not None:
+        sheet_logger_listener = SheetLoggerListener(
+            sheet_logger=sheet_logger,
+            run_config=config,
+            log_granularity=log_granularity,
+            logger=logger,
+        )
+        if "eval" in log_granularity:
+            agent.add_listener("on_eval_end", sheet_logger_listener.on_eval_end)
+        if "batch" in log_granularity:
+            agent.add_listener("on_train_batch_end", sheet_logger_listener.on_train_batch_end)
+
+    if config.use_profiler:
+        profiler = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(Path(save_dir) / "profiler")),
+            record_shapes=True,
+        )
+        profiler.start()
+
+    return progress_tracker, profiler
 
 
 def _resolve_train_runner_policy(
@@ -129,7 +371,7 @@ def train_runner(
     accum_grad: Optional[int] = None,
     log_granularity: Optional[List[Literal["eval", "batch"]]] = ["eval"],
     allow_auto_offload: bool = False,
-) -> Dict[str, Any]:
+) -> TrainRunnerResult:
     """
     Unified training runner
 
@@ -158,7 +400,7 @@ def train_runner(
         allow_auto_offload: Whether to enable automatic EMA/model offload policy
 
     Returns:
-        Dictionary with training results
+        Structured training result with terminal contract fields
     """
     # Handle compatibility parameters
     if args is None:
@@ -295,109 +537,68 @@ def train_runner(
         target_mode=config.checkpoint.get("mode", "min"),
     )
 
-    # Load checkpoint FIRST to restore training state
-    if config.ckp_file and Path(config.ckp_file).exists():
-        checkpoint_manager.load(
-            config.ckp_file,
-            device,
-            model,
-            task,
-            optimizer,
-            effective_scheduler,
-            ema_model,
-            agent.state,
-            early_stopper,
-            agent.best_model_tracker,
-        )
-        logger.info(f"Loaded checkpoint from {config.ckp_file}")
-
-    # Callback listeners for loop-external behaviors
-    def _on_validation_end_step_scheduler(context: EventContext) -> None:
-        if effective_scheduler is None:
-            return
-
-        if effective_scheduler.step_on != SCHEDULER_STEP_ON_VALID_END:
-            return
-
-        eval_results = context.eval_results or {}
-        effective_scheduler.step_main(metrics=eval_results.get("val_metric"))
-
-    agent.add_listener("on_validation_end", _on_validation_end_step_scheduler)
-    agent.add_listener("on_validation_end", eval_summary_listener.on_validation_end)
-    agent.add_listener("on_validation_end", early_stop_listener.on_validation_end)
-    agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
-    # Unified LogListener handling
-    progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type)
-    agent.add_listener("on_epoch_start", progress_tracker.on_epoch_start)
-    agent.add_listener("on_progress_tick", progress_tracker.on_progress_tick)
-    agent.add_listener("on_table_update", progress_tracker.on_table_update)
-    agent.add_listener("on_epoch_end", progress_tracker.on_epoch_end)
-    # Ensure progress tracker can pause/resume during mid-epoch evaluations
-    agent.add_listener("on_eval_start", progress_tracker.on_eval_start)
-    agent.add_listener("on_eval_end", progress_tracker.on_eval_end)
-
-    # Sheet logger listener for structured data
-    if log_granularity and sheet_logger is not None:
-        sheet_logger_listener = SheetLoggerListener(
-            sheet_logger=sheet_logger,
-            run_config=config,
-            log_granularity=log_granularity,
-            logger=logger,
-        )
-        if "eval" in log_granularity:
-            agent.add_listener("on_eval_end", sheet_logger_listener.on_eval_end)
-        if "batch" in log_granularity:
-            agent.add_listener("on_train_batch_end", sheet_logger_listener.on_train_batch_end)
-
-    # Start profiler
+    progress_tracker = None
     profiler = None
-    if config.use_profiler:
-        profiler = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(Path(save_dir) / "profiler")),
-            record_shapes=True,
-        )
-        profiler.start()
+    terminal_event: Optional[TerminalEvent] = None
 
-    # Run training
-    early_stopped = False
     try:
-        early_stopped = agent.run()
-
-        if early_stopped:
-            logger.info(f"Early stopping triggered at epoch {agent.state.epoch}, step {agent.state.global_step}")
-        else:
-            logger.info(f"Training completed: epoch {agent.state.epoch}, step {agent.state.global_step}")
+        progress_tracker, profiler = _prepare_training_session(
+            config=config,
+            save_dir=save_dir,
+            logger=logger,
+            sheet_logger=sheet_logger,
+            checkpoint_manager=checkpoint_manager,
+            agent=agent,
+            early_stopper=early_stopper,
+            eval_summary_listener=eval_summary_listener,
+            early_stop_listener=early_stop_listener,
+            checkpoint_listener=checkpoint_listener,
+            effective_scheduler=effective_scheduler,
+            device=device,
+            model=model,
+            task=task,
+            optimizer=optimizer,
+            ema_model=ema_model,
+            log_granularity=log_granularity,
+        )
+        loop_stopped_by_early_stop = agent.run()
+        terminal_event = _build_and_emit_terminal_event(
+            logger=logger,
+            terminal_cause="early_stop" if loop_stopped_by_early_stop else "normal_finish",
+            state=agent.state,
+            run_config=config,
+        )
 
     except KeyboardInterrupt:
-        logger.info("Training interrupted by user")
-        early_stopped = True
+        terminal_event = _build_and_emit_terminal_event(
+            logger=logger,
+            terminal_cause="user_interrupt",
+            state=agent.state,
+            run_config=config,
+        )
+
+    except Exception as error:
+        terminal_event = _build_and_emit_terminal_event(
+            logger=logger,
+            terminal_cause="exception",
+            state=agent.state,
+            run_config=config,
+            exception=error,
+        )
+        raise
 
     finally:
-        # Stop profiler
-        if profiler is not None:
-            profiler.stop()
-            if isinstance(profiler, profile):
-                logger.info("Profiler results:")
-                logger.info(profiler.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-
-        # Ensure progress renderer resources are always released, even on exceptions.
-        try:
-            progress_tracker.on_run_end()
-        except Exception as progress_cleanup_error:
-            logger.debug(
-                "ProgressTracker cleanup failed: %s",
-                progress_cleanup_error,
-                exc_info=True,
-            )
-
-        if sheet_logger is not None:
-            sheet_logger.close()
-        logger.close()
-        logging.shutdown()
+        _finalize_train_runner(
+            logger=logger,
+            sheet_logger=sheet_logger,
+            progress_tracker=progress_tracker,
+            profiler=profiler,
+        )
 
     # Return final results
+    if terminal_event is None:
+        raise RuntimeError("train_runner completed without terminal_event classification")
+
     return {
         "best_epoch": agent.state.best_epoch,
         "best_step": agent.state.best_step,
@@ -407,7 +608,8 @@ def train_runner(
         "final_epoch": agent.state.epoch,
         "final_step": agent.state.global_step,
         "total_train_time": agent.state.total_train_time,
-        "early_stopped": early_stopped,
+        "early_stopped": terminal_event["reason"] == "early_stop",
+        "terminal_event": terminal_event,
     }
 
 

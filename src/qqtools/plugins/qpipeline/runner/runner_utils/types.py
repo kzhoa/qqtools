@@ -2,11 +2,14 @@ import copy
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 
 import torch
 
 from qqtools.torch import qdist
+
+TerminalReason = Literal["max_steps", "max_epochs", "early_stop", "user_interrupt", "oom", "exception"]
+EpochResultMetricSource = Literal["current_eval", "latest_eval_reuse", "missing"]
 
 __all__ = [
     "RunMode",
@@ -16,12 +19,38 @@ __all__ = [
     "FrozenRunningState",
     "EventType",
     "EventContext",
+    "TerminalReason",
+    "EpochResultMetricSource",
+    "TerminalEvent",
+    "TrainRunnerResult",
 ]
 
 
 class RunMode(Enum):
     EPOCH = "epoch"
     STEP = "step"
+
+
+class TerminalEvent(TypedDict):
+    status: Literal["finished", "stopped", "failed"]
+    reason: TerminalReason
+    text: str
+    epoch: int
+    step: int
+    exception_type: NotRequired[str]
+
+
+class TrainRunnerResult(TypedDict):
+    best_epoch: int
+    best_step: int
+    best_monitored_key: Optional[str]
+    best_monitored_metric: Optional[float]
+    best_model_metrics_snapshot: Dict[str, Any]
+    final_epoch: int
+    final_step: int
+    total_train_time: float
+    early_stopped: bool
+    terminal_event: TerminalEvent
 
 
 @dataclass(frozen=True)
@@ -108,6 +137,9 @@ class RunningState:
     current_train_metric: Optional[float] = None
     current_val_metric: Optional[float] = None
     current_test_metric: Optional[float] = None
+    epoch_end_eval_triggered: bool = False
+    epoch_result_val_metric_source: EpochResultMetricSource = "missing"
+    epoch_result_test_metric_source: EpochResultMetricSource = "missing"
 
     # time related
     epoch_start_time: float = 0.0
@@ -126,6 +158,20 @@ class RunningState:
             self.current_test_metric = metrics["test_metric"]
         if "train_loss" in metrics:
             self.current_train_loss = metrics["train_loss"]
+
+    def mark_epoch_end_eval_trigger(self, *, eval_triggered: bool) -> None:
+        self.epoch_end_eval_triggered = eval_triggered
+
+    def refresh_epoch_result_metric_sources(self) -> None:
+        self.epoch_result_val_metric_source = self._resolve_epoch_result_metric_source(self.current_val_metric)
+        self.epoch_result_test_metric_source = self._resolve_epoch_result_metric_source(self.current_test_metric)
+
+    def _resolve_epoch_result_metric_source(self, metric_value: Optional[float]) -> EpochResultMetricSource:
+        if metric_value is None:
+            return "missing"
+        if self.epoch_end_eval_triggered:
+            return "current_eval"
+        return "latest_eval_reuse"
 
     def to_dict(self) -> Dict[str, Any]:
         return {

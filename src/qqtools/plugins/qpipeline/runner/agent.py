@@ -173,6 +173,7 @@ class RunningAgent:
         if self.config.distributed and hasattr(self.train_loader.sampler, "set_epoch"):
             self.train_loader.sampler.set_epoch(self.state.epoch)
 
+        self.state.mark_epoch_end_eval_trigger(eval_triggered=False)
         self._trigger("on_epoch_start", total_batches=len(self.train_loader), stage="train")
 
     def _handle_epoch_end(self):
@@ -187,6 +188,7 @@ class RunningAgent:
             self.train_tensor_bank.reset()
 
         self.state.update_current_metrics(epoch_metrics)
+        self.state.refresh_epoch_result_metric_sources()
         self._trigger("on_epoch_end")
         self.state.epoch += 1
         self.state.batch_idx_in_epoch = 0
@@ -391,6 +393,9 @@ class RunningAgent:
         signal = LoopSignal()
 
         is_eval_trigger = self._check_run_period(self.config.eval_interval, is_epoch_end)
+        if is_epoch_end:
+            self.state.mark_epoch_end_eval_trigger(eval_triggered=is_eval_trigger)
+
         if is_eval_trigger:
             self.logger.debug(
                 f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
@@ -407,7 +412,7 @@ class RunningAgent:
 
         if signal.should_stop:
             stop_message = signal.stop_message or "Early stopping triggered."
-            self.logger.info(stop_message)
+            self.logger.debug(stop_message)
             self._trigger("on_early_stop", signal=signal)
             return True
 
@@ -419,7 +424,7 @@ class RunningAgent:
 
         is_reached = self.state.global_step >= max_steps_limit or self.state.epoch >= max_epochs_limit
         if is_reached:
-            self.logger.info(f"Training loop stopping at epoch {self.state.epoch}, step {self.state.global_step}.")
+            self.logger.debug(f"Training loop stopping at epoch {self.state.epoch}, step {self.state.global_step}.")
 
         return is_reached
 
@@ -611,42 +616,38 @@ class RunningAgent:
         return batch_metrics, did_optimizer_step
 
     def _training_loop(self) -> bool:
-        try:
-            while True:
-                if self._reached_run_limits():
-                    return False
+        while True:
+            if self._reached_run_limits():
+                return False
 
-                self._start_new_epoch()
-                total_batches = len(self.train_loader)
-                start_batch_idx = min(self.state.batch_idx_in_epoch, total_batches)
+            self._start_new_epoch()
+            total_batches = len(self.train_loader)
+            start_batch_idx = min(self.state.batch_idx_in_epoch, total_batches)
 
-                for batch_idx, batch_data in enumerate(self.train_loader):
-                    if batch_idx < start_batch_idx:
-                        continue
+            for batch_idx, batch_data in enumerate(self.train_loader):
+                if batch_idx < start_batch_idx:
+                    continue
 
-                    self.state.batch_idx_in_epoch = batch_idx + 1
-                    _, did_optimizer_step = self._train_one_batch(batch_data, emit_events=True)
+                self.state.batch_idx_in_epoch = batch_idx + 1
+                _, did_optimizer_step = self._train_one_batch(batch_data, emit_events=True)
 
-                    is_epoch_end = self.state.batch_idx_in_epoch >= total_batches
-                    should_handle_periodic = False
-                    if self.config.run_mode == RunMode.EPOCH:
-                        should_handle_periodic = is_epoch_end
-                    else:
-                        should_handle_periodic = did_optimizer_step
+                is_epoch_end = self.state.batch_idx_in_epoch >= total_batches
+                should_handle_periodic = False
+                if self.config.run_mode == RunMode.EPOCH:
+                    should_handle_periodic = is_epoch_end
+                else:
+                    should_handle_periodic = did_optimizer_step
 
-                    if should_handle_periodic:
-                        should_stop_mid_epoch = self._handle_periodic_events(is_epoch_end=is_epoch_end)
-                        if should_stop_mid_epoch:
-                            return True
+                if should_handle_periodic:
+                    should_stop_mid_epoch = self._handle_periodic_events(is_epoch_end=is_epoch_end)
+                    if should_stop_mid_epoch:
+                        return True
 
-                    if did_optimizer_step:
-                        if self._reached_run_limits():
-                            return False
+                if did_optimizer_step:
+                    if self._reached_run_limits():
+                        return False
 
-                self._handle_epoch_end()
-        except KeyboardInterrupt:
-            self.logger.info("Training interrupted by user.")
-            return True
+            self._handle_epoch_end()
 
     def run(self) -> bool:
         max_epochs_limit = self.config.max_epochs if self.config.max_epochs is not None else float("inf")
@@ -660,14 +661,14 @@ class RunningAgent:
             f"max_steps={max_steps_limit})"
         )
 
-        early_stopped = self._training_loop()
+        loop_stopped_by_early_stop = self._training_loop()
 
-        if not early_stopped:
+        if not loop_stopped_by_early_stop:
             if self.state.global_step >= max_steps_limit:
-                self.logger.info(f"Reached max_steps={max_steps_limit}")
+                self.logger.debug(f"Reached max_steps={max_steps_limit}")
             elif self.state.epoch >= max_epochs_limit:
-                self.logger.info(f"Reached max_epochs={max_epochs_limit}")
+                self.logger.debug(f"Reached max_epochs={max_epochs_limit}")
 
-        return early_stopped
+        return loop_stopped_by_early_stop
 
 

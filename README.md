@@ -118,6 +118,52 @@ under `plugins/`
 - qchem
 - qpipeline
 - qhyperconnect
+- qexp (Linux only)
+
+
+# qexp Quick Start
+
+`qexp` is a local tmux-backed experiment queue for Linux GPU hosts.
+
+Install optional experiment dependencies:
+
+```bash
+pip install qqtools[exp]
+```
+
+Basic commands:
+
+```bash
+qexp submit --num-gpus 1 --job-name demo -- python train.py --epochs 10
+qexp daemon --background
+qexp status
+qexp status --json
+qexp top
+qexp logs <task_id> --follow
+qexp cancel <task_id>
+qexp clean --dry-run
+qexp clean --older-than-seconds 604800
+```
+
+Python API:
+
+```python
+from qqtools.plugins import qexp
+
+task = qexp.submit(
+    argv=["python", "train.py", "--epochs", "10"],
+    num_gpus=1,
+    job_name="demo",
+)
+print(task.task_id)
+```
+
+Release validation notes:
+
+- packaged Python API surface: `from qqtools.plugins import qexp`
+- packaged CLI surface: `qexp`
+- actual execution is supported on local Linux GPU hosts with `tmux` installed
+- non-Linux development is limited to parsing, rendering, and test validation flows
 
 
 # Test
