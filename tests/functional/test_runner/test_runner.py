@@ -73,6 +73,8 @@ class TestRunningState:
         assert state.best_monitored_key is None
         assert state.best_monitored_metric is None
         assert state.best_model_metrics_snapshot == {}
+        assert state.epoch_result_val_metric_source == "missing"
+        assert state.epoch_result_test_metric_source == "missing"
 
     def test_running_state_to_dict(self):
         """Test RunningState to_dict"""
@@ -91,6 +93,30 @@ class TestRunningState:
         assert state_dict["best_model_metrics_snapshot"]["val_metric"] == 0.5
         # Early stopper is managed separately, not in state dict
         assert "early_stop_counter" not in state_dict
+
+    def test_running_state_refresh_epoch_result_metric_sources(self):
+        state = RunningState()
+
+        state.current_val_metric = 0.3
+        state.current_test_metric = 0.4
+        state.mark_epoch_end_eval_trigger(eval_triggered=True)
+        state.refresh_epoch_result_metric_sources()
+
+        assert state.epoch_result_val_metric_source == "current_eval"
+        assert state.epoch_result_test_metric_source == "current_eval"
+
+        state.mark_epoch_end_eval_trigger(eval_triggered=False)
+        state.refresh_epoch_result_metric_sources()
+
+        assert state.epoch_result_val_metric_source == "latest_eval_reuse"
+        assert state.epoch_result_test_metric_source == "latest_eval_reuse"
+
+        state.current_val_metric = None
+        state.current_test_metric = None
+        state.refresh_epoch_result_metric_sources()
+
+        assert state.epoch_result_val_metric_source == "missing"
+        assert state.epoch_result_test_metric_source == "missing"
 
 
 # ============================================================================
@@ -575,6 +601,55 @@ class TestTrainRunner:
             assert "EarlyStopping: 1/2" in log_text
             assert "EarlyStopping: 2/2" in log_text
             assert "Early stopping triggered" not in log_text
+
+    def test_epoch_result_logs_metric_sources_for_missing_current_and_reuse_states(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components(num_samples=50)
+
+            result = train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=3,
+                eval_interval=2,
+                save_dir=tmpdir,
+                run_mode="epoch",
+            )
+
+            assert result["final_epoch"] == 3
+
+            log_text = self._read_debug_log(tmpdir)
+            assert "[val] metric: n/a source=missing" in log_text
+            assert "[test] metric: n/a source=missing" in log_text
+            assert "source=current_eval" in log_text
+            assert "source=latest_eval_reuse" in log_text
+
+    def test_epoch_result_logs_step_mode_mid_epoch_eval_as_reuse_at_epoch_end(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task, model, loss_fn, optimizer = self._create_training_components(num_samples=48)
+
+            result = train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_steps=4,
+                eval_interval=2,
+                save_dir=tmpdir,
+                run_mode="step",
+            )
+
+            assert result["final_epoch"] == 1
+
+            log_text = self._read_debug_log(tmpdir)
+            assert "eval trigger: run_mode=RunMode.STEP" in log_text
+            assert "[val] metric:" in log_text
+            assert "[test] metric:" in log_text
+            assert "source=current_eval" not in log_text
+            assert "source=latest_eval_reuse" in log_text
 
     def test_train_runner_emits_user_interrupt_terminal_event(self, monkeypatch):
         captured_terminal_event = {}

@@ -173,6 +173,7 @@ class RunningAgent:
         if self.config.distributed and hasattr(self.train_loader.sampler, "set_epoch"):
             self.train_loader.sampler.set_epoch(self.state.epoch)
 
+        self.state.mark_epoch_end_eval_trigger(eval_triggered=False)
         self._trigger("on_epoch_start", total_batches=len(self.train_loader), stage="train")
 
     def _handle_epoch_end(self):
@@ -187,6 +188,7 @@ class RunningAgent:
             self.train_tensor_bank.reset()
 
         self.state.update_current_metrics(epoch_metrics)
+        self.state.refresh_epoch_result_metric_sources()
         self._trigger("on_epoch_end")
         self.state.epoch += 1
         self.state.batch_idx_in_epoch = 0
@@ -391,6 +393,9 @@ class RunningAgent:
         signal = LoopSignal()
 
         is_eval_trigger = self._check_run_period(self.config.eval_interval, is_epoch_end)
+        if is_epoch_end:
+            self.state.mark_epoch_end_eval_trigger(eval_triggered=is_eval_trigger)
+
         if is_eval_trigger:
             self.logger.debug(
                 f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
