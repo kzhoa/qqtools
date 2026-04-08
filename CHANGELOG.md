@@ -1,5 +1,11 @@
 # History
 
+## v1.2.9
+
+- feat: add `qexp use` command for CLI context persistence so `--shared-root`, `--machine`, and `--runtime-root` no longer need to be repeated on every command
+- feat: `qexp init` now auto-saves CLI context after successful initialization
+- feat: `_resolve_cfg` fallback chain extended to flags → env vars → context file (`~/.qqtools/qexp-context.json`) → error
+
 ## v1.2.8
 
 - fix: handle libtmux `ObjectDoesNotExist` exception in tmux session/window lookup to support newer libtmux versions where `.get()` raises instead of returning `None`

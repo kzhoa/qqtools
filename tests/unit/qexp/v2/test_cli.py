@@ -200,6 +200,152 @@ class TestV2Clean:
         assert "Cleaned" in out
 
 
+class TestV2Use:
+    """Tests for the 'use' command and context persistence."""
+
+    def _patch_context(self, monkeypatch, tmp_path):
+        ctx_file = str(tmp_path / "qexp-context.json")
+        import qqtools.plugins.qexp.v2.layout as _layout
+        monkeypatch.setattr(_layout, "_context_file_override", ctx_file)
+        monkeypatch.delenv("QEXP_SHARED_ROOT", raising=False)
+        monkeypatch.delenv("QEXP_MACHINE", raising=False)
+        monkeypatch.delenv("QEXP_RUNTIME_ROOT", raising=False)
+        return ctx_file
+
+    def test_use_set_and_resolve(self, cfg, tmp_path, monkeypatch, capsys):
+        """After 'use', commands work without flags."""
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.v2.cli import main as v2_main
+
+        ret = v2_main([
+            "use",
+            "--shared-root", str(cfg.shared_root),
+            "--machine", cfg.machine_name,
+        ])
+        assert ret == 0
+        capsys.readouterr()
+
+        ret = v2_main(["list"])
+        assert ret == 0
+
+    def test_use_show(self, cfg, tmp_path, monkeypatch, capsys):
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.v2.cli import main as v2_main
+
+        v2_main([
+            "use",
+            "--shared-root", str(cfg.shared_root),
+            "--machine", cfg.machine_name,
+        ])
+        capsys.readouterr()
+
+        ret = v2_main(["use", "--show"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert cfg.machine_name in out
+        assert str(cfg.shared_root) in out
+
+    def test_use_show_empty(self, tmp_path, monkeypatch, capsys):
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.v2.cli import main as v2_main
+
+        ret = v2_main(["use", "--show"])
+        assert ret == 0
+        assert "No context" in capsys.readouterr().out
+
+    def test_use_clear(self, cfg, tmp_path, monkeypatch, capsys):
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.v2.cli import main as v2_main
+
+        v2_main([
+            "use",
+            "--shared-root", str(cfg.shared_root),
+            "--machine", cfg.machine_name,
+        ])
+        capsys.readouterr()
+
+        ret = v2_main(["use", "--clear"])
+        assert ret == 0
+        assert "cleared" in capsys.readouterr().out.lower()
+
+        with pytest.raises(SystemExit):
+            v2_main(["list"])
+
+    def test_use_requires_shared_root_and_machine(self, tmp_path, monkeypatch, capsys):
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.v2.cli import main as v2_main
+
+        ret = v2_main(["use", "--shared-root", "/tmp/x"])
+        assert ret == 1
+
+    def test_init_saves_context(self, tmp_path, monkeypatch, capsys):
+        """init should auto-save context so subsequent commands work."""
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.v2.cli import main as v2_main
+
+        ret = v2_main([
+            "--shared-root", str(tmp_path / "shared"),
+            "--machine", "auto-ctx",
+            "init",
+        ])
+        assert ret == 0
+        assert "context saved" in capsys.readouterr().out.lower()
+
+        ret = v2_main(["list"])
+        assert ret == 0
+
+    def test_cli_flags_override_context(self, tmp_path, monkeypatch, capsys):
+        """CLI flags take precedence over saved context."""
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.v2.cli import main as v2_main
+
+        # Save context pointing to one machine
+        cfg1 = init_shared_root(tmp_path / "s1", "m1")
+        v2_main([
+            "use",
+            "--shared-root", str(cfg1.shared_root),
+            "--machine", "m1",
+        ])
+        capsys.readouterr()
+
+        # Init a second machine
+        cfg2 = init_shared_root(tmp_path / "s2", "m2")
+
+        # Explicit flags should override saved context
+        ret = v2_main([
+            "--shared-root", str(cfg2.shared_root),
+            "--machine", "m2",
+            "machines",
+        ])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "m2" in out
+
+    def test_env_overrides_context(self, tmp_path, monkeypatch, capsys):
+        """Environment variables take precedence over saved context."""
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.v2.cli import main as v2_main
+
+        # Save context pointing to one machine
+        cfg1 = init_shared_root(tmp_path / "s1", "m1")
+        v2_main([
+            "use",
+            "--shared-root", str(cfg1.shared_root),
+            "--machine", "m1",
+        ])
+        capsys.readouterr()
+
+        # Init a second machine and set env
+        cfg2 = init_shared_root(tmp_path / "s2", "m2")
+        monkeypatch.setenv("QEXP_SHARED_ROOT", str(cfg2.shared_root))
+        monkeypatch.setenv("QEXP_MACHINE", "m2")
+
+        ret = v2_main(["machines"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "m2" in out
+
+
 class TestRouting:
     def test_default_routes_to_v2(self, cfg, capsys, monkeypatch):
         """v2 is the default since 1.2.7."""

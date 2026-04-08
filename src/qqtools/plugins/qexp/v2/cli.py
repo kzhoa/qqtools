@@ -16,7 +16,13 @@ from .doctor import (
     repair_orphans,
     verify_integrity,
 )
-from .layout import init_shared_root, load_root_config
+from .layout import (
+    clear_context,
+    init_shared_root,
+    load_context,
+    load_root_config,
+    save_context,
+)
 
 TOP_REFRESH_INTERVAL_SECONDS = 1.0
 
@@ -30,15 +36,23 @@ def _resolve_cfg(args: argparse.Namespace):
         return load_root_config(shared_root, machine, runtime_root)
 
     # Try to load from environment or defaults
-    import os
     sr = shared_root or os.environ.get("QEXP_SHARED_ROOT")
     mn = machine or os.environ.get("QEXP_MACHINE")
     rr = runtime_root or os.environ.get("QEXP_RUNTIME_ROOT")
 
+    # Fall back to saved context file
+    if not sr or not mn:
+        ctx = load_context()
+        if ctx:
+            sr = sr or ctx.get("shared_root")
+            mn = mn or ctx.get("machine")
+            rr = rr or ctx.get("runtime_root")
+
     if not sr or not mn:
         print(
             "Error: --shared-root and --machine are required "
-            "(or set QEXP_SHARED_ROOT and QEXP_MACHINE).",
+            "(or set QEXP_SHARED_ROOT / QEXP_MACHINE, "
+            "or run 'qexp use' to save defaults).",
             file=sys.stderr,
         )
         raise SystemExit(1)
@@ -149,6 +163,14 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_sub.add_parser("stop", help="stop agent")
     daemon_sub.add_parser("status", help="show agent status")
 
+    # use (context management)
+    use_p = sub.add_parser("use", help="set or show default context")
+    use_p.add_argument("--shared-root", type=str, default=None, dest="use_shared_root")
+    use_p.add_argument("--machine", type=str, default=None, dest="use_machine")
+    use_p.add_argument("--runtime-root", type=str, default=None, dest="use_runtime_root")
+    use_p.add_argument("--show", action="store_true", help="show current context")
+    use_p.add_argument("--clear", action="store_true", help="clear saved context")
+
     # doctor
     doctor_p = sub.add_parser("doctor", help="diagnostics and repair")
     doctor_sub = doctor_p.add_subparsers(dest="doctor_command")
@@ -185,7 +207,43 @@ def handle_init(args: argparse.Namespace) -> int:
         agent_mode=args.agent_mode,
         runtime_root=Path(args.runtime_root) if args.runtime_root else None,
     )
-    print(f"Initialized: shared_root={cfg.shared_root} machine={cfg.machine_name}")
+    # Only persist runtime_root when explicitly passed via --runtime-root;
+    # the default path is derivable at runtime and should not be hardcoded.
+    save_context(
+        str(cfg.shared_root),
+        cfg.machine_name,
+        str(cfg.runtime_root) if args.runtime_root else None,
+    )
+    print(f"Initialized: shared_root={cfg.shared_root} machine={cfg.machine_name} (context saved)")
+    return 0
+
+
+def handle_use(args: argparse.Namespace) -> int:
+    if args.clear:
+        if clear_context():
+            print("Context cleared.")
+        else:
+            print("No context to clear.")
+        return 0
+    if args.show:
+        ctx = load_context()
+        if ctx:
+            print(json.dumps(ctx, indent=2, sort_keys=True))
+        else:
+            print("No context saved. Run 'qexp use --shared-root ... --machine ...' to set.")
+        return 0
+    # Accept flags from both 'qexp --shared-root X use' and 'qexp use --shared-root X'
+    sr = getattr(args, "use_shared_root", None) or args.shared_root
+    mn = getattr(args, "use_machine", None) or args.machine
+    rr = getattr(args, "use_runtime_root", None) or args.runtime_root
+    if not sr or not mn:
+        print(
+            "Error: --shared-root and --machine are required for 'qexp use'.",
+            file=sys.stderr,
+        )
+        return 1
+    path = save_context(sr, mn, rr)
+    print(f"Context saved to {path}: shared_root={sr} machine={mn}")
     return 0
 
 
@@ -413,6 +471,7 @@ def handle_doctor(args: argparse.Namespace) -> int:
 
 _HANDLERS = {
     "init": handle_init,
+    "use": handle_use,
     "submit": handle_submit,
     "cancel": handle_cancel,
     "retry": handle_retry,

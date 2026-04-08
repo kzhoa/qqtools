@@ -17,6 +17,7 @@ from .models import (
 )
 
 DEFAULT_RUNTIME_BASE = "~/.qqtools/qexp-runtime"
+DEFAULT_CONTEXT_FILE = "~/.qqtools/qexp-context.json"
 
 
 @dataclass(slots=True)
@@ -279,3 +280,53 @@ def init_shared_root(
     os.replace(tmp, machine_path)
 
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# CLI context persistence
+# ---------------------------------------------------------------------------
+
+_context_file_override: str | None = None
+
+
+def _context_path() -> Path:
+    if _context_file_override is not None:
+        return Path(_context_file_override)
+    return Path(DEFAULT_CONTEXT_FILE).expanduser()
+
+
+def save_context(
+    shared_root: str,
+    machine_name: str,
+    runtime_root: str | None = None,
+) -> Path:
+    path = _context_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "shared_root": shared_root,
+        "machine": machine_name,
+    }
+    if runtime_root is not None:
+        payload["runtime_root"] = runtime_root
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def load_context() -> dict | None:
+    path = _context_path()
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def clear_context() -> bool:
+    path = _context_path()
+    if path.is_file():
+        path.unlink()
+        return True
+    return False
