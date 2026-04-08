@@ -1,7 +1,4 @@
 import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.joinpath("src")))
 
 
 def test_import_mypackage():
@@ -11,3 +8,6 @@ def test_import_mypackage():
     print(qqtools.__file__)
     print("✅ qqtools import successfully.")
     print("✅ qqtools version:", qqtools.__version__)
+    assert "libtmux" not in sys.modules
+    assert "psutil" not in sys.modules
+    assert "pynvml" not in sys.modules

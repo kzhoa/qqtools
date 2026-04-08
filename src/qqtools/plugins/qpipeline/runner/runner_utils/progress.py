@@ -46,6 +46,12 @@ except ImportError:
 __all__ = ["ProgressTracker", "RunnerListener"]
 
 
+def _format_epoch_result_metric(value: Optional[float]) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.6f}"
+
+
 class ProgressStrategy(Protocol):
     """Common protocol for progress rendering strategies."""
 
@@ -607,11 +613,14 @@ class ProgressTracker:
                 train_msg.append(f"metric: {context.state.current_train_metric:.6f}")
             self.logger.info(f"[train] {' '.join(train_msg)}")
 
-        if context.state.current_val_metric is not None:
-            self.logger.info(f"[val] metric: {context.state.current_val_metric:.6f}")
-
-        if context.state.current_test_metric is not None:
-            self.logger.info(f"[test] metric: {context.state.current_test_metric:.6f}")
+        self.logger.info(
+            f"[val] metric: {_format_epoch_result_metric(context.state.current_val_metric)} "
+            f"source={context.state.epoch_result_val_metric_source}"
+        )
+        self.logger.info(
+            f"[test] metric: {_format_epoch_result_metric(context.state.current_test_metric)} "
+            f"source={context.state.epoch_result_test_metric_source}"
+        )
 
         # Also log any extra eval results if present in context
         if context.eval_results:
