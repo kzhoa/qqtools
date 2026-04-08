@@ -8,6 +8,12 @@ from qqtools.plugins.qexp import cli
 from qqtools.plugins.qexp.models import qExpTask
 
 
+@pytest.fixture(autouse=True)
+def _force_v1(monkeypatch):
+    """These tests exercise the v1 CLI which is no longer the default."""
+    monkeypatch.setenv("QEXP_VERSION", "1")
+
+
 def test_submit_command_dispatches_to_api(monkeypatch, capsys, tmp_path):
     captured = {}
 
@@ -198,12 +204,17 @@ def test_status_command_renders_json_snapshot(monkeypatch, capsys, tmp_path):
     assert json.loads(capsys.readouterr().out) == payload
 
 
-def test_top_command_delegates_to_dashboard_renderer(monkeypatch, tmp_path):
-    rendered = {}
+def test_top_command_refreshes_until_interrupted(monkeypatch, tmp_path):
+    calls = {"snapshot": 0, "render": 0, "clear": 0}
+
+    class _FakeConsole:
+        def clear(self):
+            calls["clear"] += 1
+
     monkeypatch.setattr(
         cli.api,
         "get_status_snapshot",
-        lambda root=None: {
+        lambda root=None: calls.__setitem__("snapshot", calls["snapshot"] + 1) or {
             "daemon": {},
             "host": {},
             "gpus": {"slots": [], "visible_gpu_ids": []},
@@ -212,12 +223,22 @@ def test_top_command_delegates_to_dashboard_renderer(monkeypatch, tmp_path):
             "warnings": [],
         },
     )
-    monkeypatch.setattr(cli, "_render_top", lambda snapshot: rendered.setdefault("snapshot", snapshot))
+    monkeypatch.setattr(cli, "_create_top_console", lambda: _FakeConsole())
+    monkeypatch.setattr(
+        cli,
+        "_render_top",
+        lambda snapshot, *, console=None: calls.__setitem__("render", calls["render"] + 1),
+    )
+    monkeypatch.setattr(
+        cli.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
 
     result = cli.main(["--root", str(tmp_path), "top"])
 
     assert result == 0
-    assert "snapshot" in rendered
+    assert calls == {"snapshot": 1, "render": 1, "clear": 1}
 
 
 def test_clean_command_prints_deleted_targets(monkeypatch, capsys, tmp_path):

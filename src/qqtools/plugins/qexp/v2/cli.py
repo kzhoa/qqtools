@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+from . import api, observer
+from .agent import get_agent_status, run_agent_loop
+from .doctor import (
+    cleanup_stale_locks,
+    rebuild_indexes,
+    repair_orphans,
+    verify_integrity,
+)
+from .layout import init_shared_root, load_root_config
+
+TOP_REFRESH_INTERVAL_SECONDS = 1.0
+
+
+def _resolve_cfg(args: argparse.Namespace):
+    shared_root = getattr(args, "shared_root", None)
+    machine = getattr(args, "machine", None)
+    runtime_root = getattr(args, "runtime_root", None)
+
+    if shared_root and machine:
+        return load_root_config(shared_root, machine, runtime_root)
+
+    # Try to load from environment or defaults
+    import os
+    sr = shared_root or os.environ.get("QEXP_SHARED_ROOT")
+    mn = machine or os.environ.get("QEXP_MACHINE")
+    rr = runtime_root or os.environ.get("QEXP_RUNTIME_ROOT")
+
+    if not sr or not mn:
+        print(
+            "Error: --shared-root and --machine are required "
+            "(or set QEXP_SHARED_ROOT and QEXP_MACHINE).",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    return load_root_config(sr, mn, rr)
+
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="qexp v2 — shared-root experiment queue"
+    )
+    parser.add_argument("--shared-root", type=str, default=None)
+    parser.add_argument("--machine", type=str, default=None)
+    parser.add_argument("--runtime-root", type=str, default=None)
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # init
+    init_p = sub.add_parser("init", help="initialize shared root and machine")
+    init_p.add_argument("--agent-mode", choices=["on_demand", "persistent"], default="on_demand")
+
+    # submit
+    submit_p = sub.add_parser("submit", help="submit a single task")
+    submit_p.add_argument("--task-id", type=str, default=None)
+    submit_p.add_argument("--name", type=str, default=None)
+    submit_p.add_argument("--gpus", type=int, default=1)
+    submit_p.add_argument("argv", nargs=argparse.REMAINDER)
+
+    # cancel
+    cancel_p = sub.add_parser("cancel", help="cancel a task")
+    cancel_p.add_argument("task_id", type=str)
+
+    # retry
+    retry_p = sub.add_parser("retry", help="retry a terminal task")
+    retry_p.add_argument("task_id", type=str)
+
+    # batch-submit
+    batch_p = sub.add_parser("batch-submit", help="submit tasks from manifest")
+    batch_p.add_argument("--file", type=str, required=True, dest="manifest_file")
+
+    # batch-retry-failed
+    brf_p = sub.add_parser("batch-retry-failed", help="retry failed tasks in batch")
+    brf_p.add_argument("batch_id", type=str)
+
+    # batch-retry-cancelled
+    brc_p = sub.add_parser("batch-retry-cancelled", help="retry cancelled tasks in batch")
+    brc_p.add_argument("batch_id", type=str)
+
+    # list
+    list_p = sub.add_parser("list", help="list tasks")
+    list_p.add_argument("--phase", type=str, default=None)
+    list_p.add_argument("--batch", type=str, default=None, dest="batch_id")
+    list_p.add_argument("--limit", type=int, default=50)
+
+    # inspect
+    inspect_p = sub.add_parser("inspect", help="inspect a single task")
+    inspect_p.add_argument("task_id", type=str)
+
+    # top
+    top_p = sub.add_parser("top", help="live queue overview")
+    top_p.add_argument("--all", action="store_true", dest="all_machines")
+
+    # batches
+    sub.add_parser("batches", help="list batches")
+
+    # batch (inspect)
+    batch_i = sub.add_parser("batch", help="inspect a batch")
+    batch_i.add_argument("batch_id", type=str)
+
+    # machines
+    sub.add_parser("machines", help="list registered machines")
+
+    # logs
+    logs_p = sub.add_parser("logs", help="show task log output")
+    logs_p.add_argument("task_id", type=str)
+    logs_p.add_argument("-f", "--follow", action="store_true")
+
+    # clean
+    clean_p = sub.add_parser("clean", help="clean old terminal task records")
+    clean_p.add_argument("--dry-run", action="store_true")
+    clean_p.add_argument("--include-failed", action="store_true")
+    clean_p.add_argument(
+        "--older-than-seconds",
+        type=int,
+        default=api.DEFAULT_CLEAN_OLDER_THAN_SECONDS,
+    )
+
+    # agent
+    agent_p = sub.add_parser("agent", help="agent management")
+    agent_sub = agent_p.add_subparsers(dest="agent_command", required=True)
+    agent_start = agent_sub.add_parser("start", help="start agent")
+    agent_start.add_argument("--persistent", action="store_true")
+    agent_start.add_argument("--background", action="store_true", help="start in tmux background")
+    agent_sub.add_parser("stop", help="stop agent")
+    agent_sub.add_parser("status", help="show agent status")
+
+    # daemon (v1-compat alias for 'agent')
+    daemon_p = sub.add_parser("daemon", help="(deprecated, use 'agent') agent management")
+    daemon_sub = daemon_p.add_subparsers(dest="agent_command")
+    daemon_start = daemon_sub.add_parser("start", help="start agent")
+    daemon_start.add_argument("--persistent", action="store_true")
+    daemon_start.add_argument("--background", action="store_true")
+    daemon_sub.add_parser("stop", help="stop agent")
+    daemon_sub.add_parser("status", help="show agent status")
+
+    # doctor
+    doctor_p = sub.add_parser("doctor", help="diagnostics and repair")
+    doctor_sub = doctor_p.add_subparsers(dest="doctor_command")
+    doctor_sub.add_parser("rebuild-index", help="rebuild all indexes")
+    doctor_sub.add_parser("repair-orphans", help="repair orphaned tasks")
+    doctor_sub.add_parser("cleanup-locks", help="clean stale locks")
+    doctor_sub.add_parser("verify", help="non-destructive integrity check")
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_argv(argv: list[str]) -> list[str]:
+    normalized = list(argv)
+    if normalized and normalized[0] == "--":
+        normalized = normalized[1:]
+    if not normalized:
+        raise ValueError("submit requires a command after '--'.")
+    return normalized
+
+
+def handle_init(args: argparse.Namespace) -> int:
+    sr = args.shared_root
+    mn = args.machine
+    if not sr or not mn:
+        print("Error: --shared-root and --machine are required for init.", file=sys.stderr)
+        return 1
+    cfg = init_shared_root(
+        Path(sr), mn,
+        agent_mode=args.agent_mode,
+        runtime_root=Path(args.runtime_root) if args.runtime_root else None,
+    )
+    print(f"Initialized: shared_root={cfg.shared_root} machine={cfg.machine_name}")
+    return 0
+
+
+def handle_submit(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    task = api.submit(
+        cfg,
+        command=_normalize_argv(args.argv),
+        requested_gpus=args.gpus,
+        task_id=args.task_id,
+        name=args.name,
+    )
+    print(task.task_id)
+    return 0
+
+
+def handle_cancel(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    task = api.cancel(cfg, args.task_id)
+    print(f"{task.task_id} {task.status.phase}")
+    return 0
+
+
+def handle_retry(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    new_task = api.retry(cfg, args.task_id)
+    print(f"{new_task.task_id} (retry of {new_task.lineage.retry_of})")
+    return 0
+
+
+def handle_batch_submit(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    batch = api.batch_submit(cfg, Path(args.manifest_file))
+    print(f"batch={batch.batch_id} tasks={len(batch.task_ids)}")
+    return 0
+
+
+def handle_batch_retry_failed(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    new_tasks = api.batch_retry_failed(cfg, args.batch_id)
+    print(f"Retried {len(new_tasks)} failed tasks.")
+    return 0
+
+
+def handle_batch_retry_cancelled(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    new_tasks = api.batch_retry_cancelled(cfg, args.batch_id)
+    print(f"Retried {len(new_tasks)} cancelled tasks.")
+    return 0
+
+
+def handle_list(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    tasks = observer.list_tasks(
+        cfg,
+        phase=args.phase,
+        batch_id=args.batch_id,
+        limit=args.limit,
+    )
+    if not tasks:
+        print("No tasks found.")
+        return 0
+    for t in tasks:
+        print(f"{t['phase']:12s} {t['task_id']:14s} {t.get('name') or '-':20s} gpus={t['gpus']}")
+    return 0
+
+
+def handle_inspect(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    data = observer.inspect_task(cfg, args.task_id)
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 0
+
+
+def handle_top(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    try:
+        while True:
+            view = observer.top_view(cfg, all_machines=args.all_machines)
+            sys.stdout.write("\033[2J\033[H")  # clear screen
+            print(f"=== qexp top ({cfg.machine_name}) ===\n")
+            counts = view["counts"]
+            print(
+                f"queued={counts.get('queued', 0)}  running={counts.get('running', 0)}  "
+                f"succeeded={counts.get('succeeded', 0)}  failed={counts.get('failed', 0)}"
+            )
+            print()
+            for m in view.get("machines", []):
+                print(f"  machine={m['machine_name']}  gpus={m['gpu_count']}  agent={m['agent_state']}")
+            print()
+            for e in view.get("recent_events", [])[:5]:
+                print(f"  {e.get('timestamp', '')}  {e.get('event_type', '')}  {e.get('task_id', '')}")
+            sys.stdout.flush()
+            time.sleep(TOP_REFRESH_INTERVAL_SECONDS)
+    except KeyboardInterrupt:
+        return 0
+
+
+def handle_batches(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    batches = observer.list_batches(cfg)
+    if not batches:
+        print("No batches found.")
+        return 0
+    for b in batches:
+        print(f"{b['batch_id']:14s} {b.get('name') or '-':20s} total={b['total']} failed={b['failed']}")
+    return 0
+
+
+def handle_batch_inspect(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    data = observer.inspect_batch(cfg, args.batch_id)
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 0
+
+
+def handle_machines(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    machines = observer.list_machines(cfg)
+    if not machines:
+        print("No machines registered.")
+        return 0
+    for m in machines:
+        print(
+            f"{m['machine_name']:14s} host={m.get('hostname') or '-':20s} "
+            f"mode={m['agent_mode']}  state={m['agent_state']}  gpus={m['gpu_count']}"
+        )
+    return 0
+
+
+def handle_logs(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    if args.follow:
+        try:
+            api.tail_log(cfg, args.task_id)
+        except KeyboardInterrupt:
+            pass
+        return 0
+    sys.stdout.write(api.read_logs(cfg, args.task_id))
+    return 0
+
+
+def handle_clean(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    result = api.clean(
+        cfg,
+        dry_run=args.dry_run,
+        include_failed=args.include_failed,
+        older_than_seconds=args.older_than_seconds,
+    )
+    mode = "Dry run" if result["dry_run"] else "Cleaned"
+    print(f"{mode}: {result['deleted_task_count']} tasks, {result['deleted_log_count']} logs")
+    for tid in result["task_ids"]:
+        print(f"  {tid}")
+    return 0
+
+
+def handle_agent(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    # 'daemon' without subcommand means foreground start (v1 compat)
+    if not getattr(args, "agent_command", None):
+        return run_agent_loop(cfg, persistent=getattr(args, "persistent", False))
+    if args.agent_command == "start":
+        if args.background:
+            from .agent import wake_agent_if_needed
+            ok = wake_agent_if_needed(cfg)
+            if ok:
+                print("Agent started in background.")
+                return 0
+            else:
+                print("Failed to start agent in background.", file=sys.stderr)
+                return 1
+        return run_agent_loop(cfg, persistent=args.persistent)
+    elif args.agent_command == "stop":
+        from .agent import stop_agent_record, is_agent_running, read_agent_state
+        state = read_agent_state(cfg)
+        if state and state.get("pid") and is_agent_running(cfg):
+            import signal as _sig
+            try:
+                os.kill(state["pid"], _sig.SIGTERM)
+            except OSError:
+                pass
+        stop_agent_record(cfg, reason="manual_stop")
+        print("Agent stop requested.")
+        return 0
+    elif args.agent_command == "status":
+        status = get_agent_status(cfg)
+        print(json.dumps(status, indent=2, sort_keys=True))
+        return 0
+    return 1
+
+
+def handle_doctor(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    cmd = args.doctor_command
+
+    if cmd == "rebuild-index":
+        stats = rebuild_indexes(cfg)
+        print(json.dumps(stats, indent=2))
+        return 0
+    elif cmd == "repair-orphans":
+        orphaned = repair_orphans(cfg)
+        print(f"Repaired {len(orphaned)} orphaned tasks.")
+        for tid in orphaned:
+            print(f"  {tid}")
+        return 0
+    elif cmd == "cleanup-locks":
+        cleaned = cleanup_stale_locks(cfg)
+        print(f"Cleaned {len(cleaned)} stale locks.")
+        return 0
+    elif cmd == "verify":
+        result = verify_integrity(cfg)
+        print(json.dumps(result, indent=2))
+        return 0 if result["ok"] else 1
+    else:
+        # Default: run verify
+        result = verify_integrity(cfg)
+        print(json.dumps(result, indent=2))
+        return 0 if result["ok"] else 1
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+_HANDLERS = {
+    "init": handle_init,
+    "submit": handle_submit,
+    "cancel": handle_cancel,
+    "retry": handle_retry,
+    "batch-submit": handle_batch_submit,
+    "batch-retry-failed": handle_batch_retry_failed,
+    "batch-retry-cancelled": handle_batch_retry_cancelled,
+    "list": handle_list,
+    "inspect": handle_inspect,
+    "top": handle_top,
+    "batches": handle_batches,
+    "batch": handle_batch_inspect,
+    "machines": handle_machines,
+    "logs": handle_logs,
+    "clean": handle_clean,
+    "agent": handle_agent,
+    "daemon": handle_agent,  # v1-compat alias
+    "doctor": handle_doctor,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    handler = _HANDLERS.get(args.command)
+    if handler is None:
+        parser.error(f"Unsupported command: {args.command}")
+        return 2
+    return handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

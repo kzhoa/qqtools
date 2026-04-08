@@ -1,5 +1,13 @@
 # History
 
+## v1.2.7
+
+- breaking: qexp now defaults to the v2 shared-root engine; the v1 single-machine engine is still available via `--v1` flag or `QEXP_VERSION=1` environment variable
+- feat: qexp v2 — shared-root multi-machine experiment queue with explicit machine identity, CAS-based concurrency, batch support, retry lineage, on-demand agent, and scheduling events
+- feat: qexp v2 subcommands: `init`, `submit`, `cancel`, `retry`, `batch-submit`, `batch-retry-failed`, `batch-retry-cancelled`, `list`, `inspect`, `top`, `batches`, `batch`, `machines`, `logs`, `clean`, `agent start/stop/status`, `doctor verify/rebuild-index/repair-orphans/cleanup-locks`
+- deprecation: qexp v1 engine is deprecated and will be removed in v1.3.0
+- docs: add qexp user manual and release workflow checks that publish changelog-backed release notes
+
 ## v1.2.6
 
 - breaking: `train_runner().early_stopped` is now strictly derived from `terminal_event.reason == "early_stop"`; user interruption is exposed as `terminal_event.status=\"stopped\"` and `reason=\"user_interrupt\"`

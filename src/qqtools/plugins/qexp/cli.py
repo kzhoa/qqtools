@@ -8,6 +8,8 @@ from pathlib import Path
 
 from . import api, fsqueue, manager
 
+TOP_REFRESH_INTERVAL_SECONDS = 1.0
+
 
 def _normalize_root(root: str | None) -> Path | None:
     if root is None:
@@ -129,13 +131,19 @@ def _render_gpu_slot(slot: dict) -> str:
     )
 
 
-def _render_top(snapshot: dict) -> None:
-    from rich.columns import Columns
+def _create_top_console():
     from rich.console import Console
+
+    return Console()
+
+
+def _render_top(snapshot: dict, *, console=None) -> None:
+    from rich.columns import Columns
     from rich.panel import Panel
     from rich.table import Table
 
-    console = Console()
+    if console is None:
+        console = _create_top_console()
     daemon = snapshot["daemon"]
     daemon_table = Table.grid(padding=(0, 1))
     daemon_table.add_row("Daemon", daemon["state"])
@@ -179,6 +187,17 @@ def _render_top(snapshot: dict) -> None:
     console.print(Panel(Columns(gpu_panels, equal=True, expand=True), title="GPU Occupancy"))
     console.print(Panel(pending_table, title="Pending Preview"))
     console.print(Panel(event_table, title="Recent Events"))
+
+
+def _run_top_monitor(*, root: Path | None, refresh_interval: float = TOP_REFRESH_INTERVAL_SECONDS) -> int:
+    console = _create_top_console()
+    try:
+        while True:
+            console.clear()
+            _render_top(api.get_status_snapshot(root=root), console=console)
+            time.sleep(refresh_interval)
+    except KeyboardInterrupt:
+        return 0
 
 
 def _render_clean_summary(result: dict) -> str:
@@ -229,7 +248,8 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="show queue and daemon status")
     status_parser.add_argument("--json", action="store_true", dest="json_output")
 
-    subparsers.add_parser("top", help="show operator dashboard")
+    top_parser = subparsers.add_parser("top", help="show live operator dashboard")
+    top_parser.add_argument("--once", action="store_true", help="print one snapshot and exit")
 
     clean_parser = subparsers.add_parser("clean", help="clean completed qexp records")
     clean_parser.add_argument("--dry-run", action="store_true")
@@ -303,8 +323,11 @@ def handle_status(args: argparse.Namespace) -> int:
 
 
 def handle_top(args: argparse.Namespace) -> int:
-    _render_top(api.get_status_snapshot(root=_normalize_root(args.root)))
-    return 0
+    root = _normalize_root(args.root)
+    if args.once:
+        _render_top(api.get_status_snapshot(root=root))
+        return 0
+    return _run_top_monitor(root=root)
 
 
 def handle_clean(args: argparse.Namespace) -> int:
@@ -318,9 +341,48 @@ def handle_clean(args: argparse.Namespace) -> int:
     return 0
 
 
+def _should_use_v1(argv: list[str] | None) -> bool:
+    """Check if the user explicitly requested v1 via --v1 flag or QEXP_VERSION=1."""
+    import os
+    if os.environ.get("QEXP_VERSION") == "1":
+        return True
+    if argv:
+        try:
+            sep = argv.index("--")
+            prefix = argv[:sep]
+        except ValueError:
+            prefix = argv
+        if "--v1" in prefix:
+            return True
+    return False
+
+
+def _strip_v1_flag(argv: list[str]) -> list[str]:
+    """Remove the --v1 flag only from the portion before '--'."""
+    try:
+        sep = argv.index("--")
+        prefix = [a for a in argv[:sep] if a != "--v1"]
+        return prefix + argv[sep:]
+    except ValueError:
+        return [a for a in argv if a != "--v1"]
+
+
+# Keep old names for backward compatibility during transition
+def _should_use_v2(argv: list[str] | None) -> bool:
+    return not _should_use_v1(argv)
+
+
 def main(argv: list[str] | None = None) -> int:
+    # v2 is the default since 1.2.7. Use --v1 or QEXP_VERSION=1 to
+    # fall back to the legacy single-machine engine.
+    # v1 will be removed in 1.3.0.
+    if not _should_use_v1(argv):
+        from .v2.cli import main as v2_main
+        return v2_main(argv)
+
+    cleaned = _strip_v1_flag(argv or sys.argv[1:])
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(cleaned)
 
     if args.command == "submit":
         return handle_submit(args)
