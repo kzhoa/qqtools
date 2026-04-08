@@ -44,8 +44,8 @@ Training failed: reason=exception
 ```text
 --- Epoch N Results ---
 [train] loss: ... metric: ...
-[val] metric: ...
-[test] metric: ...
+[val] metric: ... source=current_eval|latest_eval_reuse|missing
+[test] metric: ... source=current_eval|latest_eval_reuse|missing
 ```
 
 这三类日志的触发机制不同：
@@ -141,6 +141,18 @@ evaluation 是否触发由以下条件决定：
 - 不管 `run_mode=epoch` 还是 `run_mode=step`
 - 只要 epoch 没结束，就不会打印 `--- Epoch N Results ---`
 
+当前 phase2 语义下，epoch-result 中的 `[val]` / `[test]` 行会显式标注指标来源：
+
+- `source=current_eval`
+  表示本次 epoch-end 边界刚好触发了 evaluation，当前指标是这一边界新鲜计算得到的
+- `source=latest_eval_reuse`
+  表示当前 epoch-end 没有触发新的 evaluation，日志复用了最近一次已存在的 evaluation 指标
+- `source=missing`
+  表示到这个 epoch-end 为止仍没有可用的对应指标值，此时日志会打印 `metric: n/a`
+
+这条来源语义是按“epoch-end 边界是否新鲜求值”来定义的，而不是按“本 epoch 内是否曾经做过 evaluation”来定义。
+因此在 `run_mode=step` 下，即使同一个 epoch 中间已经出现过 `[Eval Summary]`，只要 epoch 结束时没有再次 evaluation，epoch-result 仍会标记为 `latest_eval_reuse`。
+
 
 ## Run Mode 语义
 
@@ -213,8 +225,8 @@ Starting training (mode=epoch, eval_interval=2, ...)
 
 --- Epoch 1 Results ---
 [train] loss: ...
-[val] metric: ...
-[test] metric: ...
+[val] metric: ... source=current_eval
+[test] metric: ... source=current_eval
 ```
 
 
@@ -241,8 +253,8 @@ Starting training (mode=step, eval_interval=100, ...)
 
 --- Epoch 0 Results ---
 [train] loss: ...
-[val] metric: ...
-[test] metric: ...
+[val] metric: ... source=latest_eval_reuse
+[test] metric: ... source=latest_eval_reuse
 ```
 
 这个例子说明：
@@ -256,8 +268,8 @@ Starting training (mode=step, eval_interval=100, ...)
 `--- Epoch N Results ---` 中的：
 
 ```text
-[val] metric: ...
-[test] metric: ...
+[val] metric: ... source=current_eval|latest_eval_reuse|missing
+[test] metric: ... source=current_eval|latest_eval_reuse|missing
 ```
 
 来自当前运行状态中的最近一次 evaluation 结果。
@@ -265,7 +277,9 @@ Starting training (mode=step, eval_interval=100, ...)
 这意味着：
 
 - 它们表示当前 state 中缓存的最新 `val_metric` / `test_metric`
-- 只有当 `state.current_val_metric` / `state.current_test_metric` 不为 `None` 时，对应行才会被打印
+- 这两行在 epoch 结束时会固定打印；如果当前没有可用指标值，则会输出 `metric: n/a source=missing`
+- `source=current_eval` 表示 epoch-end 边界刚好触发了新的 evaluation
+- `source=latest_eval_reuse` 表示 epoch-end 没有新 eval，而是复用了最近一次已有指标
 - 不一定意味着 epoch 结束时刚刚又做了一次 evaluation
 
 特别是在 `run_mode=step` 下，如果本 epoch 的最后一次 evaluation 发生在中段，那么 epoch 结束时打印的 `[val]` / `[test]` 很可能只是复用了那次中段 evaluation 的结果。
@@ -360,5 +374,6 @@ Epoch 1
 - `--- Epoch N Results ---` 永远只在 epoch 真正结束时打印
 - `Epoch Results` 只是 epoch 收尾摘要，不是 eval 事件记录
 - `step` 模式下可以出现多个 `[Eval Summary]` 对应一个 `--- Epoch N Results ---`
-- epoch result 中的 `[val]` / `[test]` 是最近一次 evaluation 的缓存值，不必然表示 epoch 末尾重新 evaluation
+- epoch result 中的 `[val]` / `[test]` 会固定打印，缺值时使用 `metric: n/a source=missing`
+- epoch result 中的 `[val]` / `[test]` 是最近一次 evaluation 的缓存值或缺值占位，不必然表示 epoch 末尾重新 evaluation
 - 是否发生了新的 eval，以有没有新的 `Eval Summary` 为准
