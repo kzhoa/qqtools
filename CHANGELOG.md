@@ -1,5 +1,15 @@
 # History
 
+## v1.2.10
+
+- breaking: qpipeline standard config field `runner.keep_latest_ckp` is replaced by `runner.checkpoint.regular_latest_only`
+- feat: qpipeline regular checkpoints now default to keeping only the latest file unless `runner.checkpoint.regular_latest_only: false`
+- feat: log learning rate in qpipeline eval summary blocks and summary-table headers
+- docs: update qConfig docs and standard config generator output for `runner.checkpoint.regular_latest_only`
+- docs: refresh qpipeline log-format examples to show eval-summary learning rate output
+- test: add coverage for regular checkpoint latest-only rotation and config parsing
+- test: add eval-summary formatter coverage for learning-rate rendering
+
 ## v1.2.9
 
 - feat: add `qexp use` command for CLI context persistence so `--shared-root`, `--machine`, and `--runtime-root` no longer need to be repeated on every command
