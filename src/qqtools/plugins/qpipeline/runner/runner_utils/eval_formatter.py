@@ -30,6 +30,12 @@ class EvalFormatter:
             return f"{float(scalar):.{precision}f}{suffix}"
         return str(scalar)
 
+    @classmethod
+    def _format_learning_rate(cls, lr: Optional[float]) -> str:
+        if lr is None:
+            return "n/a"
+        return cls._format_metric_value(lr, "lr", precision=6)
+
     @staticmethod
     def _format_delta_with_arrow(delta: Optional[float]) -> Tuple[str, str]:
         if delta is None:
@@ -184,10 +190,12 @@ class EvalFormatter:
         best_info: Dict[str, Any],
         grouped: Dict[str, Dict[str, Dict[str, Any]]],
         others: Dict[str, Any],
+        lr: Optional[float],
         color_new_best: bool,
     ) -> Tuple[List[str], bool]:
         lines = [f"\n[Eval Summary] Epoch: {best_info['epoch']}, Step: {best_info['step']}"]
         has_markup = False
+        lines.append(f"  - Learning Rate: {cls._format_learning_rate(lr)}")
 
         if target_val is not None:
             lines.append(
@@ -256,13 +264,14 @@ class EvalFormatter:
         target_val: Any,
         best_info: Dict[str, Any],
         grouped: Dict[str, Dict[str, Dict[str, Any]]],
+        lr: Optional[float],
         regular_checkpoint_path: Optional[str],
         new_best_checkpoint_path: Optional[str],
         color_new_best: bool,
     ) -> Tuple[List[str], bool]:
         target_str = cls._format_metric_value(target_val, target_key, precision=6) if target_val is not None else "n/a"
         lines = [
-            f"\n[Eval Summary Table] Epoch: {best_info['epoch']} | Step: {best_info['step']} | Target: {target_key}({target_str})"
+            f"\n[Eval Summary Table] Epoch: {best_info['epoch']} | Step: {best_info['step']} | LR: {cls._format_learning_rate(lr)} | Target: {target_key}({target_str})"
         ]
         has_markup = False
 
@@ -380,6 +389,7 @@ class EvalFormatter:
         is_best: bool,
         previous_best: Optional[Dict[str, Any]],
         best_model_tracker: Optional[Any],
+        lr: Optional[float] = None,
         regular_checkpoint_path: Optional[str] = None,
         new_best_checkpoint_path: Optional[str] = None,
         color_new_best: bool = True,
@@ -402,6 +412,7 @@ class EvalFormatter:
             best_info=best_info,
             grouped=grouped,
             others=others,
+            lr=lr,
             color_new_best=color_new_best,
         )
         table_lines, table_has_markup = cls._build_table_summary_lines(
@@ -410,6 +421,7 @@ class EvalFormatter:
             target_val=target_val,
             best_info=best_info,
             grouped=grouped,
+            lr=lr,
             regular_checkpoint_path=regular_checkpoint_path,
             new_best_checkpoint_path=new_best_checkpoint_path,
             color_new_best=color_new_best,
@@ -469,6 +481,7 @@ class EvalSummaryListener:
             is_best=bool(context.is_best),
             previous_best=context.previous_best,
             best_model_tracker=tracker_for_log,
+            lr=context.lr,
             regular_checkpoint_path=regular_checkpoint_path,
             new_best_checkpoint_path=new_best_checkpoint_path,
             color_new_best=self.color_new_best,

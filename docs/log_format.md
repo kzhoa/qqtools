@@ -28,6 +28,7 @@ Training failed: reason=exception
 
 ```text
 [Eval Summary] Epoch: E, Step: S
+  - Learning Rate: ...
   - Primary Target: ...
   - Best Tracker: ...
   - Validation:
@@ -35,7 +36,7 @@ Training failed: reason=exception
   - Testing:
     - [Main] ...
 
-[Eval Summary Table] Epoch: E | Step: S | Target: ...
+[Eval Summary Table] Epoch: E | Step: S | LR: ... | Target: ...
 ...
 ```
 
@@ -118,6 +119,12 @@ Training failed: reason=exception
 ### `[Eval Summary]`
 
 `[Eval Summary]` 在一次 evaluation 完成后打印。
+
+当前格式中：
+
+- 层级块会打印当前 evaluation 触发时的 `Learning Rate`
+- 表格块标题行会打印同一时刻的 `LR`
+- 如果当前上下文拿不到学习率，则显示为 `n/a`
 
 evaluation 是否触发由以下条件决定：
 
@@ -213,6 +220,7 @@ Starting training (mode=epoch, eval_interval=2, ...)
 ```text
 ... train batch logs ...
 [Eval Summary] Epoch: 1, Step: S
+  - Learning Rate: 0.000250
   - Primary Target: val_metric: ...
   - Best Tracker: ...
   - Validation:
@@ -220,7 +228,7 @@ Starting training (mode=epoch, eval_interval=2, ...)
   - Testing:
     - [Main] ...
 
-[Eval Summary Table] Epoch: 1 | Step: S | Target: val_metric(...)
+[Eval Summary Table] Epoch: 1 | Step: S | LR: 0.000250 | Target: val_metric(...)
 ...
 
 --- Epoch 1 Results ---
@@ -239,16 +247,19 @@ Starting training (mode=step, eval_interval=100, ...)
 ... train batch logs ...
 
 [Eval Summary] Epoch: 0, Step: 100
+  - Learning Rate: 0.000500
 ...
 
 ... train batch logs ...
 
 [Eval Summary] Epoch: 0, Step: 200
+  - Learning Rate: 0.000250
 ...
 
 ... train batch logs ...
 
 [Eval Summary] Epoch: 0, Step: 300
+  - Learning Rate: 0.000125
 ...
 
 --- Epoch 0 Results ---
@@ -337,6 +348,7 @@ Starting training (mode=step, eval_interval=100, ...)
 
 ```text
 [Eval Summary] Epoch: 0, Step: 1000
+  - Learning Rate: 0.000250
 Training loop stopping at epoch 0, step 1000.
 Reached max_steps=1000
 Training finished: reason=max_steps

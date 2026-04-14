@@ -353,6 +353,7 @@ class RunningAgent:
             snapshot=False,
             stage="eval",
             eval_results=eval_results,
+            lr=self._get_current_lr(),
             previous_best=previous_best,
             is_best=is_best,
             best_model_tracker=self.best_model_tracker,
