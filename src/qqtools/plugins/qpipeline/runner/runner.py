@@ -26,7 +26,7 @@ from ..entry_utils.scheduler import (
 from ..entry_utils.type_qconfig import CheckpointConfig, EarlyStopConfig, qConfig
 from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import qTaskBase
-from .agent import RunningAgent
+from .agent import NaNDetectedError, RunningAgent
 from .runner_utils.ckp_manager import CheckpointListener, CheckpointManager
 from .runner_utils.common import _getattr_or_default, _is_periodic_trigger, move_batch_to_device
 from .runner_utils.earlystop import EarlyStopListener, EarlyStopper
@@ -45,7 +45,7 @@ from .runner_utils.types import (
 
 __all__ = ["train_runner", "infer_runner", "SheetLoggerListener"]
 
-TerminalCause = Literal["normal_finish", "early_stop", "user_interrupt", "exception"]
+TerminalCause = Literal["normal_finish", "early_stop", "user_interrupt", "exception", "nan_detected"]
 
 
 def _qconfig_get(config: Any, key: str, default: Any = None) -> Any:
@@ -113,6 +113,14 @@ def _build_terminal_event_for_cause(
             epoch=state.epoch,
             step=state.global_step,
             exception=exception,
+        )
+
+    if terminal_cause == "nan_detected":
+        return _build_terminal_event(
+            status="failed",
+            reason="nan_detected",
+            epoch=state.epoch,
+            step=state.global_step,
         )
 
     if terminal_cause == "early_stop":
@@ -593,6 +601,14 @@ def train_runner(
         terminal_event = _build_and_emit_terminal_event(
             logger=logger,
             terminal_cause="user_interrupt",
+            state=agent.state,
+            run_config=config,
+        )
+
+    except NaNDetectedError:
+        terminal_event = _build_and_emit_terminal_event(
+            logger=logger,
+            terminal_cause="nan_detected",
             state=agent.state,
             run_config=config,
         )

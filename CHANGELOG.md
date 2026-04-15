@@ -1,5 +1,12 @@
 # History
 
+## v1.2.11
+
+- feat: fail qpipeline runs with `reason=nan_detected` when periodic eval/save boundaries observe NaN training loss
+- feat: synchronize NaN-failure signals across DDP ranks and report source ranks from rank0 logs before unified failed exit
+- docs: add qpipeline timing manual and update log-format docs for periodic NaN interception behavior
+- test: add functional coverage for NaN terminal events, periodic interception, and distributed NaN-failure signal synchronization
+
 ## v1.2.10
 
 - breaking: qpipeline standard config field `runner.keep_latest_ckp` is replaced by `runner.checkpoint.regular_latest_only`

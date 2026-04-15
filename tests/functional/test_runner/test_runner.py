@@ -42,6 +42,7 @@ TERMINAL_LINE_PREFIXES = (
     "Training stopped:",
     "Training failed:",
 )
+from qqtools.torch import qdist
 
 
 class DeterministicEarlyStopTask(SimpleTask):
@@ -55,6 +56,21 @@ class DeterministicEarlyStopTask(SimpleTask):
         metric_value = self._val_metric_seq[current_idx]
         self._eval_count += 1
         return metric_value
+
+
+class NaNLossTask(SimpleTask):
+    def __init__(self, nan_on_loss_call: int, num_samples=50, num_features=10):
+        super().__init__(num_samples=num_samples, num_features=num_features)
+        self.nan_on_loss_call = nan_on_loss_call
+        self.loss_call_count = 0
+
+    def batch_loss(self, out: Dict, batch_data, loss_fn=None) -> Dict[str, tuple[torch.Tensor, int]]:
+        self.loss_call_count += 1
+        if self.loss_call_count >= self.nan_on_loss_call:
+            pred = out["pred"]
+            nan_loss = pred.sum() * float("nan")
+            return {"loss": (nan_loss, pred.shape[0])}
+        return super().batch_loss(out, batch_data, loss_fn=loss_fn)
 
 # ============================================================================
 # Unit Tests for RunningState
@@ -429,6 +445,57 @@ class TestTrainingAgent:
         assert checkpoint_manager.save.call_count == 1
         assert agent.state.best_ckp_file == "best.pt"
 
+    def test_handle_periodic_events_raises_nan_before_eval_and_regular_checkpoint(self, monkeypatch):
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        logger = Mock()
+
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            config=RunConfig(run_mode="epoch", eval_interval=1, save_interval=1),
+            device=self.device,
+            logger=logger,
+        )
+        agent.state.epoch = 1
+        agent.state.global_step = 5
+        agent._latest_train_loss = float("nan")
+
+        eval_mock = Mock()
+        checkpoint_mock = Mock()
+        monkeypatch.setattr(agent, "_run_evaluation_and_update", eval_mock)
+        monkeypatch.setattr(agent, "_request_checkpoint", checkpoint_mock)
+
+        with pytest.raises(agent_module.NaNDetectedError, match="NaN detected before periodic"):
+            agent._handle_periodic_events(is_epoch_end=True)
+
+        eval_mock.assert_not_called()
+        checkpoint_mock.assert_not_called()
+        logger.error.assert_called_once()
+        assert (
+            logger.error.call_args.args[0]
+            == "NaN detected before evaluation and regular checkpoint on ranks=[0] at epoch=1, step=5."
+        )
+
+    def test_loop_signal_synchronize_nan_failure_collects_source_ranks(self, monkeypatch):
+        signal = LoopSignal(nan_failure=True)
+
+        monkeypatch.setattr(qdist, "get_world_size", lambda: 4)
+
+        def _fake_all_gather(gathered_tensors, local_tensor):
+            values = [0, 1, 0, 1]
+            for target_tensor, value in zip(gathered_tensors, values):
+                target_tensor.copy_(torch.tensor([value], dtype=local_tensor.dtype, device=local_tensor.device))
+
+        monkeypatch.setattr("qqtools.plugins.qpipeline.runner.runner_utils.types.dist.all_gather", _fake_all_gather)
+
+        signal.synchronize_nan_failure(device=torch.device("cpu"), distributed=True)
+
+        assert signal.nan_failure is True
+        assert signal.nan_failure_source_ranks == [1, 3]
+
 # ============================================================================
 # Integration Tests for train_runner
 # ============================================================================
@@ -786,6 +853,110 @@ class TestTrainRunner:
             log_text = self._read_debug_log(tmpdir)
             self._assert_single_terminal_line(log_text, "Training failed: reason=oom")
             assert "CUDA out of memory. Tried to allocate 1.00 GiB" not in log_text
+
+    def test_train_runner_emits_nan_detected_terminal_event_in_epoch_mode(self, monkeypatch):
+        captured_terminal_event = {}
+        original_emit = runner_module._emit_terminal_event
+        eval_call_count = {"count": 0}
+
+        def _capture_terminal_event(logger, terminal_event):
+            captured_terminal_event["event"] = terminal_event
+            return original_emit(logger, terminal_event)
+
+        def _capture_eval(self, signal):
+            eval_call_count["count"] += 1
+            return original_eval(self, signal)
+
+        original_eval = runner_module.RunningAgent._run_evaluation_and_update
+        monkeypatch.setattr(runner_module, "_emit_terminal_event", _capture_terminal_event)
+        monkeypatch.setattr(runner_module.RunningAgent, "_run_evaluation_and_update", _capture_eval)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task = NaNLossTask(nan_on_loss_call=1)
+            model = SimpleModel(input_dim=10)
+            loss_fn = nn.MSELoss()
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+            result = train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=2,
+                eval_interval=1,
+                save_interval=1,
+                save_dir=tmpdir,
+                run_mode="epoch",
+            )
+
+            assert result["early_stopped"] is False
+            assert result["terminal_event"] == {
+                "status": "failed",
+                "reason": "nan_detected",
+                "text": "Training failed: reason=nan_detected",
+                "epoch": result["final_epoch"],
+                "step": result["final_step"],
+            }
+            assert captured_terminal_event["event"] == result["terminal_event"]
+            assert eval_call_count["count"] == 0
+            assert list(Path(tmpdir).glob("*.pt")) == []
+
+            log_text = self._read_debug_log(tmpdir)
+            self._assert_single_terminal_line(log_text, "Training failed: reason=nan_detected")
+            assert "NaN detected before evaluation and regular checkpoint on ranks=[0]" in log_text
+
+    def test_train_runner_emits_nan_detected_terminal_event_in_step_mode(self, monkeypatch):
+        captured_terminal_event = {}
+        original_emit = runner_module._emit_terminal_event
+        eval_call_count = {"count": 0}
+
+        def _capture_terminal_event(logger, terminal_event):
+            captured_terminal_event["event"] = terminal_event
+            return original_emit(logger, terminal_event)
+
+        def _capture_eval(self, signal):
+            eval_call_count["count"] += 1
+            return original_eval(self, signal)
+
+        original_eval = runner_module.RunningAgent._run_evaluation_and_update
+        monkeypatch.setattr(runner_module, "_emit_terminal_event", _capture_terminal_event)
+        monkeypatch.setattr(runner_module.RunningAgent, "_run_evaluation_and_update", _capture_eval)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task = NaNLossTask(nan_on_loss_call=2, num_samples=80)
+            model = SimpleModel(input_dim=10)
+            loss_fn = nn.MSELoss()
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+            result = train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_steps=10,
+                eval_interval=2,
+                save_interval=2,
+                save_dir=tmpdir,
+                run_mode="step",
+            )
+
+            assert result["early_stopped"] is False
+            assert result["terminal_event"] == {
+                "status": "failed",
+                "reason": "nan_detected",
+                "text": "Training failed: reason=nan_detected",
+                "epoch": result["final_epoch"],
+                "step": result["final_step"],
+            }
+            assert captured_terminal_event["event"] == result["terminal_event"]
+            assert eval_call_count["count"] == 0
+            assert list(Path(tmpdir).glob("*.pt")) == []
+
+            log_text = self._read_debug_log(tmpdir)
+            self._assert_single_terminal_line(log_text, "Training failed: reason=nan_detected")
+            assert "NaN detected before evaluation and regular checkpoint on ranks=[0]" in log_text
 
     def test_train_runner_auto_offload_default_is_false(self, monkeypatch):
         captured = {}

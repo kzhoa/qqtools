@@ -5,10 +5,11 @@ from types import MappingProxyType
 from typing import Any, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 
 import torch
+import torch.distributed as dist
 
 from qqtools.torch import qdist
 
-TerminalReason = Literal["max_steps", "max_epochs", "early_stop", "user_interrupt", "oom", "exception"]
+TerminalReason = Literal["max_steps", "max_epochs", "early_stop", "user_interrupt", "oom", "exception", "nan_detected"]
 EpochResultMetricSource = Literal["current_eval", "latest_eval_reuse", "missing"]
 
 __all__ = [
@@ -198,6 +199,8 @@ class LoopSignal:
 
     should_stop: bool = False
     stop_message: Optional[str] = None
+    nan_failure: bool = False
+    nan_failure_source_ranks: List[int] = field(default_factory=list)
     pending_checkpoint_types: List[Literal["best", "regular"]] = field(default_factory=list)
     checkpoint_path: Optional[str] = None
 
@@ -220,6 +223,24 @@ class LoopSignal:
             if not self.should_stop:
                 self.stop_message = "Stopping triggered by another rank."
             self.should_stop = True
+
+    def synchronize_nan_failure(self, device: torch.device, distributed: bool) -> None:
+        """Synchronize NaN failure signals across all DDP ranks."""
+        local_nan_flag = 1 if self.nan_failure else 0
+
+        if not distributed:
+            if local_nan_flag > 0 and not self.nan_failure_source_ranks:
+                self.nan_failure_source_ranks = [0]
+            return
+
+        local_flag_tensor = torch.tensor([local_nan_flag], dtype=torch.int64, device=device)
+        gathered_flag_tensors = [torch.empty_like(local_flag_tensor) for _ in range(qdist.get_world_size())]
+        dist.all_gather(gathered_flag_tensors, local_flag_tensor)
+        source_ranks = [rank for rank, flag in enumerate(gathered_flag_tensors) if int(flag.item()) > 0]
+
+        if source_ranks:
+            self.nan_failure = True
+            self.nan_failure_source_ranks = source_ranks
 
 
 def _deep_freeze(value: Any) -> Any:

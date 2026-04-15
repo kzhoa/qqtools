@@ -22,6 +22,7 @@ Training finished: reason=early_stop
 Training stopped: reason=user_interrupt
 Training failed: reason=oom
 Training failed: reason=exception
+Training failed: reason=nan_detected
 ```
 
 2. Evaluation summary
@@ -75,6 +76,7 @@ Training finished: reason=early_stop
 Training stopped: reason=user_interrupt
 Training failed: reason=oom
 Training failed: reason=exception
+Training failed: reason=nan_detected
 ```
 
 其中：
@@ -91,6 +93,7 @@ Training failed: reason=exception
 - `user_interrupt`
 - `oom`
 - `exception`
+- `nan_detected`
 
 如果调用方直接使用 `train_runner` 的返回值，`terminal_event` 负载当前包含：
 
@@ -106,6 +109,7 @@ Training failed: reason=exception
 - `early_stopped == (terminal_event.reason == "early_stop")`
 - `user_interrupt` 不再计入 `early_stopped=True`
 - `max_steps` / `max_epochs` / `oom` / `exception` 都对应 `early_stopped=False`
+- `nan_detected` 也对应 `early_stopped=False`
 
 默认行为中：
 
@@ -135,6 +139,7 @@ evaluation 是否触发由以下条件决定：
 
 - `epoch` 模式中，evaluation 只会发生在 epoch 末尾
 - `step` 模式中，evaluation 可以发生在 epoch 中间
+- 如果在该 periodic 边界进入 evaluation 之前检测到训练 loss 已为 `NaN`，则本轮 evaluation 不会执行，run 会直接输出 `Training failed: reason=nan_detected`
 
 
 ### `--- Epoch N Results ---`
@@ -175,10 +180,11 @@ evaluation 是否触发由以下条件决定：
 同一个 epoch 末尾的常见顺序为：
 
 1. 最后一个 batch 跑完
-2. 若命中 `eval_interval`，执行 evaluation
-3. 打印 `[Eval Summary]`
-4. 触发 epoch end
-5. 打印 `--- Epoch N Results ---`
+2. 若该边界命中 NaN 检测，直接输出 `Training failed: reason=nan_detected`
+3. 若命中 `eval_interval` 且未命中 NaN，执行 evaluation
+4. 打印 `[Eval Summary]`
+5. 触发 epoch end
+6. 打印 `--- Epoch N Results ---`
 
 因此在 `epoch` 模式下，如果某个 epoch 命中了 evaluation，通常会先看到 `[Eval Summary]`，再看到 `--- Epoch N Results ---`。
 
@@ -195,6 +201,7 @@ evaluation 是否触发由以下条件决定：
 
 - 如果一个 epoch 很长，可能在同一个 epoch 内打印多次 `[Eval Summary]`
 - `--- Epoch N Results ---` 仍然只会在该 epoch 全部 batch 跑完后打印一次
+- 如果某个 step periodic 边界在 evaluation / regular checkpoint 前检测到 `NaN`，则该边界不会再进入 evaluation 或 regular checkpoint，而是直接失败退出
 
 因此在 `step` 模式下，日志常见形态是：
 

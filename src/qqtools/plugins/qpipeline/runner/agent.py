@@ -8,6 +8,7 @@ Design Philosophy:
 
 import copy
 import gc
+import math
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
@@ -38,6 +39,10 @@ def _get_scalar_metrics(batch_metrics: Dict[str, Any]) -> Dict[str, float]:
         value = item[0] if isinstance(item, (tuple, list)) else item
         scalar_metrics[key] = qt.ensure_scala(value)
     return scalar_metrics
+
+
+class NaNDetectedError(RuntimeError):
+    """Raised when a periodic boundary detects that training loss became NaN."""
 
 
 class RunningAgent:
@@ -116,6 +121,7 @@ class RunningAgent:
             self._apply_train_step_accum if self.has_accum_grad else self._apply_train_step_plain
         )
         self._current_accum_loss_count = 0.0
+        self._latest_train_loss: Optional[float] = None
 
     def _validate_event_name(self, event: Union[str, EventType]) -> str:
         event_name = event.value if isinstance(event, EventType) else str(event)
@@ -402,9 +408,24 @@ class RunningAgent:
                 f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
                 f"\n eval_interval={self.config.eval_interval} save_interval={self.config.save_interval}"
             )
+        is_save_trigger = self._check_run_period(self.config.save_interval, is_epoch_end)
+
+        if is_eval_trigger or is_save_trigger:
+            signal.nan_failure = self._latest_train_loss is not None and math.isnan(self._latest_train_loss)
+            signal.synchronize_nan_failure(self.device, self.config.distributed)
+
+        if signal.nan_failure:
+            parts = (is_eval_trigger * ["evaluation"]) + (is_save_trigger * ["regular checkpoint"])
+            boundary_text = " and ".join(parts) or "periodic boundary"
+            self.logger.error(
+                f"NaN detected before {boundary_text} on ranks={signal.nan_failure_source_ranks} "
+                f"at epoch={self.state.epoch}, step={self.state.global_step}."
+            )
+            raise NaNDetectedError("NaN detected before periodic evaluation/checkpoint boundary.")
+
+        if is_eval_trigger:
             self._run_evaluation_and_update(signal)
 
-        is_save_trigger = self._check_run_period(self.config.save_interval, is_epoch_end)
         if is_save_trigger:
             self._request_checkpoint("regular", signal=signal)
 
@@ -412,8 +433,7 @@ class RunningAgent:
         signal.synchronize_stop(self.device, self.config.distributed)
 
         if signal.should_stop:
-            stop_message = signal.stop_message or "Early stopping triggered."
-            self.logger.debug(stop_message)
+            self.logger.debug(signal.stop_message or "Early stopping triggered.")
             self._trigger("on_early_stop", signal=signal)
             return True
 
@@ -565,6 +585,7 @@ class RunningAgent:
         losses = self.task.batch_loss(out, batch_data, self.loss_fn)
         loss_tensor, loss_count = self._extract_training_loss(losses)
         did_optimizer_step = self._apply_train_step_impl(loss_tensor, loss_count, batch_metrics, total_batches)
+        self._latest_train_loss = batch_metrics["loss"]
 
         if not emit_events:
             return batch_metrics, did_optimizer_step
@@ -671,5 +692,3 @@ class RunningAgent:
                 self.logger.debug(f"Reached max_epochs={max_epochs_limit}")
 
         return loop_stopped_by_early_stop
-
-
