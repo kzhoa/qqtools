@@ -10,6 +10,8 @@ from qqtools.plugins.qexp.v2.api import (
     batch_retry_failed,
     batch_submit,
     cancel,
+    clean,
+    get_log_path,
     retry,
     submit,
 )
@@ -27,7 +29,7 @@ from qqtools.plugins.qexp.v2.storage import cas_update_task, load_batch, load_ta
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1")
+    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
 
 
 # ---------------------------------------------------------------------------
@@ -331,11 +333,17 @@ class TestLogs:
             read_logs(cfg, "no-log")
 
     def test_get_log_path(self, cfg):
-        from qqtools.plugins.qexp.v2.api import get_log_path
-
+        submit(cfg, command=["echo"], task_id="some-task")
         path = get_log_path(cfg, "some-task")
         assert "some-task" in str(path)
         assert "logs" in str(path)
+
+    def test_get_log_path_uses_task_machine_runtime_root(self, tmp_path):
+        cfg_a = init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime-dev1")
+        cfg_b = init_shared_root(tmp_path / "shared", "dev2", runtime_root=tmp_path / "runtime-dev2")
+        submit(cfg_b, command=["echo"], task_id="remote-log-task")
+        path = get_log_path(cfg_a, "remote-log-task")
+        assert str(path).startswith(str(cfg_b.runtime_root))
 
 
 # ---------------------------------------------------------------------------
@@ -361,19 +369,17 @@ class TestClean:
         return t
 
     def test_clean_dry_run(self, cfg):
-        from qqtools.plugins.qexp.v2.api import clean
-
         self._make_old_succeeded_task(cfg, "old-1")
         result = clean(cfg, dry_run=True)
         assert result["dry_run"] is True
-        assert result["deleted_task_count"] == 1
+        assert result["planned_task_count"] == 1
+        assert result["deleted_task_count"] == 0
         assert "old-1" in result["task_ids"]
         # Task should still exist (dry run)
         loaded = load_task(cfg, "old-1")
         assert loaded is not None
 
     def test_clean_real(self, cfg):
-        from qqtools.plugins.qexp.v2.api import clean
         from qqtools.plugins.qexp.v2.layout import runtime_log_path
 
         self._make_old_succeeded_task(cfg, "old-2")
@@ -387,7 +393,6 @@ class TestClean:
         assert not log_path.is_file()
 
     def test_clean_skips_recent(self, cfg):
-        from qqtools.plugins.qexp.v2.api import clean
         from qqtools.plugins.qexp.v2.indexes import update_index_on_phase_change
         from qqtools.plugins.qexp.v2.models import utc_now_iso
 
@@ -401,7 +406,6 @@ class TestClean:
         assert result["deleted_task_count"] == 0
 
     def test_clean_skips_failed_by_default(self, cfg):
-        from qqtools.plugins.qexp.v2.api import clean
         from qqtools.plugins.qexp.v2.indexes import update_index_on_phase_change
 
         t = submit(cfg, command=["echo"], task_id="fail-old")
@@ -414,7 +418,6 @@ class TestClean:
         assert result["deleted_task_count"] == 0
 
     def test_clean_includes_failed(self, cfg):
-        from qqtools.plugins.qexp.v2.api import clean
         from qqtools.plugins.qexp.v2.indexes import update_index_on_phase_change
 
         t = submit(cfg, command=["echo"], task_id="fail-old2")
@@ -425,3 +428,85 @@ class TestClean:
 
         result = clean(cfg, dry_run=False, include_failed=True)
         assert result["deleted_task_count"] == 1
+
+    def test_single_task_clean_updates_batch_truth_and_indexes(self, cfg, tmp_path):
+        manifest = tmp_path / "batch.yaml"
+        manifest.write_text(yaml.dump({
+            "batch": {"name": "sweep"},
+            "tasks": [
+                {"task_id": "keep-me", "command": ["echo", "1"]},
+                {"task_id": "drop-me", "command": ["echo", "2"]},
+            ],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest)
+
+        from qqtools.plugins.qexp.v2.indexes import update_index_on_phase_change
+        from qqtools.plugins.qexp.v2.layout import runtime_log_path
+
+        doomed = load_task(cfg, "drop-me")
+        doomed.status.phase = PHASE_SUCCEEDED
+        doomed.timestamps.finished_at = "2020-01-01T00:00:00Z"
+        cas_update_task(cfg, doomed, doomed.meta.revision)
+        update_index_on_phase_change(cfg, doomed.task_id, PHASE_QUEUED, PHASE_SUCCEEDED)
+        runtime_log_path(cfg, doomed.task_id).write_text("done", encoding="utf-8")
+
+        result = clean(cfg, task_id="drop-me")
+        assert result["mode"] == "single_task"
+        assert result["deleted_task_count"] == 1
+        assert result["repaired_batches"] == [batch.batch_id]
+
+        with pytest.raises(FileNotFoundError):
+            load_task(cfg, "drop-me")
+
+        reloaded_batch = load_batch(cfg, batch.batch_id)
+        assert reloaded_batch.task_ids == ["keep-me"]
+        assert reloaded_batch.summary.total == 1
+        assert reloaded_batch.summary.queued == 1
+        assert "drop-me" not in load_index(cfg, "batch", batch.batch_id)
+
+    def test_single_task_clean_rejects_non_terminal(self, cfg):
+        submit(cfg, command=["echo"], task_id="active-task")
+        with pytest.raises(ValueError, match="Only terminal tasks can be cleaned"):
+            clean(cfg, task_id="active-task")
+
+    def test_single_task_clean_rejects_broken_batch_reference(self, cfg, tmp_path):
+        manifest = tmp_path / "broken-batch.yaml"
+        manifest.write_text(yaml.dump({
+            "batch": {"name": "broken"},
+            "tasks": [{"task_id": "broken-task", "command": ["echo"]}],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest)
+
+        from qqtools.plugins.qexp.v2.indexes import update_index_on_phase_change
+        from qqtools.plugins.qexp.v2.layout import batch_path
+
+        task = load_task(cfg, "broken-task")
+        task.status.phase = PHASE_SUCCEEDED
+        task.timestamps.finished_at = "2020-01-01T00:00:00Z"
+        cas_update_task(cfg, task, task.meta.revision)
+        update_index_on_phase_change(cfg, task.task_id, PHASE_QUEUED, PHASE_SUCCEEDED)
+        batch_path(cfg, batch.batch_id).unlink()
+
+        with pytest.raises(FileNotFoundError):
+            clean(cfg, task_id="broken-task")
+
+        assert load_task(cfg, "broken-task").task_id == "broken-task"
+
+    def test_single_task_clean_reports_unresolved_remote_log(self, tmp_path):
+        cfg_a = init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime-dev1")
+        cfg_b = init_shared_root(tmp_path / "shared", "dev2", runtime_root=tmp_path / "runtime-dev2")
+        submit(cfg_b, command=["echo"], task_id="remote-task")
+
+        from qqtools.plugins.qexp.v2.indexes import update_index_on_phase_change
+        task = load_task(cfg_b, "remote-task")
+        task.status.phase = PHASE_SUCCEEDED
+        task.timestamps.finished_at = "2020-01-01T00:00:00Z"
+        cas_update_task(cfg_b, task, task.meta.revision)
+        update_index_on_phase_change(cfg_b, task.task_id, PHASE_QUEUED, PHASE_SUCCEEDED)
+
+        machine_path = cfg_b.shared_root / "machines" / "dev2" / "machine.json"
+        machine_path.unlink()
+
+        result = clean(cfg_a, task_id="remote-task")
+        assert result["deleted_task_count"] == 1
+        assert result["log_results"][0]["status"] == "unresolved"

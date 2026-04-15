@@ -9,7 +9,6 @@ from pathlib import Path
 from .models import (
     AGENT_MODE_ON_DEMAND,
     AGENT_MODES,
-    AGENT_STATE_STOPPED,
     SCHEMA_VERSION,
     GpuInventory,
     Machine,
@@ -161,6 +160,10 @@ def migrate_lock_path(cfg: RootConfig) -> Path:
     return global_locks_dir(cfg) / "migrate"
 
 
+def clean_lock_path(cfg: RootConfig) -> Path:
+    return global_locks_dir(cfg) / "clean"
+
+
 # ---------------------------------------------------------------------------
 # Layout creation
 # ---------------------------------------------------------------------------
@@ -267,8 +270,6 @@ def init_shared_root(
         shared_root=str(cfg.shared_root),
         runtime_root=str(cfg.runtime_root),
         agent_mode=agent_mode,
-        agent_state=AGENT_STATE_STOPPED,
-        last_heartbeat=None,
         gpu_inventory=GpuInventory(),
     )
 

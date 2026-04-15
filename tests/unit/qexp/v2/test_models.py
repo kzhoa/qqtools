@@ -6,13 +6,18 @@ from qqtools.plugins.qexp.v2.models import (
     ALL_PHASES,
     AGENT_MODE_ON_DEMAND,
     AGENT_MODE_PERSISTENT,
+    AGENT_STATE_ACTIVE,
+    AGENT_STATE_DRAINING,
     AGENT_STATE_STOPPED,
+    AgentSnapshot,
     Batch,
     BatchPolicy,
     BatchSummary,
     GpuInventory,
     LEGAL_TRANSITIONS,
     Machine,
+    MachineSummary,
+    MachineWorkset,
     Meta,
     PHASE_CANCELLED,
     PHASE_DISPATCHING,
@@ -294,8 +299,6 @@ class TestMachine:
             shared_root="/mnt/share",
             runtime_root="/home/user/.qqtools/runtime",
             agent_mode=AGENT_MODE_ON_DEMAND,
-            agent_state=AGENT_STATE_STOPPED,
-            last_heartbeat=None,
             gpu_inventory=GpuInventory(count=4, visible_gpu_ids=[0, 1, 2, 3]),
         )
         assert m.machine_name == "gpu1"
@@ -308,8 +311,6 @@ class TestMachine:
                 shared_root="/x",
                 runtime_root="/y",
                 agent_mode="invalid",
-                agent_state=AGENT_STATE_STOPPED,
-                last_heartbeat=None,
                 gpu_inventory=GpuInventory(),
             )
 
@@ -320,8 +321,6 @@ class TestMachine:
             shared_root="/mnt/share",
             runtime_root="/home/user/.rt",
             agent_mode=AGENT_MODE_PERSISTENT,
-            agent_state=AGENT_STATE_STOPPED,
-            last_heartbeat=None,
             gpu_inventory=GpuInventory(count=2, visible_gpu_ids=[0, 1]),
         )
         d = m.to_dict()
@@ -329,3 +328,102 @@ class TestMachine:
         assert m2.machine_name == "gpu1"
         assert m2.agent_mode == AGENT_MODE_PERSISTENT
         assert m2.gpu_inventory.count == 2
+
+
+class TestMachineWorkset:
+    def test_create_valid(self):
+        workset = MachineWorkset(
+            machine_name="gpu1",
+            queued_count=1,
+            dispatching_count=0,
+            starting_count=0,
+            running_count=2,
+            terminal_count=3,
+            has_launch_backlog=True,
+            has_active_responsibility=True,
+            updated_at="2026-04-14T00:00:00Z",
+        )
+        assert workset.machine_name == "gpu1"
+
+    def test_flags_must_match_counts(self):
+        with pytest.raises(ValueError):
+            MachineWorkset(
+                machine_name="gpu1",
+                queued_count=0,
+                dispatching_count=0,
+                starting_count=0,
+                running_count=1,
+                terminal_count=0,
+                has_launch_backlog=True,
+                has_active_responsibility=True,
+                updated_at="2026-04-14T00:00:00Z",
+            )
+
+
+class TestAgentSnapshot:
+    def test_round_trip(self):
+        snapshot = AgentSnapshot(
+            schema_version="3.0",
+            machine_name="gpu1",
+            agent_mode=AGENT_MODE_ON_DEMAND,
+            agent_state=AGENT_STATE_DRAINING,
+            pid=123,
+            started_at="2026-04-14T00:00:00Z",
+            last_heartbeat="2026-04-14T00:00:01Z",
+            last_transition_at="2026-04-14T00:00:01Z",
+            idle_timeout_seconds=600,
+            idle_started_at=None,
+            idle_deadline_at=None,
+            drain_started_at="2026-04-14T00:00:01Z",
+            last_exit_reason=None,
+            workset=MachineWorkset(
+                machine_name="gpu1",
+                queued_count=0,
+                dispatching_count=0,
+                starting_count=0,
+                running_count=1,
+                terminal_count=0,
+                has_launch_backlog=False,
+                has_active_responsibility=True,
+                updated_at="2026-04-14T00:00:01Z",
+            ),
+        )
+        loaded = AgentSnapshot.from_dict(snapshot.to_dict())
+        assert loaded.agent_state == AGENT_STATE_DRAINING
+        assert loaded.workset.running_count == 1
+
+    def test_machine_name_must_match_workset(self):
+        with pytest.raises(ValueError):
+            AgentSnapshot(
+                schema_version="3.0",
+                machine_name="gpu1",
+                agent_mode=AGENT_MODE_ON_DEMAND,
+                agent_state=AGENT_STATE_ACTIVE,
+                pid=123,
+                started_at=None,
+                last_heartbeat=None,
+                last_transition_at=None,
+                idle_timeout_seconds=600,
+                idle_started_at=None,
+                idle_deadline_at=None,
+                drain_started_at=None,
+                last_exit_reason=None,
+                workset=MachineWorkset(
+                    machine_name="gpu2",
+                    has_launch_backlog=False,
+                    has_active_responsibility=False,
+                    updated_at="2026-04-14T00:00:00Z",
+                ),
+            )
+
+
+class TestMachineSummary:
+    def test_round_trip(self):
+        summary = MachineSummary(
+            machine_name="gpu1",
+            counts_by_phase={"queued": 1, "running": 2},
+            updated_at="2026-04-14T00:00:00Z",
+        )
+        loaded = MachineSummary.from_dict(summary.to_dict())
+        assert loaded.machine_name == "gpu1"
+        assert loaded.counts_by_phase["running"] == 2

@@ -96,13 +96,36 @@ qexp init --shared-root /mnt/share/my_qexp --machine gpu-a --agent-mode persiste
 
 `--agent-mode on_demand` 是默认模式，agent 会在需要调度时被拉起，并在空闲一段时间后自动退出；`persistent` 适合长期跑任务的固定机器，agent 会持续常驻，减少反复拉起的等待。
 
-初始化后，后续命令可以继续显式传参：
+`qexp init` 成功后会自动保存当前 CLI context（`shared_root`、`machine`，以及显式传入的 `runtime_root`）。
+
+因此初始化后，后续命令通常不需要再重复填写这些参数：
+
+```bash
+qexp list
+qexp top
+qexp logs <task_id>
+```
+
+如果您想显式切换或覆盖默认 context，可以使用：
+
+```bash
+qexp use --shared-root /mnt/share/my_qexp --machine gpu-a
+qexp use --show
+```
+
+当然，后续命令也仍然可以继续显式传参：
 
 ```bash
 qexp --shared-root /mnt/share/my_qexp --machine gpu-a list
 ```
 
-也可以使用环境变量：
+也可以使用环境变量；优先级是：
+
+1. 命令行参数
+2. 环境变量
+3. 已保存的 context
+
+例如：
 
 ```bash
 export QEXP_SHARED_ROOT=/mnt/share/my_qexp
@@ -119,19 +142,20 @@ qexp init \
   --runtime-root /data/local/qexp-runtime
 ```
 
+`init` 也可以安全重复执行。重复执行时，它会确保目录结构存在、刷新当前 machine 注册信息，并更新本地保存的 context。
+
 ### 第二步：提交第一个任务
 
 ```bash
-qexp --shared-root /mnt/share/my_qexp --machine gpu-a \
-  submit -- python train.py --config configs/a.yaml
+qexp submit -- python train.py --config configs/a.yaml
 ```
 
 ### 第三步：观察执行情况
 
 ```bash
-qexp --shared-root /mnt/share/my_qexp --machine gpu-a list
-qexp --shared-root /mnt/share/my_qexp --machine gpu-a top
-qexp --shared-root /mnt/share/my_qexp --machine gpu-a logs <task_id>
+qexp list
+qexp top
+qexp logs <task_id>
 ```
 
 ## 常用命令
@@ -320,6 +344,27 @@ qexp clean --older-than-seconds 259200
 qexp clean --include-failed
 ```
 
+精确清理单个终态 task：
+
+```bash
+qexp clean --task-id <task_id>
+```
+
+先预览单 task clean 的结果：
+
+```bash
+qexp clean --task-id <task_id> --dry-run
+```
+
+说明：
+
+- `qexp clean` 默认是批量清理模式
+- `qexp clean --task-id <task_id>` 是单 task 精确清理模式
+- 单 task 模式下不允许再组合 `--older-than-seconds` 或 `--include-failed`
+- 单 task clean 只允许用于终态 task：`succeeded` / `failed` / `cancelled`
+- 若该 task 属于某个 batch，clean 会同步修正 batch 成员列表与摘要
+- runtime log 删除是 best-effort：若 log 可定位且当前进程可访问，则一并删除；否则 CLI 会明确提示未删除
+
 ## Agent 管理
 
 ### 手动启动 agent
@@ -354,6 +399,22 @@ qexp agent stop
 qexp agent status
 ```
 
+`qexp agent status` 是 agent 生命周期的权威解释入口。
+
+状态语义：
+
+- `active`：当前 machine 仍有 `queued` / `dispatching` / `starting` 责任
+- `draining`：当前 machine 已无 launch backlog，但仍有 `running` 责任需要收敛
+- `idle`：当前 machine 已无任何 active responsibility，正在等待 idle timeout 自动退出
+- `stopped` / `stale` / `failed`：分别表示未运行、心跳失效、异常退出
+
+`on_demand` agent 仍会自动退出，但退出条件不是“最近没 launch 新任务”，而是：
+
+1. 当前 machine 不再承担 `queued` / `dispatching` / `starting` / `running` 责任
+2. agent 进入 `idle`
+3. `idle` 持续达到 `idle_timeout`
+4. 然后才自动退出
+
 ## Doctor 命令
 
 用于排查和修复共享状态问题：
@@ -371,6 +432,12 @@ qexp doctor cleanup-locks
 - `qexp doctor rebuild-index`：重建索引，适合索引与任务实际状态不一致时使用
 - `qexp doctor repair-orphans`：把长时间失去机器心跳、但仍停留在活动态的任务修复为 `orphaned`
 - `qexp doctor cleanup-locks`：清理残留过久的锁文件，适合异常退出后锁未释放的场景
+
+与 clean 的关系：
+
+- 若 clean 中途失败且您怀疑索引视图不一致，优先跑 `qexp doctor rebuild-index`
+- **假设/未验证**：若后续实现提供更通用的 `qexp doctor repair`，则 single-task clean 的失败恢复应优先收敛到该入口
+- `cleanup-locks` 和 `repair-orphans` 不负责补做 single-task clean 的 batch 修正或索引重建
 
 推荐顺序：
 
@@ -417,6 +484,7 @@ qexp init --shared-root /mnt/share/my_qexp --machine gpu-b
 优先检查：
 
 - 当前机器的 agent 是否真的在运行：`qexp agent status`
+- 当前机器是否卡在 `active` / `draining`，以及 `workset` 是否仍显示 backlog
 - 是否安装了 `tmux`
 - 是否安装了 `libtmux`
 - 当前机器是否能检测到 GPU
@@ -502,6 +570,14 @@ qexp --shared-root /mnt/share/my_qexp --machine gpu-a list
 - `--dry-run`：只展示将被清理的记录，不实际删除
 - `--include-failed`：把失败和取消的终态任务也纳入清理范围
 - `--older-than-seconds <int>`：只清理早于该秒数阈值的任务；默认 `604800`，即 7 天
+- `--task-id <id>`：精确清理单个终态 task；与 `--older-than-seconds`、`--include-failed` 互斥
+
+`clean` 的结果语义：
+
+- batch clean 主要按终态范围和时间阈值筛选删除对象
+- single-task clean 会删除该 task 的共享真相，并同步修正相关 batch 真相与索引
+- single-task clean 成功后，`qexp inspect <task_id>` 与 `qexp logs <task_id>` 应表现为该 task 已不存在
+- runtime log 删除不是跨机器强保证；若日志未删，CLI 必须明确报告
 
 ## 边界说明
 

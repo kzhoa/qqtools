@@ -22,29 +22,42 @@ import shlex
 import signal
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .events import write_event
 from .executor import Executor
+from .lifecycle import (
+    build_machine_workset,
+    build_starting_agent_snapshot,
+    build_stopped_agent_snapshot,
+    build_summary_snapshot,
+    derive_agent_state,
+    read_agent_snapshot,
+    summarize_agent_snapshot,
+    write_agent_snapshot,
+    write_summary_snapshot,
+)
 from .layout import (
     RootConfig,
-    agent_state_path,
     gpu_state_path,
     runtime_pid_path,
-    summary_state_path,
 )
 from .models import (
     AGENT_MODE_ON_DEMAND,
     AGENT_STATE_ACTIVE,
+    AGENT_STATE_DRAINING,
+    AGENT_STATE_FAILED,
     AGENT_STATE_IDLE,
+    AGENT_STATE_STARTING,
+    AGENT_STATE_STALE,
     AGENT_STATE_STOPPED,
-    PHASE_QUEUED,
-    PHASE_RUNNING,
+    AgentSnapshot,
+    MachineWorkset,
     utc_now_iso,
 )
-from .storage import write_atomic_json, read_json
-from .indexes import load_index
+from .storage import read_json, write_atomic_json
 
 log = logging.getLogger(__name__)
 
@@ -94,18 +107,11 @@ def run_preflight_checks() -> PreflightResult:
 # ---------------------------------------------------------------------------
 
 
-def _write_agent_state(cfg: RootConfig, state: dict[str, Any]) -> None:
-    write_atomic_json(agent_state_path(cfg), state)
-
-
 def read_agent_state(cfg: RootConfig) -> dict[str, Any] | None:
-    path = agent_state_path(cfg)
-    if not path.is_file():
+    snapshot = read_agent_snapshot(cfg)
+    if snapshot is None:
         return None
-    try:
-        return read_json(path)
-    except (json.JSONDecodeError, OSError):
-        return None
+    return summarize_agent_snapshot(snapshot)
 
 
 def is_agent_running(cfg: RootConfig) -> bool:
@@ -117,6 +123,16 @@ def is_agent_running(cfg: RootConfig) -> bool:
         return False
     try:
         os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def is_agent_running_from_snapshot(snapshot: AgentSnapshot | None) -> bool:
+    if snapshot is None or snapshot.pid is None:
+        return False
+    try:
+        os.kill(snapshot.pid, 0)
         return True
     except OSError:
         return False
@@ -140,28 +156,12 @@ def write_gpu_state(cfg: RootConfig, tracker: Any) -> None:
     write_atomic_json(gpu_state_path(cfg), payload)
 
 
-def write_summary(cfg: RootConfig) -> None:
-    queued = len(load_index(cfg, "state", PHASE_QUEUED))
-    running = len(load_index(cfg, "state", PHASE_RUNNING))
-    failed = len(load_index(cfg, "state", "failed"))
-    payload = {
-        "queued_count": queued,
-        "running_count": running,
-        "failed_count": failed,
-        "updated_at": utc_now_iso(),
-    }
-    write_atomic_json(summary_state_path(cfg), payload)
-
-
-# ---------------------------------------------------------------------------
-# Heartbeat
-# ---------------------------------------------------------------------------
-
-
 def write_heartbeat(cfg: RootConfig) -> None:
-    state = read_agent_state(cfg) or {}
-    state["last_heartbeat"] = utc_now_iso()
-    _write_agent_state(cfg, state)
+    snapshot = read_agent_snapshot(cfg)
+    if snapshot is None:
+        return
+    snapshot.last_heartbeat = utc_now_iso()
+    write_agent_snapshot(cfg, snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -206,34 +206,55 @@ class _RuntimeLock:
 # ---------------------------------------------------------------------------
 
 
-def start_agent_record(cfg: RootConfig, persistent: bool = False) -> None:
-    _write_agent_state(cfg, {
-        "agent_state": AGENT_STATE_ACTIVE,
-        "pid": os.getpid(),
-        "started_at": utc_now_iso(),
-        "last_heartbeat": utc_now_iso(),
-        "idle_timeout_seconds": 0 if persistent else IDLE_TIMEOUT_DEFAULT,
-        "persistent": persistent,
-        "last_exit_reason": None,
-    })
+def start_agent_record(
+    cfg: RootConfig,
+    persistent: bool = False,
+    idle_timeout: int = IDLE_TIMEOUT_DEFAULT,
+) -> None:
+    snapshot = build_starting_agent_snapshot(
+        cfg,
+        persistent=persistent,
+        pid=os.getpid(),
+        idle_timeout_seconds=idle_timeout,
+        started_at=utc_now_iso(),
+    )
+    write_agent_snapshot(cfg, snapshot)
 
 
 def stop_agent_record(cfg: RootConfig, reason: str = "clean_exit") -> None:
-    state = read_agent_state(cfg) or {}
-    state["agent_state"] = AGENT_STATE_STOPPED
-    state["pid"] = None
-    state["last_exit_reason"] = reason
-    _write_agent_state(cfg, state)
+    previous = read_agent_snapshot(cfg)
+    if previous is None:
+        previous = build_starting_agent_snapshot(
+            cfg,
+            persistent=False,
+            pid=os.getpid(),
+            started_at=utc_now_iso(),
+        )
+    snapshot = build_stopped_agent_snapshot(previous, reason=reason, stopped_at=utc_now_iso())
+    write_agent_snapshot(cfg, snapshot)
 
 
-def get_agent_status(cfg: RootConfig) -> dict[str, Any]:
-    state = read_agent_state(cfg)
-    if state is None:
+def get_agent_status(cfg: RootConfig, probe_local_pid: bool = True) -> dict[str, Any]:
+    snapshot = read_agent_snapshot(cfg)
+    if snapshot is None:
         return {"agent_state": AGENT_STATE_STOPPED, "pid": None, "is_running": False}
-    running = is_agent_running(cfg)
-    result = dict(state)
+    running = (
+        is_agent_running_from_snapshot(snapshot)
+        if probe_local_pid
+        else snapshot.agent_state not in {
+            AGENT_STATE_STOPPED,
+            AGENT_STATE_STALE,
+            AGENT_STATE_FAILED,
+        }
+    )
+    result = summarize_agent_snapshot(snapshot)
     result["is_running"] = running
-    if not running and state.get("agent_state") in (AGENT_STATE_ACTIVE, AGENT_STATE_IDLE):
+    if probe_local_pid and not running and snapshot.agent_state in (
+        AGENT_STATE_STARTING,
+        AGENT_STATE_ACTIVE,
+        AGENT_STATE_DRAINING,
+        AGENT_STATE_IDLE,
+    ):
         result["agent_state"] = "stale"
     return result
 
@@ -280,11 +301,11 @@ def run_agent_loop(
         )
         scheduler = Scheduler(tracker=tracker)
 
-    start_agent_record(cfg, persistent=persistent)
+    start_agent_record(cfg, persistent=persistent, idle_timeout=idle_timeout)
+    agent_snapshot = read_agent_snapshot(cfg)
     write_event(cfg, "agent_started")
-
-    last_active = time.monotonic()
     shutdown = False
+    exit_reason = "clean_exit"
 
     def _handle_signal(sig: int, frame: Any) -> None:
         nonlocal shutdown
@@ -317,28 +338,36 @@ def run_agent_loop(
                     reconcile_running_tasks(cfg)
             except Exception:
                 log.exception("Agent cycle error")
-                launched = []
-
-            if launched:
-                last_active = time.monotonic()
-
-            # Write snapshots
-            write_heartbeat(cfg)
+            cycle_now = utc_now_iso()
+            workset = build_machine_workset(cfg, updated_at=cycle_now)
+            agent_snapshot = _build_live_agent_snapshot(
+                cfg=cfg,
+                previous=agent_snapshot,
+                workset=workset,
+                persistent=persistent,
+                idle_timeout=idle_timeout,
+            )
+            write_agent_snapshot(cfg, agent_snapshot)
             try:
-                write_summary(cfg)
+                write_summary_snapshot(cfg, build_summary_snapshot(workset))
             except Exception:
                 pass
 
-            idle_seconds = time.monotonic() - last_active
-            if not persistent and idle_seconds >= idle_timeout:
+            if (
+                not persistent
+                and agent_snapshot.agent_state == AGENT_STATE_IDLE
+                and agent_snapshot.idle_deadline_at is not None
+                and _iso_is_due(agent_snapshot.idle_deadline_at, cycle_now)
+            ):
                 log.info("Idle timeout reached (%ds), exiting.", idle_timeout)
+                exit_reason = "idle_timeout"
                 break
 
             time.sleep(loop_interval)
     finally:
         signal.signal(signal.SIGTERM, prev_term)
         signal.signal(signal.SIGINT, prev_int)
-        reason = "clean_exit" if not shutdown else "signal"
+        reason = "signal" if shutdown else exit_reason
         stop_agent_record(cfg, reason=reason)
         write_event(cfg, "agent_stopped", details={"reason": reason})
         runtime_lock.release()
@@ -363,6 +392,76 @@ def _rebuild_tracker_from_v2(cfg: RootConfig, tracker: Any) -> None:
             gpu_ids = list(task.runtime.assigned_gpus)
             tracker.task_id_to_gpu_ids[task.task_id] = gpu_ids
             tracker.reserved_gpu_ids.update(gpu_ids)
+
+
+def _build_live_agent_snapshot(
+    cfg: RootConfig,
+    previous: AgentSnapshot | None,
+    workset: MachineWorkset,
+    persistent: bool,
+    idle_timeout: int,
+) -> AgentSnapshot:
+    workset_updated_at = workset.updated_at
+    agent_state = derive_agent_state(workset)
+    previous_state = previous.agent_state if previous is not None else None
+
+    idle_started_at = None
+    idle_deadline_at = None
+    if agent_state == AGENT_STATE_IDLE:
+        if previous_state == AGENT_STATE_IDLE and previous is not None:
+            idle_started_at = previous.idle_started_at or workset_updated_at
+        else:
+            idle_started_at = workset_updated_at
+        if not persistent:
+            idle_deadline_at = _iso_add_seconds(idle_started_at, idle_timeout)
+
+    drain_started_at = None
+    if agent_state == AGENT_STATE_DRAINING:
+        if previous_state == AGENT_STATE_DRAINING and previous is not None:
+            drain_started_at = previous.drain_started_at or workset_updated_at
+        else:
+            drain_started_at = workset_updated_at
+
+    started_at = previous.started_at if previous is not None else workset_updated_at
+    last_transition_at = (
+        previous.last_transition_at
+        if previous is not None and previous_state == agent_state
+        else workset_updated_at
+    )
+
+    return AgentSnapshot(
+        schema_version=previous.schema_version if previous is not None else "3.0",
+        machine_name=cfg.machine_name,
+        agent_mode="persistent" if persistent else AGENT_MODE_ON_DEMAND,
+        agent_state=agent_state,
+        pid=os.getpid(),
+        started_at=started_at,
+        last_heartbeat=workset_updated_at,
+        last_transition_at=last_transition_at,
+        idle_timeout_seconds=0 if persistent else idle_timeout,
+        idle_started_at=idle_started_at,
+        idle_deadline_at=idle_deadline_at,
+        drain_started_at=drain_started_at,
+        last_exit_reason=None,
+        workset=workset,
+    )
+
+
+def _iso_add_seconds(value: str, seconds: int) -> str:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return (
+        (dt + timedelta(seconds=seconds))
+        .astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _iso_is_due(deadline_at: str, current_at: str) -> bool:
+    deadline = datetime.fromisoformat(deadline_at.replace("Z", "+00:00"))
+    current = datetime.fromisoformat(current_at.replace("Z", "+00:00"))
+    return current >= deadline
 
 
 # ---------------------------------------------------------------------------

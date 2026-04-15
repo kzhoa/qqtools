@@ -10,13 +10,14 @@ from qqtools.plugins.qexp.v2.locking import (
     FileLock,
     LockTimeout,
     batch_lock,
+    clean_lock,
     submit_lock,
 )
 
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1")
+    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
 
 
 class TestFileLock:
@@ -79,4 +80,8 @@ class TestLockFactories:
 
     def test_batch_lock(self, cfg):
         with batch_lock(cfg):
+            pass
+
+    def test_clean_lock(self, cfg):
+        with clean_lock(cfg):
             pass

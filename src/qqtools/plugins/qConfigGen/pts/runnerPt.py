@@ -196,11 +196,14 @@ def prompt_runner_params():
 
     # Step 6: Keep only latest regular checkpoint
     while True:
-        ans = prompt("\nKeep only latest regular checkpoint (deletes old ones)? [y/n] (default: n): ").strip().lower()
-        if not ans or ans in ("n", "no"):
+        ans = prompt(
+            "\nKeep only latest regular checkpoint (deletes old ones)? [y/n] (default: y): "
+        ).strip().lower()
+        if not ans or ans in ("y", "yes"):
+            params["regular_latest_only"] = True
             break
-        if ans in ("y", "yes"):
-            params["keep_latest_ckp"] = True
+        if ans in ("n", "no"):
+            params["regular_latest_only"] = False
             break
         print_formatted_text("❌ Invalid input. Please enter 'y' or 'n'.")
 

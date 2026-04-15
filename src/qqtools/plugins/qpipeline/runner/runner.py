@@ -48,6 +48,14 @@ __all__ = ["train_runner", "infer_runner", "SheetLoggerListener"]
 TerminalCause = Literal["normal_finish", "early_stop", "user_interrupt", "exception"]
 
 
+def _qconfig_get(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
 def _is_oom_exception(exception: BaseException) -> bool:
     if isinstance(exception, torch.cuda.OutOfMemoryError):
         return True
@@ -424,6 +432,11 @@ def train_runner(
     init_file = _getattr_or_default(args, "init_file")
     render_type = _getattr_or_default(args, "render_type", "auto")
 
+    if checkpoint_config is None:
+        checkpoint_config = {}
+    if early_stop_config is None:
+        early_stop_config = {}
+
     (
         resolved_run_mode,
         effective_eval_interval,
@@ -440,13 +453,16 @@ def train_runner(
     )
     # Configuration fallback logic
     if not checkpoint_config:
-        checkpoint_config["target"] = early_stop_config.get("target", "val_metric")
-        checkpoint_config["mode"] = early_stop_config.get("mode", "min")
-        checkpoint_config["min_delta"] = early_stop_config.get("min_delta", 0.0)
+        checkpoint_config = {
+            "target": _qconfig_get(early_stop_config, "target", "val_metric"),
+            "mode": _qconfig_get(early_stop_config, "mode", "min"),
+            "min_delta": _qconfig_get(early_stop_config, "min_delta", 0.0),
+            "regular_latest_only": True,
+        }
 
-    if "target" not in early_stop_config:
+    if _qconfig_get(early_stop_config, "target") is None:
         early_stop_config["target"] = "val_metric"
-    if "mode" not in early_stop_config:
+    if _qconfig_get(early_stop_config, "mode") is None:
         early_stop_config["mode"] = "min"
 
     # Create run configuration
@@ -499,7 +515,11 @@ def train_runner(
         )
 
     # Create managers and callback listeners
-    checkpoint_manager = CheckpointManager(config.save_dir, config.rank)
+    checkpoint_manager = CheckpointManager(
+        config.save_dir,
+        config.rank,
+        keep_only_latest_regular=_qconfig_get(config.checkpoint, "regular_latest_only", True),
+    )
     early_stopper = EarlyStopper.from_config(config.early_stop)
 
     # Create training agent
@@ -533,8 +553,8 @@ def train_runner(
     )
     eval_summary_listener = EvalSummaryListener(
         logger=logger,
-        target_key=config.checkpoint.get("target", "val_metric"),
-        target_mode=config.checkpoint.get("mode", "min"),
+        target_key=_qconfig_get(config.checkpoint, "target", "val_metric"),
+        target_mode=_qconfig_get(config.checkpoint, "mode", "min"),
     )
 
     progress_tracker = None

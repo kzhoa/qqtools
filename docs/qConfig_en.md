@@ -549,7 +549,7 @@ runner:
 | `max_steps`       | ⚠️        | Integer | ≥ 1        | null    | Effective in step mode; ignored in epoch mode |
 | `eval_interval`   | ❌        | Integer | ≥ 1        | 1       | Evaluation interval           |
 | `save_interval`   | ❌        | Integer | ≥ 1        | null    | Regular save interval (units follow run_mode) |
-| `keep_latest_ckp` | ❌        | Boolean | true/false | false   | Keep only latest regular ckp  |
+| `checkpoint.regular_latest_only` | ❌        | Boolean | true/false | true    | Keep only latest regular ckp  |
 | `clip_grad`       | ❌        | Float   | ≥ 0.1      | null    | Gradient clipping threshold   |
 | `accum_grad`      | ❌        | Integer | ≥ 1        | null    | Gradient accumulation factor  |
 | `early_stop`      | ✅        | Object  | -          | -       | Early stopping configuration  |
@@ -622,21 +622,21 @@ runner:
   - Separate from best model checkpoint
   - Protects against interruption during long training
 
-### keep_latest_ckp (Keep Latest Regular Checkpoint Only)
+### checkpoint.regular_latest_only (Keep Latest Regular Checkpoint Only)
 
 ```yaml
 runner:
-  save_interval: 1000
-  keep_latest_ckp: true
+  checkpoint:
+    regular_latest_only: true
 ```
 
 - **Type**: Boolean
-- **Default**: `false`
+- **Default**: `true`
 - **Description**: If `true`, only the most recent regular checkpoint (saved based on `save_interval`) will be kept. Older regular checkpoints will be automatically deleted.
 - **Effect**:
+  - `true`: Saves disk space by removing stale regular checkpoints.
   - `false`: All regular checkpoints are kept.
-  - `true`: Saves disk space by removing stale checkpoints.
-- **Note**: This setting only affects regular checkpoints, not the "best model" checkpoint, which is always preserved.
+- **Note**: This setting lives under `runner.checkpoint` and only affects regular checkpoints, not the "best model" checkpoint, which is always preserved.
 
 ### clip_grad (Gradient Clipping)
 

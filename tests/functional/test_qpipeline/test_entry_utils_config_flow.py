@@ -29,6 +29,39 @@ def test_merge_basic_args_reads_yaml_and_keeps_extra(cmd_args_from_yaml, tmp_pat
     assert args.extra_flag == "hello"
     assert args.log_dir == str(tmp_path / "logs")
 
+
+def test_merge_basic_args_reads_checkpoint_regular_latest_only(cmd_args_from_yaml, tmp_path):
+    config_path = tmp_path / "regular_latest_only.yaml"
+    config_path.write_text(
+        """
+log_dir: ./logs
+optim:
+  optimizer: adam
+  optimizer_params:
+    lr: 0.001
+  loss: mse
+runner:
+  run_mode: epoch
+  max_epochs: 3
+  eval_interval: 1
+  early_stop:
+    patience: 2
+  checkpoint:
+    regular_latest_only: false
+task:
+  dataset: dummy
+  dataloader:
+    batch_size: 2
+""".strip(),
+        encoding="utf-8",
+    )
+    cmd_args = cmd_args_from_yaml(config_path.name)
+    cmd_args.config = str(config_path)
+
+    args = merge_basic_args(cmd_args)
+
+    assert args.runner.checkpoint.regular_latest_only is False
+
 def test_optimizer_name_invalid_raises_keyerror():
     with pytest.raises(KeyError):
         getCanonicalName("nonexistent_optim")

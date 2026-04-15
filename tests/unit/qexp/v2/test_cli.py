@@ -11,7 +11,7 @@ from qqtools.plugins.qexp.v2.layout import init_shared_root
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1")
+    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
 
 
 def _base_args(cfg):
@@ -24,11 +24,15 @@ def _base_args(cfg):
 
 
 class TestV2Init:
-    def test_init(self, tmp_path, capsys):
+    def test_init(self, tmp_path, monkeypatch, capsys):
         from qqtools.plugins.qexp.v2.cli import main as v2_main
+        import qqtools.plugins.qexp.v2.layout as _layout
+
+        monkeypatch.setattr(_layout, "_context_file_override", str(tmp_path / "context.json"))
         ret = v2_main([
             "--shared-root", str(tmp_path / "new_shared"),
             "--machine", "test-m",
+            "--runtime-root", str(tmp_path / "runtime"),
             "init",
         ])
         assert ret == 0
@@ -148,6 +152,13 @@ class TestV2Doctor:
         ret = v2_main(_base_args(cfg) + ["doctor", "rebuild-index"])
         assert ret == 0
 
+    def test_repair(self, cfg, capsys):
+        from qqtools.plugins.qexp.v2.cli import main as v2_main
+        ret = v2_main(_base_args(cfg) + ["doctor", "repair"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "repaired_batch_count" in out
+
 
 # ---------------------------------------------------------------------------
 # V1 routing tests
@@ -198,6 +209,13 @@ class TestV2Clean:
         assert ret == 0
         out = capsys.readouterr().out
         assert "Cleaned" in out
+
+    def test_clean_rejects_incompatible_single_task_flags(self, cfg, capsys):
+        from qqtools.plugins.qexp.v2.cli import main as v2_main
+
+        ret = v2_main(_base_args(cfg) + ["clean", "--task-id", "t1", "--include-failed"])
+        assert ret == 1
+        assert "--task-id cannot be combined" in capsys.readouterr().err
 
 
 class TestV2Use:

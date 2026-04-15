@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from .agent import get_agent_status
 from .events import query_events
 from .indexes import load_index
 from .layout import RootConfig
-from .models import ALL_PHASES, PHASE_QUEUED, PHASE_RUNNING
+from .lifecycle import (
+    build_machine_workset,
+    read_agent_snapshot,
+    read_summary_snapshot,
+)
+from .models import AGENT_STATE_STOPPED, ALL_PHASES, PHASE_QUEUED, PHASE_RUNNING
 from .storage import (
     iter_all_batches,
     iter_all_tasks,
@@ -14,7 +20,7 @@ from .storage import (
     load_task,
     read_json,
 )
-from .layout import agent_state_path, gpu_state_path, summary_state_path
+from .layout import gpu_state_path
 
 
 # ---------------------------------------------------------------------------
@@ -118,13 +124,46 @@ def list_machines(cfg: RootConfig) -> list[dict[str, Any]]:
     machines = iter_machines(cfg)
     results: list[dict[str, Any]] = []
     for m in machines:
+        machine_cfg = RootConfig(
+            shared_root=cfg.shared_root,
+            machine_name=m.machine_name,
+            runtime_root=m.runtime_root,
+        )
+        agent_snapshot = read_agent_snapshot(machine_cfg)
+        summary_snapshot = read_summary_snapshot(machine_cfg)
+        workset = agent_snapshot.workset if agent_snapshot is not None else build_machine_workset(
+            cfg,
+            machine_name=m.machine_name,
+        )
+        counts_by_phase = (
+            dict(summary_snapshot.counts_by_phase)
+            if summary_snapshot is not None
+            else {
+                "queued": workset.queued_count,
+                "dispatching": workset.dispatching_count,
+                "starting": workset.starting_count,
+                "running": workset.running_count,
+            }
+        )
+        agent_status = (
+            get_agent_status(machine_cfg, probe_local_pid=False)
+            if agent_snapshot is not None
+            else None
+        )
+        agent_state = (
+            agent_status["agent_state"] if agent_status is not None else AGENT_STATE_STOPPED
+        )
         results.append({
             "machine_name": m.machine_name,
             "hostname": m.hostname,
             "agent_mode": m.agent_mode,
-            "agent_state": m.agent_state,
+            "agent_state": agent_state,
             "gpu_count": m.gpu_inventory.count,
-            "last_heartbeat": m.last_heartbeat,
+            "last_heartbeat": agent_snapshot.last_heartbeat if agent_snapshot else None,
+            "idle_deadline_at": agent_snapshot.idle_deadline_at if agent_snapshot else None,
+            "drain_started_at": agent_snapshot.drain_started_at if agent_snapshot else None,
+            "counts_by_phase": counts_by_phase,
+            "workset": workset.to_dict(),
         })
     return results
 

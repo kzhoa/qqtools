@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from .layout import (
+    clean_lock_path,
     RootConfig,
     batch_lock_path,
     migrate_lock_path,
@@ -81,3 +82,7 @@ def batch_lock(cfg: RootConfig, timeout: float = 30.0) -> FileLock:
 
 def migrate_lock(cfg: RootConfig, timeout: float = 30.0) -> FileLock:
     return FileLock(migrate_lock_path(cfg), timeout=timeout)
+
+
+def clean_lock(cfg: RootConfig, timeout: float = 30.0) -> FileLock:
+    return FileLock(clean_lock_path(cfg), timeout=timeout)

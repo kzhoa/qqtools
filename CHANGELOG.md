@@ -4,17 +4,23 @@
 
 - breaking: qpipeline standard config field `runner.keep_latest_ckp` is replaced by `runner.checkpoint.regular_latest_only`
 - feat: qpipeline regular checkpoints now default to keeping only the latest file unless `runner.checkpoint.regular_latest_only: false`
-- feat: log learning rate in qpipeline eval summary blocks and summary-table headers
+- feat: upgrade qexp v2 agent lifecycle to machine-scoped `active` / `draining` / `idle` semantics with `state/agent.json` as the single lifecycle source of truth
+- feat: add formal qexp v2 lifecycle contracts for machine worksets, agent snapshots, and machine summary caches
+- fix: prevent on-demand qexp agents from auto-exiting while the current machine still owns `running` task responsibility
+- fix: stop cross-machine qexp status and orphan repair flows from misclassifying healthy remote agents via local PID probes
 - docs: update qConfig docs and standard config generator output for `runner.checkpoint.regular_latest_only`
-- docs: refresh qpipeline log-format examples to show eval-summary learning rate output
+- docs: sync qexp manual and runtime/product specs with the final lifecycle contract and lifecycle-state observability rules
 - test: add coverage for regular checkpoint latest-only rotation and config parsing
-- test: add eval-summary formatter coverage for learning-rate rendering
+- test: add qexp v2 coverage for lifecycle state transitions, cross-machine observer behavior, orphan repair, and contract serialization
 
 ## v1.2.9
 
 - feat: add `qexp use` command for CLI context persistence so `--shared-root`, `--machine`, and `--runtime-root` no longer need to be repeated on every command
 - feat: `qexp init` now auto-saves CLI context after successful initialization
 - feat: `_resolve_cfg` fallback chain extended to flags → env vars → context file (`~/.qqtools/qexp-context.json`) → error
+- feat: log learning rate in qpipeline eval summary blocks and summary-table headers
+- docs: refresh qpipeline log-format examples to show eval-summary learning rate output
+- test: add eval-summary formatter coverage for learning-rate rendering
 
 ## v1.2.8
 

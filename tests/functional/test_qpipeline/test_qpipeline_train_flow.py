@@ -80,8 +80,11 @@ def test_train_runner_regular_checkpoint_saving(base_args, tiny_task, tiny_model
         save_dir=str(save_dir),
     )
 
-    ckpts = list(Path(save_dir).glob("*.pt"))
-    assert len(ckpts) >= 2
+    regular_ckpts = list(Path(save_dir).glob("epoch*.pt"))
+    best_ckpts = list(Path(save_dir).glob("best_*.pt"))
+
+    assert len(regular_ckpts) == 1
+    assert len(best_ckpts) >= 1
 
 
 def test_train_runner_ckp_file_takes_effect(base_args, tiny_task, tiny_model, tmp_path):

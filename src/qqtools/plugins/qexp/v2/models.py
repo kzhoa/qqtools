@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "3.0"
 
 # ---------------------------------------------------------------------------
 # Task phases
@@ -65,6 +65,7 @@ AGENT_MODES = (AGENT_MODE_ON_DEMAND, AGENT_MODE_PERSISTENT)
 AGENT_STATE_STOPPED = "stopped"
 AGENT_STATE_STARTING = "starting"
 AGENT_STATE_ACTIVE = "active"
+AGENT_STATE_DRAINING = "draining"
 AGENT_STATE_IDLE = "idle"
 AGENT_STATE_STALE = "stale"
 AGENT_STATE_FAILED = "failed"
@@ -73,6 +74,7 @@ AGENT_STATES = (
     AGENT_STATE_STOPPED,
     AGENT_STATE_STARTING,
     AGENT_STATE_ACTIVE,
+    AGENT_STATE_DRAINING,
     AGENT_STATE_IDLE,
     AGENT_STATE_STALE,
     AGENT_STATE_FAILED,
@@ -427,8 +429,6 @@ class Machine:
     shared_root: str
     runtime_root: str
     agent_mode: str
-    agent_state: str
-    last_heartbeat: str | None
     gpu_inventory: GpuInventory
 
     def __post_init__(self) -> None:
@@ -436,10 +436,6 @@ class Machine:
         if self.agent_mode not in AGENT_MODES:
             raise ValueError(
                 f"agent_mode must be one of {AGENT_MODES}, got {self.agent_mode!r}."
-            )
-        if self.agent_state not in AGENT_STATES:
-            raise ValueError(
-                f"agent_state must be one of {AGENT_STATES}, got {self.agent_state!r}."
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -450,8 +446,6 @@ class Machine:
                 "shared_root": self.shared_root,
                 "runtime_root": self.runtime_root,
                 "agent_mode": self.agent_mode,
-                "agent_state": self.agent_state,
-                "last_heartbeat": self.last_heartbeat,
                 "gpu_inventory": self.gpu_inventory.to_dict(),
             },
         }
@@ -465,7 +459,165 @@ class Machine:
             shared_root=m["shared_root"],
             runtime_root=m["runtime_root"],
             agent_mode=m.get("agent_mode", AGENT_MODE_ON_DEMAND),
-            agent_state=m.get("agent_state", AGENT_STATE_STOPPED),
-            last_heartbeat=m.get("last_heartbeat"),
             gpu_inventory=GpuInventory.from_dict(m.get("gpu_inventory", {})),
+        )
+
+
+@dataclass(slots=True)
+class MachineWorkset:
+    machine_name: str
+    queued_count: int = 0
+    dispatching_count: int = 0
+    starting_count: int = 0
+    running_count: int = 0
+    terminal_count: int = 0
+    has_launch_backlog: bool = False
+    has_active_responsibility: bool = False
+    updated_at: str = field(default_factory=utc_now_iso)
+
+    def __post_init__(self) -> None:
+        validate_machine_name(self.machine_name)
+        counts = (
+            self.queued_count,
+            self.dispatching_count,
+            self.starting_count,
+            self.running_count,
+            self.terminal_count,
+        )
+        if any((not isinstance(count, int)) or count < 0 for count in counts):
+            raise ValueError("MachineWorkset counts must be non-negative integers.")
+        expected_backlog = (
+            self.queued_count > 0
+            or self.dispatching_count > 0
+            or self.starting_count > 0
+        )
+        expected_active = expected_backlog or self.running_count > 0
+        if self.has_launch_backlog != expected_backlog:
+            raise ValueError(
+                "MachineWorkset.has_launch_backlog must match queued/dispatching/starting counts."
+            )
+        if self.has_active_responsibility != expected_active:
+            raise ValueError(
+                "MachineWorkset.has_active_responsibility must match launch backlog or running_count."
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MachineWorkset:
+        return cls(**data)
+
+
+@dataclass(slots=True)
+class AgentSnapshot:
+    schema_version: str
+    machine_name: str
+    agent_mode: str
+    agent_state: str
+    pid: int | None
+    started_at: str | None
+    last_heartbeat: str | None
+    last_transition_at: str | None
+    idle_timeout_seconds: int
+    idle_started_at: str | None
+    idle_deadline_at: str | None
+    drain_started_at: str | None
+    last_exit_reason: str | None
+    workset: MachineWorkset
+
+    def __post_init__(self) -> None:
+        validate_machine_name(self.machine_name)
+        if self.agent_mode not in AGENT_MODES:
+            raise ValueError(
+                f"agent_mode must be one of {AGENT_MODES}, got {self.agent_mode!r}."
+            )
+        if self.agent_state not in AGENT_STATES:
+            raise ValueError(
+                f"agent_state must be one of {AGENT_STATES}, got {self.agent_state!r}."
+            )
+        if not isinstance(self.idle_timeout_seconds, int) or self.idle_timeout_seconds < 0:
+            raise ValueError("idle_timeout_seconds must be a non-negative integer.")
+        if self.workset.machine_name != self.machine_name:
+            raise ValueError("AgentSnapshot.workset.machine_name must match machine_name.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agent": {
+                "schema_version": self.schema_version,
+                "machine_name": self.machine_name,
+                "agent_mode": self.agent_mode,
+                "agent_state": self.agent_state,
+                "pid": self.pid,
+                "started_at": self.started_at,
+                "last_heartbeat": self.last_heartbeat,
+                "last_transition_at": self.last_transition_at,
+                "idle_timeout_seconds": self.idle_timeout_seconds,
+                "idle_started_at": self.idle_started_at,
+                "idle_deadline_at": self.idle_deadline_at,
+                "drain_started_at": self.drain_started_at,
+                "last_exit_reason": self.last_exit_reason,
+                "workset": self.workset.to_dict(),
+            }
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AgentSnapshot:
+        payload = data["agent"]
+        workset_payload = payload.get("workset", {
+            "machine_name": payload["machine_name"],
+            "has_launch_backlog": False,
+            "has_active_responsibility": False,
+            "updated_at": payload.get("last_heartbeat") or utc_now_iso(),
+        })
+        return cls(
+            schema_version=payload.get("schema_version", SCHEMA_VERSION),
+            machine_name=payload["machine_name"],
+            agent_mode=payload["agent_mode"],
+            agent_state=payload["agent_state"],
+            pid=payload.get("pid"),
+            started_at=payload.get("started_at"),
+            last_heartbeat=payload.get("last_heartbeat"),
+            last_transition_at=payload.get("last_transition_at"),
+            idle_timeout_seconds=payload.get("idle_timeout_seconds", 0),
+            idle_started_at=payload.get("idle_started_at"),
+            idle_deadline_at=payload.get("idle_deadline_at"),
+            drain_started_at=payload.get("drain_started_at"),
+            last_exit_reason=payload.get("last_exit_reason"),
+            workset=MachineWorkset.from_dict(workset_payload),
+        )
+
+
+@dataclass(slots=True)
+class MachineSummary:
+    machine_name: str
+    counts_by_phase: dict[str, int]
+    updated_at: str
+
+    def __post_init__(self) -> None:
+        validate_machine_name(self.machine_name)
+        cleaned_counts: dict[str, int] = {}
+        for phase, count in self.counts_by_phase.items():
+            validate_phase(phase)
+            if not isinstance(count, int) or count < 0:
+                raise ValueError("MachineSummary counts must be non-negative integers.")
+            cleaned_counts[phase] = count
+        self.counts_by_phase = cleaned_counts
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "summary": {
+                "machine_name": self.machine_name,
+                "counts_by_phase": dict(self.counts_by_phase),
+                "updated_at": self.updated_at,
+            }
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MachineSummary:
+        payload = data["summary"]
+        return cls(
+            machine_name=payload["machine_name"],
+            counts_by_phase=payload.get("counts_by_phase", {}),
+            updated_at=payload["updated_at"],
         )

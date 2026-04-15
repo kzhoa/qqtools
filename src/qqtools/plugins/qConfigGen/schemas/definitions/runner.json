@@ -83,6 +83,11 @@
                     "type": "number",
                     "default": 0.0,
                     "description": "Minimum change in the monitored quantity to qualify as an improvement"
+                },
+                "regular_latest_only": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Whether to keep only the latest regular checkpoint and delete older regular checkpoint files"
                 }
             },
             "additionalProperties": false,

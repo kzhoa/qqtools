@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from qqtools.plugins.qexp.v2.api import batch_submit, submit
+from qqtools.plugins.qexp.v2.agent import start_agent_record
 from qqtools.plugins.qexp.v2.layout import init_shared_root
 from qqtools.plugins.qexp.v2.models import PHASE_QUEUED
 from qqtools.plugins.qexp.v2.observer import (
@@ -18,7 +19,7 @@ from qqtools.plugins.qexp.v2.observer import (
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1")
+    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
 
 
 class TestListTasks:
@@ -136,9 +137,48 @@ class TestBatchLiveSummary:
 
 class TestMachineViews:
     def test_list_machines(self, cfg):
+        start_agent_record(cfg)
         machines = list_machines(cfg)
         assert len(machines) == 1
         assert machines[0]["machine_name"] == "dev1"
+        assert machines[0]["agent_state"] == "starting"
+
+    def test_agent_state_comes_from_agent_snapshot_not_summary(self, cfg):
+        from qqtools.plugins.qexp.v2.lifecycle import write_summary_snapshot
+        from qqtools.plugins.qexp.v2.models import MachineSummary
+
+        start_agent_record(cfg)
+        write_summary_snapshot(
+            cfg,
+            MachineSummary(
+                machine_name="dev1",
+                counts_by_phase={"queued": 99, "running": 88},
+                updated_at="2026-04-14T00:00:00Z",
+            ),
+        )
+        machines = list_machines(cfg)
+        assert machines[0]["agent_state"] == "starting"
+        assert machines[0]["counts_by_phase"]["queued"] == 99
+
+    def test_remote_machine_is_not_forced_stale_by_local_pid_probe(self, cfg):
+        from qqtools.plugins.qexp.v2.layout import agent_state_path
+        from qqtools.plugins.qexp.v2.storage import write_atomic_json
+        from qqtools.plugins.qexp.v2.lifecycle import read_agent_snapshot
+
+        other_cfg = init_shared_root(
+            cfg.shared_root,
+            "gpu2",
+            runtime_root=cfg.runtime_root.parent / "runtime2",
+        )
+        start_agent_record(other_cfg)
+        snapshot = read_agent_snapshot(other_cfg)
+        snapshot.pid = 99999999
+        snapshot.agent_state = "active"
+        write_atomic_json(agent_state_path(other_cfg), snapshot.to_dict())
+
+        machines = list_machines(cfg)
+        remote = next(machine for machine in machines if machine["machine_name"] == "gpu2")
+        assert remote["agent_state"] == "active"
 
 
 class TestTopView:

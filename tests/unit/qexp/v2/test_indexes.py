@@ -28,7 +28,7 @@ from qqtools.plugins.qexp.v2.storage import save_task
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1")
+    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
 
 
 def _make_task(task_id: str, phase: str = PHASE_QUEUED, batch_id: str | None = None) -> Task:

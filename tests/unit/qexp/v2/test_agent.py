@@ -1,23 +1,40 @@
 from __future__ import annotations
 
+from collections import deque
+
 import pytest
 
+from qqtools.plugins.qexp.v2.api import submit
 from qqtools.plugins.qexp.v2.agent import (
+    _build_live_agent_snapshot,
     get_agent_status,
     is_agent_running,
     read_agent_state,
+    run_agent_loop,
     start_agent_record,
     stop_agent_record,
     write_heartbeat,
     IDLE_TIMEOUT_DEFAULT,
 )
+from qqtools.plugins.qexp.v2.indexes import update_index_on_phase_change
 from qqtools.plugins.qexp.v2.layout import init_shared_root
-from qqtools.plugins.qexp.v2.models import AGENT_STATE_ACTIVE, AGENT_STATE_STOPPED
+from qqtools.plugins.qexp.v2.lifecycle import build_machine_workset, read_agent_snapshot
+from qqtools.plugins.qexp.v2.models import (
+    AGENT_STATE_DRAINING,
+    AGENT_STATE_IDLE,
+    AGENT_STATE_STARTING,
+    AGENT_STATE_STOPPED,
+    PHASE_FAILED,
+    PHASE_QUEUED,
+    PHASE_RUNNING,
+    PHASE_STARTING,
+)
+from qqtools.plugins.qexp.v2.storage import cas_update_task, load_task
 
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1")
+    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
 
 
 class TestAgentState:
@@ -29,15 +46,16 @@ class TestAgentState:
         start_agent_record(cfg, persistent=False)
         state = read_agent_state(cfg)
         assert state is not None
-        assert state["agent_state"] == AGENT_STATE_ACTIVE
+        assert state["agent_state"] == AGENT_STATE_STARTING
         assert state["pid"] is not None
         assert state["idle_timeout_seconds"] == IDLE_TIMEOUT_DEFAULT
+        assert state["workset"]["has_active_responsibility"] is False
 
     def test_persistent_flag(self, cfg):
         start_agent_record(cfg, persistent=True)
         state = read_agent_state(cfg)
         assert state["idle_timeout_seconds"] == 0
-        assert state["persistent"] is True
+        assert state["agent_mode"] == "persistent"
 
     def test_stop_clears_pid(self, cfg):
         start_agent_record(cfg)
@@ -71,9 +89,123 @@ class TestGetAgentStatus:
         # Fake a dead PID
         from qqtools.plugins.qexp.v2.storage import write_atomic_json
         from qqtools.plugins.qexp.v2.layout import agent_state_path
-        state = read_agent_state(cfg)
-        state["pid"] = 99999999
-        write_atomic_json(agent_state_path(cfg), state)
+        snapshot = read_agent_snapshot(cfg)
+        snapshot.pid = 99999999
+        write_atomic_json(agent_state_path(cfg), snapshot.to_dict())
         status = get_agent_status(cfg)
         assert not status["is_running"]
         assert status["agent_state"] == "stale"
+
+
+class TestAgentLifecycle:
+    def test_running_task_keeps_agent_draining_until_idle(self, cfg, monkeypatch):
+        task = submit(cfg, command=["echo"], task_id="t1")
+        self._set_phase(cfg, task.task_id, PHASE_QUEUED, PHASE_RUNNING)
+
+        timestamps = deque([
+            "2026-04-14T00:00:00Z",
+            "2026-04-14T00:00:01Z",
+            "2026-04-14T00:00:02Z",
+            "2026-04-14T00:00:03Z",
+            "2026-04-14T00:00:04Z",
+        ])
+        snapshots = []
+        original_write_snapshot = None
+
+        import qqtools.plugins.qexp.v2.agent as agent_mod
+
+        original_write_snapshot = agent_mod.write_agent_snapshot
+        monkeypatch.setattr(
+            agent_mod,
+            "utc_now_iso",
+            lambda: timestamps.popleft(),
+        )
+
+        def capture_snapshot(local_cfg, snapshot):
+            snapshots.append(snapshot.agent_state)
+            original_write_snapshot(local_cfg, snapshot)
+
+        monkeypatch.setattr(agent_mod, "write_agent_snapshot", capture_snapshot)
+        monkeypatch.setattr(agent_mod.time, "sleep", lambda _: None)
+
+        call_count = {"reconcile": 0}
+
+        def dispatch_fn(local_cfg, tracker_factory):
+            return []
+
+        def reconcile_fn(local_cfg):
+            call_count["reconcile"] += 1
+            if call_count["reconcile"] == 2:
+                self._set_phase(local_cfg, "t1", PHASE_RUNNING, PHASE_FAILED)
+
+        ret = run_agent_loop(
+            cfg,
+            loop_interval=0.0,
+            idle_timeout=1,
+            dispatch_fn=dispatch_fn,
+            reconcile_fn=reconcile_fn,
+            tracker_factory=lambda: object(),
+        )
+
+        assert ret == 0
+        assert AGENT_STATE_DRAINING in snapshots
+        assert AGENT_STATE_IDLE in snapshots
+        final_state = read_agent_state(cfg)
+        assert final_state["agent_state"] == AGENT_STATE_STOPPED
+        assert final_state["last_exit_reason"] == "idle_timeout"
+
+    def test_starting_phase_is_active_not_idle(self, cfg):
+        task = submit(cfg, command=["echo"], task_id="t1")
+        self._set_phase(cfg, task.task_id, PHASE_QUEUED, PHASE_STARTING)
+        workset = build_machine_workset(cfg)
+        snapshot = _build_live_agent_snapshot(
+            cfg=cfg,
+            previous=None,
+            workset=workset,
+            persistent=False,
+            idle_timeout=600,
+        )
+        assert snapshot.agent_state != AGENT_STATE_IDLE
+        assert snapshot.agent_state != AGENT_STATE_DRAINING
+        assert snapshot.agent_state == "active"
+
+    def test_other_machine_running_task_does_not_block_idle_exit(self, cfg, monkeypatch):
+        other_cfg = init_shared_root(
+            cfg.shared_root,
+            "gpu2",
+            runtime_root=cfg.runtime_root.parent / "runtime2",
+        )
+        remote_task = submit(other_cfg, command=["echo"], task_id="remote")
+        self._set_phase(other_cfg, remote_task.task_id, PHASE_QUEUED, PHASE_RUNNING)
+
+        timestamps = deque([
+            "2026-04-14T00:00:00Z",
+            "2026-04-14T00:00:01Z",
+            "2026-04-14T00:00:02Z",
+            "2026-04-14T00:00:03Z",
+        ])
+        import qqtools.plugins.qexp.v2.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "utc_now_iso", lambda: timestamps.popleft())
+        monkeypatch.setattr(agent_mod.time, "sleep", lambda _: None)
+
+        ret = run_agent_loop(
+            cfg,
+            loop_interval=0.0,
+            idle_timeout=1,
+            dispatch_fn=lambda local_cfg, tracker_factory: [],
+            reconcile_fn=lambda local_cfg: None,
+            tracker_factory=lambda: object(),
+        )
+
+        assert ret == 0
+        final_state = read_agent_state(cfg)
+        assert final_state["agent_state"] == AGENT_STATE_STOPPED
+        assert final_state["last_exit_reason"] == "idle_timeout"
+
+    @staticmethod
+    def _set_phase(cfg, task_id: str, old_phase: str, new_phase: str) -> None:
+        task = load_task(cfg, task_id)
+        task.status.phase = new_phase
+        cas_update_task(cfg, task, task.meta.revision)
+        update_index_on_phase_change(cfg, task_id, old_phase, new_phase)

@@ -222,6 +222,8 @@ class TestInitSharedRoot:
         data = json.loads(mpath.read_text(encoding="utf-8"))
         assert data["machine"]["machine_name"] == "gpu2a"
         assert data["machine"]["agent_mode"] == "on_demand"
+        assert "agent_state" not in data["machine"]
+        assert "last_heartbeat" not in data["machine"]
 
     def test_persistent_mode(self, tmp_path):
         cfg = init_shared_root(

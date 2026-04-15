@@ -6,13 +6,20 @@ from pathlib import Path
 from typing import Any
 
 from .indexes import rebuild_all_indexes
+from .locking import clean_lock
 from .layout import (
     RootConfig,
+    global_batches_dir,
     global_locks_dir,
     global_tasks_dir,
 )
+from .lifecycle import read_agent_snapshot
 from .models import (
     ACTIVE_PHASES,
+    AGENT_STATE_FAILED,
+    AGENT_STATE_STALE,
+    AGENT_STATE_STOPPED,
+    BatchSummary,
     PHASE_ORPHANED,
     utc_now_iso,
     validate_phase_transition,
@@ -22,7 +29,9 @@ from .storage import (
     cas_update_task,
     iter_all_tasks,
     iter_machines,
+    load_batch,
     load_task,
+    save_batch,
     read_json,
 )
 from .indexes import update_index_on_phase_change
@@ -36,7 +45,8 @@ log = logging.getLogger(__name__)
 
 
 def rebuild_indexes(cfg: RootConfig) -> dict[str, Any]:
-    return rebuild_all_indexes(cfg)
+    with clean_lock(cfg):
+        return rebuild_all_indexes(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +70,7 @@ def repair_orphans(
     Transitions stale tasks to orphaned and returns affected task_ids.
     """
     from datetime import datetime, timezone
-    from .agent import read_agent_state, is_agent_running
+    from .agent import get_agent_status
 
     machines = iter_machines(cfg)
     stale_machines: set[str] = set()
@@ -74,17 +84,27 @@ def repair_orphans(
         )
 
         # Check agent state file (the actual heartbeat source)
-        state = read_agent_state(alt_cfg)
-        if state is None:
+        snapshot = read_agent_snapshot(alt_cfg)
+        if snapshot is None:
             stale_machines.add(m.machine_name)
             continue
 
-        # If agent PID is recorded and still alive, machine is healthy
-        if state.get("pid") and is_agent_running(alt_cfg):
+        if snapshot.agent_state in {
+            AGENT_STATE_STOPPED,
+            AGENT_STATE_FAILED,
+            AGENT_STATE_STALE,
+        }:
+            stale_machines.add(m.machine_name)
+            continue
+
+        # Cross-machine health must be interpreted from the shared snapshot,
+        # not by probing a foreign PID in the local process namespace.
+        status = get_agent_status(alt_cfg, probe_local_pid=False)
+        if status["is_running"]:
             continue
 
         # Agent not running — check how long since last heartbeat
-        hb = state.get("last_heartbeat")
+        hb = snapshot.last_heartbeat
         if hb is None:
             stale_machines.add(m.machine_name)
             continue
@@ -153,6 +173,71 @@ def cleanup_stale_locks(
     return cleaned
 
 
+def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
+    """Repair batch truth and indexes into a converged state.
+
+    This is the recovery entrypoint for partial clean failures:
+    - prune missing task_ids from batch truth
+    - recompute batch summaries from surviving tasks
+    - rebuild all derived indexes
+    """
+    repaired_batches: list[str] = []
+    pruned_task_refs = 0
+
+    with clean_lock(cfg):
+        batches_dir = global_batches_dir(cfg)
+        if batches_dir.is_dir():
+            for path in sorted(batches_dir.glob("*.json")):
+                if path.name.endswith(".tmp"):
+                    continue
+                batch_id = path.stem
+                batch = load_batch(cfg, batch_id)
+
+                surviving_ids: list[str] = []
+                counts: dict[str, int] = {}
+                removed = 0
+
+                for task_id in batch.task_ids:
+                    try:
+                        task = load_task(cfg, task_id)
+                    except FileNotFoundError:
+                        removed += 1
+                        continue
+                    surviving_ids.append(task_id)
+                    phase = task.status.phase
+                    counts[phase] = counts.get(phase, 0) + 1
+
+                new_summary = BatchSummary(
+                    total=len(surviving_ids),
+                    queued=counts.get("queued", 0),
+                    running=counts.get("running", 0),
+                    succeeded=counts.get("succeeded", 0),
+                    failed=counts.get("failed", 0),
+                    cancelled=counts.get("cancelled", 0),
+                    blocked=counts.get("blocked", 0),
+                    orphaned=counts.get("orphaned", 0),
+                )
+
+                if surviving_ids != batch.task_ids or new_summary != batch.summary:
+                    batch.task_ids = surviving_ids
+                    batch.summary = new_summary
+                    batch.meta.revision += 1
+                    batch.meta.updated_at = utc_now_iso()
+                    batch.meta.updated_by_machine = cfg.machine_name
+                    save_batch(cfg, batch)
+                    repaired_batches.append(batch.batch_id)
+                    pruned_task_refs += removed
+
+        index_stats = rebuild_all_indexes(cfg)
+
+    return {
+        "repaired_batch_count": len(repaired_batches),
+        "repaired_batches": repaired_batches,
+        "pruned_task_ref_count": pruned_task_refs,
+        "index_stats": index_stats,
+    }
+
+
 # ---------------------------------------------------------------------------
 # verify-integrity
 # ---------------------------------------------------------------------------
@@ -165,9 +250,15 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
     """
     issues: list[str] = []
     tasks_dir = global_tasks_dir(cfg)
+    batches_dir = global_batches_dir(cfg)
 
     if not tasks_dir.is_dir():
-        return {"ok": True, "issues": [], "tasks_checked": 0}
+        return {
+            "ok": True,
+            "issues": [],
+            "tasks_checked": 0,
+            "batches_checked": 0,
+        }
 
     checked = 0
     for path in tasks_dir.glob("*.json"):
@@ -190,8 +281,59 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
         except Exception as e:
             issues.append(f"Cannot read {path.name}: {e}")
 
+    batches_checked = 0
+    if batches_dir.is_dir():
+        for path in batches_dir.glob("*.json"):
+            if path.name.endswith(".tmp"):
+                continue
+            batches_checked += 1
+            expected_id = path.stem
+            try:
+                data = read_json(path)
+                batch_data = data.get("batch", {})
+                batch_id = batch_data.get("batch_id")
+                if batch_id != expected_id:
+                    issues.append(
+                        f"Batch filename/ID mismatch: file={path.name}, batch_id={batch_id}"
+                    )
+                    continue
+
+                declared_task_ids = list(batch_data.get("task_ids", []))
+                surviving_ids: list[str] = []
+                counts: dict[str, int] = {}
+                for task_id in declared_task_ids:
+                    try:
+                        task = load_task(cfg, task_id)
+                    except FileNotFoundError:
+                        issues.append(
+                            f"Batch {expected_id} references missing task {task_id}"
+                        )
+                        continue
+                    surviving_ids.append(task_id)
+                    phase = task.status.phase
+                    counts[phase] = counts.get(phase, 0) + 1
+
+                expected_summary = {
+                    "total": len(surviving_ids),
+                    "queued": counts.get("queued", 0),
+                    "running": counts.get("running", 0),
+                    "succeeded": counts.get("succeeded", 0),
+                    "failed": counts.get("failed", 0),
+                    "cancelled": counts.get("cancelled", 0),
+                    "blocked": counts.get("blocked", 0),
+                    "orphaned": counts.get("orphaned", 0),
+                }
+                actual_summary = batch_data.get("summary", {})
+                if actual_summary != expected_summary:
+                    issues.append(
+                        f"Batch {expected_id} summary drift: expected={expected_summary}, actual={actual_summary}"
+                    )
+            except Exception as e:
+                issues.append(f"Cannot read batch {path.name}: {e}")
+
     return {
         "ok": len(issues) == 0,
         "issues": issues,
         "tasks_checked": checked,
+        "batches_checked": batches_checked,
     }

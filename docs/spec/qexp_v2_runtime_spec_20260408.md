@@ -154,16 +154,26 @@ machine 子目录主要承载：
 
 承载：
 
+- `schema_version`
+- `machine_name`
+- `agent_mode`
 - `agent_state`
 - `pid`
 - `started_at`
 - `last_heartbeat`
+- `last_transition_at`
 - `idle_timeout_seconds`
+- `idle_started_at`
+- `idle_deadline_at`
+- `drain_started_at`
 - `last_exit_reason`
+- `workset`
 
 用途：
 
+- 作为 agent 生命周期状态的唯一真相源
 - 让其他命令看到这台机器当前 agent 是否活着
+- 区分 `active`、`draining`、`idle` 等生命周期位置
 - 区分 `on_demand` 自动退出和异常退出
 
 #### 3. `state/gpu.json`
@@ -189,16 +199,21 @@ machine 子目录主要承载：
 
 承载：
 
-- `queued_count`
-- `running_count`
-- `failed_count`
-- `last_task_started_at`
-- `last_task_finished_at`
+- `machine_name`
+- `counts_by_phase`
+- `updated_at`
 
 用途：
 
-- 提供轻量 machine 总览
+- 提供轻量 machine phase/count 总览
+- 作为 `qexp top` / `qexp machines` 的展示缓存
 - 避免每次都全量扫 task 文件
+
+约束：
+
+- `state/summary.json` 不是生命周期状态真相源
+- 不得承载独立的 `agent_state` 或 `has_active_responsibility`
+- 凡涉及 agent 生命周期判定，必须回到 `state/agent.json`
 
 #### 5. `claims/active/<task_id>.json`
 
@@ -304,11 +319,37 @@ machine:
   shared_root: str
   runtime_root: str
   agent_mode: enum[on_demand, persistent]
-  agent_state: enum[stopped, starting, active, idle, stale, failed]
-  last_heartbeat: str | null
   gpu_inventory:
     count: int
     visible_gpu_ids: list[int]
+```
+
+`machines/<machine_name>/state/agent.json` 至少包含：
+
+```yaml
+agent:
+  schema_version: "3.0"
+  machine_name: str
+  agent_mode: enum[on_demand, persistent]
+  agent_state: enum[stopped, starting, active, draining, idle, stale, failed]
+  pid: int | null
+  started_at: str | null
+  last_heartbeat: str | null
+  last_transition_at: str | null
+  idle_timeout_seconds: int
+  idle_started_at: str | null
+  idle_deadline_at: str | null
+  drain_started_at: str | null
+  last_exit_reason: str | null
+  workset:
+    queued_count: int
+    dispatching_count: int
+    starting_count: int
+    running_count: int
+    terminal_count: int
+    has_launch_backlog: bool
+    has_active_responsibility: bool
+    updated_at: str
 ```
 
 ## task 对象
@@ -483,9 +524,27 @@ batch:
 - batch 下新 task 创建完成后补全 `task_ids`
 - batch-retry-failed 产生新 task 后更新摘要
 - batch-retry-cancelled 产生新 task 后更新摘要
+- single-task clean 删除 batch 成员后同步修正 `task_ids` 与摘要
 - rebuild-index / repair 重新计算摘要
 
 不允许把 batch 当作 task 状态真相来源。
+
+### single-task clean 对 batch 的修正规则
+
+当 `global/tasks/<task_id>.json` 对应 task 带有 `batch_id` 时，single-task clean 必须同步改写对应 batch 真相。
+
+规则固定为：
+
+1. 从 `batch.task_ids` 中移除被删除的 `task_id`
+2. 基于删除后的正式成员集合重算 `batch.summary.*`
+3. 保留 `batch.policy`、`batch.name`、`batch.machine_name` 等非聚合字段
+4. 若删除后该 batch 不再包含任何 task，batch 真相仍然保留，不自动删除 `global/batches/<batch_id>.json`
+
+约束：
+
+- 不允许留下仍引用已删除 `task_id` 的 `batch.task_ids`
+- 不允许只修索引而不修 batch 真相
+- batch 摘要必须视为可重建聚合值，不得把已删除 task 继续计入摘要
 
 ## shared root 真相层规则
 
@@ -508,6 +567,72 @@ shared root 下真正的 source of truth 只有：
 1. 先信任 task 真相
 2. 再信任 batch 真相
 3. 最后重建索引和 machine 侧辅助视图
+
+single-task clean 生效后，恢复规则补充如下：
+
+- 若 task 真相已删除，则不允许为了“回滚 clean”而凭空重建该 task 文件
+- 若 batch 真相或索引尚未修正完成，应通过 repair / rebuild 流程继续收敛，而不是把已删除 task 重新视为存在
+
+## clean 运行时语义
+
+### 1. single-task clean 的对象边界
+
+首版 single-task clean 只允许直接修改或删除以下共享层对象：
+
+- 删除 `global/tasks/<task_id>.json`
+- 改写相关 `global/indexes/...` 派生条目
+- 若存在 `batch_id`，改写 `global/batches/<batch_id>.json`
+
+首版不应把以下对象纳入 clean 的强契约：
+
+- `machines/<machine_name>/events/...`
+- `machines/<machine_name>/claims/...`
+- 训练框架自身业务日志、checkpoint、artifact
+
+### 2. runtime log 语义
+
+runtime log 不属于 shared root 真相层。
+
+因此 single-task clean 对 runtime log 的契约固定为：
+
+- 若实现能从 task 元数据稳定定位到 log 路径，且当前进程对该路径可访问，则按 best-effort 删除
+- 若路径不存在、机器不可达、权限不足或路径无法确定，不得阻断 shared root 中 task/batch/index 的 clean 主流程
+- CLI 或 API 返回值必须区分“task 已清理”与“runtime log 未删除”
+
+这意味着：
+
+- clean 成功的判定以 shared root 真相与派生视图收敛成功为准
+- runtime log 删除失败不构成 task 真相删除的回滚条件
+
+### 3. single-task clean 的失败模型
+
+single-task clean 应分为两个阶段：
+
+前置校验阶段：
+
+- 读取 task 真相
+- 校验终态
+- 若有 `batch_id`，读取 batch 真相
+- 预计算 batch 修正结果与索引修正结果
+
+这一阶段失败时，必须不写入任何对象。
+
+执行阶段：
+
+1. 写入 batch 真相修正结果（若存在）
+2. 写入索引修正结果
+3. 删除 `global/tasks/<task_id>.json`
+4. best-effort 删除 runtime log
+
+允许的中间状态：
+
+- task 已删除，但 machine 本地 log 尚未删除
+- **假设/未验证**：若执行阶段在 batch/索引修正后半途失败，系统可暂时依赖 repair / rebuild-index 继续收敛
+
+不允许的持久状态：
+
+- batch 真相仍保留对已删除 task 的正式成员引用
+- 索引长期把已删除 task 暴露为有效对象
 
 ## 并发写策略
 
@@ -652,9 +777,16 @@ agent dispatch task 时：
 建议保留：
 
 - `qexp doctor`
+- `qexp doctor verify`
 - `qexp doctor rebuild-index`
 - `qexp doctor repair-orphans`
 - `qexp doctor cleanup-locks`
+
+与 single-task clean 的关系：
+
+- `rebuild-index` 负责收敛 clean 后的派生索引视图
+- **假设/未验证**：若后续提供更通用的 `doctor repair`，则它应能同时收敛 batch 摘要与索引
+- `repair-orphans` 不负责修复 clean 产生的 batch 成员引用问题
 
 ## 验收标准
 

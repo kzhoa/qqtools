@@ -12,6 +12,7 @@ from . import api, observer
 from .agent import get_agent_status, run_agent_loop
 from .doctor import (
     cleanup_stale_locks,
+    repair_metadata,
     rebuild_indexes,
     repair_orphans,
     verify_integrity,
@@ -76,7 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # init
-    init_p = sub.add_parser("init", help="initialize shared root and machine")
+    init_p = sub.add_parser(
+        "init",
+        help="initialize or refresh machine registration and save CLI context",
+        description=(
+            "Initialize qexp for one machine. Safe to run multiple times: "
+            "it ensures the layout exists, refreshes machine.json, and saves "
+            "the current CLI context."
+        ),
+    )
     init_p.add_argument("--agent-mode", choices=["on_demand", "persistent"], default="on_demand")
 
     # submit
@@ -138,11 +147,12 @@ def build_parser() -> argparse.ArgumentParser:
     # clean
     clean_p = sub.add_parser("clean", help="clean old terminal task records")
     clean_p.add_argument("--dry-run", action="store_true")
+    clean_p.add_argument("--task-id", type=str, default=None)
     clean_p.add_argument("--include-failed", action="store_true")
     clean_p.add_argument(
         "--older-than-seconds",
         type=int,
-        default=api.DEFAULT_CLEAN_OLDER_THAN_SECONDS,
+        default=None,
     )
 
     # agent
@@ -164,7 +174,14 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_sub.add_parser("status", help="show agent status")
 
     # use (context management)
-    use_p = sub.add_parser("use", help="set or show default context")
+    use_p = sub.add_parser(
+        "use",
+        help="set, show, or clear saved CLI context",
+        description=(
+            "Manage the saved qexp CLI context used as a fallback after "
+            "explicit flags and environment variables."
+        ),
+    )
     use_p.add_argument("--shared-root", type=str, default=None, dest="use_shared_root")
     use_p.add_argument("--machine", type=str, default=None, dest="use_machine")
     use_p.add_argument("--runtime-root", type=str, default=None, dest="use_runtime_root")
@@ -174,6 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     # doctor
     doctor_p = sub.add_parser("doctor", help="diagnostics and repair")
     doctor_sub = doctor_p.add_subparsers(dest="doctor_command")
+    doctor_sub.add_parser("repair", help="repair batch truth and rebuild indexes")
     doctor_sub.add_parser("rebuild-index", help="rebuild all indexes")
     doctor_sub.add_parser("repair-orphans", help="repair orphaned tasks")
     doctor_sub.add_parser("cleanup-locks", help="clean stale locks")
@@ -332,7 +350,17 @@ def handle_top(args: argparse.Namespace) -> int:
             )
             print()
             for m in view.get("machines", []):
-                print(f"  machine={m['machine_name']}  gpus={m['gpu_count']}  agent={m['agent_state']}")
+                phase_counts = m.get("counts_by_phase", {})
+                print(
+                    "  "
+                    f"machine={m['machine_name']}  "
+                    f"gpus={m['gpu_count']}  "
+                    f"agent={m['agent_state']}  "
+                    f"queued={phase_counts.get('queued', 0)}  "
+                    f"dispatching={phase_counts.get('dispatching', 0)}  "
+                    f"starting={phase_counts.get('starting', 0)}  "
+                    f"running={phase_counts.get('running', 0)}"
+                )
             print()
             for e in view.get("recent_events", [])[:5]:
                 print(f"  {e.get('timestamp', '')}  {e.get('event_type', '')}  {e.get('task_id', '')}")
@@ -367,9 +395,14 @@ def handle_machines(args: argparse.Namespace) -> int:
         print("No machines registered.")
         return 0
     for m in machines:
+        phase_counts = m.get("counts_by_phase", {})
         print(
             f"{m['machine_name']:14s} host={m.get('hostname') or '-':20s} "
-            f"mode={m['agent_mode']}  state={m['agent_state']}  gpus={m['gpu_count']}"
+            f"mode={m['agent_mode']}  state={m['agent_state']}  gpus={m['gpu_count']}  "
+            f"queued={phase_counts.get('queued', 0)}  "
+            f"dispatching={phase_counts.get('dispatching', 0)}  "
+            f"starting={phase_counts.get('starting', 0)}  "
+            f"running={phase_counts.get('running', 0)}"
         )
     return 0
 
@@ -388,16 +421,40 @@ def handle_logs(args: argparse.Namespace) -> int:
 
 def handle_clean(args: argparse.Namespace) -> int:
     cfg = _resolve_cfg(args)
+    if args.task_id and args.include_failed:
+        print(
+            "Error: --task-id cannot be combined with --include-failed.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.task_id and args.older_than_seconds is not None:
+        print(
+            "Error: --task-id cannot be combined with --older-than-seconds.",
+            file=sys.stderr,
+        )
+        return 1
     result = api.clean(
         cfg,
         dry_run=args.dry_run,
+        task_id=args.task_id,
         include_failed=args.include_failed,
         older_than_seconds=args.older_than_seconds,
     )
     mode = "Dry run" if result["dry_run"] else "Cleaned"
-    print(f"{mode}: {result['deleted_task_count']} tasks, {result['deleted_log_count']} logs")
+    task_count = (
+        result["planned_task_count"] if result["dry_run"] else result["deleted_task_count"]
+    )
+    print(
+        f"{mode}: mode={result['mode']} tasks={task_count} "
+        f"logs_deleted={result['deleted_log_count']} "
+        f"batches_repaired={len(result['repaired_batches'])}"
+    )
     for tid in result["task_ids"]:
         print(f"  {tid}")
+    for log_result in result.get("log_results", []):
+        status = log_result.get("status")
+        path = log_result.get("path") or "-"
+        print(f"  log[{status}] {log_result['task_id']} {path}")
     return 0
 
 
@@ -443,6 +500,10 @@ def handle_doctor(args: argparse.Namespace) -> int:
     if cmd == "rebuild-index":
         stats = rebuild_indexes(cfg)
         print(json.dumps(stats, indent=2))
+        return 0
+    elif cmd == "repair":
+        result = repair_metadata(cfg)
+        print(json.dumps(result, indent=2))
         return 0
     elif cmd == "repair-orphans":
         orphaned = repair_orphans(cfg)

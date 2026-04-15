@@ -202,6 +202,27 @@ qexp batch-retry-cancelled batch_xxx
 - 不要求用户先 clean 再 submit
 - `retry` 必须生成新的 task，并保留 lineage
 
+### 6. 清理
+
+`clean` 仍然是唯一删除终态 task 记录的入口，但需要同时支持批量模式与精确模式：
+
+```bash
+qexp clean
+qexp clean --include-failed
+qexp clean --older-than-seconds 259200
+qexp clean --task-id task_xxx
+qexp clean --task-id task_xxx --dry-run
+```
+
+要求：
+
+- `qexp clean` 默认仍按现有批量规则清理旧终态 task
+- `qexp clean --task-id <task_id>` 必须精确清理单个终态 task
+- single-task clean 只允许 `succeeded` / `failed` / `cancelled`
+- single-task clean 与 `--older-than-seconds`、`--include-failed` 互斥
+- 若被清理 task 属于某个 batch，batch 视图必须同步反映删除后的正式成员与摘要
+- runtime log 删除只承诺 best-effort，不承诺跨机器强一致删除
+
 ## 最终 CLI
 
 ### 高频命令
@@ -214,6 +235,7 @@ qexp batch-retry-cancelled batch_xxx
 - `qexp top`
 - `qexp cancel`
 - `qexp retry`
+- `qexp clean`
 - `qexp batches`
 - `qexp batch`
 - `qexp machines`
@@ -234,8 +256,11 @@ Lightweight experiment submission queue for the current machine.
 
 By default, qexp submits tasks to the current machine only.
 It uses a shared control root for metadata and an on-demand local agent.
-The local agent exits automatically after 10 minutes of idleness unless
+The local agent exits automatically after 10 minutes of true idleness unless
 persistent mode was explicitly enabled.
+True idleness means this machine has no remaining `queued`, `dispatching`,
+`starting`, or `running` responsibilities. If only `running` tasks remain,
+the agent stays alive in `draining` state until they converge.
 
 Common commands:
   init            Initialize qexp on the current machine
@@ -246,6 +271,7 @@ Common commands:
   top             Show live queue / machine overview
   cancel          Cancel one task
   retry           Retry one task
+  clean           Clean terminal task records
   batches         List batches
   batch           Show one batch
   machines        List visible machines
@@ -263,6 +289,8 @@ Examples:
   qexp top
   qexp cancel task_xxx
   qexp retry task_xxx
+  qexp clean --dry-run
+  qexp clean --task-id task_xxx
 ```
 
 ## 应砍掉的命令
@@ -285,3 +313,4 @@ Examples:
 - 默认不支持跨机器远程投递。
 - 默认不支持长期常驻后台进程。
 - `qexp` 不管理训练日志体系，只记录调度事件。
+- `clean` 必须同时覆盖批量清理与单 task 精确清理，且单 task clean 后 batch 视图不能残留悬挂引用。
