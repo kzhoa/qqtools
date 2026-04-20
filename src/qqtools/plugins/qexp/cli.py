@@ -74,7 +74,17 @@ def _resolve_cfg(args: argparse.Namespace):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="qexp — project-root control-plane experiment queue"
+        description=(
+            "qexp — project-root control-plane experiment queue.\n\n"
+            "Mental model:\n"
+            "  - task: one concrete run\n"
+            "  - group: long-lived grouping key; runtime projects it to one tmux session\n"
+            "  - batch: one bulk submit operation; not the same thing as group\n\n"
+            "High-frequency path:\n"
+            "  qexp submit -- python train.py --config configs/a.yaml\n"
+            "  qexp submit --group contract_n_4and6 --name n4 -- python train.py --n 4\n"
+            "  qexp batch-submit --file runs.yaml"
+        )
     )
     parser.add_argument("--shared-root", type=str, default=None)
     parser.add_argument("--machine", type=str, default=None)
@@ -96,7 +106,27 @@ def build_parser() -> argparse.ArgumentParser:
     init_p.add_argument("--agent-mode", choices=["on_demand", "persistent"], default="on_demand")
 
     # submit
-    submit_p = sub.add_parser("submit", help="submit a single task")
+    submit_p = sub.add_parser(
+        "submit",
+        help="submit one new task on the current machine",
+        description=(
+            "Submit one new task on the current machine.\n\n"
+            "Use submit for the high-frequency path: one command, one task.\n"
+            "Do not write YAML for a single task.\n\n"
+            "About --group:\n"
+            "  - group is a long-lived grouping key inside the project\n"
+            "  - runtime projects group directly to one tmux session\n"
+            "  - group is not batch\n"
+            "  - group is not a scientific truth object; it is the tool-layer key you use\n"
+            "    to keep related runs in one working context\n\n"
+            "Examples:\n"
+            "  qexp submit -- python train.py --config configs/a.yaml\n"
+            "  qexp submit --group contract_n_4and6 --name n4 -- python train.py --n 4\n"
+            "  qexp submit --group contract_n_4and6 --name n6 -- python train.py --n 6\n"
+            "The last two commands create two different tasks that share one long-lived group\n"
+            "and therefore land in the same tmux session."
+        ),
+    )
     submit_p.add_argument("--task-id", type=str, default=None)
     submit_p.add_argument("--name", type=str, default=None)
     submit_p.add_argument("--group", type=str, default=None)
@@ -121,7 +151,30 @@ def build_parser() -> argparse.ArgumentParser:
     resubmit_p.add_argument("argv", nargs=argparse.REMAINDER)
 
     # batch-submit
-    batch_p = sub.add_parser("batch-submit", help="submit tasks from manifest")
+    batch_p = sub.add_parser(
+        "batch-submit",
+        help="submit one batch manifest on the current machine",
+        description=(
+            "Submit a manifest that creates one batch and all of its member tasks.\n\n"
+            "Use batch-submit only when you are submitting a set of tasks together.\n\n"
+            "About batch vs group:\n"
+            "  - batch = one bulk submit operation\n"
+            "  - batch.group = the default long-lived group for tasks in this batch\n"
+            "  - group still means long-lived working context and runtime projects it to a\n"
+            "    tmux session\n"
+            "  - if you submit another related set tomorrow, usually create a new batch and\n"
+            "    reuse the same group\n\n"
+            "Example manifest shape:\n"
+            "  batch:\n"
+            "    name: contract-compare-round1\n"
+            "    group: contract_n_4and6\n"
+            "  tasks:\n"
+            "    - name: n4\n"
+            "      command: [\"python\", \"train.py\", \"--n\", \"4\"]\n"
+            "    - name: n6\n"
+            "      command: [\"python\", \"train.py\", \"--n\", \"6\"]"
+        ),
+    )
     batch_p.add_argument("--file", type=str, required=True, dest="manifest_file")
 
     # batch-retry-failed

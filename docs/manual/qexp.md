@@ -1,134 +1,173 @@
 # qexp Manual
 
-状态：草稿
+Status: draft
 
-更新时间：2026-04-17
+Updated: 2026-04-20
 
-## 目标
+## What This Manual Covers
 
-本文档面向直接使用 `qexp` 的用户，只回答这些问题：
+This manual is for people who use `qexp` directly.
 
-1. `qexp` 现在默认怎么工作
-2. 第一次接入时要做什么
-3. 单任务、批量任务怎么提交
-4. 平时怎么观察、取消、重试
-5. 遇到常见问题时先检查什么
+It focuses on the operational questions that matter in day-to-day use:
 
-本文档只保留用户真正需要理解的行为、命令和排障方式，不要求读者再跳转到开发规格文档。
+1. What `qexp` is and how it behaves by default
+2. What you need before the first machine joins
+3. How to submit single tasks and batch manifests
+4. How to observe, cancel, retry, resubmit, and clean tasks
+5. What to check first when something looks wrong
 
-## 当前版本行为
+This document is intentionally practical. It keeps the product model, CLI behavior,
+and troubleshooting rules in one place so users do not have to jump into runtime
+specs unless they are working on the internals.
 
-当前 `qexp` 使用 shared-root 引擎。
+## What qexp Is
 
-这意味着：
+`qexp` is a lightweight experiment submission queue built around a project-scoped
+control plane.
 
-- 默认入口是多机器共享视图
-- 需要显式提供 machine 身份
-- 任务元数据保存在 shared root
-- agent 默认按需启动，不要求长期常驻
+In the current version:
 
-## 基本概念
+- metadata lives in one shared project root
+- machines join that shared control plane explicitly
+- the CLI always operates in the context of one current machine
+- the agent is on-demand by default
 
-- `shared root`：多机器共享的 `qexp` 控制目录，保存任务、批次、索引和事件
-- `machine`：当前执行任务的一台机器或一个容器实例
-- `runtime root`：当前机器本地运行目录，保存 agent pid、日志等本地状态
-- `task`：一次实际提交与执行对象
-- `group`：项目内长期归组键，用来把一组相关 task 归在同一个工作上下文里
-- `batch`：一组一起提交、一起观察、一起重试的 task
-- `name`：单个 task 的展示名
-- `task_id`：单个 task 的唯一标识
+`qexp` is not a full experiment platform. It is a shared queue and execution shell
+for submitting tasks, observing them, and recovering from common queue-state issues.
 
-这些概念的关系要分清：
+## Core Mental Model
 
-- `group` 解决“这些 task 长期属于哪一组工作上下文”
-- `batch` 解决“这些 task 是否是这一次一起提交的一批”
-- `name` 解决“这个 task 给人看的名字是什么”
-- `task_id` 解决“系统内部唯一标识是什么”
-- 一个 `group` 内可以有多个 `batch`
-- `group` 不等于 `batch`
-- `name` 不等于 `group`
-- `task_id` 不等于 `group`
+If users get confused, it is usually because they blur `task`, `group`, and `batch`.
+Do not blur them.
 
-这几个字段的职责必须固定：
+- `shared root`: the shared `qexp` control directory for one project; it stores tasks,
+  batches, indexes, machine metadata, and events
+- `machine`: one machine or container instance that can execute tasks
+- `runtime root`: machine-local writable state such as agent pid files and logs
+- `task`: one concrete submission and execution unit
+- `group`: a long-lived grouping key inside the project; at runtime it maps directly
+  to one tmux session
+- `batch`: one bulk submit operation that creates a set of tasks together
+- `name`: a human-facing label for one task
+- `task_id`: the unique identifier for one task
 
-- `group` 只承担归组职责，并直接映射到 tmux session
-- `name` 只承担展示职责，不作为归组主键
-- `task_id` 只承担唯一标识职责，用于 `inspect`、`logs`、`cancel`、`retry`
+These boundaries must remain stable:
 
-task 的常见状态流转是：
+- `task` answers: what exactly is being run?
+- `group` answers: which long-lived working context does this task belong to?
+- `batch` answers: which tasks were created together in one bulk submit operation?
+- `name` answers: what should users see in listings?
+- `task_id` answers: which exact task object do commands target?
+
+Important non-equivalences:
+
+- `group` is not `batch`
+- `group` is not `name`
+- `task_id` is not `group`
+- one `group` can contain many `batch` objects
+- one experiment plan can map to one stable `group` across multiple submits or batches
+
+### About `group`
+
+`group` is the most commonly misunderstood field. Read this literally:
+
+- `group` is a long-lived grouping key
+- runtime projects it directly to a tmux session
+- `group` is not "the batch I submitted today"
+- `group` is not a scientific truth object owned by your research workflow
+- `group` is the tool-layer key you use to keep related runs in one durable working context
+
+Typical mappings:
+
+- one experiment plan -> one stable `group`
+- one debugging campaign -> one stable `group`
+- one long-running topic of work -> one stable `group`
+
+If two tasks share the same `group`, they should be understood as belonging to the
+same long-lived working context, even if they were submitted on different days and
+through different `batch` objects.
+
+### Task Lifecycle
+
+Typical phase progression:
 
 `queued -> dispatching -> starting -> running -> succeeded / failed / cancelled`
 
-其中：
+Meaning:
 
-- `queued`：已入队，等待某台机器的 agent 拉取
-- `dispatching`：agent 已接手，正在分配执行资源
-- `starting`：执行包装器已准备启动用户命令
-- `running`：用户命令已开始运行
-- `succeeded` / `failed` / `cancelled`：终态
+- `queued`: the task exists in the queue and is waiting for an agent to claim it
+- `dispatching`: an agent has taken responsibility and is assigning execution resources
+- `starting`: the wrapper is preparing to launch the user command
+- `running`: the user command has started
+- `succeeded` / `failed` / `cancelled`: terminal phases
 
-## 环境要求
+## Environment Requirements
 
-### 基本要求
+### Required for Basic Use
 
-- Python 环境中已安装 `qqtools`
-- 有一个所有相关机器都可访问的 shared root
-- 当前机器有一个可写的本地 runtime 目录
+- Python with `qqtools` installed
+- one shared root visible to all relevant machines
+- one writable local runtime directory on the current machine
 
-### agent / 调度要求
+### Required for Automatic Execution
 
-如果您希望任务提交后自动被调度执行，还需要：
+If you expect submitted tasks to start automatically, the machine also needs:
 
 - Linux
 - `tmux`
 - `libtmux`
-- 可用 GPU 检测后端，例如 `pynvml` 或 `nvidia-smi`
+- a usable GPU detection backend such as `pynvml` or `nvidia-smi`
 
-如果这些依赖不齐，任务仍可能被成功写入队列，但不会自动开始执行。
+If these dependencies are missing, tasks may still be written to the queue, but
+they will not automatically start running.
 
-## 快速开始
+## Quick Start
 
-### 第一步：初始化一台机器
+### 1. Initialize One Machine
 
-每台机器第一次接入 shared queue 时都需要初始化一次：
-
-```bash
-qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
-```
-
-`shared root` 不是任意目录，而是项目控制目录；正式形态固定为 `project_root/.qexp`。
-
-正确形态：
+Each machine must initialize itself once before joining the shared queue:
 
 ```bash
 qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
 ```
 
-不推荐：
+This is not an arbitrary directory. The supported shape is:
+
+```bash
+qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
+```
+
+Do not treat `shared_root` as a per-experiment directory:
 
 ```bash
 qexp init --shared-root /mnt/share/myproject/.qexp/exp1/shared --machine gpu-a
 qexp init --shared-root /mnt/share/myproject/.qexp/exp2/shared --machine gpu-a
 ```
 
-原因：
+Why this is wrong:
 
-- `shared root` 代表一整套项目级控制平面
-- 同一项目内的 task、batch、machine、索引和事件应共享同一套真相
-- 如果按实验计划拆多个 `shared root`，同项目内的资源视图、观察面和队列状态会被打碎
-- 当前运行时会拒绝不符合 `project_root/.qexp` 约束的根路径
+- `shared_root` is one project-level control plane
+- tasks, batches, machines, indexes, and events are meant to share one truth set
+- splitting roots by experiment fragments the queue view and the resource view
+- current runtime validation rejects roots that do not follow the `project_root/.qexp` contract
 
-如果您希望 agent 在该机器上常驻：
+If this machine should run a persistent agent:
 
 ```bash
 qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a --agent-mode persistent
 ```
 
-`--agent-mode on_demand` 是默认模式，agent 会在需要调度时被拉起，并在空闲一段时间后自动退出；`persistent` 适合长期跑任务的固定机器，agent 会持续常驻，减少反复拉起的等待。
+Default mode is `on_demand`. In that mode the agent starts when needed and exits
+after true idleness. `persistent` is better for dedicated machines that should keep
+an agent alive continuously.
 
-`qexp init` 成功后会自动保存当前 CLI context（`shared_root`、`machine`，以及显式传入的 `runtime_root`）。
+`qexp init` also saves the current CLI context:
 
-因此初始化后，后续命令通常不需要再重复填写这些参数：
+- `shared_root`
+- `machine`
+- explicitly provided `runtime_root`
+
+So after initialization, these commands usually work without repeating those flags:
 
 ```bash
 qexp list
@@ -136,26 +175,26 @@ qexp top
 qexp logs <task_id>
 ```
 
-如果您想显式切换或覆盖默认 context，可以使用：
+You can still switch or inspect the saved context explicitly:
 
 ```bash
 qexp use --shared-root /mnt/share/myproject/.qexp --machine gpu-a
 qexp use --show
 ```
 
-当然，后续命令也仍然可以继续显式传参：
+Flags still override saved context when needed:
 
 ```bash
 qexp --shared-root /mnt/share/myproject/.qexp --machine gpu-a list
 ```
 
-也可以使用环境变量；优先级是：
+Environment variables also work. Precedence is:
 
-1. 命令行参数
-2. 环境变量
-3. 已保存的 context
+1. CLI flags
+2. environment variables
+3. saved context
 
-例如：
+Example:
 
 ```bash
 export QEXP_SHARED_ROOT=/mnt/share/myproject/.qexp
@@ -163,7 +202,7 @@ export QEXP_MACHINE=gpu-a
 qexp list
 ```
 
-如果本机 runtime 目录需要自定义，也可以显式指定：
+If the machine-local runtime directory must be customized:
 
 ```bash
 qexp init \
@@ -172,15 +211,31 @@ qexp init \
   --runtime-root /data/local/qexp-runtime
 ```
 
-`init` 也可以安全重复执行。重复执行时，它会确保目录结构存在、刷新当前 machine 注册信息，并更新本地保存的 context。
+Re-running `init` is safe. It refreshes the layout, machine registration, and saved
+context.
 
-### 第二步：提交第一个任务
+### 2. Submit the First Task
 
 ```bash
 qexp submit -- python train.py --config configs/a.yaml
 ```
 
-### 第三步：观察执行情况
+If you already know that multiple runs belong to the same long-lived working context,
+declare `group` early:
+
+```bash
+qexp submit --group contract_n_4and6 --name n4 -- python train.py --n 4
+qexp submit --group contract_n_4and6 --name n6 -- python train.py --n 6
+```
+
+Interpret those commands this way:
+
+- they create two different tasks
+- they share one long-lived `group`
+- runtime places them into the same tmux session: `contract_n_4and6`
+- that does not imply they belong to the same `batch`
+
+### 3. Observe the Queue
 
 ```bash
 qexp list
@@ -188,17 +243,17 @@ qexp top
 qexp logs <task_id>
 ```
 
-## 常用命令
+## Submitting Tasks
 
-### 单任务提交
+### Single-Task Submit
 
-最常见的提交方式：
+The most common path is still:
 
 ```bash
 qexp submit -- python train.py --config configs/a.yaml
 ```
 
-显式指定 task id 和展示名：
+With an explicit task id and display name:
 
 ```bash
 qexp submit \
@@ -208,13 +263,14 @@ qexp submit \
   -- python train.py --config configs/a.yaml
 ```
 
-说明：
+Notes:
 
-- `--` 后面的内容会原样作为用户命令
-- `--gpus` 表示请求的 GPU 数量
-- `--task-id` 不传时会自动生成
+- everything after `--` is passed through as the user command
+- `--gpus` is the requested GPU count
+- `--task-id` is optional; if omitted, `qexp` generates one
 
-如果您想把多个相关 task 放进同一个工作上下文里，推荐显式声明 `group`：
+If several tasks belong in the same long-lived working context, declare `group`
+explicitly:
 
 ```bash
 qexp submit \
@@ -224,43 +280,44 @@ qexp submit \
   -- python train.py --n 4
 ```
 
-推荐理解方式：
+Recommended interpretation:
 
-- `group` 不是业务里的“实验计划”正式术语
-- 但您可以把脑中的一个实验计划映射成一个稳定的 `group`
-- 同一 `group` 下的 task 会被视为同一组长期相关任务
+- `group` is not a formal business term like "experiment plan"
+- but you can map an experiment plan, debugging campaign, or durable work topic to one stable `group`
+- tasks in the same `group` are treated as long-term related work
+- runtime maps that `group` directly to one tmux session
+- `group` is not the "submitted together today" concept; that is `batch`
 
-`group` 的约束如下：
+`group` constraints:
 
-- 允许字符：字母、数字、`.`、`_`、`-`
-- 区分大小写
-- 禁止保留名：`experiments`
-- 禁止保留名：`qqtools_internal`
-- 禁止以 `.` 或 `-` 开头
-- 长度上限为 `64`
-- 校验通过后直接映射为 tmux session 名，不做二次 sanitize
+- allowed characters: letters, digits, `.`, `_`, `-`
+- case-sensitive
+- reserved names are forbidden: `experiments`, `qqtools_internal`
+- must not start with `.` or `-`
+- maximum length: `64`
+- after validation, the value maps directly to the tmux session name with no second sanitization pass
 
-推荐命名习惯：
+Recommended naming:
 
-- 一个实验计划对应一个稳定 `group`
-- 一次具体 run 用 `name`
-- 若需要一次性批量提交，再用 `batch`
+- one experiment plan -> one stable `group`
+- one specific run -> one `name`
+- one bulk submission -> one `batch`
 
-例如：
+Example:
 
 - `group=contract_n_4and6`
 - `name=n4`
 - `name=n6`
 
-### 批量提交
+### Batch Submit
 
-使用 manifest 批量提交：
+Use a manifest when you want to submit a set of tasks together:
 
 ```bash
 qexp batch-submit --file runs.yaml
 ```
 
-一个最小 manifest 示例：
+Minimal manifest:
 
 ```yaml
 batch:
@@ -272,7 +329,7 @@ tasks:
   - command: ["python", "train.py", "--config", "configs/b.yaml"]
 ```
 
-一个更完整的 manifest 示例：
+More complete manifest:
 
 ```yaml
 batch:
@@ -298,36 +355,45 @@ tasks:
     command: ["python", "train.py", "--config", "configs/a.yaml", "--seed", "2"]
 ```
 
-字段约定：
+Field semantics:
 
-- `batch.name`：批次展示名
-- `batch.group`：该批任务默认归属的长期 `group`
-- `batch.policy.allow_retry_failed`：是否允许执行 `qexp batch-retry-failed`
-- `batch.policy.allow_retry_cancelled`：是否允许执行 `qexp batch-retry-cancelled`
-- `defaults.requested_gpus`：本批次任务默认 GPU 数量
-- `tasks[].task_id`：可选；不写时自动生成
-- `tasks[].name`：可选；用于展示
-- `tasks[].group`：可选；单任务归组；优先级高于 `batch.group`
-- `tasks[].requested_gpus`：单任务覆盖默认 GPU 数量
-- `tasks[].command`：必填；实际执行命令
+- `batch.name`: display name for this bulk submit operation
+- `batch.group`: default long-lived `group` for tasks in this batch
+- `batch.policy.allow_retry_failed`: whether `qexp batch-retry-failed` is allowed
+- `batch.policy.allow_retry_cancelled`: whether `qexp batch-retry-cancelled` is allowed
+- `defaults.requested_gpus`: default GPU count for tasks in this batch
+- `tasks[].task_id`: optional; autogenerated if omitted
+- `tasks[].name`: optional display label
+- `tasks[].group`: optional task-level group override; higher priority than `batch.group`
+- `tasks[].requested_gpus`: task-level GPU override
+- `tasks[].command`: required user command
 
-归组优先级：
+Grouping precedence:
 
-1. `tasks[].group` 优先级最高
-2. 若 `tasks[].group` 缺失，则继承 `batch.group`
-3. 若二者都缺失，则该 task 的 `group = null`
+1. `tasks[].group` has the highest priority
+2. if `tasks[].group` is missing, inherit `batch.group`
+3. if both are missing, task `group = null`
 
-建议这样理解：
+Recommended interpretation:
 
-- `batch` 表示“这次一起交的一批”
-- `group` 表示“长期属于哪组工作上下文”
+- `batch` means "submitted together in this one bulk operation"
+- `group` means "belongs to this long-lived working context"
 
-如果您今天交一批、明天再补交一批，但它们都属于同一个实验计划，推荐：
+A common pattern:
 
-- 使用不同 `batch`
-- 继续复用同一个 `group`
+- submit batch one today
+- submit batch two tomorrow
+- they are different `batch` objects
+- they can still reuse the same `group`
 
-### 查看任务列表
+If two different bulk submissions belong to the same experiment plan, use:
+
+- different `batch` values
+- the same stable `group`
+
+## Observing and Managing Tasks
+
+### List Tasks
 
 ```bash
 qexp list
@@ -335,241 +401,246 @@ qexp list --phase queued
 qexp list --batch <batch_id>
 ```
 
-### 查看单个任务详情
+### Inspect One Task
 
 ```bash
 qexp inspect <task_id>
 ```
 
-### 查看总览
+### Live Overview
 
-仅看当前 machine：
+Current machine only:
 
 ```bash
 qexp top
 ```
 
-查看所有 machine：
+All visible machines:
 
 ```bash
 qexp top --all
 ```
 
-### 查看机器列表
+### List Machines
 
 ```bash
 qexp machines
 ```
 
-### 查看批次
+### List and Inspect Batches
 
 ```bash
 qexp batches
 qexp batch <batch_id>
 ```
 
-### 查看日志
+### Read Logs
 
-查看某个 task 的已落盘日志：
+Read existing log output:
 
 ```bash
 qexp logs <task_id>
 ```
 
-持续跟随日志：
+Follow the log continuously:
 
 ```bash
 qexp logs -f <task_id>
 ```
 
-### 取消与重试
+### Cancel, Retry, and Resubmit
 
-取消任务：
+Cancel a task:
 
 ```bash
 qexp cancel <task_id>
 ```
 
-重试一个已结束任务：
+Retry one terminal task:
 
 ```bash
 qexp retry <task_id>
 ```
 
-显式把重试后的新 task 放进另一个 group：
+Retry into another `group` explicitly:
 
 ```bash
 qexp retry <task_id> --group regrouped_debug
 ```
 
-规则：
+Rules:
 
-- `qexp retry <task_id>` 默认继承原 task 的 `group`
-- `qexp retry <task_id> --group <group>` 使用显式覆盖值，不继承原 group
-- retry 只创建新的 task，不改写原 task 的 `group`
+- `qexp retry <task_id>` inherits the original task `group` by default
+- `qexp retry <task_id> --group <group>` overrides it explicitly
+- retry creates a new task; it does not rewrite the old task's `group`
 
-原位替换一个已结束且允许 `resubmit` 的 task：
+Replace one terminal task in place:
 
 ```bash
 qexp resubmit <task_id> -- python train.py --config configs/a.yaml
 ```
 
-显式覆盖新的展示名和 group：
+Override the new display name and group:
 
 ```bash
 qexp resubmit <task_id> --name rerun_a --group regrouped_debug -- python train.py --config configs/a.yaml
 ```
 
-规则：
+Rules:
 
-- `resubmit` 只允许 `failed` / `cancelled`
-- `resubmit` 不允许 batch 成员 task
-- `resubmit` 会删除旧 task 正式记录，再用同一个 `task_id` 创建新的首次提交真相
-- 若命令中途失败并留下未完成替换事务，执行 `qexp doctor repair` 继续收敛
-- 当正式 task 已被删、替换仍未完成时，`qexp inspect <task_id>` 会显示未完成 `resubmit` 的操作态提示
+- `resubmit` is only allowed for `failed` or `cancelled`
+- `resubmit` is not allowed for batch-member tasks
+- `resubmit` deletes the old formal task record and recreates a fresh first-attempt truth with the same `task_id`
+- if replacement fails mid-flight and leaves an unfinished operation, run `qexp doctor repair`
+- when the old task truth is gone but replacement has not converged yet, `qexp inspect <task_id>` shows the unfinished resubmit operation state
 
-批量重试失败任务：
+Retry failed tasks in a batch:
 
 ```bash
 qexp batch-retry-failed <batch_id>
 ```
 
-批量重试已取消任务：
+Retry cancelled tasks in a batch:
 
 ```bash
 qexp batch-retry-cancelled <batch_id>
 ```
 
-### 清理旧记录
+### Clean Old Records
 
-先 dry run：
+Preview cleanup:
 
 ```bash
 qexp clean --dry-run
 ```
 
-默认只清理 7 天前的成功任务：
+Default cleanup behavior removes succeeded tasks older than 7 days:
 
 ```bash
 qexp clean
 ```
 
-显式指定时间阈值：
+Set an explicit age threshold:
 
 ```bash
 qexp clean --older-than-seconds 259200
 ```
 
-连失败和取消一起清理：
+Include failed and cancelled terminal tasks:
 
 ```bash
 qexp clean --include-failed
 ```
 
-精确清理单个终态 task：
+Clean one specific terminal task:
 
 ```bash
 qexp clean --task-id <task_id>
 ```
 
-先预览单 task clean 的结果：
+Preview one task cleanup:
 
 ```bash
 qexp clean --task-id <task_id> --dry-run
 ```
 
-说明：
+Notes:
 
-- `qexp clean` 默认是批量清理模式
-- `qexp clean --task-id <task_id>` 是单 task 精确清理模式
-- 单 task 模式下不允许再组合 `--older-than-seconds` 或 `--include-failed`
-- 单 task clean 只允许用于终态 task：`succeeded` / `failed` / `cancelled`
-- 若该 task 属于某个 batch，clean 会同步修正 batch 成员列表与摘要
-- runtime log 删除是 best-effort：若 log 可定位且当前进程可访问，则一并删除；否则 CLI 会明确提示未删除
+- `qexp clean` is the bulk cleanup mode
+- `qexp clean --task-id <task_id>` is precise single-task cleanup mode
+- single-task mode cannot be combined with `--older-than-seconds` or `--include-failed`
+- single-task cleanup is only allowed for terminal tasks: `succeeded`, `failed`, `cancelled`
+- if the task belongs to a batch, cleanup also repairs batch membership and summary fields
+- runtime log deletion is best-effort; if a log cannot be deleted, the CLI reports that explicitly
 
-## Agent 管理
+## Agent Lifecycle
 
-### 手动启动 agent
+### Start the Agent
 
-前台运行：
+Foreground:
 
 ```bash
 qexp agent start
 ```
 
-常驻模式：
+Persistent mode:
 
 ```bash
 qexp agent start --persistent
 ```
 
-后台启动：
+Background:
 
 ```bash
 qexp agent start --background
 ```
 
-### 停止 agent
+### Stop the Agent
 
 ```bash
 qexp agent stop
 ```
 
-### 查看 agent 状态
+### Inspect Agent State
 
 ```bash
 qexp agent status
 ```
 
-`qexp agent status` 是 agent 生命周期的权威解释入口。
+`qexp agent status` is the authoritative entrypoint for interpreting current agent
+lifecycle state.
 
-状态语义：
+State meanings:
 
-- `active`：当前 machine 仍有 `queued` / `dispatching` / `starting` 责任
-- `draining`：当前 machine 已无 launch backlog，但仍有 `running` 责任需要收敛
-- `idle`：当前 machine 已无任何 active responsibility，正在等待 idle timeout 自动退出
-- `stopped` / `stale` / `failed`：分别表示未运行、心跳失效、异常退出
+- `active`: this machine still owns `queued`, `dispatching`, or `starting` responsibilities
+- `draining`: this machine has no remaining launch backlog but still owns `running` responsibility
+- `idle`: this machine has no remaining active responsibility and is waiting for idle timeout
+- `stopped` / `stale` / `failed`: respectively not running, heartbeat lost, or exited abnormally
 
-`on_demand` agent 仍会自动退出，但退出条件不是“最近没 launch 新任务”，而是：
+An `on_demand` agent still exits automatically, but not just because it has not launched
+a new task recently. The exit path is:
 
-1. 当前 machine 不再承担 `queued` / `dispatching` / `starting` / `running` 责任
-2. agent 进入 `idle`
-3. `idle` 持续达到 `idle_timeout`
-4. 然后才自动退出
+1. this machine no longer owns `queued`, `dispatching`, `starting`, or `running` responsibility
+2. the agent enters `idle`
+3. `idle` lasts until `idle_timeout`
+4. then the process exits automatically
 
-## Doctor 命令
+## Repair and Recovery
 
-用于排查和修复共享状态问题：
+Use doctor commands when you need to inspect or repair shared metadata:
 
 ```bash
 qexp doctor verify
 qexp doctor rebuild-index
+qexp doctor repair
 qexp doctor repair-orphans
 qexp doctor cleanup-locks
 ```
 
-各子命令含义：
+Subcommand meanings:
 
-- `qexp doctor verify`：只读完整性检查，不会修改文件；主要检查任务文件是否可读、文件名和 task_id 是否一致、revision 是否有效
-- `qexp doctor rebuild-index`：重建索引，适合索引与任务实际状态不一致时使用
-- `qexp doctor repair-orphans`：把长时间失去机器心跳、但仍停留在活动态的任务修复为 `orphaned`
-- `qexp doctor cleanup-locks`：清理残留过久的锁文件，适合异常退出后锁未释放的场景
+- `qexp doctor verify`: read-only integrity check; does not modify files; mainly verifies readability, file-name to task-id consistency, and revision validity
+- `qexp doctor rebuild-index`: rebuild indexes when index views disagree with formal task truth
+- `qexp doctor repair`: converge unfinished metadata repair operations; currently continues interrupted `resubmit` replacements and repairs leftover batch summary corrections from single-task clean
+- `qexp doctor repair-orphans`: moves tasks that lost machine heartbeat for too long while still appearing active into `orphaned`
+- `qexp doctor cleanup-locks`: removes stale lock files after abnormal exits
 
-与 clean 的关系：
+Relationship to `clean`:
 
-- 若 clean 中途失败且您怀疑索引视图不一致，优先跑 `qexp doctor rebuild-index`
-- **假设/未验证**：若后续实现提供更通用的 `qexp doctor repair`，则 single-task clean 的失败恢复应优先收敛到该入口
-- `cleanup-locks` 和 `repair-orphans` 不负责补做 single-task clean 的 batch 修正或索引重建
+- if single-task clean or `resubmit` failed midway, run `qexp doctor repair` first
+- if the main suspicion is index drift, run `qexp doctor rebuild-index`
+- `cleanup-locks` and `repair-orphans` do not complete unfinished `resubmit`, batch repair, or index rebuild work
 
-推荐顺序：
+Recommended order:
 
-1. 先跑 `qexp doctor verify`
-2. 如果怀疑索引不一致，再跑 `qexp doctor rebuild-index`
-3. 如果任务疑似卡死或丢失归属，再考虑 `repair-orphans` 和 `cleanup-locks`
+1. run `qexp doctor verify`
+2. if there is an interrupted `resubmit` or single-task clean, run `qexp doctor repair`
+3. if index inconsistency is still suspected, run `qexp doctor rebuild-index`
+4. if tasks look abandoned or mis-owned, consider `repair-orphans` and `cleanup-locks`
 
-## 典型工作流
+## Common Workflows
 
-### 单机日常使用
+### Daily Single-Machine Use
 
 ```bash
 export QEXP_SHARED_ROOT=/mnt/share/my_qexp
@@ -581,36 +652,37 @@ qexp top
 qexp logs <task_id>
 ```
 
-### 项目内按实验计划管理任务
+### Managing Tasks by Experiment Plan Inside One Project
 
-假设您的项目目录是：
+Assume the project directory is:
 
 ```text
 /mnt/share/myproject/
 ```
 
-并且您现在有一个实验计划，要比较 `n=4` 和 `n=6`。
+And the current plan is to compare `n=4` and `n=6`.
 
-推荐做法不是为这个实验计划单独建一个 `shared root`，而是：
+The recommended approach is not to create a separate `shared_root` for that one plan.
+Instead:
 
-1. 整个项目共用一个 project 级 `shared root`
-2. 用一个稳定的 `group` 表示这次实验计划
-3. 每个具体 run 用单独 task 提交
+1. keep one project-wide `shared_root`
+2. use one stable `group` for this experiment plan
+3. submit each concrete run as its own task
 
-推荐初始化：
+Recommended initialization:
 
 ```bash
 qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
 ```
 
-推荐提交方式：
+Recommended single-task submit path:
 
 ```bash
 qexp submit --group contract_n_4and6 --name n4 --gpus 1 -- python train.py --n 4
 qexp submit --group contract_n_4and6 --name n6 --gpus 1 -- python train.py --n 6
 ```
 
-如果是一批一起交：
+If you want to submit a set together:
 
 ```yaml
 batch:
@@ -626,171 +698,181 @@ tasks:
     command: ["python", "train.py", "--n", "6"]
 ```
 
-然后：
+Then:
 
 ```bash
 qexp batch-submit --file runs.yaml
 ```
 
-后续如果您要补交同一实验计划的新任务，推荐继续复用：
+If you later submit new tasks for the same experiment plan, keep reusing:
 
-- 同一个 `group`
+- the same stable `group`
 
-而不是：
+Do not solve that by creating:
 
-- 新建一个新的 `shared root`
+- a new `shared_root`
 
-推荐管理方式：
+Recommended mental model:
 
-- 用 `group` 代表实验计划
-- 用 `name` 区分具体 run
-- 用 `batch` 组织一次批量提交
-- 用 `task_id` 作为单 task 的唯一主键
-- 用同一个 project 级 `shared root` 保持项目内资源与观察一致性
+- use `group` for the experiment-plan or work-context identity
+- use `name` to distinguish one concrete run from another
+- use `batch` to represent one bulk submit operation
+- use `task_id` as the unique key for one task
+- keep one project-level `shared_root` so queue state and resource visibility stay coherent
 
-### 多机共享同一队列
+### Multiple Machines Sharing One Queue
 
-机器 A：
+Machine A:
 
 ```bash
 qexp init --shared-root /mnt/share/my_qexp --machine gpu-a
 ```
 
-机器 B：
+Machine B:
 
 ```bash
 qexp init --shared-root /mnt/share/my_qexp --machine gpu-b
 ```
 
-之后两台机器都连接到同一个 `shared root`，但各自使用自己的 `machine` 身份和本地 runtime 目录。
+Both machines now point at the same `shared_root`, but each machine still uses:
 
-任务最终在哪台机器执行，取决于哪台机器上的 agent 实际把该任务从队列中拉起并开始调度。
+- its own `machine` identity
+- its own local runtime directory
 
-## 常见问题
+Where a task actually runs depends on which machine agent claims and launches it.
 
-### 1. `submit` 成功了，但任务一直停在 `queued`
+## Troubleshooting
 
-优先检查：
+### `submit` succeeded, but the task stays in `queued`
 
-- 当前机器的 agent 是否真的在运行：`qexp agent status`
-- 当前机器是否卡在 `active` / `draining`，以及 `workset` 是否仍显示 backlog
-- 是否安装了 `tmux`
-- 是否安装了 `libtmux`
-- 当前机器是否能检测到 GPU
+Check these first:
 
-如果自动拉起失败，可以先手动执行：
+- is the current machine's agent actually running: `qexp agent status`
+- is the machine stuck in `active` or `draining`, and does the workset still show backlog
+- is `tmux` installed
+- is `libtmux` installed
+- can the current machine detect GPUs
+
+If automatic wake-up failed, start the agent manually:
 
 ```bash
 qexp agent start
 ```
 
-### 2. `qexp` 提示缺少 `--shared-root` 或 `--machine`
+### `qexp` says `--shared-root` or `--machine` is missing
 
-说明当前命令没有拿到必要的 machine 上下文。
+The current command has no machine context.
 
-解决方式：
+Fix options:
 
-- 显式传 `--shared-root` 和 `--machine`
-- 或设置 `QEXP_SHARED_ROOT` / `QEXP_MACHINE`
+- pass `--shared-root` and `--machine` explicitly
+- or set `QEXP_SHARED_ROOT` and `QEXP_MACHINE`
+- or save context with `qexp use`
 
-### 3. 我能不能为每个实验计划单独建一个 `shared root`
+### Can I create one `shared_root` per experiment plan?
 
-不推荐。
+Not recommended.
 
-推荐：
+Recommended model:
 
-- 整个项目共用一个 project 级 `shared root`
-- 不同实验计划通过 `group` 区分
+- one project-level `shared_root`
+- different experiment plans separated by `group`
 
-如果为每个实验计划拆一个新的 `shared root`，会出现这些问题：
+Problems with one root per experiment plan:
 
-- 同一项目内资源视图被拆碎
-- 同一项目内的 `top` / `machines` / `list` 只能看到局部事实
-- 切换 `qexp use` 后，新的 root 不会自动感知旧 root 中的 task 占用
+- the resource view becomes fragmented inside one project
+- `top`, `machines`, and `list` only see partial truth
+- after switching with `qexp use`, the new root does not automatically know about tasks occupying resources in the old root
 
-只有当您明确要隔离成“另一套独立控制平面”时，才应使用另一个 `shared root`
+Only create another `shared_root` when you explicitly want another independent
+control plane.
 
-### 4. 我以前用过旧版单机 qexp
+### I used the old single-machine qexp before
 
-旧版单机接口已移除。
+The old single-machine interface is gone.
 
-当前应改用 project-root `.qexp` 控制目录，并显式提供 `shared_root` 与 `machine` 上下文。
+The supported model now is:
 
-### 5. `logs` 或任务执行时报本地路径不可写
+- project-root `.qexp` control directory
+- explicit `shared_root`
+- explicit `machine` context
 
-说明当前 machine 的 runtime root 不可写。
+### `logs` fails or task execution says a local path is not writable
 
-优先处理方式：
+That usually means the current machine's runtime root is not writable.
 
-- 给当前用户提供一个可写目录
-- 或显式指定 `--runtime-root`
-- 或设置 `QEXP_RUNTIME_ROOT`
+Preferred fixes:
 
-例如：
+- provide a writable directory for the current user
+- or pass `--runtime-root`
+- or set `QEXP_RUNTIME_ROOT`
+
+Example:
 
 ```bash
 export QEXP_RUNTIME_ROOT=/data/local/qexp-runtime
 ```
 
-## 参数约定
+## CLI Argument Reference
 
-### 全局参数
+### Global Arguments
 
-当前命令支持这些全局参数：
+These global arguments are supported:
 
-- `--shared-root <path>`：共享控制目录；多台机器看到的是同一份任务与索引
-- `--machine <name>`：当前机器身份；必须在 shared root 内唯一
-- `--runtime-root <path>`：当前机器的本地运行目录；保存 agent pid、日志等本地状态；不传时使用默认本地目录
+- `--shared-root <path>`: shared control directory; all machines see the same tasks and indexes there
+- `--machine <name>`: current machine identity; must be unique inside one shared root
+- `--runtime-root <path>`: machine-local runtime directory for logs, pid files, and other local state; defaults to the standard local path if omitted
 
-这些参数一般写在子命令前：
+These arguments usually appear before the subcommand:
 
 ```bash
 qexp --shared-root /mnt/share/my_qexp --machine gpu-a list
 ```
 
-### `submit` 参数
+### `submit` Arguments
 
-- `--task-id <id>`：可选；自定义任务 ID；不传则自动生成
-- `--name <text>`：可选；任务展示名
-- `--group <text>`：可选；项目内长期归组键；适合映射一个实验计划或一组长期相关任务；直接映射到 tmux session 名
-- `--gpus <int>`：请求的 GPU 数量；默认是 `1`
-- `-- <your command...>`：分隔符之后的内容会原样作为用户命令执行
+- `--task-id <id>`: optional custom task id; autogenerated if omitted
+- `--name <text>`: optional display name
+- `--group <text>`: optional long-lived grouping key inside the project; suitable for mapping one experiment plan or other durable work context; maps directly to the tmux session name
+- `--gpus <int>`: requested GPU count; default is `1`
+- `-- <your command...>`: everything after the separator is passed through as the user command
 
-### `retry` 参数
+### `retry` Arguments
 
-- `<task_id>`：必填；要重试的原 task
-- `--group <text>`：可选；显式指定新 task 的 group；不传时默认继承原 task 的 group
+- `<task_id>`: required original task to retry
+- `--group <text>`: optional explicit `group` for the new task; defaults to the original task's `group`
 
-### `top` 参数
+### `top` Arguments
 
-- `--all`：显示所有机器的概览；不传时只看当前 machine
+- `--all`: show an overview of all machines; without it, only the current machine is shown
 
-### `logs` 参数
+### `logs` Arguments
 
-- `-f` / `--follow`：持续跟随日志输出；不传时只打印当前已落盘内容
+- `-f` / `--follow`: follow log output continuously; without it, only already-written content is printed
 
-### `clean` 参数
+### `clean` Arguments
 
-- `--dry-run`：只展示将被清理的记录，不实际删除
-- `--include-failed`：把失败和取消的终态任务也纳入清理范围
-- `--older-than-seconds <int>`：只清理早于该秒数阈值的任务；默认 `604800`，即 7 天
-- `--task-id <id>`：精确清理单个终态 task；与 `--older-than-seconds`、`--include-failed` 互斥
+- `--dry-run`: show what would be removed without deleting it
+- `--include-failed`: include failed and cancelled terminal tasks in cleanup
+- `--older-than-seconds <int>`: only clean tasks older than this threshold; default is `604800` seconds, or 7 days
+- `--task-id <id>`: clean one specific terminal task; mutually exclusive with `--older-than-seconds` and `--include-failed`
 
-`clean` 的结果语义：
+Cleanup result semantics:
 
-- batch clean 主要按终态范围和时间阈值筛选删除对象
-- single-task clean 会删除该 task 的共享真相，并同步修正相关 batch 真相与索引
-- single-task clean 成功后，`qexp inspect <task_id>` 与 `qexp logs <task_id>` 应表现为该 task 已不存在
-- runtime log 删除不是跨机器强保证；若日志未删，CLI 必须明确报告
+- bulk cleanup selects objects mainly by terminal phase and age threshold
+- single-task cleanup removes formal shared truth for that task and also repairs related batch truth and indexes
+- after successful single-task cleanup, `qexp inspect <task_id>` and `qexp logs <task_id>` should behave as if the task no longer exists
+- runtime log deletion is not a cross-machine strong guarantee; if a log remains, the CLI must report that explicitly
 
-## 边界说明
+## Boundaries and Non-Goals
 
-`qexp` 负责轻量实验排队与调度，不负责：
+`qexp` handles lightweight experiment queueing and scheduling. It does not handle:
 
-- 训练指标体系设计
-- artifact 托管
-- 模型版本管理
-- 数据版本管理
-- 远程跨机器命令代理
+- training metric system design
+- artifact hosting
+- model version management
+- data version management
+- remote cross-machine command proxying
 
-如果您需要的是完整实验平台，`qexp` 不是那类系统；它更接近一个轻量共享队列和调度外壳。
+If you need a full experiment platform, `qexp` is not that kind of system. It is
+closer to a lightweight shared queue with scheduling semantics and recovery tooling.

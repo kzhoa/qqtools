@@ -171,21 +171,40 @@ def validate_group_name(group: str | None) -> str | None:
     if group is None:
         return None
     if not isinstance(group, str):
-        raise ValueError("group must be a string or null.")
+        raise ValueError(
+            "group must be a string or null. "
+            "group is the long-lived grouping key that runtime maps to a tmux session."
+        )
     if not group:
-        raise ValueError("group must not be empty.")
+        raise ValueError(
+            "group must not be empty. "
+            "Use null for no long-lived grouping, or pass a stable group name."
+        )
     if len(group) > GROUP_MAX_LENGTH:
-        raise ValueError(f"group length must be <= {GROUP_MAX_LENGTH}.")
+        raise ValueError(
+            f"group length must be <= {GROUP_MAX_LENGTH}. "
+            "group is a long-lived key, not a free-form description."
+        )
     if group[0] in {".", "-"}:
-        raise ValueError("group must not start with '.' or '-'.")
+        raise ValueError(
+            "group must not start with '.' or '-'. "
+            "It maps directly to a tmux session name."
+        )
     if "/" in group or "\\" in group:
-        raise ValueError("group contains illegal path characters.")
+        raise ValueError(
+            "group contains illegal path characters. "
+            "It maps directly to a tmux session name."
+        )
     if group in GROUP_RESERVED_NAMES:
-        raise ValueError(f"group {group!r} is reserved.")
+        raise ValueError(
+            f"group {group!r} is reserved. "
+            "Choose another long-lived grouping key."
+        )
     if not GROUP_PATTERN.fullmatch(group):
         raise ValueError(
             "group contains illegal characters. "
-            "Only letters, digits, '.', '_', and '-' are allowed."
+            "Only letters, digits, '.', '_', and '-' are allowed. "
+            "group maps directly to a tmux session name."
         )
     return group
 

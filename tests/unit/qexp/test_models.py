@@ -126,6 +126,11 @@ class TestValidateGroupName:
         with pytest.raises(ValueError):
             validate_group_name(group)
 
+    def test_invalid_error_mentions_tmux_session_mapping(self):
+        with pytest.raises(ValueError) as exc:
+            validate_group_name("bad space")
+        assert "tmux session" in str(exc.value)
+
 
 # ---------------------------------------------------------------------------
 # validate_machine_name

@@ -41,6 +41,17 @@ class TestInit:
 
 
 class TestSubmit:
+    def test_submit_help_explains_group_vs_batch(self, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        with pytest.raises(SystemExit) as exc:
+            cli_main(["submit", "--help"])
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "group is a long-lived grouping key" in out
+        assert "group is not batch" in out
+        assert "tmux session" in out
+
     def test_submit(self, cfg, capsys):
         from qqtools.plugins.qexp.cli import main as cli_main
         ret = cli_main(_base_args(cfg) + ["submit", "--", "echo", "hello"])
@@ -186,6 +197,20 @@ class TestInspect:
 
 
 class TestBatchSubmit:
+    def test_batch_submit_help_explains_batch_vs_group(self, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        with pytest.raises(SystemExit) as exc:
+            cli_main(["batch-submit", "--help"])
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "batch = one bulk submit operation" in out
+        assert "batch.group = the default" in out
+        assert "long-lived" in out
+        assert "for tasks in this batch" in out
+        assert "another related set tomorrow" in out
+        assert "reuse the same" in out
+
     def test_batch_submit(self, cfg, tmp_path, capsys):
         manifest = tmp_path / "m.yaml"
         manifest.write_text(yaml.dump({
