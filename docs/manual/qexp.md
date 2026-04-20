@@ -16,21 +16,26 @@ It focuses on the operational questions that matter in day-to-day use:
 4. How to observe, cancel, retry, resubmit, and clean tasks
 5. What to check first when something looks wrong
 
-This document is intentionally practical. It keeps the product model, CLI behavior,
-and troubleshooting rules in one place so users do not have to jump into runtime
-specs unless they are working on the internals.
+It is intentionally practical: one document for the product model, the common
+command paths, and the first-line recovery rules. You should not need runtime
+specs unless you are working on the internals.
 
 ## What qexp Is
 
 `qexp` is a lightweight experiment submission queue built around a project-scoped
 control plane.
 
-In the current version:
+At a glance:
 
 - metadata lives in one shared project root
 - machines join that shared control plane explicitly
 - the CLI always operates in the context of one current machine
 - the agent is on-demand by default
+
+`shared_root` is required qexp context. That does not mean every command must
+spell out `--shared-root` explicitly: after `qexp init`, saved context or
+environment variables can provide it. The recommended and supported location is
+`project_root/.qexp`.
 
 `qexp` is not a full experiment platform. It is a shared queue and execution shell
 for submitting tasks, observing them, and recovering from common queue-state issues.
@@ -51,7 +56,7 @@ Do not blur them.
 - `name`: a human-facing label for one task
 - `task_id`: the unique identifier for one task
 
-These boundaries must remain stable:
+Keep these responsibilities stable:
 
 - `task` answers: what exactly is being run?
 - `group` answers: which long-lived working context does this task belong to?
@@ -69,7 +74,7 @@ Important non-equivalences:
 
 ### About `group`
 
-`group` is the most commonly misunderstood field. Read this literally:
+`group` is the most commonly misunderstood field. Read it literally:
 
 - `group` is a long-lived grouping key
 - runtime projects it directly to a tmux session
@@ -83,9 +88,9 @@ Typical mappings:
 - one debugging campaign -> one stable `group`
 - one long-running topic of work -> one stable `group`
 
-If two tasks share the same `group`, they should be understood as belonging to the
-same long-lived working context, even if they were submitted on different days and
-through different `batch` objects.
+If two tasks share the same `group`, they belong to the same long-lived working
+context even if they were submitted on different days through different `batch`
+objects.
 
 ### Task Lifecycle
 
@@ -103,13 +108,13 @@ Meaning:
 
 ## Environment Requirements
 
-### Required for Basic Use
+### Basic Requirements
 
 - Python with `qqtools` installed
 - one shared root visible to all relevant machines
 - one writable local runtime directory on the current machine
 
-### Required for Automatic Execution
+### Requirements for Automatic Execution
 
 If you expect submitted tasks to start automatically, the machine also needs:
 
@@ -157,9 +162,9 @@ If this machine should run a persistent agent:
 qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a --agent-mode persistent
 ```
 
-Default mode is `on_demand`. In that mode the agent starts when needed and exits
-after true idleness. `persistent` is better for dedicated machines that should keep
-an agent alive continuously.
+Default mode is `on_demand`. The agent starts when needed and exits after true
+idleness. `persistent` is better for dedicated machines that should keep an agent
+alive continuously.
 
 `qexp init` also saves the current CLI context:
 
@@ -247,7 +252,7 @@ qexp logs <task_id>
 
 ### Single-Task Submit
 
-The most common path is still:
+This is still the default path:
 
 ```bash
 qexp submit -- python train.py --config configs/a.yaml
@@ -280,7 +285,7 @@ qexp submit \
   -- python train.py --n 4
 ```
 
-Recommended interpretation:
+Interpretation:
 
 - `group` is not a formal business term like "experiment plan"
 - but you can map an experiment plan, debugging campaign, or durable work topic to one stable `group`
@@ -374,7 +379,7 @@ Grouping precedence:
 2. if `tasks[].group` is missing, inherit `batch.group`
 3. if both are missing, task `group = null`
 
-Recommended interpretation:
+Interpretation:
 
 - `batch` means "submitted together in this one bulk operation"
 - `group` means "belongs to this long-lived working context"
@@ -391,7 +396,7 @@ If two different bulk submissions belong to the same experiment plan, use:
 - different `batch` values
 - the same stable `group`
 
-## Observing and Managing Tasks
+## Observe and Manage Tasks
 
 ### List Tasks
 
@@ -468,7 +473,7 @@ Retry into another `group` explicitly:
 qexp retry <task_id> --group regrouped_debug
 ```
 
-Rules:
+Retry rules:
 
 - `qexp retry <task_id>` inherits the original task `group` by default
 - `qexp retry <task_id> --group <group>` overrides it explicitly
@@ -486,7 +491,7 @@ Override the new display name and group:
 qexp resubmit <task_id> --name rerun_a --group regrouped_debug -- python train.py --config configs/a.yaml
 ```
 
-Rules:
+Resubmit rules:
 
 - `resubmit` is only allowed for `failed` or `cancelled`
 - `resubmit` is not allowed for batch-member tasks
@@ -544,7 +549,7 @@ Preview one task cleanup:
 qexp clean --task-id <task_id> --dry-run
 ```
 
-Notes:
+Cleanup notes:
 
 - `qexp clean` is the bulk cleanup mode
 - `qexp clean --task-id <task_id>` is precise single-task cleanup mode
@@ -597,8 +602,8 @@ State meanings:
 - `idle`: this machine has no remaining active responsibility and is waiting for idle timeout
 - `stopped` / `stale` / `failed`: respectively not running, heartbeat lost, or exited abnormally
 
-An `on_demand` agent still exits automatically, but not just because it has not launched
-a new task recently. The exit path is:
+An `on_demand` agent still exits automatically, but not just because it has not
+launched a task recently. The exit path is:
 
 1. this machine no longer owns `queued`, `dispatching`, `starting`, or `running` responsibility
 2. the agent enters `idle`
@@ -625,7 +630,7 @@ Subcommand meanings:
 - `qexp doctor repair-orphans`: moves tasks that lost machine heartbeat for too long while still appearing active into `orphaned`
 - `qexp doctor cleanup-locks`: removes stale lock files after abnormal exits
 
-Relationship to `clean`:
+How this relates to `clean`:
 
 - if single-task clean or `resubmit` failed midway, run `qexp doctor repair` first
 - if the main suspicion is index drift, run `qexp doctor rebuild-index`
@@ -652,7 +657,7 @@ qexp top
 qexp logs <task_id>
 ```
 
-### Managing Tasks by Experiment Plan Inside One Project
+### Manage Tasks by Experiment Plan Inside One Project
 
 Assume the project directory is:
 
@@ -662,8 +667,7 @@ Assume the project directory is:
 
 And the current plan is to compare `n=4` and `n=6`.
 
-The recommended approach is not to create a separate `shared_root` for that one plan.
-Instead:
+Do not create a separate `shared_root` for that plan. Instead:
 
 1. keep one project-wide `shared_root`
 2. use one stable `group` for this experiment plan
@@ -874,5 +878,5 @@ Cleanup result semantics:
 - data version management
 - remote cross-machine command proxying
 
-If you need a full experiment platform, `qexp` is not that kind of system. It is
-closer to a lightweight shared queue with scheduling semantics and recovery tooling.
+If you need a full experiment platform, `qexp` is not that kind of system. It is a
+lightweight shared queue with scheduling semantics and recovery tooling.
