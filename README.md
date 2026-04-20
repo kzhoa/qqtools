@@ -39,8 +39,30 @@ At its core, `qqtools` is a collection of small utilities I use around PyTorch p
 - a command-line experiment queue for Linux, `qexp`
 - config and serialization helpers for YAML, JSON, pickle, and LMDB
 
+At the core, it is still a practical toolbox for the repetitive parts around experiments.
 
-For example, `qDict` is mainly there for cleaner attribute access in batch-like code:
+
+## Install
+
+
+
+```bash
+# Core install
+pip install qqtools
+
+# Full install
+pip install qqtools[full]
+
+# If you only want the experiment queue extras:
+pip install qqtools[exp]
+```
+
+> While some parts still work with `torch==1.x`, `torch>=2.4` is recommended
+
+
+## qDict
+
+`qDict` is mainly there for cleaner attribute access in batch-like code:
 
 ```python
 # Instead of dirty dict brackets:
@@ -51,90 +73,19 @@ batch = qt.qDict({"input_ids": input_ids, "attention_mask": attention_mask})
 out = model(batch.input_ids)
 ```
 
-At the core, it is still a practical toolbox for the repetitive parts around experiments.
-
-## Install
-
-Core install:
-
-```bash
-pip install qqtools
-```
-
-Full install:
-
-```bash
-pip install qqtools[full]
-```
-
-If you only want the experiment queue extras:
-
-```bash
-pip install qqtools[exp]
-```
-
-Requirements:
-
-- Python `>=3.11`
-- `torch>=2.0`
-- `PyYAML>=6.0`
-
-Notes:
-
-- some parts still work with `torch==1.x`
-- `torch>=2.4` is recommended
-
-## A tiny example
-
-```python
-import qqtools as qt
-qt.import_common(globals())
-
-x = np.random.rand(100, 5)
-y = np.random.rand(100, 1)
-
-data_list = [qt.qData({"x": x[i], "y": y[i]}) for i in range(len(x))]
-dataset = qt.qDictDataset(data_list=data_list)
-dataloader = qt.qDictDataloader(dataset=dataset, batch_size=32, shuffle=True)
-
-model = qt.nn.qMLP([5, 5, 1], activation="relu")
-loss_fn = torch.nn.MSELoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4, weight_decay=0.01)
-
-device = torch.device("cuda")
-model.to(device)
-
-for epoch in range(100):
-    for batch in dataloader:
-        batch.to(device)
-        out = model(batch.x)
-        loss = loss_fn(out, batch.y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    print(f"{epoch} {loss.item():4.6f}")
-```
-
 ## qexp
 
-`qexp` is the most standalone tool in this repository.
-It is a lightweight experiment queue for Linux GPU hosts built around a shared project root.
-
-Install:
-
-```bash
-pip install qqtools[exp]
-```
+`qexp` is a lightweight experiment queue for Linux hosts.
+It is built around a shared project root, can work on multi-machines with multi-GPUs.
 
 Quick start:
 
 ```bash
 qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
-qexp submit --name demo -- python train.py --epochs 10
-qexp agent start --background
-qexp list
-qexp top
-qexp logs <task_id> --follow
+qexp submit --name demo1 -- python train.py -c config1.yaml
+qexp submit --name demo2 -- python train.py -c config2.yaml
+qexp submit --name demo3 -- python train.py -c config3.yaml
+# 3 tasks will be queued and run sequentially
 ```
 
 After `init`, `qexp` saves the current `shared_root` and `machine` as CLI context, so you usually do not need to repeat them on every command.
@@ -152,12 +103,60 @@ task = qexp.submit(
 print(task.task_id)
 ```
 
-Notes:
+>Note: Run `pip install qqtools[exp]` before use `qexp` command.
 
-- packaged CLI surface: `qexp`
-- packaged Python API surface: `from qqtools.plugins import qexp`
-- actual execution is supported on local Linux GPU hosts with `tmux` installed
-- non-Linux development is mainly for parsing, rendering, and tests
+## qpipeline
+
+`qpipeline` is a minimal training loop scaffold. It doesn't try to be a heavy framework. You write the project-specific model and task logic, and qpipeline handles the repetitive boilerplate: config-driven startup, train/val loops, metric aggregation, and checkpointing.
+
+A tight training entry:
+
+```python
+import torch
+from qqtools.plugins.qpipeline import prepare_cmd_args, qPipeline
+from qqtools.nn import qMLP
+
+class MyTask:
+    def __init__(self, args):
+        # Your custom data logic goes here
+        self.train_loader, self.val_loader = build_loaders(args)
+
+    def batch_forward(self, model, batch):
+        return {"pred": model(batch.x)}
+
+    def batch_loss(self, out, batch):
+        loss = torch.nn.functional.mse_loss(out["pred"], batch.y)
+        return {"loss": (loss, len(batch.y))}
+
+    def batch_metric(self, out, batch):
+        mae = (out["pred"] - batch.y).abs().mean()
+        return {"mae": (mae, len(batch.y))}
+
+    def post_metric_to_err(self, result):
+        return result["mae"]
+
+class MyPipeline(qPipeline):
+    @staticmethod
+    def prepare_model(args):
+        return qMLP([16, 8, 1])
+
+    @staticmethod
+    def prepare_task(args):
+        return MyTask(args)
+
+if __name__ == "__main__":
+    args = prepare_cmd_args()
+    pipe = MyPipeline(args, train=True)
+    pipe.fit()
+```
+
+Because qpipeline enforces a stable entry contract, it pairs perfectly with qexp for queued execution:
+
+```bash
+qexp submit -- python entry.py --config configs/train.yaml
+```
+
+Configuration follows a standard YAML structure. See [qConfig.md](docs/qConfig_en.md) for details.
 
 ## Plugin modules
 
