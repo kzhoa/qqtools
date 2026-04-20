@@ -2,9 +2,15 @@
 
 ## v1.2.11
 
+- breaking: remove qexp v1 compatibility shims and the transitional `qqtools.plugins.qexp.v2` package surface; only the unified shared-root qexp API/CLI remains
+- feat: add `qexp resubmit` to replace one terminal non-batch task in place with the same `task_id`, persist resubmit operation truth, and surface unfinished replacement state through `inspect`
+- feat: add `qexp doctor repair` to converge unfinished resubmit operations and repair batch metadata inconsistencies in one recovery entrypoint
+- fix: reconcile qexp batch commit-state truth so incomplete `preparing` batches are repaired to committed or aborted with refreshed batch summaries and indexes
 - feat: fail qpipeline runs with `reason=nan_detected` when periodic eval/save boundaries observe NaN training loss
 - feat: synchronize NaN-failure signals across DDP ranks and report source ranks from rank0 logs before unified failed exit
+- docs: sync qexp README/manual/specs with the unified shared-root package surface, project-root `.qexp` contract, `group` semantics, `resubmit`, and `doctor repair`
 - docs: add qpipeline timing manual and update log-format docs for periodic NaN interception behavior
+- test: add qexp coverage for unified package surface, doctor integrity/repair flows, batch commit-state reconciliation, and resubmit transaction semantics
 - test: add functional coverage for NaN terminal events, periodic interception, and distributed NaN-failure signal synchronization
 
 ## v1.2.10
