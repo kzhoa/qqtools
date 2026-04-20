@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ from .layout import (
     validate_root_contract,
 )
 from .locking import batch_lock, clean_lock, submit_lock
+from .locking import task_operation_lock
 from .models import (
     Batch,
     BATCH_COMMIT_ABORTED,
@@ -51,6 +53,14 @@ from .models import (
     TERMINAL_PHASES,
     Task,
     TaskLineage,
+    ResubmitOperation,
+    ResubmitNewSubmission,
+    ResubmitOldTaskSummary,
+    RESUBMIT_STATE_ABORTED,
+    RESUBMIT_STATE_COMMITTED,
+    RESUBMIT_STATE_CREATING_NEW,
+    RESUBMIT_STATE_DELETING_OLD,
+    RESUBMIT_STATE_PREPARING,
     TaskResult,
     TaskRuntime,
     TaskSpec,
@@ -65,16 +75,150 @@ from .storage import (
     CASConflict,
     cas_update_batch,
     cas_update_task,
+    delete_resubmit_operation,
     delete_task_file,
+    load_resubmit_operation,
     load_batch,
     load_machine,
     load_task,
+    save_resubmit_operation,
     save_batch,
     save_task,
     iter_all_tasks,
 )
 
 log = logging.getLogger(__name__)
+
+RESUBMIT_ALLOWED_PHASES = frozenset({PHASE_FAILED, PHASE_CANCELLED})
+
+
+def _create_task(
+    *,
+    cfg: RootConfig,
+    command: list[str],
+    requested_gpus: int,
+    task_id: str,
+    name: str | None,
+    batch_id: str | None,
+    group: str | None,
+    machine_name: str,
+    attempt: int,
+    lineage: TaskLineage | None = None,
+) -> Task:
+    now = utc_now_iso()
+    return Task(
+        meta=Meta.new(machine_name),
+        task_id=task_id,
+        name=name,
+        group=group,
+        batch_id=batch_id,
+        machine_name=machine_name,
+        attempt=attempt,
+        spec=TaskSpec(command=list(command), requested_gpus=requested_gpus),
+        status=TaskStatus(phase=PHASE_QUEUED),
+        runtime=TaskRuntime(),
+        timestamps=TaskTimestamps(created_at=now, queued_at=now),
+        result=TaskResult(),
+        lineage=lineage or TaskLineage(),
+    )
+
+
+def _ensure_no_pending_resubmit(cfg: RootConfig, task_id: str) -> None:
+    try:
+        operation = load_resubmit_operation(cfg, task_id)
+    except FileNotFoundError:
+        return
+    if operation.state not in {RESUBMIT_STATE_COMMITTED, RESUBMIT_STATE_ABORTED}:
+        raise RuntimeError(
+            f"Task {task_id} has an unfinished resubmit operation in state "
+            f"{operation.state!r}. Run 'qexp doctor repair' to converge it."
+        )
+
+
+def _advance_resubmit_operation(
+    cfg: RootConfig,
+    operation: ResubmitOperation,
+    state: str,
+) -> ResubmitOperation:
+    operation.state = state
+    operation.meta.revision += 1
+    operation.meta.updated_at = utc_now_iso()
+    operation.meta.updated_by_machine = cfg.machine_name
+    save_resubmit_operation(cfg, operation)
+    return operation
+
+
+def _build_resubmit_operation(
+    cfg: RootConfig,
+    task: Task,
+    *,
+    command: list[str],
+    requested_gpus: int,
+    name: str | None,
+    group: str | None,
+) -> ResubmitOperation:
+    prepared_task = _create_task(
+        cfg=cfg,
+        command=command,
+        requested_gpus=requested_gpus,
+        task_id=task.task_id,
+        name=name,
+        batch_id=None,
+        group=group,
+        machine_name=cfg.machine_name,
+        attempt=1,
+    )
+    return ResubmitOperation(
+        meta=Meta.new(cfg.machine_name),
+        operation_type="resubmit",
+        task_id=task.task_id,
+        state=RESUBMIT_STATE_PREPARING,
+        old_task_snapshot_path=f"global/tasks/{task.task_id}.json",
+        new_submission=ResubmitNewSubmission(
+            command=list(command),
+            requested_gpus=requested_gpus,
+            name=name,
+            group=group,
+            machine_name=cfg.machine_name,
+        ),
+        new_task_snapshot=prepared_task.to_dict(),
+        old_task_summary=ResubmitOldTaskSummary(
+            phase=task.status.phase,
+            machine_name=task.machine_name,
+            attempt=task.attempt,
+            batch_id=task.batch_id,
+            name=task.name,
+            group=task.group,
+        ),
+    )
+
+
+def _best_effort_delete_task_log(cfg: RootConfig, task: Task) -> None:
+    try:
+        _delete_task_log(_resolve_task_log_path(cfg, task))
+    except Exception:
+        log.warning("Failed to remove runtime log for task %s.", task.task_id, exc_info=True)
+
+
+def _delete_task_truth(cfg: RootConfig, task: Task) -> None:
+    delete_task_file(cfg, task.task_id)
+    try:
+        remove_index_on_delete(cfg, task)
+    except Exception:
+        log.warning("Failed to update indexes while deleting task %s.", task.task_id, exc_info=True)
+    _best_effort_delete_task_log(cfg, task)
+
+
+def _persist_submitted_task_truth(cfg: RootConfig, task: Task) -> None:
+    save_task(cfg, task)
+    try:
+        update_index_on_submit(cfg, task)
+    except Exception:
+        log.warning("Failed to update indexes while creating task %s.", task.task_id, exc_info=True)
+
+
+def _materialize_resubmit_task(operation: ResubmitOperation) -> Task:
+    return Task.from_dict(operation.new_task_snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -96,30 +240,30 @@ def submit(
         task_id = generate_id()
     validate_task_id(task_id)
     group = validate_group_name(group)
-
-    now = utc_now_iso()
-    task = Task(
-        meta=Meta.new(cfg.machine_name),
+    task = _create_task(
+        cfg=cfg,
+        command=command,
+        requested_gpus=requested_gpus,
         task_id=task_id,
         name=name,
-        group=group,
         batch_id=batch_id,
+        group=group,
         machine_name=cfg.machine_name,
         attempt=1,
-        spec=TaskSpec(command=list(command), requested_gpus=requested_gpus),
-        status=TaskStatus(phase=PHASE_QUEUED),
-        runtime=TaskRuntime(),
-        timestamps=TaskTimestamps(created_at=now, queued_at=now),
-        result=TaskResult(),
-        lineage=TaskLineage(),
     )
 
     ensure_shared_layout(cfg)
     ensure_machine_layout(cfg)
 
     with submit_lock(cfg):
-        save_task(cfg, task)
-        update_index_on_submit(cfg, task)
+        _ensure_no_pending_resubmit(cfg, task_id)
+        try:
+            load_task(cfg, task_id)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError(f"Task {task_id!r} already exists.")
+        _persist_submitted_task_truth(cfg, task)
 
     if not wake_agent_if_needed(cfg):
         import sys
@@ -142,42 +286,44 @@ def cancel(
     grace_seconds: float = 3.0,
     poll_interval: float = 0.1,
 ) -> Task:
-    task = load_task(cfg, task_id)
-    phase = task.status.phase
+    with task_operation_lock(cfg, task_id):
+        _ensure_no_pending_resubmit(cfg, task_id)
+        task = load_task(cfg, task_id)
+        phase = task.status.phase
 
-    if phase not in CANCELLABLE_PHASES:
-        raise ValueError(
-            f"Cannot cancel task {task_id} in phase {phase!r}. "
-            f"Cancellable phases: {sorted(CANCELLABLE_PHASES)}."
-        )
+        if phase not in CANCELLABLE_PHASES:
+            raise ValueError(
+                f"Cannot cancel task {task_id} in phase {phase!r}. "
+                f"Cancellable phases: {sorted(CANCELLABLE_PHASES)}."
+            )
 
-    old_phase = phase
-    old_rev = task.meta.revision
+        old_phase = phase
+        old_rev = task.meta.revision
 
-    # If running with a live process, signal with escalation
-    if phase == PHASE_RUNNING and task.runtime.wrapper_pid:
-        _kill_with_escalation(
-            task.runtime.wrapper_pid,
-            grace_seconds=grace_seconds,
-            poll_interval=poll_interval,
-        )
-        # Also signal the process group if available
-        if task.runtime.process_group_id:
-            try:
-                os.killpg(task.runtime.process_group_id, signal.SIGTERM)
-            except OSError:
-                pass
+        # If running with a live process, signal with escalation
+        if phase == PHASE_RUNNING and task.runtime.wrapper_pid:
+            _kill_with_escalation(
+                task.runtime.wrapper_pid,
+                grace_seconds=grace_seconds,
+                poll_interval=poll_interval,
+            )
+            # Also signal the process group if available
+            if task.runtime.process_group_id:
+                try:
+                    os.killpg(task.runtime.process_group_id, signal.SIGTERM)
+                except OSError:
+                    pass
 
-    task.status.phase = PHASE_CANCELLED
-    task.status.reason = "cancelled_by_user"
-    task.timestamps.finished_at = utc_now_iso()
-    task = cas_update_task(cfg, task, old_rev)
-    update_index_on_phase_change(cfg, task_id, old_phase, PHASE_CANCELLED)
+        task.status.phase = PHASE_CANCELLED
+        task.status.reason = "cancelled_by_user"
+        task.timestamps.finished_at = utc_now_iso()
+        task = cas_update_task(cfg, task, old_rev)
+        update_index_on_phase_change(cfg, task_id, old_phase, PHASE_CANCELLED)
 
-    from .events import write_event
-    write_event(cfg, "task_cancelled", task_id=task_id)
+        from .events import write_event
+        write_event(cfg, "task_cancelled", task_id=task_id)
 
-    return task
+        return task
 
 
 def _kill_with_escalation(
@@ -213,47 +359,135 @@ def _kill_with_escalation(
 
 def retry(cfg: RootConfig, task_id: str, group: str | None = None) -> Task:
     validate_root_contract(cfg)
-    original = load_task(cfg, task_id)
+    with task_operation_lock(cfg, task_id):
+        _ensure_no_pending_resubmit(cfg, task_id)
+        original = load_task(cfg, task_id)
 
-    if original.status.phase not in TERMINAL_PHASES:
-        raise ValueError(
-            f"Cannot retry task {task_id} in phase {original.status.phase!r}. "
-            f"Only terminal tasks can be retried."
+        if original.status.phase not in TERMINAL_PHASES:
+            raise ValueError(
+                f"Cannot retry task {task_id} in phase {original.status.phase!r}. "
+                f"Only terminal tasks can be retried."
+            )
+
+        resolved_group = original.group if group is None else validate_group_name(group)
+
+        new_id = generate_id()
+        new_task = _create_task(
+            cfg=cfg,
+            command=original.spec.command,
+            requested_gpus=original.spec.requested_gpus,
+            task_id=new_id,
+            name=original.name,
+            batch_id=original.batch_id,
+            group=resolved_group,
+            machine_name=cfg.machine_name,
+            attempt=original.attempt + 1,
+            lineage=TaskLineage(retry_of=original.task_id),
         )
 
-    resolved_group = original.group if group is None else validate_group_name(group)
-
-    new_id = generate_id()
-    now = utc_now_iso()
-
-    new_task = Task(
-        meta=Meta.new(cfg.machine_name),
-        task_id=new_id,
-        name=original.name,
-        group=resolved_group,
-        batch_id=original.batch_id,
-        machine_name=cfg.machine_name,
-        attempt=original.attempt + 1,
-        spec=TaskSpec(
-            command=list(original.spec.command),
-            requested_gpus=original.spec.requested_gpus,
-        ),
-        status=TaskStatus(phase=PHASE_QUEUED),
-        runtime=TaskRuntime(),
-        timestamps=TaskTimestamps(created_at=now, queued_at=now),
-        result=TaskResult(),
-        lineage=TaskLineage(retry_of=original.task_id),
-    )
-
-    with submit_lock(cfg):
-        save_task(cfg, new_task)
-        update_index_on_submit(cfg, new_task)
+        with submit_lock(cfg):
+            _persist_submitted_task_truth(cfg, new_task)
 
     # Update batch if applicable
     if original.batch_id:
         _add_task_to_batch(cfg, original.batch_id, new_id)
 
     wake_agent_if_needed(cfg)
+    return new_task
+
+
+def resubmit(
+    cfg: RootConfig,
+    task_id: str,
+    *,
+    command: list[str],
+    requested_gpus: int | None = None,
+    name: str | None = None,
+    group: str | None = None,
+) -> Task:
+    validate_root_contract(cfg)
+    validate_task_id(task_id)
+
+    with task_operation_lock(cfg, task_id):
+        operation_persisted = False
+        _ensure_no_pending_resubmit(cfg, task_id)
+        original = load_task(cfg, task_id)
+
+        if original.status.phase not in RESUBMIT_ALLOWED_PHASES:
+            raise ValueError(
+                f"Cannot resubmit task {task_id} in phase {original.status.phase!r}. "
+                f"Allowed phases: {sorted(RESUBMIT_ALLOWED_PHASES)}."
+            )
+        if original.batch_id is not None:
+            raise ValueError(
+                f"Cannot resubmit batch member task {task_id}. "
+                "Batch task resubmit is not supported."
+            )
+
+        resolved_group = original.group if group is None else validate_group_name(group)
+        resolved_name = original.name if name is None else name
+        resolved_gpus = (
+            original.spec.requested_gpus if requested_gpus is None else requested_gpus
+        )
+        TaskSpec(command=list(command), requested_gpus=resolved_gpus)
+        operation = _build_resubmit_operation(
+            cfg,
+            original,
+            command=command,
+            requested_gpus=resolved_gpus,
+            name=resolved_name,
+            group=resolved_group,
+        )
+
+        ensure_shared_layout(cfg)
+        ensure_machine_layout(cfg)
+
+        with submit_lock(cfg):
+            try:
+                save_resubmit_operation(cfg, operation)
+                operation_persisted = True
+                from .events import write_event
+
+                write_event(
+                    cfg,
+                    "resubmit_started",
+                    task_id=task_id,
+                    details={"state": operation.state},
+                )
+
+                operation = _advance_resubmit_operation(
+                    cfg, operation, RESUBMIT_STATE_DELETING_OLD
+                )
+                _delete_task_truth(cfg, original)
+
+                operation = _advance_resubmit_operation(
+                    cfg, operation, RESUBMIT_STATE_CREATING_NEW
+                )
+                new_task = _materialize_resubmit_task(operation)
+                _persist_submitted_task_truth(cfg, new_task)
+                _advance_resubmit_operation(cfg, operation, RESUBMIT_STATE_COMMITTED)
+                delete_resubmit_operation(cfg, task_id)
+                write_event(
+                    cfg,
+                    "resubmit_committed",
+                    task_id=task_id,
+                    details={"replaced_phase": original.status.phase},
+                )
+            except Exception as exc:
+                if operation_persisted:
+                    raise RuntimeError(
+                        f"Resubmit for task {task_id} did not converge. "
+                        "An unfinished resubmit operation was recorded. "
+                        "Run 'qexp doctor repair' to continue convergence."
+                    ) from exc
+                raise
+
+    if not wake_agent_if_needed(cfg):
+        print(
+            f"Warning: task {task_id} resubmitted, but agent could not be started. "
+            f"Run 'qexp agent start' manually or start an agent on this machine.",
+            file=sys.stderr,
+        )
     return new_task
 
 
@@ -578,72 +812,82 @@ def clean(
 
     mode = "single_task" if task_id is not None else "batch"
 
-    if mode == "single_task":
-        candidates = [_load_single_clean_candidate(cfg, task_id)]
-    else:
-        candidates = _select_batch_clean_candidates(
-            cfg,
-            include_failed=include_failed,
-            older_than_seconds=older_than_seconds,
-        )
-
-    planned_task_ids = [task.task_id for task in candidates]
-    log_plans = [_resolve_task_log_path(cfg, task) for task in candidates]
-
-    batch_updates = _plan_batch_updates(cfg, candidates)
-
-    result: dict[str, Any] = {
-        "dry_run": dry_run,
-        "mode": mode,
-        "task_ids": planned_task_ids,
-        "deleted_task_count": len(planned_task_ids) if not dry_run else 0,
-        "planned_task_count": len(planned_task_ids),
-        "deleted_log_count": 0,
-        "deleted_log_files": [],
-        "repaired_batches": sorted(batch_updates.keys()),
-        "log_results": [asdict(plan) for plan in log_plans],
-    }
-
-    if dry_run:
-        return result
-
-    deleted_task_ids: list[str] = []
-    deleted_log_files: list[str] = []
-    log_results: list[dict[str, Any]] = []
-    mutations_started = False
-
+    should_repair = False
     try:
         with clean_lock(cfg):
-            _apply_batch_updates(cfg, batch_updates)
-            mutations_started = bool(batch_updates)
+            task_lock = (
+                task_operation_lock(cfg, task_id)
+                if mode == "single_task" and task_id
+                else nullcontext()
+            )
+            with task_lock:
+                if mode == "single_task" and task_id is not None:
+                    _ensure_no_pending_resubmit(cfg, task_id)
+                    candidates = [_load_single_clean_candidate(cfg, task_id)]
+                else:
+                    candidates = _select_batch_clean_candidates(
+                        cfg,
+                        include_failed=include_failed,
+                        older_than_seconds=older_than_seconds,
+                    )
 
-            for task in candidates:
-                delete_task_file(cfg, task.task_id)
-                deleted_task_ids.append(task.task_id)
-                mutations_started = True
+                planned_task_ids = [task.task_id for task in candidates]
+                log_plans = [_resolve_task_log_path(cfg, task) for task in candidates]
 
-            rebuild_all_indexes(cfg)
+                batch_updates = _plan_batch_updates(cfg, candidates)
 
-        for resolved in log_plans:
-            log_result = _delete_task_log(resolved)
-            log_results.append(log_result)
-            if log_result["status"] == "deleted" and log_result["path"]:
-                deleted_log_files.append(log_result["path"])
+                result: dict[str, Any] = {
+                    "dry_run": dry_run,
+                    "mode": mode,
+                    "task_ids": planned_task_ids,
+                    "deleted_task_count": len(planned_task_ids) if not dry_run else 0,
+                    "planned_task_count": len(planned_task_ids),
+                    "deleted_log_count": 0,
+                    "deleted_log_files": [],
+                    "repaired_batches": sorted(batch_updates.keys()),
+                    "log_results": [asdict(plan) for plan in log_plans],
+                }
+
+                if dry_run:
+                    return result
+
+                deleted_task_ids: list[str] = []
+                deleted_log_files: list[str] = []
+                log_results: list[dict[str, Any]] = []
+                mutations_started = False
+
+                _apply_batch_updates(cfg, batch_updates)
+                mutations_started = bool(batch_updates)
+                should_repair = mutations_started
+
+                for task in candidates:
+                    delete_task_file(cfg, task.task_id)
+                    deleted_task_ids.append(task.task_id)
+                    mutations_started = True
+                    should_repair = True
+
+                rebuild_all_indexes(cfg)
+
+                for resolved in log_plans:
+                    log_result = _delete_task_log(resolved)
+                    log_results.append(log_result)
+                    if log_result["status"] == "deleted" and log_result["path"]:
+                        deleted_log_files.append(log_result["path"])
+
+                result.update(
+                    {
+                        "task_ids": deleted_task_ids,
+                        "deleted_task_count": len(deleted_task_ids),
+                        "deleted_log_count": len(deleted_log_files),
+                        "deleted_log_files": deleted_log_files,
+                        "log_results": log_results,
+                    }
+                )
+                return result
     except Exception:
-        if mutations_started:
+        if should_repair:
             repair_metadata(cfg)
         raise
-
-    result.update(
-        {
-            "task_ids": deleted_task_ids,
-            "deleted_task_count": len(deleted_task_ids),
-            "deleted_log_count": len(deleted_log_files),
-            "deleted_log_files": deleted_log_files,
-            "log_results": log_results,
-        }
-    )
-    return result
 
 
 def _load_single_clean_candidate(cfg: RootConfig, task_id: str) -> Task:

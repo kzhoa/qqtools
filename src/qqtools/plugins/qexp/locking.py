@@ -11,6 +11,7 @@ from .layout import (
     batch_lock_path,
     migrate_lock_path,
     submit_lock_path,
+    task_operation_lock_path,
 )
 
 
@@ -86,3 +87,11 @@ def migrate_lock(cfg: RootConfig, timeout: float = 30.0) -> FileLock:
 
 def clean_lock(cfg: RootConfig, timeout: float = 30.0) -> FileLock:
     return FileLock(clean_lock_path(cfg), timeout=timeout)
+
+
+def task_operation_lock(
+    cfg: RootConfig,
+    task_id: str,
+    timeout: float = 30.0,
+) -> FileLock:
+    return FileLock(task_operation_lock_path(cfg, task_id), timeout=timeout)

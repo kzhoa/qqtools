@@ -10,15 +10,18 @@ from .layout import (
     RootConfig,
     batch_path,
     global_batches_dir,
+    global_resubmit_operations_dir,
     global_tasks_dir,
     machine_claims_active_dir,
     machine_claims_released_dir,
     machine_json_path,
+    resubmit_operation_path,
     task_path,
 )
 from .models import (
     Batch,
     Machine,
+    ResubmitOperation,
     Task,
     utc_now_iso,
     validate_task_id,
@@ -108,6 +111,43 @@ def delete_task_file(cfg: RootConfig, task_id: str) -> None:
     path = task_path(cfg, task_id)
     if path.is_file():
         path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Resubmit operation persistence
+# ---------------------------------------------------------------------------
+
+
+def save_resubmit_operation(cfg: RootConfig, operation: ResubmitOperation) -> None:
+    path = resubmit_operation_path(cfg, operation.task_id)
+    write_atomic_json(path, operation.to_dict())
+
+
+def load_resubmit_operation(cfg: RootConfig, task_id: str) -> ResubmitOperation:
+    validate_task_id(task_id)
+    path = resubmit_operation_path(cfg, task_id)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Resubmit operation for task {task_id} not found at {path}."
+        )
+    return ResubmitOperation.from_dict(read_json(path))
+
+
+def delete_resubmit_operation(cfg: RootConfig, task_id: str) -> None:
+    path = resubmit_operation_path(cfg, task_id)
+    if path.is_file():
+        path.unlink()
+
+
+def iter_resubmit_operations(cfg: RootConfig) -> list[ResubmitOperation]:
+    ops_dir = global_resubmit_operations_dir(cfg)
+    if not ops_dir.is_dir():
+        return []
+    result = []
+    for p in sorted(ops_dir.glob("*.json")):
+        if p.suffix == ".json" and not p.name.endswith(".tmp"):
+            result.append(ResubmitOperation.from_dict(read_json(p)))
+    return result
 
 
 # ---------------------------------------------------------------------------

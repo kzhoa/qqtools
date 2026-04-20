@@ -63,6 +63,14 @@ def global_indexes_dir(cfg: RootConfig) -> Path:
     return global_dir(cfg) / "indexes"
 
 
+def global_operations_dir(cfg: RootConfig) -> Path:
+    return global_dir(cfg) / "operations"
+
+
+def global_resubmit_operations_dir(cfg: RootConfig) -> Path:
+    return global_operations_dir(cfg) / "resubmit"
+
+
 def global_locks_dir(cfg: RootConfig) -> Path:
     return global_dir(cfg) / "locks"
 
@@ -100,6 +108,10 @@ def task_path(cfg: RootConfig, task_id: str) -> Path:
 
 def batch_path(cfg: RootConfig, batch_id: str) -> Path:
     return global_batches_dir(cfg) / f"{batch_id}.json"
+
+
+def resubmit_operation_path(cfg: RootConfig, task_id: str) -> Path:
+    return global_resubmit_operations_dir(cfg) / f"{task_id}.json"
 
 
 def machine_json_path(cfg: RootConfig) -> Path:
@@ -183,6 +195,10 @@ def clean_lock_path(cfg: RootConfig) -> Path:
     return global_locks_dir(cfg) / "clean"
 
 
+def task_operation_lock_path(cfg: RootConfig, task_id: str) -> Path:
+    return global_locks_dir(cfg) / "tasks" / f"{task_id}.lock"
+
+
 # ---------------------------------------------------------------------------
 # Layout creation
 # ---------------------------------------------------------------------------
@@ -191,6 +207,7 @@ _SHARED_DIRS = [
     global_schema_dir,
     global_tasks_dir,
     global_batches_dir,
+    global_resubmit_operations_dir,
     global_locks_dir,
     global_events_dir,
     index_by_state_dir,

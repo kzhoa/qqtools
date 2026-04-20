@@ -533,11 +533,6 @@ task:
 - `group` 不得要求在 `shared_root` 下拥有独立真相目录
 - `group` 的缺省值为 `null`
 
-**假设/未验证**：
-
-- `group` 已被本文档定义为正式目标字段
-- 但当前安装版本未必已经在 task 真相文件、CLI submit 参数和 observer 输出中完整实现
-
 设计原则：
 
 - 这是唯一正式 task 真相
@@ -604,11 +599,6 @@ batch:
 - `batch.task_ids` 是这批 task 的正式成员列表
 - `batch.summary.*` 是聚合字段，可由 task 真相重建
 
-**假设/未验证**：
-
-- `batch.group` 已被本文档定义为正式目标字段
-- 但当前安装版本未必已经在 batch-submit manifest、batch 真相写入和相关观察命令中完整实现
-
 设计原则：
 
 - batch 是组织容器，不是执行主体
@@ -670,8 +660,10 @@ batch 与 group 的关系约束：
 
 1. 校验目标 task 当前处于允许被 `resubmit` 的终态
 2. 校验该 task 不属于受限场景
-3. 删除旧 task 真相、相关索引项以及 best-effort runtime log
-4. 用相同 `task_id` 创建一个新的 task 真相文件
+3. 持久化一条独立的 resubmit operation 真相
+4. 删除旧 task 真相、相关索引项以及 best-effort runtime log
+5. 用相同 `task_id` 创建一个新的 task 真相文件
+6. 将 operation 推进为 committed，或在中断后由 `qexp doctor repair` 继续收敛
 
 默认限制：
 
@@ -685,6 +677,7 @@ batch 与 group 的关系约束：
 - 不允许把旧 task 的 `lineage.retry_of`、终态 `status.reason`、`result.*` 直接带入新 task
 - 新 task 必须表现为一次新的首次提交，而不是一次可见的 retry
 - `resubmit` 可以复用 single-task clean 的底层删除逻辑，但必须由 `resubmit` 自己掌控完整流程与一致性边界，不能退化成两个独立公开命令的松散拼接
+- 在 `creating_new` 阶段，repair 必须按 prepared replacement snapshot 识别已创建的新 task，而不是把运行中 replacement task 误判为残留旧真相
 
 ### batch 真相层最小写入原则
 

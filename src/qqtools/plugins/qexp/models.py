@@ -97,6 +97,24 @@ BATCH_COMMIT_STATES = (
 )
 
 # ---------------------------------------------------------------------------
+# Resubmit operation states
+# ---------------------------------------------------------------------------
+
+RESUBMIT_STATE_PREPARING = "preparing"
+RESUBMIT_STATE_DELETING_OLD = "deleting_old"
+RESUBMIT_STATE_CREATING_NEW = "creating_new"
+RESUBMIT_STATE_COMMITTED = "committed"
+RESUBMIT_STATE_ABORTED = "aborted"
+
+RESUBMIT_STATES = (
+    RESUBMIT_STATE_PREPARING,
+    RESUBMIT_STATE_DELETING_OLD,
+    RESUBMIT_STATE_CREATING_NEW,
+    RESUBMIT_STATE_COMMITTED,
+    RESUBMIT_STATE_ABORTED,
+)
+
+# ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
 
@@ -200,6 +218,14 @@ def validate_batch_commit_state(state: str) -> str:
         raise ValueError(
             f"Invalid batch commit_state {state!r}. "
             f"Must be one of {BATCH_COMMIT_STATES}."
+        )
+    return state
+
+
+def validate_resubmit_state(state: str) -> str:
+    if state not in RESUBMIT_STATES:
+        raise ValueError(
+            f"Invalid resubmit state {state!r}. Must be one of {RESUBMIT_STATES}."
         )
     return state
 
@@ -485,6 +511,109 @@ class Batch:
             task_ids=b.get("task_ids", []),
             summary=BatchSummary.from_dict(b.get("summary", {})),
             policy=BatchPolicy.from_dict(b.get("policy", {})),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Resubmit operation
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class ResubmitNewSubmission:
+    command: list[str]
+    requested_gpus: int
+    name: str | None
+    group: str | None
+    machine_name: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.command, list) or not self.command:
+            raise ValueError("resubmit new submission command must be a non-empty list.")
+        if any(not isinstance(a, str) for a in self.command):
+            raise ValueError("resubmit new submission command entries must be strings.")
+        if not isinstance(self.requested_gpus, int) or self.requested_gpus <= 0:
+            raise ValueError("requested_gpus must be a positive integer.")
+        validate_group_name(self.group)
+        validate_machine_name(self.machine_name)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ResubmitNewSubmission:
+        return cls(**data)
+
+
+@dataclass(slots=True)
+class ResubmitOldTaskSummary:
+    phase: str
+    machine_name: str
+    attempt: int
+    batch_id: str | None
+    name: str | None
+    group: str | None
+
+    def __post_init__(self) -> None:
+        validate_phase(self.phase)
+        validate_machine_name(self.machine_name)
+        validate_group_name(self.group)
+        if not isinstance(self.attempt, int) or self.attempt <= 0:
+            raise ValueError("attempt must be a positive integer.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ResubmitOldTaskSummary:
+        return cls(**data)
+
+
+@dataclass(slots=True)
+class ResubmitOperation:
+    meta: Meta
+    operation_type: str
+    task_id: str
+    state: str
+    old_task_snapshot_path: str
+    new_submission: ResubmitNewSubmission
+    new_task_snapshot: dict[str, Any]
+    old_task_summary: ResubmitOldTaskSummary
+
+    def __post_init__(self) -> None:
+        if self.operation_type != "resubmit":
+            raise ValueError("operation_type must be 'resubmit'.")
+        validate_task_id(self.task_id)
+        validate_resubmit_state(self.state)
+        Task.from_dict(self.new_task_snapshot)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "meta": self.meta.to_dict(),
+            "operation": {
+                "operation_type": self.operation_type,
+                "task_id": self.task_id,
+                "state": self.state,
+                "old_task_snapshot_path": self.old_task_snapshot_path,
+                "new_submission": self.new_submission.to_dict(),
+                "new_task_snapshot": self.new_task_snapshot,
+                "old_task_summary": self.old_task_summary.to_dict(),
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ResubmitOperation:
+        meta = Meta.from_dict(data["meta"])
+        op = data["operation"]
+        return cls(
+            meta=meta,
+            operation_type=op["operation_type"],
+            task_id=op["task_id"],
+            state=validate_resubmit_state(op["state"]),
+            old_task_snapshot_path=op["old_task_snapshot_path"],
+            new_submission=ResubmitNewSubmission.from_dict(op["new_submission"]),
+            new_task_snapshot=op["new_task_snapshot"],
+            old_task_summary=ResubmitOldTaskSummary.from_dict(op["old_task_summary"]),
         )
 
 

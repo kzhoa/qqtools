@@ -12,11 +12,13 @@ from qqtools.plugins.qexp.api import (
     cancel,
     clean,
     get_log_path,
+    resubmit,
     retry,
     submit,
 )
+from qqtools.plugins.qexp.doctor import repair_metadata
 from qqtools.plugins.qexp.indexes import load_index
-from qqtools.plugins.qexp.layout import init_shared_root
+from qqtools.plugins.qexp.layout import init_shared_root, resubmit_operation_path
 from qqtools.plugins.qexp.models import (
     BATCH_COMMIT_ABORTED,
     BATCH_COMMIT_COMMITTED,
@@ -27,7 +29,13 @@ from qqtools.plugins.qexp.models import (
     PHASE_RUNNING,
     PHASE_SUCCEEDED,
 )
-from qqtools.plugins.qexp.storage import cas_update_task, load_batch, load_task
+from qqtools.plugins.qexp.storage import (
+    cas_update_task,
+    load_batch,
+    load_resubmit_operation,
+    load_task,
+    save_resubmit_operation,
+)
 
 
 @pytest.fixture()
@@ -69,6 +77,11 @@ class TestSubmit:
     def test_invalid_task_id(self, cfg):
         with pytest.raises(ValueError):
             submit(cfg, command=["echo"], task_id="../bad")
+
+    def test_rejects_existing_task_id(self, cfg):
+        submit(cfg, command=["echo"], task_id="dup1")
+        with pytest.raises(ValueError, match="already exists"):
+            submit(cfg, command=["echo"], task_id="dup1")
 
     def test_with_name(self, cfg):
         t = submit(cfg, command=["echo"], name="test run")
@@ -200,6 +213,142 @@ class TestRetry:
         original = self._make_failed_task(cfg)
         new = retry(cfg, original.task_id)
         assert new.task_id in load_index(cfg, "state", PHASE_QUEUED)
+
+
+class TestResubmit:
+    def _make_terminal_task(self, cfg, phase=PHASE_FAILED, *, task_id="t1", batch_id=None):
+        t = submit(cfg, command=["python", "train.py"], task_id=task_id, name="exp1", group="contract_n_4and6")
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+
+        t = load_task(cfg, t.task_id)
+        t.batch_id = batch_id
+        t.status.phase = phase
+        t.status.reason = "terminal"
+        t.result.exit_code = 1 if phase == PHASE_FAILED else None
+        t.result.terminal_reason = "nonzero_exit" if phase == PHASE_FAILED else None
+        t.runtime.wrapper_pid = 999 if phase == PHASE_FAILED else None
+        t.timestamps.started_at = "2026-01-01T00:00:00Z"
+        t.timestamps.finished_at = "2026-01-01T00:10:00Z"
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, t.task_id, PHASE_QUEUED, phase)
+        return load_task(cfg, t.task_id)
+
+    def _save_resubmit_op(self, cfg, task, *, command):
+        from qqtools.plugins.qexp.api import _build_resubmit_operation
+
+        operation = _build_resubmit_operation(
+            cfg,
+            task,
+            command=command,
+            requested_gpus=task.spec.requested_gpus,
+            name=task.name,
+            group=task.group,
+        )
+        save_resubmit_operation(cfg, operation)
+        return load_resubmit_operation(cfg, task.task_id)
+
+    def test_resubmit_failed_task_replaces_truth(self, cfg):
+        original = self._make_terminal_task(cfg, PHASE_FAILED)
+        new = resubmit(cfg, original.task_id, command=["python", "train.py", "--fresh"])
+
+        assert new.task_id == original.task_id
+        assert new.status.phase == PHASE_QUEUED
+        assert new.spec.command == ["python", "train.py", "--fresh"]
+        assert new.lineage.retry_of is None
+        assert new.result.exit_code is None
+        assert new.result.terminal_reason is None
+        assert new.runtime.wrapper_pid is None
+        assert new.timestamps.finished_at is None
+        assert new.group == "contract_n_4and6"
+        assert new.task_id in load_index(cfg, "state", PHASE_QUEUED)
+        assert new.task_id not in load_index(cfg, "state", PHASE_FAILED)
+        assert not resubmit_operation_path(cfg, new.task_id).exists()
+
+    def test_resubmit_cancelled_task_is_fresh_first_submit(self, cfg):
+        original = self._make_terminal_task(cfg, PHASE_CANCELLED, task_id="cancelled1")
+        new = resubmit(cfg, original.task_id, command=["echo", "rerun"])
+
+        assert new.task_id == "cancelled1"
+        assert new.attempt == 1
+        assert new.lineage.retry_of is None
+        assert new.status.phase == PHASE_QUEUED
+
+    def test_resubmit_rejects_non_terminal_task(self, cfg):
+        submit(cfg, command=["echo"], task_id="live1")
+
+        with pytest.raises(ValueError, match="Cannot resubmit"):
+            resubmit(cfg, "live1", command=["echo", "again"])
+
+        assert not resubmit_operation_path(cfg, "live1").exists()
+
+    def test_resubmit_rejects_batch_member(self, cfg):
+        task = self._make_terminal_task(cfg, PHASE_FAILED, task_id="batch-task", batch_id="b1")
+
+        with pytest.raises(ValueError, match="Batch task resubmit"):
+            resubmit(cfg, task.task_id, command=["echo", "again"])
+
+        assert load_task(cfg, task.task_id).batch_id == "b1"
+        assert not resubmit_operation_path(cfg, task.task_id).exists()
+
+    def test_repair_completes_resubmit_after_delete_old(self, cfg):
+        task = self._make_terminal_task(cfg, PHASE_FAILED, task_id="repair1")
+        operation = self._save_resubmit_op(cfg, task, command=["echo", "new"])
+        from qqtools.plugins.qexp.api import _delete_task_truth, _advance_resubmit_operation
+
+        _advance_resubmit_operation(cfg, operation, "deleting_old")
+        _delete_task_truth(cfg, task)
+
+        result = repair_metadata(cfg)
+        repaired = load_task(cfg, "repair1")
+        assert "repair1" in result["repaired_resubmits"]
+        assert repaired.status.phase == PHASE_QUEUED
+        assert repaired.spec.command == ["echo", "new"]
+        assert not resubmit_operation_path(cfg, "repair1").exists()
+
+    def test_repair_commits_when_new_truth_already_exists(self, cfg):
+        task = self._make_terminal_task(cfg, PHASE_FAILED, task_id="repair2")
+        operation = self._save_resubmit_op(cfg, task, command=["echo", "newer"])
+        from qqtools.plugins.qexp.api import _advance_resubmit_operation, _create_task
+
+        _advance_resubmit_operation(cfg, operation, "creating_new")
+        new_task = _create_task(
+            cfg=cfg,
+            command=["echo", "newer"],
+            requested_gpus=1,
+            task_id="repair2",
+            name=task.name,
+            batch_id=None,
+            group=task.group,
+            machine_name=cfg.machine_name,
+            attempt=1,
+        )
+        from qqtools.plugins.qexp.api import _persist_submitted_task_truth
+
+        delete_then_ignore = resubmit_operation_path(cfg, "repair2")
+        from qqtools.plugins.qexp.api import _delete_task_truth
+        _delete_task_truth(cfg, task)
+        _persist_submitted_task_truth(cfg, new_task)
+
+        result = repair_metadata(cfg)
+        repaired = load_task(cfg, "repair2")
+        assert "repair2" in result["repaired_resubmits"]
+        assert repaired.spec.command == ["echo", "newer"]
+        assert not delete_then_ignore.exists()
+
+    def test_resubmit_failure_points_to_doctor_repair(self, cfg, monkeypatch):
+        task = self._make_terminal_task(cfg, PHASE_FAILED, task_id="broken1")
+        import qqtools.plugins.qexp.api as api_mod
+
+        def boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(api_mod, "_persist_submitted_task_truth", boom)
+
+        with pytest.raises(RuntimeError, match="qexp doctor repair"):
+            resubmit(cfg, task.task_id, command=["echo", "new"])
+
+        operation = load_resubmit_operation(cfg, task.task_id)
+        assert operation.state == "creating_new"
 
 
 # ---------------------------------------------------------------------------

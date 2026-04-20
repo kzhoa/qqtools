@@ -112,6 +112,14 @@ def build_parser() -> argparse.ArgumentParser:
     retry_p.add_argument("task_id", type=str)
     retry_p.add_argument("--group", type=str, default=None)
 
+    # resubmit
+    resubmit_p = sub.add_parser("resubmit", help="replace a terminal task in place")
+    resubmit_p.add_argument("task_id", type=str)
+    resubmit_p.add_argument("--name", type=str, default=None)
+    resubmit_p.add_argument("--group", type=str, default=None)
+    resubmit_p.add_argument("--gpus", type=int, default=None)
+    resubmit_p.add_argument("argv", nargs=argparse.REMAINDER)
+
     # batch-submit
     batch_p = sub.add_parser("batch-submit", help="submit tasks from manifest")
     batch_p.add_argument("--file", type=str, required=True, dest="manifest_file")
@@ -304,6 +312,20 @@ def handle_retry(args: argparse.Namespace) -> int:
     cfg = _resolve_cfg(args)
     new_task = api.retry(cfg, args.task_id, group=args.group)
     print(f"{new_task.task_id} (retry of {new_task.lineage.retry_of})")
+    return 0
+
+
+def handle_resubmit(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    task = api.resubmit(
+        cfg,
+        args.task_id,
+        command=_normalize_argv(args.argv),
+        requested_gpus=args.gpus,
+        name=args.name,
+        group=args.group,
+    )
+    print(task.task_id)
     return 0
 
 
@@ -559,6 +581,7 @@ _HANDLERS = {
     "submit": handle_submit,
     "cancel": handle_cancel,
     "retry": handle_retry,
+    "resubmit": handle_resubmit,
     "batch-submit": handle_batch_submit,
     "batch-retry-failed": handle_batch_retry_failed,
     "batch-retry-cancelled": handle_batch_retry_cancelled,

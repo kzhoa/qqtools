@@ -11,6 +11,7 @@ from .batch_state import (
 )
 from .indexes import rebuild_all_indexes
 from .locking import clean_lock
+from .locking import submit_lock, task_operation_lock
 from .layout import (
     RootConfig,
     global_batches_dir,
@@ -32,6 +33,11 @@ from .models import (
     BATCH_COMMIT_PREPARING,
     BatchSummary,
     PHASE_ORPHANED,
+    RESUBMIT_STATE_ABORTED,
+    RESUBMIT_STATE_COMMITTED,
+    RESUBMIT_STATE_CREATING_NEW,
+    RESUBMIT_STATE_DELETING_OLD,
+    RESUBMIT_STATE_PREPARING,
     ROOT_SCOPE_PROJECT,
     TERMINAL_PHASES,
     RootGovernanceSnapshot,
@@ -44,8 +50,11 @@ from .storage import (
     cas_update_task,
     iter_all_tasks,
     iter_machines,
+    iter_resubmit_operations,
     load_batch,
+    load_resubmit_operation,
     load_task,
+    save_resubmit_operation,
     save_batch,
     read_json,
 )
@@ -96,6 +105,116 @@ def refresh_root_manifest_governance(cfg: RootConfig) -> RootGovernanceSnapshot:
     manifest.governance = collect_governance_snapshot(cfg)
     write_root_manifest(cfg, manifest)
     return manifest.governance
+
+
+def _advance_resubmit_operation_state(cfg: RootConfig, operation, state: str):
+    operation.state = state
+    operation.meta.revision += 1
+    operation.meta.updated_at = utc_now_iso()
+    operation.meta.updated_by_machine = cfg.machine_name
+    save_resubmit_operation(cfg, operation)
+    return operation
+
+
+def _resubmit_snapshot_matches_current_task(operation, task: Task) -> bool:
+    expected = Task.from_dict(operation.new_task_snapshot)
+    return (
+        task.task_id == expected.task_id
+        and task.name == expected.name
+        and task.group == expected.group
+        and task.batch_id == expected.batch_id
+        and task.machine_name == expected.machine_name
+        and task.attempt == expected.attempt
+        and task.spec.command == expected.spec.command
+        and task.spec.requested_gpus == expected.spec.requested_gpus
+        and task.lineage.retry_of == expected.lineage.retry_of
+        and task.timestamps.created_at == expected.timestamps.created_at
+        and task.timestamps.queued_at == expected.timestamps.queued_at
+    )
+
+
+def _repair_resubmit_operation(cfg: RootConfig, operation) -> str:
+    from .api import _delete_task_truth, _materialize_resubmit_task, _persist_submitted_task_truth
+    from .events import write_event
+    from .storage import delete_resubmit_operation
+
+    task_id = operation.task_id
+    with task_operation_lock(cfg, task_id):
+        with submit_lock(cfg):
+            try:
+                current = load_resubmit_operation(cfg, task_id)
+            except FileNotFoundError:
+                return "missing"
+            operation = current
+
+            old_task = None
+            try:
+                old_task = load_task(cfg, task_id)
+            except FileNotFoundError:
+                pass
+
+            if operation.state == RESUBMIT_STATE_PREPARING and old_task is not None:
+                if _resubmit_snapshot_matches_current_task(operation, old_task):
+                    operation = _advance_resubmit_operation_state(
+                        cfg, operation, RESUBMIT_STATE_COMMITTED
+                    )
+                else:
+                    operation = _advance_resubmit_operation_state(
+                        cfg, operation, RESUBMIT_STATE_DELETING_OLD
+                    )
+            elif operation.state == RESUBMIT_STATE_PREPARING and old_task is None:
+                operation = _advance_resubmit_operation_state(
+                    cfg, operation, RESUBMIT_STATE_CREATING_NEW
+                )
+
+            if operation.state == RESUBMIT_STATE_DELETING_OLD:
+                if old_task is not None:
+                    if _resubmit_snapshot_matches_current_task(operation, old_task):
+                        raise RuntimeError(
+                            f"Resubmit operation for task {task_id} is inconsistent: "
+                            "operation is deleting_old but visible task truth already matches "
+                            "the prepared replacement snapshot."
+                        )
+                    _delete_task_truth(cfg, old_task)
+                operation = _advance_resubmit_operation_state(
+                    cfg, operation, RESUBMIT_STATE_CREATING_NEW
+                )
+
+            if operation.state == RESUBMIT_STATE_CREATING_NEW:
+                current_task = None
+                try:
+                    current_task = load_task(cfg, task_id)
+                except FileNotFoundError:
+                    pass
+
+                if current_task is None:
+                    new_task = _materialize_resubmit_task(operation)
+                    _persist_submitted_task_truth(cfg, new_task)
+                elif not _resubmit_snapshot_matches_current_task(operation, current_task):
+                    raise RuntimeError(
+                        f"Resubmit operation for task {task_id} cannot be auto-repaired: "
+                        "visible task truth does not match the prepared replacement snapshot."
+                    )
+
+                operation = _advance_resubmit_operation_state(
+                    cfg, operation, RESUBMIT_STATE_COMMITTED
+                )
+
+            if operation.state == RESUBMIT_STATE_COMMITTED:
+                delete_resubmit_operation(cfg, task_id)
+                write_event(
+                    cfg,
+                    "resubmit_repaired",
+                    task_id=task_id,
+                    details={"state": RESUBMIT_STATE_COMMITTED},
+                )
+                return "committed"
+
+            if operation.state == RESUBMIT_STATE_ABORTED:
+                delete_resubmit_operation(cfg, task_id)
+                return "aborted"
+
+    return operation.state
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +369,16 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
     committed_batches: list[str] = []
     aborted_batches: list[str] = []
     pruned_task_refs = 0
+    repaired_resubmits: list[str] = []
 
     with clean_lock(cfg):
+        for operation in iter_resubmit_operations(cfg):
+            if operation.state in {RESUBMIT_STATE_COMMITTED, RESUBMIT_STATE_ABORTED}:
+                continue
+            result = _repair_resubmit_operation(cfg, operation)
+            if result == "committed":
+                repaired_resubmits.append(operation.task_id)
+
         batches_dir = global_batches_dir(cfg)
         if batches_dir.is_dir():
             for path in sorted(batches_dir.glob("*.json")):
@@ -312,6 +439,8 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
         governance = refresh_root_manifest_governance(cfg)
 
     return {
+        "repaired_resubmit_count": len(repaired_resubmits),
+        "repaired_resubmits": repaired_resubmits,
         "repaired_batch_count": len(repaired_batches),
         "repaired_batches": repaired_batches,
         "committed_batches": committed_batches,
@@ -473,6 +602,47 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
             except Exception as e:
                 issues.append(f"Cannot read batch {path.name}: {e}")
 
+    resubmit_ops_checked = 0
+    for operation in iter_resubmit_operations(cfg):
+        resubmit_ops_checked += 1
+        if operation.state in {RESUBMIT_STATE_COMMITTED, RESUBMIT_STATE_ABORTED}:
+            issues.append(
+                f"Resubmit operation {operation.task_id} is left behind in terminal state {operation.state!r}."
+            )
+        if not operation.new_submission.command:
+            issues.append(
+                f"Resubmit operation {operation.task_id} is missing new submission command."
+            )
+        try:
+            expected_task = Task.from_dict(operation.new_task_snapshot)
+        except Exception as exc:
+            issues.append(
+                f"Resubmit operation {operation.task_id} has invalid prepared task snapshot: {exc}"
+            )
+            expected_task = None
+        else:
+            if expected_task.task_id != operation.task_id:
+                issues.append(
+                    f"Resubmit operation {operation.task_id} prepared snapshot task_id mismatches: {expected_task.task_id!r}."
+                )
+        if operation.old_task_summary.batch_id is not None:
+            issues.append(
+                f"Resubmit operation {operation.task_id} illegally targets batch task {operation.old_task_summary.batch_id}."
+            )
+        try:
+            current_task = load_task(cfg, operation.task_id)
+        except FileNotFoundError:
+            current_task = None
+        if (
+            operation.state == RESUBMIT_STATE_CREATING_NEW
+            and expected_task is not None
+            and current_task is not None
+            and not _resubmit_snapshot_matches_current_task(operation, current_task)
+        ):
+            issues.append(
+                f"Resubmit operation {operation.task_id} is creating_new but visible task truth does not match the prepared replacement snapshot."
+            )
+
     governance = collect_governance_snapshot(cfg).to_dict()
     if governance["terminal_tasks"] > governance["total_tasks"] * 0.8 and governance["total_tasks"] > 20:
         issues.append(
@@ -487,4 +657,5 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
         "governance": governance,
         "tasks_checked": checked,
         "batches_checked": batches_checked,
+        "resubmit_ops_checked": resubmit_ops_checked,
     }

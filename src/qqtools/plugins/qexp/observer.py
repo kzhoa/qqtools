@@ -24,6 +24,7 @@ from .storage import (
     iter_all_batches,
     iter_all_tasks,
     iter_machines,
+    load_resubmit_operation,
     load_batch,
     load_task,
     read_json,
@@ -96,7 +97,22 @@ def list_tasks(
 
 
 def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
-    t = load_task(cfg, task_id)
+    try:
+        t = load_task(cfg, task_id)
+    except FileNotFoundError as exc:
+        try:
+            operation = load_resubmit_operation(cfg, task_id)
+        except FileNotFoundError:
+            raise exc
+        return {
+            "task": None,
+            "operation": operation.to_dict()["operation"],
+            "meta": operation.meta.to_dict(),
+            "message": (
+                f"Task {task_id} has no visible task truth because an unfinished "
+                f"resubmit operation is converging. Run 'qexp doctor repair' if needed."
+            ),
+        }
     return t.to_dict()
 
 

@@ -20,10 +20,17 @@ from qqtools.plugins.qexp.layout import (
     global_locks_dir,
     global_tasks_dir,
     init_shared_root,
+    resubmit_operation_path,
     task_path,
 )
 from qqtools.plugins.qexp.models import PHASE_QUEUED, PHASE_RUNNING, PHASE_SUCCEEDED
-from qqtools.plugins.qexp.storage import cas_update_task, load_batch, load_task, save_batch
+from qqtools.plugins.qexp.storage import (
+    cas_update_task,
+    load_batch,
+    load_task,
+    save_batch,
+    save_resubmit_operation,
+)
 
 
 @pytest.fixture()
@@ -130,6 +137,57 @@ class TestVerifyIntegrity:
         result = verify_integrity(cfg)
         assert not result["ok"]
         assert any("still preparing" in issue for issue in result["issues"])
+
+    def test_detects_invalid_resubmit_operation(self, cfg):
+        from qqtools.plugins.qexp.api import _build_resubmit_operation
+
+        task = submit(cfg, command=["echo"], task_id="bad-op")
+        task = load_task(cfg, "bad-op")
+        task.status.phase = PHASE_SUCCEEDED
+        task.timestamps.finished_at = "2026-01-01T00:00:00Z"
+        cas_update_task(cfg, task, task.meta.revision)
+        update_index_on_phase_change(cfg, "bad-op", PHASE_QUEUED, PHASE_SUCCEEDED)
+
+        operation = _build_resubmit_operation(
+            cfg,
+            task,
+            command=["echo", "new"],
+            requested_gpus=1,
+            name=task.name,
+            group=task.group,
+        )
+        operation.old_task_summary.batch_id = "batch-x"
+        save_resubmit_operation(cfg, operation)
+
+        result = verify_integrity(cfg)
+        assert not result["ok"]
+        assert any("illegally targets batch task" in issue for issue in result["issues"])
+
+    def test_detects_creating_new_snapshot_mismatch(self, cfg):
+        from qqtools.plugins.qexp.api import _build_resubmit_operation, _advance_resubmit_operation
+
+        task = submit(cfg, command=["echo"], task_id="mismatch1")
+        task = load_task(cfg, "mismatch1")
+        task.status.phase = PHASE_SUCCEEDED
+        task.timestamps.finished_at = "2026-01-01T00:00:00Z"
+        cas_update_task(cfg, task, task.meta.revision)
+        update_index_on_phase_change(cfg, "mismatch1", PHASE_QUEUED, PHASE_SUCCEEDED)
+
+        operation = _build_resubmit_operation(
+            cfg,
+            task,
+            command=["echo", "fresh"],
+            requested_gpus=1,
+            name=task.name,
+            group=task.group,
+        )
+        save_resubmit_operation(cfg, operation)
+        _advance_resubmit_operation(cfg, operation, "creating_new")
+
+        # Keep the old visible truth to simulate an ambiguous conflict.
+        result = verify_integrity(cfg)
+        assert not result["ok"]
+        assert any("does not match the prepared replacement snapshot" in issue for issue in result["issues"])
 
 
 class TestRepairOrphans:
@@ -256,3 +314,76 @@ class TestRepairMetadata:
         repaired = load_batch(cfg, batch.batch_id)
         assert repaired.commit_state == "aborted"
         assert repaired.task_ids == ["keep"]
+
+    def test_repairs_resubmit_gap(self, cfg):
+        from qqtools.plugins.qexp.api import _advance_resubmit_operation, _build_resubmit_operation, _delete_task_truth
+
+        task = submit(cfg, command=["echo"], task_id="repair-gap")
+        task = load_task(cfg, "repair-gap")
+        task.status.phase = PHASE_SUCCEEDED
+        task.timestamps.finished_at = "2026-01-01T00:00:00Z"
+        cas_update_task(cfg, task, task.meta.revision)
+        update_index_on_phase_change(cfg, "repair-gap", PHASE_QUEUED, PHASE_SUCCEEDED)
+
+        operation = _build_resubmit_operation(
+            cfg,
+            task,
+            command=["echo", "new"],
+            requested_gpus=1,
+            name=task.name,
+            group=task.group,
+        )
+        save_resubmit_operation(cfg, operation)
+        _advance_resubmit_operation(cfg, operation, "deleting_old")
+        _delete_task_truth(cfg, task)
+
+        result = repair_metadata(cfg)
+        repaired = load_task(cfg, "repair-gap")
+        assert "repair-gap" in result["repaired_resubmits"]
+        assert repaired.status.phase == PHASE_QUEUED
+        assert repaired.spec.command == ["echo", "new"]
+        assert not resubmit_operation_path(cfg, "repair-gap").exists()
+
+    def test_repairs_resubmit_when_replacement_task_has_started(self, cfg):
+        from qqtools.plugins.qexp.api import (
+            _advance_resubmit_operation,
+            _build_resubmit_operation,
+            _delete_task_truth,
+            _materialize_resubmit_task,
+            _persist_submitted_task_truth,
+        )
+
+        task = submit(cfg, command=["echo"], task_id="repair-running")
+        task = load_task(cfg, "repair-running")
+        task.status.phase = PHASE_SUCCEEDED
+        task.timestamps.finished_at = "2026-01-01T00:00:00Z"
+        cas_update_task(cfg, task, task.meta.revision)
+        update_index_on_phase_change(cfg, "repair-running", PHASE_QUEUED, PHASE_SUCCEEDED)
+
+        operation = _build_resubmit_operation(
+            cfg,
+            task,
+            command=["echo", "replacement"],
+            requested_gpus=1,
+            name=task.name,
+            group=task.group,
+        )
+        save_resubmit_operation(cfg, operation)
+        _advance_resubmit_operation(cfg, operation, "deleting_old")
+        _delete_task_truth(cfg, task)
+        _advance_resubmit_operation(cfg, operation, "creating_new")
+
+        replacement = _materialize_resubmit_task(operation)
+        _persist_submitted_task_truth(cfg, replacement)
+        replacement = load_task(cfg, "repair-running")
+        replacement.status.phase = PHASE_RUNNING
+        replacement.timestamps.started_at = "2026-01-01T00:01:00Z"
+        cas_update_task(cfg, replacement, replacement.meta.revision)
+        update_index_on_phase_change(cfg, "repair-running", PHASE_QUEUED, PHASE_RUNNING)
+
+        result = repair_metadata(cfg)
+        repaired = load_task(cfg, "repair-running")
+        assert "repair-running" in result["repaired_resubmits"]
+        assert repaired.status.phase == PHASE_RUNNING
+        assert repaired.spec.command == ["echo", "replacement"]
+        assert not resubmit_operation_path(cfg, "repair-running").exists()

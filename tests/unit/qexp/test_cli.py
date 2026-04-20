@@ -102,6 +102,51 @@ class TestRetry:
         assert ret == 0
 
 
+class TestResubmit:
+    def test_resubmit(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.api import cancel
+
+        cli_main(_base_args(cfg) + ["submit", "--task-id", "t1", "--", "echo"])
+        capsys.readouterr()
+        cancel(cfg, "t1")
+
+        ret = cli_main(_base_args(cfg) + ["resubmit", "t1", "--", "echo", "again"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "t1"
+
+    def test_inspect_shows_pending_resubmit_operation(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.api import submit, _build_resubmit_operation, _advance_resubmit_operation, _delete_task_truth
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        from qqtools.plugins.qexp.storage import cas_update_task, load_task, save_resubmit_operation
+
+        submit(cfg, command=["echo"], task_id="pending1")
+        task = load_task(cfg, "pending1")
+        task.status.phase = "failed"
+        task.timestamps.finished_at = "2026-01-01T00:00:00Z"
+        cas_update_task(cfg, task, task.meta.revision)
+        update_index_on_phase_change(cfg, "pending1", "queued", "failed")
+
+        operation = _build_resubmit_operation(
+            cfg,
+            task,
+            command=["echo", "new"],
+            requested_gpus=1,
+            name=task.name,
+            group=task.group,
+        )
+        save_resubmit_operation(cfg, operation)
+        _advance_resubmit_operation(cfg, operation, "deleting_old")
+        _delete_task_truth(cfg, task)
+
+        ret = cli_main(_base_args(cfg) + ["inspect", "pending1"])
+        assert ret == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["task"] is None
+        assert data["operation"]["state"] == "deleting_old"
+
+
 class TestList:
     def test_list_empty(self, cfg, capsys):
         from qqtools.plugins.qexp.cli import main as cli_main

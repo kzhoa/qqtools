@@ -170,8 +170,6 @@ qexp submit -- python train.py --config configs/a.yaml
 qexp submit --task-id qm9_seed_1 --name "qm9 seed 1" -- python train.py --config configs/a.yaml
 ```
 
-**假设/未验证**：`group` 已进入产品推荐契约，但当前安装版本未必已经支持 `--group`；若未支持，请把下面示例理解为目标用法。
-
 如果用户脑中有一个明确的实验计划，推荐把它映射成一个稳定的 `group`：
 
 ```bash
@@ -201,8 +199,6 @@ qexp batch-submit --file runs.yaml
 ```
 
 manifest 只服务于 batch，不反向污染单任务入口。
-
-**假设/未验证**：`batch.group` 已进入产品推荐契约，但当前安装版本未必已经支持该字段；若未支持，请把下面示例理解为目标 schema。
 
 推荐形态：
 
@@ -290,6 +286,8 @@ qexp clean --task-id task_xxx --dry-run
 - 若未来要支持对 batch 成员 `resubmit`，必须单独扩展 batch 真相修正规则，不能隐式放开
 - `resubmit` 成功后，用户不应再能观察到被替换前那条旧 task 记录
 - `resubmit` 可复用 single-task clean 的删除子流程，但不是 `clean` 的别名命令，也不应被实现成简单串联 CLI `clean + submit`
+- `resubmit` 必须持久化独立 operation 真相，未完成替换由 `qexp doctor repair` 继续收敛
+- 当正式 task 已暂时不可见但替换仍未完成时，`qexp inspect <task_id>` 必须返回可解释的 operation 视图
 
 设计取舍：
 

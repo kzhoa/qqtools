@@ -408,6 +408,26 @@ qexp retry <task_id> --group regrouped_debug
 - `qexp retry <task_id> --group <group>` 使用显式覆盖值，不继承原 group
 - retry 只创建新的 task，不改写原 task 的 `group`
 
+原位替换一个已结束且允许 `resubmit` 的 task：
+
+```bash
+qexp resubmit <task_id> -- python train.py --config configs/a.yaml
+```
+
+显式覆盖新的展示名和 group：
+
+```bash
+qexp resubmit <task_id> --name rerun_a --group regrouped_debug -- python train.py --config configs/a.yaml
+```
+
+规则：
+
+- `resubmit` 只允许 `failed` / `cancelled`
+- `resubmit` 不允许 batch 成员 task
+- `resubmit` 会删除旧 task 正式记录，再用同一个 `task_id` 创建新的首次提交真相
+- 若命令中途失败并留下未完成替换事务，执行 `qexp doctor repair` 继续收敛
+- 当正式 task 已被删、替换仍未完成时，`qexp inspect <task_id>` 会显示未完成 `resubmit` 的操作态提示
+
 批量重试失败任务：
 
 ```bash
