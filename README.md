@@ -1,4 +1,3 @@
-
 <div style="
   position: relative;
   width: 100%;
@@ -20,83 +19,91 @@
 </div>
 
 # ✨qqtools✨
-[![PyPI Downloads](https://static.pepy.tech/personalized-badge/qqtools?period=total&units=ABBREVIATION&left_color=GREY&right_color=BRIGHTGREEN&left_text=PyPI+Downloads)](https://pepy.tech/projects/qqtools) ![PyPI - Monthly Downloads](https://img.shields.io/pypi/dm/qqtools?color=3cb371&label=Monthly) ![Python version](https://img.shields.io/badge/python->=3.11-blue)  
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/qqtools?period=total&units=ABBREVIATION&left_color=GREY&right_color=BRIGHTGREEN&left_text=PyPI+Downloads)](https://pepy.tech/projects/qqtools) ![PyPI - Monthly Downloads](https://img.shields.io/pypi/dm/qqtools?color=3cb371&label=Monthly) ![Python version](https://img.shields.io/badge/python->=3.11-blue)
 
-A lightweight library, crafted and battle-tested daily by *qq*, to make PyTorch life a little easier. 
+A lightweight library, crafted and battle-tested daily by *qq*, to make PyTorch life a little easier.
 
 I’ve gathered the repetitive parts of my day-to-day work and refined them into this slim utility library.
 It serves as my personal toolkit for handling data, training, and experiments, designed to keep projects moving fast with cleaner code and smoother workflows (and hopefully yours too!).
 
->Built for me, shared for you. 
+>Built for me, shared for you.
+
+## What it includes
+
+At its core, `qqtools` is a collection of small utilities I use around PyTorch projects:
+
+- data containers such as `qDict` and `qData`
+- dataset and dataloader helpers such as `qDictDataset` and `qDictDataloader`
+- small neural network helpers such as `qMLP`
+- a lightweight training framework, `qpipeline`
+- a command-line experiment queue for Linux, `qexp`
+- config and serialization helpers for YAML, JSON, pickle, and LMDB
 
 
+For example, `qDict` is mainly there for cleaner attribute access in batch-like code:
 
-# Requirements
+```python
+# Instead of dirty dict brackets:
+# batch["input_ids"], batch["attention_mask"]
 
-- torch>=2.0 for full functionality 
-  - Some components maintain backward compatibility with torch==1.x
-  - Recommended: torch>=2.4
-- pyyaml>=6.0
-  - Recommended to use YAML format for all configuration files.
+# Use clean attribute access:
+batch = qt.qDict({"input_ids": input_ids, "attention_mask": attention_mask})
+out = model(batch.input_ids)
+```
 
-This provides a unified approach to drive and manage all workflow operations.
+At the core, it is still a practical toolbox for the repetitive parts around experiments.
 
-To get started quickly, install it via pip:
+## Install
+
+Core install:
+
 ```bash
 pip install qqtools
 ```
 
-Install with full features:
+Full install:
+
 ```bash
 pip install qqtools[full]
 ```
 
+If you only want the experiment queue extras:
 
-# Data Format Support
-
-Non-torch formats:
 ```bash
-qDict : Enhanced of basic Dict.
-qScalaDict : Dict[str, num]. A dict that maps str to scala;
-qListData : List[dict]. A list of dicts.
+pip install qqtools[exp]
 ```
 
-Torch-related data formats
-```bash
-qData
-qBatchList
-```
+Requirements:
 
+- Python `>=3.11`
+- `torch>=2.0`
+- `PyYAML>=6.0`
 
+Notes:
 
-# Simple Training Loop
+- some parts still work with `torch==1.x`
+- `torch>=2.4` is recommended
 
-For jupyter users
+## A tiny example
 
 ```python
 import qqtools as qt
 qt.import_common(globals())
 
 x = np.random.rand(100, 5)
-y = np.random.rand(100)
+y = np.random.rand(100, 1)
 
-# dataset wrap
-xs = [ x[i] for i in range(len(x))]
-ys = [ y[i] for i in range(len(y))]
-data_list = [ qt.qData({'x': x[i], 'y':y[i]})  for i in range(len(x))] 
+data_list = [qt.qData({"x": x[i], "y": y[i]}) for i in range(len(x))]
 dataset = qt.qDictDataset(data_list=data_list)
-dataloader = qt.qDictDataloader()
+dataloader = qt.qDictDataloader(dataset=dataset, batch_size=32, shuffle=True)
 
-# model
-model = qt.nn.qMLP([5,5,1], activation="relu")
+model = qt.nn.qMLP([5, 5, 1], activation="relu")
 loss_fn = torch.nn.MSELoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4, weight_decay=0.01)
 
-# device
 device = torch.device("cuda")
 model.to(device)
 
-# loop
 for epoch in range(100):
     for batch in dataloader:
         batch.to(device)
@@ -108,43 +115,29 @@ for epoch in range(100):
     print(f"{epoch} {loss.item():4.6f}")
 ```
 
+## qexp
 
-# Individual Modules
+`qexp` is the most standalone tool in this repository.
+It is a lightweight experiment queue for Linux GPU hosts built around a shared project root.
 
-The following modules are consumers of the core functionality provided by this package. Each is designed to be independent, allowing for sole import.
-
-under `plugins/`
-
-- qchem
-- qpipeline
-- qhyperconnect
-- qexp (Linux only)
-
-
-# qexp Quick Start
-
-`qexp` is a shared-root experiment queue for Linux GPU hosts.
-
-Install optional experiment dependencies:
+Install:
 
 ```bash
 pip install qqtools[exp]
 ```
 
-Basic commands:
+Quick start:
 
 ```bash
 qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
-qexp submit --shared-root /mnt/share/myproject/.qexp --machine gpu-a --name demo -- python train.py --epochs 10
-qexp agent start --shared-root /mnt/share/myproject/.qexp --machine gpu-a --background
-qexp list --shared-root /mnt/share/myproject/.qexp --machine gpu-a
-qexp machines --shared-root /mnt/share/myproject/.qexp --machine gpu-a
-qexp top --shared-root /mnt/share/myproject/.qexp --machine gpu-a
+qexp submit --name demo -- python train.py --epochs 10
+qexp agent start --background
+qexp list
+qexp top
 qexp logs <task_id> --follow
-qexp cancel <task_id>
-qexp clean --dry-run
-qexp clean --older-than-seconds 604800
 ```
+
+After `init`, `qexp` saves the current `shared_root` and `machine` as CLI context, so you usually do not need to repeat them on every command.
 
 Python API:
 
@@ -159,15 +152,22 @@ task = qexp.submit(
 print(task.task_id)
 ```
 
-Release validation notes:
+Notes:
 
-- packaged Python API surface: `from qqtools.plugins import qexp`
 - packaged CLI surface: `qexp`
+- packaged Python API surface: `from qqtools.plugins import qexp`
 - actual execution is supported on local Linux GPU hosts with `tmux` installed
-- non-Linux development is limited to parsing, rendering, and test validation flows
+- non-Linux development is mainly for parsing, rendering, and tests
 
+## Plugin modules
 
-# Test
+Under `src/qqtools/plugins/`, there are also:
+
+- `qchem` - tools for reading and processing quantum chemistry outputs
+- `qpipeline` - a training pipeline framework built on top of the core torch utilities
+- `qhyperconnect` - an implementation of Hyper-Connection for PyTorch
+
+## Test
 
 ```bash
 tox
