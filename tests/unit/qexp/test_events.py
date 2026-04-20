@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from qqtools.plugins.qexp.v2.events import query_events, write_event
-from qqtools.plugins.qexp.v2.layout import init_shared_root
+from qqtools.plugins.qexp.events import query_events, write_event
+from qqtools.plugins.qexp.layout import init_shared_root
 
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
+    return init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime")
 
 
 class TestWriteEvent:
@@ -18,7 +18,7 @@ class TestWriteEvent:
 
     def test_global_and_machine_dirs(self, cfg):
         write_event(cfg, "task_started", task_id="t1")
-        from qqtools.plugins.qexp.v2.layout import global_events_dir, machine_events_dir
+        from qqtools.plugins.qexp.layout import global_events_dir, machine_events_dir
         g = global_events_dir(cfg)
         m = machine_events_dir(cfg)
         assert any(g.rglob("*.json"))

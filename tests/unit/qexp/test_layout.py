@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from qqtools.plugins.qexp.v2.layout import (
+from qqtools.plugins.qexp.layout import (
     RootConfig,
     agent_state_path,
     batch_path,
@@ -26,13 +26,20 @@ from qqtools.plugins.qexp.v2.layout import (
     machine_events_dir,
     machine_json_path,
     machine_state_dir,
+    ensure_shared_layout,
+    ensure_machine_layout,
+    ensure_runtime_layout,
+    read_root_manifest,
     read_schema_version,
+    root_manifest_path,
     schema_version_path,
     summary_state_path,
     task_path,
+    validate_root_contract,
+    write_root_manifest,
     write_schema_version,
 )
-from qqtools.plugins.qexp.v2.models import SCHEMA_VERSION
+from qqtools.plugins.qexp.models import SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -43,18 +50,21 @@ from qqtools.plugins.qexp.v2.models import SCHEMA_VERSION
 class TestRootConfig:
     def test_construction(self, tmp_path):
         cfg = RootConfig(
-            shared_root=tmp_path / "shared",
+            shared_root=tmp_path / ".qexp",
+            project_root=tmp_path,
             machine_name="gpu1",
             runtime_root=tmp_path / "runtime",
         )
         assert cfg.machine_name == "gpu1"
         assert cfg.shared_root.is_absolute()
+        assert cfg.project_root == tmp_path.resolve()
         assert cfg.runtime_root.is_absolute()
 
     def test_invalid_machine_name(self, tmp_path):
         with pytest.raises(ValueError):
             RootConfig(
-                shared_root=tmp_path / "shared",
+                shared_root=tmp_path / ".qexp",
+                project_root=tmp_path,
                 machine_name="../evil",
                 runtime_root=tmp_path / "runtime",
             )
@@ -69,7 +79,8 @@ class TestPathHelpers:
     @pytest.fixture()
     def cfg(self, tmp_path):
         return RootConfig(
-            shared_root=tmp_path / "shared",
+            shared_root=tmp_path / ".qexp",
+            project_root=tmp_path,
             machine_name="dev1",
             runtime_root=tmp_path / "runtime",
         )
@@ -127,7 +138,8 @@ class TestEnsureLayout:
     @pytest.fixture()
     def cfg(self, tmp_path):
         return RootConfig(
-            shared_root=tmp_path / "shared",
+            shared_root=tmp_path / ".qexp",
+            project_root=tmp_path,
             machine_name="dev1",
             runtime_root=tmp_path / "runtime",
         )
@@ -164,7 +176,8 @@ class TestSchemaVersion:
     @pytest.fixture()
     def cfg(self, tmp_path):
         return RootConfig(
-            shared_root=tmp_path / "shared",
+            shared_root=tmp_path / ".qexp",
+            project_root=tmp_path,
             machine_name="dev1",
             runtime_root=tmp_path / "runtime",
         )
@@ -185,21 +198,26 @@ class TestSchemaVersion:
 
 class TestLoadRootConfig:
     def test_default_runtime(self, tmp_path):
-        cfg = load_root_config(tmp_path / "shared", "gpu1")
+        cfg = load_root_config(tmp_path / ".qexp", "gpu1")
         assert cfg.machine_name == "gpu1"
+        assert cfg.project_root == tmp_path.resolve()
         assert "qexp-runtime" in str(cfg.runtime_root)
 
     def test_default_runtime_includes_machine_name(self):
         """Default runtime_root must be isolated per machine."""
-        cfg1 = load_root_config("/tmp/shared", "m1")
-        cfg2 = load_root_config("/tmp/shared", "m2")
+        cfg1 = load_root_config("/tmp/.qexp", "m1")
+        cfg2 = load_root_config("/tmp/.qexp", "m2")
         assert cfg1.runtime_root != cfg2.runtime_root
         assert "m1" in str(cfg1.runtime_root)
         assert "m2" in str(cfg2.runtime_root)
 
     def test_custom_runtime(self, tmp_path):
-        cfg = load_root_config(tmp_path / "s", "m1", tmp_path / "rt")
+        cfg = load_root_config(tmp_path / ".qexp", "m1", tmp_path / "rt")
         assert cfg.runtime_root == (tmp_path / "rt").resolve()
+
+    def test_rejects_non_project_control_root(self, tmp_path):
+        with pytest.raises(ValueError, match="named '.qexp'"):
+            load_root_config(tmp_path / "shared", "gpu1")
 
 
 # ---------------------------------------------------------------------------
@@ -209,14 +227,16 @@ class TestLoadRootConfig:
 
 class TestInitSharedRoot:
     def test_creates_full_layout(self, tmp_path):
-        cfg = init_shared_root(tmp_path / "shared", "gpu2a")
+        cfg = init_shared_root(tmp_path / ".qexp", "gpu2a")
         assert global_tasks_dir(cfg).is_dir()
         assert machine_state_dir(cfg).is_dir()
         assert cfg.runtime_root.is_dir()
         assert read_schema_version(cfg) == SCHEMA_VERSION
+        assert root_manifest_path(cfg).is_file()
+        assert read_root_manifest(cfg).project_root == str(tmp_path.resolve())
 
     def test_writes_machine_json(self, tmp_path):
-        cfg = init_shared_root(tmp_path / "shared", "gpu2a")
+        cfg = init_shared_root(tmp_path / ".qexp", "gpu2a")
         mpath = machine_json_path(cfg)
         assert mpath.is_file()
         data = json.loads(mpath.read_text(encoding="utf-8"))
@@ -227,15 +247,47 @@ class TestInitSharedRoot:
 
     def test_persistent_mode(self, tmp_path):
         cfg = init_shared_root(
-            tmp_path / "shared", "gpu3", agent_mode="persistent"
+            tmp_path / ".qexp", "gpu3", agent_mode="persistent"
         )
         data = json.loads(machine_json_path(cfg).read_text(encoding="utf-8"))
         assert data["machine"]["agent_mode"] == "persistent"
 
     def test_invalid_agent_mode(self, tmp_path):
         with pytest.raises(ValueError):
-            init_shared_root(tmp_path / "shared", "gpu1", agent_mode="bad")
+            init_shared_root(tmp_path / ".qexp", "gpu1", agent_mode="bad")
 
     def test_shared_mode_requires_machine(self, tmp_path):
         with pytest.raises(ValueError):
-            init_shared_root(tmp_path / "shared", "")
+            init_shared_root(tmp_path / ".qexp", "")
+
+    def test_validate_root_contract_detects_forbidden_truth_dirs(self, tmp_path):
+        cfg = init_shared_root(tmp_path / ".qexp", "gpu2a")
+        forbidden = cfg.shared_root / "groups" / "exp1" / "tasks"
+        forbidden.mkdir(parents=True)
+        with pytest.raises(ValueError, match="Forbidden truth-layout"):
+            validate_root_contract(cfg)
+
+    def test_repeated_init_preserves_root_manifest_identity(self, tmp_path):
+        cfg1 = init_shared_root(tmp_path / ".qexp", "gpu2a")
+        manifest1 = read_root_manifest(cfg1)
+
+        cfg2 = init_shared_root(tmp_path / ".qexp", "gpu3")
+        manifest2 = read_root_manifest(cfg2)
+
+        assert manifest2.control_plane_id == manifest1.control_plane_id
+        assert manifest2.created_at == manifest1.created_at
+        assert manifest2.created_by_machine == manifest1.created_by_machine
+
+    def test_require_initialized_root_rejects_uninitialized_qexp_dir(self, tmp_path):
+        cfg = RootConfig(
+            shared_root=tmp_path / ".qexp",
+            project_root=tmp_path,
+            machine_name="dev1",
+            runtime_root=tmp_path / "runtime",
+        )
+        ensure_shared_layout(cfg)
+        ensure_machine_layout(cfg)
+        ensure_runtime_layout(cfg)
+
+        with pytest.raises(FileNotFoundError, match="Root manifest not found"):
+            load_root_config(tmp_path / ".qexp", "dev1", require_initialized=True)

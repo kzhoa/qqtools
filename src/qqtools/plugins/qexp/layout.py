@@ -9,25 +9,32 @@ from pathlib import Path
 from .models import (
     AGENT_MODE_ON_DEMAND,
     AGENT_MODES,
+    ROOT_SCOPE_PROJECT,
     SCHEMA_VERSION,
     GpuInventory,
     Machine,
+    RootManifest,
+    generate_id,
+    utc_now_iso,
     validate_machine_name,
 )
 
 DEFAULT_RUNTIME_BASE = "~/.qqtools/qexp-runtime"
 DEFAULT_CONTEXT_FILE = "~/.qqtools/qexp-context.json"
+FORBIDDEN_TRUTH_LAYOUT_DIRS = ("groups", "experiments")
 
 
 @dataclass(slots=True)
 class RootConfig:
     shared_root: Path
+    project_root: Path
     machine_name: str
     runtime_root: Path
 
     def __post_init__(self) -> None:
         validate_machine_name(self.machine_name)
         self.shared_root = Path(self.shared_root).expanduser().resolve()
+        self.project_root = Path(self.project_root).expanduser().resolve()
         self.runtime_root = Path(self.runtime_root).expanduser().resolve()
 
 
@@ -103,6 +110,10 @@ def schema_version_path(cfg: RootConfig) -> Path:
     return global_schema_dir(cfg) / "version.json"
 
 
+def root_manifest_path(cfg: RootConfig) -> Path:
+    return global_schema_dir(cfg) / "root.json"
+
+
 def agent_state_path(cfg: RootConfig) -> Path:
     return machine_state_dir(cfg) / "agent.json"
 
@@ -145,6 +156,14 @@ def index_by_machine_dir(cfg: RootConfig) -> Path:
     return global_indexes_dir(cfg) / "tasks_by_machine"
 
 
+def index_by_group_dir(cfg: RootConfig) -> Path:
+    return global_indexes_dir(cfg) / "tasks_by_group"
+
+
+def batch_index_by_group_dir(cfg: RootConfig) -> Path:
+    return global_indexes_dir(cfg) / "batches_by_group"
+
+
 # Lock paths
 
 
@@ -177,6 +196,8 @@ _SHARED_DIRS = [
     index_by_state_dir,
     index_by_batch_dir,
     index_by_machine_dir,
+    index_by_group_dir,
+    batch_index_by_group_dir,
 ]
 
 _MACHINE_DIRS = [
@@ -225,6 +246,92 @@ def read_schema_version(cfg: RootConfig) -> str | None:
     return data.get("schema_version")
 
 
+def _resolve_project_root(shared_root: Path) -> Path:
+    resolved = Path(shared_root).expanduser().resolve()
+    if resolved.name != ".qexp":
+        raise ValueError(
+            "shared_root must be the project control directory named '.qexp'. "
+            f"Got {resolved}."
+        )
+    return resolved.parent
+
+
+def create_root_manifest(cfg: RootConfig) -> RootManifest:
+    return RootManifest(
+        schema_version=SCHEMA_VERSION,
+        root_scope=ROOT_SCOPE_PROJECT,
+        control_plane_id=f"cp_{generate_id()}",
+        shared_root=str(cfg.shared_root),
+        project_root=str(cfg.project_root),
+        layout_version=SCHEMA_VERSION,
+        created_at=utc_now_iso(),
+        created_by_machine=cfg.machine_name,
+    )
+
+
+def write_root_manifest(cfg: RootConfig, manifest: RootManifest | None = None) -> RootManifest:
+    if manifest is None:
+        manifest = create_root_manifest(cfg)
+    path = root_manifest_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(manifest.to_dict(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+    return manifest
+
+
+def read_root_manifest(cfg: RootConfig) -> RootManifest | None:
+    path = root_manifest_path(cfg)
+    if not path.is_file():
+        return None
+    return RootManifest.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def ensure_root_manifest(cfg: RootConfig) -> RootManifest:
+    manifest = read_root_manifest(cfg)
+    if manifest is not None:
+        return manifest
+    return write_root_manifest(cfg)
+
+
+def list_forbidden_truth_layout_dirs(cfg: RootConfig) -> list[Path]:
+    return [
+        cfg.shared_root / dirname
+        for dirname in FORBIDDEN_TRUTH_LAYOUT_DIRS
+        if (cfg.shared_root / dirname).exists()
+    ]
+
+
+def validate_root_contract(cfg: RootConfig) -> RootManifest:
+    manifest = read_root_manifest(cfg)
+    if manifest is None:
+        raise FileNotFoundError(
+            f"Root manifest not found at {root_manifest_path(cfg)}. "
+            "Run 'qexp init' to initialize the project control root."
+        )
+    if Path(manifest.shared_root).resolve() != cfg.shared_root:
+        raise ValueError(
+            "shared_root does not match the initialized control-plane manifest: "
+            f"manifest={manifest.shared_root}, requested={cfg.shared_root}."
+        )
+    if Path(manifest.project_root).resolve() != cfg.project_root:
+        raise ValueError(
+            "project_root does not match the initialized control-plane manifest: "
+            f"manifest={manifest.project_root}, inferred={cfg.project_root}."
+        )
+
+    for path in list_forbidden_truth_layout_dirs(cfg):
+        if path.exists():
+            raise ValueError(
+                f"Forbidden truth-layout directory detected at {path}. "
+                "qexp only permits global object truth and machine-private directories."
+            )
+    return manifest
+
+
 # ---------------------------------------------------------------------------
 # RootConfig construction
 # ---------------------------------------------------------------------------
@@ -234,14 +341,23 @@ def load_root_config(
     shared_root: str | Path,
     machine_name: str,
     runtime_root: str | Path | None = None,
+    require_initialized: bool = False,
 ) -> RootConfig:
+    shared_root_path = Path(shared_root)
+    project_root = _resolve_project_root(shared_root_path)
     if runtime_root is None:
         runtime_root = Path(DEFAULT_RUNTIME_BASE).expanduser() / machine_name
-    return RootConfig(
-        shared_root=Path(shared_root),
+    cfg = RootConfig(
+        shared_root=shared_root_path,
+        project_root=project_root,
         machine_name=machine_name,
         runtime_root=Path(runtime_root),
     )
+    if require_initialized:
+        validate_root_contract(cfg)
+    elif root_manifest_path(cfg).is_file():
+        validate_root_contract(cfg)
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +379,8 @@ def init_shared_root(
     ensure_machine_layout(cfg)
     ensure_runtime_layout(cfg)
     write_schema_version(cfg)
+    ensure_root_manifest(cfg)
+    validate_root_contract(cfg)
 
     machine = Machine(
         machine_name=cfg.machine_name,

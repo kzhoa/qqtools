@@ -1,4 +1,4 @@
-"""v2 agent — on-demand or persistent agent with tmux-based lifecycle.
+"""qexp agent — on-demand or persistent agent with tmux-based lifecycle.
 
 The agent is the single process responsible for dispatching queued tasks
 on this machine. It runs in a tmux window and writes heartbeats to
@@ -84,14 +84,14 @@ def run_preflight_checks() -> PreflightResult:
     if platform.system() != "Linux":
         raise RuntimeError("qexp agent is only supported on Linux.")
 
-    from ..tmux import is_tmux_executable_available, require_libtmux
+    from .tmux import is_tmux_executable_available, require_libtmux
 
     if not is_tmux_executable_available():
         raise RuntimeError("tmux is required. Install it and try again.")
 
     require_libtmux()
 
-    from ..tracker import probe_gpu_backend
+    from .tracker import probe_gpu_backend
 
     backend, gpu_ids = probe_gpu_backend()
     if backend is None or not gpu_ids:
@@ -293,8 +293,8 @@ def run_agent_loop(
     elif dispatch_fn is None:
         # Production mode: preflight + real tracker
         preflight = run_preflight_checks()
-        from ..tracker import qExpTracker
-        tracker = qExpTracker(
+        from .tracker import Tracker
+        tracker = Tracker(
             visible_gpu_ids=preflight.visible_gpu_ids,
             backend_name=preflight.gpu_backend,
             gpu_probe=lambda: (preflight.gpu_backend, preflight.visible_gpu_ids),
@@ -320,13 +320,13 @@ def run_agent_loop(
                 if scheduler is not None:
                     # Full production dispatch
                     tracker.refresh_visibility()
-                    # Rebuild reservations from v2 storage
-                    _rebuild_tracker_from_v2(cfg, tracker)
+                    # Rebuild reservations from current task storage.
+                    _rebuild_tracker_from_tasks(cfg, tracker)
                     write_gpu_state(cfg, tracker)
 
                     failed = scheduler.reconcile_running_tasks(cfg)
                     if failed:
-                        _rebuild_tracker_from_v2(cfg, tracker)
+                        _rebuild_tracker_from_tasks(cfg, tracker)
 
                     launched = scheduler.run_dispatch_cycle(cfg)
                 elif dispatch_fn is not None:
@@ -375,8 +375,8 @@ def run_agent_loop(
     return 0
 
 
-def _rebuild_tracker_from_v2(cfg: RootConfig, tracker: Any) -> None:
-    """Rebuild tracker reservations from v2 running tasks (not v1 fsqueue)."""
+def _rebuild_tracker_from_tasks(cfg: RootConfig, tracker: Any) -> None:
+    """Rebuild tracker reservations from current running tasks."""
     from .storage import iter_all_tasks
     from .models import PHASE_RUNNING, PHASE_DISPATCHING, PHASE_STARTING
 
@@ -492,7 +492,7 @@ def wake_agent_if_needed(cfg: RootConfig) -> bool:
 
 def _start_agent_background(cfg: RootConfig) -> str:
     """Launch the agent in a tmux window (background)."""
-    from ..tmux import ensure_managed_session, send_command_to_window
+    from .tmux import ensure_managed_session, send_command_to_window
 
     session = ensure_managed_session(
         "qqtools_internal",
@@ -507,7 +507,7 @@ def _start_agent_background(cfg: RootConfig) -> str:
     command = " ".join([
         shlex.quote(sys.executable),
         "-m",
-        "qqtools.plugins.qexp.v2.agent",
+        "qqtools.plugins.qexp.agent",
         "--shared-root",
         shlex.quote(str(cfg.shared_root)),
         "--machine",
@@ -530,7 +530,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from .layout import load_root_config
 
-    parser = argparse.ArgumentParser(description="qexp v2 agent")
+    parser = argparse.ArgumentParser(description="qexp agent")
     parser.add_argument("--shared-root", required=True, type=str)
     parser.add_argument("--machine", required=True, type=str)
     parser.add_argument("--runtime-root", type=str, default=None)

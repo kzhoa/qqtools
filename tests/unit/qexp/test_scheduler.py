@@ -1,77 +1,255 @@
-from qqtools.plugins.qexp import fsqueue
-from qqtools.plugins.qexp.executor import qExpExecutor
-from qqtools.plugins.qexp.models import qExpTask
-from qqtools.plugins.qexp.scheduler import qExpScheduler
-from qqtools.plugins.qexp.tracker import qExpTracker
+from __future__ import annotations
+
+import pytest
+
+from qqtools.plugins.qexp.indexes import load_index, update_index_on_submit
+from qqtools.plugins.qexp.layout import init_shared_root
+from qqtools.plugins.qexp.models import (
+    Meta,
+    PHASE_FAILED,
+    PHASE_QUEUED,
+    PHASE_RUNNING,
+    PHASE_STARTING,
+    Task,
+    TaskLineage,
+    TaskResult,
+    TaskRuntime,
+    TaskSpec,
+    TaskStatus,
+    TaskTimestamps,
+    utc_now_iso,
+)
+from qqtools.plugins.qexp.scheduler import (
+    Scheduler,
+    reconcile_running_tasks,
+    run_dispatch_cycle,
+)
+from qqtools.plugins.qexp.storage import cas_update_task, load_task, save_task
 
 
-def test_scheduler_uses_fifo_with_backfill(tmp_path, monkeypatch):
-    root = tmp_path / "scheduler-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
+@pytest.fixture()
+def cfg(tmp_path):
+    return init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime")
 
-    first = qExpTask(
-        task_id="job_big",
-        argv=["python", "train_big.py"],
-        num_gpus=2,
-        created_at="2024-01-01T00:00:00Z",
+
+def _make_task(task_id: str, machine: str = "dev1") -> Task:
+    now = utc_now_iso()
+    return Task(
+        meta=Meta.new(machine),
+        task_id=task_id,
+        name=None,
+        group=None,
+        batch_id=None,
+        machine_name=machine,
+        attempt=1,
+        spec=TaskSpec(command=["echo", "hi"], requested_gpus=1),
+        status=TaskStatus(phase=PHASE_QUEUED),
+        runtime=TaskRuntime(),
+        timestamps=TaskTimestamps(created_at=now, queued_at=now),
+        result=TaskResult(),
+        lineage=TaskLineage(),
     )
-    second = qExpTask(
-        task_id="job_small",
-        argv=["python", "train_small.py"],
-        num_gpus=1,
-        created_at="2024-01-01T00:00:01Z",
-    )
-    fsqueue.save_task(first)
-    fsqueue.save_task(second)
-
-    tracker = qExpTracker(gpu_probe=lambda: ("stub", [0]))
-    tracker.refresh(root, running_tasks=[])
-    scheduler = qExpScheduler(
-        tracker=tracker,
-        create_window=lambda task_id, session_name: f"@{task_id}",
-        executor=qExpExecutor(send_command=lambda _window_id, _command: None),
-    )
-
-    launched = scheduler.run_cycle(root)
-
-    assert launched == ["job_small"]
-    assert fsqueue.load_task_by_id("job_big", root).status == "pending"
-    launched_task = fsqueue.load_task_by_id("job_small", root)
-    assert launched_task.status == "running"
-    assert launched_task.assigned_gpus == [0]
-    assert launched_task.tmux_window_id == "@job_small"
 
 
-def test_scheduler_kills_window_when_dispatch_races(tmp_path, monkeypatch):
-    root = tmp_path / "scheduler-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
+class TestDispatchCycle:
+    def test_empty_queue(self, cfg):
+        launched = run_dispatch_cycle(cfg)
+        assert launched == []
 
-    task = qExpTask(
-        task_id="job_race",
-        argv=["python", "train.py"],
-        num_gpus=1,
-        created_at="2024-01-01T00:00:00Z",
-    )
-    fsqueue.save_task(task)
+    def test_dispatch_without_tracker(self, cfg):
+        t = _make_task("t1")
+        save_task(cfg, t)
+        update_index_on_submit(cfg, t)
 
-    tracker = qExpTracker(gpu_probe=lambda: ("stub", [0]))
-    tracker.refresh(root, running_tasks=[])
-    killed_windows: list[str | None] = []
-    scheduler = qExpScheduler(
-        tracker=tracker,
-        create_window=lambda task_id, session_name: "@race",
-        kill_window=lambda window_id: killed_windows.append(window_id),
-        executor=qExpExecutor(send_command=lambda _window_id, _command: None),
-    )
-    original_dispatch = fsqueue.dispatch_task_to_running
+        launched = run_dispatch_cycle(cfg, tracker=None)
+        assert launched == ["t1"]
 
-    def _raise_dispatch_race(*args, **kwargs):
-        raise FileNotFoundError("simulated cancel race")
+        loaded = load_task(cfg, "t1")
+        assert loaded.status.phase == PHASE_STARTING
+        assert loaded.meta.revision == 3  # 1 (create) + 2 (dispatching + starting)
 
-    monkeypatch.setattr(fsqueue, "dispatch_task_to_running", _raise_dispatch_race)
+    def test_dispatch_skips_other_machine(self, cfg):
+        t = _make_task("t1", machine="other-machine")
+        save_task(cfg, t)
+        update_index_on_submit(cfg, t)
 
-    launched = scheduler.run_cycle(root)
+        launched = run_dispatch_cycle(cfg)
+        assert launched == []
 
-    assert launched == []
-    assert killed_windows == ["@race"]
-    assert tracker.reserved_gpu_ids == set()
+    def test_dispatch_multiple(self, cfg):
+        for i in range(3):
+            t = _make_task(f"t{i}")
+            save_task(cfg, t)
+            update_index_on_submit(cfg, t)
+
+        launched = run_dispatch_cycle(cfg)
+        assert len(launched) == 3
+
+    def test_index_updated_after_dispatch(self, cfg):
+        t = _make_task("t1")
+        save_task(cfg, t)
+        update_index_on_submit(cfg, t)
+
+        run_dispatch_cycle(cfg)
+        assert "t1" not in load_index(cfg, "state", PHASE_QUEUED)
+        assert "t1" in load_index(cfg, "state", PHASE_STARTING)
+
+
+class _FakeTracker:
+    def __init__(self, available: int = 8):
+        self._available = available
+        self.allocated: dict[str, list[int]] = {}
+        self.visible_gpu_ids: list[int] = list(range(available))
+        self.reserved_gpu_ids: set[int] = set()
+        self.task_id_to_gpu_ids: dict[str, list[int]] = {}
+
+    def allocate(self, task_id: str, num_gpus: int) -> list[int] | None:
+        if num_gpus > self._available:
+            return None
+        gpus = list(range(self._available - num_gpus, self._available))
+        self._available -= num_gpus
+        self.allocated[task_id] = gpus
+        return gpus
+
+    def release(self, task_id: str) -> None:
+        gpus = self.allocated.pop(task_id, [])
+        self._available += len(gpus)
+
+
+class _FakeExecutor:
+    """Executor that doesn't require tmux."""
+
+    def __init__(self):
+        self.launched: list[str] = []
+
+    def launch_in_window(self, cfg, task_id, session_name="experiments"):
+        self.launched.append(task_id)
+        return f"@fake-window-{task_id}"
+
+    def launch_task(self, cfg, task_id, group):
+        session_name = group or "experiments"
+        self.launched.append(f"{task_id}:{session_name}")
+        return f"@fake-window-{task_id}"
+
+    def cleanup_window(self, window_id):
+        pass
+
+
+class TestSchedulerWithTracker:
+    def test_allocates_gpus(self, cfg):
+        t = _make_task("t1")
+        t.spec.requested_gpus = 2
+        save_task(cfg, t)
+        update_index_on_submit(cfg, t)
+
+        tracker = _FakeTracker(available=4)
+        executor = _FakeExecutor()
+        scheduler = Scheduler(tracker=tracker, executor=executor)
+        launched = scheduler.run_dispatch_cycle(cfg)
+        assert launched == ["t1"]
+        loaded = load_task(cfg, "t1")
+        assert len(loaded.runtime.assigned_gpus) == 2
+        assert executor.launched == ["t1:experiments"]
+
+    def test_routes_group_to_tmux_session(self, cfg):
+        t = _make_task("t1")
+        t.group = "contract_n_4and6"
+        save_task(cfg, t)
+        update_index_on_submit(cfg, t)
+
+        tracker = _FakeTracker(available=2)
+        executor = _FakeExecutor()
+        scheduler = Scheduler(tracker=tracker, executor=executor)
+        launched = scheduler.run_dispatch_cycle(cfg)
+
+        assert launched == ["t1"]
+        assert executor.launched == ["t1:contract_n_4and6"]
+
+    def test_insufficient_gpus_rollback(self, cfg):
+        t = _make_task("t1")
+        t.spec.requested_gpus = 4
+        save_task(cfg, t)
+        update_index_on_submit(cfg, t)
+
+        tracker = _FakeTracker(available=2)
+        executor = _FakeExecutor()
+        scheduler = Scheduler(tracker=tracker, executor=executor)
+        launched = scheduler.run_dispatch_cycle(cfg)
+        assert launched == []
+        loaded = load_task(cfg, "t1")
+        assert loaded.status.phase == PHASE_QUEUED
+
+    def test_multiple_tasks_gpu_backfill(self, cfg):
+        """Tasks that fit get scheduled; those that don't are rolled back."""
+        t1 = _make_task("t1")
+        t1.spec.requested_gpus = 2
+        save_task(cfg, t1)
+        update_index_on_submit(cfg, t1)
+
+        t2 = _make_task("t2")
+        t2.spec.requested_gpus = 4
+        save_task(cfg, t2)
+        update_index_on_submit(cfg, t2)
+
+        t3 = _make_task("t3")
+        t3.spec.requested_gpus = 1
+        save_task(cfg, t3)
+        update_index_on_submit(cfg, t3)
+
+        tracker = _FakeTracker(available=4)
+        executor = _FakeExecutor()
+        scheduler = Scheduler(tracker=tracker, executor=executor)
+        launched = scheduler.run_dispatch_cycle(cfg)
+
+        # t1 (2 gpus) fits, t2 (4 gpus) doesn't (only 2 left), t3 (1 gpu) fits
+        assert "t1" in launched
+        assert "t3" in launched
+        assert "t2" not in launched
+        assert load_task(cfg, "t2").status.phase == PHASE_QUEUED
+
+
+class TestReconcileRunning:
+    def test_no_orphans(self, cfg):
+        orphaned = reconcile_running_tasks(cfg)
+        assert orphaned == []
+
+    def test_detects_crashed_wrapper(self, cfg):
+        t = _make_task("t1")
+        save_task(cfg, t)
+        update_index_on_submit(cfg, t)
+
+        # Move to running with a fake dead PID
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        t = load_task(cfg, "t1")
+        t.status.phase = PHASE_RUNNING
+        t.runtime.wrapper_pid = 99999999  # dead PID
+        t.timestamps.started_at = "2020-01-01T00:00:00Z"  # long ago
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, "t1", PHASE_QUEUED, PHASE_RUNNING)
+
+        tracker = _FakeTracker()
+        executor = _FakeExecutor()
+        scheduler = Scheduler(tracker=tracker, executor=executor)
+        failed = scheduler.reconcile_running_tasks(cfg)
+        assert "t1" in failed
+        assert load_task(cfg, "t1").status.phase == PHASE_FAILED
+
+    def test_startup_timeout(self, cfg):
+        t = _make_task("t1")
+        save_task(cfg, t)
+        update_index_on_submit(cfg, t)
+
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        t = load_task(cfg, "t1")
+        t.status.phase = PHASE_STARTING
+        t.timestamps.started_at = "2020-01-01T00:00:00Z"  # long ago
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, "t1", PHASE_QUEUED, PHASE_STARTING)
+
+        tracker = _FakeTracker()
+        executor = _FakeExecutor()
+        scheduler = Scheduler(
+            tracker=tracker, executor=executor, startup_grace_seconds=1
+        )
+        failed = scheduler.reconcile_running_tasks(cfg)
+        assert "t1" in failed

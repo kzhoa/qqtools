@@ -11,14 +11,14 @@
 
 - breaking: qpipeline standard config field `runner.keep_latest_ckp` is replaced by `runner.checkpoint.regular_latest_only`
 - feat: qpipeline regular checkpoints now default to keeping only the latest file unless `runner.checkpoint.regular_latest_only: false`
-- feat: upgrade qexp v2 agent lifecycle to machine-scoped `active` / `draining` / `idle` semantics with `state/agent.json` as the single lifecycle source of truth
-- feat: add formal qexp v2 lifecycle contracts for machine worksets, agent snapshots, and machine summary caches
+- feat: upgrade qexp agent lifecycle to machine-scoped `active` / `draining` / `idle` semantics with `state/agent.json` as the single lifecycle source of truth
+- feat: add formal qexp lifecycle contracts for machine worksets, agent snapshots, and machine summary caches
 - fix: prevent on-demand qexp agents from auto-exiting while the current machine still owns `running` task responsibility
 - fix: stop cross-machine qexp status and orphan repair flows from misclassifying healthy remote agents via local PID probes
 - docs: update qConfig docs and standard config generator output for `runner.checkpoint.regular_latest_only`
 - docs: sync qexp manual and runtime/product specs with the final lifecycle contract and lifecycle-state observability rules
 - test: add coverage for regular checkpoint latest-only rotation and config parsing
-- test: add qexp v2 coverage for lifecycle state transitions, cross-machine observer behavior, orphan repair, and contract serialization
+- test: add qexp coverage for lifecycle state transitions, cross-machine observer behavior, orphan repair, and contract serialization
 
 ## v1.2.9
 
@@ -35,10 +35,10 @@
 
 ## v1.2.7
 
-- breaking: qexp now defaults to the v2 shared-root engine; the v1 single-machine engine is still available via `--v1` flag or `QEXP_VERSION=1` environment variable
-- feat: qexp v2 — shared-root multi-machine experiment queue with explicit machine identity, CAS-based concurrency, batch support, retry lineage, on-demand agent, and scheduling events
-- feat: qexp v2 subcommands: `init`, `submit`, `cancel`, `retry`, `batch-submit`, `batch-retry-failed`, `batch-retry-cancelled`, `list`, `inspect`, `top`, `batches`, `batch`, `machines`, `logs`, `clean`, `agent start/stop/status`, `doctor verify/rebuild-index/repair-orphans/cleanup-locks`
-- deprecation: qexp v1 engine is deprecated and will be removed in v1.3.0
+- breaking: qexp now uses the shared-root engine as the only supported runtime
+- feat: qexp — shared-root multi-machine experiment queue with explicit machine identity, CAS-based concurrency, batch support, retry lineage, on-demand agent, and scheduling events
+- feat: qexp subcommands: `init`, `submit`, `cancel`, `retry`, `batch-submit`, `batch-retry-failed`, `batch-retry-cancelled`, `list`, `inspect`, `top`, `batches`, `batch`, `machines`, `logs`, `clean`, `agent start/stop/status`, `doctor verify/rebuild-index/repair-orphans/cleanup-locks`
+- breaking: qexp v1 single-machine engine has been removed
 - docs: add qexp user manual and release workflow checks that publish changelog-backed release notes
 
 ## v1.2.6

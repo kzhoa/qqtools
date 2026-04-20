@@ -69,6 +69,7 @@ def query_events(
     if machine and machine != cfg.machine_name:
         alt_cfg = RootConfig(
             shared_root=cfg.shared_root,
+            project_root=cfg.project_root,
             machine_name=machine,
             runtime_root=cfg.runtime_root,
         )

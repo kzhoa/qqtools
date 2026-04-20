@@ -78,7 +78,7 @@ def test_ensure_managed_session_rejects_unowned_collision(monkeypatch):
 
 
 def test_send_command_to_window_targets_primary_pane(monkeypatch):
-    window = _FakeWindow("@1", "job_demo")
+    window = _FakeWindow("@1", "task_demo")
     server = _FakeServer(windows=[window])
     monkeypatch.setattr(tmux, "_get_server", lambda: server)
 
@@ -97,19 +97,12 @@ def test_require_libtmux_reports_install_hint(monkeypatch):
         tmux.require_libtmux()
 
 
-def test_launch_background_daemon_emits_manager_command_compatible_with_parser(monkeypatch, tmp_path):
-    session = _FakeSession("qqtools_internal", role=tmux.QQTOOLS_SESSION_ROLE_INTERNAL)
-    daemon_window = _FakeWindow("@daemon", "daemon")
-    session.windows_list = [daemon_window]
-    session.windows = _FakeCollection(session.windows_list, "window_name")
-    server = _FakeServer(sessions=[session], windows=[daemon_window])
+def test_create_window_for_task_uses_custom_session(monkeypatch):
+    session = _FakeSession("custom", role=tmux.QQTOOLS_SESSION_ROLE_EXPERIMENTS)
+    server = _FakeServer(sessions=[session])
     monkeypatch.setattr(tmux, "_get_server", lambda: server)
 
-    window_id = tmux.launch_background_daemon(tmp_path)
+    window_id = tmux.create_window_for_task("task-demo", session_name="custom")
 
-    assert window_id == "@daemon"
-    command, entered = daemon_window.panes[0].commands[-1]
-    assert entered is True
-    assert "qqtools.plugins.qexp.manager" in command
-    assert "--foreground" in command
-    assert "--root" in command
+    assert window_id == "@2"
+    assert session.windows_list[-1].window_name == "task-demo"

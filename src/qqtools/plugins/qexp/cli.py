@@ -2,405 +2,587 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
-from . import api, fsqueue, manager
+from . import api, observer
+from .agent import get_agent_status, run_agent_loop
+from .doctor import (
+    cleanup_stale_locks,
+    repair_metadata,
+    rebuild_indexes,
+    repair_orphans,
+    verify_integrity,
+)
+from .layout import (
+    clear_context,
+    init_shared_root,
+    load_context,
+    load_root_config,
+    save_context,
+)
 
 TOP_REFRESH_INTERVAL_SECONDS = 1.0
 
 
-def _normalize_root(root: str | None) -> Path | None:
-    if root is None:
-        return None
-    return Path(root).expanduser().resolve()
+def _resolve_cfg(args: argparse.Namespace):
+    shared_root = getattr(args, "shared_root", None)
+    machine = getattr(args, "machine", None)
+    runtime_root = getattr(args, "runtime_root", None)
 
-
-def _parse_extra_env(values: list[str] | None) -> dict[str, str] | None:
-    if not values:
-        return None
-
-    extra_env: dict[str, str] = {}
-    for item in values:
-        if "=" not in item:
-            raise ValueError(f"Invalid --env entry {item!r}; expected KEY=VALUE.")
-        key, value = item.split("=", 1)
-        if not key:
-            raise ValueError("Invalid --env entry with empty key.")
-        extra_env[key] = value
-    return extra_env
-
-
-def _build_env_payload(args: argparse.Namespace) -> dict | None:
-    extra_env = _parse_extra_env(args.env)
-    if args.conda_name or args.conda_activate_script:
-        if not args.conda_name or not args.conda_activate_script:
-            raise ValueError("Conda mode requires both --conda-name and --conda-activate-script.")
-        payload = {
-            "kind": "conda",
-            "name": args.conda_name,
-            "activate_script": args.conda_activate_script,
-        }
-    elif args.venv_path:
-        payload = {
-            "kind": "venv",
-            "path": args.venv_path,
-        }
-    elif extra_env:
-        payload = {"kind": "none"}
-    else:
-        return None
-
-    if extra_env:
-        payload["extra_env"] = extra_env
-    return payload
-
-
-def _normalize_submit_argv(argv: list[str]) -> list[str]:
-    normalized = list(argv)
-    if normalized and normalized[0] == "--":
-        normalized = normalized[1:]
-    if not normalized:
-        raise ValueError("qexp submit requires a task argv after '--'.")
-    return normalized
-
-
-def _wait_for_daemon_start(root: Path | None) -> None:
-    wait_seconds = manager.DEFAULT_STARTUP_WAIT_SECONDS
-    if wait_seconds > 0:
-        time.sleep(wait_seconds)
-    if not manager.is_daemon_active(root):
-        raise RuntimeError(
-            "qexp daemon background startup failed. Run `qexp daemon` for debugging."
+    if shared_root and machine:
+        return load_root_config(
+            shared_root,
+            machine,
+            runtime_root,
+            require_initialized=True,
         )
 
+    # Try to load from environment or defaults
+    sr = shared_root or os.environ.get("QEXP_SHARED_ROOT")
+    mn = machine or os.environ.get("QEXP_MACHINE")
+    rr = runtime_root or os.environ.get("QEXP_RUNTIME_ROOT")
 
-def _tail_log_forever(log_path: Path) -> int:
-    with log_path.open("r", encoding="utf-8") as handle:
-        while True:
-            chunk = handle.read()
-            if chunk:
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
-                continue
-            time.sleep(0.5)
+    # Fall back to saved context file
+    if not sr or not mn:
+        ctx = load_context()
+        if ctx:
+            sr = sr or ctx.get("shared_root")
+            mn = mn or ctx.get("machine")
+            rr = rr or ctx.get("runtime_root")
 
-
-def _render_status_text(snapshot: dict) -> str:
-    lines = [
-        f"Daemon: {snapshot['daemon']['state']}",
-        (
-            "Pending: {pending}  Running: {running}  Done: {done}  Failed: {failed}  "
-            "Cancelled: {cancelled}"
-        ).format(**snapshot["counts"]),
-        "",
-    ]
-
-    columns = [
-        ("STATE", "state"),
-        ("TASK_ID", "task_id"),
-        ("NAME", "name"),
-        ("GPUS", "gpus"),
-        ("ASSIGNED", "assigned"),
-        ("CREATED_AT", "created_at"),
-        ("EXIT_REASON", "exit_reason"),
-    ]
-    rows = snapshot["tasks"]
-    widths: list[int] = []
-    for header, key in columns:
-        cell_width = max((len(str(row[key])) for row in rows), default=0)
-        widths.append(max(len(header), cell_width))
-
-    header_line = "  ".join(header.ljust(width) for (header, _key), width in zip(columns, widths))
-    lines.append(header_line)
-    for row in rows:
-        lines.append(
-            "  ".join(str(row[key]).ljust(width) for (_header, key), width in zip(columns, widths))
+    if not sr or not mn:
+        print(
+            "Error: --shared-root and --machine are required "
+            "(or set QEXP_SHARED_ROOT / QEXP_MACHINE, "
+            "or run 'qexp use' to save defaults). "
+            "shared_root must point to the project control root '.qexp'.",
+            file=sys.stderr,
         )
-    return "\n".join(lines).rstrip() + "\n"
+        raise SystemExit(1)
+
+    return load_root_config(sr, mn, rr, require_initialized=True)
 
 
-def _render_gpu_slot(slot: dict) -> str:
-    return "\n".join(
-        [
-            f"GPU {slot['gpu_id']}",
-            slot["state"],
-            slot["task_id"],
-        ]
-    )
-
-
-def _create_top_console():
-    from rich.console import Console
-
-    return Console()
-
-
-def _render_top(snapshot: dict, *, console=None) -> None:
-    from rich.columns import Columns
-    from rich.panel import Panel
-    from rich.table import Table
-
-    if console is None:
-        console = _create_top_console()
-    daemon = snapshot["daemon"]
-    daemon_table = Table.grid(padding=(0, 1))
-    daemon_table.add_row("Daemon", daemon["state"])
-    daemon_table.add_row("Host", snapshot["host"]["hostname"] or "-")
-    daemon_table.add_row("Platform", snapshot["host"]["platform"] or "-")
-    daemon_table.add_row("GPU Backend", snapshot["gpus"]["backend"] or daemon["gpu_backend"] or "-")
-    daemon_table.add_row("Visible GPUs", str(len(snapshot["gpus"]["visible_gpu_ids"])))
-
-    gpu_panels = []
-    slots = list(snapshot["gpus"]["slots"])
-    visible_count = max(8, len(slots))
-    for index in range(visible_count):
-        slot = slots[index] if index < len(slots) else {"gpu_id": "-", "state": "-", "task_id": "-"}
-        style = "red" if slot["state"] == "Reserved" else "green"
-        if slot["state"] == "-":
-            style = "dim"
-        gpu_panels.append(Panel(_render_gpu_slot(slot), border_style=style))
-
-    pending_table = Table(show_header=True)
-    pending_table.add_column("TASK_ID")
-    pending_table.add_column("NAME")
-    pending_table.add_column("GPUS")
-    pending_table.add_column("CREATED_AT")
-    for row in snapshot["pending_preview"]:
-        pending_table.add_row(row["task_id"], row["name"], str(row["gpus"]), row["created_at"])
-
-    event_table = Table(show_header=True)
-    event_table.add_column("TIMESTAMP")
-    event_table.add_column("TASK_ID")
-    event_table.add_column("STATE")
-    event_table.add_column("EXIT_REASON")
-    for event in snapshot["events"]:
-        event_table.add_row(
-            event["timestamp"],
-            event["task_id"],
-            event["state"],
-            event["exit_reason"],
-        )
-
-    console.print(Panel(daemon_table, title="Daemon And Host"))
-    console.print(Panel(Columns(gpu_panels, equal=True, expand=True), title="GPU Occupancy"))
-    console.print(Panel(pending_table, title="Pending Preview"))
-    console.print(Panel(event_table, title="Recent Events"))
-
-
-def _run_top_monitor(*, root: Path | None, refresh_interval: float = TOP_REFRESH_INTERVAL_SECONDS) -> int:
-    console = _create_top_console()
-    try:
-        while True:
-            console.clear()
-            _render_top(api.get_status_snapshot(root=root), console=console)
-            time.sleep(refresh_interval)
-    except KeyboardInterrupt:
-        return 0
-
-
-def _render_clean_summary(result: dict) -> str:
-    mode = "Dry run" if result["dry_run"] else "Deleted"
-    lines = [
-        f"{mode}: {len(result['task_ids'])} task files, {len(result['deleted_log_files'])} log files",
-    ]
-    for path in result["deleted_task_files"]:
-        lines.append(path)
-    for path in result["deleted_log_files"]:
-        lines.append(path)
-    return "\n".join(lines) + "\n"
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="qexp local experiment scheduler")
-    parser.add_argument("--root", type=str, default=None, help="override qexp state root")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    submit_parser = subparsers.add_parser("submit", help="queue a task")
-    submit_parser.add_argument("--num-gpus", type=int, required=True)
-    submit_parser.add_argument("--job-id", type=str, default=None)
-    submit_parser.add_argument("--job-name", type=str, default=None)
-    submit_parser.add_argument("--workdir", type=str, default=None)
-    submit_parser.add_argument("--conda-name", type=str, default=None)
-    submit_parser.add_argument("--conda-activate-script", type=str, default=None)
-    submit_parser.add_argument("--venv-path", type=str, default=None)
-    submit_parser.add_argument(
-        "--env",
-        action="append",
-        default=None,
-        metavar="KEY=VALUE",
-        help="extra environment variable to inject into task runtime",
+    parser = argparse.ArgumentParser(
+        description="qexp — project-root control-plane experiment queue"
     )
-    submit_parser.add_argument("argv", nargs=argparse.REMAINDER)
+    parser.add_argument("--shared-root", type=str, default=None)
+    parser.add_argument("--machine", type=str, default=None)
+    parser.add_argument("--runtime-root", type=str, default=None)
 
-    daemon_parser = subparsers.add_parser("daemon", help="run or start the qexp daemon")
-    daemon_parser.add_argument("--background", action="store_true")
-    daemon_parser.add_argument("--foreground", action="store_true")
+    sub = parser.add_subparsers(dest="command", required=True)
 
-    cancel_parser = subparsers.add_parser("cancel", help="cancel a queued or running task")
-    cancel_parser.add_argument("task_id", type=str)
+    # init
+    init_p = sub.add_parser(
+        "init",
+        help="initialize or refresh machine registration and save CLI context",
+        description=(
+            "Initialize qexp for one machine. Safe to run multiple times: "
+            "it ensures the layout exists, refreshes machine.json, and saves "
+            "the current CLI context. shared_root must be the project "
+            "control directory named '.qexp'."
+        ),
+    )
+    init_p.add_argument("--agent-mode", choices=["on_demand", "persistent"], default="on_demand")
 
-    logs_parser = subparsers.add_parser("logs", help="show persisted logs for a task")
-    logs_parser.add_argument("task_id", type=str)
-    logs_parser.add_argument("-f", "--follow", action="store_true")
+    # submit
+    submit_p = sub.add_parser("submit", help="submit a single task")
+    submit_p.add_argument("--task-id", type=str, default=None)
+    submit_p.add_argument("--name", type=str, default=None)
+    submit_p.add_argument("--group", type=str, default=None)
+    submit_p.add_argument("--gpus", type=int, default=1)
+    submit_p.add_argument("argv", nargs=argparse.REMAINDER)
 
-    status_parser = subparsers.add_parser("status", help="show queue and daemon status")
-    status_parser.add_argument("--json", action="store_true", dest="json_output")
+    # cancel
+    cancel_p = sub.add_parser("cancel", help="cancel a task")
+    cancel_p.add_argument("task_id", type=str)
 
-    top_parser = subparsers.add_parser("top", help="show live operator dashboard")
-    top_parser.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    # retry
+    retry_p = sub.add_parser("retry", help="retry a terminal task")
+    retry_p.add_argument("task_id", type=str)
+    retry_p.add_argument("--group", type=str, default=None)
 
-    clean_parser = subparsers.add_parser("clean", help="clean completed qexp records")
-    clean_parser.add_argument("--dry-run", action="store_true")
-    clean_parser.add_argument("--include-failed", action="store_true")
-    clean_parser.add_argument(
+    # batch-submit
+    batch_p = sub.add_parser("batch-submit", help="submit tasks from manifest")
+    batch_p.add_argument("--file", type=str, required=True, dest="manifest_file")
+
+    # batch-retry-failed
+    brf_p = sub.add_parser("batch-retry-failed", help="retry failed tasks in batch")
+    brf_p.add_argument("batch_id", type=str)
+
+    # batch-retry-cancelled
+    brc_p = sub.add_parser("batch-retry-cancelled", help="retry cancelled tasks in batch")
+    brc_p.add_argument("batch_id", type=str)
+
+    # list
+    list_p = sub.add_parser("list", help="list tasks")
+    list_p.add_argument("--phase", type=str, default=None)
+    list_p.add_argument("--batch", type=str, default=None, dest="batch_id")
+    list_p.add_argument("--group", type=str, default=None)
+    list_p.add_argument("--limit", type=int, default=50)
+
+    # inspect
+    inspect_p = sub.add_parser("inspect", help="inspect a single task")
+    inspect_p.add_argument("task_id", type=str)
+
+    # top
+    top_p = sub.add_parser("top", help="live queue overview")
+    top_p.add_argument("--all", action="store_true", dest="all_machines")
+
+    # batches
+    sub.add_parser("batches", help="list batches")
+
+    # batch (inspect)
+    batch_i = sub.add_parser("batch", help="inspect a batch")
+    batch_i.add_argument("batch_id", type=str)
+
+    # machines
+    sub.add_parser("machines", help="list registered machines")
+
+    # logs
+    logs_p = sub.add_parser("logs", help="show task log output")
+    logs_p.add_argument("task_id", type=str)
+    logs_p.add_argument("-f", "--follow", action="store_true")
+
+    # clean
+    clean_p = sub.add_parser("clean", help="clean old terminal task records")
+    clean_p.add_argument("--dry-run", action="store_true")
+    clean_p.add_argument("--task-id", type=str, default=None)
+    clean_p.add_argument("--include-failed", action="store_true")
+    clean_p.add_argument(
         "--older-than-seconds",
         type=int,
-        default=api.DEFAULT_CLEAN_OLDER_THAN_SECONDS,
+        default=None,
     )
+
+    # agent
+    agent_p = sub.add_parser("agent", help="agent management")
+    agent_sub = agent_p.add_subparsers(dest="agent_command", required=True)
+    agent_start = agent_sub.add_parser("start", help="start agent")
+    agent_start.add_argument("--persistent", action="store_true")
+    agent_start.add_argument("--background", action="store_true", help="start in tmux background")
+    agent_sub.add_parser("stop", help="stop agent")
+    agent_sub.add_parser("status", help="show agent status")
+
+    # use (context management)
+    use_p = sub.add_parser(
+        "use",
+        help="set, show, or clear saved CLI context",
+        description=(
+            "Manage the saved qexp CLI context used as a fallback after "
+            "explicit flags and environment variables."
+        ),
+    )
+    use_p.add_argument("--shared-root", type=str, default=None, dest="use_shared_root")
+    use_p.add_argument("--machine", type=str, default=None, dest="use_machine")
+    use_p.add_argument("--runtime-root", type=str, default=None, dest="use_runtime_root")
+    use_p.add_argument("--show", action="store_true", help="show current context")
+    use_p.add_argument("--clear", action="store_true", help="clear saved context")
+
+    # doctor
+    doctor_p = sub.add_parser("doctor", help="diagnostics and repair")
+    doctor_sub = doctor_p.add_subparsers(dest="doctor_command")
+    doctor_sub.add_parser("repair", help="repair batch truth and rebuild indexes")
+    doctor_sub.add_parser("rebuild-index", help="rebuild all indexes")
+    doctor_sub.add_parser("repair-orphans", help="repair orphaned tasks")
+    doctor_sub.add_parser("cleanup-locks", help="clean stale locks")
+    doctor_sub.add_parser("verify", help="non-destructive integrity check")
 
     return parser
 
 
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_argv(argv: list[str]) -> list[str]:
+    normalized = list(argv)
+    if normalized and normalized[0] == "--":
+        normalized = normalized[1:]
+    if not normalized:
+        raise ValueError("submit requires a command after '--'.")
+    return normalized
+
+
+def handle_init(args: argparse.Namespace) -> int:
+    sr = args.shared_root
+    mn = args.machine
+    if not sr or not mn:
+        print(
+            "Error: --shared-root and --machine are required for init. "
+            "shared_root must be the project control root '.qexp'.",
+            file=sys.stderr,
+        )
+        return 1
+    cfg = init_shared_root(
+        Path(sr), mn,
+        agent_mode=args.agent_mode,
+        runtime_root=Path(args.runtime_root) if args.runtime_root else None,
+    )
+    # Only persist runtime_root when explicitly passed via --runtime-root;
+    # the default path is derivable at runtime and should not be hardcoded.
+    save_context(
+        str(cfg.shared_root),
+        cfg.machine_name,
+        str(cfg.runtime_root) if args.runtime_root else None,
+    )
+    print(
+        f"Initialized project control root: shared_root={cfg.shared_root} "
+        f"project_root={cfg.project_root} machine={cfg.machine_name} (context saved)"
+    )
+    return 0
+
+
+def handle_use(args: argparse.Namespace) -> int:
+    if args.clear:
+        if clear_context():
+            print("Context cleared.")
+        else:
+            print("No context to clear.")
+        return 0
+    if args.show:
+        ctx = load_context()
+        if ctx:
+            print(json.dumps(ctx, indent=2, sort_keys=True))
+        else:
+            print("No context saved. Run 'qexp use --shared-root ... --machine ...' to set.")
+        return 0
+    # Accept flags from both 'qexp --shared-root X use' and 'qexp use --shared-root X'
+    sr = getattr(args, "use_shared_root", None) or args.shared_root
+    mn = getattr(args, "use_machine", None) or args.machine
+    rr = getattr(args, "use_runtime_root", None) or args.runtime_root
+    if not sr or not mn:
+        print(
+            "Error: --shared-root and --machine are required for 'qexp use'. "
+            "shared_root must be the project control root '.qexp'.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        load_root_config(sr, mn, rr, require_initialized=True)
+    except Exception as exc:
+        print(f"Error: cannot save qexp context: {exc}", file=sys.stderr)
+        return 1
+    path = save_context(sr, mn, rr)
+    print(f"Context saved to {path}: shared_root={sr} machine={mn}")
+    return 0
+
+
 def handle_submit(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
     task = api.submit(
-        argv=_normalize_submit_argv(args.argv),
-        num_gpus=args.num_gpus,
-        job_id=args.job_id,
-        job_name=args.job_name,
-        workdir=args.workdir,
-        env=_build_env_payload(args),
-        root=_normalize_root(args.root),
+        cfg,
+        command=_normalize_argv(args.argv),
+        requested_gpus=args.gpus,
+        task_id=args.task_id,
+        name=args.name,
+        group=args.group,
     )
     print(task.task_id)
     return 0
 
 
-def handle_daemon(args: argparse.Namespace) -> int:
-    root = _normalize_root(args.root)
-    if args.background and args.foreground:
-        raise ValueError("Choose either --background or --foreground, not both.")
-
-    if args.background:
-        manager.run_preflight_checks()
-        manager.start_daemon_background(root)
-        _wait_for_daemon_start(root)
-        print("qexp daemon started in background")
-        return 0
-
-    return manager.run_daemon_foreground(root=root)
-
-
 def handle_cancel(args: argparse.Namespace) -> int:
-    task = api.cancel(args.task_id, root=_normalize_root(args.root))
-    print(f"{task.task_id} {task.status}")
+    cfg = _resolve_cfg(args)
+    task = api.cancel(cfg, args.task_id)
+    print(f"{task.task_id} {task.status.phase}")
     return 0
 
 
-def handle_logs(args: argparse.Namespace) -> int:
-    root = _normalize_root(args.root)
-    log_path = fsqueue.get_log_path(args.task_id, root=root)
-    if not log_path.exists():
-        raise FileNotFoundError(f"qexp log for task '{args.task_id}' does not exist.")
-
-    if args.follow:
-        return _tail_log_forever(log_path)
-
-    sys.stdout.write(api.read_logs(args.task_id, root=root))
+def handle_retry(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    new_task = api.retry(cfg, args.task_id, group=args.group)
+    print(f"{new_task.task_id} (retry of {new_task.lineage.retry_of})")
     return 0
 
 
-def handle_status(args: argparse.Namespace) -> int:
-    snapshot = api.get_status_snapshot(root=_normalize_root(args.root))
-    if args.json_output:
-        sys.stdout.write(json.dumps(snapshot, indent=2, sort_keys=True))
-        sys.stdout.write("\n")
+def handle_batch_submit(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    batch = api.batch_submit(cfg, Path(args.manifest_file))
+    print(f"batch={batch.batch_id} tasks={len(batch.task_ids)}")
+    return 0
+
+
+def handle_batch_retry_failed(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    new_tasks = api.batch_retry_failed(cfg, args.batch_id)
+    print(f"Retried {len(new_tasks)} failed tasks.")
+    return 0
+
+
+def handle_batch_retry_cancelled(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    new_tasks = api.batch_retry_cancelled(cfg, args.batch_id)
+    print(f"Retried {len(new_tasks)} cancelled tasks.")
+    return 0
+
+
+def handle_list(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    tasks = observer.list_tasks(
+        cfg,
+        phase=args.phase,
+        batch_id=args.batch_id,
+        group=args.group,
+        limit=args.limit,
+    )
+    if not tasks:
+        print("No tasks found.")
         return 0
+    for t in tasks:
+        print(
+            f"{t['phase']:12s} {t['task_id']:14s} "
+            f"{(t.get('group') or '-'):20s} "
+            f"{(t.get('name') or '-'):20s} gpus={t['gpus']}"
+        )
+    return 0
 
-    sys.stdout.write(_render_status_text(snapshot))
+
+def handle_inspect(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    data = observer.inspect_task(cfg, args.task_id)
+    print(json.dumps(data, indent=2, sort_keys=True))
     return 0
 
 
 def handle_top(args: argparse.Namespace) -> int:
-    root = _normalize_root(args.root)
-    if args.once:
-        _render_top(api.get_status_snapshot(root=root))
+    cfg = _resolve_cfg(args)
+    try:
+        while True:
+            view = observer.top_view(cfg, all_machines=args.all_machines)
+            sys.stdout.write("\033[2J\033[H")  # clear screen
+            print(f"=== qexp top ({cfg.machine_name}) ===\n")
+            counts = view["counts"]
+            print(
+                f"queued={counts.get('queued', 0)}  running={counts.get('running', 0)}  "
+                f"succeeded={counts.get('succeeded', 0)}  failed={counts.get('failed', 0)}"
+            )
+            print()
+            for m in view.get("machines", []):
+                phase_counts = m.get("counts_by_phase", {})
+                print(
+                    "  "
+                    f"machine={m['machine_name']}  "
+                    f"gpus={m['gpu_count']}  "
+                    f"agent={m['agent_state']}  "
+                    f"queued={phase_counts.get('queued', 0)}  "
+                    f"dispatching={phase_counts.get('dispatching', 0)}  "
+                    f"starting={phase_counts.get('starting', 0)}  "
+                    f"running={phase_counts.get('running', 0)}"
+                )
+            print()
+            for e in view.get("recent_events", [])[:5]:
+                print(f"  {e.get('timestamp', '')}  {e.get('event_type', '')}  {e.get('task_id', '')}")
+            sys.stdout.flush()
+            time.sleep(TOP_REFRESH_INTERVAL_SECONDS)
+    except KeyboardInterrupt:
         return 0
-    return _run_top_monitor(root=root)
 
 
-def handle_clean(args: argparse.Namespace) -> int:
-    result = api.clean(
-        root=_normalize_root(args.root),
-        dry_run=args.dry_run,
-        include_failed=args.include_failed,
-        older_than_seconds=args.older_than_seconds,
-    )
-    sys.stdout.write(_render_clean_summary(result))
+def handle_batches(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    batches = observer.list_batches(cfg)
+    if not batches:
+        print("No batches found.")
+        return 0
+    for b in batches:
+        print(
+            f"{b['batch_id']:14s} {(b.get('group') or '-'):20s} "
+            f"{b.get('name') or '-':20s} total={b['total']} failed={b['failed']}"
+        )
     return 0
 
 
-def _should_use_v1(argv: list[str] | None) -> bool:
-    """Check if the user explicitly requested v1 via --v1 flag or QEXP_VERSION=1."""
-    import os
-    if os.environ.get("QEXP_VERSION") == "1":
-        return True
-    if argv:
+def handle_batch_inspect(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    data = observer.inspect_batch(cfg, args.batch_id)
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 0
+
+
+def handle_machines(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    machines = observer.list_machines(cfg)
+    if not machines:
+        print("No machines registered.")
+        return 0
+    for m in machines:
+        phase_counts = m.get("counts_by_phase", {})
+        print(
+            f"{m['machine_name']:14s} host={m.get('hostname') or '-':20s} "
+            f"mode={m['agent_mode']}  state={m['agent_state']}  gpus={m['gpu_count']}  "
+            f"queued={phase_counts.get('queued', 0)}  "
+            f"dispatching={phase_counts.get('dispatching', 0)}  "
+            f"starting={phase_counts.get('starting', 0)}  "
+            f"running={phase_counts.get('running', 0)}"
+        )
+    return 0
+
+
+def handle_logs(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    if args.follow:
         try:
-            sep = argv.index("--")
-            prefix = argv[:sep]
-        except ValueError:
-            prefix = argv
-        if "--v1" in prefix:
-            return True
-    return False
+            api.tail_log(cfg, args.task_id)
+        except KeyboardInterrupt:
+            pass
+        return 0
+    sys.stdout.write(api.read_logs(cfg, args.task_id))
+    return 0
 
 
-def _strip_v1_flag(argv: list[str]) -> list[str]:
-    """Remove the --v1 flag only from the portion before '--'."""
-    try:
-        sep = argv.index("--")
-        prefix = [a for a in argv[:sep] if a != "--v1"]
-        return prefix + argv[sep:]
-    except ValueError:
-        return [a for a in argv if a != "--v1"]
+def handle_clean(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    if args.task_id and args.include_failed:
+        print(
+            "Error: --task-id cannot be combined with --include-failed.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.task_id and args.older_than_seconds is not None:
+        print(
+            "Error: --task-id cannot be combined with --older-than-seconds.",
+            file=sys.stderr,
+        )
+        return 1
+    result = api.clean(
+        cfg,
+        dry_run=args.dry_run,
+        task_id=args.task_id,
+        include_failed=args.include_failed,
+        older_than_seconds=args.older_than_seconds,
+    )
+    mode = "Dry run" if result["dry_run"] else "Cleaned"
+    task_count = (
+        result["planned_task_count"] if result["dry_run"] else result["deleted_task_count"]
+    )
+    print(
+        f"{mode}: mode={result['mode']} tasks={task_count} "
+        f"logs_deleted={result['deleted_log_count']} "
+        f"batches_repaired={len(result['repaired_batches'])}"
+    )
+    for tid in result["task_ids"]:
+        print(f"  {tid}")
+    for log_result in result.get("log_results", []):
+        status = log_result.get("status")
+        path = log_result.get("path") or "-"
+        print(f"  log[{status}] {log_result['task_id']} {path}")
+    return 0
 
 
-# Keep old names for backward compatibility during transition
-def _should_use_v2(argv: list[str] | None) -> bool:
-    return not _should_use_v1(argv)
+def handle_agent(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    # 'daemon' without subcommand means foreground start (v1 compat)
+    if not getattr(args, "agent_command", None):
+        return run_agent_loop(cfg, persistent=getattr(args, "persistent", False))
+    if args.agent_command == "start":
+        if args.background:
+            from .agent import wake_agent_if_needed
+            ok = wake_agent_if_needed(cfg)
+            if ok:
+                print("Agent started in background.")
+                return 0
+            else:
+                print("Failed to start agent in background.", file=sys.stderr)
+                return 1
+        return run_agent_loop(cfg, persistent=args.persistent)
+    elif args.agent_command == "stop":
+        from .agent import stop_agent_record, is_agent_running, read_agent_state
+        state = read_agent_state(cfg)
+        if state and state.get("pid") and is_agent_running(cfg):
+            import signal as _sig
+            try:
+                os.kill(state["pid"], _sig.SIGTERM)
+            except OSError:
+                pass
+        stop_agent_record(cfg, reason="manual_stop")
+        print("Agent stop requested.")
+        return 0
+    elif args.agent_command == "status":
+        status = get_agent_status(cfg)
+        print(json.dumps(status, indent=2, sort_keys=True))
+        return 0
+    return 1
+
+
+def handle_doctor(args: argparse.Namespace) -> int:
+    cfg = _resolve_cfg(args)
+    cmd = args.doctor_command
+
+    if cmd == "rebuild-index":
+        stats = rebuild_indexes(cfg)
+        print(json.dumps(stats, indent=2))
+        return 0
+    elif cmd == "repair":
+        result = repair_metadata(cfg)
+        print(json.dumps(result, indent=2))
+        return 0
+    elif cmd == "repair-orphans":
+        orphaned = repair_orphans(cfg)
+        print(f"Repaired {len(orphaned)} orphaned tasks.")
+        for tid in orphaned:
+            print(f"  {tid}")
+        return 0
+    elif cmd == "cleanup-locks":
+        cleaned = cleanup_stale_locks(cfg)
+        print(f"Cleaned {len(cleaned)} stale locks.")
+        return 0
+    elif cmd == "verify":
+        result = verify_integrity(cfg)
+        print(json.dumps(result, indent=2))
+        return 0 if result["ok"] else 1
+    else:
+        # Default: run verify
+        result = verify_integrity(cfg)
+        print(json.dumps(result, indent=2))
+        return 0 if result["ok"] else 1
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+_HANDLERS = {
+    "init": handle_init,
+    "use": handle_use,
+    "submit": handle_submit,
+    "cancel": handle_cancel,
+    "retry": handle_retry,
+    "batch-submit": handle_batch_submit,
+    "batch-retry-failed": handle_batch_retry_failed,
+    "batch-retry-cancelled": handle_batch_retry_cancelled,
+    "list": handle_list,
+    "inspect": handle_inspect,
+    "top": handle_top,
+    "batches": handle_batches,
+    "batch": handle_batch_inspect,
+    "machines": handle_machines,
+    "logs": handle_logs,
+    "clean": handle_clean,
+    "agent": handle_agent,
+    "doctor": handle_doctor,
+}
 
 
 def main(argv: list[str] | None = None) -> int:
-    # v2 is the default since 1.2.7. Use --v1 or QEXP_VERSION=1 to
-    # fall back to the legacy single-machine engine.
-    # v1 will be removed in 1.3.0.
-    if not _should_use_v1(argv):
-        from .v2.cli import main as v2_main
-        return v2_main(argv)
-
-    cleaned = _strip_v1_flag(argv or sys.argv[1:])
     parser = build_parser()
-    args = parser.parse_args(cleaned)
-
-    if args.command == "submit":
-        return handle_submit(args)
-    if args.command == "daemon":
-        return handle_daemon(args)
-    if args.command == "cancel":
-        return handle_cancel(args)
-    if args.command == "logs":
-        return handle_logs(args)
-    if args.command == "status":
-        return handle_status(args)
-    if args.command == "top":
-        return handle_top(args)
-    if args.command == "clean":
-        return handle_clean(args)
-
-    parser.error(f"Unsupported command: {args.command}")
-    return 2
+    args = parser.parse_args(argv)
+    handler = _HANDLERS.get(args.command)
+    if handler is None:
+        parser.error(f"Unsupported command: {args.command}")
+        return 2
+    return handler(args)
 
 
 if __name__ == "__main__":

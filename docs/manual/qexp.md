@@ -2,7 +2,7 @@
 
 状态：草稿
 
-更新时间：2026-04-08
+更新时间：2026-04-17
 
 ## 目标
 
@@ -18,26 +18,14 @@
 
 ## 当前版本行为
 
-从 `v1.2.7` 开始，`qexp` 默认使用 v2 shared-root 引擎。
+当前 `qexp` 使用 shared-root 引擎。
 
 这意味着：
 
-- 默认入口是多机器共享视图的 v2
+- 默认入口是多机器共享视图
 - 需要显式提供 machine 身份
 - 任务元数据保存在 shared root
 - agent 默认按需启动，不要求长期常驻
-
-如果您要临时回退到旧版单机引擎，可以显式使用：
-
-```bash
-qexp --v1 ...
-```
-
-或者：
-
-```bash
-QEXP_VERSION=1 qexp ...
-```
 
 ## 基本概念
 
@@ -45,7 +33,27 @@ QEXP_VERSION=1 qexp ...
 - `machine`：当前执行任务的一台机器或一个容器实例
 - `runtime root`：当前机器本地运行目录，保存 agent pid、日志等本地状态
 - `task`：一次实际提交与执行对象
+- `group`：项目内长期归组键，用来把一组相关 task 归在同一个工作上下文里
 - `batch`：一组一起提交、一起观察、一起重试的 task
+- `name`：单个 task 的展示名
+- `task_id`：单个 task 的唯一标识
+
+这些概念的关系要分清：
+
+- `group` 解决“这些 task 长期属于哪一组工作上下文”
+- `batch` 解决“这些 task 是否是这一次一起提交的一批”
+- `name` 解决“这个 task 给人看的名字是什么”
+- `task_id` 解决“系统内部唯一标识是什么”
+- 一个 `group` 内可以有多个 `batch`
+- `group` 不等于 `batch`
+- `name` 不等于 `group`
+- `task_id` 不等于 `group`
+
+这几个字段的职责必须固定：
+
+- `group` 只承担归组职责，并直接映射到 tmux session
+- `name` 只承担展示职责，不作为归组主键
+- `task_id` 只承担唯一标识职责，用于 `inspect`、`logs`、`cancel`、`retry`
 
 task 的常见状态流转是：
 
@@ -61,7 +69,7 @@ task 的常见状态流转是：
 
 ## 环境要求
 
-### v2 基本要求
+### 基本要求
 
 - Python 环境中已安装 `qqtools`
 - 有一个所有相关机器都可访问的 shared root
@@ -85,13 +93,35 @@ task 的常见状态流转是：
 每台机器第一次接入 shared queue 时都需要初始化一次：
 
 ```bash
-qexp init --shared-root /mnt/share/my_qexp --machine gpu-a
+qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
 ```
+
+`shared root` 不是任意目录，而是项目控制目录；正式形态固定为 `project_root/.qexp`。
+
+正确形态：
+
+```bash
+qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
+```
+
+不推荐：
+
+```bash
+qexp init --shared-root /mnt/share/myproject/.qexp/exp1/shared --machine gpu-a
+qexp init --shared-root /mnt/share/myproject/.qexp/exp2/shared --machine gpu-a
+```
+
+原因：
+
+- `shared root` 代表一整套项目级控制平面
+- 同一项目内的 task、batch、machine、索引和事件应共享同一套真相
+- 如果按实验计划拆多个 `shared root`，同项目内的资源视图、观察面和队列状态会被打碎
+- 当前运行时会拒绝不符合 `project_root/.qexp` 约束的根路径
 
 如果您希望 agent 在该机器上常驻：
 
 ```bash
-qexp init --shared-root /mnt/share/my_qexp --machine gpu-a --agent-mode persistent
+qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a --agent-mode persistent
 ```
 
 `--agent-mode on_demand` 是默认模式，agent 会在需要调度时被拉起，并在空闲一段时间后自动退出；`persistent` 适合长期跑任务的固定机器，agent 会持续常驻，减少反复拉起的等待。
@@ -109,14 +139,14 @@ qexp logs <task_id>
 如果您想显式切换或覆盖默认 context，可以使用：
 
 ```bash
-qexp use --shared-root /mnt/share/my_qexp --machine gpu-a
+qexp use --shared-root /mnt/share/myproject/.qexp --machine gpu-a
 qexp use --show
 ```
 
 当然，后续命令也仍然可以继续显式传参：
 
 ```bash
-qexp --shared-root /mnt/share/my_qexp --machine gpu-a list
+qexp --shared-root /mnt/share/myproject/.qexp --machine gpu-a list
 ```
 
 也可以使用环境变量；优先级是：
@@ -128,7 +158,7 @@ qexp --shared-root /mnt/share/my_qexp --machine gpu-a list
 例如：
 
 ```bash
-export QEXP_SHARED_ROOT=/mnt/share/my_qexp
+export QEXP_SHARED_ROOT=/mnt/share/myproject/.qexp
 export QEXP_MACHINE=gpu-a
 qexp list
 ```
@@ -137,7 +167,7 @@ qexp list
 
 ```bash
 qexp init \
-  --shared-root /mnt/share/my_qexp \
+  --shared-root /mnt/share/myproject/.qexp \
   --machine gpu-a \
   --runtime-root /data/local/qexp-runtime
 ```
@@ -184,6 +214,44 @@ qexp submit \
 - `--gpus` 表示请求的 GPU 数量
 - `--task-id` 不传时会自动生成
 
+如果您想把多个相关 task 放进同一个工作上下文里，推荐显式声明 `group`：
+
+```bash
+qexp submit \
+  --group contract_n_4and6 \
+  --name n4 \
+  --gpus 1 \
+  -- python train.py --n 4
+```
+
+推荐理解方式：
+
+- `group` 不是业务里的“实验计划”正式术语
+- 但您可以把脑中的一个实验计划映射成一个稳定的 `group`
+- 同一 `group` 下的 task 会被视为同一组长期相关任务
+
+`group` 的约束如下：
+
+- 允许字符：字母、数字、`.`、`_`、`-`
+- 区分大小写
+- 禁止保留名：`experiments`
+- 禁止保留名：`qqtools_internal`
+- 禁止以 `.` 或 `-` 开头
+- 长度上限为 `64`
+- 校验通过后直接映射为 tmux session 名，不做二次 sanitize
+
+推荐命名习惯：
+
+- 一个实验计划对应一个稳定 `group`
+- 一次具体 run 用 `name`
+- 若需要一次性批量提交，再用 `batch`
+
+例如：
+
+- `group=contract_n_4and6`
+- `name=n4`
+- `name=n6`
+
 ### 批量提交
 
 使用 manifest 批量提交：
@@ -197,6 +265,7 @@ qexp batch-submit --file runs.yaml
 ```yaml
 batch:
   name: sweep-a
+  group: contract_n_4and6
 
 tasks:
   - command: ["python", "train.py", "--config", "configs/a.yaml"]
@@ -208,6 +277,7 @@ tasks:
 ```yaml
 batch:
   name: sweep-a
+  group: contract_n_4and6
   policy:
     allow_retry_failed: true
     allow_retry_cancelled: false
@@ -218,10 +288,12 @@ defaults:
 tasks:
   - task_id: qm9_seed_1
     name: qm9 seed 1
+    group: contract_n_4and6
     command: ["python", "train.py", "--config", "configs/a.yaml", "--seed", "1"]
 
   - task_id: qm9_seed_2
     name: qm9 seed 2
+    group: regrouped_debug
     requested_gpus: 2
     command: ["python", "train.py", "--config", "configs/a.yaml", "--seed", "2"]
 ```
@@ -229,13 +301,31 @@ tasks:
 字段约定：
 
 - `batch.name`：批次展示名
+- `batch.group`：该批任务默认归属的长期 `group`
 - `batch.policy.allow_retry_failed`：是否允许执行 `qexp batch-retry-failed`
 - `batch.policy.allow_retry_cancelled`：是否允许执行 `qexp batch-retry-cancelled`
 - `defaults.requested_gpus`：本批次任务默认 GPU 数量
 - `tasks[].task_id`：可选；不写时自动生成
 - `tasks[].name`：可选；用于展示
+- `tasks[].group`：可选；单任务归组；优先级高于 `batch.group`
 - `tasks[].requested_gpus`：单任务覆盖默认 GPU 数量
 - `tasks[].command`：必填；实际执行命令
+
+归组优先级：
+
+1. `tasks[].group` 优先级最高
+2. 若 `tasks[].group` 缺失，则继承 `batch.group`
+3. 若二者都缺失，则该 task 的 `group = null`
+
+建议这样理解：
+
+- `batch` 表示“这次一起交的一批”
+- `group` 表示“长期属于哪组工作上下文”
+
+如果您今天交一批、明天再补交一批，但它们都属于同一个实验计划，推荐：
+
+- 使用不同 `batch`
+- 继续复用同一个 `group`
 
 ### 查看任务列表
 
@@ -305,6 +395,18 @@ qexp cancel <task_id>
 ```bash
 qexp retry <task_id>
 ```
+
+显式把重试后的新 task 放进另一个 group：
+
+```bash
+qexp retry <task_id> --group regrouped_debug
+```
+
+规则：
+
+- `qexp retry <task_id>` 默认继承原 task 的 `group`
+- `qexp retry <task_id> --group <group>` 使用显式覆盖值，不继承原 group
+- retry 只创建新的 task，不改写原 task 的 `group`
 
 批量重试失败任务：
 
@@ -459,6 +561,73 @@ qexp top
 qexp logs <task_id>
 ```
 
+### 项目内按实验计划管理任务
+
+假设您的项目目录是：
+
+```text
+/mnt/share/myproject/
+```
+
+并且您现在有一个实验计划，要比较 `n=4` 和 `n=6`。
+
+推荐做法不是为这个实验计划单独建一个 `shared root`，而是：
+
+1. 整个项目共用一个 project 级 `shared root`
+2. 用一个稳定的 `group` 表示这次实验计划
+3. 每个具体 run 用单独 task 提交
+
+推荐初始化：
+
+```bash
+qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
+```
+
+推荐提交方式：
+
+```bash
+qexp submit --group contract_n_4and6 --name n4 --gpus 1 -- python train.py --n 4
+qexp submit --group contract_n_4and6 --name n6 --gpus 1 -- python train.py --n 6
+```
+
+如果是一批一起交：
+
+```yaml
+batch:
+  name: contract-compare-round1
+  group: contract_n_4and6
+
+tasks:
+  - name: n4
+    group: contract_n_4and6
+    command: ["python", "train.py", "--n", "4"]
+  - name: n6
+    group: regrouped_debug
+    command: ["python", "train.py", "--n", "6"]
+```
+
+然后：
+
+```bash
+qexp batch-submit --file runs.yaml
+```
+
+后续如果您要补交同一实验计划的新任务，推荐继续复用：
+
+- 同一个 `group`
+
+而不是：
+
+- 新建一个新的 `shared root`
+
+推荐管理方式：
+
+- 用 `group` 代表实验计划
+- 用 `name` 区分具体 run
+- 用 `batch` 组织一次批量提交
+- 用 `task_id` 作为单 task 的唯一主键
+- 用同一个 project 级 `shared root` 保持项目内资源与观察一致性
+
 ### 多机共享同一队列
 
 机器 A：
@@ -497,28 +666,37 @@ qexp agent start
 
 ### 2. `qexp` 提示缺少 `--shared-root` 或 `--machine`
 
-说明当前命令处于 v2 模式，但没有拿到必要的 machine 上下文。
+说明当前命令没有拿到必要的 machine 上下文。
 
 解决方式：
 
 - 显式传 `--shared-root` 和 `--machine`
 - 或设置 `QEXP_SHARED_ROOT` / `QEXP_MACHINE`
 
-### 3. 我只想继续使用旧版单机 qexp
+### 3. 我能不能为每个实验计划单独建一个 `shared root`
 
-可以显式切回 v1：
+不推荐。
 
-```bash
-qexp --v1 status
-```
+推荐：
 
-或：
+- 整个项目共用一个 project 级 `shared root`
+- 不同实验计划通过 `group` 区分
 
-```bash
-QEXP_VERSION=1 qexp status
-```
+如果为每个实验计划拆一个新的 `shared root`，会出现这些问题：
 
-### 4. `logs` 或任务执行时报本地路径不可写
+- 同一项目内资源视图被拆碎
+- 同一项目内的 `top` / `machines` / `list` 只能看到局部事实
+- 切换 `qexp use` 后，新的 root 不会自动感知旧 root 中的 task 占用
+
+只有当您明确要隔离成“另一套独立控制平面”时，才应使用另一个 `shared root`
+
+### 4. 我以前用过旧版单机 qexp
+
+旧版单机接口已移除。
+
+当前应改用 project-root `.qexp` 控制目录，并显式提供 `shared_root` 与 `machine` 上下文。
+
+### 5. `logs` 或任务执行时报本地路径不可写
 
 说明当前 machine 的 runtime root 不可写。
 
@@ -538,7 +716,7 @@ export QEXP_RUNTIME_ROOT=/data/local/qexp-runtime
 
 ### 全局参数
 
-v2 命令支持这些全局参数：
+当前命令支持这些全局参数：
 
 - `--shared-root <path>`：共享控制目录；多台机器看到的是同一份任务与索引
 - `--machine <name>`：当前机器身份；必须在 shared root 内唯一
@@ -554,8 +732,14 @@ qexp --shared-root /mnt/share/my_qexp --machine gpu-a list
 
 - `--task-id <id>`：可选；自定义任务 ID；不传则自动生成
 - `--name <text>`：可选；任务展示名
+- `--group <text>`：可选；项目内长期归组键；适合映射一个实验计划或一组长期相关任务；直接映射到 tmux session 名
 - `--gpus <int>`：请求的 GPU 数量；默认是 `1`
 - `-- <your command...>`：分隔符之后的内容会原样作为用户命令执行
+
+### `retry` 参数
+
+- `<task_id>`：必填；要重试的原 task
+- `--group <text>`：可选；显式指定新 task 的 group；不传时默认继承原 task 的 group
 
 ### `top` 参数
 

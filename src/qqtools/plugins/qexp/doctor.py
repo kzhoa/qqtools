@@ -3,15 +3,18 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any
 
 from .indexes import rebuild_all_indexes
 from .locking import clean_lock
 from .layout import (
     RootConfig,
     global_batches_dir,
+    global_events_dir,
     global_locks_dir,
     global_tasks_dir,
+    list_forbidden_truth_layout_dirs,
+    validate_root_contract,
+    write_root_manifest,
 )
 from .lifecycle import read_agent_snapshot
 from .models import (
@@ -21,6 +24,10 @@ from .models import (
     AGENT_STATE_STOPPED,
     BatchSummary,
     PHASE_ORPHANED,
+    ROOT_SCOPE_PROJECT,
+    TERMINAL_PHASES,
+    RootGovernanceSnapshot,
+    Task,
     utc_now_iso,
     validate_phase_transition,
 )
@@ -39,6 +46,50 @@ from .indexes import update_index_on_phase_change
 log = logging.getLogger(__name__)
 
 
+def _count_event_files(base: Path) -> int:
+    if not base.is_dir():
+        return 0
+    total = 0
+    for path in base.rglob("*.json"):
+        if not path.name.endswith(".tmp"):
+            total += 1
+    return total
+
+
+def collect_governance_snapshot(cfg: RootConfig) -> RootGovernanceSnapshot:
+    total_tasks = 0
+    terminal_tasks = 0
+    tasks_dir = global_tasks_dir(cfg)
+    if tasks_dir.is_dir():
+        for path in tasks_dir.glob("*.json"):
+            if path.name.endswith(".tmp"):
+                continue
+            try:
+                task = Task.from_dict(read_json(path))
+            except Exception:
+                continue
+            total_tasks += 1
+            if task.status.phase in TERMINAL_PHASES:
+                terminal_tasks += 1
+    return RootGovernanceSnapshot(
+        total_tasks=total_tasks,
+        terminal_tasks=terminal_tasks,
+        total_batches=len(list(global_batches_dir(cfg).glob("*.json")))
+        if global_batches_dir(cfg).is_dir()
+        else 0,
+        total_events=_count_event_files(global_events_dir(cfg)),
+        total_machines=len(iter_machines(cfg)),
+        updated_at=utc_now_iso(),
+    )
+
+
+def refresh_root_manifest_governance(cfg: RootConfig) -> RootGovernanceSnapshot:
+    manifest = validate_root_contract(cfg)
+    manifest.governance = collect_governance_snapshot(cfg)
+    write_root_manifest(cfg, manifest)
+    return manifest.governance
+
+
 # ---------------------------------------------------------------------------
 # rebuild-index
 # ---------------------------------------------------------------------------
@@ -46,7 +97,12 @@ log = logging.getLogger(__name__)
 
 def rebuild_indexes(cfg: RootConfig) -> dict[str, Any]:
     with clean_lock(cfg):
-        return rebuild_all_indexes(cfg)
+        stats = rebuild_all_indexes(cfg)
+        governance = refresh_root_manifest_governance(cfg)
+        return {
+            "index_stats": stats,
+            "governance": governance.to_dict(),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +135,7 @@ def repair_orphans(
     for m in machines:
         alt_cfg = RootConfig(
             shared_root=cfg.shared_root,
+            project_root=cfg.project_root,
             machine_name=m.machine_name,
             runtime_root=cfg.runtime_root,
         )
@@ -229,12 +286,14 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
                     pruned_task_refs += removed
 
         index_stats = rebuild_all_indexes(cfg)
+        governance = refresh_root_manifest_governance(cfg)
 
     return {
         "repaired_batch_count": len(repaired_batches),
         "repaired_batches": repaired_batches,
         "pruned_task_ref_count": pruned_task_refs,
         "index_stats": index_stats,
+        "governance": governance.to_dict(),
     }
 
 
@@ -249,37 +308,50 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
     Returns dict with 'ok' bool and 'issues' list.
     """
     issues: list[str] = []
+    manifest: dict[str, Any] | None = None
     tasks_dir = global_tasks_dir(cfg)
     batches_dir = global_batches_dir(cfg)
 
-    if not tasks_dir.is_dir():
-        return {
-            "ok": True,
-            "issues": [],
-            "tasks_checked": 0,
-            "batches_checked": 0,
-        }
+    try:
+        root_manifest = validate_root_contract(cfg)
+        manifest = root_manifest.to_dict()["root_manifest"]
+        if root_manifest.root_scope != ROOT_SCOPE_PROJECT:
+            issues.append(
+                f"Invalid root scope {root_manifest.root_scope!r}; expected {ROOT_SCOPE_PROJECT!r}."
+            )
+    except Exception as exc:
+        issues.append(f"Invalid root manifest: {exc}")
+
+    forbidden_truth_dirs = [
+        str(path) for path in list_forbidden_truth_layout_dirs(cfg)
+    ]
+    for path in forbidden_truth_dirs:
+        issues.append(
+            f"Forbidden truth-layout directory detected: {path}. "
+            "Only global object truth and machine-private subtrees are allowed."
+        )
 
     checked = 0
-    for path in tasks_dir.glob("*.json"):
-        if path.name.endswith(".tmp"):
-            continue
-        checked += 1
-        expected_id = path.stem
-        try:
-            data = read_json(path)
-            task_id = data.get("task", {}).get("task_id")
-            if task_id != expected_id:
-                issues.append(
-                    f"Filename/ID mismatch: file={path.name}, task_id={task_id}"
-                )
-            revision = data.get("meta", {}).get("revision")
-            if not isinstance(revision, int) or revision < 1:
-                issues.append(
-                    f"Invalid revision for {expected_id}: {revision}"
-                )
-        except Exception as e:
-            issues.append(f"Cannot read {path.name}: {e}")
+    if tasks_dir.is_dir():
+        for path in tasks_dir.glob("*.json"):
+            if path.name.endswith(".tmp"):
+                continue
+            checked += 1
+            expected_id = path.stem
+            try:
+                data = read_json(path)
+                task_id = data.get("task", {}).get("task_id")
+                if task_id != expected_id:
+                    issues.append(
+                        f"Filename/ID mismatch: file={path.name}, task_id={task_id}"
+                    )
+                revision = data.get("meta", {}).get("revision")
+                if not isinstance(revision, int) or revision < 1:
+                    issues.append(
+                        f"Invalid revision for {expected_id}: {revision}"
+                    )
+            except Exception as e:
+                issues.append(f"Cannot read {path.name}: {e}")
 
     batches_checked = 0
     if batches_dir.is_dir():
@@ -331,9 +403,18 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
             except Exception as e:
                 issues.append(f"Cannot read batch {path.name}: {e}")
 
+    governance = collect_governance_snapshot(cfg).to_dict()
+    if governance["terminal_tasks"] > governance["total_tasks"] * 0.8 and governance["total_tasks"] > 20:
+        issues.append(
+            "Terminal task ratio exceeds 80%; lifecycle cleanup or archive governance is overdue."
+        )
+
     return {
         "ok": len(issues) == 0,
         "issues": issues,
+        "root_manifest": manifest,
+        "forbidden_truth_dirs": forbidden_truth_dirs,
+        "governance": governance,
         "tasks_checked": checked,
         "batches_checked": batches_checked,
     }

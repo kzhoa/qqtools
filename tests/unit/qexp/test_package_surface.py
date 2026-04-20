@@ -30,7 +30,9 @@ def test_qexp_plugin_surface_is_available_via_plugins_import():
     assert callable(qexp.submit)
     assert callable(qexp.cancel)
     assert callable(qexp.clean)
-    assert callable(qexp.get_status_snapshot)
+    assert callable(qexp.list_tasks)
+    assert callable(qexp.top_view)
+    assert qexp.Task.__name__ == "Task"
 
 
 def test_import_qqtools_does_not_expose_root_qexp():
@@ -52,3 +54,9 @@ def test_import_qqtools_plugins_qexp_remains_lazy_for_optional_runtime_dependenc
     assert "psutil" not in sys.modules
     assert "pynvml" not in sys.modules
 
+
+def test_root_cli_module_exposes_package_main():
+    from qqtools.plugins.qexp import cli
+    from qqtools.plugins.qexp.cli import main as package_main
+
+    assert cli.main is package_main

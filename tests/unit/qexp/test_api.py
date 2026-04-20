@@ -1,336 +1,577 @@
-import os
-import sys
-import time
+from __future__ import annotations
+
+import json
 
 import pytest
-
-from qqtools.plugins.qexp import api as qexp_api
-from qqtools.plugins.qexp import cancel, submit
-from qqtools.plugins.qexp import fsqueue
-from qqtools.plugins.qexp import manager
-from qqtools.plugins.qexp.models import qExpTask
-from qqtools.plugins.qexp import observer
-
-
-def test_submit_bootstraps_layout_and_persists_pending_task(tmp_path, monkeypatch):
-    root = tmp_path / "submit-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    monkeypatch.setattr(manager, "run_preflight_checks", lambda: object())
-    monkeypatch.setattr(manager, "is_daemon_active", lambda _root=None: True)
-
-    task = submit(argv=["python", "train.py"], num_gpus=1, job_name="demo")
-
-    assert task.status == "pending"
-    assert root.joinpath("jobs", "pending", f"{task.task_id}.json").is_file()
-
-
-def test_submit_is_idempotent_for_explicit_job_id(tmp_path, monkeypatch):
-    root = tmp_path / "submit-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    monkeypatch.setattr(manager, "run_preflight_checks", lambda: object())
-    monkeypatch.setattr(manager, "is_daemon_active", lambda _root=None: True)
-
-    first = submit(argv=["python", "train.py"], num_gpus=1, job_id="job_same")
-    second = submit(argv=["python", "different.py"], num_gpus=2, job_id="job_same")
-
-    assert first.task_id == second.task_id == "job_same"
-    assert first.argv == second.argv == ["python", "train.py"]
-
-
-def test_import_qqtools_and_qexp_do_not_eager_import_optional_runtime_deps():
-    for module_name in ("qqtools", "qqtools.plugins", "qqtools.plugins.qexp"):
-        sys.modules.pop(module_name, None)
-    for module_name in ("libtmux", "psutil", "pynvml"):
-        sys.modules.pop(module_name, None)
-
-    import qqtools
-
-    assert "libtmux" not in sys.modules
-    assert "psutil" not in sys.modules
-    assert "pynvml" not in sys.modules
-
-
-def test_submit_reports_daemon_start_failure_after_queueing(tmp_path, monkeypatch):
-    root = tmp_path / "submit-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    monkeypatch.setattr(manager, "run_preflight_checks", lambda: object())
-
-    daemon_states = iter([False, False])
-    monkeypatch.setattr(manager, "is_daemon_active", lambda _root=None: next(daemon_states))
-    monkeypatch.setattr(manager, "start_daemon_background", lambda _root=None: object())
-    monkeypatch.setattr(manager, "DEFAULT_STARTUP_WAIT_SECONDS", 0)
-
-    with pytest.raises(RuntimeError, match="daemon startup failed"):
-        submit(argv=["python", "train.py"], num_gpus=1, job_id="job_fail")
-
-    assert root.joinpath("jobs", "pending", "job_fail.json").is_file()
-
-
-def test_submit_rejects_path_traversal_job_id(tmp_path, monkeypatch):
-    root = tmp_path / "submit-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    monkeypatch.setattr(manager, "run_preflight_checks", lambda: object())
-    monkeypatch.setattr(manager, "is_daemon_active", lambda _root=None: True)
-
-    with pytest.raises(ValueError, match="illegal path characters|illegal characters"):
-        submit(argv=["python", "train.py"], num_gpus=1, job_id="../../../tmp/pwn")
-
-
-def test_get_logs_path_and_read_logs_reject_path_traversal_task_id(tmp_path):
-    root = tmp_path / "logs-home"
-
-    with pytest.raises(ValueError, match="illegal path characters|illegal characters"):
-        qexp_api.get_logs_path("../../../tmp/pwn", root=root)
-
-    with pytest.raises(ValueError, match="illegal path characters|illegal characters"):
-        qexp_api.read_logs("../../../tmp/pwn", root=root)
-
-
-def test_cancel_moves_pending_task_to_cancelled(tmp_path, monkeypatch):
-    root = tmp_path / "cancel-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    task = qExpTask(task_id="job_pending", argv=["python", "train.py"], num_gpus=1)
-    fsqueue.save_task(task, root)
-
-    cancelled = cancel("job_pending", root=root)
-
-    assert cancelled.status == "cancelled"
-    assert cancelled.exit_reason == "cancelled_before_start"
-
-
-def test_cancel_running_task_signals_process_group_and_escalates(tmp_path, monkeypatch):
-    root = tmp_path / "cancel-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    task = qExpTask(
-        task_id="job_running",
-        argv=["python", "train.py"],
-        num_gpus=1,
-        status="running",
-        assigned_gpus=[0],
-        tmux_session="experiments",
-        tmux_window_id="@job_running",
-        process_group_id=1234,
-    )
-    fsqueue.save_task(task, root)
-
-    signals: list[tuple[int, int]] = []
-    monkeypatch.setattr(qexp_api.os, "killpg", lambda pgid, sig: signals.append((pgid, sig)))
-    monkeypatch.setattr(qexp_api, "_is_process_group_alive", lambda _pgid: True)
-    monkeypatch.setattr(qexp_api.time, "sleep", lambda _seconds: None)
-    time_values = iter([0.0, 0.05, 0.1, 0.25])
-    monkeypatch.setattr(qexp_api.time, "time", lambda: next(time_values))
-
-    current = cancel("job_running", root=root, grace_seconds=0.2, poll_interval_seconds=0.01)
-
-    assert current.status == "running"
-    assert signals[0][0] == 1234
-    assert len(signals) == 2
-
-
-def test_get_status_snapshot_reports_stale_daemon_and_recent_events(tmp_path, monkeypatch):
-    root = tmp_path / "status-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-
-    pending = qExpTask(task_id="job_pending", argv=["python", "p.py"], num_gpus=2)
-    running = qExpTask(
-        task_id="job_running",
-        argv=["python", "r.py"],
-        num_gpus=1,
-        status="running",
-        assigned_gpus=[0],
-        scheduled_at="2026-04-02T09:00:00Z",
-        started_at="2026-04-02T09:00:10Z",
-    )
-    failed = qExpTask(
-        task_id="job_failed",
-        argv=["python", "f.py"],
-        num_gpus=1,
-        status="failed",
-        assigned_gpus=[1],
-        finished_at="2026-04-02T09:05:00Z",
-        exit_reason="wrapper_crashed",
-    )
-    fsqueue.save_task(pending, root)
-    fsqueue.save_task(running, root)
-    failed_path = fsqueue.save_task(failed, root)
-    log_path = fsqueue.get_log_path("job_failed", root)
-    log_path.write_text("failed\n", encoding="utf-8")
-
-    daemon_lock = manager.qExpDaemonLock(root)
-    assert daemon_lock.acquire() is True
-    daemon_lock.write_metadata({"pid": 1234, "started_at": "2026-04-02T09:00:00Z"})
-
-    monkeypatch.setattr(manager, "_is_process_alive", lambda pid: pid == 1234)
-    monkeypatch.setattr(manager.time, "time", lambda: failed_path.stat().st_mtime + 1000)
-    monkeypatch.setattr(observer.platform, "node", lambda: "worker-a")
-    monkeypatch.setattr(observer.platform, "platform", lambda: "Linux-x86_64")
-    monkeypatch.setattr(observer, "probe_gpu_backend", lambda: ("stub", [0, 1]))
-
-    snapshot = qexp_api.get_status_snapshot(root=root)
-
-    daemon_lock.release()
-
-    assert snapshot["daemon"]["state"] == "STALE (Unresponsive)"
-    assert snapshot["counts"] == {
-        "pending": 1,
-        "running": 1,
-        "done": 0,
-        "failed": 1,
-        "cancelled": 0,
-    }
-    task_map = {item["task_id"]: item for item in snapshot["tasks"]}
-    assert task_map["job_running"]["state"] == "Running"
-    assert snapshot["pending_preview"][0]["task_id"] == "job_pending"
-    assert snapshot["gpus"]["slots"][0]["task_id"] == "job_running"
-    assert snapshot["events"][0]["task_id"] == "job_failed"
-    assert snapshot["warnings"] == []
-    assert snapshot["summary"]["invalid_task_files"] == 0
-    assert "env" not in task_map["job_running"]["task"]
-
-
-def test_status_snapshot_does_not_create_pid_file_on_fresh_root(tmp_path, monkeypatch):
-    root = tmp_path / "readonly-status-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    monkeypatch.setattr(observer.platform, "node", lambda: "worker-a")
-    monkeypatch.setattr(observer.platform, "platform", lambda: "Linux-x86_64")
-    monkeypatch.setattr(observer, "probe_gpu_backend", lambda: (None, []))
-
-    snapshot = qexp_api.get_status_snapshot(root=root)
-
-    assert snapshot["daemon"]["state"] == "STOPPED"
-    assert not root.joinpath("daemon.pid").exists()
-
-
-def test_status_snapshot_skips_bad_task_files_with_warning(tmp_path, monkeypatch):
-    root = tmp_path / "bad-task-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    fsqueue.ensure_qexp_layout(root)
-    broken_path = root.joinpath("jobs", "running", "job_broken.json")
-    broken_path.write_text('{"task_id":"job_broken","status":"pending"}', encoding="utf-8")
-
-    monkeypatch.setattr(observer.platform, "node", lambda: "worker-a")
-    monkeypatch.setattr(observer.platform, "platform", lambda: "Linux-x86_64")
-    monkeypatch.setattr(observer, "probe_gpu_backend", lambda: ("stub", [0]))
-
-    snapshot = qexp_api.get_status_snapshot(root=root)
-
-    assert snapshot["tasks"] == []
-    assert snapshot["events"] == []
-    assert snapshot["counts"] == {
-        "pending": 0,
-        "running": 0,
-        "done": 0,
-        "failed": 0,
-        "cancelled": 0,
-    }
-    assert len(snapshot["warnings"]) == 1
-    assert snapshot["summary"]["invalid_task_files"] == 1
-    assert snapshot["gpus"]["slots"][0]["state"] == "Free"
-
-
-def test_status_snapshot_masks_env_by_omission(tmp_path, monkeypatch):
-    root = tmp_path / "env-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    task = qExpTask(
-        task_id="job_secret",
-        argv=["python", "secret.py"],
-        num_gpus=1,
-        env={"kind": "none", "extra_env": {"API_KEY": "secret-value"}},
-    )
-    fsqueue.save_task(task, root)
-
-    monkeypatch.setattr(observer.platform, "node", lambda: "worker-a")
-    monkeypatch.setattr(observer.platform, "platform", lambda: "Linux-x86_64")
-    monkeypatch.setattr(observer, "probe_gpu_backend", lambda: (None, []))
-
-    snapshot = qexp_api.get_status_snapshot(root=root)
-
-    assert snapshot["tasks"][0]["task"]["task_id"] == "job_secret"
-    assert "env" not in snapshot["tasks"][0]["task"]
-
-
-def test_status_snapshot_tolerates_task_file_removed_during_observation(tmp_path, monkeypatch):
-    root = tmp_path / "vanish-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    fsqueue.ensure_qexp_layout(root)
-    path = root.joinpath("jobs", "running", "job_vanish.json")
-    path.write_text("{}", encoding="utf-8")
-
-    original_load_task = observer.fsqueue.load_task
-
-    def _vanishing_load_task(target_path):
-        if target_path == path:
-            path.unlink(missing_ok=True)
-            raise FileNotFoundError("task file vanished during observation")
-        return original_load_task(target_path)
-
-    monkeypatch.setattr(observer.fsqueue, "load_task", _vanishing_load_task)
-    monkeypatch.setattr(observer.platform, "node", lambda: "worker-a")
-    monkeypatch.setattr(observer.platform, "platform", lambda: "Linux-x86_64")
-    monkeypatch.setattr(observer, "probe_gpu_backend", lambda: ("stub", [0]))
-
-    snapshot = qexp_api.get_status_snapshot(root=root)
-
-    assert snapshot["tasks"] == []
-    assert snapshot["events"] == []
-    assert snapshot["warnings"] == [
-        f"Skipped unreadable task file '{path}': task file vanished during observation"
-    ]
-
-
-def test_clean_keeps_recent_done_and_cancelled_by_default(tmp_path, monkeypatch):
-    root = tmp_path / "clean-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    for state in ("done", "cancelled", "failed"):
-        task = qExpTask(
-            task_id=f"job_{state}",
-            argv=["python", f"{state}.py"],
-            num_gpus=1,
-            status=state,
+import yaml
+
+from qqtools.plugins.qexp.api import (
+    batch_retry_cancelled,
+    batch_retry_failed,
+    batch_submit,
+    cancel,
+    clean,
+    get_log_path,
+    retry,
+    submit,
+)
+from qqtools.plugins.qexp.indexes import load_index
+from qqtools.plugins.qexp.layout import init_shared_root
+from qqtools.plugins.qexp.models import (
+    PHASE_CANCELLED,
+    PHASE_FAILED,
+    PHASE_QUEUED,
+    PHASE_RUNNING,
+    PHASE_SUCCEEDED,
+)
+from qqtools.plugins.qexp.storage import cas_update_task, load_batch, load_task
+
+
+@pytest.fixture()
+def cfg(tmp_path):
+    return init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime")
+
+
+# ---------------------------------------------------------------------------
+# Submit
+# ---------------------------------------------------------------------------
+
+
+class TestSubmit:
+    def test_basic_submit(self, cfg):
+        t = submit(cfg, command=["python", "train.py"])
+        assert t.status.phase == PHASE_QUEUED
+        assert t.machine_name == "dev1"
+        assert t.spec.command == ["python", "train.py"]
+        assert t.meta.revision == 1
+
+    def test_explicit_task_id(self, cfg):
+        t = submit(cfg, command=["echo"], task_id="my-task")
+        assert t.task_id == "my-task"
+
+    def test_persisted(self, cfg):
+        t = submit(cfg, command=["echo"])
+        loaded = load_task(cfg, t.task_id)
+        assert loaded.task_id == t.task_id
+
+    def test_indexed(self, cfg):
+        t = submit(cfg, command=["echo"])
+        assert t.task_id in load_index(cfg, "state", PHASE_QUEUED)
+        assert t.task_id in load_index(cfg, "machine", "dev1")
+
+    def test_custom_gpus(self, cfg):
+        t = submit(cfg, command=["echo"], requested_gpus=4)
+        assert t.spec.requested_gpus == 4
+
+    def test_invalid_task_id(self, cfg):
+        with pytest.raises(ValueError):
+            submit(cfg, command=["echo"], task_id="../bad")
+
+    def test_with_name(self, cfg):
+        t = submit(cfg, command=["echo"], name="test run")
+        assert t.name == "test run"
+
+    def test_with_group(self, cfg):
+        t = submit(cfg, command=["echo"], group="contract_n_4and6")
+        assert t.group == "contract_n_4and6"
+        assert t.task_id in load_index(cfg, "group", "contract_n_4and6")
+
+    def test_rejects_reserved_group(self, cfg):
+        with pytest.raises(ValueError, match="reserved"):
+            submit(cfg, command=["echo"], group="experiments")
+
+    def test_submit_rejects_uninitialized_root(self, tmp_path):
+        from qqtools.plugins.qexp.layout import RootConfig, ensure_machine_layout, ensure_runtime_layout, ensure_shared_layout
+
+        cfg = RootConfig(
+            shared_root=tmp_path / ".qexp",
+            project_root=tmp_path,
+            machine_name="dev1",
+            runtime_root=tmp_path / "runtime",
         )
-        fsqueue.save_task(task, root)
-        fsqueue.get_log_path(task.task_id, root).write_text(f"{state}\n", encoding="utf-8")
+        ensure_shared_layout(cfg)
+        ensure_machine_layout(cfg)
+        ensure_runtime_layout(cfg)
 
-    dry_run = qexp_api.clean(root=root, dry_run=True)
-    assert dry_run["task_ids"] == []
-    assert fsqueue.load_task_by_id("job_done", root) is not None
-    assert fsqueue.get_log_path("job_done", root).exists()
-
-    result = qexp_api.clean(root=root)
-
-    assert result["task_ids"] == []
-    assert fsqueue.load_task_by_id("job_done", root) is not None
-    assert fsqueue.load_task_by_id("job_cancelled", root) is not None
-    assert fsqueue.load_task_by_id("job_failed", root) is not None
-    assert fsqueue.get_log_path("job_done", root).exists()
-    assert fsqueue.get_log_path("job_cancelled", root).exists()
-    assert fsqueue.get_log_path("job_failed", root).exists()
+        with pytest.raises(FileNotFoundError, match="Root manifest not found"):
+            submit(cfg, command=["echo"])
 
 
-def test_clean_removes_only_old_done_and_cancelled_logs(tmp_path, monkeypatch):
-    root = tmp_path / "clean-old-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    for state in ("done", "cancelled", "failed"):
-        task = qExpTask(
-            task_id=f"job_{state}",
-            argv=["python", f"{state}.py"],
-            num_gpus=1,
-            status=state,
-        )
-        path = fsqueue.save_task(task, root)
-        fsqueue.get_log_path(task.task_id, root).write_text(f"{state}\n", encoding="utf-8")
-        old_time = time.time() - (qexp_api.DEFAULT_CLEAN_OLDER_THAN_SECONDS + 60)
-        if state != "failed":
-            os.utime(path, (old_time, old_time))
-            log_path = fsqueue.get_log_path(task.task_id, root)
-            os.utime(log_path, (old_time, old_time))
+# ---------------------------------------------------------------------------
+# Cancel
+# ---------------------------------------------------------------------------
 
-    result = qexp_api.clean(root=root)
 
-    assert sorted(result["task_ids"]) == ["job_cancelled", "job_done"]
-    assert fsqueue.load_task_by_id("job_done", root) is None
-    assert fsqueue.load_task_by_id("job_cancelled", root) is None
-    assert fsqueue.load_task_by_id("job_failed", root) is not None
-    assert not fsqueue.get_log_path("job_done", root).exists()
-    assert not fsqueue.get_log_path("job_cancelled", root).exists()
-    assert fsqueue.get_log_path("job_failed", root).exists()
+class TestCancel:
+    def test_cancel_queued(self, cfg):
+        t = submit(cfg, command=["echo"])
+        cancelled = cancel(cfg, t.task_id)
+        assert cancelled.status.phase == PHASE_CANCELLED
+        assert cancelled.status.reason == "cancelled_by_user"
+        assert cancelled.timestamps.finished_at is not None
+
+    def test_cancel_non_cancellable(self, cfg):
+        t = submit(cfg, command=["echo"])
+        # Force to succeeded
+        t.status.phase = PHASE_SUCCEEDED
+        t.timestamps.finished_at = "2026-01-01T00:00:00Z"
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, t.task_id, PHASE_QUEUED, PHASE_SUCCEEDED)
+
+        with pytest.raises(ValueError, match="Cannot cancel"):
+            cancel(cfg, t.task_id)
+
+    def test_cancel_updates_index(self, cfg):
+        t = submit(cfg, command=["echo"])
+        cancel(cfg, t.task_id)
+        assert t.task_id not in load_index(cfg, "state", PHASE_QUEUED)
+        assert t.task_id in load_index(cfg, "state", PHASE_CANCELLED)
+
+
+# ---------------------------------------------------------------------------
+# Retry
+# ---------------------------------------------------------------------------
+
+
+class TestRetry:
+    def _make_failed_task(self, cfg):
+        t = submit(cfg, command=["python", "train.py"], name="exp1")
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        t.status.phase = PHASE_FAILED
+        t.result.exit_code = 1
+        t.result.terminal_reason = "nonzero_exit"
+        t.timestamps.finished_at = "2026-01-01T00:00:00Z"
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, t.task_id, PHASE_QUEUED, PHASE_FAILED)
+        return t
+
+    def test_retry_creates_new_task(self, cfg):
+        original = self._make_failed_task(cfg)
+        new = retry(cfg, original.task_id)
+        assert new.task_id != original.task_id
+        assert new.lineage.retry_of == original.task_id
+        assert new.attempt == 2
+        assert new.status.phase == PHASE_QUEUED
+
+    def test_retry_preserves_command(self, cfg):
+        original = self._make_failed_task(cfg)
+        new = retry(cfg, original.task_id)
+        assert new.spec.command == original.spec.command
+
+    def test_retry_preserves_name(self, cfg):
+        original = self._make_failed_task(cfg)
+        new = retry(cfg, original.task_id)
+        assert new.name == "exp1"
+
+    def test_retry_preserves_group_by_default(self, cfg):
+        original = submit(cfg, command=["python", "train.py"], name="exp1", group="contract_n_4and6")
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        original.status.phase = PHASE_FAILED
+        original.result.exit_code = 1
+        original.timestamps.finished_at = "2026-01-01T00:00:00Z"
+        cas_update_task(cfg, original, original.meta.revision)
+        update_index_on_phase_change(cfg, original.task_id, PHASE_QUEUED, PHASE_FAILED)
+
+        new = retry(cfg, original.task_id)
+        assert new.group == "contract_n_4and6"
+
+    def test_retry_allows_group_override(self, cfg):
+        original = submit(cfg, command=["python", "train.py"], group="contract_n_4and6")
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        original.status.phase = PHASE_FAILED
+        original.result.exit_code = 1
+        original.timestamps.finished_at = "2026-01-01T00:00:00Z"
+        cas_update_task(cfg, original, original.meta.revision)
+        update_index_on_phase_change(cfg, original.task_id, PHASE_QUEUED, PHASE_FAILED)
+
+        new = retry(cfg, original.task_id, group="regrouped_debug")
+        assert new.group == "regrouped_debug"
+
+    def test_retry_non_terminal_fails(self, cfg):
+        t = submit(cfg, command=["echo"])
+        with pytest.raises(ValueError, match="Only terminal"):
+            retry(cfg, t.task_id)
+
+    def test_retry_indexed(self, cfg):
+        original = self._make_failed_task(cfg)
+        new = retry(cfg, original.task_id)
+        assert new.task_id in load_index(cfg, "state", PHASE_QUEUED)
+
+
+# ---------------------------------------------------------------------------
+# Batch submit
+# ---------------------------------------------------------------------------
+
+
+class TestBatchSubmit:
+    def _write_manifest(self, tmp_path, content):
+        p = tmp_path / "manifest.yaml"
+        p.write_text(yaml.dump(content), encoding="utf-8")
+        return p
+
+    def test_basic_batch(self, cfg, tmp_path):
+        manifest = self._write_manifest(tmp_path, {
+            "batch": {"name": "sweep"},
+            "defaults": {"requested_gpus": 1},
+            "tasks": [
+                {"name": "t1", "command": ["echo", "1"]},
+                {"name": "t2", "command": ["echo", "2"]},
+            ],
+        })
+        batch = batch_submit(cfg, manifest)
+        assert batch.name == "sweep"
+        assert len(batch.task_ids) == 2
+        assert batch.summary.total == 2
+        assert batch.summary.queued == 2
+
+    def test_tasks_persisted(self, cfg, tmp_path):
+        manifest = self._write_manifest(tmp_path, {
+            "tasks": [{"command": ["echo"]}],
+        })
+        batch = batch_submit(cfg, manifest)
+        t = load_task(cfg, batch.task_ids[0])
+        assert t.batch_id == batch.batch_id
+        assert t.spec.command == ["echo"]
+
+    def test_gpu_override(self, cfg, tmp_path):
+        manifest = self._write_manifest(tmp_path, {
+            "defaults": {"requested_gpus": 1},
+            "tasks": [
+                {"command": ["echo"], "requested_gpus": 4},
+            ],
+        })
+        batch = batch_submit(cfg, manifest)
+        t = load_task(cfg, batch.task_ids[0])
+        assert t.spec.requested_gpus == 4
+
+    def test_empty_tasks_fails(self, cfg, tmp_path):
+        manifest = self._write_manifest(tmp_path, {"tasks": []})
+        with pytest.raises(ValueError, match="at least one task"):
+            batch_submit(cfg, manifest)
+
+    def test_missing_command_fails(self, cfg, tmp_path):
+        manifest = self._write_manifest(tmp_path, {
+            "tasks": [{"name": "oops"}],
+        })
+        with pytest.raises(ValueError, match="command"):
+            batch_submit(cfg, manifest)
+
+    def test_batch_indexed(self, cfg, tmp_path):
+        manifest = self._write_manifest(tmp_path, {
+            "tasks": [{"command": ["echo"]}],
+        })
+        batch = batch_submit(cfg, manifest)
+        ids = load_index(cfg, "batch", batch.batch_id)
+        assert batch.task_ids[0] in ids
+
+    def test_batch_group_inheritance_and_override(self, cfg, tmp_path):
+        manifest = self._write_manifest(tmp_path, {
+            "batch": {"name": "sweep", "group": "contract_n_4and6"},
+            "tasks": [
+                {"task_id": "t1", "command": ["echo", "1"]},
+                {"task_id": "t2", "group": "regrouped_debug", "command": ["echo", "2"]},
+            ],
+        })
+        batch = batch_submit(cfg, manifest)
+        assert batch.group == "contract_n_4and6"
+        assert batch.batch_id in load_index(cfg, "batch_group", "contract_n_4and6")
+        assert load_task(cfg, "t1").group == "contract_n_4and6"
+        assert load_task(cfg, "t2").group == "regrouped_debug"
+        assert "t1" in load_index(cfg, "group", "contract_n_4and6")
+        assert "t2" in load_index(cfg, "group", "regrouped_debug")
+
+
+# ---------------------------------------------------------------------------
+# Batch retry
+# ---------------------------------------------------------------------------
+
+
+class TestBatchRetry:
+    def _setup_batch_with_failures(self, cfg, tmp_path):
+        manifest_path = tmp_path / "m.yaml"
+        manifest_path.write_text(yaml.dump({
+            "batch": {"name": "test"},
+            "tasks": [
+                {"name": "ok", "command": ["echo", "ok"]},
+                {"name": "fail", "command": ["echo", "fail"]},
+                {"name": "cancel", "command": ["echo", "cancel"]},
+            ],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest_path)
+
+        # Mark second as failed
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        t_fail = load_task(cfg, batch.task_ids[1])
+        t_fail.status.phase = PHASE_FAILED
+        cas_update_task(cfg, t_fail, t_fail.meta.revision)
+        update_index_on_phase_change(cfg, t_fail.task_id, PHASE_QUEUED, PHASE_FAILED)
+
+        # Mark third as cancelled
+        t_cancel = load_task(cfg, batch.task_ids[2])
+        t_cancel.status.phase = PHASE_CANCELLED
+        cas_update_task(cfg, t_cancel, t_cancel.meta.revision)
+        update_index_on_phase_change(cfg, t_cancel.task_id, PHASE_QUEUED, PHASE_CANCELLED)
+
+        return batch
+
+    def test_retry_failed(self, cfg, tmp_path):
+        batch = self._setup_batch_with_failures(cfg, tmp_path)
+        new_tasks = batch_retry_failed(cfg, batch.batch_id)
+        assert len(new_tasks) == 1
+        assert new_tasks[0].lineage.retry_of == batch.task_ids[1]
+
+    def test_retry_cancelled(self, cfg, tmp_path):
+        batch = self._setup_batch_with_failures(cfg, tmp_path)
+        new_tasks = batch_retry_cancelled(cfg, batch.batch_id)
+        assert len(new_tasks) == 1
+        assert new_tasks[0].lineage.retry_of == batch.task_ids[2]
+
+    def test_retry_failed_blocked_by_policy(self, cfg, tmp_path):
+        manifest_path = tmp_path / "m2.yaml"
+        import yaml
+        manifest_path.write_text(yaml.dump({
+            "batch": {
+                "name": "strict",
+                "policy": {"allow_retry_failed": False},
+            },
+            "tasks": [{"command": ["echo"]}],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest_path)
+
+        # Force task to failed
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        t = load_task(cfg, batch.task_ids[0])
+        t.status.phase = PHASE_FAILED
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, t.task_id, PHASE_QUEUED, PHASE_FAILED)
+
+        with pytest.raises(ValueError, match="disallows retrying failed"):
+            batch_retry_failed(cfg, batch.batch_id)
+
+    def test_retry_cancelled_blocked_by_policy(self, cfg, tmp_path):
+        manifest_path = tmp_path / "m3.yaml"
+        import yaml
+        manifest_path.write_text(yaml.dump({
+            "batch": {
+                "name": "strict",
+                "policy": {"allow_retry_cancelled": False},
+            },
+            "tasks": [{"command": ["echo"]}],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest_path)
+
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        t = load_task(cfg, batch.task_ids[0])
+        t.status.phase = PHASE_CANCELLED
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, t.task_id, PHASE_QUEUED, PHASE_CANCELLED)
+
+        with pytest.raises(ValueError, match="disallows retrying cancelled"):
+            batch_retry_cancelled(cfg, batch.batch_id)
+
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+
+
+class TestLogs:
+    def test_read_logs(self, cfg):
+        from qqtools.plugins.qexp.api import read_logs
+        from qqtools.plugins.qexp.layout import runtime_log_path
+
+        t = submit(cfg, command=["echo"], task_id="log-task")
+        log_path = runtime_log_path(cfg, "log-task")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("line 1\nline 2\n", encoding="utf-8")
+
+        content = read_logs(cfg, "log-task")
+        assert "line 1" in content
+        assert "line 2" in content
+
+    def test_read_logs_missing(self, cfg):
+        from qqtools.plugins.qexp.api import read_logs
+
+        t = submit(cfg, command=["echo"], task_id="no-log")
+        with pytest.raises(FileNotFoundError):
+            read_logs(cfg, "no-log")
+
+    def test_get_log_path(self, cfg):
+        submit(cfg, command=["echo"], task_id="some-task")
+        path = get_log_path(cfg, "some-task")
+        assert "some-task" in str(path)
+        assert "logs" in str(path)
+
+    def test_get_log_path_uses_task_machine_runtime_root(self, tmp_path):
+        cfg_a = init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime-dev1")
+        cfg_b = init_shared_root(tmp_path / ".qexp", "dev2", runtime_root=tmp_path / "runtime-dev2")
+        submit(cfg_b, command=["echo"], task_id="remote-log-task")
+        path = get_log_path(cfg_a, "remote-log-task")
+        assert str(path).startswith(str(cfg_b.runtime_root))
+
+
+# ---------------------------------------------------------------------------
+# Clean
+# ---------------------------------------------------------------------------
+
+
+class TestClean:
+    def _make_old_succeeded_task(self, cfg, task_id: str):
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        from qqtools.plugins.qexp.layout import runtime_log_path
+
+        t = submit(cfg, command=["echo"], task_id=task_id)
+        t.status.phase = PHASE_SUCCEEDED
+        t.timestamps.finished_at = "2020-01-01T00:00:00Z"  # very old
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, task_id, PHASE_QUEUED, PHASE_SUCCEEDED)
+
+        # Create a log file
+        log_path = runtime_log_path(cfg, task_id)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("log content", encoding="utf-8")
+        return t
+
+    def test_clean_dry_run(self, cfg):
+        self._make_old_succeeded_task(cfg, "old-1")
+        result = clean(cfg, dry_run=True)
+        assert result["dry_run"] is True
+        assert result["planned_task_count"] == 1
+        assert result["deleted_task_count"] == 0
+        assert "old-1" in result["task_ids"]
+        # Task should still exist (dry run)
+        loaded = load_task(cfg, "old-1")
+        assert loaded is not None
+
+    def test_clean_real(self, cfg):
+        from qqtools.plugins.qexp.layout import runtime_log_path
+
+        self._make_old_succeeded_task(cfg, "old-2")
+        result = clean(cfg, dry_run=False)
+        assert result["deleted_task_count"] == 1
+
+        with pytest.raises(FileNotFoundError):
+            load_task(cfg, "old-2")
+
+        log_path = runtime_log_path(cfg, "old-2")
+        assert not log_path.is_file()
+
+    def test_clean_skips_recent(self, cfg):
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        from qqtools.plugins.qexp.models import utc_now_iso
+
+        t = submit(cfg, command=["echo"], task_id="recent")
+        t.status.phase = PHASE_SUCCEEDED
+        t.timestamps.finished_at = utc_now_iso()  # just now
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, t.task_id, PHASE_QUEUED, PHASE_SUCCEEDED)
+
+        result = clean(cfg, dry_run=False)
+        assert result["deleted_task_count"] == 0
+
+    def test_clean_skips_failed_by_default(self, cfg):
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+
+        t = submit(cfg, command=["echo"], task_id="fail-old")
+        t.status.phase = PHASE_FAILED
+        t.timestamps.finished_at = "2020-01-01T00:00:00Z"
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, t.task_id, PHASE_QUEUED, PHASE_FAILED)
+
+        result = clean(cfg, dry_run=False)
+        assert result["deleted_task_count"] == 0
+
+    def test_clean_includes_failed(self, cfg):
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+
+        t = submit(cfg, command=["echo"], task_id="fail-old2")
+        t.status.phase = PHASE_FAILED
+        t.timestamps.finished_at = "2020-01-01T00:00:00Z"
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, t.task_id, PHASE_QUEUED, PHASE_FAILED)
+
+        result = clean(cfg, dry_run=False, include_failed=True)
+        assert result["deleted_task_count"] == 1
+
+    def test_single_task_clean_updates_batch_truth_and_indexes(self, cfg, tmp_path):
+        manifest = tmp_path / "batch.yaml"
+        manifest.write_text(yaml.dump({
+            "batch": {"name": "sweep"},
+            "tasks": [
+                {"task_id": "keep-me", "command": ["echo", "1"]},
+                {"task_id": "drop-me", "command": ["echo", "2"]},
+            ],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest)
+
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        from qqtools.plugins.qexp.layout import runtime_log_path
+
+        doomed = load_task(cfg, "drop-me")
+        doomed.status.phase = PHASE_SUCCEEDED
+        doomed.timestamps.finished_at = "2020-01-01T00:00:00Z"
+        cas_update_task(cfg, doomed, doomed.meta.revision)
+        update_index_on_phase_change(cfg, doomed.task_id, PHASE_QUEUED, PHASE_SUCCEEDED)
+        runtime_log_path(cfg, doomed.task_id).write_text("done", encoding="utf-8")
+
+        result = clean(cfg, task_id="drop-me")
+        assert result["mode"] == "single_task"
+        assert result["deleted_task_count"] == 1
+        assert result["repaired_batches"] == [batch.batch_id]
+
+        with pytest.raises(FileNotFoundError):
+            load_task(cfg, "drop-me")
+
+        reloaded_batch = load_batch(cfg, batch.batch_id)
+        assert reloaded_batch.task_ids == ["keep-me"]
+        assert reloaded_batch.summary.total == 1
+        assert reloaded_batch.summary.queued == 1
+        assert "drop-me" not in load_index(cfg, "batch", batch.batch_id)
+
+    def test_single_task_clean_rejects_non_terminal(self, cfg):
+        submit(cfg, command=["echo"], task_id="active-task")
+        with pytest.raises(ValueError, match="Only terminal tasks can be cleaned"):
+            clean(cfg, task_id="active-task")
+
+    def test_single_task_clean_rejects_broken_batch_reference(self, cfg, tmp_path):
+        manifest = tmp_path / "broken-batch.yaml"
+        manifest.write_text(yaml.dump({
+            "batch": {"name": "broken"},
+            "tasks": [{"task_id": "broken-task", "command": ["echo"]}],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest)
+
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        from qqtools.plugins.qexp.layout import batch_path
+
+        task = load_task(cfg, "broken-task")
+        task.status.phase = PHASE_SUCCEEDED
+        task.timestamps.finished_at = "2020-01-01T00:00:00Z"
+        cas_update_task(cfg, task, task.meta.revision)
+        update_index_on_phase_change(cfg, task.task_id, PHASE_QUEUED, PHASE_SUCCEEDED)
+        batch_path(cfg, batch.batch_id).unlink()
+
+        with pytest.raises(FileNotFoundError):
+            clean(cfg, task_id="broken-task")
+
+        assert load_task(cfg, "broken-task").task_id == "broken-task"
+
+    def test_single_task_clean_reports_unresolved_remote_log(self, tmp_path):
+        cfg_a = init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime-dev1")
+        cfg_b = init_shared_root(tmp_path / ".qexp", "dev2", runtime_root=tmp_path / "runtime-dev2")
+        submit(cfg_b, command=["echo"], task_id="remote-task")
+
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        task = load_task(cfg_b, "remote-task")
+        task.status.phase = PHASE_SUCCEEDED
+        task.timestamps.finished_at = "2020-01-01T00:00:00Z"
+        cas_update_task(cfg_b, task, task.meta.revision)
+        update_index_on_phase_change(cfg_b, task.task_id, PHASE_QUEUED, PHASE_SUCCEEDED)
+
+        machine_path = cfg_b.shared_root / "machines" / "dev2" / "machine.json"
+        machine_path.unlink()
+
+        result = clean(cfg_a, task_id="remote-task")
+        assert result["deleted_task_count"] == 1
+        assert result["log_results"][0]["status"] == "unresolved"

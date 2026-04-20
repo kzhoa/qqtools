@@ -1,115 +1,246 @@
-import io
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from qqtools.plugins.qexp import fsqueue
-from qqtools.plugins.qexp.models import qExpTask
-from qqtools.plugins.qexp.runner import build_child_shell_command, run_job_file
+from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+from qqtools.plugins.qexp.layout import init_shared_root
+from qqtools.plugins.qexp.models import (
+    Meta,
+    PHASE_CANCELLED,
+    PHASE_FAILED,
+    PHASE_QUEUED,
+    PHASE_RUNNING,
+    PHASE_STARTING,
+    PHASE_SUCCEEDED,
+    Task,
+    TaskLineage,
+    TaskResult,
+    TaskRuntime,
+    TaskSpec,
+    TaskStatus,
+    TaskTimestamps,
+    utc_now_iso,
+)
+from qqtools.plugins.qexp.runner import (
+    build_child_command,
+    build_child_environment,
+    classify_exit,
+    run_task,
+)
+from qqtools.plugins.qexp.storage import cas_update_task, load_task, save_task
+from qqtools.plugins.qexp.indexes import update_index_on_submit
 
 
-class _FakeStdout:
-    def __init__(self, chunks: list[bytes]):
-        self._chunks = list(chunks)
+@pytest.fixture()
+def cfg(tmp_path):
+    return init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime")
 
-    def read1(self, _size: int) -> bytes:
-        if not self._chunks:
+
+def _make_starting_task(cfg, task_id: str = "t1") -> Task:
+    now = utc_now_iso()
+    task = Task(
+        meta=Meta.new("dev1"),
+        task_id=task_id,
+        name=None,
+        group=None,
+        batch_id=None,
+        machine_name="dev1",
+        attempt=1,
+        spec=TaskSpec(command=["echo", "hello"], requested_gpus=1),
+        status=TaskStatus(phase=PHASE_STARTING),
+        runtime=TaskRuntime(assigned_gpus=[0]),
+        timestamps=TaskTimestamps(created_at=now, queued_at=now, started_at=now),
+        result=TaskResult(),
+        lineage=TaskLineage(),
+    )
+    save_task(cfg, task)
+    update_index_on_submit(cfg, task)
+    # Fix index: put in starting, not queued
+    update_index_on_phase_change(cfg, task_id, PHASE_QUEUED, PHASE_STARTING)
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for helpers
+# ---------------------------------------------------------------------------
+
+
+class TestBuildChildEnvironment:
+    def test_sets_cuda_visible_devices(self):
+        env = build_child_environment([0, 2])
+        assert env["CUDA_VISIBLE_DEVICES"] == "0,2"
+
+    def test_empty_gpus(self):
+        env = build_child_environment([])
+        assert "CUDA_VISIBLE_DEVICES" not in env
+
+    def test_extra_env(self):
+        env = build_child_environment([1], extra_env={"FOO": "bar"})
+        assert env["FOO"] == "bar"
+        assert env["CUDA_VISIBLE_DEVICES"] == "1"
+
+    def test_inherits_parent_env(self):
+        env = build_child_environment([])
+        assert "PATH" in env
+
+
+class TestBuildChildCommand:
+    def test_wraps_in_bash(self):
+        cmd = build_child_command(["python", "train.py", "--lr", "0.01"])
+        assert cmd[0] == "bash"
+        assert cmd[1] == "-c"
+        assert "exec" in cmd[2]
+        assert "python" in cmd[2]
+        assert "train.py" in cmd[2]
+
+
+class TestClassifyExit:
+    def test_success(self):
+        phase, reason = classify_exit(0)
+        assert phase == PHASE_SUCCEEDED
+        assert reason is None
+
+    def test_nonzero(self):
+        phase, reason = classify_exit(1)
+        assert phase == PHASE_FAILED
+        assert reason == "nonzero_exit"
+
+    def test_sigterm(self):
+        phase, reason = classify_exit(-signal.SIGTERM)
+        assert phase == PHASE_CANCELLED
+        assert reason == "cancelled_by_signal"
+
+    def test_sigkill(self):
+        phase, reason = classify_exit(-signal.SIGKILL)
+        assert phase == PHASE_CANCELLED
+        assert reason == "cancelled_by_signal"
+
+    def test_other_signal(self):
+        phase, reason = classify_exit(-signal.SIGSEGV)
+        assert phase == PHASE_FAILED
+        assert reason == "nonzero_exit"
+
+
+# ---------------------------------------------------------------------------
+# Integration tests for run_task
+# ---------------------------------------------------------------------------
+
+
+class _FakePopen:
+    """Simulate subprocess.Popen for testing."""
+
+    def __init__(self, exit_code: int = 0, output: bytes = b"test output\n"):
+        self._exit_code = exit_code
+        self._output = output
+        self.pid = 12345
+
+    def __call__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        # Create a fake stdout with read1 method
+        self.stdout = MagicMock()
+        call_count = [0]
+
+        def fake_read1(size):
+            if call_count[0] == 0:
+                call_count[0] += 1
+                return self._output
             return b""
-        return self._chunks.pop(0)
+
+        self.stdout.read1 = fake_read1
+        return self
+
+    def wait(self):
+        return self._exit_code
+
+    def poll(self):
+        return self._exit_code
 
 
-class _FakeProcess:
-    def __init__(self, return_code: int, chunks: list[bytes]):
-        self.pid = 43210
-        self.stdout = _FakeStdout(chunks)
-        self._return_code = return_code
+class TestRunTask:
+    def test_successful_task(self, cfg):
+        task = _make_starting_task(cfg)
+        popen = _FakePopen(exit_code=0, output=b"ok\n")
 
-    def wait(self) -> int:
-        return self._return_code
+        rc = run_task(cfg, "t1", popen_factory=popen)
 
+        assert rc == 0
+        loaded = load_task(cfg, "t1")
+        assert loaded.status.phase == PHASE_SUCCEEDED
+        assert loaded.result.exit_code == 0
+        assert loaded.timestamps.finished_at is not None
 
-class _FakeStdoutBuffer:
-    def __init__(self):
-        self.buffer = io.BytesIO()
+    def test_failed_task(self, cfg):
+        task = _make_starting_task(cfg)
+        popen = _FakePopen(exit_code=1)
 
+        rc = run_task(cfg, "t1", popen_factory=popen)
 
-@pytest.fixture
-def qexp_root(tmp_path, monkeypatch):
-    root = tmp_path / "runner-home"
-    monkeypatch.setenv(fsqueue.QQTOOLS_HOME_ENV, str(root))
-    return root
+        assert rc == 1
+        loaded = load_task(cfg, "t1")
+        assert loaded.status.phase == PHASE_FAILED
+        assert loaded.result.exit_code == 1
+        assert loaded.status.reason == "nonzero_exit"
 
+    def test_wrong_phase_raises(self, cfg):
+        # Create a task in queued phase instead of starting
+        now = utc_now_iso()
+        task = Task(
+            meta=Meta.new("dev1"),
+            task_id="t-bad",
+            name=None,
+            group=None,
+            batch_id=None,
+            machine_name="dev1",
+            attempt=1,
+            spec=TaskSpec(command=["echo"], requested_gpus=1),
+            status=TaskStatus(phase=PHASE_QUEUED),
+            runtime=TaskRuntime(),
+            timestamps=TaskTimestamps(created_at=now, queued_at=now),
+            result=TaskResult(),
+            lineage=TaskLineage(),
+        )
+        save_task(cfg, task)
 
-def test_build_child_shell_command_supports_conda_activation():
-    task = qExpTask(
-        task_id="job_conda",
-        argv=["python", "train.py", "--epochs", "1"],
-        num_gpus=1,
-        env={
-            "kind": "conda",
-            "name": "torch",
-            "activate_script": "/opt/miniconda3/etc/profile.d/conda.sh",
-        },
-    )
+        with pytest.raises(RuntimeError, match="starting"):
+            run_task(cfg, "t-bad")
 
-    command = build_child_shell_command(task)
+    def test_sets_wrapper_pid(self, cfg):
+        task = _make_starting_task(cfg)
+        popen = _FakePopen(exit_code=0)
 
-    assert command[:2] == ["bash", "-c"]
-    assert "conda activate torch" in command[2]
-    assert "exec python train.py --epochs 1" in command[2]
+        run_task(cfg, "t1", popen_factory=popen)
 
+        loaded = load_task(cfg, "t1")
+        # wrapper_pid was set during running phase
+        # After finalization it's still there
+        assert loaded.runtime.wrapper_pid is not None
 
-def test_run_job_file_persists_logs_and_moves_successful_task(qexp_root, monkeypatch):
-    running_task = qExpTask(
-        task_id="job_success",
-        argv=["python", "train.py"],
-        num_gpus=1,
-        status="running",
-        scheduled_at="2024-01-01T00:00:00Z",
-        assigned_gpus=[0],
-        tmux_session="experiments",
-        tmux_window_id="@1",
-    )
-    job_file = fsqueue.save_task(running_task, qexp_root)
-    fake_stdout = _FakeStdoutBuffer()
-    monkeypatch.setattr("sys.stdout", fake_stdout)
+    def test_creates_log_file(self, cfg):
+        task = _make_starting_task(cfg)
+        popen = _FakePopen(exit_code=0, output=b"logged output\n")
 
-    def _fake_popen(*args, **kwargs):
-        assert kwargs["start_new_session"] is True
-        assert kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "0"
-        return _FakeProcess(0, [b"hello\n", b"world\n"])
+        run_task(cfg, "t1", popen_factory=popen)
 
-    result = run_job_file(job_file, popen_factory=_fake_popen)
+        from qqtools.plugins.qexp.layout import runtime_log_path
+        log_path = runtime_log_path(cfg, "t1")
+        assert log_path.is_file()
+        assert b"logged output" in log_path.read_bytes()
 
-    assert result == 0
-    completed = fsqueue.load_task_by_id("job_success", qexp_root)
-    assert completed is not None
-    assert completed.status == "done"
-    assert completed.wrapper_pid is not None
-    assert completed.process_group_id == 43210
-    assert completed.started_at is not None
-    assert completed.exit_code == 0
-    assert fsqueue.get_log_path("job_success", qexp_root).read_text(encoding="utf-8") == "hello\nworld\n"
-    assert fake_stdout.buffer.getvalue() == b"hello\nworld\n"
+    def test_launch_failure_marks_failed(self, cfg):
+        task = _make_starting_task(cfg)
 
+        def bad_popen(*args, **kwargs):
+            raise OSError("cannot launch")
 
-def test_run_job_file_marks_sigterm_exit_as_cancelled(qexp_root, monkeypatch):
-    running_task = qExpTask(
-        task_id="job_cancelled",
-        argv=["python", "train.py"],
-        num_gpus=1,
-        status="running",
-        scheduled_at="2024-01-01T00:00:00Z",
-        assigned_gpus=[1],
-        tmux_session="experiments",
-        tmux_window_id="@2",
-    )
-    job_file = fsqueue.save_task(running_task, qexp_root)
-    monkeypatch.setattr("sys.stdout", _FakeStdoutBuffer())
+        with pytest.raises(OSError, match="cannot launch"):
+            run_task(cfg, "t1", popen_factory=bad_popen)
 
-    result = run_job_file(job_file, popen_factory=lambda *args, **kwargs: _FakeProcess(-15, []))
-
-    assert result == -15
-    completed = fsqueue.load_task_by_id("job_cancelled", qexp_root)
-    assert completed is not None
-    assert completed.status == "cancelled"
-    assert completed.exit_reason == "cancelled_by_signal"
+        loaded = load_task(cfg, "t1")
+        assert loaded.status.phase == PHASE_FAILED
+        assert "launch_failed" in (loaded.status.reason or "")

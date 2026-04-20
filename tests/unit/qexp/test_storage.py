@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from qqtools.plugins.qexp.v2.layout import RootConfig, init_shared_root
-from qqtools.plugins.qexp.v2.models import (
+from qqtools.plugins.qexp.layout import RootConfig, init_shared_root
+from qqtools.plugins.qexp.models import (
     Batch,
     BatchPolicy,
     BatchSummary,
@@ -25,7 +25,7 @@ from qqtools.plugins.qexp.v2.models import (
     AGENT_MODE_ON_DEMAND,
     AGENT_STATE_STOPPED,
 )
-from qqtools.plugins.qexp.v2.storage import (
+from qqtools.plugins.qexp.storage import (
     CASConflict,
     cas_update_batch,
     cas_update_task,
@@ -45,7 +45,7 @@ from qqtools.plugins.qexp.v2.storage import (
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
+    return init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime")
 
 
 def _make_task(task_id: str = "t-001", machine: str = "dev1") -> Task:
@@ -54,6 +54,7 @@ def _make_task(task_id: str = "t-001", machine: str = "dev1") -> Task:
         meta=Meta.new(machine),
         task_id=task_id,
         name=None,
+        group=None,
         batch_id=None,
         machine_name=machine,
         attempt=1,
@@ -71,6 +72,7 @@ def _make_batch(batch_id: str = "b-001", machine: str = "dev1") -> Batch:
         meta=Meta.new(machine),
         batch_id=batch_id,
         name=None,
+        group=None,
         source_manifest=None,
         machine_name=machine,
         task_ids=[],
@@ -104,7 +106,7 @@ class TestTaskPersistence:
     def test_atomic_write_no_partial(self, cfg):
         t = _make_task()
         save_task(cfg, t)
-        from qqtools.plugins.qexp.v2.layout import task_path
+        from qqtools.plugins.qexp.layout import task_path
         p = task_path(cfg, "t-001")
         assert p.is_file()
         tmp = p.with_suffix(".json.tmp")
@@ -189,7 +191,7 @@ class TestMachinePersistence:
 class TestClaims:
     def test_save_and_release(self, cfg):
         save_claim(cfg, "t-001", utc_now_iso(), 1)
-        from qqtools.plugins.qexp.v2.layout import machine_claims_active_dir, machine_claims_released_dir
+        from qqtools.plugins.qexp.layout import machine_claims_active_dir, machine_claims_released_dir
         assert (machine_claims_active_dir(cfg) / "t-001.json").is_file()
 
         release_claim(cfg, "t-001", "completed")
@@ -201,7 +203,7 @@ class TestClaims:
 
     def test_release_without_active(self, cfg):
         release_claim(cfg, "t-002", "orphaned")
-        from qqtools.plugins.qexp.v2.layout import machine_claims_released_dir
+        from qqtools.plugins.qexp.layout import machine_claims_released_dir
         assert (machine_claims_released_dir(cfg) / "t-002.json").is_file()
 
 

@@ -3,11 +3,11 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from qqtools.plugins.qexp.v2.api import batch_submit, submit
-from qqtools.plugins.qexp.v2.agent import start_agent_record
-from qqtools.plugins.qexp.v2.layout import init_shared_root
-from qqtools.plugins.qexp.v2.models import PHASE_QUEUED
-from qqtools.plugins.qexp.v2.observer import (
+from qqtools.plugins.qexp.api import batch_submit, submit
+from qqtools.plugins.qexp.agent import start_agent_record
+from qqtools.plugins.qexp.layout import init_shared_root
+from qqtools.plugins.qexp.models import PHASE_QUEUED
+from qqtools.plugins.qexp.observer import (
     inspect_batch,
     inspect_task,
     list_batches,
@@ -19,7 +19,7 @@ from qqtools.plugins.qexp.v2.observer import (
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
+    return init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime")
 
 
 class TestListTasks:
@@ -43,11 +43,34 @@ class TestListTasks:
         assert len(tasks) == 1
         assert list_tasks(cfg, machine="other") == []
 
+    def test_filter_by_group(self, cfg):
+        submit(cfg, command=["echo"], group="contract_n_4and6")
+        submit(cfg, command=["echo"], group="regrouped_debug")
+        tasks = list_tasks(cfg, group="contract_n_4and6")
+        assert len(tasks) == 1
+        assert tasks[0]["group"] == "contract_n_4and6"
+
+    def test_combines_group_and_phase_filters(self, cfg):
+        submit(cfg, command=["echo"], group="contract_n_4and6")
+        tasks = list_tasks(cfg, group="contract_n_4and6", phase=PHASE_QUEUED)
+        assert len(tasks) == 1
+
+    def test_invalid_group_filter_is_rejected(self, cfg):
+        with pytest.raises(ValueError):
+            list_tasks(cfg, group="../tasks_by_state/queued")
+
     def test_limit(self, cfg):
         for _ in range(10):
             submit(cfg, command=["echo"])
         tasks = list_tasks(cfg, limit=3)
         assert len(tasks) == 3
+
+    def test_limit_preserves_index_order_under_additional_filters(self, cfg):
+        submit(cfg, command=["echo"], task_id="z-last", group="contract_n_4and6")
+        submit(cfg, command=["echo"], task_id="a-first", group="contract_n_4and6")
+        submit(cfg, command=["echo"], task_id="m-middle", group="contract_n_4and6")
+        tasks = list_tasks(cfg, phase=PHASE_QUEUED, group="contract_n_4and6", limit=2)
+        assert [task["task_id"] for task in tasks] == ["z-last", "a-first"]
 
 
 class TestInspectTask:
@@ -74,6 +97,16 @@ class TestBatchViews:
         assert len(batches) == 1
         assert batches[0]["name"] == "sweep"
 
+    def test_list_batches_includes_group(self, cfg, tmp_path):
+        manifest = tmp_path / "m.yaml"
+        manifest.write_text(yaml.dump({
+            "batch": {"name": "sweep", "group": "contract_n_4and6"},
+            "tasks": [{"command": ["echo"]}],
+        }), encoding="utf-8")
+        batch_submit(cfg, manifest)
+        batches = list_batches(cfg)
+        assert batches[0]["group"] == "contract_n_4and6"
+
     def test_inspect_batch(self, cfg, tmp_path):
         manifest = tmp_path / "m.yaml"
         manifest.write_text(yaml.dump({
@@ -88,9 +121,9 @@ class TestBatchLiveSummary:
     """Verify batch summary is computed from live task states, not stale."""
 
     def test_summary_reflects_phase_changes(self, cfg, tmp_path):
-        from qqtools.plugins.qexp.v2.indexes import update_index_on_phase_change
-        from qqtools.plugins.qexp.v2.models import PHASE_FAILED
-        from qqtools.plugins.qexp.v2.storage import cas_update_task, load_task
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        from qqtools.plugins.qexp.models import PHASE_FAILED
+        from qqtools.plugins.qexp.storage import cas_update_task, load_task
 
         manifest = tmp_path / "m.yaml"
         manifest.write_text(yaml.dump({
@@ -115,9 +148,9 @@ class TestBatchLiveSummary:
         assert batches[0]["total"] == 2
 
     def test_inspect_batch_live_summary(self, cfg, tmp_path):
-        from qqtools.plugins.qexp.v2.indexes import update_index_on_phase_change
-        from qqtools.plugins.qexp.v2.models import PHASE_SUCCEEDED
-        from qqtools.plugins.qexp.v2.storage import cas_update_task, load_task
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        from qqtools.plugins.qexp.models import PHASE_SUCCEEDED
+        from qqtools.plugins.qexp.storage import cas_update_task, load_task
 
         manifest = tmp_path / "m.yaml"
         manifest.write_text(yaml.dump({
@@ -144,8 +177,8 @@ class TestMachineViews:
         assert machines[0]["agent_state"] == "starting"
 
     def test_agent_state_comes_from_agent_snapshot_not_summary(self, cfg):
-        from qqtools.plugins.qexp.v2.lifecycle import write_summary_snapshot
-        from qqtools.plugins.qexp.v2.models import MachineSummary
+        from qqtools.plugins.qexp.lifecycle import write_summary_snapshot
+        from qqtools.plugins.qexp.models import MachineSummary
 
         start_agent_record(cfg)
         write_summary_snapshot(
@@ -161,9 +194,9 @@ class TestMachineViews:
         assert machines[0]["counts_by_phase"]["queued"] == 99
 
     def test_remote_machine_is_not_forced_stale_by_local_pid_probe(self, cfg):
-        from qqtools.plugins.qexp.v2.layout import agent_state_path
-        from qqtools.plugins.qexp.v2.storage import write_atomic_json
-        from qqtools.plugins.qexp.v2.lifecycle import read_agent_snapshot
+        from qqtools.plugins.qexp.layout import agent_state_path
+        from qqtools.plugins.qexp.storage import write_atomic_json
+        from qqtools.plugins.qexp.lifecycle import read_agent_snapshot
 
         other_cfg = init_shared_root(
             cfg.shared_root,

@@ -123,7 +123,7 @@ under `plugins/`
 
 # qexp Quick Start
 
-`qexp` is a local tmux-backed experiment queue for Linux GPU hosts.
+`qexp` is a shared-root experiment queue for Linux GPU hosts.
 
 Install optional experiment dependencies:
 
@@ -134,11 +134,12 @@ pip install qqtools[exp]
 Basic commands:
 
 ```bash
-qexp submit --num-gpus 1 --job-name demo -- python train.py --epochs 10
-qexp daemon --background
-qexp status
-qexp status --json
-qexp top
+qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
+qexp submit --shared-root /mnt/share/myproject/.qexp --machine gpu-a --name demo -- python train.py --epochs 10
+qexp agent start --shared-root /mnt/share/myproject/.qexp --machine gpu-a --background
+qexp list --shared-root /mnt/share/myproject/.qexp --machine gpu-a
+qexp machines --shared-root /mnt/share/myproject/.qexp --machine gpu-a
+qexp top --shared-root /mnt/share/myproject/.qexp --machine gpu-a
 qexp logs <task_id> --follow
 qexp cancel <task_id>
 qexp clean --dry-run
@@ -151,9 +152,9 @@ Python API:
 from qqtools.plugins import qexp
 
 task = qexp.submit(
-    argv=["python", "train.py", "--epochs", "10"],
-    num_gpus=1,
-    job_name="demo",
+    qexp.load_root_config("/mnt/share/myproject/.qexp", "gpu-a"),
+    command=["python", "train.py", "--epochs", "10"],
+    name="demo",
 )
 print(task.task_id)
 ```

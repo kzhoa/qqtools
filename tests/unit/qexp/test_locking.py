@@ -5,8 +5,8 @@ import time
 
 import pytest
 
-from qqtools.plugins.qexp.v2.layout import init_shared_root
-from qqtools.plugins.qexp.v2.locking import (
+from qqtools.plugins.qexp.layout import init_shared_root
+from qqtools.plugins.qexp.locking import (
     FileLock,
     LockTimeout,
     batch_lock,
@@ -17,7 +17,7 @@ from qqtools.plugins.qexp.v2.locking import (
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
+    return init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime")
 
 
 class TestFileLock:
@@ -47,7 +47,7 @@ class TestFileLock:
             release_event.wait(timeout=10.0)
             lock.release()
 
-        from qqtools.plugins.qexp.v2.layout import submit_lock_path
+        from qqtools.plugins.qexp.layout import submit_lock_path
         lp = submit_lock_path(cfg)
 
         acquired = multiprocessing.Event()

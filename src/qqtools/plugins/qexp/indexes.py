@@ -7,12 +7,14 @@ from typing import Any
 
 from .layout import (
     RootConfig,
+    batch_index_by_group_dir,
     index_by_batch_dir,
+    index_by_group_dir,
     index_by_machine_dir,
     index_by_state_dir,
 )
-from .models import ALL_PHASES, Task
-from .storage import iter_all_tasks, write_atomic_json
+from .models import ALL_PHASES, Batch, Task
+from .storage import iter_all_batches, iter_all_tasks, write_atomic_json
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +67,19 @@ def update_index_on_submit(cfg: RootConfig, task: Task) -> None:
             index_by_batch_dir(cfg) / f"{task.batch_id}.json",
             task.task_id,
         )
+    if task.group:
+        _add_to_index(
+            index_by_group_dir(cfg) / f"{task.group}.json",
+            task.task_id,
+        )
+
+
+def update_batch_index_on_create(cfg: RootConfig, batch: Batch) -> None:
+    if batch.group:
+        _add_to_index(
+            batch_index_by_group_dir(cfg) / f"{batch.group}.json",
+            batch.batch_id,
+        )
 
 
 def update_index_on_phase_change(
@@ -87,6 +102,10 @@ def load_index(cfg: RootConfig, index_type: str, key: str) -> list[str]:
         return _read_index_file(index_by_batch_dir(cfg) / f"{key}.json")
     elif index_type == "machine":
         return _read_index_file(index_by_machine_dir(cfg) / f"{key}.json")
+    elif index_type == "group":
+        return _read_index_file(index_by_group_dir(cfg) / f"{key}.json")
+    elif index_type == "batch_group":
+        return _read_index_file(batch_index_by_group_dir(cfg) / f"{key}.json")
     else:
         raise ValueError(f"Unknown index type: {index_type!r}")
 
@@ -100,6 +119,8 @@ def rebuild_all_indexes(cfg: RootConfig) -> dict[str, Any]:
     by_state: dict[str, list[str]] = {p: [] for p in ALL_PHASES}
     by_machine: dict[str, list[str]] = {}
     by_batch: dict[str, list[str]] = {}
+    by_group: dict[str, list[str]] = {}
+    batches_by_group: dict[str, list[str]] = {}
 
     tasks = iter_all_tasks(cfg)
     for t in tasks:
@@ -108,6 +129,13 @@ def rebuild_all_indexes(cfg: RootConfig) -> dict[str, Any]:
         by_machine.setdefault(t.machine_name, []).append(t.task_id)
         if t.batch_id:
             by_batch.setdefault(t.batch_id, []).append(t.task_id)
+        if t.group:
+            by_group.setdefault(t.group, []).append(t.task_id)
+
+    batches = iter_all_batches(cfg)
+    for batch in batches:
+        if batch.group:
+            batches_by_group.setdefault(batch.group, []).append(batch.batch_id)
 
     # Clear and rewrite state indexes
     state_dir = index_by_state_dir(cfg)
@@ -134,9 +162,25 @@ def rebuild_all_indexes(cfg: RootConfig) -> dict[str, Any]:
     for bid, ids in by_batch.items():
         _write_index_file(batch_dir / f"{bid}.json", ids)
 
+    group_dir = index_by_group_dir(cfg)
+    group_dir.mkdir(parents=True, exist_ok=True)
+    for f in group_dir.glob("*.json"):
+        f.unlink()
+    for group, ids in by_group.items():
+        _write_index_file(group_dir / f"{group}.json", ids)
+
+    batch_group_dir = batch_index_by_group_dir(cfg)
+    batch_group_dir.mkdir(parents=True, exist_ok=True)
+    for f in batch_group_dir.glob("*.json"):
+        f.unlink()
+    for group, ids in batches_by_group.items():
+        _write_index_file(batch_group_dir / f"{group}.json", ids)
+
     return {
         "total_tasks": len(tasks),
         "states": {k: len(v) for k, v in by_state.items() if v},
         "machines": {k: len(v) for k, v in by_machine.items()},
         "batches": {k: len(v) for k, v in by_batch.items()},
+        "groups": {k: len(v) for k, v in by_group.items()},
+        "batch_groups": {k: len(v) for k, v in batches_by_group.items()},
     }

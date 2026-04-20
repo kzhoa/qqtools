@@ -5,30 +5,30 @@ import time
 
 import pytest
 
-from qqtools.plugins.qexp.v2.api import submit
-from qqtools.plugins.qexp.v2.agent import start_agent_record, stop_agent_record
-from qqtools.plugins.qexp.v2.doctor import (
+from qqtools.plugins.qexp.api import submit
+from qqtools.plugins.qexp.agent import start_agent_record, stop_agent_record
+from qqtools.plugins.qexp.doctor import (
     cleanup_stale_locks,
     repair_metadata,
     rebuild_indexes,
     repair_orphans,
     verify_integrity,
 )
-from qqtools.plugins.qexp.v2.indexes import load_index, update_index_on_phase_change
-from qqtools.plugins.qexp.v2.layout import (
+from qqtools.plugins.qexp.indexes import load_index, update_index_on_phase_change
+from qqtools.plugins.qexp.layout import (
     batch_path,
     global_locks_dir,
     global_tasks_dir,
     init_shared_root,
     task_path,
 )
-from qqtools.plugins.qexp.v2.models import PHASE_QUEUED, PHASE_RUNNING, PHASE_SUCCEEDED
-from qqtools.plugins.qexp.v2.storage import cas_update_task, load_batch, load_task
+from qqtools.plugins.qexp.models import PHASE_QUEUED, PHASE_RUNNING, PHASE_SUCCEEDED
+from qqtools.plugins.qexp.storage import cas_update_task, load_batch, load_task
 
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
+    return init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime")
 
 
 class TestRebuildIndexes:
@@ -36,12 +36,13 @@ class TestRebuildIndexes:
         submit(cfg, command=["echo", "1"])
         submit(cfg, command=["echo", "2"])
         stats = rebuild_indexes(cfg)
-        assert stats["total_tasks"] == 2
-        assert stats["states"].get("queued") == 2
+        assert stats["index_stats"]["total_tasks"] == 2
+        assert stats["index_stats"]["states"].get("queued") == 2
+        assert stats["governance"]["total_tasks"] == 2
 
     def test_rebuild_empty(self, cfg):
         stats = rebuild_indexes(cfg)
-        assert stats["total_tasks"] == 0
+        assert stats["index_stats"]["total_tasks"] == 0
 
 
 class TestCleanupStaleLocks:
@@ -73,6 +74,8 @@ class TestVerifyIntegrity:
         result = verify_integrity(cfg)
         assert result["ok"] is True
         assert result["tasks_checked"] == 1
+        assert result["root_manifest"]["project_root"] == str(cfg.project_root)
+        assert result["governance"]["total_tasks"] == 1
 
     def test_id_mismatch(self, cfg):
         t = submit(cfg, command=["echo"])
@@ -95,9 +98,10 @@ class TestVerifyIntegrity:
         result = verify_integrity(cfg)
         assert result["ok"]
         assert result["tasks_checked"] == 0
+        assert result["root_manifest"]["shared_root"] == str(cfg.shared_root)
 
     def test_detects_batch_dangling_reference(self, cfg, tmp_path):
-        from qqtools.plugins.qexp.v2.api import batch_submit
+        from qqtools.plugins.qexp.api import batch_submit
         import yaml
 
         manifest = tmp_path / "batch.yaml"
@@ -144,9 +148,9 @@ class TestRepairOrphans:
         assert t.task_id in orphaned
 
     def test_remote_recent_heartbeat_is_not_orphaned_by_foreign_pid(self, cfg):
-        from qqtools.plugins.qexp.v2.layout import agent_state_path
-        from qqtools.plugins.qexp.v2.lifecycle import read_agent_snapshot
-        from qqtools.plugins.qexp.v2.storage import write_atomic_json
+        from qqtools.plugins.qexp.layout import agent_state_path
+        from qqtools.plugins.qexp.lifecycle import read_agent_snapshot
+        from qqtools.plugins.qexp.storage import write_atomic_json
 
         other_cfg = init_shared_root(
             cfg.shared_root,
@@ -172,7 +176,7 @@ class TestRepairOrphans:
 
 class TestRepairMetadata:
     def test_prunes_missing_task_refs_and_rebuilds_summary(self, cfg, tmp_path):
-        from qqtools.plugins.qexp.v2.api import batch_submit
+        from qqtools.plugins.qexp.api import batch_submit
         import yaml
 
         manifest = tmp_path / "batch.yaml"
@@ -188,6 +192,7 @@ class TestRepairMetadata:
 
         result = repair_metadata(cfg)
         assert result["repaired_batch_count"] == 1
+        assert result["governance"]["total_tasks"] == 1
 
         repaired = load_batch(cfg, batch.batch_id)
         assert repaired.task_ids == ["keep"]

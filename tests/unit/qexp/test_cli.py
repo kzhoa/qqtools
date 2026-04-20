@@ -1,288 +1,414 @@
-import io
+from __future__ import annotations
+
 import json
-from pathlib import Path
+import os
 
 import pytest
+import yaml
 
-from qqtools.plugins.qexp import cli
-from qqtools.plugins.qexp.models import qExpTask
-
-
-@pytest.fixture(autouse=True)
-def _force_v1(monkeypatch):
-    """These tests exercise the v1 CLI which is no longer the default."""
-    monkeypatch.setenv("QEXP_VERSION", "1")
+from qqtools.plugins.qexp.layout import init_shared_root
 
 
-def test_submit_command_dispatches_to_api(monkeypatch, capsys, tmp_path):
-    captured = {}
-
-    def _fake_submit(**kwargs):
-        captured.update(kwargs)
-        return qExpTask(task_id="job_cli", argv=["python", "train.py"], num_gpus=1)
-
-    monkeypatch.setattr(cli.api, "submit", _fake_submit)
-
-    result = cli.main(
-        [
-            "--root",
-            str(tmp_path),
-            "submit",
-            "--num-gpus",
-            "1",
-            "--job-id",
-            "job_cli",
-            "--job-name",
-            "demo",
-            "--env",
-            "OMP_NUM_THREADS=8",
-            "--",
-            "python",
-            "train.py",
-        ]
-    )
-
-    assert result == 0
-    assert captured["num_gpus"] == 1
-    assert captured["job_id"] == "job_cli"
-    assert captured["job_name"] == "demo"
-    assert captured["root"] == tmp_path.resolve()
-    assert captured["argv"] == ["python", "train.py"]
-    assert captured["env"]["kind"] == "none"
-    assert captured["env"]["extra_env"]["OMP_NUM_THREADS"] == "8"
-    assert capsys.readouterr().out.strip() == "job_cli"
+@pytest.fixture()
+def cfg(tmp_path):
+    return init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime")
 
 
-def test_submit_command_builds_conda_env(monkeypatch):
-    captured = {}
-    monkeypatch.setattr(
-        cli.api,
-        "submit",
-        lambda **kwargs: captured.update(kwargs) or qExpTask(task_id="job_conda", argv=["python"], num_gpus=1),
-    )
-
-    cli.main(
-        [
-            "submit",
-            "--num-gpus",
-            "1",
-            "--conda-name",
-            "torch",
-            "--conda-activate-script",
-            "/opt/conda.sh",
-            "--",
-            "python",
-            "train.py",
-        ]
-    )
-
-    assert captured["env"] == {
-        "kind": "conda",
-        "name": "torch",
-        "activate_script": "/opt/conda.sh",
-    }
+def _base_args(cfg):
+    return ["--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name]
 
 
-def test_submit_requires_task_argv():
-    with pytest.raises(ValueError, match="requires a task argv"):
-        cli.main(["submit", "--num-gpus", "1"])
+# ---------------------------------------------------------------------------
+# CLI tests
+# ---------------------------------------------------------------------------
 
 
-def test_daemon_background_starts_and_verifies(monkeypatch, capsys, tmp_path):
-    calls = {"preflight": 0, "start": 0}
-    monkeypatch.setattr(cli.manager, "run_preflight_checks", lambda: calls.__setitem__("preflight", calls["preflight"] + 1))
-    monkeypatch.setattr(cli.manager, "start_daemon_background", lambda root=None: calls.__setitem__("start", calls["start"] + 1))
-    monkeypatch.setattr(cli.manager, "is_daemon_active", lambda root=None: True)
-    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+class TestInit:
+    def test_init(self, tmp_path, monkeypatch, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        import qqtools.plugins.qexp.layout as _layout
 
-    result = cli.main(["--root", str(tmp_path), "daemon", "--background"])
-
-    assert result == 0
-    assert calls == {"preflight": 1, "start": 1}
-    assert "started in background" in capsys.readouterr().out
-
-
-def test_daemon_foreground_calls_manager(monkeypatch, tmp_path):
-    monkeypatch.setattr(cli.manager, "run_daemon_foreground", lambda root=None: 7)
-
-    result = cli.main(["--root", str(tmp_path), "daemon"])
-
-    assert result == 7
+        monkeypatch.setattr(_layout, "_context_file_override", str(tmp_path / "context.json"))
+        ret = cli_main([
+            "--shared-root", str(tmp_path / ".qexp"),
+            "--machine", "test-m",
+            "--runtime-root", str(tmp_path / "runtime"),
+            "init",
+        ])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "test-m" in out
 
 
-def test_daemon_rejects_conflicting_mode_flags():
-    with pytest.raises(ValueError, match="Choose either --background or --foreground"):
-        cli.main(["daemon", "--background", "--foreground"])
+class TestSubmit:
+    def test_submit(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        ret = cli_main(_base_args(cfg) + ["submit", "--", "echo", "hello"])
+        assert ret == 0
+        task_id = capsys.readouterr().out.strip()
+        assert len(task_id) > 0
+
+    def test_submit_with_name(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        ret = cli_main(_base_args(cfg) + [
+            "submit", "--name", "test-run", "--", "echo"
+        ])
+        assert ret == 0
+
+    def test_submit_with_group(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        ret = cli_main(_base_args(cfg) + [
+            "submit", "--group", "contract_n_4and6", "--", "echo"
+        ])
+        assert ret == 0
+
+    def test_submit_no_command_fails(self, cfg):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        with pytest.raises((ValueError, SystemExit)):
+            cli_main(_base_args(cfg) + ["submit"])
 
 
-def test_cancel_command_prints_task_state(monkeypatch, capsys, tmp_path):
-    monkeypatch.setattr(
-        cli.api,
-        "cancel",
-        lambda task_id, root=None: qExpTask(
-            task_id=task_id,
-            argv=["python", "train.py"],
-            num_gpus=1,
-            status="cancelled",
-        ),
-    )
-
-    result = cli.main(["--root", str(tmp_path), "cancel", "job_cancelled"])
-
-    assert result == 0
-    assert capsys.readouterr().out.strip() == "job_cancelled cancelled"
+class TestCancel:
+    def test_cancel(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        cli_main(_base_args(cfg) + ["submit", "--task-id", "t1", "--", "echo"])
+        capsys.readouterr()
+        ret = cli_main(_base_args(cfg) + ["cancel", "t1"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "cancelled" in out
 
 
-def test_logs_command_prints_log_contents(monkeypatch, capsys, tmp_path):
-    log_path = tmp_path / "jobs" / "logs" / "job_logs.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("hello\nworld\n", encoding="utf-8")
-    monkeypatch.setattr(cli.api, "read_logs", lambda task_id, root=None: log_path.read_text(encoding="utf-8"))
+class TestRetry:
+    def test_retry(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.api import cancel
+        cli_main(_base_args(cfg) + ["submit", "--task-id", "t1", "--", "echo"])
+        capsys.readouterr()
+        cancel(cfg, "t1")
+        ret = cli_main(_base_args(cfg) + ["retry", "t1"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "retry of t1" in out
 
-    result = cli.main(["--root", str(tmp_path), "logs", "job_logs"])
+    def test_retry_with_group_override(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.api import cancel
 
-    assert result == 0
-    assert capsys.readouterr().out == "hello\nworld\n"
-
-
-def test_logs_follow_tails_existing_log(monkeypatch, tmp_path):
-    log_path = tmp_path / "jobs" / "logs" / "job_follow.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("line1\n", encoding="utf-8")
-    buffer = io.StringIO()
-    monkeypatch.setattr(cli.sys, "stdout", buffer)
-    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
-
-    with pytest.raises(KeyboardInterrupt):
-        cli.main(["--root", str(tmp_path), "logs", "job_follow", "--follow"])
-
-    assert buffer.getvalue() == "line1\n"
+        cli_main(_base_args(cfg) + ["submit", "--task-id", "t1", "--group", "contract_n_4and6", "--", "echo"])
+        capsys.readouterr()
+        cancel(cfg, "t1")
+        ret = cli_main(_base_args(cfg) + ["retry", "t1", "--group", "regrouped_debug"])
+        assert ret == 0
 
 
-def test_status_command_renders_text_snapshot(monkeypatch, capsys, tmp_path):
-    monkeypatch.setattr(
-        cli.api,
-        "get_status_snapshot",
-        lambda root=None: {
-            "daemon": {"state": "HEALTHY"},
-            "counts": {"pending": 1, "running": 1, "done": 2, "failed": 0, "cancelled": 0},
+class TestList:
+    def test_list_empty(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        ret = cli_main(_base_args(cfg) + ["list"])
+        assert ret == 0
+        assert "No tasks" in capsys.readouterr().out
+
+    def test_list_with_tasks(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        cli_main(_base_args(cfg) + ["submit", "--", "echo"])
+        capsys.readouterr()
+        ret = cli_main(_base_args(cfg) + ["list"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "queued" in out
+
+    def test_list_filter_by_group(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        cli_main(_base_args(cfg) + ["submit", "--group", "contract_n_4and6", "--", "echo"])
+        capsys.readouterr()
+        ret = cli_main(_base_args(cfg) + ["list", "--group", "contract_n_4and6"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "contract_n_4and6" in out
+
+
+class TestInspect:
+    def test_inspect(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        cli_main(_base_args(cfg) + ["submit", "--task-id", "t1", "--", "echo"])
+        capsys.readouterr()
+        ret = cli_main(_base_args(cfg) + ["inspect", "t1"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert data["task"]["task_id"] == "t1"
+
+
+class TestBatchSubmit:
+    def test_batch_submit(self, cfg, tmp_path, capsys):
+        manifest = tmp_path / "m.yaml"
+        manifest.write_text(yaml.dump({
+            "batch": {"name": "sweep", "group": "contract_n_4and6"},
             "tasks": [
-                {
-                    "state": "Running",
-                    "task_id": "job_running",
-                    "name": "demo",
-                    "gpus": 1,
-                    "assigned": "0",
-                    "created_at": "2026-04-02T09:00:00Z",
-                    "exit_reason": "-",
-                }
+                {"command": ["echo", "1"]},
+                {"command": ["echo", "2"]},
             ],
-        },
-    )
-
-    result = cli.main(["--root", str(tmp_path), "status"])
-
-    assert result == 0
-    output = capsys.readouterr().out
-    assert "Daemon: HEALTHY" in output
-    assert "STATE" in output
-    assert "job_running" in output
+        }), encoding="utf-8")
+        from qqtools.plugins.qexp.cli import main as cli_main
+        ret = cli_main(_base_args(cfg) + ["batch-submit", "--file", str(manifest)])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "tasks=2" in out
 
 
-def test_status_command_renders_json_snapshot(monkeypatch, capsys, tmp_path):
-    payload = {
-        "daemon": {"state": "HEALTHY"},
-        "counts": {"pending": 0, "running": 0, "done": 0, "failed": 0, "cancelled": 0},
-        "tasks": [],
-        "warnings": [],
-    }
-    monkeypatch.setattr(cli.api, "get_status_snapshot", lambda root=None: payload)
-
-    result = cli.main(["--root", str(tmp_path), "status", "--json"])
-
-    assert result == 0
-    assert json.loads(capsys.readouterr().out) == payload
+class TestMachines:
+    def test_machines(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        ret = cli_main(_base_args(cfg) + ["machines"])
+        assert ret == 0
+        assert "dev1" in capsys.readouterr().out
 
 
-def test_top_command_refreshes_until_interrupted(monkeypatch, tmp_path):
-    calls = {"snapshot": 0, "render": 0, "clear": 0}
+class TestDoctor:
+    def test_verify(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        ret = cli_main(_base_args(cfg) + ["doctor", "verify"])
+        assert ret == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["ok"] is True
 
-    class _FakeConsole:
-        def clear(self):
-            calls["clear"] += 1
+    def test_rebuild_index(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        ret = cli_main(_base_args(cfg) + ["doctor", "rebuild-index"])
+        assert ret == 0
 
-    monkeypatch.setattr(
-        cli.api,
-        "get_status_snapshot",
-        lambda root=None: calls.__setitem__("snapshot", calls["snapshot"] + 1) or {
-            "daemon": {},
-            "host": {},
-            "gpus": {"slots": [], "visible_gpu_ids": []},
-            "pending_preview": [],
-            "events": [],
-            "warnings": [],
-        },
-    )
-    monkeypatch.setattr(cli, "_create_top_console", lambda: _FakeConsole())
-    monkeypatch.setattr(
-        cli,
-        "_render_top",
-        lambda snapshot, *, console=None: calls.__setitem__("render", calls["render"] + 1),
-    )
-    monkeypatch.setattr(
-        cli.time,
-        "sleep",
-        lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()),
-    )
-
-    result = cli.main(["--root", str(tmp_path), "top"])
-
-    assert result == 0
-    assert calls == {"snapshot": 1, "render": 1, "clear": 1}
+    def test_repair(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        ret = cli_main(_base_args(cfg) + ["doctor", "repair"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "repaired_batch_count" in out
 
 
-def test_clean_command_prints_deleted_targets(monkeypatch, capsys, tmp_path):
-    monkeypatch.setattr(
-        cli.api,
-        "clean",
-        lambda **kwargs: {
-            "dry_run": True,
-            "task_ids": ["job_done"],
-            "deleted_task_files": ["/tmp/job_done.json"],
-            "deleted_log_files": ["/tmp/job_done.log"],
-        },
-    )
+class TestLogs:
+    def test_logs(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.layout import runtime_log_path
 
-    result = cli.main(["--root", str(tmp_path), "clean", "--dry-run"])
+        cli_main(_base_args(cfg) + ["submit", "--task-id", "log1", "--", "echo"])
+        capsys.readouterr()
 
-    assert result == 0
-    output = capsys.readouterr().out
-    assert "Dry run: 1 task files, 1 log files" in output
-    assert "/tmp/job_done.json" in output
+        # Create a log file
+        log_path = runtime_log_path(cfg, "log1")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("hello from log\n", encoding="utf-8")
+
+        ret = cli_main(_base_args(cfg) + ["logs", "log1"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "hello from log" in out
+
+    def test_logs_missing(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        cli_main(_base_args(cfg) + ["submit", "--task-id", "nolog", "--", "echo"])
+        capsys.readouterr()
+
+        with pytest.raises(FileNotFoundError):
+            cli_main(_base_args(cfg) + ["logs", "nolog"])
 
 
-def test_clean_command_forwards_retention_window(monkeypatch, tmp_path):
-    captured = {}
-    monkeypatch.setattr(
-        cli.api,
-        "clean",
-        lambda **kwargs: captured.update(kwargs) or {
-            "dry_run": False,
-            "task_ids": [],
-            "deleted_task_files": [],
-            "deleted_log_files": [],
-        },
-    )
+class TestClean:
+    def test_clean_dry_run(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
 
-    result = cli.main(
-        [
-            "--root",
-            str(tmp_path),
-            "clean",
-            "--older-than-seconds",
-            "123",
-        ]
-    )
+        ret = cli_main(_base_args(cfg) + ["clean", "--dry-run"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "Dry run" in out
 
-    assert result == 0
-    assert captured["older_than_seconds"] == 123
+    def test_clean(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        ret = cli_main(_base_args(cfg) + ["clean"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "Cleaned" in out
+
+    def test_clean_rejects_incompatible_single_task_flags(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        ret = cli_main(_base_args(cfg) + ["clean", "--task-id", "t1", "--include-failed"])
+        assert ret == 1
+        assert "--task-id cannot be combined" in capsys.readouterr().err
+
+
+class TestUse:
+    """Tests for the 'use' command and context persistence."""
+
+    def _patch_context(self, monkeypatch, tmp_path):
+        ctx_file = str(tmp_path / "qexp-context.json")
+        import qqtools.plugins.qexp.layout as _layout
+        monkeypatch.setattr(_layout, "_context_file_override", ctx_file)
+        monkeypatch.delenv("QEXP_SHARED_ROOT", raising=False)
+        monkeypatch.delenv("QEXP_MACHINE", raising=False)
+        monkeypatch.delenv("QEXP_RUNTIME_ROOT", raising=False)
+        return ctx_file
+
+    def test_use_set_and_resolve(self, cfg, tmp_path, monkeypatch, capsys):
+        """After 'use', commands work without flags."""
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        ret = cli_main([
+            "use",
+            "--shared-root", str(cfg.shared_root),
+            "--machine", cfg.machine_name,
+        ])
+        assert ret == 0
+        capsys.readouterr()
+
+        ret = cli_main(["list"])
+        assert ret == 0
+
+    def test_use_show(self, cfg, tmp_path, monkeypatch, capsys):
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        cli_main([
+            "use",
+            "--shared-root", str(cfg.shared_root),
+            "--machine", cfg.machine_name,
+        ])
+        capsys.readouterr()
+
+        ret = cli_main(["use", "--show"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert cfg.machine_name in out
+        assert str(cfg.shared_root) in out
+
+    def test_use_show_empty(self, tmp_path, monkeypatch, capsys):
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        ret = cli_main(["use", "--show"])
+        assert ret == 0
+        assert "No context" in capsys.readouterr().out
+
+    def test_use_clear(self, cfg, tmp_path, monkeypatch, capsys):
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        cli_main([
+            "use",
+            "--shared-root", str(cfg.shared_root),
+            "--machine", cfg.machine_name,
+        ])
+        capsys.readouterr()
+
+        ret = cli_main(["use", "--clear"])
+        assert ret == 0
+        assert "cleared" in capsys.readouterr().out.lower()
+
+        with pytest.raises(SystemExit):
+            cli_main(["list"])
+
+    def test_use_requires_shared_root_and_machine(self, tmp_path, monkeypatch, capsys):
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        ret = cli_main(["use", "--shared-root", "/tmp/x"])
+        assert ret == 1
+
+    def test_use_rejects_uninitialized_root(self, tmp_path, monkeypatch, capsys):
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        ret = cli_main([
+            "use",
+            "--shared-root", str(tmp_path / ".qexp"),
+            "--machine", "m1",
+        ])
+        assert ret == 1
+        assert "cannot save qexp context" in capsys.readouterr().err
+
+    def test_init_saves_context(self, tmp_path, monkeypatch, capsys):
+        """init should auto-save context so subsequent commands work."""
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        ret = cli_main([
+            "--shared-root", str(tmp_path / ".qexp"),
+            "--machine", "auto-ctx",
+            "init",
+        ])
+        assert ret == 0
+        assert "context saved" in capsys.readouterr().out.lower()
+
+        ret = cli_main(["list"])
+        assert ret == 0
+
+    def test_cli_flags_override_context(self, tmp_path, monkeypatch, capsys):
+        """CLI flags take precedence over saved context."""
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        # Save context pointing to one machine
+        cfg1 = init_shared_root(tmp_path / "p1" / ".qexp", "m1")
+        cli_main([
+            "use",
+            "--shared-root", str(cfg1.shared_root),
+            "--machine", "m1",
+        ])
+        capsys.readouterr()
+
+        # Init a second machine
+        cfg2 = init_shared_root(tmp_path / "p2" / ".qexp", "m2")
+
+        # Explicit flags should override saved context
+        ret = cli_main([
+            "--shared-root", str(cfg2.shared_root),
+            "--machine", "m2",
+            "machines",
+        ])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "m2" in out
+
+    def test_env_overrides_context(self, tmp_path, monkeypatch, capsys):
+        """Environment variables take precedence over saved context."""
+        self._patch_context(monkeypatch, tmp_path)
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        # Save context pointing to one machine
+        cfg1 = init_shared_root(tmp_path / "p1" / ".qexp", "m1")
+        cli_main([
+            "use",
+            "--shared-root", str(cfg1.shared_root),
+            "--machine", "m1",
+        ])
+        capsys.readouterr()
+
+        # Init a second machine and set env
+        cfg2 = init_shared_root(tmp_path / "p2" / ".qexp", "m2")
+        monkeypatch.setenv("QEXP_SHARED_ROOT", str(cfg2.shared_root))
+        monkeypatch.setenv("QEXP_MACHINE", "m2")
+
+        ret = cli_main(["machines"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "m2" in out
+
+
+class TestRouting:
+    def test_root_cli_routes_to_v2(self, cfg, capsys, monkeypatch):
+        monkeypatch.setenv("QEXP_SHARED_ROOT", str(cfg.shared_root))
+        monkeypatch.setenv("QEXP_MACHINE", cfg.machine_name)
+        from qqtools.plugins.qexp.cli import main
+
+        ret = main(["machines"])
+        assert ret == 0
+        assert "dev1" in capsys.readouterr().out
+
+    def test_daemon_command_is_rejected(self, cfg):
+        from qqtools.plugins.qexp.cli import main as cli_main
+
+        with pytest.raises(SystemExit):
+            cli_main(_base_args(cfg) + ["daemon", "status"])

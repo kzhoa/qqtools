@@ -158,6 +158,7 @@ def load_machine(cfg: RootConfig, machine_name: str | None = None) -> Machine:
     if machine_name and machine_name != cfg.machine_name:
         alt_cfg = RootConfig(
             shared_root=cfg.shared_root,
+            project_root=cfg.project_root,
             machine_name=machine_name,
             runtime_root=cfg.runtime_root,
         )

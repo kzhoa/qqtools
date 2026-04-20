@@ -4,8 +4,8 @@ from collections import deque
 
 import pytest
 
-from qqtools.plugins.qexp.v2.api import submit
-from qqtools.plugins.qexp.v2.agent import (
+from qqtools.plugins.qexp.api import submit
+from qqtools.plugins.qexp.agent import (
     _build_live_agent_snapshot,
     get_agent_status,
     is_agent_running,
@@ -16,10 +16,10 @@ from qqtools.plugins.qexp.v2.agent import (
     write_heartbeat,
     IDLE_TIMEOUT_DEFAULT,
 )
-from qqtools.plugins.qexp.v2.indexes import update_index_on_phase_change
-from qqtools.plugins.qexp.v2.layout import init_shared_root
-from qqtools.plugins.qexp.v2.lifecycle import build_machine_workset, read_agent_snapshot
-from qqtools.plugins.qexp.v2.models import (
+from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+from qqtools.plugins.qexp.layout import init_shared_root
+from qqtools.plugins.qexp.lifecycle import build_machine_workset, read_agent_snapshot
+from qqtools.plugins.qexp.models import (
     AGENT_STATE_DRAINING,
     AGENT_STATE_IDLE,
     AGENT_STATE_STARTING,
@@ -29,12 +29,12 @@ from qqtools.plugins.qexp.v2.models import (
     PHASE_RUNNING,
     PHASE_STARTING,
 )
-from qqtools.plugins.qexp.v2.storage import cas_update_task, load_task
+from qqtools.plugins.qexp.storage import cas_update_task, load_task
 
 
 @pytest.fixture()
 def cfg(tmp_path):
-    return init_shared_root(tmp_path / "shared", "dev1", runtime_root=tmp_path / "runtime")
+    return init_shared_root(tmp_path / ".qexp", "dev1", runtime_root=tmp_path / "runtime")
 
 
 class TestAgentState:
@@ -87,8 +87,8 @@ class TestGetAgentStatus:
     def test_stale_agent(self, cfg):
         start_agent_record(cfg)
         # Fake a dead PID
-        from qqtools.plugins.qexp.v2.storage import write_atomic_json
-        from qqtools.plugins.qexp.v2.layout import agent_state_path
+        from qqtools.plugins.qexp.storage import write_atomic_json
+        from qqtools.plugins.qexp.layout import agent_state_path
         snapshot = read_agent_snapshot(cfg)
         snapshot.pid = 99999999
         write_atomic_json(agent_state_path(cfg), snapshot.to_dict())
@@ -112,7 +112,7 @@ class TestAgentLifecycle:
         snapshots = []
         original_write_snapshot = None
 
-        import qqtools.plugins.qexp.v2.agent as agent_mod
+        import qqtools.plugins.qexp.agent as agent_mod
 
         original_write_snapshot = agent_mod.write_agent_snapshot
         monkeypatch.setattr(
@@ -184,7 +184,7 @@ class TestAgentLifecycle:
             "2026-04-14T00:00:02Z",
             "2026-04-14T00:00:03Z",
         ])
-        import qqtools.plugins.qexp.v2.agent as agent_mod
+        import qqtools.plugins.qexp.agent as agent_mod
 
         monkeypatch.setattr(agent_mod, "utc_now_iso", lambda: timestamps.popleft())
         monkeypatch.setattr(agent_mod.time, "sleep", lambda _: None)

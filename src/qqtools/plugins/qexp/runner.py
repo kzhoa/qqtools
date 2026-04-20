@@ -1,67 +1,93 @@
+"""qexp task wrapper process.
+
+Invoked by the executor inside a tmux window::
+
+    python -m qqtools.plugins.qexp.runner \
+        --shared-root /mnt/share/qexp \
+        --machine gpu2a \
+        --task-id abc123def456 \
+        [--runtime-root ~/.qqtools/qexp-runtime]
+
+Lifecycle:
+    1. Load task, validate phase == starting
+    2. CAS: starting → running (set wrapper_pid, process_group_id)
+    3. Spawn child process with CUDA_VISIBLE_DEVICES
+    4. Stream stdout+stderr to log file and stdout
+    5. On exit: classify result, CAS: running → succeeded/failed/cancelled
+    6. Write scheduling event
+    7. Release claim
+"""
 from __future__ import annotations
 
 import argparse
 import os
-import shlex
 import signal
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-from . import fsqueue
-from .models import qExpTask, utc_now_iso
+from .events import write_event
+from .indexes import update_index_on_phase_change
+from .layout import (
+    RootConfig,
+    load_root_config,
+    runtime_log_path,
+)
+from .models import (
+    PHASE_CANCELLED,
+    PHASE_FAILED,
+    PHASE_RUNNING,
+    PHASE_STARTING,
+    PHASE_SUCCEEDED,
+    utc_now_iso,
+)
+from .storage import (
+    CASConflict,
+    cas_update_task,
+    load_task,
+    release_claim,
+)
 
 
-def _infer_root_from_job_file(job_file: Path) -> Path:
-    return job_file.expanduser().resolve().parents[2]
+# ---------------------------------------------------------------------------
+# Child process helpers
+# ---------------------------------------------------------------------------
 
 
-def _build_child_environment(task: qExpTask) -> dict[str, str]:
-    child_env = os.environ.copy()
-    if task.assigned_gpus:
-        child_env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in task.assigned_gpus)
-
-    task_env = task.env or {"kind": "none"}
-    extra_env = task_env.get("extra_env") or {}
-    for key, value in extra_env.items():
-        child_env[str(key)] = str(value)
-    return child_env
-
-
-def build_child_shell_command(task: qExpTask) -> list[str]:
-    task_env = task.env or {"kind": "none"}
-    argv = shlex.join(task.argv)
-    env_kind = task_env.get("kind", "none")
-
-    if env_kind == "conda":
-        activate_script = shlex.quote(task_env["activate_script"])
-        env_name = shlex.quote(task_env["name"])
-        shell_command = (
-            f"source {activate_script} && conda activate {env_name} && exec {argv}"
-        )
-    elif env_kind == "venv":
-        activate_path = Path(task_env["path"]).expanduser().resolve().joinpath("bin", "activate")
-        shell_command = f"source {shlex.quote(str(activate_path))} && exec {argv}"
-    else:
-        shell_command = f"exec {argv}"
-
-    return ["bash", "-c", shell_command]
+def build_child_environment(
+    assigned_gpus: list[int],
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    env = os.environ.copy()
+    if assigned_gpus:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in assigned_gpus)
+    if extra_env:
+        env.update(extra_env)
+    return env
 
 
-def _validate_stage1_metadata(task: qExpTask) -> None:
-    if task.status != "running":
-        raise RuntimeError(f"Wrapper expected a running task file, got status={task.status!r}.")
-    if not task.tmux_session or not task.tmux_window_id:
-        raise RuntimeError("Wrapper requires Stage 1 tmux metadata before startup.")
-    if not task.assigned_gpus:
-        raise RuntimeError("Wrapper requires Stage 1 assigned_gpus before startup.")
+def build_child_command(command: list[str]) -> list[str]:
+    """Wrap command for exec via bash."""
+    import shlex
+
+    joined = shlex.join(command)
+    return ["bash", "-c", f"exec {joined}"]
 
 
-def _stream_child_output(stream: Any, log_handle) -> None:
+def classify_exit(return_code: int) -> tuple[str, str | None]:
+    """Return (phase, terminal_reason) based on child exit code."""
+    if return_code == 0:
+        return PHASE_SUCCEEDED, None
+    if return_code < 0 and abs(return_code) in (signal.SIGTERM, signal.SIGKILL):
+        return PHASE_CANCELLED, "cancelled_by_signal"
+    return PHASE_FAILED, "nonzero_exit"
+
+
+def stream_output(stream: Any, log_handle: Any) -> None:
+    """Read child stdout/stderr and tee to log file + stdout."""
     if stream is None:
         return
-
     while True:
         chunk = stream.read1(8192)
         if not chunk:
@@ -72,75 +98,157 @@ def _stream_child_output(stream: Any, log_handle) -> None:
         log_handle.flush()
 
 
-def _classify_terminal_state(return_code: int) -> tuple[str, str | None]:
-    if return_code == 0:
-        return "done", None
-    if return_code < 0 and abs(return_code) in {signal.SIGTERM, signal.SIGKILL}:
-        return "cancelled", "cancelled_by_signal"
-    return "failed", "nonzero_exit"
+# ---------------------------------------------------------------------------
+# Main runner
+# ---------------------------------------------------------------------------
 
 
-def run_job_file(
-    job_file: Path | str,
+def run_task(
+    cfg: RootConfig,
+    task_id: str,
     *,
     popen_factory: Any = subprocess.Popen,
 ) -> int:
-    job_path = Path(job_file).expanduser().resolve()
-    root = _infer_root_from_job_file(job_path)
-    task = fsqueue.load_task(job_path)
-    _validate_stage1_metadata(task)
+    """Execute a single task through its full lifecycle.
 
-    fsqueue.update_running_task(task.task_id, root=root, wrapper_pid=os.getpid())
-    log_path = fsqueue.get_log_path(task.task_id, root=root)
+    Returns the child process exit code (0 on success).
+    """
+    task = load_task(cfg, task_id)
+
+    if task.status.phase != PHASE_STARTING:
+        raise RuntimeError(
+            f"Runner expected task in 'starting' phase, got {task.status.phase!r}."
+        )
+
+    # CAS: starting → running
+    old_rev = task.meta.revision
+    task.status.phase = PHASE_RUNNING
+    task.runtime.wrapper_pid = os.getpid()
+    task.timestamps.started_at = utc_now_iso()
+    try:
+        task = cas_update_task(cfg, task, old_rev)
+        update_index_on_phase_change(cfg, task_id, PHASE_STARTING, PHASE_RUNNING)
+    except CASConflict:
+        raise RuntimeError(f"CAS conflict transitioning task {task_id} to running.")
+
+    write_event(cfg, "task_started", task_id=task_id)
+
+    # Prepare log
+    log_path = runtime_log_path(cfg, task_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    child_process = None
+    # Build child
+    child_env = build_child_environment(task.runtime.assigned_gpus)
+    child_cmd = build_child_command(task.spec.command)
+
+    child: subprocess.Popen | None = None
+    return_code: int = -1
+
+    # Forward SIGTERM to child process group
+    def _forward_signal(sig: int, frame: Any) -> None:
+        if child is not None and child.poll() is None:
+            try:
+                os.killpg(child.pid, sig)
+            except OSError:
+                pass
+
+    signal.signal(signal.SIGTERM, _forward_signal)
+    signal.signal(signal.SIGINT, _forward_signal)
+
     with log_path.open("ab") as log_handle:
         try:
-            child_process = popen_factory(
-                build_child_shell_command(task),
-                cwd=task.workdir or None,
-                env=_build_child_environment(task),
+            child = popen_factory(
+                child_cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env=child_env,
             )
         except Exception as exc:
-            fsqueue.complete_running_task(
-                task.task_id,
-                "failed",
-                root=root,
+            _finalize_task(
+                cfg, task, PHASE_FAILED,
                 exit_code=None,
-                exit_reason=f"launch_failed:{type(exc).__name__}",
+                terminal_reason=f"launch_failed:{type(exc).__name__}",
             )
             raise
 
-        fsqueue.update_running_task(
-            task.task_id,
-            root=root,
-            process_group_id=child_process.pid,
-            started_at=utc_now_iso(),
-        )
-        _stream_child_output(child_process.stdout, log_handle)
-        return_code = child_process.wait()
+        # Update process_group_id
+        old_rev = task.meta.revision
+        task.runtime.process_group_id = child.pid
+        try:
+            task = cas_update_task(cfg, task, old_rev)
+        except CASConflict:
+            pass  # Best-effort; non-critical field
 
-    terminal_state, exit_reason = _classify_terminal_state(return_code)
-    fsqueue.complete_running_task(
-        task.task_id,
-        terminal_state,
-        root=root,
+        # Stream output
+        stream_output(child.stdout, log_handle)
+        return_code = child.wait()
+
+    # Finalize
+    terminal_phase, terminal_reason = classify_exit(return_code)
+    _finalize_task(
+        cfg, task, terminal_phase,
         exit_code=return_code,
-        exit_reason=exit_reason,
+        terminal_reason=terminal_reason,
     )
+
     return return_code
+
+
+def _finalize_task(
+    cfg: RootConfig,
+    task: Any,
+    terminal_phase: str,
+    exit_code: int | None,
+    terminal_reason: str | None,
+) -> None:
+    """Write terminal state, event, and release claim."""
+    old_phase = task.status.phase
+    old_rev = task.meta.revision
+
+    task.status.phase = terminal_phase
+    task.status.reason = terminal_reason
+    task.result.exit_code = exit_code
+    task.result.terminal_reason = terminal_reason
+    task.timestamps.finished_at = utc_now_iso()
+
+    try:
+        cas_update_task(cfg, task, old_rev)
+        update_index_on_phase_change(cfg, task.task_id, old_phase, terminal_phase)
+    except CASConflict:
+        pass  # Best-effort on finalization
+
+    # Write event
+    event_type = {
+        PHASE_SUCCEEDED: "task_finished",
+        PHASE_FAILED: "task_failed",
+        PHASE_CANCELLED: "task_cancelled",
+    }.get(terminal_phase, "task_finished")
+    write_event(cfg, event_type, task_id=task.task_id, details={
+        "exit_code": exit_code,
+        "terminal_reason": terminal_reason,
+    })
+
+    # Release claim
+    release_claim(cfg, task.task_id, terminal_reason or "completed")
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="qexp task wrapper")
-    parser.add_argument("--job-file", required=True, type=str)
+    parser.add_argument("--shared-root", required=True, type=str)
+    parser.add_argument("--machine", required=True, type=str)
+    parser.add_argument("--task-id", required=True, type=str)
+    parser.add_argument("--runtime-root", type=str, default=None)
     args = parser.parse_args(argv)
-    return run_job_file(args.job_file)
+
+    cfg = load_root_config(args.shared_root, args.machine, args.runtime_root)
+    return run_task(cfg, args.task_id)
 
 
 if __name__ == "__main__":

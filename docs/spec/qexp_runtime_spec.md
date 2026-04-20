@@ -1,8 +1,8 @@
-# qexp v2 Runtime Spec
+# qexp Runtime Spec
 
 状态：草稿
 
-更新时间：2026-04-08
+更新时间：2026-04-17
 
 ## 目标
 
@@ -15,19 +15,45 @@
 
 产品定位、CLI、工作流不在本文档展开，见：
 
-- [qexp_v2_product_spec_20260408.md](/mnt/c/Users/Administrator/proj/qqtools/docs/spec/qexp_v2_product_spec_20260408.md)
+- [qexp_product_spec.md](/mnt/c/Users/Administrator/proj/qqtools/docs/spec/qexp_product_spec.md)
 
-## 系统平面
+## 文档边界与实现状态
 
-### 1. shared control root
+实现状态说明：
 
-示例：
+- 本文档同时承载当前 runtime 契约与已接受但**尚未完全落地**的目标契约
+- 若某项能力明确标注为 **假设/未验证**，表示它已进入推荐设计方向，但当前安装版本未必已经实现
+- 当前最需要注意的未完全落地点包括：`group` 字段、`--group` CLI 参数、以及 `batch.group` manifest 字段
+
+## Runtime 总览
+
+### 系统平面
+
+#### 1. shared control root
+
+正式形态：
 
 ```text
-/mnt/share/myusername/qexp
+/mnt/share/myproject/.qexp
 ```
 
-这只是示例路径，不是强制约定。
+- `shared_root` 必须按 project 级切分
+- `shared_root` 必须直接命名为 `.qexp`
+- `shared_root` 必须直接位于 project root 下
+
+不推荐形态：
+
+```text
+/mnt/share/myproject/.qexp/exp1/shared
+/mnt/share/myproject/.qexp/exp2/shared
+```
+
+原因：
+
+- `shared_root` 代表一整套控制平面
+- 同一项目内的 task / batch / machine / indexes / events 应共享同一套真相
+- 不同实验计划、group、batch 不应各自拥有独立 `shared_root`
+- `qexp` 运行时会把 `project_root/.qexp` 作为正式控制目录契约，而不是仅文档推荐
 
 职责：
 
@@ -38,7 +64,7 @@
 - 锁
 - 调度事件记录
 
-### 2. local runtime root
+#### 2. local runtime root
 
 建议：
 
@@ -53,7 +79,52 @@
 - heartbeat
 - wrapper / runtime 临时状态
 
-## 共享目录布局
+### shared root 真相层规则
+
+shared root 下真正的 source of truth 只有：
+
+- `global/tasks/<task_id>.json`
+- `global/batches/<batch_id>.json`
+- `machines/<machine_name>/machine.json`
+
+其余内容都应视为派生层或辅助层：
+
+- `global/indexes/`
+- `global/events/`
+- `machines/<machine_name>/state/`
+- `machines/<machine_name>/claims/`
+- `machines/<machine_name>/events/`
+
+这条规则需要进一步明确到目录设计：
+
+- 不允许为不同 experiment / group 建立独立真相目录
+- 不允许出现 `groups/<group>/tasks/...` 或 `groups/<group>/batches/...`
+- 不允许把 group 目录作为 submit / retry / clean / repair 的依赖真相
+
+如果未来需要 group 级目录，最多只允许纯派生、可重建的目录，例如：
+
+- `global/indexes/tasks_by_group/`
+- `global/indexes/batches_by_group/`
+- **假设/未验证**：`derived/groups/<group>/summary.json`
+
+这些目录必须满足：
+
+- 删除后可完全重建
+- 不得成为 source of truth
+- 不得改变恢复顺序中的真相优先级
+
+恢复顺序也应明确：
+
+1. 先信任 task 真相
+2. 再信任 batch 真相
+3. 最后重建索引和 machine 侧辅助视图
+
+single-task clean 生效后，恢复规则补充如下：
+
+- 若 task 真相已删除，则不允许为了“回滚 clean”而凭空重建该 task 文件
+- 若 batch 真相或索引尚未修正完成，应通过 repair / rebuild 流程继续收敛，而不是把已删除 task 重新视为存在
+
+### 共享目录布局
 
 ```text
 <shared-root>/
@@ -83,6 +154,22 @@
       state/
 ```
 
+这里的目录组织原则必须写死为：
+
+- 按对象类型组织
+- 按 machine 私有区组织
+
+禁止按 experiment / group 目录组织真相层，例如：
+
+```text
+<shared-root>/exp1/
+<shared-root>/exp2/
+<shared-root>/groups/<group>/tasks/
+<shared-root>/groups/<group>/batches/
+```
+
+这些形态都会制造第二套真相组织维度，不属于正式 runtime layout。
+
 原则：
 
 - `global/` 是共享真相
@@ -90,7 +177,9 @@
 - 本机只写自己的 machine 子目录
 - 机器之间不直接写对方子目录
 
-## 为什么每个机器要有自己的共享子目录
+## machine 模型
+
+### 为什么每个机器要有自己的共享子目录
 
 因为这样可以把高频写操作局部化。
 
@@ -107,7 +196,27 @@ machine 子目录主要承载：
 - 本机状态镜像
 - 本机 claim 记录
 
-### 每个 machine 子目录的固定布局
+### machine 身份
+
+#### 1. 共享模式下 machine 名必填
+
+由于同一 Docker 镜像可起多个容器，hostname 不可靠。
+
+因此：
+
+```bash
+qexp init --shared-root /path/to/shared --machine gpu2a
+```
+
+中的 `--machine` 必填。
+
+#### 2. 不以 hostname 作为主键
+
+`hostname` 可以记录在 `machine.json` 里作为辅助信息，但不能作为 machine 主身份。
+
+machine 主键必须是用户显式提供的 `machine_name`。
+
+### machine 共享子目录
 
 `machines/<machine_name>/` 应直接写死为以下结构：
 
@@ -288,27 +397,7 @@ machine 子目录主要承载：
 - `global/` 是 source of truth
 - `machines/<machine>/...` 是 machine 私有的共享侧辅助视图
 
-## machine 身份
-
-### 1. 共享模式下 machine 名必填
-
-由于同一 Docker 镜像可起多个容器，hostname 不可靠。
-
-因此：
-
-```bash
-qexp init --shared-root /path/to/shared --machine gpu2a
-```
-
-中的 `--machine` 必填。
-
-### 2. 不以 hostname 作为主键
-
-`hostname` 可以记录在 `machine.json` 里作为辅助信息，但不能作为 machine 主身份。
-
-machine 主键必须是用户显式提供的 `machine_name`。
-
-### 3. machine 对象
+### machine 对象
 
 `machines/<machine_name>/machine.json` 至少包含：
 
@@ -352,12 +441,15 @@ agent:
     updated_at: str
 ```
 
-## task 对象
+## 共享对象契约
+
+### task 对象
 
 ```yaml
 task:
   task_id: str
   name: str | null
+  group: str | null
   batch_id: str | null
   machine_name: str
   attempt: int
@@ -397,6 +489,7 @@ meta:
 task:
   task_id: str
   name: str | null
+  group: str | null
   batch_id: str | null
   machine_name: str
   attempt: int
@@ -427,37 +520,36 @@ task:
 
 - `meta.revision` 每次成功写入都必须递增
 - `task.task_id` 必须与文件名一致
+- `task.group` 是 project 内长期归组键；允许为 null
 - `task.machine_name` 一旦写入后不得随意迁移
 - `task.spec.command` 是 task 真正执行命令
 - `task.status.phase` 是 task 当前唯一正式状态
 - `task.lineage.retry_of` 仅在 retry 产生的新 task 上存在
+
+`group` 的额外语义约束：
+
+- `group` 是工具层归组键，不是控制平面边界
+- `group` 不得隐式映射到独立 `shared_root`
+- `group` 不得要求在 `shared_root` 下拥有独立真相目录
+- `group` 的缺省值为 `null`
+
+**假设/未验证**：
+
+- `group` 已被本文档定义为正式目标字段
+- 但当前安装版本未必已经在 task 真相文件、CLI submit 参数和 observer 输出中完整实现
 
 设计原则：
 
 - 这是唯一正式 task 真相
 - indexes 和 machine 子目录都只是派生视图
 
-### task 真相层最小写入原则
-
-只有以下动作应改写 `global/tasks/<task_id>.json`：
-
-- submit 创建 task
-- agent dispatch task
-- agent 启动 task
-- task 正常结束
-- task 失败
-- task 取消
-- orphan repair
-- retry 生成新 task
-
-任何机器级缓存、GPU 快照、辅助状态都不得反向覆盖 task 真相文件。
-
-## batch 对象
+### batch 对象
 
 ```yaml
 batch:
   batch_id: str
   name: str | null
+  group: str | null
   task_ids: list[str]
   source_manifest: str | null
   summary:
@@ -485,6 +577,7 @@ meta:
 batch:
   batch_id: str
   name: str | null
+  group: str | null
   source_manifest: str | null
   machine_name: str
   task_ids: list[str]
@@ -506,15 +599,92 @@ batch:
 
 - `meta.revision` 每次成功写入都必须递增
 - `batch.batch_id` 必须与文件名一致
+- `batch.group` 表示该 batch 默认归属的 project 内 group；允许为 null
 - `batch.machine_name` 表示这次 batch-submit 的提交机器
 - `batch.task_ids` 是这批 task 的正式成员列表
 - `batch.summary.*` 是聚合字段，可由 task 真相重建
+
+**假设/未验证**：
+
+- `batch.group` 已被本文档定义为正式目标字段
+- 但当前安装版本未必已经在 batch-submit manifest、batch 真相写入和相关观察命令中完整实现
 
 设计原则：
 
 - batch 是组织容器，不是执行主体
 - task 真相优先于 batch 摘要
 - 若 batch 摘要损坏，可通过 task 列表重建
+
+batch 与 group 的关系约束：
+
+- `batch` 是一次批量提交形成的操作集合
+- `group` 是长期归组键
+- 一个 `group` 内允许存在多个 `batch`
+- 一个 `batch` 通常应默认归属于一个 `group`
+- `batch` 不得替代 `group`
+
+## 运行时语义
+
+### task 真相层最小写入原则
+
+只有以下动作应改写 `global/tasks/<task_id>.json`：
+
+- submit 创建 task
+- agent dispatch task
+- agent 启动 task
+- task 正常结束
+- task 失败
+- task 取消
+- orphan repair
+- retry 生成新 task
+- resubmit 删除旧 task 并创建同 `task_id` 新 task
+
+任何机器级缓存、GPU 快照、辅助状态都不得反向覆盖 task 真相文件。
+
+### `submit / retry / resubmit` 的真相层规则
+
+`submit / retry / resubmit` 在 task 真相层的正式约束：
+
+- `submit` 创建的新 task 必须满足：
+  - `task.task_id` 是一个当前不存在于真相层的新主键
+  - `task.lineage.retry_of = null`
+- `retry` 创建的新 task 必须满足：
+  - 使用新的 `task_id`
+  - `task.lineage.retry_of = <old_task_id>`
+  - 原 task 真相文件继续保留
+- `resubmit` 创建的新 task 必须满足：
+  - 复用被替换旧 task 的 `task_id`
+  - `task.lineage.retry_of = null`
+  - 新 task 写入前，旧 task 真相文件必须已被正式删除
+
+因此：
+
+- 同一个 `task_id` 在任一时刻最多只允许对应一条正式 task 真相
+- 不允许通过 `submit` 静默覆盖已有 `task_id`
+- 不允许通过 `retry` 复用原 `task_id`
+- `resubmit` 是唯一允许复用旧 `task_id` 的正式入口
+
+### resubmit 的真相层规则
+
+`resubmit` 是一个显式双阶段动作，但对外语义必须稳定：
+
+1. 校验目标 task 当前处于允许被 `resubmit` 的终态
+2. 校验该 task 不属于受限场景
+3. 删除旧 task 真相、相关索引项以及 best-effort runtime log
+4. 用相同 `task_id` 创建一个新的 task 真相文件
+
+默认限制：
+
+- 只允许 `failed` / `cancelled`
+- 不允许 `queued` / `dispatching` / `starting` / `running`
+- 不允许 batch 成员 task
+
+一致性要求：
+
+- 不允许在 `resubmit` 结束后同时留下“旧 task 内容”和“新 task 内容”的混合真相
+- 不允许把旧 task 的 `lineage.retry_of`、终态 `status.reason`、`result.*` 直接带入新 task
+- 新 task 必须表现为一次新的首次提交，而不是一次可见的 retry
+- `resubmit` 可以复用 single-task clean 的底层删除逻辑，但必须由 `resubmit` 自己掌控完整流程与一致性边界，不能退化成两个独立公开命令的松散拼接
 
 ### batch 真相层最小写入原则
 
@@ -546,36 +716,9 @@ batch:
 - 不允许只修索引而不修 batch 真相
 - batch 摘要必须视为可重建聚合值，不得把已删除 task 继续计入摘要
 
-## shared root 真相层规则
+### clean 运行时语义
 
-shared root 下真正的 source of truth 只有：
-
-- `global/tasks/<task_id>.json`
-- `global/batches/<batch_id>.json`
-- `machines/<machine_name>/machine.json`
-
-其余内容都应视为派生层或辅助层：
-
-- `global/indexes/`
-- `global/events/`
-- `machines/<machine_name>/state/`
-- `machines/<machine_name>/claims/`
-- `machines/<machine_name>/events/`
-
-恢复顺序也应明确：
-
-1. 先信任 task 真相
-2. 再信任 batch 真相
-3. 最后重建索引和 machine 侧辅助视图
-
-single-task clean 生效后，恢复规则补充如下：
-
-- 若 task 真相已删除，则不允许为了“回滚 clean”而凭空重建该 task 文件
-- 若 batch 真相或索引尚未修正完成，应通过 repair / rebuild 流程继续收敛，而不是把已删除 task 重新视为存在
-
-## clean 运行时语义
-
-### 1. single-task clean 的对象边界
+#### 1. single-task clean 的对象边界
 
 首版 single-task clean 只允许直接修改或删除以下共享层对象：
 
@@ -589,7 +732,7 @@ single-task clean 生效后，恢复规则补充如下：
 - `machines/<machine_name>/claims/...`
 - 训练框架自身业务日志、checkpoint、artifact
 
-### 2. runtime log 语义
+#### 2. runtime log 语义
 
 runtime log 不属于 shared root 真相层。
 
@@ -604,7 +747,7 @@ runtime log 不属于 shared root 真相层。
 - clean 成功的判定以 shared root 真相与派生视图收敛成功为准
 - runtime log 删除失败不构成 task 真相删除的回滚条件
 
-### 3. single-task clean 的失败模型
+#### 3. single-task clean 的失败模型
 
 single-task clean 应分为两个阶段：
 
@@ -634,9 +777,92 @@ single-task clean 应分为两个阶段：
 - batch 真相仍保留对已删除 task 的正式成员引用
 - 索引长期把已删除 task 暴露为有效对象
 
-## 并发写策略
+### agent 模型
 
-### 1. 单对象原子写
+#### 1. on_demand
+
+默认模式：
+
+- 提交 task 时若本机 agent 不在，则可本机唤起
+- 连续 600 秒无任务活动则自动退出
+
+#### 2. persistent
+
+仅在用户显式选择时启用：
+
+```bash
+qexp init --shared-root /path/to/shared --machine gpu2a --agent-mode persistent
+```
+
+或：
+
+```bash
+qexp agent start --persistent
+```
+
+#### 3. 默认不做远程唤起
+
+不支持：
+
+- 从机器 A 远程拉起机器 B 的 agent
+- 从机器 A 远程投递 task 到机器 B
+
+因此 agent 唤起只讨论本机：
+
+- `qexp submit`
+- `qexp batch-submit`
+- `qexp retry`
+
+### 调度一致性
+
+#### 1. 当前机器只处理属于自己的 queued task
+
+一旦 `task.machine_name` 写定：
+
+- 只有对应机器能 dispatch 它
+
+#### 2. dispatch 前必须 CAS 改状态
+
+agent dispatch task 时：
+
+1. 读取 task
+2. 确认 `phase == queued`
+3. CAS 更新到 `dispatching`
+4. 成功后才占 GPU
+
+#### 3. orphaned 检测
+
+若 shared root 中某个 task 显示：
+
+- `dispatching`
+- `starting`
+- `running`
+
+但本机 runtime 已找不到对应执行证据，则应转为：
+
+- `orphaned`
+
+### doctor 能力
+
+建议保留：
+
+- `qexp doctor`
+- `qexp doctor verify`
+- `qexp doctor rebuild-index`
+- `qexp doctor repair-orphans`
+- `qexp doctor cleanup-locks`
+
+与 single-task clean 的关系：
+
+- `rebuild-index` 负责收敛 clean 后的派生索引视图
+- **假设/未验证**：若后续提供更通用的 `doctor repair`，则它应能同时收敛 batch 摘要与索引
+- `repair-orphans` 不负责修复 clean 产生的 batch 成员引用问题
+
+## 一致性与写入机制
+
+### 并发写策略
+
+#### 1. 单对象原子写
 
 共享对象写入必须使用：
 
@@ -644,7 +870,7 @@ single-task clean 应分为两个阶段：
 2. fsync
 3. rename
 
-### 2. revision CAS
+#### 2. revision CAS
 
 所有共享对象必须带：
 
@@ -661,7 +887,7 @@ meta:
 - 写入时校验 revision
 - 不匹配就重读重试
 
-### 3. 锁只保护关键路径
+#### 3. 锁只保护关键路径
 
 建议只在这些路径上锁：
 
@@ -676,7 +902,7 @@ meta:
 <shared-root>/global/locks/
 ```
 
-### 4. 索引不是 source of truth
+#### 4. 索引不是 source of truth
 
 真相是主对象文件：
 
@@ -685,71 +911,6 @@ meta:
 - machines/
 
 索引失败可以重建，不需要伪事务。
-
-## agent 模型
-
-### 1. on_demand
-
-默认模式：
-
-- 提交 task 时若本机 agent 不在，则可本机唤起
-- 连续 600 秒无任务活动则自动退出
-
-### 2. persistent
-
-仅在用户显式选择时启用：
-
-```bash
-qexp init --shared-root /path/to/shared --machine gpu2a --agent-mode persistent
-```
-
-或：
-
-```bash
-qexp agent start --persistent
-```
-
-### 3. 默认不做远程唤起
-
-不支持：
-
-- 从机器 A 远程拉起机器 B 的 agent
-- 从机器 A 远程投递 task 到机器 B
-
-因此 agent 唤起只讨论本机：
-
-- `qexp submit`
-- `qexp batch-submit`
-- `qexp retry`
-
-## 调度一致性
-
-### 1. 当前机器只处理属于自己的 queued task
-
-一旦 `task.machine_name` 写定：
-
-- 只有对应机器能 dispatch 它
-
-### 2. dispatch 前必须 CAS 改状态
-
-agent dispatch task 时：
-
-1. 读取 task
-2. 确认 `phase == queued`
-3. CAS 更新到 `dispatching`
-4. 成功后才占 GPU
-
-### 3. orphaned 检测
-
-若 shared root 中某个 task 显示：
-
-- `dispatching`
-- `starting`
-- `running`
-
-但本机 runtime 已找不到对应执行证据，则应转为：
-
-- `orphaned`
 
 ## 调度事件记录
 
@@ -771,22 +932,6 @@ agent dispatch task 时：
 <shared-root>/global/events/
 <shared-root>/machines/<machine_name>/events/
 ```
-
-## doctor 能力
-
-建议保留：
-
-- `qexp doctor`
-- `qexp doctor verify`
-- `qexp doctor rebuild-index`
-- `qexp doctor repair-orphans`
-- `qexp doctor cleanup-locks`
-
-与 single-task clean 的关系：
-
-- `rebuild-index` 负责收敛 clean 后的派生索引视图
-- **假设/未验证**：若后续提供更通用的 `doctor repair`，则它应能同时收敛 batch 摘要与索引
-- `repair-orphans` 不负责修复 clean 产生的 batch 成员引用问题
 
 ## 验收标准
 

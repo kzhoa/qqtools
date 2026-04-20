@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import importlib
-import shlex
 import shutil
-import sys
-from pathlib import Path
 
 TMUX_SESSION_INTERNAL = "qqtools_internal"
 TMUX_SESSION_EXPERIMENTS = "experiments"
@@ -91,7 +88,7 @@ def ensure_internal_session():
     return ensure_managed_session(
         TMUX_SESSION_INTERNAL,
         QQTOOLS_SESSION_ROLE_INTERNAL,
-        initial_window_name="daemon",
+        initial_window_name="agent",
     )
 
 
@@ -128,27 +125,6 @@ def send_command_to_window(window_id: str, command: str) -> None:
     pane.send_keys(command, enter=True)
 
 
-def launch_background_daemon(root: Path | str) -> str:
-    root_path = Path(root).expanduser().resolve()
-    session = ensure_internal_session()
-    window = _safe_get(session.windows, window_name="daemon")
-    if window is None:
-        window = session.new_window(window_name="daemon", attach=False)
-
-    command = " ".join(
-        [
-            shlex.quote(sys.executable),
-            "-m",
-            "qqtools.plugins.qexp.manager",
-            "--foreground",
-            "--root",
-            shlex.quote(str(root_path)),
-        ]
-    )
-    send_command_to_window(str(window.window_id), command)
-    return str(window.window_id)
-
-
 def create_window_for_task(task_id: str, session_name: str = TMUX_SESSION_EXPERIMENTS) -> str:
     if session_name == TMUX_SESSION_EXPERIMENTS:
         session = ensure_experiments_session()
@@ -167,7 +143,6 @@ def create_window_for_task(task_id: str, session_name: str = TMUX_SESSION_EXPERI
 def window_exists(window_id: str | None) -> bool:
     if not window_id:
         return False
-
     return _get_window(window_id) is not None
 
 
