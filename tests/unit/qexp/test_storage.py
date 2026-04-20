@@ -7,6 +7,7 @@ import pytest
 from qqtools.plugins.qexp.layout import RootConfig, init_shared_root
 from qqtools.plugins.qexp.models import (
     Batch,
+    BATCH_COMMIT_COMMITTED,
     BatchPolicy,
     BatchSummary,
     GpuInventory,
@@ -75,6 +76,8 @@ def _make_batch(batch_id: str = "b-001", machine: str = "dev1") -> Batch:
         group=None,
         source_manifest=None,
         machine_name=machine,
+        commit_state=BATCH_COMMIT_COMMITTED,
+        expected_task_count=0,
         task_ids=[],
         summary=BatchSummary(),
         policy=BatchPolicy(),

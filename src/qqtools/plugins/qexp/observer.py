@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .agent import get_agent_status
+from .batch_state import build_batch_summary_from_counts, collect_batch_task_counts
 from .events import query_events
 from .indexes import load_index
 from .layout import RootConfig
@@ -14,6 +15,7 @@ from .lifecycle import (
 from .models import (
     AGENT_STATE_STOPPED,
     ALL_PHASES,
+    BATCH_COMMIT_COMMITTED,
     PHASE_QUEUED,
     PHASE_RUNNING,
     validate_group_name,
@@ -105,41 +107,48 @@ def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
 
 def _compute_batch_summary(cfg: RootConfig, batch) -> dict[str, int]:
     """Recompute batch summary from actual task states."""
-    counts: dict[str, int] = {}
-    for tid in batch.task_ids:
-        try:
-            t = load_task(cfg, tid)
-            phase = t.status.phase
-            counts[phase] = counts.get(phase, 0) + 1
-        except FileNotFoundError:
-            continue
+    surviving_ids, counts = collect_batch_task_counts(
+        cfg,
+        batch.task_ids,
+        ignore_missing=True,
+    )
+    summary = build_batch_summary_from_counts(total=len(surviving_ids), counts=counts)
     return {
-        "total": len(batch.task_ids),
-        "queued": counts.get("queued", 0),
-        "running": counts.get("running", 0),
-        "succeeded": counts.get("succeeded", 0),
-        "failed": counts.get("failed", 0),
-        "cancelled": counts.get("cancelled", 0),
+        "total": summary.total,
+        "queued": summary.queued,
+        "running": summary.running,
+        "succeeded": summary.succeeded,
+        "failed": summary.failed,
+        "cancelled": summary.cancelled,
     }
 
 
 def list_batches(cfg: RootConfig, limit: int = 50) -> list[dict[str, Any]]:
     batches = iter_all_batches(cfg)
     results: list[dict[str, Any]] = []
-    for b in batches[:limit]:
+    for b in batches:
+        if b.commit_state != BATCH_COMMIT_COMMITTED:
+            continue
         summary = _compute_batch_summary(cfg, b)
         results.append({
             "batch_id": b.batch_id,
             "name": b.name,
             "group": b.group,
             "machine": b.machine_name,
+            "commit_state": b.commit_state,
             **summary,
         })
+        if len(results) >= limit:
+            break
     return results
 
 
 def inspect_batch(cfg: RootConfig, batch_id: str) -> dict[str, Any]:
     b = load_batch(cfg, batch_id)
+    if b.commit_state != BATCH_COMMIT_COMMITTED:
+        raise FileNotFoundError(
+            f"Batch {batch_id} is not committed and is hidden from observer surfaces."
+        )
     data = b.to_dict()
     # Override stale summary with live computation
     data["batch"]["summary"] = _compute_batch_summary(cfg, b)

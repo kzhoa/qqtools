@@ -13,6 +13,7 @@ from .indexes import load_index, update_index_on_phase_change
 from .layout import RootConfig, machine_claims_active_dir
 from .models import (
     ACTIVE_PHASES,
+    BATCH_COMMIT_COMMITTED,
     PHASE_DISPATCHING,
     PHASE_FAILED,
     PHASE_ORPHANED,
@@ -25,6 +26,7 @@ from .models import (
 from .storage import (
     CASConflict,
     cas_update_task,
+    load_batch,
     load_task,
     read_json,
     release_claim,
@@ -42,6 +44,29 @@ def _is_process_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _task_batch_is_dispatchable(cfg: RootConfig, task: Any) -> bool:
+    if not task.batch_id:
+        return True
+    try:
+        batch = load_batch(cfg, task.batch_id)
+    except FileNotFoundError:
+        log.warning(
+            "Skipping queued task %s because batch %s is missing.",
+            task.task_id,
+            task.batch_id,
+        )
+        return False
+    if batch.commit_state != BATCH_COMMIT_COMMITTED:
+        log.warning(
+            "Skipping queued task %s because batch %s is %s.",
+            task.task_id,
+            task.batch_id,
+            batch.commit_state,
+        )
+        return False
+    return True
 
 
 @dataclass(slots=True)
@@ -73,6 +98,8 @@ class Scheduler:
             if task.status.phase != PHASE_QUEUED:
                 continue
             if task.machine_name != cfg.machine_name:
+                continue
+            if not _task_batch_is_dispatchable(cfg, task):
                 continue
 
             # CAS: queued → dispatching
@@ -260,6 +287,8 @@ def _dispatch_without_executor(cfg: RootConfig) -> list[str]:
         if task.status.phase != PHASE_QUEUED:
             continue
         if task.machine_name != cfg.machine_name:
+            continue
+        if not _task_batch_is_dispatchable(cfg, task):
             continue
 
         old_rev = task.meta.revision

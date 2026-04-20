@@ -11,6 +11,9 @@ from qqtools.plugins.qexp.models import (
     AGENT_STATE_STOPPED,
     AgentSnapshot,
     Batch,
+    BATCH_COMMIT_ABORTED,
+    BATCH_COMMIT_COMMITTED,
+    BATCH_COMMIT_PREPARING,
     BatchPolicy,
     BatchSummary,
     GpuInventory,
@@ -280,6 +283,8 @@ def _make_batch(**overrides) -> Batch:
         group=None,
         source_manifest=None,
         machine_name="dev1",
+        commit_state=BATCH_COMMIT_COMMITTED,
+        expected_task_count=0,
         task_ids=[],
         summary=BatchSummary(),
         policy=BatchPolicy(),
@@ -301,6 +306,8 @@ class TestBatch:
         b = _make_batch(
             name="sweep",
             group="contract_n_4and6",
+            commit_state=BATCH_COMMIT_PREPARING,
+            expected_task_count=2,
             task_ids=["t1", "t2"],
             summary=BatchSummary(total=2, queued=2),
         )
@@ -309,6 +316,8 @@ class TestBatch:
         assert b2.batch_id == "batch-001"
         assert b2.name == "sweep"
         assert b2.group == "contract_n_4and6"
+        assert b2.commit_state == BATCH_COMMIT_PREPARING
+        assert b2.expected_task_count == 2
         assert b2.task_ids == ["t1", "t2"]
         assert b2.summary.total == 2
 
@@ -318,6 +327,15 @@ class TestBatch:
         assert "meta" in d
         assert "batch" in d
         assert d["batch"]["batch_id"] == "batch-001"
+        assert d["batch"]["commit_state"] == BATCH_COMMIT_COMMITTED
+
+    def test_invalid_commit_state(self):
+        with pytest.raises(ValueError):
+            _make_batch(commit_state="broken")
+
+    def test_rejects_task_count_overflow(self):
+        with pytest.raises(ValueError):
+            _make_batch(expected_task_count=1, task_ids=["t1", "t2"])
 
 
 # ---------------------------------------------------------------------------

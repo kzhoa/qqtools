@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-SCHEMA_VERSION = "3.0"
+SCHEMA_VERSION = "4.0"
 ROOT_SCOPE_PROJECT = "project"
 ROOT_SCOPES = (ROOT_SCOPE_PROJECT,)
 
@@ -80,6 +80,20 @@ AGENT_STATES = (
     AGENT_STATE_IDLE,
     AGENT_STATE_STALE,
     AGENT_STATE_FAILED,
+)
+
+# ---------------------------------------------------------------------------
+# Batch commit states
+# ---------------------------------------------------------------------------
+
+BATCH_COMMIT_PREPARING = "preparing"
+BATCH_COMMIT_COMMITTED = "committed"
+BATCH_COMMIT_ABORTED = "aborted"
+
+BATCH_COMMIT_STATES = (
+    BATCH_COMMIT_PREPARING,
+    BATCH_COMMIT_COMMITTED,
+    BATCH_COMMIT_ABORTED,
 )
 
 # ---------------------------------------------------------------------------
@@ -179,6 +193,15 @@ def validate_phase_transition(from_phase: str, to_phase: str) -> None:
         raise ValueError(
             f"Illegal phase transition: {from_phase!r} -> {to_phase!r}."
         )
+
+
+def validate_batch_commit_state(state: str) -> str:
+    if state not in BATCH_COMMIT_STATES:
+        raise ValueError(
+            f"Invalid batch commit_state {state!r}. "
+            f"Must be one of {BATCH_COMMIT_STATES}."
+        )
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -409,14 +432,23 @@ class Batch:
     group: str | None
     source_manifest: str | None
     machine_name: str
-    task_ids: list[str]
-    summary: BatchSummary
-    policy: BatchPolicy
+    commit_state: str = BATCH_COMMIT_COMMITTED
+    expected_task_count: int = 0
+    task_ids: list[str] = field(default_factory=list)
+    summary: BatchSummary = field(default_factory=BatchSummary)
+    policy: BatchPolicy = field(default_factory=BatchPolicy)
 
     def __post_init__(self) -> None:
         validate_task_id(self.batch_id)
         validate_group_name(self.group)
         validate_machine_name(self.machine_name)
+        validate_batch_commit_state(self.commit_state)
+        if not isinstance(self.expected_task_count, int) or self.expected_task_count < 0:
+            raise ValueError("expected_task_count must be a non-negative integer.")
+        if len(self.task_ids) > self.expected_task_count:
+            raise ValueError(
+                "task_ids length must not exceed expected_task_count."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -427,6 +459,8 @@ class Batch:
                 "group": self.group,
                 "source_manifest": self.source_manifest,
                 "machine_name": self.machine_name,
+                "commit_state": self.commit_state,
+                "expected_task_count": self.expected_task_count,
                 "task_ids": list(self.task_ids),
                 "summary": self.summary.to_dict(),
                 "policy": self.policy.to_dict(),
@@ -444,6 +478,10 @@ class Batch:
             group=validate_group_name(b.get("group")),
             source_manifest=b.get("source_manifest"),
             machine_name=b["machine_name"],
+            commit_state=validate_batch_commit_state(
+                b.get("commit_state", BATCH_COMMIT_COMMITTED)
+            ),
+            expected_task_count=b.get("expected_task_count", len(b.get("task_ids", []))),
             task_ids=b.get("task_ids", []),
             summary=BatchSummary.from_dict(b.get("summary", {})),
             policy=BatchPolicy.from_dict(b.get("policy", {})),

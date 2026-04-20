@@ -13,7 +13,7 @@ from .layout import (
     index_by_machine_dir,
     index_by_state_dir,
 )
-from .models import ALL_PHASES, Batch, Task
+from .models import ALL_PHASES, BATCH_COMMIT_COMMITTED, Batch, Task
 from .storage import iter_all_batches, iter_all_tasks, write_atomic_json
 
 
@@ -74,8 +74,29 @@ def update_index_on_submit(cfg: RootConfig, task: Task) -> None:
         )
 
 
+def remove_index_on_delete(cfg: RootConfig, task: Task) -> None:
+    _remove_from_index(
+        index_by_state_dir(cfg) / f"{task.status.phase}.json",
+        task.task_id,
+    )
+    _remove_from_index(
+        index_by_machine_dir(cfg) / f"{task.machine_name}.json",
+        task.task_id,
+    )
+    if task.batch_id:
+        _remove_from_index(
+            index_by_batch_dir(cfg) / f"{task.batch_id}.json",
+            task.task_id,
+        )
+    if task.group:
+        _remove_from_index(
+            index_by_group_dir(cfg) / f"{task.group}.json",
+            task.task_id,
+        )
+
+
 def update_batch_index_on_create(cfg: RootConfig, batch: Batch) -> None:
-    if batch.group:
+    if batch.commit_state == BATCH_COMMIT_COMMITTED and batch.group:
         _add_to_index(
             batch_index_by_group_dir(cfg) / f"{batch.group}.json",
             batch.batch_id,
@@ -134,7 +155,7 @@ def rebuild_all_indexes(cfg: RootConfig) -> dict[str, Any]:
 
     batches = iter_all_batches(cfg)
     for batch in batches:
-        if batch.group:
+        if batch.commit_state == BATCH_COMMIT_COMMITTED and batch.group:
             batches_by_group.setdefault(batch.group, []).append(batch.batch_id)
 
     # Clear and rewrite state indexes

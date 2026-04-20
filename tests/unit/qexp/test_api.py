@@ -18,6 +18,9 @@ from qqtools.plugins.qexp.api import (
 from qqtools.plugins.qexp.indexes import load_index
 from qqtools.plugins.qexp.layout import init_shared_root
 from qqtools.plugins.qexp.models import (
+    BATCH_COMMIT_ABORTED,
+    BATCH_COMMIT_COMMITTED,
+    BATCH_COMMIT_PREPARING,
     PHASE_CANCELLED,
     PHASE_FAILED,
     PHASE_QUEUED,
@@ -222,6 +225,8 @@ class TestBatchSubmit:
         batch = batch_submit(cfg, manifest)
         assert batch.name == "sweep"
         assert len(batch.task_ids) == 2
+        assert batch.commit_state == BATCH_COMMIT_COMMITTED
+        assert batch.expected_task_count == 2
         assert batch.summary.total == 2
         assert batch.summary.queued == 2
 
@@ -257,6 +262,16 @@ class TestBatchSubmit:
         with pytest.raises(ValueError, match="command"):
             batch_submit(cfg, manifest)
 
+    def test_duplicate_task_id_fails_before_persist(self, cfg, tmp_path):
+        manifest = self._write_manifest(tmp_path, {
+            "tasks": [
+                {"task_id": "dup", "command": ["echo", "1"]},
+                {"task_id": "dup", "command": ["echo", "2"]},
+            ],
+        })
+        with pytest.raises(ValueError, match="Duplicate task_id"):
+            batch_submit(cfg, manifest)
+
     def test_batch_indexed(self, cfg, tmp_path):
         manifest = self._write_manifest(tmp_path, {
             "tasks": [{"command": ["echo"]}],
@@ -280,6 +295,47 @@ class TestBatchSubmit:
         assert load_task(cfg, "t2").group == "regrouped_debug"
         assert "t1" in load_index(cfg, "group", "contract_n_4and6")
         assert "t2" in load_index(cfg, "group", "regrouped_debug")
+
+    def test_existing_task_id_conflict_fails_before_batch_write(self, cfg, tmp_path):
+        submit(cfg, command=["echo"], task_id="taken")
+        manifest = self._write_manifest(tmp_path, {
+            "tasks": [{"task_id": "taken", "command": ["echo", "1"]}],
+        })
+        with pytest.raises(ValueError, match="already exists"):
+            batch_submit(cfg, manifest)
+
+    def test_partial_failure_marks_batch_aborted(self, cfg, tmp_path, monkeypatch):
+        manifest = self._write_manifest(tmp_path, {
+            "tasks": [
+                {"task_id": "ok-task", "command": ["echo", "1"]},
+                {"task_id": "boom-task", "command": ["echo", "2"]},
+            ],
+        })
+
+        from qqtools.plugins.qexp import api as api_mod
+
+        original_save_task = api_mod.save_task
+
+        def _boom(current_cfg, task):
+            if task.task_id == "boom-task":
+                raise RuntimeError("boom")
+            return original_save_task(current_cfg, task)
+
+        monkeypatch.setattr(api_mod, "save_task", _boom)
+        with pytest.raises(RuntimeError, match="boom"):
+            batch_submit(cfg, manifest)
+
+        batches = list(load_index(cfg, "batch_group", "missing"))
+        assert batches == []
+        batch_files = list((cfg.shared_root / "global" / "batches").glob("*.json"))
+        assert len(batch_files) == 1
+        aborted = load_batch(cfg, batch_files[0].stem)
+        assert aborted.commit_state == BATCH_COMMIT_ABORTED
+        assert aborted.expected_task_count == 0
+        assert aborted.task_ids == []
+        assert load_index(cfg, "state", PHASE_QUEUED) == []
+        with pytest.raises(FileNotFoundError):
+            load_task(cfg, "ok-task")
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +425,19 @@ class TestBatchRetry:
 
         with pytest.raises(ValueError, match="disallows retrying cancelled"):
             batch_retry_cancelled(cfg, batch.batch_id)
+
+    def test_retry_rejects_non_committed_batch(self, cfg, tmp_path):
+        manifest_path = tmp_path / "m4.yaml"
+        manifest_path.write_text(yaml.dump({
+            "tasks": [{"command": ["echo"]}],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest_path)
+        batch.commit_state = BATCH_COMMIT_PREPARING
+        from qqtools.plugins.qexp.storage import save_batch
+        save_batch(cfg, batch)
+
+        with pytest.raises(ValueError, match="not committed"):
+            batch_retry_failed(cfg, batch.batch_id)
 
 
 # ---------------------------------------------------------------------------

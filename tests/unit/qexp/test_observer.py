@@ -6,7 +6,7 @@ import yaml
 from qqtools.plugins.qexp.api import batch_submit, submit
 from qqtools.plugins.qexp.agent import start_agent_record
 from qqtools.plugins.qexp.layout import init_shared_root
-from qqtools.plugins.qexp.models import PHASE_QUEUED
+from qqtools.plugins.qexp.models import BATCH_COMMIT_PREPARING, PHASE_QUEUED
 from qqtools.plugins.qexp.observer import (
     inspect_batch,
     inspect_task,
@@ -115,6 +115,33 @@ class TestBatchViews:
         b = batch_submit(cfg, manifest)
         result = inspect_batch(cfg, b.batch_id)
         assert result["batch"]["batch_id"] == b.batch_id
+
+    def test_list_batches_hides_non_committed_batches(self, cfg, tmp_path):
+        manifest = tmp_path / "m-hidden.yaml"
+        manifest.write_text(yaml.dump({
+            "tasks": [{"command": ["echo"]}],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest)
+        from qqtools.plugins.qexp.storage import save_batch
+
+        batch.commit_state = BATCH_COMMIT_PREPARING
+        save_batch(cfg, batch)
+
+        assert list_batches(cfg) == []
+
+    def test_inspect_batch_hides_non_committed_batch(self, cfg, tmp_path):
+        manifest = tmp_path / "m-hidden2.yaml"
+        manifest.write_text(yaml.dump({
+            "tasks": [{"command": ["echo"]}],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest)
+        from qqtools.plugins.qexp.storage import save_batch
+
+        batch.commit_state = BATCH_COMMIT_PREPARING
+        save_batch(cfg, batch)
+
+        with pytest.raises(FileNotFoundError, match="not committed"):
+            inspect_batch(cfg, batch.batch_id)
 
 
 class TestBatchLiveSummary:

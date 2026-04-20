@@ -14,10 +14,12 @@ from typing import Any
 import yaml
 
 from .agent import wake_agent_if_needed
+from .batch_state import build_batch_summary_from_counts, collect_batch_task_counts
 from .doctor import repair_metadata
 from .indexes import (
     load_index,
     rebuild_all_indexes,
+    remove_index_on_delete,
     update_batch_index_on_create,
     update_index_on_phase_change,
     update_index_on_submit,
@@ -32,6 +34,9 @@ from .layout import (
 from .locking import batch_lock, clean_lock, submit_lock
 from .models import (
     Batch,
+    BATCH_COMMIT_ABORTED,
+    BATCH_COMMIT_COMMITTED,
+    BATCH_COMMIT_PREPARING,
     BatchPolicy,
     BatchSummary,
     Meta,
@@ -258,10 +263,12 @@ def _add_task_to_batch(cfg: RootConfig, batch_id: str, task_id: str) -> None:
             batch = load_batch(cfg, batch_id)
         except FileNotFoundError:
             return
+        _ensure_batch_committed(batch)
         if task_id in batch.task_ids:
             return
 
         batch.task_ids.append(task_id)
+        batch.expected_task_count = max(batch.expected_task_count, len(batch.task_ids))
         batch.summary = _build_batch_summary(cfg, batch.task_ids)
         try:
             cas_update_batch(cfg, batch, batch.meta.revision)
@@ -293,43 +300,22 @@ def batch_submit(
 
     batch_id = generate_id()
     now = utc_now_iso()
-    task_ids: list[str] = []
     batch_group = validate_group_name(batch_section.get("group"))
+    task_specs = _prepare_batch_task_specs(
+        cfg,
+        batch_id=batch_id,
+        now=now,
+        defaults=defaults,
+        tasks_section=tasks_section,
+        batch_group=batch_group,
+    )
 
     ensure_shared_layout(cfg)
     ensure_machine_layout(cfg)
 
     with batch_lock(cfg):
-        for entry in tasks_section:
-            command = entry.get("command")
-            if not command:
-                raise ValueError("Each task in the manifest must have a 'command'.")
-
-            gpus = entry.get("requested_gpus", defaults.get("requested_gpus", 1))
-            task_name = entry.get("name")
-            tid = entry.get("task_id", generate_id())
-            task_group = validate_group_name(entry.get("group", batch_group))
-
-            task = Task(
-                meta=Meta.new(cfg.machine_name),
-                task_id=tid,
-                name=task_name,
-                group=task_group,
-                batch_id=batch_id,
-                machine_name=cfg.machine_name,
-                attempt=1,
-                spec=TaskSpec(command=list(command), requested_gpus=gpus),
-                status=TaskStatus(phase=PHASE_QUEUED),
-                runtime=TaskRuntime(),
-                timestamps=TaskTimestamps(created_at=now, queued_at=now),
-                result=TaskResult(),
-                lineage=TaskLineage(),
-            )
-            save_task(cfg, task)
-            update_index_on_submit(cfg, task)
-            task_ids.append(tid)
-
         policy_raw = batch_section.get("policy", {})
+        persisted_tasks: list[Task] = []
         batch = Batch(
             meta=Meta.new(cfg.machine_name),
             batch_id=batch_id,
@@ -337,15 +323,37 @@ def batch_submit(
             group=batch_group,
             source_manifest=str(manifest_path),
             machine_name=cfg.machine_name,
-            task_ids=task_ids,
-            summary=BatchSummary(total=len(task_ids), queued=len(task_ids)),
+            commit_state=BATCH_COMMIT_PREPARING,
+            expected_task_count=len(task_specs),
+            task_ids=[],
+            summary=BatchSummary(total=len(task_specs)),
             policy=BatchPolicy(
                 allow_retry_failed=policy_raw.get("allow_retry_failed", True),
                 allow_retry_cancelled=policy_raw.get("allow_retry_cancelled", True),
             ),
         )
         save_batch(cfg, batch)
-        update_batch_index_on_create(cfg, batch)
+        try:
+            for task in task_specs:
+                save_task(cfg, task)
+                persisted_tasks.append(task)
+                batch.task_ids.append(task.task_id)
+                update_index_on_submit(cfg, task)
+
+            batch.commit_state = BATCH_COMMIT_COMMITTED
+            batch.summary = _build_batch_summary(cfg, batch.task_ids)
+            save_batch(cfg, batch)
+            update_batch_index_on_create(cfg, batch)
+        except Exception:
+            for task in persisted_tasks:
+                remove_index_on_delete(cfg, task)
+                delete_task_file(cfg, task.task_id)
+            batch.task_ids = []
+            batch.commit_state = BATCH_COMMIT_ABORTED
+            batch.expected_task_count = 0
+            batch.summary = BatchSummary()
+            save_batch(cfg, batch)
+            raise
 
     wake_agent_if_needed(cfg)
     return batch
@@ -359,6 +367,7 @@ def batch_submit(
 def batch_retry_failed(cfg: RootConfig, batch_id: str) -> list[Task]:
     validate_root_contract(cfg)
     batch = load_batch(cfg, batch_id)
+    _ensure_batch_committed(batch)
     if not batch.policy.allow_retry_failed:
         raise ValueError(
             f"Batch {batch_id} policy disallows retrying failed tasks."
@@ -369,6 +378,7 @@ def batch_retry_failed(cfg: RootConfig, batch_id: str) -> list[Task]:
 def batch_retry_cancelled(cfg: RootConfig, batch_id: str) -> list[Task]:
     validate_root_contract(cfg)
     batch = load_batch(cfg, batch_id)
+    _ensure_batch_committed(batch)
     if not batch.policy.allow_retry_cancelled:
         raise ValueError(
             f"Batch {batch_id} policy disallows retrying cancelled tasks."
@@ -379,6 +389,7 @@ def batch_retry_cancelled(cfg: RootConfig, batch_id: str) -> list[Task]:
 def _batch_retry_by_phase(
     cfg: RootConfig, batch: Batch, target_phase: str
 ) -> list[Task]:
+    _ensure_batch_committed(batch)
     new_tasks: list[Task] = []
 
     for tid in list(batch.task_ids):
@@ -413,23 +424,66 @@ def _parse_iso_timestamp(value: str) -> datetime:
 
 
 def _build_batch_summary(cfg: RootConfig, task_ids: list[str]) -> BatchSummary:
-    counts: dict[str, int] = {}
-    surviving_ids: list[str] = []
-    for task_id in task_ids:
-        task = load_task(cfg, task_id)
-        surviving_ids.append(task_id)
-        phase = task.status.phase
-        counts[phase] = counts.get(phase, 0) + 1
-    return BatchSummary(
-        total=len(surviving_ids),
-        queued=counts.get(PHASE_QUEUED, 0),
-        running=counts.get(PHASE_RUNNING, 0),
-        succeeded=counts.get(PHASE_SUCCEEDED, 0),
-        failed=counts.get(PHASE_FAILED, 0),
-        cancelled=counts.get(PHASE_CANCELLED, 0),
-        blocked=counts.get("blocked", 0),
-        orphaned=counts.get("orphaned", 0),
-    )
+    surviving_ids, counts = collect_batch_task_counts(cfg, task_ids)
+    return build_batch_summary_from_counts(total=len(surviving_ids), counts=counts)
+
+
+def _ensure_batch_committed(batch: Batch) -> None:
+    if batch.commit_state != BATCH_COMMIT_COMMITTED:
+        raise ValueError(
+            f"Batch {batch.batch_id} is not committed. "
+            f"Current commit_state={batch.commit_state!r}."
+        )
+
+
+def _prepare_batch_task_specs(
+    cfg: RootConfig,
+    *,
+    batch_id: str,
+    now: str,
+    defaults: dict[str, Any],
+    tasks_section: list[dict[str, Any]],
+    batch_group: str | None,
+) -> list[Task]:
+    prepared_tasks: list[Task] = []
+    seen_task_ids: set[str] = set()
+
+    for entry in tasks_section:
+        command = entry.get("command")
+        if not command:
+            raise ValueError("Each task in the manifest must have a 'command'.")
+
+        tid = entry.get("task_id", generate_id())
+        validate_task_id(tid)
+        if tid in seen_task_ids:
+            raise ValueError(f"Duplicate task_id in manifest: {tid!r}.")
+        try:
+            load_task(cfg, tid)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError(f"Task {tid!r} already exists.")
+
+        seen_task_ids.add(tid)
+        gpus = entry.get("requested_gpus", defaults.get("requested_gpus", 1))
+        prepared_tasks.append(
+            Task(
+                meta=Meta.new(cfg.machine_name),
+                task_id=tid,
+                name=entry.get("name"),
+                group=validate_group_name(entry.get("group", batch_group)),
+                batch_id=batch_id,
+                machine_name=cfg.machine_name,
+                attempt=1,
+                spec=TaskSpec(command=list(command), requested_gpus=gpus),
+                status=TaskStatus(phase=PHASE_QUEUED),
+                runtime=TaskRuntime(),
+                timestamps=TaskTimestamps(created_at=now, queued_at=now),
+                result=TaskResult(),
+                lineage=TaskLineage(),
+            )
+        )
+    return prepared_tasks
 
 
 def _resolve_task_log_path(cfg: RootConfig, task: Task) -> _ResolvedLogPath:
@@ -650,6 +704,7 @@ def _apply_batch_updates(cfg: RootConfig, removals_by_batch: dict[str, set[str]]
             batch = load_batch(cfg, batch_id)
             next_task_ids = [tid for tid in batch.task_ids if tid not in removed_ids]
             batch.task_ids = next_task_ids
+            batch.expected_task_count = len(next_task_ids)
             batch.summary = _build_batch_summary(cfg, next_task_ids)
             try:
                 cas_update_batch(cfg, batch, batch.meta.revision)

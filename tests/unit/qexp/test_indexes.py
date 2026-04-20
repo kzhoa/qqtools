@@ -5,11 +5,18 @@ import pytest
 from qqtools.plugins.qexp.indexes import (
     load_index,
     rebuild_all_indexes,
+    remove_index_on_delete,
+    update_batch_index_on_create,
     update_index_on_phase_change,
     update_index_on_submit,
 )
 from qqtools.plugins.qexp.layout import init_shared_root
 from qqtools.plugins.qexp.models import (
+    BATCH_COMMIT_COMMITTED,
+    BATCH_COMMIT_PREPARING,
+    Batch,
+    BatchPolicy,
+    BatchSummary,
     Meta,
     PHASE_QUEUED,
     PHASE_RUNNING,
@@ -23,7 +30,7 @@ from qqtools.plugins.qexp.models import (
     TaskTimestamps,
     utc_now_iso,
 )
-from qqtools.plugins.qexp.storage import save_task
+from qqtools.plugins.qexp.storage import save_batch, save_task
 
 
 @pytest.fixture()
@@ -126,3 +133,66 @@ class TestRebuild:
     def test_invalid_index_type(self, cfg):
         with pytest.raises(ValueError):
             load_index(cfg, "invalid", "key")
+
+
+class TestBatchIndexes:
+    def test_batch_group_index_only_includes_committed_batches(self, cfg):
+        committed = Batch(
+            meta=Meta.new("dev1"),
+            batch_id="b-committed",
+            name=None,
+            group="contract_n_4and6",
+            source_manifest=None,
+            machine_name="dev1",
+            commit_state=BATCH_COMMIT_COMMITTED,
+            expected_task_count=0,
+            task_ids=[],
+            summary=BatchSummary(),
+            policy=BatchPolicy(),
+        )
+        preparing = Batch(
+            meta=Meta.new("dev1"),
+            batch_id="b-preparing",
+            name=None,
+            group="contract_n_4and6",
+            source_manifest=None,
+            machine_name="dev1",
+            commit_state=BATCH_COMMIT_PREPARING,
+            expected_task_count=0,
+            task_ids=[],
+            summary=BatchSummary(),
+            policy=BatchPolicy(),
+        )
+
+        save_batch(cfg, committed)
+        save_batch(cfg, preparing)
+        update_batch_index_on_create(cfg, committed)
+        update_batch_index_on_create(cfg, preparing)
+
+        assert load_index(cfg, "batch_group", "contract_n_4and6") == ["b-committed"]
+
+    def test_remove_index_on_delete_removes_all_task_indexes(self, cfg):
+        task = Task(
+            meta=Meta.new("dev1"),
+            task_id="t-delete",
+            name=None,
+            group="contract_n_4and6",
+            batch_id="b1",
+            machine_name="dev1",
+            attempt=1,
+            spec=TaskSpec(command=["echo"], requested_gpus=1),
+            status=TaskStatus(phase=PHASE_QUEUED),
+            runtime=TaskRuntime(),
+            timestamps=TaskTimestamps(created_at=utc_now_iso(), queued_at=utc_now_iso()),
+            result=TaskResult(),
+            lineage=TaskLineage(),
+        )
+        save_task(cfg, task)
+        update_index_on_submit(cfg, task)
+
+        remove_index_on_delete(cfg, task)
+
+        assert "t-delete" not in load_index(cfg, "state", PHASE_QUEUED)
+        assert "t-delete" not in load_index(cfg, "machine", "dev1")
+        assert "t-delete" not in load_index(cfg, "batch", "b1")
+        assert "t-delete" not in load_index(cfg, "group", "contract_n_4and6")

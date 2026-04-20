@@ -4,6 +4,11 @@ import logging
 import time
 from pathlib import Path
 
+from .batch_state import (
+    build_batch_summary_from_counts,
+    collect_batch_task_counts,
+    resolve_declared_batch_total,
+)
 from .indexes import rebuild_all_indexes
 from .locking import clean_lock
 from .layout import (
@@ -22,6 +27,9 @@ from .models import (
     AGENT_STATE_FAILED,
     AGENT_STATE_STALE,
     AGENT_STATE_STOPPED,
+    BATCH_COMMIT_ABORTED,
+    BATCH_COMMIT_COMMITTED,
+    BATCH_COMMIT_PREPARING,
     BatchSummary,
     PHASE_ORPHANED,
     ROOT_SCOPE_PROJECT,
@@ -239,6 +247,8 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
     - rebuild all derived indexes
     """
     repaired_batches: list[str] = []
+    committed_batches: list[str] = []
+    aborted_batches: list[str] = []
     pruned_task_refs = 0
 
     with clean_lock(cfg):
@@ -250,34 +260,47 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
                 batch_id = path.stem
                 batch = load_batch(cfg, batch_id)
 
-                surviving_ids: list[str] = []
-                counts: dict[str, int] = {}
                 removed = 0
 
                 for task_id in batch.task_ids:
                     try:
-                        task = load_task(cfg, task_id)
+                        load_task(cfg, task_id)
                     except FileNotFoundError:
                         removed += 1
-                        continue
-                    surviving_ids.append(task_id)
-                    phase = task.status.phase
-                    counts[phase] = counts.get(phase, 0) + 1
-
-                new_summary = BatchSummary(
-                    total=len(surviving_ids),
-                    queued=counts.get("queued", 0),
-                    running=counts.get("running", 0),
-                    succeeded=counts.get("succeeded", 0),
-                    failed=counts.get("failed", 0),
-                    cancelled=counts.get("cancelled", 0),
-                    blocked=counts.get("blocked", 0),
-                    orphaned=counts.get("orphaned", 0),
+                surviving_ids, counts = collect_batch_task_counts(
+                    cfg,
+                    batch.task_ids,
+                    ignore_missing=True,
                 )
+                declared_count = resolve_declared_batch_total(
+                    commit_state=batch.commit_state,
+                    expected_task_count=batch.expected_task_count,
+                    declared_task_ids=batch.task_ids,
+                    surviving_ids=surviving_ids,
+                )
+                new_summary = build_batch_summary_from_counts(
+                    total=declared_count,
+                    counts=counts,
+                )
+                next_commit_state = batch.commit_state
+                if batch.commit_state == BATCH_COMMIT_PREPARING:
+                    if len(surviving_ids) == declared_count:
+                        next_commit_state = BATCH_COMMIT_COMMITTED
+                        committed_batches.append(batch.batch_id)
+                    else:
+                        next_commit_state = BATCH_COMMIT_ABORTED
+                        aborted_batches.append(batch.batch_id)
 
-                if surviving_ids != batch.task_ids or new_summary != batch.summary:
+                if (
+                    surviving_ids != batch.task_ids
+                    or new_summary != batch.summary
+                    or next_commit_state != batch.commit_state
+                    or batch.expected_task_count != declared_count
+                ):
                     batch.task_ids = surviving_ids
                     batch.summary = new_summary
+                    batch.commit_state = next_commit_state
+                    batch.expected_task_count = declared_count
                     batch.meta.revision += 1
                     batch.meta.updated_at = utc_now_iso()
                     batch.meta.updated_by_machine = cfg.machine_name
@@ -291,6 +314,8 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
     return {
         "repaired_batch_count": len(repaired_batches),
         "repaired_batches": repaired_batches,
+        "committed_batches": committed_batches,
+        "aborted_batches": aborted_batches,
         "pruned_task_ref_count": pruned_task_refs,
         "index_stats": index_stats,
         "governance": governance.to_dict(),
@@ -371,8 +396,33 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
                     continue
 
                 declared_task_ids = list(batch_data.get("task_ids", []))
-                surviving_ids: list[str] = []
+                stored_expected_task_count = batch_data.get(
+                    "expected_task_count",
+                    len(declared_task_ids),
+                )
+                commit_state = batch_data.get("commit_state")
+                if commit_state not in {
+                    BATCH_COMMIT_PREPARING,
+                    BATCH_COMMIT_COMMITTED,
+                    BATCH_COMMIT_ABORTED,
+                }:
+                    issues.append(
+                        f"Batch {expected_id} has invalid commit_state {commit_state!r}"
+                    )
+                if (
+                    not isinstance(stored_expected_task_count, int)
+                    or stored_expected_task_count < 0
+                ):
+                    issues.append(
+                        f"Batch {expected_id} has invalid expected_task_count {stored_expected_task_count!r}"
+                    )
+                    stored_expected_task_count = len(declared_task_ids)
+                if len(declared_task_ids) > stored_expected_task_count:
+                    issues.append(
+                        f"Batch {expected_id} has more persisted tasks than expected_task_count."
+                    )
                 counts: dict[str, int] = {}
+                surviving_ids: list[str] = []
                 for task_id in declared_task_ids:
                     try:
                         task = load_task(cfg, task_id)
@@ -384,21 +434,41 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
                     surviving_ids.append(task_id)
                     phase = task.status.phase
                     counts[phase] = counts.get(phase, 0) + 1
+                    if task.batch_id != expected_id:
+                        issues.append(
+                            f"Batch {expected_id} contains task {task_id} with mismatched batch_id {task.batch_id!r}"
+                        )
 
-                expected_summary = {
-                    "total": len(surviving_ids),
-                    "queued": counts.get("queued", 0),
-                    "running": counts.get("running", 0),
-                    "succeeded": counts.get("succeeded", 0),
-                    "failed": counts.get("failed", 0),
-                    "cancelled": counts.get("cancelled", 0),
-                    "blocked": counts.get("blocked", 0),
-                    "orphaned": counts.get("orphaned", 0),
-                }
+                expected_task_count = resolve_declared_batch_total(
+                    commit_state=commit_state,
+                    expected_task_count=stored_expected_task_count,
+                    declared_task_ids=declared_task_ids,
+                    surviving_ids=surviving_ids,
+                )
+
+                expected_summary = build_batch_summary_from_counts(
+                    total=expected_task_count,
+                    counts=counts,
+                ).to_dict()
                 actual_summary = batch_data.get("summary", {})
                 if actual_summary != expected_summary:
                     issues.append(
                         f"Batch {expected_id} summary drift: expected={expected_summary}, actual={actual_summary}"
+                    )
+                if (
+                    commit_state == BATCH_COMMIT_COMMITTED
+                    and len(surviving_ids) != expected_task_count
+                ):
+                    issues.append(
+                        f"Batch {expected_id} is committed but only has "
+                        f"{len(surviving_ids)}/{expected_task_count} tasks."
+                    )
+                if (
+                    commit_state == BATCH_COMMIT_PREPARING
+                    and len(surviving_ids) == expected_task_count
+                ):
+                    issues.append(
+                        f"Batch {expected_id} is still preparing despite complete task set."
                     )
             except Exception as e:
                 issues.append(f"Cannot read batch {path.name}: {e}")

@@ -5,6 +5,10 @@ import pytest
 from qqtools.plugins.qexp.indexes import load_index, update_index_on_submit
 from qqtools.plugins.qexp.layout import init_shared_root
 from qqtools.plugins.qexp.models import (
+    BATCH_COMMIT_ABORTED,
+    Batch,
+    BatchPolicy,
+    BatchSummary,
     Meta,
     PHASE_FAILED,
     PHASE_QUEUED,
@@ -24,7 +28,7 @@ from qqtools.plugins.qexp.scheduler import (
     reconcile_running_tasks,
     run_dispatch_cycle,
 )
-from qqtools.plugins.qexp.storage import cas_update_task, load_task, save_task
+from qqtools.plugins.qexp.storage import cas_update_task, load_task, save_batch, save_task
 
 
 @pytest.fixture()
@@ -93,6 +97,29 @@ class TestDispatchCycle:
         run_dispatch_cycle(cfg)
         assert "t1" not in load_index(cfg, "state", PHASE_QUEUED)
         assert "t1" in load_index(cfg, "state", PHASE_STARTING)
+
+    def test_dispatch_skips_aborted_batch_task(self, cfg):
+        t = _make_task("t1")
+        t.batch_id = "b1"
+        save_task(cfg, t)
+        update_index_on_submit(cfg, t)
+        save_batch(cfg, Batch(
+            meta=Meta.new("dev1"),
+            batch_id="b1",
+            name=None,
+            group=None,
+            source_manifest=None,
+            machine_name="dev1",
+            commit_state=BATCH_COMMIT_ABORTED,
+            expected_task_count=0,
+            task_ids=[],
+            summary=BatchSummary(),
+            policy=BatchPolicy(),
+        ))
+
+        launched = run_dispatch_cycle(cfg)
+        assert launched == []
+        assert load_task(cfg, "t1").status.phase == PHASE_QUEUED
 
 
 class _FakeTracker:

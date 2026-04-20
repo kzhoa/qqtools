@@ -156,6 +156,41 @@ class TestBatchSubmit:
         out = capsys.readouterr().out
         assert "tasks=2" in out
 
+    def test_batches_hides_non_committed_batches(self, cfg, tmp_path, capsys):
+        from qqtools.plugins.qexp.api import batch_submit
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.models import BATCH_COMMIT_PREPARING
+        from qqtools.plugins.qexp.storage import save_batch
+
+        manifest = tmp_path / "hidden-batch.yaml"
+        manifest.write_text(yaml.dump({
+            "tasks": [{"command": ["echo", "1"]}],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest)
+        batch.commit_state = BATCH_COMMIT_PREPARING
+        save_batch(cfg, batch)
+
+        ret = cli_main(_base_args(cfg) + ["batches"])
+        assert ret == 0
+        assert "No batches found." in capsys.readouterr().out
+
+    def test_batch_inspect_raises_for_non_committed_batch(self, cfg, tmp_path, capsys):
+        from qqtools.plugins.qexp.api import batch_submit
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.models import BATCH_COMMIT_PREPARING
+        from qqtools.plugins.qexp.storage import save_batch
+
+        manifest = tmp_path / "hidden-inspect.yaml"
+        manifest.write_text(yaml.dump({
+            "tasks": [{"command": ["echo", "1"]}],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest)
+        batch.commit_state = BATCH_COMMIT_PREPARING
+        save_batch(cfg, batch)
+
+        with pytest.raises(FileNotFoundError, match="not committed"):
+            cli_main(_base_args(cfg) + ["batch", batch.batch_id])
+
 
 class TestMachines:
     def test_machines(self, cfg, capsys):

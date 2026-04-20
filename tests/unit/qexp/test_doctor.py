@@ -23,7 +23,7 @@ from qqtools.plugins.qexp.layout import (
     task_path,
 )
 from qqtools.plugins.qexp.models import PHASE_QUEUED, PHASE_RUNNING, PHASE_SUCCEEDED
-from qqtools.plugins.qexp.storage import cas_update_task, load_batch, load_task
+from qqtools.plugins.qexp.storage import cas_update_task, load_batch, load_task, save_batch
 
 
 @pytest.fixture()
@@ -115,6 +115,22 @@ class TestVerifyIntegrity:
         assert not result["ok"]
         assert any("references missing task" in issue for issue in result["issues"])
 
+    def test_detects_preparing_batch_that_should_be_committed(self, cfg, tmp_path):
+        from qqtools.plugins.qexp.api import batch_submit
+        import yaml
+
+        manifest = tmp_path / "batch-preparing.yaml"
+        manifest.write_text(yaml.dump({
+            "tasks": [{"task_id": "t1", "command": ["echo"]}],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest)
+        batch.commit_state = "preparing"
+        save_batch(cfg, batch)
+
+        result = verify_integrity(cfg)
+        assert not result["ok"]
+        assert any("still preparing" in issue for issue in result["issues"])
+
 
 class TestRepairOrphans:
     def test_no_orphans_when_healthy(self, cfg):
@@ -198,3 +214,45 @@ class TestRepairMetadata:
         assert repaired.task_ids == ["keep"]
         assert repaired.summary.total == 1
         assert repaired.summary.queued == 1
+
+    def test_promotes_complete_preparing_batch_to_committed(self, cfg, tmp_path):
+        from qqtools.plugins.qexp.api import batch_submit
+        import yaml
+
+        manifest = tmp_path / "promote.yaml"
+        manifest.write_text(yaml.dump({
+            "tasks": [{"task_id": "ready", "command": ["echo"]}],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest)
+        batch.commit_state = "preparing"
+        save_batch(cfg, batch)
+
+        result = repair_metadata(cfg)
+        assert batch.batch_id in result["committed_batches"]
+
+        repaired = load_batch(cfg, batch.batch_id)
+        assert repaired.commit_state == "committed"
+        assert repaired.summary.total == 1
+
+    def test_marks_incomplete_preparing_batch_aborted(self, cfg, tmp_path):
+        from qqtools.plugins.qexp.api import batch_submit
+        import yaml
+
+        manifest = tmp_path / "abort.yaml"
+        manifest.write_text(yaml.dump({
+            "tasks": [
+                {"task_id": "keep", "command": ["echo"]},
+                {"task_id": "drop", "command": ["echo"]},
+            ],
+        }), encoding="utf-8")
+        batch = batch_submit(cfg, manifest)
+        batch.commit_state = "preparing"
+        save_batch(cfg, batch)
+        task_path(cfg, "drop").unlink()
+
+        result = repair_metadata(cfg)
+        assert batch.batch_id in result["aborted_batches"]
+
+        repaired = load_batch(cfg, batch.batch_id)
+        assert repaired.commit_state == "aborted"
+        assert repaired.task_ids == ["keep"]
