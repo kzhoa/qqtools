@@ -269,6 +269,62 @@ class TestMachines:
         assert ret == 0
         assert "dev1" in capsys.readouterr().out
 
+    def test_machines_prints_gpu_summary_columns(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.layout import gpu_state_path
+        from qqtools.plugins.qexp.storage import write_atomic_json
+
+        write_atomic_json(gpu_state_path(cfg), {
+            "gpu_count": 4,
+            "visible_gpu_ids": [0, 1, 2, 3],
+            "reserved_gpu_ids": [1, 2],
+            "task_to_gpu_ids": {"t1": [1], "t2": [2]},
+            "backend": "stub",
+            "probe_succeeded": True,
+            "probe_error": None,
+            "updated_at": "2099-01-01T00:00:00Z",
+        })
+
+        ret = cli_main(_base_args(cfg) + ["machines"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "gpu_status=live" in out
+        assert "visible=4" in out
+        assert "reserved=2" in out
+        assert "free=2" in out
+
+    def test_machines_prints_cross_machine_gpu_summary(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.agent import start_agent_record
+        from qqtools.plugins.qexp.layout import gpu_state_path
+        from qqtools.plugins.qexp.storage import write_atomic_json
+
+        other_cfg = init_shared_root(
+            cfg.shared_root,
+            "gpu2",
+            runtime_root=cfg.runtime_root.parent / "runtime2",
+        )
+        start_agent_record(other_cfg)
+        write_atomic_json(gpu_state_path(other_cfg), {
+            "gpu_count": 6,
+            "visible_gpu_ids": [0, 1, 2, 3, 4, 5],
+            "reserved_gpu_ids": [0, 5],
+            "task_to_gpu_ids": {"t1": [0], "t2": [5]},
+            "backend": "stub",
+            "probe_succeeded": True,
+            "probe_error": None,
+            "updated_at": "2099-01-01T00:00:00Z",
+        })
+
+        ret = cli_main(_base_args(cfg) + ["machines"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "gpu2" in out
+        assert "state=starting" in out
+        assert "visible=6" in out
+        assert "reserved=2" in out
+        assert "free=4" in out
+
 
 class TestDoctor:
     def test_verify(self, cfg, capsys):

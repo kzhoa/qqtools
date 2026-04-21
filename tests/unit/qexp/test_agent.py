@@ -13,6 +13,8 @@ from qqtools.plugins.qexp.agent import (
     run_agent_loop,
     start_agent_record,
     stop_agent_record,
+    write_gpu_probe_failure_state,
+    write_gpu_state,
     write_heartbeat,
     IDLE_TIMEOUT_DEFAULT,
 )
@@ -71,6 +73,54 @@ class TestAgentState:
         write_heartbeat(cfg)
         new_hb = read_agent_state(cfg)["last_heartbeat"]
         assert new_hb >= old_hb
+
+    def test_write_gpu_state_updates_runtime_snapshot_and_machine_snapshot(self, cfg):
+        from types import SimpleNamespace
+
+        from qqtools.plugins.qexp.layout import gpu_state_path
+        from qqtools.plugins.qexp.storage import load_machine, read_json
+
+        tracker = SimpleNamespace(
+            visible_gpu_ids=[0, 1, 2],
+            reserved_gpu_ids={1},
+            task_id_to_gpu_ids={"task-a": [1]},
+            backend_name="stub",
+        )
+
+        write_gpu_state(cfg, tracker)
+
+        gpu_state = read_json(gpu_state_path(cfg))
+        assert gpu_state["gpu_count"] == 3
+        assert gpu_state["visible_gpu_ids"] == [0, 1, 2]
+        assert gpu_state["reserved_gpu_ids"] == [1]
+        assert gpu_state["backend"] == "stub"
+        assert gpu_state["probe_succeeded"] is True
+
+        machine = load_machine(cfg)
+        assert machine.gpu_inventory.count == 3
+        assert machine.gpu_inventory.visible_gpu_ids == [0, 1, 2]
+
+    def test_write_gpu_probe_failure_state_persists_error_without_overwriting_machine_snapshot(self, cfg):
+        from qqtools.plugins.qexp.layout import gpu_state_path
+        from qqtools.plugins.qexp.models import GpuInventory
+        from qqtools.plugins.qexp.storage import load_machine, read_json, save_machine
+
+        machine = load_machine(cfg)
+        machine.gpu_inventory = GpuInventory(count=4, visible_gpu_ids=[0, 1, 2, 3])
+        save_machine(cfg, machine)
+
+        write_gpu_probe_failure_state(cfg, RuntimeError("nvml exploded"), backend="pynvml")
+
+        gpu_state = read_json(gpu_state_path(cfg))
+        assert gpu_state["probe_succeeded"] is False
+        assert gpu_state["probe_error"] == "nvml exploded"
+        assert gpu_state["backend"] == "pynvml"
+        assert gpu_state["gpu_count"] is None
+        assert gpu_state["visible_gpu_ids"] == []
+
+        machine = load_machine(cfg)
+        assert machine.gpu_inventory.count == 4
+        assert machine.gpu_inventory.visible_gpu_ids == [0, 1, 2, 3]
 
 
 class TestGetAgentStatus:

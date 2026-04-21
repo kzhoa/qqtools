@@ -202,6 +202,10 @@ class TestMachineViews:
         assert len(machines) == 1
         assert machines[0]["machine_name"] == "dev1"
         assert machines[0]["agent_state"] == "starting"
+        assert machines[0]["gpu_status"] == "unknown"
+        assert machines[0]["gpu_visible_count"] is None
+        assert machines[0]["gpu_reserved_count"] is None
+        assert machines[0]["gpu_free_count"] is None
 
     def test_agent_state_comes_from_agent_snapshot_not_summary(self, cfg):
         from qqtools.plugins.qexp.lifecycle import write_summary_snapshot
@@ -239,6 +243,127 @@ class TestMachineViews:
         machines = list_machines(cfg)
         remote = next(machine for machine in machines if machine["machine_name"] == "gpu2")
         assert remote["agent_state"] == "active"
+
+    def test_gpu_counts_come_from_dynamic_gpu_snapshot(self, cfg):
+        from qqtools.plugins.qexp.layout import gpu_state_path
+        from qqtools.plugins.qexp.storage import write_atomic_json
+
+        write_atomic_json(gpu_state_path(cfg), {
+            "gpu_count": 4,
+            "visible_gpu_ids": [0, 1, 2, 3],
+            "reserved_gpu_ids": [1, 3],
+            "task_to_gpu_ids": {"task-a": [1], "task-b": [3]},
+            "backend": "stub",
+            "probe_succeeded": True,
+            "probe_error": None,
+            "updated_at": "2099-01-01T00:00:00Z",
+        })
+
+        machines = list_machines(cfg)
+        machine = machines[0]
+        assert machine["gpu_status"] == "live"
+        assert machine["gpu_visible_count"] == 4
+        assert machine["gpu_reserved_count"] == 2
+        assert machine["gpu_free_count"] == 2
+        assert machine["gpu_backend"] == "stub"
+
+    def test_gpu_snapshot_falls_back_to_machine_snapshot(self, cfg):
+        from qqtools.plugins.qexp.models import GpuInventory
+        from qqtools.plugins.qexp.storage import load_machine, save_machine
+
+        machine = load_machine(cfg)
+        machine.gpu_inventory = GpuInventory(count=3, visible_gpu_ids=[0, 1, 2])
+        save_machine(cfg, machine)
+
+        machines = list_machines(cfg)
+        machine_view = machines[0]
+        assert machine_view["gpu_status"] == "fallback"
+        assert machine_view["gpu_visible_count"] == 3
+        assert machine_view["gpu_reserved_count"] is None
+        assert machine_view["gpu_free_count"] is None
+
+    def test_gpu_snapshot_supports_cross_machine_summary(self, cfg):
+        from qqtools.plugins.qexp.layout import gpu_state_path
+        from qqtools.plugins.qexp.storage import write_atomic_json
+
+        other_cfg = init_shared_root(
+            cfg.shared_root,
+            "gpu2",
+            runtime_root=cfg.runtime_root.parent / "runtime2",
+        )
+        start_agent_record(other_cfg)
+        write_atomic_json(gpu_state_path(other_cfg), {
+            "gpu_count": 8,
+            "visible_gpu_ids": list(range(8)),
+            "reserved_gpu_ids": [0, 2, 4],
+            "task_to_gpu_ids": {"r1": [0], "r2": [2], "r3": [4]},
+            "backend": "stub",
+            "probe_succeeded": True,
+            "probe_error": None,
+            "updated_at": "2099-01-01T00:00:00Z",
+        })
+
+        machines = list_machines(cfg)
+        remote = next(machine for machine in machines if machine["machine_name"] == "gpu2")
+        assert remote["agent_state"] == "starting"
+        assert remote["gpu_visible_count"] == 8
+        assert remote["gpu_reserved_count"] == 3
+        assert remote["gpu_free_count"] == 5
+
+    def test_gpu_error_uses_last_known_visible_count_without_reserved_or_free(self, cfg):
+        from qqtools.plugins.qexp.layout import gpu_state_path
+        from qqtools.plugins.qexp.models import GpuInventory
+        from qqtools.plugins.qexp.storage import load_machine, save_machine, write_atomic_json
+
+        machine = load_machine(cfg)
+        machine.gpu_inventory = GpuInventory(count=4, visible_gpu_ids=[0, 1, 2, 3])
+        save_machine(cfg, machine)
+
+        write_atomic_json(gpu_state_path(cfg), {
+            "gpu_count": None,
+            "visible_gpu_ids": [],
+            "reserved_gpu_ids": [],
+            "task_to_gpu_ids": {},
+            "backend": "pynvml",
+            "probe_succeeded": False,
+            "probe_error": "nvml exploded",
+            "updated_at": "2099-01-01T00:00:00Z",
+        })
+
+        machines = list_machines(cfg)
+        machine_view = machines[0]
+        assert machine_view["gpu_status"] == "error"
+        assert machine_view["gpu_visible_count"] == 4
+        assert machine_view["gpu_reserved_count"] is None
+        assert machine_view["gpu_free_count"] is None
+        assert machine_view["gpu_probe_error"] == "nvml exploded"
+
+    def test_malformed_gpu_snapshot_degrades_to_fallback_instead_of_crashing(self, cfg):
+        from qqtools.plugins.qexp.layout import gpu_state_path
+        from qqtools.plugins.qexp.models import GpuInventory
+        from qqtools.plugins.qexp.storage import load_machine, save_machine, write_atomic_json
+
+        machine = load_machine(cfg)
+        machine.gpu_inventory = GpuInventory(count=2, visible_gpu_ids=[0, 1])
+        save_machine(cfg, machine)
+
+        write_atomic_json(gpu_state_path(cfg), {
+            "gpu_count": 2,
+            "visible_gpu_ids": [0, 1],
+            "reserved_gpu_ids": 1,
+            "task_to_gpu_ids": {},
+            "backend": "stub",
+            "probe_succeeded": True,
+            "probe_error": None,
+            "updated_at": "2099-01-01T00:00:00Z",
+        })
+
+        machines = list_machines(cfg)
+        machine_view = machines[0]
+        assert machine_view["gpu_status"] == "fallback"
+        assert machine_view["gpu_visible_count"] == 2
+        assert machine_view["gpu_reserved_count"] is None
+        assert machine_view["gpu_free_count"] is None
 
 
 class TestTopView:

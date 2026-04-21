@@ -452,6 +452,10 @@ def handle_inspect(args: argparse.Namespace) -> int:
 
 def handle_top(args: argparse.Namespace) -> int:
     cfg = _resolve_cfg(args)
+
+    def _fmt_count(value):
+        return "?" if value is None else str(value)
+
     try:
         while True:
             view = observer.top_view(cfg, all_machines=args.all_machines)
@@ -468,8 +472,11 @@ def handle_top(args: argparse.Namespace) -> int:
                 print(
                     "  "
                     f"machine={m['machine_name']}  "
-                    f"gpus={m['gpu_count']}  "
                     f"agent={m['agent_state']}  "
+                    f"gpu_status={m['gpu_status']}  "
+                    f"visible={_fmt_count(m['gpu_visible_count'])}  "
+                    f"reserved={_fmt_count(m['gpu_reserved_count'])}  "
+                    f"free={_fmt_count(m['gpu_free_count'])}  "
                     f"queued={phase_counts.get('queued', 0)}  "
                     f"dispatching={phase_counts.get('dispatching', 0)}  "
                     f"starting={phase_counts.get('starting', 0)}  "
@@ -511,11 +518,18 @@ def handle_machines(args: argparse.Namespace) -> int:
     if not machines:
         print("No machines registered.")
         return 0
+
+    def _fmt_count(value):
+        return "?" if value is None else str(value)
+
     for m in machines:
         phase_counts = m.get("counts_by_phase", {})
         print(
             f"{m['machine_name']:14s} host={m.get('hostname') or '-':20s} "
-            f"mode={m['agent_mode']}  state={m['agent_state']}  gpus={m['gpu_count']}  "
+            f"mode={m['agent_mode']}  state={m['agent_state']}  gpu_status={m['gpu_status']}  "
+            f"visible={_fmt_count(m['gpu_visible_count'])}  "
+            f"reserved={_fmt_count(m['gpu_reserved_count'])}  "
+            f"free={_fmt_count(m['gpu_free_count'])}  "
             f"queued={phase_counts.get('queued', 0)}  "
             f"dispatching={phase_counts.get('dispatching', 0)}  "
             f"starting={phase_counts.get('starting', 0)}  "

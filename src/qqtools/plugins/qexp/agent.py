@@ -54,10 +54,11 @@ from .models import (
     AGENT_STATE_STALE,
     AGENT_STATE_STOPPED,
     AgentSnapshot,
+    GpuInventory,
     MachineWorkset,
     utc_now_iso,
 )
-from .storage import read_json, write_atomic_json
+from .storage import load_machine, read_json, save_machine, write_atomic_json
 
 log = logging.getLogger(__name__)
 
@@ -144,13 +145,46 @@ def is_agent_running_from_snapshot(snapshot: AgentSnapshot | None) -> bool:
 
 
 def write_gpu_state(cfg: RootConfig, tracker: Any) -> None:
+    visible_gpu_ids = list(tracker.visible_gpu_ids)
     payload = {
-        "visible_gpu_ids": list(tracker.visible_gpu_ids),
+        "gpu_count": len(visible_gpu_ids),
+        "visible_gpu_ids": visible_gpu_ids,
         "reserved_gpu_ids": sorted(tracker.reserved_gpu_ids),
         "task_to_gpu_ids": {
             tid: list(gpus)
             for tid, gpus in tracker.task_id_to_gpu_ids.items()
         },
+        "backend": getattr(tracker, "backend_name", None),
+        "probe_succeeded": True,
+        "probe_error": None,
+        "updated_at": utc_now_iso(),
+    }
+    write_atomic_json(gpu_state_path(cfg), payload)
+    try:
+        machine = load_machine(cfg)
+        machine.gpu_inventory = GpuInventory(
+            count=len(visible_gpu_ids),
+            visible_gpu_ids=visible_gpu_ids,
+        )
+        save_machine(cfg, machine)
+    except Exception:
+        log.exception("Failed to refresh machine GPU snapshot for %s.", cfg.machine_name)
+
+
+def write_gpu_probe_failure_state(
+    cfg: RootConfig,
+    error: Exception,
+    *,
+    backend: str | None = None,
+) -> None:
+    payload = {
+        "gpu_count": None,
+        "visible_gpu_ids": [],
+        "reserved_gpu_ids": [],
+        "task_to_gpu_ids": {},
+        "backend": backend,
+        "probe_succeeded": False,
+        "probe_error": str(error),
         "updated_at": utc_now_iso(),
     }
     write_atomic_json(gpu_state_path(cfg), payload)
@@ -319,7 +353,15 @@ def run_agent_loop(
             try:
                 if scheduler is not None:
                     # Full production dispatch
-                    tracker.refresh_visibility()
+                    try:
+                        tracker.refresh_visibility()
+                    except Exception as exc:
+                        write_gpu_probe_failure_state(
+                            cfg,
+                            exc,
+                            backend=getattr(tracker, "backend_name", None),
+                        )
+                        raise
                     # Rebuild reservations from current task storage.
                     _rebuild_tracker_from_tasks(cfg, tracker)
                     write_gpu_state(cfg, tracker)

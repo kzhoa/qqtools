@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from .agent import get_agent_status
@@ -30,6 +31,8 @@ from .storage import (
     read_json,
 )
 from .layout import gpu_state_path
+
+GPU_STATE_FRESHNESS_SECONDS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +183,119 @@ def inspect_batch(cfg: RootConfig, batch_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _parse_iso_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _is_gpu_snapshot_stale(updated_at: str | None, now: datetime | None = None) -> bool:
+    updated_dt = _parse_iso_timestamp(updated_at)
+    if updated_dt is None:
+        return True
+    current = now or datetime.now(timezone.utc)
+    return (current - updated_dt).total_seconds() > GPU_STATE_FRESHNESS_SECONDS
+
+
+def _fallback_gpu_count(machine) -> int | None:
+    if machine.gpu_inventory.visible_gpu_ids:
+        return len(machine.gpu_inventory.visible_gpu_ids)
+    if machine.gpu_inventory.count > 0:
+        return machine.gpu_inventory.count
+    return None
+
+
+def _read_gpu_snapshot(machine_cfg: RootConfig) -> dict[str, Any] | None:
+    path = gpu_state_path(machine_cfg)
+    if not path.is_file():
+        return None
+    try:
+        return read_json(path)
+    except Exception:
+        return None
+
+
+def _normalize_int_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("GPU snapshot field must be a list.")
+    normalized: list[int] = []
+    for item in value:
+        if not isinstance(item, int):
+            raise ValueError("GPU snapshot list items must be integers.")
+        normalized.append(item)
+    return normalized
+
+
+def _build_machine_gpu_view(machine_cfg: RootConfig, machine) -> dict[str, Any]:
+    gpu_snapshot = _read_gpu_snapshot(machine_cfg)
+    fallback_gpu_count = _fallback_gpu_count(machine)
+
+    gpu_visible_ids: list[int] = []
+    gpu_reserved_ids: list[int] = []
+    gpu_backend = None
+    gpu_probe_error = None
+    gpu_updated_at = None
+    gpu_count: int | None = None
+    gpu_status = "unknown"
+
+    if gpu_snapshot is not None:
+        try:
+            gpu_visible_ids = _normalize_int_list(gpu_snapshot.get("visible_gpu_ids"))
+            gpu_reserved_ids = _normalize_int_list(gpu_snapshot.get("reserved_gpu_ids"))
+            gpu_backend = gpu_snapshot.get("backend")
+            gpu_probe_error = gpu_snapshot.get("probe_error")
+            gpu_updated_at = gpu_snapshot.get("updated_at")
+
+            snapshot_count = gpu_snapshot.get("gpu_count")
+            if isinstance(snapshot_count, int):
+                gpu_count = snapshot_count
+            elif gpu_visible_ids:
+                gpu_count = len(gpu_visible_ids)
+
+            if gpu_snapshot.get("probe_succeeded") is False:
+                gpu_status = "error"
+                if gpu_count is None:
+                    gpu_count = fallback_gpu_count
+            elif _is_gpu_snapshot_stale(gpu_updated_at):
+                gpu_status = "stale"
+            else:
+                gpu_status = "live"
+        except Exception:
+            gpu_snapshot = None
+
+    if gpu_snapshot is None and fallback_gpu_count is not None:
+        gpu_count = fallback_gpu_count
+        gpu_status = "fallback"
+
+    gpu_visible_count = gpu_count
+    gpu_reserved_count = (
+        len(gpu_reserved_ids)
+        if gpu_snapshot is not None and gpu_status in {"live", "stale"}
+        else None
+    )
+    gpu_free_count = None
+    if isinstance(gpu_visible_count, int) and isinstance(gpu_reserved_count, int):
+        gpu_free_count = max(gpu_visible_count - gpu_reserved_count, 0)
+
+    return {
+        "gpu_count": gpu_count,
+        "gpu_status": gpu_status,
+        "gpu_visible_ids": gpu_visible_ids,
+        "gpu_reserved_ids": gpu_reserved_ids,
+        "gpu_backend": gpu_backend,
+        "gpu_probe_error": gpu_probe_error,
+        "gpu_updated_at": gpu_updated_at,
+        "gpu_visible_count": gpu_visible_count,
+        "gpu_reserved_count": gpu_reserved_count,
+        "gpu_free_count": gpu_free_count,
+    }
+
+
 def list_machines(cfg: RootConfig) -> list[dict[str, Any]]:
     machines = iter_machines(cfg)
     results: list[dict[str, Any]] = []
@@ -214,17 +330,18 @@ def list_machines(cfg: RootConfig) -> list[dict[str, Any]]:
         agent_state = (
             agent_status["agent_state"] if agent_status is not None else AGENT_STATE_STOPPED
         )
+        gpu_view = _build_machine_gpu_view(machine_cfg, m)
         results.append({
             "machine_name": m.machine_name,
             "hostname": m.hostname,
             "agent_mode": m.agent_mode,
             "agent_state": agent_state,
-            "gpu_count": m.gpu_inventory.count,
             "last_heartbeat": agent_snapshot.last_heartbeat if agent_snapshot else None,
             "idle_deadline_at": agent_snapshot.idle_deadline_at if agent_snapshot else None,
             "drain_started_at": agent_snapshot.drain_started_at if agent_snapshot else None,
             "counts_by_phase": counts_by_phase,
             "workset": workset.to_dict(),
+            **gpu_view,
         })
     return results
 
