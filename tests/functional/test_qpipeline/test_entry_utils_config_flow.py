@@ -3,7 +3,7 @@ import torch
 
 import qqtools as qt
 from qqtools.plugins.qpipeline.cmd_args import merge_basic_args, str2bool
-from qqtools.plugins.qpipeline.entry_utils.loss import parse_loss_name, prepare_loss
+from qqtools.plugins.qpipeline.entry_utils.loss import DDPMeanReducedLoss, FocalLoss, RMSELoss, parse_loss_name, prepare_loss
 from qqtools.plugins.qpipeline.entry_utils.optimizer import getCanonicalName, prepare_optimizer
 from qqtools.plugins.qpipeline.entry_utils.scheduler import (
     SchedulerConfig,
@@ -78,6 +78,38 @@ def test_parse_loss_name_unknown_raises():
         parse_loss_name("unknown_loss")
 
 
+def test_parse_loss_name_rmse_returns_rmse_loss():
+    loss_fn = parse_loss_name("rmse")
+
+    assert isinstance(loss_fn, RMSELoss)
+
+    input_tensor = torch.tensor([1.0, 3.0])
+    target_tensor = torch.tensor([1.0, 1.0])
+    loss = loss_fn(input_tensor, target_tensor)
+
+    assert torch.isclose(loss, torch.tensor((2.0**0.5)))
+
+
+def test_parse_loss_name_rmse_ddp_returns_ddp_rmse_loss():
+    with pytest.raises(NotImplementedError, match="rmse is not supported in DDP"):
+        parse_loss_name("rmse", dpp=True)
+
+
+def test_parse_loss_name_focal_ddp_returns_ddp_focal_loss():
+    loss_fn = parse_loss_name("focal", dpp=True)
+
+    assert isinstance(loss_fn, DDPMeanReducedLoss)
+    assert isinstance(loss_fn.loss_fn, FocalLoss)
+    assert loss_fn.loss_fn.reduction == "sum"
+
+
+def test_parse_loss_name_focal_returns_mean_focal_loss():
+    loss_fn = parse_loss_name("focal")
+
+    assert isinstance(loss_fn, FocalLoss)
+    assert loss_fn.reduction == "mean"
+
+
 def test_prepare_loss_comboloss_success():
     args = qt.qDict(
         {
@@ -92,6 +124,8 @@ def test_prepare_loss_comboloss_success():
         }
     )
     loss_fn = prepare_loss(args)
+    assert isinstance(loss_fn, torch.nn.Module)
+    assert isinstance(loss_fn.loss_fns, torch.nn.ModuleDict)
     assert callable(loss_fn)
 
 
@@ -108,6 +142,48 @@ def test_prepare_loss_comboloss_none_loss_params_raises():
 
     with pytest.raises(ValueError, match="optim.loss_params is required"):
         prepare_loss(args)
+
+
+def test_prepare_loss_single_rmse_success():
+    args = qt.qDict(
+        {
+            "distributed": False,
+            "optim": {
+                "loss": "rmse",
+            },
+        }
+    )
+
+    loss_fn = prepare_loss(args)
+
+    assert isinstance(loss_fn, RMSELoss)
+
+
+def test_comboloss_forwards_kwargs_to_child_losses():
+    class CaptureLoss(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.kwargs = None
+
+        def forward(self, input, target, **kwargs):
+            self.kwargs = kwargs
+            return ((input - target) ** 2).mean()
+
+    from qqtools.plugins.qpipeline.entry_utils.loss import ComboLoss
+
+    child_loss = CaptureLoss()
+    combo = ComboLoss({"energy": child_loss}, {"energy": 1.0})
+
+    combo({"energy": torch.tensor([1.0])}, {"energy": torch.tensor([0.0])}, natoms=torch.tensor([3]))
+
+    assert child_loss.kwargs == {"natoms": torch.tensor([3])}
+
+
+def test_comboloss_rejects_empty_loss_fns():
+    from qqtools.plugins.qpipeline.entry_utils.loss import ComboLoss
+
+    with pytest.raises(AssertionError, match="loss_fns must not be empty"):
+        ComboLoss({}, {})
 
 
 def test_warmup_config_invalid_factor_raises():

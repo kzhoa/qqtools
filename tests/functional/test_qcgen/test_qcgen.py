@@ -299,6 +299,38 @@ def test_prompt_runner_params_accepts_step_mode_secondary_max_epochs():
     assert params["max_epochs"] == 7
 
 
+def test_prompt_loss_params_accepts_rmse():
+    from qqtools.plugins.qConfigGen.pts.optimizerPt import prompt_loss_params
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.optimizerPt.prompt", side_effect=["rmse"]),
+        mock.patch("qqtools.plugins.qConfigGen.pts.optimizerPt.print_formatted_text"),
+    ):
+        params = prompt_loss_params()
+
+    assert params == {"loss": "rmse"}
+
+
+def test_prompt_loss_params_comboloss_accepts_rmse_target():
+    from qqtools.plugins.qConfigGen.pts.optimizerPt import prompt_loss_params
+
+    prompt_values = [
+        "comboloss",
+        "energy",
+        "rmse",
+        "",
+        "",
+    ]
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.optimizerPt.prompt", side_effect=prompt_values),
+        mock.patch("qqtools.plugins.qConfigGen.pts.optimizerPt.print_formatted_text"),
+    ):
+        params = prompt_loss_params()
+
+    assert params == {"loss": "comboloss", "loss_params": {"energy": ["rmse", 1.0]}}
+
+
 def test_prompt_lr_scheduler_params_defaults_non_plateau_step_on():
     from qqtools.plugins.qConfigGen.pts.lrSchedulerPt import prompt_lr_scheduler_params
 
