@@ -1,5 +1,9 @@
 # History
 
+## v1.2.13
+
+- fix: harden qexp machine GPU live view with safer agent/observer handling and add regression coverage for the live machine status path
+
 ## v1.2.12
 
 - docs: archive completed qexp truth-domain and derived-index pitch documents under `docs/archive/pitch`
