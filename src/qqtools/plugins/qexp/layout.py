@@ -160,22 +160,6 @@ def index_by_state_dir(cfg: RootConfig) -> Path:
     return global_indexes_dir(cfg) / "tasks_by_state"
 
 
-def index_by_batch_dir(cfg: RootConfig) -> Path:
-    return global_indexes_dir(cfg) / "tasks_by_batch"
-
-
-def index_by_machine_dir(cfg: RootConfig) -> Path:
-    return global_indexes_dir(cfg) / "tasks_by_machine"
-
-
-def index_by_group_dir(cfg: RootConfig) -> Path:
-    return global_indexes_dir(cfg) / "tasks_by_group"
-
-
-def batch_index_by_group_dir(cfg: RootConfig) -> Path:
-    return global_indexes_dir(cfg) / "batches_by_group"
-
-
 # Lock paths
 
 
@@ -211,10 +195,6 @@ _SHARED_DIRS = [
     global_locks_dir,
     global_events_dir,
     index_by_state_dir,
-    index_by_batch_dir,
-    index_by_machine_dir,
-    index_by_group_dir,
-    batch_index_by_group_dir,
 ]
 
 _MACHINE_DIRS = [

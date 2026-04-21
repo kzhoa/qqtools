@@ -81,18 +81,21 @@
 
 ### shared root 真相层规则
 
-shared root 下真正的 source of truth 只有：
+shared root 下正式 truth domains 固定为：
 
 - `global/tasks/<task_id>.json`
 - `global/batches/<batch_id>.json`
 - `machines/<machine_name>/machine.json`
+- `machines/<machine_name>/state/agent.json`
+- `machines/<machine_name>/claims/active/<task_id>.json`
 
 其余内容都应视为派生层或辅助层：
 
 - `global/indexes/`
 - `global/events/`
-- `machines/<machine_name>/state/`
-- `machines/<machine_name>/claims/`
+- `machines/<machine_name>/state/gpu.json`
+- `machines/<machine_name>/state/summary.json`
+- `machines/<machine_name>/claims/released/`
 - `machines/<machine_name>/events/`
 
 这条规则需要进一步明确到目录设计：
@@ -101,10 +104,8 @@ shared root 下真正的 source of truth 只有：
 - 不允许出现 `groups/<group>/tasks/...` 或 `groups/<group>/batches/...`
 - 不允许把 group 目录作为 submit / retry / clean / repair 的依赖真相
 
-如果未来需要 group 级目录，最多只允许纯派生、可重建的目录，例如：
+如果未来需要 group 级目录，最多只允许 machine-local 或离线可重建的派生产物，例如：
 
-- `global/indexes/tasks_by_group/`
-- `global/indexes/batches_by_group/`
 - **假设/未验证**：`derived/groups/<group>/summary.json`
 
 这些目录必须满足：
@@ -117,7 +118,8 @@ shared root 下真正的 source of truth 只有：
 
 1. 先信任 task 真相
 2. 再信任 batch 真相
-3. 最后重建索引和 machine 侧辅助视图
+3. 再信任 agent lifecycle truth 与 active claim truth
+4. 最后重建索引和 machine 侧辅助视图
 
 single-task clean 生效后，恢复规则补充如下：
 
@@ -136,9 +138,7 @@ single-task clean 生效后，恢复规则补充如下：
     batches/
       <batch_id>.json
     indexes/
-      tasks_by_batch/
       tasks_by_state/
-      tasks_by_machine/
     locks/
       submit/
       batch/
@@ -338,7 +338,8 @@ machine 主键必须是用户显式提供的 `machine_name`。
 用途：
 
 - 帮助排查 dispatch 归属
-- 为 orphan repair 提供额外证据
+- 作为 execution ownership truth
+- 为 orphan repair 提供执行责任证据
 
 #### 6. `claims/released/<task_id>.json`
 
@@ -387,15 +388,18 @@ machine 主键必须是用户显式提供的 `machine_name`。
 
 职责分层应明确：
 
-- `global/tasks/*.json` 是 task 真相
-- `machines/<machine>/state/*.json` 是该机器的状态镜像
-- `claims/` 是调度证据
+- `global/tasks/*.json` 是 task truth
+- `global/batches/*.json` 是 batch truth
+- `machines/<machine>/state/agent.json` 是 agent lifecycle truth
+- `machines/<machine>/claims/active/*.json` 是 execution ownership truth
+- `machines/<machine>/state/summary.json` / `state/gpu.json` 是 machine 侧派生视图
+- `machines/<machine>/claims/released/*.json` 是审计证据
 - `events/` 是 machine 维度事件审计
 
 也就是说：
 
-- `global/` 是 source of truth
-- `machines/<machine>/...` 是 machine 私有的共享侧辅助视图
+- `global/` 承载 task truth 与 batch truth
+- `machines/<machine>/...` 同时承载 machine 私有 truth objects 与 machine 侧派生/审计对象
 
 ### machine 对象
 
@@ -536,7 +540,13 @@ task:
 设计原则：
 
 - 这是唯一正式 task 真相
-- indexes 和 machine 子目录都只是派生视图
+- indexes 只是派生视图
+- machine 子目录中同时包含 machine-side truth objects、派生视图与审计对象
+
+补充约束：
+
+- `tasks_by_state` 只可作为 runtime 候选集，不得覆盖 `task.status.phase`
+- 若 `tasks_by_state` 与 task truth 冲突，必须以 task truth 为准
 
 ### batch 对象
 
@@ -692,6 +702,43 @@ batch 与 group 的关系约束：
 
 不允许把 batch 当作 task 状态真相来源。
 
+## 派生索引族分层
+
+### Tier A: runtime-critical projection
+
+- `global/indexes/tasks_by_state/*.json`
+
+约束：
+
+- 允许 runtime 用于 phase 候选集枚举
+- 读到候选后必须回读 task truth
+- 发现 phase/index 不一致时，应优先执行单任务纠偏
+
+### Tier B: removed persistent membership projections
+
+以下索引族不再属于长期正式架构：
+
+- `global/indexes/tasks_by_batch/*.json`
+- `global/indexes/tasks_by_machine/*.json`
+- `global/indexes/tasks_by_group/*.json`
+- `global/indexes/batches_by_group/*.json`
+
+正式要求：
+
+- 不再由运行时写路径维护
+- 不再作为 verify / rebuild 的治理对象存在
+- batch / group / machine listing 与 summary 直接从 truth objects 计算
+
+### Tier C: offline recovery substrate
+
+- `qexp doctor rebuild-index`
+
+约束：
+
+- 必须可从 truth 全量重建 `tasks_by_state`
+- 应清理历史遗留的 Tier B index 目录
+- 不得反向推断或覆盖 truth objects
+
 ### single-task clean 对 batch 的修正规则
 
 当 `global/tasks/<task_id>.json` 对应 task 带有 `batch_id` 时，single-task clean 必须同步改写对应 batch 真相。
@@ -739,6 +786,56 @@ runtime log 不属于 shared root 真相层。
 
 - clean 成功的判定以 shared root 真相与派生视图收敛成功为准
 - runtime log 删除失败不构成 task 真相删除的回滚条件
+
+## 读取路径规则
+
+### runtime critical readers
+
+- `scheduler`
+- `runner` 相关 phase/liveness 判断
+- orphan / stale recovery
+
+规则：
+
+- 仅 `tasks_by_state` 可进入 runtime critical 候选集路径
+- task phase 判定回到 `global/tasks/*.json`
+- agent lifecycle 判定回到 `machines/<machine>/state/agent.json`
+- execution ownership 判定回到 `machines/<machine>/claims/active/*.json`
+
+### query and listing readers
+
+- `observer`
+- list / show / status APIs
+
+规则：
+
+- batch / group / machine 结果直接从 truth objects 计算
+- 不再依赖持久化 membership indexes
+- 最终展示结果必须以 truth objects 为准
+
+### summary builders
+
+- machine workset builder
+- machine summary / gpu summary builders
+
+规则：
+
+- 直接从 task truth 聚合
+- `workset` / `summary` 不得反向定义 agent lifecycle truth
+
+## Legacy Membership Index Cleanup
+
+历史 `tasks_by_batch` / `tasks_by_machine` / `tasks_by_group` / `batches_by_group`
+目录若仍存在，只视为待清理遗留物，不再属于正式治理面。
+
+恢复要求：
+
+- 新写路径不得继续写入这些目录
+- `doctor rebuild-index` 应清理这些目录
+
+- 允许短暂漂移
+- 不允许长期明显不准
+- 不允许无人知晓地长期失真
 
 #### 3. single-task clean 的失败模型
 
@@ -841,6 +938,7 @@ agent dispatch task 时：
 
 - `qexp doctor`
 - `qexp doctor verify`
+- `qexp doctor repair`
 - `qexp doctor rebuild-index`
 - `qexp doctor repair-orphans`
 - `qexp doctor cleanup-locks`
@@ -848,8 +946,50 @@ agent dispatch task 时：
 与 single-task clean 的关系：
 
 - `rebuild-index` 负责收敛 clean 后的派生索引视图
-- **假设/未验证**：若后续提供更通用的 `doctor repair`，则它应能同时收敛 batch 摘要与索引
+- `repair` 负责收敛中断中的 metadata repair operation，并对 repair 触达的 batch truth / targeted stale task indexes 做定点收敛
+- `repair` 不应吸收 `rebuild-index` 的核心语义；二者语义必须保持区分
 - `repair-orphans` 不负责修复 clean 产生的 batch 成员引用问题
+- `repair-orphans` 必须联合 task truth、agent lifecycle truth、active claim truth 做 orphan 判定
+- 历史 membership index 目录若仍残留，应通过 `rebuild-index` 清理，而不是继续扩大对这些遗留对象的依赖
+
+`doctor verify` 的输出应至少包含：
+
+- `ok`
+- `severity`
+- `issues`
+- `messages`
+- `index_drift`
+- `recommended_actions`
+- `diagnosis`
+- `issue_count_by_category`
+- `issue_count_by_code`
+
+其中：
+
+- `severity` 用于区分 truth corruption、metadata gap、derived drift 的处理优先级
+- `issues` 必须是结构化对象数组，而不是仅字符串数组；每项至少包含 `code`、`category`、`severity`、`message`
+- `messages` 是给人读的投影层，不得作为唯一机器语义接口
+- `recommended_actions` 必须是结构化对象数组；每项至少包含 `action_code`、`command`、`blocking`、`reason`
+- `recommended_actions` 必须明确建议是执行 `repair`、`rebuild-index`、`repair-orphans`，还是进入人工修复
+- `blocking` 用于区分“必须先处理的阻塞性治理动作”和“可延后汇总处理的非阻塞动作”
+- `recommended_actions` 的生成规则必须来自显式 policy table；正式语义应是 `issue_code -> action_code` 映射，而不是散落在代码中的文本匹配或隐式分支
+- `diagnosis` 应至少暴露 truth 是否可读、是否仅为 index drift、是否存在 resubmit gap、是否存在 batch truth drift
+- `issue_count_by_category` / `issue_count_by_code` 应服务于 CI、巡检与治理报表聚合
+
+`doctor verify` 还必须支持面向治理系统的策略接口：
+
+- `qexp doctor verify`：默认 observation mode，只输出诊断结果，不因发现问题而把命令本身视为执行失败
+- `qexp doctor verify --strict`：把任意治理发现（`low` 及以上）映射为非零策略退出
+- `qexp doctor verify --fail-on <severity>`：按阈值触发策略退出，阈值集合固定为 `low` / `medium` / `high`
+- `qexp doctor verify --jsonl`：输出 line-delimited structured records，至少包含 `verify_summary`、`verify_issue`、`verify_recommendation`、`verify_result`
+- `verify_issue` record 必须显式输出 `issue_code`、`category`、`severity`，禁止要求下游系统解析 message 文本推断治理语义
+- `verify_recommendation` record 必须显式输出 `action_code`、`blocking`、`command`，禁止要求下游系统解析 reason 文本推断动作语义
+
+策略退出约定：
+
+- 退出码 `0`：诊断命令执行成功，且未触发所请求的 fail policy
+- 退出码 `2`：诊断命令执行成功，但结果触发了 `--strict` 或 `--fail-on` 的治理策略
+- 退出码 `1` 或其他常规非零码：CLI/运行时错误，而不是治理判定本身
 
 ## 一致性与写入机制
 
@@ -897,11 +1037,13 @@ meta:
 
 #### 4. 索引不是 source of truth
 
-真相是主对象文件：
+真相是对应 truth objects：
 
-- tasks/
-- batches/
-- machines/
+- `global/tasks/`
+- `global/batches/`
+- `machines/<machine>/machine.json`
+- `machines/<machine>/state/agent.json`
+- `machines/<machine>/claims/active/`
 
 索引失败可以重建，不需要伪事务。
 

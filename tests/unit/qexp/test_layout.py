@@ -15,8 +15,6 @@ from qqtools.plugins.qexp.layout import (
     global_locks_dir,
     global_tasks_dir,
     gpu_state_path,
-    index_by_batch_dir,
-    index_by_machine_dir,
     index_by_state_dir,
     init_shared_root,
     load_root_config,
@@ -119,8 +117,6 @@ class TestPathHelpers:
     def test_index_dirs(self, cfg):
         base = cfg.shared_root / "global" / "indexes"
         assert index_by_state_dir(cfg) == base / "tasks_by_state"
-        assert index_by_batch_dir(cfg) == base / "tasks_by_batch"
-        assert index_by_machine_dir(cfg) == base / "tasks_by_machine"
 
     def test_state_file_paths(self, cfg):
         sd = machine_state_dir(cfg)
@@ -151,8 +147,6 @@ class TestEnsureLayout:
         assert global_locks_dir(cfg).is_dir()
         assert global_events_dir(cfg).is_dir()
         assert index_by_state_dir(cfg).is_dir()
-        assert index_by_batch_dir(cfg).is_dir()
-        assert index_by_machine_dir(cfg).is_dir()
 
     def test_ensure_machine_layout(self, cfg):
         ensure_machine_layout(cfg)

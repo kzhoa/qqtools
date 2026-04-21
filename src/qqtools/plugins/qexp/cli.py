@@ -11,10 +11,13 @@ from typing import Any
 from . import api, observer
 from .agent import get_agent_status, run_agent_loop
 from .doctor import (
+    build_verify_jsonl_records,
     cleanup_stale_locks,
+    normalize_verify_severity,
     repair_metadata,
     rebuild_indexes,
     repair_orphans,
+    resolve_verify_exit_code,
     verify_integrity,
 )
 from .layout import (
@@ -253,11 +256,27 @@ def build_parser() -> argparse.ArgumentParser:
     # doctor
     doctor_p = sub.add_parser("doctor", help="diagnostics and repair")
     doctor_sub = doctor_p.add_subparsers(dest="doctor_command")
-    doctor_sub.add_parser("repair", help="repair batch truth and rebuild indexes")
-    doctor_sub.add_parser("rebuild-index", help="rebuild all indexes")
-    doctor_sub.add_parser("repair-orphans", help="repair orphaned tasks")
+    doctor_sub.add_parser("repair", help="converge unfinished metadata repair operations")
+    doctor_sub.add_parser("rebuild-index", help="rebuild all derived indexes from truth")
+    doctor_sub.add_parser("repair-orphans", help="repair orphaned tasks via task/agent/claim truth")
     doctor_sub.add_parser("cleanup-locks", help="clean stale locks")
-    doctor_sub.add_parser("verify", help="non-destructive integrity check")
+    doctor_verify = doctor_sub.add_parser("verify", help="non-destructive integrity check")
+    doctor_verify.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit non-zero when verify finds any governed issue",
+    )
+    doctor_verify.add_argument(
+        "--fail-on",
+        choices=["low", "medium", "high"],
+        default=None,
+        help="exit non-zero when severity is at or above the threshold",
+    )
+    doctor_verify.add_argument(
+        "--jsonl",
+        action="store_true",
+        help="emit machine-readable JSONL records instead of one formatted JSON document",
+    )
 
     return parser
 
@@ -615,13 +634,26 @@ def handle_doctor(args: argparse.Namespace) -> int:
         return 0
     elif cmd == "verify":
         result = verify_integrity(cfg)
-        print(json.dumps(result, indent=2))
-        return 0 if result["ok"] else 1
+        fail_on = normalize_verify_severity(args.fail_on) if args.fail_on else None
+        if args.jsonl:
+            for record in build_verify_jsonl_records(
+                result,
+                strict=args.strict,
+                fail_on=fail_on,
+            ):
+                print(json.dumps(record, sort_keys=True))
+        else:
+            print(json.dumps(result, indent=2))
+        return resolve_verify_exit_code(
+            result,
+            strict=args.strict,
+            fail_on=fail_on,
+        )
     else:
         # Default: run verify
         result = verify_integrity(cfg)
         print(json.dumps(result, indent=2))
-        return 0 if result["ok"] else 1
+        return 0
 
 
 # ---------------------------------------------------------------------------

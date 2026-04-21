@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from .events import write_event
 from .executor import Executor
-from .indexes import load_index, update_index_on_phase_change
+from .indexes import load_index, sync_task_state_index, update_index_on_phase_change
 from .layout import RootConfig, machine_claims_active_dir
 from .models import (
     ACTIVE_PHASES,
@@ -186,6 +186,15 @@ class Scheduler:
                 except FileNotFoundError:
                     continue
                 if task.machine_name != cfg.machine_name:
+                    continue
+                if task.status.phase != phase:
+                    sync_task_state_index(cfg, task_id, task.status.phase, stale_phases=[phase])
+                    log.warning(
+                        "Repaired stale state index for task %s: indexed=%s actual=%s.",
+                        task_id,
+                        phase,
+                        task.status.phase,
+                    )
                     continue
 
                 should_fail = False

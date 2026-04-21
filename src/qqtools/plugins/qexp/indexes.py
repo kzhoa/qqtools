@@ -1,207 +1,175 @@
 from __future__ import annotations
 
 import json
-import os
+import shutil
 from pathlib import Path
 from typing import Any
 
-from .layout import (
-    RootConfig,
-    batch_index_by_group_dir,
-    index_by_batch_dir,
-    index_by_group_dir,
-    index_by_machine_dir,
-    index_by_state_dir,
-)
-from .models import ALL_PHASES, BATCH_COMMIT_COMMITTED, Batch, Task
-from .storage import iter_all_batches, iter_all_tasks, write_atomic_json
-
-
-# ---------------------------------------------------------------------------
-# Low-level index file I/O
-# ---------------------------------------------------------------------------
+from .layout import RootConfig, global_tasks_dir, index_by_state_dir
+from .models import ALL_PHASES, Task
+from .storage import iter_all_tasks, read_json, write_atomic_json
 
 
 def _read_index_file(path: Path) -> list[str]:
     if not path.is_file():
         return []
     data = json.loads(path.read_text(encoding="utf-8"))
-    return data.get("task_ids", [])
+    values = data.get("task_ids", [])
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
 
 
 def _write_index_file(path: Path, task_ids: list[str]) -> None:
     write_atomic_json(path, {"task_ids": task_ids})
 
 
+def _legacy_membership_index_dirs(cfg: RootConfig) -> list[Path]:
+    indexes_dir = index_by_state_dir(cfg).parent
+    return [
+        indexes_dir / "tasks_by_batch",
+        indexes_dir / "tasks_by_machine",
+        indexes_dir / "tasks_by_group",
+        indexes_dir / "batches_by_group",
+    ]
+
+
 def _add_to_index(path: Path, task_id: str) -> None:
-    ids = _read_index_file(path)
-    if task_id not in ids:
-        ids.append(task_id)
-        _write_index_file(path, ids)
+    task_ids = _read_index_file(path)
+    if task_id in task_ids:
+        return
+    task_ids.append(task_id)
+    _write_index_file(path, task_ids)
 
 
 def _remove_from_index(path: Path, task_id: str) -> None:
-    ids = _read_index_file(path)
-    if task_id in ids:
-        ids.remove(task_id)
-        _write_index_file(path, ids)
+    task_ids = _read_index_file(path)
+    if task_id not in task_ids:
+        return
+    task_ids.remove(task_id)
+    _write_index_file(path, task_ids)
 
 
-# ---------------------------------------------------------------------------
-# Public index operations
-# ---------------------------------------------------------------------------
+def collect_index_drift_report(cfg: RootConfig) -> dict[str, Any]:
+    expected_by_state: dict[str, set[str]] = {phase: set() for phase in ALL_PHASES}
+
+    tasks_dir = global_tasks_dir(cfg)
+    if tasks_dir.is_dir():
+        for path in sorted(tasks_dir.glob("*.json")):
+            if path.name.endswith(".tmp"):
+                continue
+            try:
+                task = Task.from_dict(read_json(path))
+            except Exception:
+                continue
+            expected_by_state.setdefault(task.status.phase, set()).add(task.task_id)
+
+    actual_by_state: dict[str, set[str]] = {}
+    state_dir = index_by_state_dir(cfg)
+    if state_dir.is_dir():
+        for path in sorted(state_dir.glob("*.json")):
+            actual_by_state[path.stem] = set(_read_index_file(path))
+
+    entries: dict[str, Any] = {}
+    missing_count = 0
+    unexpected_count = 0
+    for phase in sorted(set(expected_by_state) | set(actual_by_state)):
+        expected_ids = expected_by_state.get(phase, set())
+        actual_ids = actual_by_state.get(phase, set())
+        missing = sorted(expected_ids - actual_ids)
+        unexpected = sorted(actual_ids - expected_ids)
+        if not missing and not unexpected:
+            continue
+        missing_count += len(missing)
+        unexpected_count += len(unexpected)
+        entries[phase] = {
+            "missing": missing,
+            "unexpected": unexpected,
+        }
+
+    family = {
+        "ok": missing_count == 0 and unexpected_count == 0,
+        "missing_count": missing_count,
+        "unexpected_count": unexpected_count,
+        "entries": entries,
+    }
+    return {
+        "ok": family["ok"],
+        "missing_count": missing_count,
+        "unexpected_count": unexpected_count,
+        "families": {
+            "state": family,
+        },
+    }
 
 
 def update_index_on_submit(cfg: RootConfig, task: Task) -> None:
-    phase = task.status.phase
-    _add_to_index(
-        index_by_state_dir(cfg) / f"{phase}.json",
-        task.task_id,
-    )
-    _add_to_index(
-        index_by_machine_dir(cfg) / f"{task.machine_name}.json",
-        task.task_id,
-    )
-    if task.batch_id:
-        _add_to_index(
-            index_by_batch_dir(cfg) / f"{task.batch_id}.json",
-            task.task_id,
-        )
-    if task.group:
-        _add_to_index(
-            index_by_group_dir(cfg) / f"{task.group}.json",
-            task.task_id,
-        )
+    sync_task_state_index(cfg, task.task_id, task.status.phase)
 
 
 def remove_index_on_delete(cfg: RootConfig, task: Task) -> None:
-    _remove_from_index(
-        index_by_state_dir(cfg) / f"{task.status.phase}.json",
-        task.task_id,
-    )
-    _remove_from_index(
-        index_by_machine_dir(cfg) / f"{task.machine_name}.json",
-        task.task_id,
-    )
-    if task.batch_id:
-        _remove_from_index(
-            index_by_batch_dir(cfg) / f"{task.batch_id}.json",
-            task.task_id,
-        )
-    if task.group:
-        _remove_from_index(
-            index_by_group_dir(cfg) / f"{task.group}.json",
-            task.task_id,
-        )
-
-
-def update_batch_index_on_create(cfg: RootConfig, batch: Batch) -> None:
-    if batch.commit_state == BATCH_COMMIT_COMMITTED and batch.group:
-        _add_to_index(
-            batch_index_by_group_dir(cfg) / f"{batch.group}.json",
-            batch.batch_id,
-        )
+    sync_task_state_index(cfg, task.task_id, None)
 
 
 def update_index_on_phase_change(
     cfg: RootConfig, task_id: str, old_phase: str, new_phase: str
 ) -> None:
-    _remove_from_index(
-        index_by_state_dir(cfg) / f"{old_phase}.json",
-        task_id,
-    )
-    _add_to_index(
-        index_by_state_dir(cfg) / f"{new_phase}.json",
-        task_id,
-    )
+    sync_task_state_index(cfg, task_id, new_phase, stale_phases=[old_phase])
+
+
+def sync_task_state_index(
+    cfg: RootConfig,
+    task_id: str,
+    actual_phase: str | None,
+    *,
+    stale_phases: list[str] | tuple[str, ...] | None = None,
+) -> None:
+    state_dir = index_by_state_dir(cfg)
+    phases_to_remove = set(ALL_PHASES)
+    if actual_phase is not None:
+        phases_to_remove.discard(actual_phase)
+    if stale_phases is not None:
+        phases_to_remove.update(stale_phases)
+
+    for phase in phases_to_remove:
+        _remove_from_index(state_dir / f"{phase}.json", task_id)
+
+    if actual_phase is not None:
+        _add_to_index(state_dir / f"{actual_phase}.json", task_id)
 
 
 def load_index(cfg: RootConfig, index_type: str, key: str) -> list[str]:
-    if index_type == "state":
-        return _read_index_file(index_by_state_dir(cfg) / f"{key}.json")
-    elif index_type == "batch":
-        return _read_index_file(index_by_batch_dir(cfg) / f"{key}.json")
-    elif index_type == "machine":
-        return _read_index_file(index_by_machine_dir(cfg) / f"{key}.json")
-    elif index_type == "group":
-        return _read_index_file(index_by_group_dir(cfg) / f"{key}.json")
-    elif index_type == "batch_group":
-        return _read_index_file(batch_index_by_group_dir(cfg) / f"{key}.json")
-    else:
+    if index_type != "state":
         raise ValueError(f"Unknown index type: {index_type!r}")
-
-
-# ---------------------------------------------------------------------------
-# Full rebuild
-# ---------------------------------------------------------------------------
+    return _read_index_file(index_by_state_dir(cfg) / f"{key}.json")
 
 
 def rebuild_all_indexes(cfg: RootConfig) -> dict[str, Any]:
-    by_state: dict[str, list[str]] = {p: [] for p in ALL_PHASES}
-    by_machine: dict[str, list[str]] = {}
-    by_batch: dict[str, list[str]] = {}
-    by_group: dict[str, list[str]] = {}
-    batches_by_group: dict[str, list[str]] = {}
+    by_state: dict[str, list[str]] = {phase: [] for phase in ALL_PHASES}
+    for task in iter_all_tasks(cfg):
+        by_state.setdefault(task.status.phase, []).append(task.task_id)
 
-    tasks = iter_all_tasks(cfg)
-    for t in tasks:
-        phase = t.status.phase
-        by_state.setdefault(phase, []).append(t.task_id)
-        by_machine.setdefault(t.machine_name, []).append(t.task_id)
-        if t.batch_id:
-            by_batch.setdefault(t.batch_id, []).append(t.task_id)
-        if t.group:
-            by_group.setdefault(t.group, []).append(t.task_id)
-
-    batches = iter_all_batches(cfg)
-    for batch in batches:
-        if batch.commit_state == BATCH_COMMIT_COMMITTED and batch.group:
-            batches_by_group.setdefault(batch.group, []).append(batch.batch_id)
-
-    # Clear and rewrite state indexes
     state_dir = index_by_state_dir(cfg)
     state_dir.mkdir(parents=True, exist_ok=True)
-    for f in state_dir.glob("*.json"):
-        f.unlink()
-    for phase, ids in by_state.items():
-        if ids:
-            _write_index_file(state_dir / f"{phase}.json", ids)
-
-    # Clear and rewrite machine indexes
-    machine_dir = index_by_machine_dir(cfg)
-    machine_dir.mkdir(parents=True, exist_ok=True)
-    for f in machine_dir.glob("*.json"):
-        f.unlink()
-    for name, ids in by_machine.items():
-        _write_index_file(machine_dir / f"{name}.json", ids)
-
-    # Clear and rewrite batch indexes
-    batch_dir = index_by_batch_dir(cfg)
-    batch_dir.mkdir(parents=True, exist_ok=True)
-    for f in batch_dir.glob("*.json"):
-        f.unlink()
-    for bid, ids in by_batch.items():
-        _write_index_file(batch_dir / f"{bid}.json", ids)
-
-    group_dir = index_by_group_dir(cfg)
-    group_dir.mkdir(parents=True, exist_ok=True)
-    for f in group_dir.glob("*.json"):
-        f.unlink()
-    for group, ids in by_group.items():
-        _write_index_file(group_dir / f"{group}.json", ids)
-
-    batch_group_dir = batch_index_by_group_dir(cfg)
-    batch_group_dir.mkdir(parents=True, exist_ok=True)
-    for f in batch_group_dir.glob("*.json"):
-        f.unlink()
-    for group, ids in batches_by_group.items():
-        _write_index_file(batch_group_dir / f"{group}.json", ids)
+    for path in state_dir.glob("*.json"):
+        path.unlink()
+    for phase, task_ids in by_state.items():
+        if task_ids:
+            _write_index_file(state_dir / f"{phase}.json", task_ids)
+    removed_legacy_dirs: list[str] = []
+    for path in _legacy_membership_index_dirs(cfg):
+        if not path.exists():
+            continue
+        shutil.rmtree(path)
+        removed_legacy_dirs.append(path.name)
 
     return {
-        "total_tasks": len(tasks),
-        "states": {k: len(v) for k, v in by_state.items() if v},
-        "machines": {k: len(v) for k, v in by_machine.items()},
-        "batches": {k: len(v) for k, v in by_batch.items()},
-        "groups": {k: len(v) for k, v in by_group.items()},
-        "batch_groups": {k: len(v) for k, v in batches_by_group.items()},
+        "total_tasks": sum(len(task_ids) for task_ids in by_state.values()),
+        "states": {phase: len(task_ids) for phase, task_ids in by_state.items() if task_ids},
+        "removed_legacy_index_dirs": removed_legacy_dirs,
     }

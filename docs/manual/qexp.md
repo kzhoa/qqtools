@@ -64,6 +64,14 @@ Keep these responsibilities stable:
 - `name` answers: what should users see in listings?
 - `task_id` answers: which exact task object do commands target?
 
+Operational truth boundaries:
+
+- task phase truth lives in `global/tasks/<task_id>.json`
+- batch truth lives in `global/batches/<batch_id>.json`, with task-level membership input also recorded on each task's `batch_id`
+- agent lifecycle truth lives in `machines/<machine>/state/agent.json`
+- active execution ownership truth lives in `machines/<machine>/claims/active/<task_id>.json`
+- indexes and summaries are derived operational views, not formal truth
+
 Important non-equivalences:
 
 - `group` is not `batch`
@@ -616,6 +624,9 @@ Use doctor commands when you need to inspect or repair shared metadata:
 
 ```bash
 qexp doctor verify
+qexp doctor verify --strict
+qexp doctor verify --fail-on medium
+qexp doctor verify --jsonl --fail-on high
 qexp doctor rebuild-index
 qexp doctor repair
 qexp doctor repair-orphans
@@ -624,11 +635,21 @@ qexp doctor cleanup-locks
 
 Subcommand meanings:
 
-- `qexp doctor verify`: read-only integrity check; does not modify files; mainly verifies readability, file-name to task-id consistency, and revision validity
-- `qexp doctor rebuild-index`: rebuild indexes when index views disagree with formal task truth
-- `qexp doctor repair`: converge unfinished metadata repair operations; currently continues interrupted `resubmit` replacements and repairs leftover batch summary corrections from single-task clean
-- `qexp doctor repair-orphans`: moves tasks that lost machine heartbeat for too long while still appearing active into `orphaned`
+- `qexp doctor verify`: read-only integrity check; does not modify files; verifies truth readability and object consistency, reports derived-index drift, and returns recommended recovery actions
+- `qexp doctor verify --strict`: treat any governed finding (`low` and above) as a failing policy result; intended for CI gates or strict巡检
+- `qexp doctor verify --fail-on <severity>`: fail only when reported severity reaches the threshold (`low` / `medium` / `high`)
+- `qexp doctor verify --jsonl`: emit line-delimited machine-readable records (`verify_summary`, `verify_issue`, `verify_recommendation`, `verify_result`) for CI collectors and巡检 pipelines
+- `qexp doctor rebuild-index`: rebuild all derived index families when index views disagree with formal truth
+- `qexp doctor repair`: converge unfinished metadata repair operations; continues interrupted `resubmit` replacements, repairs leftover batch truth from single-task clean, and reports any remaining derived-index drift separately
+- `qexp doctor repair-orphans`: evaluates orphaning from task truth, agent lifecycle truth, and active claim truth, then moves qualifying tasks into `orphaned`
 - `qexp doctor cleanup-locks`: removes stale lock files after abnormal exits
+
+Important boundary:
+
+- `repair` and `rebuild-index` are related but not interchangeable
+- use `repair` when an operation was interrupted mid-flight
+- use `rebuild-index` when the main problem is stale derived views
+- `repair-orphans` does not act as a general index repair command
 
 How this relates to `clean`:
 
@@ -642,6 +663,42 @@ Recommended order:
 2. if there is an interrupted `resubmit` or single-task clean, run `qexp doctor repair`
 3. if index inconsistency is still suspected, run `qexp doctor rebuild-index`
 4. if tasks look abandoned or mis-owned, consider `repair-orphans` and `cleanup-locks`
+
+Exit-policy boundary:
+
+- plain `qexp doctor verify` is observation mode: command execution succeeds even when findings are reported
+- `--strict` maps any governed finding to a non-zero policy exit code
+- `--fail-on <severity>` lets CI distinguish low-grade hygiene drift from medium/high operational risk
+- verify policy failures return exit code `2`; CLI/runtime errors still use normal failure codes such as `1`
+
+Structured verify payload:
+
+- `issues` is a structured list, not a free-form string array
+- each issue includes at least `code`, `category`, `severity`, `message`
+- `messages` is the human-readable projection of `issues`, kept for terminal reading
+- `issue_count_by_category` and `issue_count_by_code` are intended for CI aggregation and routing
+- JSONL `verify_issue` records repeat `issue_code` and `category` so downstream jobs do not need to parse `message`
+- `recommended_actions` is also structured; each action includes at least `action_code`, `command`, `blocking`, `reason`
+- `blocking=true` means the finding should block automation until the action is handled; `blocking=false` means it can be routed as non-blocking hygiene or follow-up work
+- JSONL `verify_recommendation` records repeat `action_code` and `blocking` so CI can branch without parsing `reason`
+- action recommendation is policy-table driven: CI should rely on `issue.code -> action.action_code` semantics rather than hardcoding string heuristics around `message` or `reason`
+
+### About Listings and Summaries
+
+Most day-to-day commands use indexes or summaries to narrow the candidate set quickly,
+then read formal truth before presenting the final result.
+
+In practice:
+
+- `tasks_by_state` is the only index family that participates in runtime-critical phase scanning
+- batch, group, and machine views are computed from task or batch truth rather than separate persistent membership indexes
+- `top`, `machines`, and `list` should be treated as operational views, not as independent truth objects
+
+If a batch, machine, or group view looks obviously wrong:
+
+- the formal task or batch truth may still be correct
+- run `qexp doctor rebuild-index` if you suspect stale state index data or want to prune legacy index directories
+- avoid making destructive decisions from one suspicious listing alone
 
 ## Common Workflows
 
@@ -757,6 +814,12 @@ Check these first:
 - is `libtmux` installed
 - can the current machine detect GPUs
 
+If queue views and task truth seem inconsistent:
+
+- check `qexp inspect <task_id>` for the formal task truth
+- run `qexp doctor verify`
+- then run `qexp doctor rebuild-index` if the issue looks like stale derived views
+
 If automatic wake-up failed, start the agent manually:
 
 ```bash
@@ -785,7 +848,7 @@ Recommended model:
 Problems with one root per experiment plan:
 
 - the resource view becomes fragmented inside one project
-- `top`, `machines`, and `list` only see partial truth
+- `top`, `machines`, and `list` only see partial truth inside each isolated root
 - after switching with `qexp use`, the new root does not automatically know about tasks occupying resources in the old root
 
 Only create another `shared_root` when you explicitly want another independent
@@ -823,7 +886,7 @@ export QEXP_RUNTIME_ROOT=/data/local/qexp-runtime
 
 These global arguments are supported:
 
-- `--shared-root <path>`: shared control directory; all machines see the same tasks and indexes there
+- `--shared-root <path>`: shared control directory; all machines see the same truth objects and derived operational views there
 - `--machine <name>`: current machine identity; must be unique inside one shared root
 - `--runtime-root <path>`: machine-local runtime directory for logs, pid files, and other local state; defaults to the standard local path if omitted
 

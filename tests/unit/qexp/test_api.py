@@ -68,7 +68,6 @@ class TestSubmit:
     def test_indexed(self, cfg):
         t = submit(cfg, command=["echo"])
         assert t.task_id in load_index(cfg, "state", PHASE_QUEUED)
-        assert t.task_id in load_index(cfg, "machine", "dev1")
 
     def test_custom_gpus(self, cfg):
         t = submit(cfg, command=["echo"], requested_gpus=4)
@@ -90,7 +89,6 @@ class TestSubmit:
     def test_with_group(self, cfg):
         t = submit(cfg, command=["echo"], group="contract_n_4and6")
         assert t.group == "contract_n_4and6"
-        assert t.task_id in load_index(cfg, "group", "contract_n_4and6")
 
     def test_rejects_reserved_group(self, cfg):
         with pytest.raises(ValueError, match="reserved"):
@@ -308,20 +306,10 @@ class TestResubmit:
     def test_repair_commits_when_new_truth_already_exists(self, cfg):
         task = self._make_terminal_task(cfg, PHASE_FAILED, task_id="repair2")
         operation = self._save_resubmit_op(cfg, task, command=["echo", "newer"])
-        from qqtools.plugins.qexp.api import _advance_resubmit_operation, _create_task
+        from qqtools.plugins.qexp.api import _advance_resubmit_operation, _materialize_resubmit_task
 
         _advance_resubmit_operation(cfg, operation, "creating_new")
-        new_task = _create_task(
-            cfg=cfg,
-            command=["echo", "newer"],
-            requested_gpus=1,
-            task_id="repair2",
-            name=task.name,
-            batch_id=None,
-            group=task.group,
-            machine_name=cfg.machine_name,
-            attempt=1,
-        )
+        new_task = _materialize_resubmit_task(load_resubmit_operation(cfg, "repair2"))
         from qqtools.plugins.qexp.api import _persist_submitted_task_truth
 
         delete_then_ignore = resubmit_operation_path(cfg, "repair2")
@@ -421,13 +409,12 @@ class TestBatchSubmit:
         with pytest.raises(ValueError, match="Duplicate task_id"):
             batch_submit(cfg, manifest)
 
-    def test_batch_indexed(self, cfg, tmp_path):
+    def test_batch_submit_persists_batch_truth(self, cfg, tmp_path):
         manifest = self._write_manifest(tmp_path, {
             "tasks": [{"command": ["echo"]}],
         })
         batch = batch_submit(cfg, manifest)
-        ids = load_index(cfg, "batch", batch.batch_id)
-        assert batch.task_ids[0] in ids
+        assert load_batch(cfg, batch.batch_id).task_ids == batch.task_ids
 
     def test_batch_group_inheritance_and_override(self, cfg, tmp_path):
         manifest = self._write_manifest(tmp_path, {
@@ -439,11 +426,8 @@ class TestBatchSubmit:
         })
         batch = batch_submit(cfg, manifest)
         assert batch.group == "contract_n_4and6"
-        assert batch.batch_id in load_index(cfg, "batch_group", "contract_n_4and6")
         assert load_task(cfg, "t1").group == "contract_n_4and6"
         assert load_task(cfg, "t2").group == "regrouped_debug"
-        assert "t1" in load_index(cfg, "group", "contract_n_4and6")
-        assert "t2" in load_index(cfg, "group", "regrouped_debug")
 
     def test_existing_task_id_conflict_fails_before_batch_write(self, cfg, tmp_path):
         submit(cfg, command=["echo"], task_id="taken")
@@ -474,8 +458,6 @@ class TestBatchSubmit:
         with pytest.raises(RuntimeError, match="boom"):
             batch_submit(cfg, manifest)
 
-        batches = list(load_index(cfg, "batch_group", "missing"))
-        assert batches == []
         batch_files = list((cfg.shared_root / "global" / "batches").glob("*.json"))
         assert len(batch_files) == 1
         aborted = load_batch(cfg, batch_files[0].stem)
@@ -745,7 +727,6 @@ class TestClean:
         assert reloaded_batch.task_ids == ["keep-me"]
         assert reloaded_batch.summary.total == 1
         assert reloaded_batch.summary.queued == 1
-        assert "drop-me" not in load_index(cfg, "batch", batch.batch_id)
 
     def test_single_task_clean_rejects_non_terminal(self, cfg):
         submit(cfg, command=["echo"], task_id="active-task")
@@ -793,3 +774,28 @@ class TestClean:
         result = clean(cfg_a, task_id="remote-task")
         assert result["deleted_task_count"] == 1
         assert result["log_results"][0]["status"] == "unresolved"
+
+    def test_clean_rebuilds_state_indexes_after_partial_delete_failure(self, cfg, monkeypatch):
+        from qqtools.plugins.qexp import api as api_module
+        from qqtools.plugins.qexp.indexes import load_index, update_index_on_phase_change
+
+        task = submit(cfg, command=["echo"], task_id="partial-clean-failure")
+        task.status.phase = PHASE_SUCCEEDED
+        task.timestamps.finished_at = "2020-01-01T00:00:00Z"
+        cas_update_task(cfg, task, task.meta.revision)
+        update_index_on_phase_change(cfg, task.task_id, PHASE_QUEUED, PHASE_SUCCEEDED)
+
+        original_delete = api_module.delete_task_file
+
+        def flaky_delete(current_cfg, task_id):
+            if task_id == task.task_id:
+                raise OSError("simulated unlink failure")
+            return original_delete(current_cfg, task_id)
+
+        monkeypatch.setattr(api_module, "delete_task_file", flaky_delete)
+
+        with pytest.raises(OSError, match="simulated unlink failure"):
+            clean(cfg, task_id=task.task_id)
+
+        assert load_task(cfg, task.task_id).task_id == task.task_id
+        assert task.task_id in load_index(cfg, "state", PHASE_SUCCEEDED)

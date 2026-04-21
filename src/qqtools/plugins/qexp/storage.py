@@ -229,10 +229,48 @@ def save_claim(
     write_atomic_json(path, claim)
 
 
-def release_claim(cfg: RootConfig, task_id: str, reason: str) -> None:
+def load_claim(
+    cfg: RootConfig,
+    task_id: str,
+    *,
+    machine_name: str | None = None,
+) -> dict[str, Any]:
     validate_task_id(task_id)
-    active = machine_claims_active_dir(cfg) / f"{task_id}.json"
-    released_dir = machine_claims_released_dir(cfg)
+    if machine_name and machine_name != cfg.machine_name:
+        claim_cfg = RootConfig(
+            shared_root=cfg.shared_root,
+            project_root=cfg.project_root,
+            machine_name=machine_name,
+            runtime_root=cfg.runtime_root,
+        )
+    else:
+        claim_cfg = cfg
+    active = machine_claims_active_dir(claim_cfg) / f"{task_id}.json"
+    if not active.is_file():
+        raise FileNotFoundError(f"Active claim for task {task_id} not found at {active}.")
+    return read_json(active)
+
+
+def release_claim(
+    cfg: RootConfig,
+    task_id: str,
+    reason: str,
+    *,
+    machine_name: str | None = None,
+) -> None:
+    validate_task_id(task_id)
+    if machine_name and machine_name != cfg.machine_name:
+        claim_cfg = RootConfig(
+            shared_root=cfg.shared_root,
+            project_root=cfg.project_root,
+            machine_name=machine_name,
+            runtime_root=cfg.runtime_root,
+        )
+    else:
+        claim_cfg = cfg
+
+    active = machine_claims_active_dir(claim_cfg) / f"{task_id}.json"
+    released_dir = machine_claims_released_dir(claim_cfg)
     released_dir.mkdir(parents=True, exist_ok=True)
 
     claim: dict[str, Any]
@@ -240,7 +278,10 @@ def release_claim(cfg: RootConfig, task_id: str, reason: str) -> None:
         claim = read_json(active)
         active.unlink()
     else:
-        claim = {"task_id": task_id, "machine_name": cfg.machine_name}
+        claim = {
+            "task_id": task_id,
+            "machine_name": machine_name or cfg.machine_name,
+        }
 
     claim["released_at"] = utc_now_iso()
     claim["release_reason"] = reason

@@ -280,3 +280,38 @@ class TestReconcileRunning:
         )
         failed = scheduler.reconcile_running_tasks(cfg)
         assert "t1" in failed
+
+    def test_reconcile_repairs_stale_starting_index_for_running_task(self, cfg):
+        t = _make_task("t1")
+        save_task(cfg, t)
+        update_index_on_submit(cfg, t)
+
+        from qqtools.plugins.qexp.indexes import update_index_on_phase_change
+        from qqtools.plugins.qexp.layout import index_by_state_dir
+        from qqtools.plugins.qexp.storage import write_atomic_json
+
+        t = load_task(cfg, "t1")
+        t.status.phase = PHASE_RUNNING
+        t.runtime.wrapper_pid = 4321
+        t.timestamps.started_at = "2020-01-01T00:00:00Z"
+        cas_update_task(cfg, t, t.meta.revision)
+        update_index_on_phase_change(cfg, "t1", PHASE_QUEUED, PHASE_RUNNING)
+        write_atomic_json(
+            index_by_state_dir(cfg) / f"{PHASE_STARTING}.json",
+            {"task_ids": ["t1"]},
+        )
+
+        tracker = _FakeTracker()
+        executor = _FakeExecutor()
+        scheduler = Scheduler(
+            tracker=tracker,
+            executor=executor,
+            startup_grace_seconds=1,
+            process_alive_check=lambda pid: True,
+        )
+
+        assert scheduler.reconcile_running_tasks(cfg) == []
+        assert load_task(cfg, "t1").status.phase == PHASE_RUNNING
+        assert "t1" not in load_index(cfg, "state", PHASE_STARTING)
+        assert "t1" in load_index(cfg, "state", PHASE_RUNNING)
+        assert scheduler.reconcile_running_tasks(cfg) == []

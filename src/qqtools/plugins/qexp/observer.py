@@ -47,37 +47,21 @@ def list_tasks(
 ) -> list[dict[str, Any]]:
     validated_group = validate_group_name(group)
 
-    task_ids: list[str]
-    if phase:
-        task_ids = load_index(cfg, "state", phase)
-    elif batch_id:
-        task_ids = load_index(cfg, "batch", batch_id)
-    elif validated_group:
-        task_ids = load_index(cfg, "group", validated_group)
-    elif machine:
-        task_ids = load_index(cfg, "machine", machine)
-    else:
-        task_ids = [t.task_id for t in iter_all_tasks(cfg)]
-
-    allowed_batch_ids = set(load_index(cfg, "batch", batch_id)) if batch_id else None
-    allowed_group_ids = (
-        set(load_index(cfg, "group", validated_group)) if validated_group else None
-    )
-    allowed_machine_ids = set(load_index(cfg, "machine", machine)) if machine else None
-    allowed_phase_ids = set(load_index(cfg, "state", phase)) if phase else None
-
     results: list[dict[str, Any]] = []
-    for tid in task_ids:
-        if allowed_phase_ids is not None and tid not in allowed_phase_ids:
-            continue
-        if allowed_batch_ids is not None and tid not in allowed_batch_ids:
-            continue
-        if allowed_group_ids is not None and tid not in allowed_group_ids:
-            continue
-        if allowed_machine_ids is not None and tid not in allowed_machine_ids:
-            continue
-        try:
-            t = load_task(cfg, tid)
+    if phase:
+        for task_id in load_index(cfg, "state", phase):
+            try:
+                t = load_task(cfg, task_id)
+            except FileNotFoundError:
+                continue
+            if t.status.phase != phase:
+                continue
+            if batch_id and t.batch_id != batch_id:
+                continue
+            if validated_group and t.group != validated_group:
+                continue
+            if machine and t.machine_name != machine:
+                continue
             results.append({
                 "task_id": t.task_id,
                 "name": t.name,
@@ -89,8 +73,28 @@ def list_tasks(
                 "created_at": t.timestamps.created_at,
                 "batch_id": t.batch_id,
             })
-        except FileNotFoundError:
+            if len(results) >= limit:
+                break
+        return results
+
+    for t in iter_all_tasks(cfg):
+        if batch_id and t.batch_id != batch_id:
             continue
+        if validated_group and t.group != validated_group:
+            continue
+        if machine and t.machine_name != machine:
+            continue
+        results.append({
+            "task_id": t.task_id,
+            "name": t.name,
+            "group": t.group,
+            "phase": t.status.phase,
+            "machine": t.machine_name,
+            "gpus": t.spec.requested_gpus,
+            "attempt": t.attempt,
+            "created_at": t.timestamps.created_at,
+            "batch_id": t.batch_id,
+        })
         if len(results) >= limit:
             break
     return results
@@ -231,10 +235,9 @@ def list_machines(cfg: RootConfig) -> list[dict[str, Any]]:
 
 
 def top_view(cfg: RootConfig, all_machines: bool = False) -> dict[str, Any]:
-    counts: dict[str, int] = {}
-    for phase in ALL_PHASES:
-        ids = load_index(cfg, "state", phase)
-        counts[phase] = len(ids)
+    counts: dict[str, int] = {phase: 0 for phase in ALL_PHASES}
+    for task in iter_all_tasks(cfg):
+        counts[task.status.phase] = counts.get(task.status.phase, 0) + 1
 
     machines_list = list_machines(cfg)
 

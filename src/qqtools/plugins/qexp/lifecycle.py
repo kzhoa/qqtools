@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 from .layout import RootConfig, agent_state_path, summary_state_path
-from .indexes import load_index
 from .models import (
     AGENT_MODE_ON_DEMAND,
     AGENT_STATE_ACTIVE,
@@ -23,7 +22,7 @@ from .models import (
     SCHEMA_VERSION,
     utc_now_iso,
 )
-from .storage import load_task, read_json, write_atomic_json
+from .storage import iter_all_tasks, read_json, write_atomic_json
 
 
 def build_machine_workset(
@@ -32,14 +31,9 @@ def build_machine_workset(
     updated_at: str | None = None,
 ) -> MachineWorkset:
     target_machine = machine_name or cfg.machine_name
-    task_ids = load_index(cfg, "machine", target_machine)
     counts_by_phase = {phase: 0 for phase in ALL_PHASES}
 
-    for task_id in task_ids:
-        try:
-            task = load_task(cfg, task_id)
-        except FileNotFoundError:
-            continue
+    for task in iter_all_tasks(cfg):
         if task.machine_name != target_machine:
             continue
         counts_by_phase[task.status.phase] = counts_by_phase.get(task.status.phase, 0) + 1

@@ -16,12 +16,9 @@ import yaml
 
 from .agent import wake_agent_if_needed
 from .batch_state import build_batch_summary_from_counts, collect_batch_task_counts
-from .doctor import repair_metadata
+from .doctor import rebuild_indexes, repair_metadata
 from .indexes import (
-    load_index,
-    rebuild_all_indexes,
     remove_index_on_delete,
-    update_batch_index_on_create,
     update_index_on_phase_change,
     update_index_on_submit,
 )
@@ -202,19 +199,13 @@ def _best_effort_delete_task_log(cfg: RootConfig, task: Task) -> None:
 
 def _delete_task_truth(cfg: RootConfig, task: Task) -> None:
     delete_task_file(cfg, task.task_id)
-    try:
-        remove_index_on_delete(cfg, task)
-    except Exception:
-        log.warning("Failed to update indexes while deleting task %s.", task.task_id, exc_info=True)
+    remove_index_on_delete(cfg, task)
     _best_effort_delete_task_log(cfg, task)
 
 
 def _persist_submitted_task_truth(cfg: RootConfig, task: Task) -> None:
     save_task(cfg, task)
-    try:
-        update_index_on_submit(cfg, task)
-    except Exception:
-        log.warning("Failed to update indexes while creating task %s.", task.task_id, exc_info=True)
+    update_index_on_submit(cfg, task)
 
 
 def _materialize_resubmit_task(operation: ResubmitOperation) -> Task:
@@ -263,7 +254,14 @@ def submit(
             pass
         else:
             raise ValueError(f"Task {task_id!r} already exists.")
-        _persist_submitted_task_truth(cfg, task)
+        try:
+            _persist_submitted_task_truth(cfg, task)
+        except Exception:
+            try:
+                remove_index_on_delete(cfg, task)
+            finally:
+                delete_task_file(cfg, task.task_id)
+            raise
 
     if not wake_agent_if_needed(cfg):
         import sys
@@ -577,7 +575,6 @@ def batch_submit(
             batch.commit_state = BATCH_COMMIT_COMMITTED
             batch.summary = _build_batch_summary(cfg, batch.task_ids)
             save_batch(cfg, batch)
-            update_batch_index_on_create(cfg, batch)
         except Exception:
             for task in persisted_tasks:
                 remove_index_on_delete(cfg, task)
@@ -861,12 +858,11 @@ def clean(
                 should_repair = mutations_started
 
                 for task in candidates:
-                    delete_task_file(cfg, task.task_id)
-                    deleted_task_ids.append(task.task_id)
                     mutations_started = True
                     should_repair = True
-
-                rebuild_all_indexes(cfg)
+                    remove_index_on_delete(cfg, task)
+                    delete_task_file(cfg, task.task_id)
+                    deleted_task_ids.append(task.task_id)
 
                 for resolved in log_plans:
                     log_result = _delete_task_log(resolved)
@@ -887,6 +883,7 @@ def clean(
     except Exception:
         if should_repair:
             repair_metadata(cfg)
+            rebuild_indexes(cfg)
         raise
 
 

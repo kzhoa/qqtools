@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .batch_state import (
     build_batch_summary_from_counts,
     collect_batch_task_counts,
     resolve_declared_batch_total,
 )
-from .indexes import rebuild_all_indexes
+from .indexes import (
+    collect_index_drift_report,
+    rebuild_all_indexes,
+    sync_task_state_index,
+    update_index_on_phase_change,
+)
 from .locking import clean_lock
 from .locking import submit_lock, task_operation_lock
 from .layout import (
@@ -57,10 +64,315 @@ from .storage import (
     save_resubmit_operation,
     save_batch,
     read_json,
+    load_claim,
+    release_claim,
 )
-from .indexes import update_index_on_phase_change
 
 log = logging.getLogger(__name__)
+
+VERIFY_SEVERITIES = ("ok", "low", "medium", "high")
+VERIFY_POLICY_EXIT_CODE = 2
+VERIFY_CATEGORIES = (
+    "root_contract",
+    "truth_layout",
+    "task_truth",
+    "batch_truth",
+    "resubmit_operation",
+    "governance",
+    "derived_index",
+)
+VERIFY_ACTION_POLICIES = (
+    {
+        "action_code": "run_doctor_repair_resubmit",
+        "command": "qexp doctor repair",
+        "reason": "unfinished resubmit or metadata repair operation needs truth convergence",
+        "blocking": True,
+        "issue_codes": (
+            "resubmit_terminal_operation_left_behind",
+            "resubmit_missing_new_submission_command",
+            "resubmit_invalid_prepared_snapshot",
+            "resubmit_prepared_snapshot_task_id_mismatch",
+            "resubmit_illegal_batch_target",
+            "resubmit_visible_truth_snapshot_mismatch",
+        ),
+    },
+    {
+        "action_code": "run_doctor_repair_batch_truth",
+        "command": "qexp doctor repair",
+        "reason": "batch truth needs metadata convergence",
+        "blocking": True,
+        "issue_codes": (
+            "batch_missing_task_reference",
+            "batch_summary_drift",
+            "batch_committed_missing_tasks",
+            "batch_preparing_complete_task_set",
+        ),
+    },
+    {
+        "action_code": "run_doctor_rebuild_index_state",
+        "command": "qexp doctor rebuild-index",
+        "reason": "runtime-critical state index drift must be rebuilt from truth",
+        "blocking": True,
+        "issue_codes": ("derived_index_state_drift",),
+    },
+    {
+        "action_code": "manual_fix_truth_layout",
+        "command": "manual_fix_required",
+        "reason": "forbidden truth-layout directories must be removed or migrated before repair",
+        "blocking": True,
+        "issue_codes": ("forbidden_truth_layout_directory",),
+    },
+    {
+        "action_code": "manual_fix_truth_corruption",
+        "command": "manual_fix_required",
+        "reason": "truth files are unreadable or root contract is broken; repair commands cannot safely infer intent",
+        "blocking": True,
+        "issue_codes": (
+            "invalid_root_manifest",
+            "task_truth_unreadable",
+            "batch_truth_unreadable",
+        ),
+    },
+)
+
+
+def _build_verify_issue(
+    *,
+    code: str,
+    category: str,
+    severity: str,
+    message: str,
+    **details: Any,
+) -> dict[str, Any]:
+    normalized_severity = normalize_verify_severity(severity)
+    if category not in VERIFY_CATEGORIES:
+        raise ValueError(
+            f"Unsupported verify category {category!r}; "
+            f"expected one of {', '.join(VERIFY_CATEGORIES)}."
+        )
+    issue = {
+        "code": code,
+        "category": category,
+        "severity": normalized_severity,
+        "message": message,
+    }
+    if details:
+        issue["details"] = details
+    return issue
+
+
+def _append_verify_issue(
+    issues: list[dict[str, Any]],
+    *,
+    code: str,
+    category: str,
+    severity: str,
+    message: str,
+    **details: Any,
+) -> None:
+    issues.append(
+        _build_verify_issue(
+            code=code,
+            category=category,
+            severity=severity,
+            message=message,
+            **details,
+        )
+    )
+
+
+def _issue_codes(issues: list[dict[str, Any]]) -> set[str]:
+    return {issue["code"] for issue in issues}
+
+
+def _issue_categories(issues: list[dict[str, Any]]) -> set[str]:
+    return {issue["category"] for issue in issues}
+
+
+def _issue_count_by_category(issues: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for issue in issues:
+        category = issue["category"]
+        counts[category] = counts.get(category, 0) + 1
+    return counts
+
+
+def _issue_count_by_code(issues: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for issue in issues:
+        code = issue["code"]
+        counts[code] = counts.get(code, 0) + 1
+    return counts
+
+
+def normalize_verify_severity(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in VERIFY_SEVERITIES:
+        raise ValueError(
+            f"Unsupported verify severity {value!r}; "
+            f"expected one of {', '.join(VERIFY_SEVERITIES)}."
+        )
+    return normalized
+
+
+def verify_severity_rank(value: str) -> int:
+    normalized = normalize_verify_severity(value)
+    return VERIFY_SEVERITIES.index(normalized)
+
+
+def verify_matches_fail_policy(result: dict[str, Any], fail_on: str) -> bool:
+    threshold = verify_severity_rank(fail_on)
+    actual = verify_severity_rank(result["severity"])
+    return actual >= threshold
+
+
+def resolve_verify_exit_code(
+    result: dict[str, Any],
+    *,
+    strict: bool = False,
+    fail_on: str | None = None,
+) -> int:
+    effective_fail_on = fail_on
+    if strict and effective_fail_on is None:
+        effective_fail_on = "low"
+    if effective_fail_on is None:
+        return 0
+    if verify_matches_fail_policy(result, effective_fail_on):
+        return VERIFY_POLICY_EXIT_CODE
+    return 0
+
+
+def build_verify_jsonl_records(
+    result: dict[str, Any],
+    *,
+    strict: bool = False,
+    fail_on: str | None = None,
+) -> list[dict[str, Any]]:
+    effective_fail_on = fail_on
+    if strict and effective_fail_on is None:
+        effective_fail_on = "low"
+    exit_code = resolve_verify_exit_code(
+        result,
+        strict=strict,
+        fail_on=effective_fail_on,
+    )
+    records: list[dict[str, Any]] = [
+        {
+            "type": "verify_summary",
+            "ok": result["ok"],
+            "severity": result["severity"],
+            "tasks_checked": result["tasks_checked"],
+            "batches_checked": result["batches_checked"],
+            "resubmit_ops_checked": result["resubmit_ops_checked"],
+            "issue_count": len(result["issues"]),
+            "issue_count_by_category": result["issue_count_by_category"],
+            "issue_count_by_code": result["issue_count_by_code"],
+            "strict": strict,
+            "fail_on": effective_fail_on,
+            "exit_code": exit_code,
+        }
+    ]
+    for index, issue in enumerate(result["issues"], start=1):
+        records.append(
+            {
+                "type": "verify_issue",
+                "index": index,
+                "issue_code": issue["code"],
+                "category": issue["category"],
+                "severity": issue["severity"],
+                "message": issue["message"],
+                "details": issue.get("details", {}),
+            }
+        )
+    for index, action in enumerate(result["recommended_actions"], start=1):
+        records.append(
+            {
+                "type": "verify_recommendation",
+                "index": index,
+                "action_code": action["action_code"],
+                "command": action["command"],
+                "blocking": action["blocking"],
+                "reason": action["reason"],
+            }
+        )
+    records.append(
+        {
+            "type": "verify_result",
+            "ok": result["ok"],
+            "severity": result["severity"],
+            "diagnosis": result["diagnosis"],
+            "index_drift": result["index_drift"],
+            "governance": result["governance"],
+            "root_manifest": result["root_manifest"],
+            "forbidden_truth_dirs": result["forbidden_truth_dirs"],
+            "issue_count_by_category": result["issue_count_by_category"],
+            "issue_count_by_code": result["issue_count_by_code"],
+            "recommended_actions": result["recommended_actions"],
+            "strict": strict,
+            "fail_on": effective_fail_on,
+            "exit_code": exit_code,
+        }
+    )
+    return records
+
+
+def _append_recommendation(
+    recommendations: list[dict[str, Any]],
+    *,
+    action_code: str,
+    command: str,
+    reason: str,
+    blocking: bool,
+) -> None:
+    for item in recommendations:
+        if (
+            item["action_code"] == action_code
+            and item["command"] == command
+            and item["reason"] == reason
+            and item["blocking"] is blocking
+        ):
+            return
+    recommendations.append(
+        {
+            "action_code": action_code,
+            "command": command,
+            "reason": reason,
+            "blocking": blocking,
+        }
+    )
+
+
+def _policy_matches_issue_codes(
+    issue_codes: set[str],
+    policy: dict[str, Any],
+) -> bool:
+    return bool(issue_codes & set(policy["issue_codes"]))
+
+
+def _verify_severity_from_issues(issues: list[dict[str, Any]]) -> str:
+    if not issues:
+        return "ok"
+    max_rank = max(verify_severity_rank(issue["severity"]) for issue in issues)
+    return VERIFY_SEVERITIES[max_rank]
+
+
+def _build_verify_recommendations(
+    issues: list[dict[str, Any]],
+    index_drift: dict[str, Any],
+) -> list[dict[str, Any]]:
+    recommendations: list[dict[str, Any]] = []
+    issue_codes = _issue_codes(issues)
+    for policy in VERIFY_ACTION_POLICIES:
+        if not _policy_matches_issue_codes(issue_codes, policy):
+            continue
+        _append_recommendation(
+            recommendations,
+            action_code=policy["action_code"],
+            command=policy["command"],
+            reason=policy["reason"],
+            blocking=policy["blocking"],
+        )
+    return recommendations
 
 
 def _count_event_files(base: Path) -> int:
@@ -241,72 +553,65 @@ def repair_orphans(
     cfg: RootConfig,
     heartbeat_stale_seconds: float = 120.0,
 ) -> list[str]:
-    """Find tasks in active phases whose machine heartbeat is stale.
-
-    Checks the agent state file (state/agent.json) for each machine,
-    which is where the agent writes heartbeats. A machine is considered
-    stale if:
-    - No agent state file exists, OR
-    - The last_heartbeat is older than heartbeat_stale_seconds, OR
-    - The agent process (PID) is not alive.
-
-    Transitions stale tasks to orphaned and returns affected task_ids.
-    """
-    from datetime import datetime, timezone
     from .agent import get_agent_status
+    from .events import write_event
 
-    machines = iter_machines(cfg)
-    stale_machines: set[str] = set()
     now = datetime.now(timezone.utc)
 
-    for m in machines:
-        alt_cfg = RootConfig(
+    def _machine_cfg(machine_name: str) -> RootConfig:
+        return RootConfig(
             shared_root=cfg.shared_root,
             project_root=cfg.project_root,
-            machine_name=m.machine_name,
+            machine_name=machine_name,
             runtime_root=cfg.runtime_root,
         )
 
-        # Check agent state file (the actual heartbeat source)
-        snapshot = read_agent_snapshot(alt_cfg)
+    def _evaluate_agent(machine_name: str) -> tuple[bool, str]:
+        snapshot = read_agent_snapshot(_machine_cfg(machine_name))
         if snapshot is None:
-            stale_machines.add(m.machine_name)
-            continue
+            return False, "agent_snapshot_missing"
 
         if snapshot.agent_state in {
             AGENT_STATE_STOPPED,
             AGENT_STATE_FAILED,
             AGENT_STATE_STALE,
         }:
-            stale_machines.add(m.machine_name)
-            continue
+            return False, f"agent_{snapshot.agent_state}"
 
-        # Cross-machine health must be interpreted from the shared snapshot,
-        # not by probing a foreign PID in the local process namespace.
-        status = get_agent_status(alt_cfg, probe_local_pid=False)
+        status = get_agent_status(_machine_cfg(machine_name), probe_local_pid=False)
         if status["is_running"]:
-            continue
+            return True, "agent_running"
 
-        # Agent not running — check how long since last heartbeat
         hb = snapshot.last_heartbeat
         if hb is None:
-            stale_machines.add(m.machine_name)
-            continue
-
+            return False, "agent_missing_heartbeat"
         try:
             dt = datetime.fromisoformat(hb.replace("Z", "+00:00"))
             elapsed = (now - dt).total_seconds()
             if elapsed > heartbeat_stale_seconds:
-                stale_machines.add(m.machine_name)
+                return False, "agent_heartbeat_stale"
         except Exception:
-            stale_machines.add(m.machine_name)
+            return False, "agent_heartbeat_invalid"
+        return True, "agent_recent_heartbeat"
 
     orphaned: list[str] = []
-    tasks = iter_all_tasks(cfg)
-    for task in tasks:
+    for task in iter_all_tasks(cfg):
         if task.status.phase not in ACTIVE_PHASES:
             continue
-        if task.machine_name not in stale_machines:
+
+        agent_healthy, agent_reason = _evaluate_agent(task.machine_name)
+        claim_reason = "claim_present"
+        try:
+            claim = load_claim(cfg, task.task_id, machine_name=task.machine_name)
+        except FileNotFoundError:
+            claim = None
+            claim_reason = "active_claim_missing"
+        else:
+            if claim.get("machine_name") != task.machine_name:
+                claim_reason = "active_claim_machine_mismatch"
+                claim = None
+
+        if agent_healthy and claim is not None:
             continue
 
         old_phase = task.status.phase
@@ -316,10 +621,30 @@ def repair_orphans(
             continue
 
         task.status.phase = PHASE_ORPHANED
-        task.status.reason = "machine_heartbeat_stale"
+        task.status.reason = (
+            claim_reason if claim_reason != "claim_present" else agent_reason
+        )
         try:
             cas_update_task(cfg, task, task.meta.revision)
             update_index_on_phase_change(cfg, task.task_id, old_phase, PHASE_ORPHANED)
+            if claim is not None:
+                release_claim(
+                    cfg,
+                    task.task_id,
+                    reason="task_orphaned",
+                    machine_name=task.machine_name,
+                )
+            write_event(
+                cfg,
+                "task_orphaned",
+                task_id=task.task_id,
+                details={
+                    "previous_phase": old_phase,
+                    "agent_reason": agent_reason,
+                    "claim_reason": claim_reason,
+                    "machine_name": task.machine_name,
+                },
+            )
             orphaned.append(task.task_id)
             log.info("Marked task %s as orphaned (was %s).", task.task_id, old_phase)
         except CASConflict:
@@ -358,12 +683,13 @@ def cleanup_stale_locks(
 
 
 def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
-    """Repair batch truth and indexes into a converged state.
+    """Repair unfinished metadata operations into a converged truth state.
 
-    This is the recovery entrypoint for partial clean failures:
+    This is the recovery entrypoint for interrupted metadata mutations:
+    - continue unfinished resubmit operations
     - prune missing task_ids from batch truth
     - recompute batch summaries from surviving tasks
-    - rebuild all derived indexes
+    - leave any remaining state-index cleanup to rebuild-index when needed
     """
     repaired_batches: list[str] = []
     committed_batches: list[str] = []
@@ -388,12 +714,14 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
                 batch = load_batch(cfg, batch_id)
 
                 removed = 0
+                missing_task_ids: list[str] = []
 
                 for task_id in batch.task_ids:
                     try:
                         load_task(cfg, task_id)
                     except FileNotFoundError:
                         removed += 1
+                        missing_task_ids.append(task_id)
                 surviving_ids, counts = collect_batch_task_counts(
                     cfg,
                     batch.task_ids,
@@ -435,7 +763,10 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
                     repaired_batches.append(batch.batch_id)
                     pruned_task_refs += removed
 
-        index_stats = rebuild_all_indexes(cfg)
+                for missing_task_id in missing_task_ids:
+                    sync_task_state_index(cfg, missing_task_id, None)
+
+        index_drift = collect_index_drift_report(cfg)
         governance = refresh_root_manifest_governance(cfg)
 
     return {
@@ -446,7 +777,7 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
         "committed_batches": committed_batches,
         "aborted_batches": aborted_batches,
         "pruned_task_ref_count": pruned_task_refs,
-        "index_stats": index_stats,
+        "index_drift": index_drift,
         "governance": governance.to_dict(),
     }
 
@@ -461,7 +792,7 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
 
     Returns dict with 'ok' bool and 'issues' list.
     """
-    issues: list[str] = []
+    issues: list[dict[str, Any]] = []
     manifest: dict[str, Any] | None = None
     tasks_dir = global_tasks_dir(cfg)
     batches_dir = global_batches_dir(cfg)
@@ -470,19 +801,42 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
         root_manifest = validate_root_contract(cfg)
         manifest = root_manifest.to_dict()["root_manifest"]
         if root_manifest.root_scope != ROOT_SCOPE_PROJECT:
-            issues.append(
-                f"Invalid root scope {root_manifest.root_scope!r}; expected {ROOT_SCOPE_PROJECT!r}."
+            _append_verify_issue(
+                issues,
+                code="invalid_root_scope",
+                category="root_contract",
+                severity="high",
+                message=(
+                    f"Invalid root scope {root_manifest.root_scope!r}; "
+                    f"expected {ROOT_SCOPE_PROJECT!r}."
+                ),
+                actual_root_scope=root_manifest.root_scope,
+                expected_root_scope=ROOT_SCOPE_PROJECT,
             )
     except Exception as exc:
-        issues.append(f"Invalid root manifest: {exc}")
+        _append_verify_issue(
+            issues,
+            code="invalid_root_manifest",
+            category="root_contract",
+            severity="high",
+            message=f"Invalid root manifest: {exc}",
+            error=str(exc),
+        )
 
     forbidden_truth_dirs = [
         str(path) for path in list_forbidden_truth_layout_dirs(cfg)
     ]
     for path in forbidden_truth_dirs:
-        issues.append(
-            f"Forbidden truth-layout directory detected: {path}. "
-            "Only global object truth and machine-private subtrees are allowed."
+        _append_verify_issue(
+            issues,
+            code="forbidden_truth_layout_directory",
+            category="truth_layout",
+            severity="high",
+            message=(
+                f"Forbidden truth-layout directory detected: {path}. "
+                "Only global object truth and machine-private subtrees are allowed."
+            ),
+            path=path,
         )
 
     checked = 0
@@ -496,16 +850,37 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
                 data = read_json(path)
                 task_id = data.get("task", {}).get("task_id")
                 if task_id != expected_id:
-                    issues.append(
-                        f"Filename/ID mismatch: file={path.name}, task_id={task_id}"
+                    _append_verify_issue(
+                        issues,
+                        code="task_filename_id_mismatch",
+                        category="task_truth",
+                        severity="high",
+                        message=f"Filename/ID mismatch: file={path.name}, task_id={task_id}",
+                        file=path.name,
+                        expected_task_id=expected_id,
+                        actual_task_id=task_id,
                     )
                 revision = data.get("meta", {}).get("revision")
                 if not isinstance(revision, int) or revision < 1:
-                    issues.append(
-                        f"Invalid revision for {expected_id}: {revision}"
+                    _append_verify_issue(
+                        issues,
+                        code="task_invalid_revision",
+                        category="task_truth",
+                        severity="low",
+                        message=f"Invalid revision for {expected_id}: {revision}",
+                        task_id=expected_id,
+                        revision=revision,
                     )
             except Exception as e:
-                issues.append(f"Cannot read {path.name}: {e}")
+                _append_verify_issue(
+                    issues,
+                    code="task_truth_unreadable",
+                    category="task_truth",
+                    severity="high",
+                    message=f"Cannot read {path.name}: {e}",
+                    file=path.name,
+                    error=str(e),
+                )
 
     batches_checked = 0
     if batches_dir.is_dir():
@@ -519,8 +894,17 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
                 batch_data = data.get("batch", {})
                 batch_id = batch_data.get("batch_id")
                 if batch_id != expected_id:
-                    issues.append(
-                        f"Batch filename/ID mismatch: file={path.name}, batch_id={batch_id}"
+                    _append_verify_issue(
+                        issues,
+                        code="batch_filename_id_mismatch",
+                        category="batch_truth",
+                        severity="high",
+                        message=(
+                            f"Batch filename/ID mismatch: file={path.name}, batch_id={batch_id}"
+                        ),
+                        file=path.name,
+                        expected_batch_id=expected_id,
+                        actual_batch_id=batch_id,
                     )
                     continue
 
@@ -535,20 +919,44 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
                     BATCH_COMMIT_COMMITTED,
                     BATCH_COMMIT_ABORTED,
                 }:
-                    issues.append(
-                        f"Batch {expected_id} has invalid commit_state {commit_state!r}"
+                    _append_verify_issue(
+                        issues,
+                        code="batch_invalid_commit_state",
+                        category="batch_truth",
+                        severity="low",
+                        message=f"Batch {expected_id} has invalid commit_state {commit_state!r}",
+                        batch_id=expected_id,
+                        commit_state=commit_state,
                     )
                 if (
                     not isinstance(stored_expected_task_count, int)
                     or stored_expected_task_count < 0
                 ):
-                    issues.append(
-                        f"Batch {expected_id} has invalid expected_task_count {stored_expected_task_count!r}"
+                    _append_verify_issue(
+                        issues,
+                        code="batch_invalid_expected_task_count",
+                        category="batch_truth",
+                        severity="low",
+                        message=(
+                            f"Batch {expected_id} has invalid expected_task_count "
+                            f"{stored_expected_task_count!r}"
+                        ),
+                        batch_id=expected_id,
+                        expected_task_count=stored_expected_task_count,
                     )
                     stored_expected_task_count = len(declared_task_ids)
                 if len(declared_task_ids) > stored_expected_task_count:
-                    issues.append(
-                        f"Batch {expected_id} has more persisted tasks than expected_task_count."
+                    _append_verify_issue(
+                        issues,
+                        code="batch_declared_tasks_exceed_expected_count",
+                        category="batch_truth",
+                        severity="low",
+                        message=(
+                            f"Batch {expected_id} has more persisted tasks than expected_task_count."
+                        ),
+                        batch_id=expected_id,
+                        declared_task_count=len(declared_task_ids),
+                        expected_task_count=stored_expected_task_count,
                     )
                 counts: dict[str, int] = {}
                 surviving_ids: list[str] = []
@@ -556,16 +964,32 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
                     try:
                         task = load_task(cfg, task_id)
                     except FileNotFoundError:
-                        issues.append(
-                            f"Batch {expected_id} references missing task {task_id}"
+                        _append_verify_issue(
+                            issues,
+                            code="batch_missing_task_reference",
+                            category="batch_truth",
+                            severity="medium",
+                            message=f"Batch {expected_id} references missing task {task_id}",
+                            batch_id=expected_id,
+                            task_id=task_id,
                         )
                         continue
                     surviving_ids.append(task_id)
                     phase = task.status.phase
                     counts[phase] = counts.get(phase, 0) + 1
                     if task.batch_id != expected_id:
-                        issues.append(
-                            f"Batch {expected_id} contains task {task_id} with mismatched batch_id {task.batch_id!r}"
+                        _append_verify_issue(
+                            issues,
+                            code="batch_task_batch_id_mismatch",
+                            category="batch_truth",
+                            severity="low",
+                            message=(
+                                f"Batch {expected_id} contains task {task_id} "
+                                f"with mismatched batch_id {task.batch_id!r}"
+                            ),
+                            batch_id=expected_id,
+                            task_id=task_id,
+                            actual_task_batch_id=task.batch_id,
                         )
 
                 expected_task_count = resolve_declared_batch_total(
@@ -581,53 +1005,131 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
                 ).to_dict()
                 actual_summary = batch_data.get("summary", {})
                 if actual_summary != expected_summary:
-                    issues.append(
-                        f"Batch {expected_id} summary drift: expected={expected_summary}, actual={actual_summary}"
+                    _append_verify_issue(
+                        issues,
+                        code="batch_summary_drift",
+                        category="batch_truth",
+                        severity="medium",
+                        message=(
+                            f"Batch {expected_id} summary drift: "
+                            f"expected={expected_summary}, actual={actual_summary}"
+                        ),
+                        batch_id=expected_id,
+                        expected_summary=expected_summary,
+                        actual_summary=actual_summary,
                     )
                 if (
                     commit_state == BATCH_COMMIT_COMMITTED
                     and len(surviving_ids) != expected_task_count
                 ):
-                    issues.append(
-                        f"Batch {expected_id} is committed but only has "
-                        f"{len(surviving_ids)}/{expected_task_count} tasks."
+                    _append_verify_issue(
+                        issues,
+                        code="batch_committed_missing_tasks",
+                        category="batch_truth",
+                        severity="medium",
+                        message=(
+                            f"Batch {expected_id} is committed but only has "
+                            f"{len(surviving_ids)}/{expected_task_count} tasks."
+                        ),
+                        batch_id=expected_id,
+                        actual_task_count=len(surviving_ids),
+                        expected_task_count=expected_task_count,
                     )
                 if (
                     commit_state == BATCH_COMMIT_PREPARING
                     and len(surviving_ids) == expected_task_count
                 ):
-                    issues.append(
-                        f"Batch {expected_id} is still preparing despite complete task set."
+                    _append_verify_issue(
+                        issues,
+                        code="batch_preparing_complete_task_set",
+                        category="batch_truth",
+                        severity="medium",
+                        message=(
+                            f"Batch {expected_id} is still preparing despite complete task set."
+                        ),
+                        batch_id=expected_id,
+                        task_count=len(surviving_ids),
                     )
             except Exception as e:
-                issues.append(f"Cannot read batch {path.name}: {e}")
+                _append_verify_issue(
+                    issues,
+                    code="batch_truth_unreadable",
+                    category="batch_truth",
+                    severity="high",
+                    message=f"Cannot read batch {path.name}: {e}",
+                    file=path.name,
+                    error=str(e),
+                )
 
     resubmit_ops_checked = 0
     for operation in iter_resubmit_operations(cfg):
         resubmit_ops_checked += 1
         if operation.state in {RESUBMIT_STATE_COMMITTED, RESUBMIT_STATE_ABORTED}:
-            issues.append(
-                f"Resubmit operation {operation.task_id} is left behind in terminal state {operation.state!r}."
+            _append_verify_issue(
+                issues,
+                code="resubmit_terminal_operation_left_behind",
+                category="resubmit_operation",
+                severity="high",
+                message=(
+                    f"Resubmit operation {operation.task_id} is left behind "
+                    f"in terminal state {operation.state!r}."
+                ),
+                task_id=operation.task_id,
+                state=operation.state,
             )
         if not operation.new_submission.command:
-            issues.append(
-                f"Resubmit operation {operation.task_id} is missing new submission command."
+            _append_verify_issue(
+                issues,
+                code="resubmit_missing_new_submission_command",
+                category="resubmit_operation",
+                severity="high",
+                message=(
+                    f"Resubmit operation {operation.task_id} is missing new submission command."
+                ),
+                task_id=operation.task_id,
             )
         try:
             expected_task = Task.from_dict(operation.new_task_snapshot)
         except Exception as exc:
-            issues.append(
-                f"Resubmit operation {operation.task_id} has invalid prepared task snapshot: {exc}"
+            _append_verify_issue(
+                issues,
+                code="resubmit_invalid_prepared_snapshot",
+                category="resubmit_operation",
+                severity="high",
+                message=(
+                    f"Resubmit operation {operation.task_id} "
+                    f"has invalid prepared task snapshot: {exc}"
+                ),
+                task_id=operation.task_id,
+                error=str(exc),
             )
             expected_task = None
         else:
             if expected_task.task_id != operation.task_id:
-                issues.append(
-                    f"Resubmit operation {operation.task_id} prepared snapshot task_id mismatches: {expected_task.task_id!r}."
+                _append_verify_issue(
+                    issues,
+                    code="resubmit_prepared_snapshot_task_id_mismatch",
+                    category="resubmit_operation",
+                    severity="high",
+                    message=(
+                        f"Resubmit operation {operation.task_id} prepared snapshot "
+                        f"task_id mismatches: {expected_task.task_id!r}."
+                    ),
+                    task_id=operation.task_id,
+                    snapshot_task_id=expected_task.task_id,
                 )
         if operation.old_task_summary.batch_id is not None:
-            issues.append(
-                f"Resubmit operation {operation.task_id} illegally targets batch task {operation.old_task_summary.batch_id}."
+            _append_verify_issue(
+                issues,
+                code="resubmit_illegal_batch_target",
+                category="resubmit_operation",
+                severity="high",
+                message=(
+                    f"Resubmit operation {operation.task_id} illegally targets "
+                    f"batch task {operation.old_task_summary.batch_id}."
+                ),
+                task_id=operation.task_id,
+                batch_id=operation.old_task_summary.batch_id,
             )
         try:
             current_task = load_task(cfg, operation.task_id)
@@ -639,22 +1141,82 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
             and current_task is not None
             and not _resubmit_snapshot_matches_current_task(operation, current_task)
         ):
-            issues.append(
-                f"Resubmit operation {operation.task_id} is creating_new but visible task truth does not match the prepared replacement snapshot."
+            _append_verify_issue(
+                issues,
+                code="resubmit_visible_truth_snapshot_mismatch",
+                category="resubmit_operation",
+                severity="high",
+                message=(
+                    f"Resubmit operation {operation.task_id} is creating_new but "
+                    "visible task truth does not match the prepared replacement snapshot."
+                ),
+                task_id=operation.task_id,
+                state=operation.state,
             )
 
     governance = collect_governance_snapshot(cfg).to_dict()
     if governance["terminal_tasks"] > governance["total_tasks"] * 0.8 and governance["total_tasks"] > 20:
-        issues.append(
-            "Terminal task ratio exceeds 80%; lifecycle cleanup or archive governance is overdue."
+        _append_verify_issue(
+            issues,
+            code="governance_terminal_task_ratio_high",
+            category="governance",
+            severity="low",
+            message=(
+                "Terminal task ratio exceeds 80%; lifecycle cleanup or archive governance is overdue."
+            ),
+            terminal_tasks=governance["terminal_tasks"],
+            total_tasks=governance["total_tasks"],
         )
+
+    index_drift = collect_index_drift_report(cfg)
+    if not index_drift["ok"]:
+        for family_name, family in index_drift["families"].items():
+            if family["ok"]:
+                continue
+            _append_verify_issue(
+                issues,
+                code="derived_index_state_drift",
+                category="derived_index",
+                severity="high",
+                message=(
+                    f"Derived index drift detected in {family_name}: "
+                    f"missing={family['missing_count']} unexpected={family['unexpected_count']}"
+                ),
+                family=family_name,
+                missing_count=family["missing_count"],
+                unexpected_count=family["unexpected_count"],
+            )
+    severity = _verify_severity_from_issues(issues)
+    issue_codes = _issue_codes(issues)
+    issue_categories = _issue_categories(issues)
+    recommended_actions = _build_verify_recommendations(issues, index_drift)
 
     return {
         "ok": len(issues) == 0,
+        "severity": severity,
         "issues": issues,
+        "messages": [issue["message"] for issue in issues],
+        "issue_count_by_category": _issue_count_by_category(issues),
+        "issue_count_by_code": _issue_count_by_code(issues),
+        "diagnosis": {
+            "truth_ok": not (issue_categories & {"root_contract", "truth_layout", "task_truth"}),
+            "index_drift_only": len(issues) > 0 and issue_categories == {"derived_index"},
+            "has_resubmit_gap": "resubmit_operation" in issue_categories,
+            "has_batch_truth_drift": bool(
+                issue_codes
+                & {
+                    "batch_missing_task_reference",
+                    "batch_summary_drift",
+                    "batch_committed_missing_tasks",
+                    "batch_preparing_complete_task_set",
+                }
+            ),
+        },
+        "recommended_actions": recommended_actions,
         "root_manifest": manifest,
         "forbidden_truth_dirs": forbidden_truth_dirs,
         "governance": governance,
+        "index_drift": index_drift,
         "tasks_checked": checked,
         "batches_checked": batches_checked,
         "resubmit_ops_checked": resubmit_ops_checked,

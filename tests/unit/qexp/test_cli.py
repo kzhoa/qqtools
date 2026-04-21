@@ -277,6 +277,92 @@ class TestDoctor:
         assert ret == 0
         data = json.loads(capsys.readouterr().out)
         assert data["ok"] is True
+        assert data["severity"] == "ok"
+        assert data["recommended_actions"] == []
+        assert data["issues"] == []
+
+    def test_verify_non_strict_does_not_fail_on_detected_issues(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.api import submit
+        from qqtools.plugins.qexp.layout import task_path
+
+        task = submit(cfg, command=["echo"], task_id="verify-broken")
+        task_path(cfg, task.task_id).write_text("not json", encoding="utf-8")
+
+        ret = cli_main(_base_args(cfg) + ["doctor", "verify"])
+        assert ret == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["severity"] == "high"
+        assert any(issue["code"] == "task_truth_unreadable" for issue in data["issues"])
+        assert any(
+            action["action_code"] == "manual_fix_truth_corruption"
+            and action["blocking"] is True
+            for action in data["recommended_actions"]
+        )
+
+    def test_verify_strict_fails_on_any_governed_issue(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.api import submit
+        from qqtools.plugins.qexp.layout import task_path
+
+        task = submit(cfg, command=["echo"], task_id="verify-strict")
+        task_path(cfg, task.task_id).write_text("not json", encoding="utf-8")
+
+        ret = cli_main(_base_args(cfg) + ["doctor", "verify", "--strict"])
+        assert ret == 2
+        data = json.loads(capsys.readouterr().out)
+        assert data["severity"] == "high"
+        assert data["issue_count_by_category"]["task_truth"] == 1
+
+    def test_verify_fail_on_threshold(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.api import submit
+        from qqtools.plugins.qexp.layout import index_by_state_dir
+        from qqtools.plugins.qexp.storage import write_atomic_json
+
+        submit(cfg, command=["echo"], task_id="verify-threshold")
+        write_atomic_json(index_by_state_dir(cfg) / "queued.json", {"task_ids": []})
+
+        ret = cli_main(_base_args(cfg) + ["doctor", "verify", "--fail-on", "high"])
+        assert ret == 2
+        data = json.loads(capsys.readouterr().out)
+        assert data["severity"] == "high"
+        assert data["issue_count_by_code"]["derived_index_state_drift"] == 1
+        assert any(
+            action["action_code"] == "run_doctor_rebuild_index_state"
+            and action["blocking"] is True
+            for action in data["recommended_actions"]
+        )
+
+    def test_verify_jsonl_outputs_machine_records(self, cfg, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.api import submit
+        from qqtools.plugins.qexp.layout import task_path
+
+        task = submit(cfg, command=["echo"], task_id="verify-jsonl")
+        task_path(cfg, task.task_id).write_text("not json", encoding="utf-8")
+
+        ret = cli_main(_base_args(cfg) + ["doctor", "verify", "--jsonl", "--strict"])
+        assert ret == 2
+        lines = [line for line in capsys.readouterr().out.strip().splitlines() if line]
+        records = [json.loads(line) for line in lines]
+        assert records[0]["type"] == "verify_summary"
+        assert records[0]["exit_code"] == 2
+        issue_records = [record for record in records if record["type"] == "verify_issue"]
+        assert issue_records
+        assert issue_records[0]["issue_code"] == "task_truth_unreadable"
+        assert issue_records[0]["category"] == "task_truth"
+        recommendation_records = [
+            record for record in records if record["type"] == "verify_recommendation"
+        ]
+        assert recommendation_records
+        assert any(
+            record["action_code"] == "manual_fix_truth_corruption"
+            and record["blocking"] is True
+            for record in recommendation_records
+        )
+        assert records[-1]["type"] == "verify_result"
+        assert records[-1]["fail_on"] == "low"
 
     def test_rebuild_index(self, cfg, capsys):
         from qqtools.plugins.qexp.cli import main as cli_main
