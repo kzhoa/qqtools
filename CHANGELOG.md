@@ -2,6 +2,7 @@
 
 ## v1.2.13
 
+- feat: allow `run_mode=step` to treat `max_epochs` as an optional secondary stopping boundary while keeping `max_steps` required
 - fix: harden qexp machine GPU live view with safer agent/observer handling and add regression coverage for the live machine status path
 
 ## v1.2.12

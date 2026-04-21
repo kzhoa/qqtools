@@ -15,7 +15,7 @@
         "max_epochs": {
             "type": "integer",
             "minimum": 1,
-            "description": "Maximum number of training epochs"
+            "description": "Maximum number of training epochs. Required when run_mode='epoch'. Optional secondary stopping boundary when run_mode='step'."
         },
         "max_steps": {
             "type": [

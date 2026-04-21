@@ -538,14 +538,14 @@ runner:
 - **Characteristics**: Update every N samples (not limited to complete epochs)
 - **When to Use**: Very large datasets, online learning, precise step control
 - **Key Parameters**: `max_steps`, `eval_interval` (counted in steps)
-- **Note**: In this mode, `max_steps` is the only effective training boundary. If `max_epochs` is also specified, the runner logs a warning and ignores it.
+- **Note**: In this mode, `max_steps` is the required primary training boundary. If `max_epochs` is also specified, it becomes an optional secondary stopping boundary and training stops when either limit is reached first.
 
 ### Fields Summary
 
 | Field             | Required | Type    | Range      | Default | Description                   |
 | ----------------- | -------- | ------- | ---------- | ------- | ----------------------------- |
 | `run_mode`        | ✅        | String  | epoch/step | epoch   | Training mode                 |
-| `max_epochs`      | ⚠️        | Integer | ≥ 1        | None    | Effective in epoch mode; ignored in step mode |
+| `max_epochs`      | ⚠️        | Integer | ≥ 1        | None    | Required in epoch mode; optional secondary stop boundary in step mode |
 | `max_steps`       | ⚠️        | Integer | ≥ 1        | null    | Effective in step mode; ignored in epoch mode |
 | `eval_interval`   | ❌        | Integer | ≥ 1        | 1       | Evaluation interval           |
 | `save_interval`   | ❌        | Integer | ≥ 1        | null    | Regular save interval (units follow run_mode) |
@@ -574,7 +574,7 @@ runner:
 - **max_epochs**:
   - Type: Integer, ≥ 1
   - Description: Maximum number of training epochs
-  - Required for epoch mode; ignored in step mode
+  - Required for epoch mode; optional secondary stopping boundary in step mode
 
 - **max_steps**:
   - Type: Integer or null
@@ -583,8 +583,8 @@ runner:
 
 - **Logic**:
   - `run_mode='epoch'`: Controlled by `max_epochs`
-  - `run_mode='step'`: Controlled by `max_steps`
-  - Cross-mode boundary fields are ignored with a warning
+  - `run_mode='step'`: Controlled by required `max_steps`, and optionally also bounded by `max_epochs`
+  - `max_steps` in epoch mode is ignored with a warning
 
 ### eval_interval (Evaluation Interval)
 
@@ -1046,12 +1046,12 @@ Certain fields in the configuration file have logical relationships with each ot
 | --------------------------- | -------- | ------------- | ------------- | --------------------------- |
 | Standard epoch mode         | epoch    | Specified     | Not specified | Stop at max_epochs          |
 | Standard step mode          | step     | Not specified | Specified     | Stop at max_steps           |
-| Misconfiguration in step mode | step   | Specified     | Specified     | Warning: max_epochs ignored |
+| Dual-boundary step mode       | step   | Specified     | Specified     | Stop at whichever limit arrives first |
 | Misconfiguration in epoch mode | epoch | Not specified | Specified     | Warning: max_steps ignored  |
 
 **Special Behaviors**:
 
-- **max_epochs in step mode**: Specifying `max_epochs` in step mode is **ignored** by the framework; only `max_steps` is effective
+- **max_epochs in step mode**: Specifying `max_epochs` in step mode enables an optional second stopping boundary; the run stops when either `max_steps` or `max_epochs` is reached first
 - **max_steps in epoch mode**: Specifying `max_steps` in epoch mode is **ignored** by the framework; only `max_epochs` is effective
 
 #### Impact of run_mode on eval_interval Meaning
@@ -1282,8 +1282,9 @@ runner:
 **Behavior**:
 
 - Training stops when `global_step >= max_steps`
-- `max_epochs` is ignored by the mutual-exclusion policy, and the framework logs a warning about it
-- Epoch counters may still advance while training is step-bounded, but they do not control stopping in this configuration
+- Training also stops when `epoch >= max_epochs`, whichever limit is reached first
+- The runner logs that `max_epochs` is active as a secondary stopping boundary in step mode
+- Epoch counters still advance normally, and in this configuration they also participate in stopping
 
 #### Scenario B: warmup_steps > max_steps
 

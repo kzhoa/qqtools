@@ -101,8 +101,8 @@ def prompt_runner_params():
                 print_formatted_text("❌ Must be an integer.")
 
     else:  # step mode
-        print_formatted_text("\n📍 Step Mode: Training stops after max_steps OR early stopping")
-        print_formatted_text("  💡 max_epochs is omitted here because step mode ignores it.")
+        print_formatted_text("\n📍 Step Mode: Training stops after max_steps, optional max_epochs, OR early stopping")
+        print_formatted_text("  💡 You can optionally add max_epochs as a secondary stopping boundary.")
 
         # max_steps (required)
         while True:
@@ -117,6 +117,20 @@ def prompt_runner_params():
                     print_formatted_text("❌ max_steps must be >= 1.")
                     continue
                 params["max_steps"] = steps
+                break
+            except ValueError:
+                print_formatted_text("❌ Must be an integer.")
+
+        while True:
+            value = prompt("  Max Epochs (optional secondary boundary, press Enter to skip): ").strip()
+            if not value or value.lower() == "none":
+                break
+            try:
+                epochs = int(value)
+                if epochs < 1:
+                    print_formatted_text("❌ max_epochs must be >= 1.")
+                    continue
+                params["max_epochs"] = epochs
                 break
             except ValueError:
                 print_formatted_text("❌ Must be an integer.")

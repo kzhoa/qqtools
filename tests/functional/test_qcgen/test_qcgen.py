@@ -183,6 +183,13 @@ def test_runner_schema_requires_mode_specific_boundaries():
     assert "anyOf" not in step_branch
     assert step_branch["properties"]["max_steps"]["type"] == "integer"
     assert step_branch["properties"]["max_steps"]["minimum"] == 1
+    assert "max_epochs" not in step_branch.get("required", [])
+
+
+def test_runner_schema_describes_step_mode_secondary_epoch_boundary():
+    schema = _load_runner_schema()
+
+    assert "secondary stopping boundary" in schema["properties"]["max_epochs"]["description"]
 
 
 def test_runner_schema_save_interval_description_matches_runtime_semantics():
@@ -264,6 +271,32 @@ def test_prompt_runner_params_can_disable_regular_latest_only():
         params = prompt_runner_params()
 
     assert params["regular_latest_only"] is False
+
+
+def test_prompt_runner_params_accepts_step_mode_secondary_max_epochs():
+    from qqtools.plugins.qConfigGen.pts.runnerPt import prompt_runner_params
+
+    prompt_values = [
+        "step",
+        "500",
+        "7",
+        "",
+        "",
+        "",
+        "",
+        "y",
+    ]
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.prompt", side_effect=prompt_values),
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.print_formatted_text"),
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.prompt_early_stop", return_value={}),
+    ):
+        params = prompt_runner_params()
+
+    assert params["run_mode"] == "step"
+    assert params["max_steps"] == 500
+    assert params["max_epochs"] == 7
 
 
 def test_prompt_lr_scheduler_params_defaults_non_plateau_step_on():

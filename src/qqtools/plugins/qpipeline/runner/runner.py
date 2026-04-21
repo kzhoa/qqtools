@@ -341,9 +341,12 @@ def _resolve_train_runner_policy(
             raise ValueError("max_steps must be a positive integer when run_mode='step'.")
         effective_max_steps = max_steps
         if max_epochs is not None:
+            if not _is_positive_int(max_epochs):
+                raise ValueError("max_epochs must be a positive integer when specified in run_mode='step'.")
+            effective_max_epochs = max_epochs
             policy_warnings.append(
-                f"[run_mode=STEP] max_epochs={max_epochs} is ignored by mutual-exclusion policy; "
-                f"training will be controlled by max_steps={max_steps}."
+                f"[run_mode=STEP] max_epochs={max_epochs} is enabled as a secondary stopping boundary; "
+                f"training will stop when max_steps={max_steps} or max_epochs={max_epochs} is reached first."
             )
 
     return (
@@ -357,10 +360,10 @@ def _resolve_train_runner_policy(
 
 
 # Design Rationale: Boundary Policy Ownership
-# The orchestration layer (train_runner) owns the business policy for mutually
-# exclusive run boundaries:
-# - EPOCH mode keeps only max_epochs
-# - STEP mode keeps only max_steps
+# The orchestration layer (train_runner) owns the business policy for run
+# boundaries:
+# - EPOCH mode keeps max_epochs and ignores max_steps
+# - STEP mode requires max_steps and may also keep max_epochs as a secondary cap
 #
 # RunningAgent remains policy-agnostic and simply stops based on the concrete
 # boundaries passed in via RunConfig.

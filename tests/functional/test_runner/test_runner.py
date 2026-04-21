@@ -1340,6 +1340,9 @@ class TestTrainRunnerPolicy:
             ("epoch", "2", None, "max_epochs must be a positive integer"),
             ("epoch", 0, None, "max_epochs must be a positive integer"),
             ("epoch", -1, None, "max_epochs must be a positive integer"),
+            ("step", "2", 3, "max_epochs must be a positive integer when specified in run_mode='step'"),
+            ("step", 0, 3, "max_epochs must be a positive integer when specified in run_mode='step'"),
+            ("step", -1, 3, "max_epochs must be a positive integer when specified in run_mode='step'"),
             ("step", None, "3", "max_steps must be a positive integer"),
             ("step", None, 0, "max_steps must be a positive integer"),
             ("step", None, -2, "max_steps must be a positive integer"),
@@ -1406,7 +1409,7 @@ class TestTrainRunnerPolicy:
                 save_interval=save_interval,
             )
 
-    def test_keeps_mutual_exclusion_and_defaults(self):
+    def test_keeps_step_secondary_epoch_boundary_and_defaults(self):
         (
             resolved_run_mode,
             effective_eval_interval,
@@ -1425,9 +1428,10 @@ class TestTrainRunnerPolicy:
         assert resolved_run_mode == RunMode.STEP
         assert effective_eval_interval == 2
         assert effective_save_interval == 2
-        assert effective_max_epochs is None
+        assert effective_max_epochs == 5
         assert effective_max_steps == 4
         assert len(policy_warnings) == 1
+        assert "secondary stopping boundary" in policy_warnings[0]
 
 
 class TestPeriodicTrigger:

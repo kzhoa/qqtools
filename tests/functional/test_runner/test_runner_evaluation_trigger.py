@@ -230,3 +230,21 @@ class TestEvaluationTiming:
 
         # 验证最终状态
         assert agent.state.global_step == max_steps
+
+    def test_step_mode_can_stop_at_secondary_max_epochs_boundary(self, common_setup):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        num_batches_in_epoch = len(task.train_loader)
+
+        config = RunConfig(
+            run_mode=RunMode.STEP,
+            eval_interval=10,
+            max_steps=999,
+            max_epochs=1,
+            device=device,
+        )
+        agent = RunningAgent(model, task, loss_fn, optimizer, config=config, device=device, logger=logger)
+
+        agent.run()
+
+        assert agent.state.epoch == 1
+        assert agent.state.global_step == num_batches_in_epoch
