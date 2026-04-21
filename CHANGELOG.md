@@ -1,5 +1,10 @@
 # History
 
+## v1.2.14
+
+- feat: restore qpipeline step mode secondary epoch boundary support so `max_epochs` can again act as an optional secondary stop limit while `max_steps` remains required
+- feat: restructure qpipeline loss specs to support RMSE alongside the refreshed loss-entry configuration flow
+
 ## v1.2.13
 
 - feat: allow `run_mode=step` to treat `max_epochs` as an optional secondary stopping boundary while keeping `max_steps` required
