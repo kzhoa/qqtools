@@ -1,5 +1,10 @@
 # History
 
+## v1.2.12
+
+- docs: archive completed qexp truth-domain and derived-index pitch documents under `docs/archive/pitch`
+- docs: keep unfinished qexp machine-gpu-view-repair and PTY stdio contract proposals active under `docs/pitch`
+
 ## v1.2.11
 
 - breaking: remove qexp v1 compatibility shims and the transitional `qqtools.plugins.qexp.v2` package surface; only the unified shared-root qexp API/CLI remains
