@@ -1,5 +1,11 @@
 # History
 
+## v1.2.15
+
+- feat: expose `qt.ctx` as a first-class package instance for scoped runtime context access
+- fix: remove `qcontext` package-init circular import and isolate fresh `ContextVar` contexts from shared default-state pollution
+- test: add unit coverage for qcontext initialization, scoped merging, reset, and fresh-context isolation
+
 ## v1.2.14
 
 - feat: restore qpipeline step mode secondary epoch boundary support so `max_epochs` can again act as an optional secondary stop limit while `max_steps` remains required

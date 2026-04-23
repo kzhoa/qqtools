@@ -1,6 +1,9 @@
 # isort:skip_file
 from .version import __version__
 
+# first-class instance
+from .qcontext import ctx
+
 # first-class class
 from .qdict import qDict
 from .qtimer import Timer

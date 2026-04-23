@@ -12,6 +12,7 @@ pytest-cache-files*
 logs/
 .github/agents
 .codex
+.claude
 tmp*
 .tmp*
 
