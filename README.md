@@ -73,6 +73,41 @@ batch = qt.qDict({"input_ids": input_ids, "attention_mask": attention_mask})
 out = model(batch.input_ids)
 ```
 
+## Context scope and `qt.use_ctx`
+
+`qt.ctx` provides a lightweight scoped context. Values set inside `with qt.ctx(...)` are visible only in that scope and its nested calls, and the outer state is restored automatically when the block exits.
+
+Scope exit restores the previous key bindings. If you intentionally mutate a shared mutable object in place through the live context, that mutation is considered caller-managed behavior and may remain visible outside the block.
+
+```python
+import qqtools as qt
+
+with qt.ctx(dim=512):
+    print(qt.ctx.dim)  # 512
+
+print(qt.ctx.get("dim"))  # None
+```
+
+`@qt.use_ctx` is the simplest way to inject context values into a class constructor:
+
+```python
+import qqtools as qt
+
+
+@qt.use_ctx
+class AttentionLayer:
+    def __init__(self, dim=64, heads=8):
+        self.dim = dim
+        self.heads = heads
+
+
+with qt.ctx(dim=512, heads=16):
+    layer = AttentionLayer()
+    print(layer.dim, layer.heads)  # 512 16
+```
+
+Manual constructor arguments still take precedence over injected context values.
+
 ## qexp
 
 `qexp` is a lightweight experiment queue for Linux hosts.

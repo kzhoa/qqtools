@@ -2,7 +2,7 @@
 from .version import __version__
 
 # first-class instance
-from .qcontext import ctx
+from .qcontext import ctx, use_ctx
 
 # first-class class
 from .qdict import qDict
