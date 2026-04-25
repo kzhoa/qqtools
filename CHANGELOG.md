@@ -1,5 +1,11 @@
 # History
 
+## v1.2.16
+
+- feat: add `use_ctx` decorator for scoped runtime context mutation
+- docs: document the `qt.ctx` mutation contract in README
+- test: add unit coverage for decorator-based context mutation flows
+
 ## v1.2.15
 
 - feat: expose `qt.ctx` as a first-class package instance for scoped runtime context access
