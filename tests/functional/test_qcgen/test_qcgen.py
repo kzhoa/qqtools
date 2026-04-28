@@ -179,11 +179,19 @@ def test_runner_schema_requires_mode_specific_boundaries():
 
     assert "max_epochs" in epoch_branch["required"]
     assert "max_steps" not in epoch_branch["required"]
-    assert "max_steps" in step_branch["required"]
-    assert "anyOf" not in step_branch
+    assert "max_steps" not in step_branch["required"]
+    assert "anyOf" in step_branch
     assert step_branch["properties"]["max_steps"]["type"] == "integer"
     assert step_branch["properties"]["max_steps"]["minimum"] == 1
-    assert "max_epochs" not in step_branch.get("required", [])
+    assert step_branch["properties"]["max_epochs"]["type"] == "integer"
+    assert {"required": ["max_steps"]} in step_branch["anyOf"]
+    assert {"required": ["max_epochs"]} in step_branch["anyOf"]
+
+
+def test_runner_schema_describes_step_mode_max_steps_inference():
+    schema = _load_runner_schema()
+
+    assert "inferred from max_epochs" in schema["properties"]["max_steps"]["description"]
 
 
 def test_runner_schema_describes_step_mode_secondary_epoch_boundary():
@@ -297,6 +305,33 @@ def test_prompt_runner_params_accepts_step_mode_secondary_max_epochs():
     assert params["run_mode"] == "step"
     assert params["max_steps"] == 500
     assert params["max_epochs"] == 7
+
+
+def test_prompt_runner_params_allows_inferred_step_mode_max_steps():
+    from qqtools.plugins.qConfigGen.pts.runnerPt import RUN_MODE_DEFAULTS, prompt_runner_params
+
+    prompt_values = [
+        "step",
+        "",
+        "7",
+        "",
+        "",
+        "",
+        "",
+        "y",
+    ]
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.prompt", side_effect=prompt_values),
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.print_formatted_text"),
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.prompt_early_stop", return_value={}),
+    ):
+        params = prompt_runner_params()
+
+    assert params["run_mode"] == "step"
+    assert "max_steps" not in params
+    assert params["max_epochs"] == 7
+    assert RUN_MODE_DEFAULTS["step"]["max_steps"] != params.get("max_steps")
 
 
 def test_prompt_loss_params_accepts_rmse():

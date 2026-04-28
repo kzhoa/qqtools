@@ -15,7 +15,7 @@
         "max_epochs": {
             "type": "integer",
             "minimum": 1,
-            "description": "Maximum number of training epochs. Required when run_mode='epoch'. Optional secondary stopping boundary when run_mode='step'."
+            "description": "Maximum number of training epochs. Required when run_mode='epoch'. In step mode, at least one of max_epochs or max_steps must be provided; max_epochs can also act as a secondary stopping boundary."
         },
         "max_steps": {
             "type": [
@@ -24,7 +24,7 @@
             ],
             "minimum": 1,
             "default": null,
-            "description": "Maximum number of optimizer steps. Required when run_mode='step'. Ignored when run_mode='epoch'."
+            "description": "Maximum number of optimizer steps. In step mode, at least one of max_steps or max_epochs must be provided; max_steps may be omitted only when it can be inferred from max_epochs, train-loader length, and accum_grad. Ignored when run_mode='epoch'."
         },
         "eval_interval": {
             "type": "integer",
@@ -115,12 +115,27 @@
                 "max_steps": {
                     "type": "integer",
                     "minimum": 1
+                },
+                "max_epochs": {
+                    "type": "integer",
+                    "minimum": 1
                 }
             },
             "required": [
                 "run_mode",
-                "max_steps",
                 "early_stop"
+            ],
+            "anyOf": [
+                {
+                    "required": [
+                        "max_steps"
+                    ]
+                },
+                {
+                    "required": [
+                        "max_epochs"
+                    ]
+                }
             ]
         }
     ],

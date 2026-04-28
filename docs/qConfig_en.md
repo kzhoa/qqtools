@@ -538,15 +538,15 @@ runner:
 - **Characteristics**: Update every N samples (not limited to complete epochs)
 - **When to Use**: Very large datasets, online learning, precise step control
 - **Key Parameters**: `max_steps`, `eval_interval` (counted in steps)
-- **Note**: In this mode, `max_steps` is the required primary training boundary. If `max_epochs` is also specified, it becomes an optional secondary stopping boundary and training stops when either limit is reached first.
+- **Note**: In this mode, you must provide at least one of `max_steps` or `max_epochs`. `max_steps` can be provided explicitly, or inferred from `max_epochs`, `len(task.train_loader)`, and `accum_grad` when omitted. If `max_epochs` is specified, it also remains an epoch-level secondary stopping boundary, and training stops when either limit is reached first.
 
 ### Fields Summary
 
 | Field             | Required | Type    | Range      | Default | Description                   |
 | ----------------- | -------- | ------- | ---------- | ------- | ----------------------------- |
 | `run_mode`        | ✅        | String  | epoch/step | epoch   | Training mode                 |
-| `max_epochs`      | ⚠️        | Integer | ≥ 1        | None    | Required in epoch mode; optional secondary stop boundary in step mode |
-| `max_steps`       | ⚠️        | Integer | ≥ 1        | null    | Effective in step mode; ignored in epoch mode |
+| `max_epochs`      | ⚠️        | Integer | ≥ 1        | None    | Required in epoch mode; in step mode, at least one of `max_epochs` or `max_steps` must be provided |
+| `max_steps`       | ⚠️        | Integer | ≥ 1        | null    | Effective in step mode; in step mode, at least one of `max_steps` or `max_epochs` must be provided; ignored in epoch mode |
 | `eval_interval`   | ❌        | Integer | ≥ 1        | 1       | Evaluation interval           |
 | `save_interval`   | ❌        | Integer | ≥ 1        | null    | Regular save interval (units follow run_mode) |
 | `checkpoint.regular_latest_only` | ❌        | Boolean | true/false | true    | Keep only latest regular ckp  |
@@ -574,16 +574,16 @@ runner:
 - **max_epochs**:
   - Type: Integer, ≥ 1
   - Description: Maximum number of training epochs
-  - Required for epoch mode; optional secondary stopping boundary in step mode
+  - Required for epoch mode; in step mode, at least one of `max_epochs` or `max_steps` must be provided
 
 - **max_steps**:
   - Type: Integer or null
   - Description: Maximum number of training steps
-  - Required for step mode; ignored in epoch mode
+  - In step mode, at least one of `max_steps` or `max_epochs` must be provided; `max_steps` may be omitted only when it can be inferred from `max_epochs`, `len(task.train_loader)`, and `accum_grad`; ignored in epoch mode
 
 - **Logic**:
   - `run_mode='epoch'`: Controlled by `max_epochs`
-  - `run_mode='step'`: Controlled by required `max_steps`, and optionally also bounded by `max_epochs`
+  - `run_mode='step'`: Controlled by explicit `max_steps`, or by an inferred `max_steps` derived from `max_epochs`, train-loader length, and `accum_grad`; `max_epochs` can also remain as a secondary epoch cap
   - `max_steps` in epoch mode is ignored with a warning
 
 ### eval_interval (Evaluation Interval)
@@ -1046,12 +1046,14 @@ Certain fields in the configuration file have logical relationships with each ot
 | --------------------------- | -------- | ------------- | ------------- | --------------------------- |
 | Standard epoch mode         | epoch    | Specified     | Not specified | Stop at max_epochs          |
 | Standard step mode          | step     | Not specified | Specified     | Stop at max_steps           |
+| Inferred step mode          | step     | Specified     | Not specified | Infer `max_steps` from loader length and stop at the inferred step boundary or `max_epochs`, whichever comes first |
 | Dual-boundary step mode       | step   | Specified     | Specified     | Stop at whichever limit arrives first |
 | Misconfiguration in epoch mode | epoch | Not specified | Specified     | Warning: max_steps ignored  |
 
 **Special Behaviors**:
 
 - **max_epochs in step mode**: Specifying `max_epochs` in step mode enables an optional second stopping boundary; the run stops when either `max_steps` or `max_epochs` is reached first
+- **max_steps omitted in step mode**: If `max_epochs` is provided and `len(task.train_loader)` is available as a positive integer, the runner infers `max_steps` from `optimizer_steps_per_epoch * max_epochs`, where `optimizer_steps_per_epoch` also respects `accum_grad`
 - **max_steps in epoch mode**: Specifying `max_steps` in epoch mode is **ignored** by the framework; only `max_epochs` is effective
 
 #### Impact of run_mode on eval_interval Meaning

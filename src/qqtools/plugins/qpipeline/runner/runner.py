@@ -452,8 +452,8 @@ def train_runner(
         scheduler: Learning rate scheduler
         args: Object containing command-line arguments and other configurations.
               It is the single source for settings like device, rank, checkpoint, etc.
-        max_epochs: Maximum number of epochs
-        max_steps: Maximum number of steps
+        max_epochs: Maximum number of epochs. Required in epoch mode; optional secondary or inferred-step source in step mode.
+        max_steps: Maximum number of optimizer steps. Optional in step mode if it can be inferred from max_epochs and task.train_loader.
         clip_grad: Gradient clipping
         distributed: Whether to use distributed training
         save_dir: Directory to save checkpoints
