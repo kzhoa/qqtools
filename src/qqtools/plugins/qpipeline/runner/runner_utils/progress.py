@@ -563,11 +563,15 @@ class ProgressTracker:
         logger: Any,
         print_freq: int = 10,
         render_type: Optional[Literal["auto", "rich", "tqdm", "plain"]] = None,
+        rank: int = 0,
     ):
         """Initialize the LogListener with automatic fallback."""
 
         self.logger = logger
         self.print_freq = print_freq
+
+        if rank != 0:
+            render_type = "plain"
 
         # Resolve render type
         self.render_type, mode_change_message = resolve_render_mode(render_type, HAS_RICH, HAS_TQDM)

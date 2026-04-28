@@ -165,7 +165,7 @@ def test_train_runner_progress_tick_contains_batch_time(monkeypatch, base_args, 
     captured_progress_contexts = []
 
     class _CaptureProgressTracker:
-        def __init__(self, logger, print_freq=10, render_type=None):
+        def __init__(self, logger, print_freq=10, render_type=None, rank=0):
             return None
 
         def on_epoch_start(self, context):

@@ -268,7 +268,7 @@ def _prepare_training_session(
     agent.add_listener("on_validation_end", early_stop_listener.on_validation_end)
     agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
 
-    progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type)
+    progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type, rank=config.rank)
     agent.add_listener("on_epoch_start", progress_tracker.on_epoch_start)
     agent.add_listener("on_progress_tick", progress_tracker.on_progress_tick)
     agent.add_listener("on_table_update", progress_tracker.on_table_update)
