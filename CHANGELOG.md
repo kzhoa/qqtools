@@ -1,5 +1,10 @@
 # History
 
+## v1.2.17
+
+- feat: add qexp task `working_dir` support across submit/resubmit flows, batch manifests, subprocess execution, and tmux window startup directories
+- fix: allow qpipeline step mode to infer `max_steps` from `max_epochs` and loader length, including accumulated-gradient runs, while preserving secondary epoch stopping boundaries
+
 ## v1.2.16
 
 - feat: add `use_ctx` decorator for scoped runtime context mutation
