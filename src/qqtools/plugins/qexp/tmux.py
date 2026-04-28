@@ -63,15 +63,19 @@ def ensure_managed_session(
     role: str,
     *,
     initial_window_name: str,
+    start_directory: str | None = None,
 ):
     server = _get_server()
     session = _safe_get(server.sessions, session_name=session_name)
     if session is None:
-        session = server.new_session(
-            session_name=session_name,
-            window_name=initial_window_name,
-            detached=True,
-        )
+        kwargs = {
+            "session_name": session_name,
+            "window_name": initial_window_name,
+            "detached": True,
+        }
+        if start_directory is not None:
+            kwargs["start_directory"] = start_directory
+        session = server.new_session(**kwargs)
         _mark_session_role(session, role)
         return session
 
@@ -92,11 +96,12 @@ def ensure_internal_session():
     )
 
 
-def ensure_experiments_session():
+def ensure_experiments_session(start_directory: str | None = None):
     return ensure_managed_session(
         TMUX_SESSION_EXPERIMENTS,
         QQTOOLS_SESSION_ROLE_EXPERIMENTS,
         initial_window_name="shell",
+        start_directory=start_directory,
     )
 
 
@@ -125,18 +130,26 @@ def send_command_to_window(window_id: str, command: str) -> None:
     pane.send_keys(command, enter=True)
 
 
-def create_window_for_task(task_id: str, session_name: str = TMUX_SESSION_EXPERIMENTS) -> str:
+def create_window_for_task(
+    task_id: str,
+    session_name: str = TMUX_SESSION_EXPERIMENTS,
+    start_directory: str | None = None,
+) -> str:
     if session_name == TMUX_SESSION_EXPERIMENTS:
-        session = ensure_experiments_session()
+        session = ensure_experiments_session(start_directory=start_directory)
     else:
         session = ensure_managed_session(
             session_name,
             QQTOOLS_SESSION_ROLE_EXPERIMENTS,
             initial_window_name="shell",
+            start_directory=start_directory,
         )
 
     window_name = task_id[:48]
-    window = session.new_window(window_name=window_name, attach=False)
+    kwargs = {"window_name": window_name, "attach": False}
+    if start_directory is not None:
+        kwargs["start_directory"] = start_directory
+    window = session.new_window(**kwargs)
     return str(window.window_id)
 
 

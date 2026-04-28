@@ -89,6 +89,12 @@ log = logging.getLogger(__name__)
 RESUBMIT_ALLOWED_PHASES = frozenset({PHASE_FAILED, PHASE_CANCELLED})
 
 
+def _resolve_working_dir(working_dir: str | Path | None) -> str:
+    if working_dir is None:
+        return str(Path.cwd().resolve())
+    return str(Path(working_dir).expanduser().resolve())
+
+
 def _create_task(
     *,
     cfg: RootConfig,
@@ -100,6 +106,7 @@ def _create_task(
     group: str | None,
     machine_name: str,
     attempt: int,
+    working_dir: str | Path | None = None,
     lineage: TaskLineage | None = None,
 ) -> Task:
     now = utc_now_iso()
@@ -111,7 +118,11 @@ def _create_task(
         batch_id=batch_id,
         machine_name=machine_name,
         attempt=attempt,
-        spec=TaskSpec(command=list(command), requested_gpus=requested_gpus),
+        spec=TaskSpec(
+            command=list(command),
+            requested_gpus=requested_gpus,
+            working_dir=_resolve_working_dir(working_dir),
+        ),
         status=TaskStatus(phase=PHASE_QUEUED),
         runtime=TaskRuntime(),
         timestamps=TaskTimestamps(created_at=now, queued_at=now),
@@ -153,6 +164,7 @@ def _build_resubmit_operation(
     requested_gpus: int,
     name: str | None,
     group: str | None,
+    working_dir: str | Path | None = None,
 ) -> ResubmitOperation:
     prepared_task = _create_task(
         cfg=cfg,
@@ -164,6 +176,7 @@ def _build_resubmit_operation(
         group=group,
         machine_name=cfg.machine_name,
         attempt=1,
+        working_dir=working_dir,
     )
     return ResubmitOperation(
         meta=Meta.new(cfg.machine_name),
@@ -225,6 +238,7 @@ def submit(
     name: str | None = None,
     batch_id: str | None = None,
     group: str | None = None,
+    working_dir: str | Path | None = None,
 ) -> Task:
     validate_root_contract(cfg)
     if task_id is None:
@@ -241,6 +255,7 @@ def submit(
         group=group,
         machine_name=cfg.machine_name,
         attempt=1,
+        working_dir=working_dir,
     )
 
     ensure_shared_layout(cfg)
@@ -402,6 +417,7 @@ def resubmit(
     requested_gpus: int | None = None,
     name: str | None = None,
     group: str | None = None,
+    working_dir: str | Path | None = None,
 ) -> Task:
     validate_root_contract(cfg)
     validate_task_id(task_id)
@@ -427,7 +443,14 @@ def resubmit(
         resolved_gpus = (
             original.spec.requested_gpus if requested_gpus is None else requested_gpus
         )
-        TaskSpec(command=list(command), requested_gpus=resolved_gpus)
+        resolved_working_dir = (
+            original.spec.working_dir if working_dir is None else _resolve_working_dir(working_dir)
+        )
+        TaskSpec(
+            command=list(command),
+            requested_gpus=resolved_gpus,
+            working_dir=resolved_working_dir,
+        )
         operation = _build_resubmit_operation(
             cfg,
             original,
@@ -435,6 +458,7 @@ def resubmit(
             requested_gpus=resolved_gpus,
             name=resolved_name,
             group=resolved_group,
+            working_dir=resolved_working_dir,
         )
 
         ensure_shared_layout(cfg)
@@ -697,6 +721,7 @@ def _prepare_batch_task_specs(
 
         seen_task_ids.add(tid)
         gpus = entry.get("requested_gpus", defaults.get("requested_gpus", 1))
+        working_dir = entry.get("working_dir", defaults.get("working_dir"))
         prepared_tasks.append(
             Task(
                 meta=Meta.new(cfg.machine_name),
@@ -706,7 +731,11 @@ def _prepare_batch_task_specs(
                 batch_id=batch_id,
                 machine_name=cfg.machine_name,
                 attempt=1,
-                spec=TaskSpec(command=list(command), requested_gpus=gpus),
+                spec=TaskSpec(
+                    command=list(command),
+                    requested_gpus=gpus,
+                    working_dir=_resolve_working_dir(working_dir),
+                ),
                 status=TaskStatus(phase=PHASE_QUEUED),
                 runtime=TaskRuntime(),
                 timestamps=TaskTimestamps(created_at=now, queued_at=now),

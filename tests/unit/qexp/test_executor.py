@@ -49,9 +49,10 @@ class TestLaunchInWindow:
     def test_creates_window_and_sends_command(self, cfg):
         created = []
         sent = []
+        task = type("TaskStub", (), {"spec": type("SpecStub", (), {"working_dir": "/tmp/from-task"})()})()
 
-        def fake_create(task_id, session):
-            created.append((task_id, session))
+        def fake_create(task_id, session, start_directory):
+            created.append((task_id, session, start_directory))
             return f"@fake-{task_id}"
 
         def fake_send(window_id, command):
@@ -60,29 +61,32 @@ class TestLaunchInWindow:
         executor = Executor(
             create_window=fake_create,
             send_command=fake_send,
+            task_loader=lambda _cfg, _task_id: task,
         )
         window_id = executor.launch_in_window(cfg, "t1", session_name="test-session")
 
         assert window_id == "@fake-t1"
         assert len(created) == 1
-        assert created[0] == ("t1", "test-session")
+        assert created[0] == ("t1", "test-session", "/tmp/from-task")
         assert len(sent) == 1
         assert sent[0][0] == "@fake-t1"
         assert "qqtools.plugins.qexp.runner" in sent[0][1]
 
     def test_launch_task_routes_group_to_session(self, cfg):
         created = []
+        task = type("TaskStub", (), {"spec": type("SpecStub", (), {"working_dir": "/tmp/from-task"})()})()
 
-        def fake_create(task_id, session):
-            created.append((task_id, session))
+        def fake_create(task_id, session, start_directory):
+            created.append((task_id, session, start_directory))
             return f"@fake-{task_id}"
 
         executor = Executor(
             create_window=fake_create,
             send_command=lambda window_id, command: None,
+            task_loader=lambda _cfg, _task_id: task,
         )
         executor.launch_task(cfg, "t1", "contract_n_4and6")
-        assert created == [("t1", "contract_n_4and6")]
+        assert created == [("t1", "contract_n_4and6", "/tmp/from-task")]
 
     def test_cleanup_window(self):
         destroyed = []

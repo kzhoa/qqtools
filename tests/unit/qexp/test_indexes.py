@@ -44,7 +44,7 @@ def _make_task(task_id: str, phase: str = PHASE_QUEUED) -> Task:
         batch_id=None,
         machine_name="dev1",
         attempt=1,
-        spec=TaskSpec(command=["echo"], requested_gpus=1),
+        spec=TaskSpec(command=["echo"], requested_gpus=1, working_dir="/tmp/project"),
         status=TaskStatus(phase=phase),
         runtime=TaskRuntime(),
         timestamps=TaskTimestamps(created_at=now, queued_at=now),

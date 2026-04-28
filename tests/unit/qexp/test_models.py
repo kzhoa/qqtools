@@ -198,20 +198,35 @@ class TestMeta:
 
 class TestTaskSpec:
     def test_valid(self):
-        s = TaskSpec(command=["python", "train.py"], requested_gpus=2)
+        s = TaskSpec(
+            command=["python", "train.py"],
+            requested_gpus=2,
+            working_dir="/tmp/project",
+        )
         assert s.requested_gpus == 2
 
     def test_empty_command(self):
         with pytest.raises(ValueError):
-            TaskSpec(command=[], requested_gpus=1)
+            TaskSpec(command=[], requested_gpus=1, working_dir="/tmp/project")
 
     def test_zero_gpus(self):
         with pytest.raises(ValueError):
-            TaskSpec(command=["echo"], requested_gpus=0)
+            TaskSpec(command=["echo"], requested_gpus=0, working_dir="/tmp/project")
+
+    def test_rejects_relative_working_dir(self):
+        with pytest.raises(ValueError):
+            TaskSpec(command=["echo"], requested_gpus=1, working_dir="relative/path")
 
     def test_round_trip(self):
-        s = TaskSpec(command=["a", "b"], requested_gpus=1)
-        assert TaskSpec.from_dict(s.to_dict()).command == ["a", "b"]
+        s = TaskSpec(command=["a", "b"], requested_gpus=1, working_dir="/tmp/project")
+        restored = TaskSpec.from_dict(s.to_dict())
+        assert restored.command == ["a", "b"]
+        assert restored.working_dir == "/tmp/project"
+
+    def test_from_dict_without_working_dir_defaults(self):
+        data = {"command": ["echo"], "requested_gpus": 1}
+        s = TaskSpec.from_dict(data)
+        assert s.working_dir == "/"
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +244,11 @@ def _make_task(**overrides) -> Task:
         batch_id=None,
         machine_name="dev1",
         attempt=1,
-        spec=TaskSpec(command=["python", "train.py"], requested_gpus=1),
+        spec=TaskSpec(
+            command=["python", "train.py"],
+            requested_gpus=1,
+            working_dir="/tmp/project",
+        ),
         status=TaskStatus(phase=PHASE_QUEUED),
         runtime=TaskRuntime(),
         timestamps=TaskTimestamps(created_at=now, queued_at=now),

@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-SCHEMA_VERSION = "4.0"
+SCHEMA_VERSION = "4.1"
 ROOT_SCOPE_PROJECT = "project"
 ROOT_SCOPES = (ROOT_SCOPE_PROJECT,)
 
@@ -283,6 +283,7 @@ class Meta:
 class TaskSpec:
     command: list[str]
     requested_gpus: int
+    working_dir: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.command, list) or not self.command:
@@ -291,13 +292,19 @@ class TaskSpec:
             raise ValueError("command entries must be strings.")
         if not isinstance(self.requested_gpus, int) or self.requested_gpus <= 0:
             raise ValueError("requested_gpus must be a positive integer.")
+        if not isinstance(self.working_dir, str) or not self.working_dir:
+            raise ValueError("working_dir must be a non-empty string.")
+        if not self.working_dir.startswith("/"):
+            raise ValueError("working_dir must be an absolute path.")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TaskSpec:
-        return cls(**data)
+        d = dict(data)
+        d.setdefault("working_dir", "/")
+        return cls(**d)
 
 
 @dataclass(slots=True)

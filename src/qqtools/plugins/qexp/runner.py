@@ -164,6 +164,7 @@ def run_task(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 env=child_env,
+                cwd=task.spec.working_dir,
             )
         except Exception as exc:
             _finalize_task(

@@ -51,7 +51,11 @@ def _make_starting_task(cfg, task_id: str = "t1") -> Task:
         batch_id=None,
         machine_name="dev1",
         attempt=1,
-        spec=TaskSpec(command=["echo", "hello"], requested_gpus=1),
+        spec=TaskSpec(
+            command=["echo", "hello"],
+            requested_gpus=1,
+            working_dir=str(cfg.project_root),
+        ),
         status=TaskStatus(phase=PHASE_STARTING),
         runtime=TaskRuntime(assigned_gpus=[0]),
         timestamps=TaskTimestamps(created_at=now, queued_at=now, started_at=now),
@@ -164,7 +168,7 @@ class _FakePopen:
 
 class TestRunTask:
     def test_successful_task(self, cfg):
-        task = _make_starting_task(cfg)
+        _make_starting_task(cfg)
         popen = _FakePopen(exit_code=0, output=b"ok\n")
 
         rc = run_task(cfg, "t1", popen_factory=popen)
@@ -176,7 +180,7 @@ class TestRunTask:
         assert loaded.timestamps.finished_at is not None
 
     def test_failed_task(self, cfg):
-        task = _make_starting_task(cfg)
+        _make_starting_task(cfg)
         popen = _FakePopen(exit_code=1)
 
         rc = run_task(cfg, "t1", popen_factory=popen)
@@ -198,7 +202,11 @@ class TestRunTask:
             batch_id=None,
             machine_name="dev1",
             attempt=1,
-            spec=TaskSpec(command=["echo"], requested_gpus=1),
+            spec=TaskSpec(
+                command=["echo"],
+                requested_gpus=1,
+                working_dir=str(cfg.project_root),
+            ),
             status=TaskStatus(phase=PHASE_QUEUED),
             runtime=TaskRuntime(),
             timestamps=TaskTimestamps(created_at=now, queued_at=now),
@@ -211,7 +219,7 @@ class TestRunTask:
             run_task(cfg, "t-bad")
 
     def test_sets_wrapper_pid(self, cfg):
-        task = _make_starting_task(cfg)
+        _make_starting_task(cfg)
         popen = _FakePopen(exit_code=0)
 
         run_task(cfg, "t1", popen_factory=popen)
@@ -222,7 +230,7 @@ class TestRunTask:
         assert loaded.runtime.wrapper_pid is not None
 
     def test_creates_log_file(self, cfg):
-        task = _make_starting_task(cfg)
+        _make_starting_task(cfg)
         popen = _FakePopen(exit_code=0, output=b"logged output\n")
 
         run_task(cfg, "t1", popen_factory=popen)
@@ -233,7 +241,7 @@ class TestRunTask:
         assert b"logged output" in log_path.read_bytes()
 
     def test_launch_failure_marks_failed(self, cfg):
-        task = _make_starting_task(cfg)
+        _make_starting_task(cfg)
 
         def bad_popen(*args, **kwargs):
             raise OSError("cannot launch")
@@ -244,3 +252,11 @@ class TestRunTask:
         loaded = load_task(cfg, "t1")
         assert loaded.status.phase == PHASE_FAILED
         assert "launch_failed" in (loaded.status.reason or "")
+
+    def test_launches_child_in_task_working_dir(self, cfg):
+        _make_starting_task(cfg)
+        popen = _FakePopen(exit_code=0)
+
+        run_task(cfg, "t1", popen_factory=popen)
+
+        assert popen.kwargs["cwd"] == str(cfg.project_root)

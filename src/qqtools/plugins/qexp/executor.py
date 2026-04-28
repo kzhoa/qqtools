@@ -3,8 +3,7 @@ from __future__ import annotations
 
 import shlex
 import sys
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Callable
 
 from .tmux import (
@@ -15,16 +14,18 @@ from .tmux import (
 )
 from .layout import RootConfig
 from .models import tmux_session_for_group
+from .storage import load_task
 
 
 @dataclass(slots=True)
 class Executor:
     """Builds and launches runner commands in tmux windows."""
 
-    create_window: Callable[[str, str], str] = create_window_for_task
+    create_window: Callable[[str, str, str | None], str] = create_window_for_task
     send_command: Callable[[str, str], None] = send_command_to_window
     destroy_window: Callable[[str | None], None] = kill_window
     check_window: Callable[[str | None], bool] = window_exists
+    task_loader: Callable[[RootConfig, str], object] = load_task
 
     def build_runner_command(
         self,
@@ -58,7 +59,8 @@ class Executor:
         Returns the tmux window_id.
         """
         resolved_session = session_name or "experiments"
-        window_id = self.create_window(task_id, resolved_session)
+        task = self.task_loader(cfg, task_id)
+        window_id = self.create_window(task_id, resolved_session, task.spec.working_dir)
         command = self.build_runner_command(cfg, task_id)
         self.send_command(window_id, command)
         return window_id

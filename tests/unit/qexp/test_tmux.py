@@ -41,6 +41,7 @@ class _FakeSession:
         self._role = role
         self.windows_list = [_FakeWindow("@base", "shell")]
         self.windows = _FakeCollection(self.windows_list, "window_name")
+        self.last_window_start_directory = None
 
     def show_option(self, _name: str):
         return self._role
@@ -48,7 +49,13 @@ class _FakeSession:
     def set_option(self, _name: str, value: str):
         self._role = value
 
-    def new_window(self, window_name: str, attach: bool = False):
+    def new_window(
+        self,
+        window_name: str,
+        attach: bool = False,
+        start_directory: str | None = None,
+    ):
+        self.last_window_start_directory = start_directory
         window = _FakeWindow(f"@{len(self.windows_list) + 1}", window_name)
         self.windows_list.append(window)
         return window
@@ -60,8 +67,16 @@ class _FakeServer:
         self.windows_list = windows or []
         self.sessions = _FakeCollection(self.sessions_list, "session_name")
         self.windows = _FakeCollection(self.windows_list, "window_id")
+        self.last_session_start_directory = None
 
-    def new_session(self, session_name: str, window_name: str, detached: bool = True):
+    def new_session(
+        self,
+        session_name: str,
+        window_name: str,
+        detached: bool = True,
+        start_directory: str | None = None,
+    ):
+        self.last_session_start_directory = start_directory
         session = _FakeSession(session_name)
         session.windows_list = [_FakeWindow("@new", window_name)]
         session.windows = _FakeCollection(session.windows_list, "window_name")
@@ -102,7 +117,12 @@ def test_create_window_for_task_uses_custom_session(monkeypatch):
     server = _FakeServer(sessions=[session])
     monkeypatch.setattr(tmux, "_get_server", lambda: server)
 
-    window_id = tmux.create_window_for_task("task-demo", session_name="custom")
+    window_id = tmux.create_window_for_task(
+        "task-demo",
+        session_name="custom",
+        start_directory="/tmp/project",
+    )
 
     assert window_id == "@2"
     assert session.windows_list[-1].window_name == "task-demo"
+    assert session.last_window_start_directory == "/tmp/project"

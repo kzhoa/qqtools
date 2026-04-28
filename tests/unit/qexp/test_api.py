@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -54,6 +55,7 @@ class TestSubmit:
         assert t.status.phase == PHASE_QUEUED
         assert t.machine_name == "dev1"
         assert t.spec.command == ["python", "train.py"]
+        assert t.spec.working_dir == str(Path.cwd().resolve())
         assert t.meta.revision == 1
 
     def test_explicit_task_id(self, cfg):
@@ -271,6 +273,18 @@ class TestResubmit:
         assert new.lineage.retry_of is None
         assert new.status.phase == PHASE_QUEUED
 
+    def test_resubmit_inherits_original_working_dir(self, cfg):
+        original = self._make_terminal_task(cfg, PHASE_FAILED)
+        new = resubmit(cfg, original.task_id, command=["echo", "retry"])
+
+        assert new.spec.working_dir == original.spec.working_dir
+
+    def test_resubmit_overrides_working_dir(self, cfg):
+        original = self._make_terminal_task(cfg, PHASE_FAILED, task_id="t-override")
+        new = resubmit(cfg, "t-override", command=["echo"], working_dir="/tmp/new-dir")
+
+        assert new.spec.working_dir == "/tmp/new-dir"
+
     def test_resubmit_rejects_non_terminal_task(self, cfg):
         submit(cfg, command=["echo"], task_id="live1")
 
@@ -415,6 +429,26 @@ class TestBatchSubmit:
         })
         batch = batch_submit(cfg, manifest)
         assert load_batch(cfg, batch.batch_id).task_ids == batch.task_ids
+
+    def test_batch_working_dir_from_defaults(self, cfg, tmp_path):
+        manifest = self._write_manifest(tmp_path, {
+            "defaults": {"working_dir": "/tmp/batch-default"},
+            "tasks": [{"task_id": "wd1", "command": ["echo"]}],
+        })
+        batch = batch_submit(cfg, manifest)
+        assert load_task(cfg, "wd1").spec.working_dir == "/tmp/batch-default"
+
+    def test_batch_working_dir_per_task_overrides_default(self, cfg, tmp_path):
+        manifest = self._write_manifest(tmp_path, {
+            "defaults": {"working_dir": "/tmp/batch-default"},
+            "tasks": [
+                {"task_id": "wd2", "command": ["echo"], "working_dir": "/tmp/per-task"},
+                {"task_id": "wd3", "command": ["echo"]},
+            ],
+        })
+        batch = batch_submit(cfg, manifest)
+        assert load_task(cfg, "wd2").spec.working_dir == "/tmp/per-task"
+        assert load_task(cfg, "wd3").spec.working_dir == "/tmp/batch-default"
 
     def test_batch_group_inheritance_and_override(self, cfg, tmp_path):
         manifest = self._write_manifest(tmp_path, {

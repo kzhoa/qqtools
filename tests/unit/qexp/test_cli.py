@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 import yaml
@@ -72,6 +73,21 @@ class TestSubmit:
             "submit", "--group", "contract_n_4and6", "--", "echo"
         ])
         assert ret == 0
+
+    def test_submit_with_cwd_override(self, cfg, tmp_path, capsys):
+        from qqtools.plugins.qexp.cli import main as cli_main
+        from qqtools.plugins.qexp.storage import load_task
+
+        run_dir = tmp_path / "run-dir"
+        run_dir.mkdir()
+
+        ret = cli_main(_base_args(cfg) + [
+            "submit", "--cwd", str(run_dir), "--task-id", "with-cwd", "--", "echo"
+        ])
+        assert ret == 0
+        capsys.readouterr()
+        task = load_task(cfg, "with-cwd")
+        assert task.spec.working_dir == str(run_dir.resolve())
 
     def test_submit_no_command_fails(self, cfg):
         from qqtools.plugins.qexp.cli import main as cli_main

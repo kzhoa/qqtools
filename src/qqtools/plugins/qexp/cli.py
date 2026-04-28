@@ -134,6 +134,12 @@ def build_parser() -> argparse.ArgumentParser:
     submit_p.add_argument("--name", type=str, default=None)
     submit_p.add_argument("--group", type=str, default=None)
     submit_p.add_argument("--gpus", type=int, default=1)
+    submit_p.add_argument(
+        "--cwd",
+        type=str,
+        default=None,
+        help="Override the task working directory. Defaults to the current directory at submit time.",
+    )
     submit_p.add_argument("argv", nargs=argparse.REMAINDER)
 
     # cancel
@@ -151,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
     resubmit_p.add_argument("--name", type=str, default=None)
     resubmit_p.add_argument("--group", type=str, default=None)
     resubmit_p.add_argument("--gpus", type=int, default=None)
+    resubmit_p.add_argument(
+        "--cwd",
+        type=str,
+        default=None,
+        help="Override the task working directory. Defaults to the current directory at resubmit time.",
+    )
     resubmit_p.add_argument("argv", nargs=argparse.REMAINDER)
 
     # batch-submit
@@ -368,6 +380,7 @@ def handle_submit(args: argparse.Namespace) -> int:
         task_id=args.task_id,
         name=args.name,
         group=args.group,
+        working_dir=args.cwd,
     )
     print(task.task_id)
     return 0
@@ -396,6 +409,7 @@ def handle_resubmit(args: argparse.Namespace) -> int:
         requested_gpus=args.gpus,
         name=args.name,
         group=args.group,
+        working_dir=args.cwd,
     )
     print(task.task_id)
     return 0
