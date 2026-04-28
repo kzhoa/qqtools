@@ -1,5 +1,9 @@
 # History
 
+## v1.2.18
+
+- fix: suppress rich/tqdm progress rendering on non-rank-0 DDP processes to prevent garbled console output in multi-GPU training
+
 ## v1.2.17
 
 - feat: add qexp task `working_dir` support across submit/resubmit flows, batch manifests, subprocess execution, and tmux window startup directories
