@@ -57,6 +57,106 @@ def test_train_runner_step_mode_dual_boundaries(base_args, tiny_task, tiny_model
     assert result["final_step"] >= 6
     assert result["final_epoch"] <= 3
     assert result["best_monitored_metric"] is not None
+    log_text = (Path(args.log_dir) / "debug.log").read_text(encoding="utf-8")
+    assert "secondary stopping boundary" in log_text
+
+
+def test_train_runner_step_mode_infers_max_steps_from_max_epochs(base_args, tiny_task, tiny_model):
+    args = base_args.copy()
+    args.runner.early_stop.patience = 999
+
+    loss_fn = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(tiny_model.parameters(), lr=1.0e-3)
+    expected_max_steps = len(tiny_task.train_loader) * 3
+
+    result = train_runner(
+        model=tiny_model,
+        task=tiny_task,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        args=args,
+        run_mode="step",
+        max_epochs=3,
+        max_steps=None,
+        eval_interval=2,
+        save_dir=args.log_dir,
+        print_freq=3,
+    )
+
+    assert result["terminal_event"]["reason"] == "max_steps"
+    assert result["final_step"] == expected_max_steps
+    log_text = (Path(args.log_dir) / "debug.log").read_text(encoding="utf-8")
+    assert f"inferred max_steps={expected_max_steps}" in log_text
+    assert "secondary stopping boundary" in log_text
+
+
+def test_train_runner_step_mode_infers_max_steps_with_accum_grad(base_args, tiny_task, tiny_model):
+    args = base_args.copy()
+    args.runner.early_stop.patience = 999
+
+    loss_fn = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(tiny_model.parameters(), lr=1.0e-3)
+    train_loader_batches = len(tiny_task.train_loader)
+    accum_grad = 2
+    expected_max_steps = ((train_loader_batches + accum_grad - 1) // accum_grad) * 3
+
+    result = train_runner(
+        model=tiny_model,
+        task=tiny_task,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        args=args,
+        run_mode="step",
+        max_epochs=3,
+        max_steps=None,
+        eval_interval=2,
+        accum_grad=accum_grad,
+        save_dir=args.log_dir,
+        print_freq=3,
+    )
+
+    assert result["terminal_event"]["reason"] == "max_steps"
+    assert result["final_step"] == expected_max_steps
+    assert result["final_epoch"] <= 3
+    log_text = (Path(args.log_dir) / "debug.log").read_text(encoding="utf-8")
+    assert f"inferred max_steps={expected_max_steps}" in log_text
+    assert "accum_grad=2" in log_text
+    assert "secondary stopping boundary" in log_text
+
+
+def test_train_runner_step_mode_infer_requires_train_loader_len(base_args, tiny_model):
+    args = base_args.copy()
+    args.runner.early_stop.patience = 999
+
+    class NoLenLoader:
+        def __iter__(self):
+            return iter(())
+
+    class NoLenTask:
+        train_loader = NoLenLoader()
+        val_loader = None
+        test_loader = None
+
+    loss_fn = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(tiny_model.parameters(), lr=1.0e-3)
+
+    with pytest.raises(
+        ValueError,
+        match="provide max_steps explicitly or ensure len\\(task.train_loader\\) is available as a positive integer",
+    ):
+        train_runner(
+            model=tiny_model,
+            task=NoLenTask(),
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            args=args,
+            run_mode="step",
+            max_epochs=3,
+            max_steps=None,
+            eval_interval=2,
+            save_dir=args.log_dir,
+            print_freq=3,
+        )
 
 
 def test_train_runner_regular_checkpoint_saving(base_args, tiny_task, tiny_model, tmp_path):

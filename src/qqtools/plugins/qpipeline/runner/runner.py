@@ -56,6 +56,10 @@ def _qconfig_get(config: Any, key: str, default: Any = None) -> Any:
     return getattr(config, key, default)
 
 
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
 def _is_oom_exception(exception: BaseException) -> bool:
     if isinstance(exception, torch.cuda.OutOfMemoryError):
         return True
@@ -305,9 +309,6 @@ def _resolve_train_runner_policy(
 ) -> Tuple[RunMode, int, int, Optional[int], Optional[int], List[str]]:
     """Resolve train-runner-owned policy fields into effective runtime values."""
 
-    def _is_positive_int(value: Any) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool) and value >= 1
-
     if run_mode is None:
         raise ValueError("run_mode cannot be None")
 
@@ -359,11 +360,60 @@ def _resolve_train_runner_policy(
     )
 
 
+def _resolve_step_mode_max_steps(
+    run_mode: Union[str, RunMode],
+    task: qTaskBase,
+    max_epochs: Optional[int],
+    max_steps: Optional[int],
+    accum_grad: Optional[int],
+) -> Tuple[Optional[int], Optional[int], List[str]]:
+    if run_mode is None or RunMode(run_mode) != RunMode.STEP:
+        return max_steps, max_epochs, []
+
+    if max_steps is not None:
+        return max_steps, max_epochs, []
+
+    if max_epochs is None:
+        return None, max_epochs, []
+
+    if not _is_positive_int(max_epochs):
+        raise ValueError(
+            f"max_epochs={max_epochs!r} is not a positive integer; "
+            "cannot infer max_steps when run_mode='step'."
+        )
+
+    effective_accum_grad = 1 if accum_grad is None else accum_grad
+    if not _is_positive_int(effective_accum_grad):
+        raise ValueError(
+            f"accum_grad={accum_grad!r} is not a positive integer; "
+            "cannot infer max_steps when run_mode='step'."
+        )
+
+    try:
+        train_loader_length = len(task.train_loader)
+    except (AttributeError, TypeError):
+        train_loader_length = None
+
+    if not _is_positive_int(train_loader_length):
+        raise ValueError(
+            "max_steps cannot be inferred when run_mode='step'; "
+            "provide max_steps explicitly or ensure len(task.train_loader) is available as a positive integer."
+        )
+
+    optimizer_steps_per_epoch = (train_loader_length + effective_accum_grad - 1) // effective_accum_grad
+    inferred_max_steps = optimizer_steps_per_epoch * max_epochs
+    return inferred_max_steps, max_epochs, [
+        f"[run_mode=STEP] max_steps is not provided; inferred max_steps={inferred_max_steps} "
+        f"from len(task.train_loader)={train_loader_length}, accum_grad={effective_accum_grad}, "
+        f"and max_epochs={max_epochs}."
+    ]
+
+
 # Design Rationale: Boundary Policy Ownership
 # The orchestration layer (train_runner) owns the business policy for run
 # boundaries:
 # - EPOCH mode keeps max_epochs and ignores max_steps
-# - STEP mode requires max_steps and may also keep max_epochs as a secondary cap
+# - STEP mode requires a concrete max_steps and may also keep max_epochs as a secondary cap
 #
 # RunningAgent remains policy-agnostic and simply stops based on the concrete
 # boundaries passed in via RunConfig.
@@ -448,6 +498,14 @@ def train_runner(
     if early_stop_config is None:
         early_stop_config = {}
 
+    effective_input_max_steps, effective_input_max_epochs, inferred_max_step_warnings = _resolve_step_mode_max_steps(
+        run_mode=run_mode,
+        task=task,
+        max_epochs=max_epochs,
+        max_steps=max_steps,
+        accum_grad=accum_grad,
+    )
+
     (
         resolved_run_mode,
         effective_eval_interval,
@@ -457,11 +515,12 @@ def train_runner(
         boundary_policy_warnings,
     ) = _resolve_train_runner_policy(
         run_mode=run_mode,
-        max_epochs=max_epochs,
-        max_steps=max_steps,
+        max_epochs=effective_input_max_epochs,
+        max_steps=effective_input_max_steps,
         eval_interval=1 if eval_interval is None else eval_interval,
         save_interval=save_interval,
     )
+    boundary_policy_warnings = [*inferred_max_step_warnings, *boundary_policy_warnings]
     # Configuration fallback logic
     if not checkpoint_config:
         checkpoint_config = {
@@ -772,4 +831,3 @@ def infer_runner(
         raise
 
     return all_results
-

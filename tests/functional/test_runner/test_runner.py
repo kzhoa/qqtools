@@ -6,6 +6,7 @@ import argparse
 import csv
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict
 from unittest.mock import Mock
 
@@ -22,6 +23,7 @@ from qqtools.plugins.qpipeline.runner.runner import (
     RunningAgent,
     SheetLoggerListener,
     _is_periodic_trigger,
+    _resolve_step_mode_max_steps,
     _resolve_train_runner_policy,
     train_runner,
 )
@@ -1364,25 +1366,22 @@ class TestTrainRunnerPolicy:
                 save_interval=1,
             )
 
-    @pytest.mark.parametrize(
-        "run_mode,max_epochs,max_steps,expected_message",
-        [
-            ("epoch", None, 5, "max_epochs must be specified when run_mode='epoch'"),
-            ("step", 5, None, "max_steps must be specified when run_mode='step'"),
-        ],
-    )
-    def test_requires_boundary_for_selected_mode(
-        self,
-        run_mode,
-        max_epochs,
-        max_steps,
-        expected_message,
-    ):
-        with pytest.raises(ValueError, match=expected_message):
+    def test_requires_max_epochs_for_epoch_mode(self):
+        with pytest.raises(ValueError, match="max_epochs must be specified when run_mode='epoch'"):
             _resolve_train_runner_policy(
-                run_mode=run_mode,
-                max_epochs=max_epochs,
-                max_steps=max_steps,
+                run_mode="epoch",
+                max_epochs=None,
+                max_steps=5,
+                eval_interval=1,
+                save_interval=1,
+            )
+
+    def test_requires_max_steps_for_step_mode(self):
+        with pytest.raises(ValueError, match="max_steps must be specified when run_mode='step'"):
+            _resolve_train_runner_policy(
+                run_mode="step",
+                max_epochs=None,
+                max_steps=None,
                 eval_interval=1,
                 save_interval=1,
             )
@@ -1432,6 +1431,61 @@ class TestTrainRunnerPolicy:
         assert effective_max_steps == 4
         assert len(policy_warnings) == 1
         assert "secondary stopping boundary" in policy_warnings[0]
+
+    def test_keeps_step_mode_with_explicit_max_steps_and_no_epoch_cap(self):
+        (
+            resolved_run_mode,
+            effective_eval_interval,
+            effective_save_interval,
+            effective_max_epochs,
+            effective_max_steps,
+            policy_warnings,
+        ) = _resolve_train_runner_policy(
+            run_mode="step",
+            max_epochs=None,
+            max_steps=4,
+            eval_interval=2,
+            save_interval=None,
+        )
+
+        assert resolved_run_mode == RunMode.STEP
+        assert effective_eval_interval == 2
+        assert effective_save_interval == 2
+        assert effective_max_epochs is None
+        assert effective_max_steps == 4
+        assert policy_warnings == []
+
+    def test_infers_step_mode_max_steps_with_accum_grad_and_keeps_epoch_cap(self):
+        task = SimpleTask(num_samples=100, num_features=10)
+
+        inferred_max_steps, retained_max_epochs, warnings = _resolve_step_mode_max_steps(
+            run_mode="step",
+            task=task,
+            max_epochs=3,
+            max_steps=None,
+            accum_grad=2,
+        )
+
+        expected_steps = ((len(task.train_loader) + 2 - 1) // 2) * 3
+        assert inferred_max_steps == expected_steps
+        assert retained_max_epochs == 3
+        assert len(warnings) == 1
+        assert "accum_grad=2" in warnings[0]
+
+    def test_infer_step_mode_max_steps_requires_train_loader_len(self):
+        task = SimpleNamespace(train_loader=object())
+
+        with pytest.raises(
+            ValueError,
+            match="provide max_steps explicitly or ensure len\\(task.train_loader\\) is available as a positive integer",
+        ):
+            _resolve_step_mode_max_steps(
+                run_mode="step",
+                task=task,
+                max_epochs=3,
+                max_steps=None,
+                accum_grad=1,
+            )
 
 
 class TestPeriodicTrigger:
@@ -1576,7 +1630,6 @@ class TestRunningAgentPerformanceOptimizations:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
 
 
 
