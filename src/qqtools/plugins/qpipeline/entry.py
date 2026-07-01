@@ -16,20 +16,16 @@ def create_pipeline_class(prepare_model_func, prepare_task_func, base_pipeline_c
     return DynamicPipelineClass
 
 
-def general_train(prepare_model, prepare_task):
+def create_pipeline(prepare_model, prepare_task):
     args = prepare_cmd_args()
-    assert args.test == False
-
-    model = prepare_model(args)
-    print("model", get_param_stats(model))
+    mode = "test" if args.test else "train"
 
     MyPipeline: qPipeline = create_pipeline_class(prepare_model, prepare_task)
+    pipe = MyPipeline(args, mode=mode)
 
-    pipe = MyPipeline(args, train=True, model=model)
-    model.to(args.device)
+    pipe.logger.info(f"ddp: {args.distributed}, rank: {args.rank}")
 
-    print("ddp:", args.distributed, "rank:", args.rank)
-
-    if hasattr(pipe.task, "pipe_middle_ware"):
-        pipe.task.pipe_middle_ware(pipe)
+    if pipe.model is not None:
+        target_model = pipe.model.module if hasattr(pipe.model, "module") else pipe.model
+        pipe.logger.info(f"model {get_param_stats(target_model)}")
     return pipe

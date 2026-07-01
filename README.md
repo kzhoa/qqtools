@@ -1,4 +1,3 @@
-
 <div style="
   position: relative;
   width: 100%;
@@ -20,130 +19,113 @@
 </div>
 
 # ✨qqtools✨
-[![PyPI Downloads](https://static.pepy.tech/personalized-badge/qqtools?period=total&units=ABBREVIATION&left_color=GREY&right_color=BRIGHTGREEN&left_text=PyPI+Downloads)](https://pepy.tech/projects/qqtools) ![PyPI - Monthly Downloads](https://img.shields.io/pypi/dm/qqtools?color=3cb371&label=Monthly) ![Python version](https://img.shields.io/badge/python->=3.11-blue)  
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/qqtools?period=total&units=ABBREVIATION&left_color=GREY&right_color=BRIGHTGREEN&left_text=PyPI+Downloads)](https://pepy.tech/projects/qqtools) ![PyPI - Monthly Downloads](https://img.shields.io/pypi/dm/qqtools?color=3cb371&label=Monthly) ![Python version](https://img.shields.io/badge/python->=3.11-blue)
 
-A lightweight library, crafted and battle-tested daily by *qq*, to make PyTorch life a little easier. 
+A lightweight library, crafted and battle-tested daily by *qq*, to make PyTorch life a little easier.
+
+It started from the frustration of PyG’s tightly coupled CUDA ecosystem—carefully matching CUDA versions, installing wheel builds from the official index, and repeatedly reinstalling dependencies like `torch-scatter` whenever anything changed. This project brings back a clean, one-line `pip install ...` experience, with no need to worry about CUDA compatibility.
 
 I’ve gathered the repetitive parts of my day-to-day work and refined them into this slim utility library.
-It serves as my personal toolkit for handling data, training, and experiments, designed to keep projects moving fast with cleaner code and smoother workflows (and hopefully yours too!).
+It serves as a unified toolkit for handling data, training, and experiments, designed to keep projects moving fast with cleaner code and smoother workflows.
 
->Built for me, shared for you. 
+>Built for me, shared for you.
+
+## What it includes
+
+At its core, `qqtools` is a collection of small utilities I use around PyTorch projects:
+
+- data containers such as `qDict` and `qData`
+- dataset and dataloader helpers such as `qDictDataset` and `qDictDataloader`
+- small neural network helpers such as `qMLP`
+- a lightweight training framework, `qpipeline`
+- a command-line experiment queue for Linux, `qexp`
+- config and serialization helpers for YAML, JSON, pickle, and LMDB
+
+At the core, it is still a practical toolbox for the repetitive parts around experiments.
+
+
+## Install
 
 
 
-# Requirements
-
-- torch>=2.0 for full functionality 
-  - Some components maintain backward compatibility with torch==1.x
-  - Recommended: torch>=2.4
-- pyyaml>=6.0
-  - Recommended to use YAML format for all configuration files.
-
-This provides a unified approach to drive and manage all workflow operations.
-
-To get started quickly, install it via pip:
 ```bash
+# Core install
 pip install qqtools
-```
 
-Install with full features:
-```bash
+# Full install
 pip install qqtools[full]
-```
 
-
-# Data Format Support
-
-Non-torch formats:
-```bash
-qDict : Enhanced of basic Dict.
-qScalaDict : Dict[str, num]. A dict that maps str to scala;
-qListData : List[dict]. A list of dicts.
-```
-
-Torch-related data formats
-```bash
-qData
-qBatchList
-```
-
-
-
-# Simple Training Loop
-
-For jupyter users
-
-```python
-import qqtools as qt
-qt.import_common(globals())
-
-x = np.random.rand(100, 5)
-y = np.random.rand(100)
-
-# dataset wrap
-xs = [ x[i] for i in range(len(x))]
-ys = [ y[i] for i in range(len(y))]
-data_list = [ qt.qData({'x': x[i], 'y':y[i]})  for i in range(len(x))] 
-dataset = qt.qDictDataset(data_list=data_list)
-dataloader = qt.qDictDataloader()
-
-# model
-model = qt.nn.qMLP([5,5,1], activation="relu")
-loss_fn = torch.nn.MSELoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4, weight_decay=0.01)
-
-# device
-device = torch.device("cuda")
-model.to(device)
-
-# loop
-for epoch in range(100):
-    for batch in dataloader:
-        batch.to(device)
-        out = model(batch.x)
-        loss = loss_fn(out, batch.y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    print(f"{epoch} {loss.item():4.6f}")
-```
-
-
-# Individual Modules
-
-The following modules are consumers of the core functionality provided by this package. Each is designed to be independent, allowing for sole import.
-
-under `plugins/`
-
-- qchem
-- qpipeline
-- qhyperconnect
-- qexp (Linux only)
-
-
-# qexp Quick Start
-
-`qexp` is a local tmux-backed experiment queue for Linux GPU hosts.
-
-Install optional experiment dependencies:
-
-```bash
+# If you only want the experiment queue extras:
 pip install qqtools[exp]
 ```
 
-Basic commands:
+> While some parts still work with `torch==1.x`, `torch>=2.4` is recommended
+
+
+## qDict
+
+`qDict` is mainly there for cleaner attribute access in batch-like code:
+
+```python
+# Instead of dirty dict brackets:
+# batch["input_ids"], batch["attention_mask"]
+
+# Use clean attribute access:
+batch = qt.qDict({"input_ids": input_ids, "attention_mask": attention_mask})
+out = model(batch.input_ids)
+```
+
+## Context scope and `qt.use_ctx`
+
+`qt.ctx` provides a lightweight scoped context. Values set inside `with qt.ctx(...)` are visible only in that scope and its nested calls, and the outer state is restored automatically when the block exits.
+
+Scope exit restores the previous key bindings. If you intentionally mutate a shared mutable object in place through the live context, that mutation is considered caller-managed behavior and may remain visible outside the block.
+
+```python
+import qqtools as qt
+
+with qt.ctx(dim=512):
+    print(qt.ctx.dim)  # 512
+
+print(qt.ctx.get("dim"))  # None
+```
+
+`@qt.use_ctx` is the simplest way to inject context values into a class constructor:
+
+```python
+import qqtools as qt
+
+
+@qt.use_ctx
+class AttentionLayer:
+    def __init__(self, dim=64, heads=8):
+        self.dim = dim
+        self.heads = heads
+
+
+with qt.ctx(dim=512, heads=16):
+    layer = AttentionLayer()
+    print(layer.dim, layer.heads)  # 512 16
+```
+
+Manual constructor arguments still take precedence over injected context values.
+
+## qexp
+
+`qexp` is a lightweight experiment queue for Linux hosts.
+It is built around a shared project root, can work on multi-machines with multi-GPUs.
+
+Quick start:
 
 ```bash
-qexp submit --num-gpus 1 --job-name demo -- python train.py --epochs 10
-qexp daemon --background
-qexp status
-qexp status --json
-qexp top
-qexp logs <task_id> --follow
-qexp cancel <task_id>
-qexp clean --dry-run
-qexp clean --older-than-seconds 604800
+qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
+qexp submit --name demo1 -- python train.py -c config1.yaml
+qexp submit --name demo2 -- python train.py -c config2.yaml
+qexp submit --name demo3 -- python train.py -c config3.yaml
+# 3 tasks will be queued and run sequentially
 ```
+
+After `init`, `qexp` saves the current `shared_root` and `machine` as CLI context, so you usually do not need to repeat them on every command.
 
 Python API:
 
@@ -151,22 +133,88 @@ Python API:
 from qqtools.plugins import qexp
 
 task = qexp.submit(
-    argv=["python", "train.py", "--epochs", "10"],
-    num_gpus=1,
-    job_name="demo",
+    qexp.load_root_config("/mnt/share/myproject/.qexp", "gpu-a"),
+    command=["python", "train.py", "--epochs", "10"],
+    name="demo",
 )
 print(task.task_id)
 ```
 
-Release validation notes:
+>Note: Run `pip install qqtools[exp]` before use `qexp` command.
 
-- packaged Python API surface: `from qqtools.plugins import qexp`
-- packaged CLI surface: `qexp`
-- actual execution is supported on local Linux GPU hosts with `tmux` installed
-- non-Linux development is limited to parsing, rendering, and test validation flows
+## qpipeline
 
+`qpipeline` is a minimal training loop scaffold. It doesn't try to be a heavy framework. You write the project-specific model and task logic, and qpipeline handles the repetitive boilerplate: config-driven startup, train/val loops, metric aggregation, and checkpointing.
 
-# Test
+A tight training entry:
+
+```python
+import torch
+from qqtools.plugins.qpipeline import prepare_cmd_args, qPipeline
+from qqtools.nn import qMLP
+
+class MyTask:
+    def __init__(self, args):
+        # Your custom data logic goes here
+        self.train_loader, self.val_loader = build_loaders(args)
+
+    def batch_forward(self, model, batch):
+        return {"pred": model(batch.x)}
+
+    def batch_loss(self, out, batch):
+        loss = torch.nn.functional.mse_loss(out["pred"], batch.y)
+        return {"loss": (loss, len(batch.y))}
+
+    def batch_metric(self, out, batch):
+        mae = (out["pred"] - batch.y).abs().mean()
+        return {"mae": (mae, len(batch.y))}
+
+    def post_metric_to_err(self, result):
+        return result["mae"]
+
+class MyPipeline(qPipeline):
+    @staticmethod
+    def prepare_model(args):
+        return qMLP([16, 8, 1])
+
+    @staticmethod
+    def prepare_task(args):
+        return MyTask(args)
+
+if __name__ == "__main__":
+    args = prepare_cmd_args()
+    pipe = MyPipeline(args, train=True)
+    pipe.fit()
+```
+
+Because qpipeline enforces a stable entry contract, it pairs perfectly with qexp for queued execution:
+
+```bash
+qexp submit -- python entry.py --config configs/train.yaml
+```
+
+For one-off runtime config edits, `qpipeline` also supports dotted CLI overrides after normal
+parser handling:
+
+```bash
+python entry.py \
+  --config configs/train.yaml \
+  --task.dataloader.eval_batch_size 32 \
+  --task.val_split val_ood \
+  --runner.fast_dev_run
+```
+
+Configuration follows a standard YAML structure. See [qConfig.md](docs/qConfig_en.md) for details.
+
+## Plugin modules
+
+Under `src/qqtools/plugins/`, there are also:
+
+- `qchem` - tools for reading and processing quantum chemistry outputs
+- `qpipeline` - a training pipeline framework built on top of the core torch utilities
+- `qhyperconnect` - an implementation of Hyper-Connection for PyTorch
+
+## Test
 
 ```bash
 tox

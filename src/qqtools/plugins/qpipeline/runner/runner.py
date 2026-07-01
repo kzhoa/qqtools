@@ -18,34 +18,47 @@ from torch.utils.data import DataLoader
 
 import qqtools as qt
 
+from ..entry_utils.optimizer import prepare_optimizer
 from ..entry_utils.qema import qEMA
-from ..entry_utils.scheduler import (
-    SCHEDULER_STEP_ON_VALID_END,
-    qWarmupScheduler,
-)
+from ..entry_utils.scheduler import SCHEDULER_STEP_ON_VALID_END, prepare_scheduler, qWarmupScheduler
 from ..entry_utils.type_qconfig import CheckpointConfig, EarlyStopConfig, qConfig
 from ..qlogger import ConsoleLogger, qLogger
-from ..task.qtask import qTaskBase
-from .agent import RunningAgent
+from ..task.qtask import TASK_LIFECYCLE_HOOKS, qTaskBase
+from .agent import NaNDetectedError, RunningAgent, _extract_auxiliary_output_fields, _normalize_output_dict
+from .runner_utils.epoch_suffix import standardize_epoch_suffixes
+from .events import ValidationEndEventContext
 from .runner_utils.ckp_manager import CheckpointListener, CheckpointManager
 from .runner_utils.common import _getattr_or_default, _is_periodic_trigger, move_batch_to_device
 from .runner_utils.earlystop import EarlyStopListener, EarlyStopper
 from .runner_utils.eval_formatter import EvalSummaryListener
 from .runner_utils.progress import ProgressTracker
 from .runner_utils.sheet_logger import SheetLogger, SheetLoggerListener
+from .runner_utils.tensorbank import TensorBank
 from .runner_utils.types import (
-    EventContext,
     RunConfig,
     RunMode,
     RunningState,
+    Stage,
     TerminalEvent,
     TerminalReason,
     TrainRunnerResult,
 )
 
-__all__ = ["train_runner", "infer_runner", "SheetLoggerListener"]
+__all__ = ["train_runner", "infer_runner", "evaluate_runner", "SheetLoggerListener"]
 
-TerminalCause = Literal["normal_finish", "early_stop", "user_interrupt", "exception"]
+TerminalCause = Literal["normal_finish", "early_stop", "user_interrupt", "exception", "nan_detected"]
+
+
+def _qconfig_get(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
 def _is_oom_exception(exception: BaseException) -> bool:
@@ -105,6 +118,14 @@ def _build_terminal_event_for_cause(
             epoch=state.epoch,
             step=state.global_step,
             exception=exception,
+        )
+
+    if terminal_cause == "nan_detected":
+        return _build_terminal_event(
+            status="failed",
+            reason="nan_detected",
+            epoch=state.epoch,
+            step=state.global_step,
         )
 
     if terminal_cause == "early_stop":
@@ -172,6 +193,7 @@ def _finalize_train_runner(
     sheet_logger: Optional[SheetLogger],
     progress_tracker: Optional[ProgressTracker],
     profiler: Optional[profile],
+    owns_logger: bool = True,
 ) -> None:
     if profiler is not None:
         profiler.stop()
@@ -191,8 +213,21 @@ def _finalize_train_runner(
 
     if sheet_logger is not None:
         sheet_logger.close()
-    logger.close()
-    logging.shutdown()
+    if owns_logger:
+        logger.close()
+        logging.shutdown()
+
+
+def _build_output_bank_result(
+    *,
+    output_bank: "TensorBank",
+    distributed: bool,
+    device: torch.device,
+) -> Optional[Dict[str, Any]]:
+    gathered_outputs = output_bank.gather(distributed, device)
+    if distributed and qt.qdist.get_rank() != 0:
+        return None
+    return gathered_outputs
 
 
 def _prepare_training_session(
@@ -233,7 +268,11 @@ def _prepare_training_session(
         )
         logger.info(f"Loaded checkpoint from {config.ckp_file}")
 
-    def _on_validation_end_step_scheduler(context: EventContext) -> None:
+    for hook_name in TASK_LIFECYCLE_HOOKS:
+        if task.has_implemented(hook_name):
+            agent.add_listener(hook_name, getattr(task, hook_name))
+
+    def _on_validation_end_step_scheduler(context: ValidationEndEventContext) -> None:
         if effective_scheduler is None:
             return
 
@@ -248,8 +287,8 @@ def _prepare_training_session(
     agent.add_listener("on_validation_end", early_stop_listener.on_validation_end)
     agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
 
-    progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type)
-    agent.add_listener("on_epoch_start", progress_tracker.on_epoch_start)
+    progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type, rank=config.rank)
+    agent.add_listener("on_epoch_start_internal", progress_tracker.on_epoch_start)
     agent.add_listener("on_progress_tick", progress_tracker.on_progress_tick)
     agent.add_listener("on_table_update", progress_tracker.on_table_update)
     agent.add_listener("on_epoch_end", progress_tracker.on_epoch_end)
@@ -289,9 +328,6 @@ def _resolve_train_runner_policy(
 ) -> Tuple[RunMode, int, int, Optional[int], Optional[int], List[str]]:
     """Resolve train-runner-owned policy fields into effective runtime values."""
 
-    def _is_positive_int(value: Any) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool) and value >= 1
-
     if run_mode is None:
         raise ValueError("run_mode cannot be None")
 
@@ -325,9 +361,12 @@ def _resolve_train_runner_policy(
             raise ValueError("max_steps must be a positive integer when run_mode='step'.")
         effective_max_steps = max_steps
         if max_epochs is not None:
+            if not _is_positive_int(max_epochs):
+                raise ValueError("max_epochs must be a positive integer when specified in run_mode='step'.")
+            effective_max_epochs = max_epochs
             policy_warnings.append(
-                f"[run_mode=STEP] max_epochs={max_epochs} is ignored by mutual-exclusion policy; "
-                f"training will be controlled by max_steps={max_steps}."
+                f"[run_mode=STEP] max_epochs={max_epochs} is enabled as a secondary stopping boundary; "
+                f"training will stop when max_steps={max_steps} or max_epochs={max_epochs} is reached first."
             )
 
     return (
@@ -340,11 +379,63 @@ def _resolve_train_runner_policy(
     )
 
 
+def _resolve_step_mode_max_steps(
+    run_mode: Union[str, RunMode],
+    task: qTaskBase,
+    max_epochs: Optional[int],
+    max_steps: Optional[int],
+    accum_grad: Optional[int],
+) -> Tuple[Optional[int], Optional[int], List[str]]:
+    if run_mode is None or RunMode(run_mode) != RunMode.STEP:
+        return max_steps, max_epochs, []
+
+    if max_steps is not None:
+        return max_steps, max_epochs, []
+
+    if max_epochs is None:
+        return None, max_epochs, []
+
+    if not _is_positive_int(max_epochs):
+        raise ValueError(
+            f"max_epochs={max_epochs!r} is not a positive integer; " "cannot infer max_steps when run_mode='step'."
+        )
+
+    effective_accum_grad = 1 if accum_grad is None else accum_grad
+    if not _is_positive_int(effective_accum_grad):
+        raise ValueError(
+            f"accum_grad={accum_grad!r} is not a positive integer; " "cannot infer max_steps when run_mode='step'."
+        )
+
+    try:
+        train_loader_length = len(task.train_loader)
+    except (AttributeError, TypeError):
+        train_loader_length = None
+
+    if not _is_positive_int(train_loader_length):
+        raise ValueError(
+            "max_steps cannot be inferred when run_mode='step'; "
+            "provide max_steps explicitly or ensure len(task.train_loader) is available as a positive integer."
+        )
+
+    optimizer_steps_per_epoch = (train_loader_length + effective_accum_grad - 1) // effective_accum_grad
+    inferred_max_steps = optimizer_steps_per_epoch * max_epochs
+    return (
+        inferred_max_steps,
+        max_epochs,
+        [
+            f"[run_mode=STEP] max_steps is not provided; inferred max_steps={inferred_max_steps} "
+            f"from len(task.train_loader)={train_loader_length}, accum_grad={effective_accum_grad}, "
+            f"and max_epochs={max_epochs}."
+        ],
+    )
+
+
+
 # Design Rationale: Boundary Policy Ownership
-# The orchestration layer (train_runner) owns the business policy for mutually
-# exclusive run boundaries:
-# - EPOCH mode keeps only max_epochs
-# - STEP mode keeps only max_steps
+# The orchestration layer (train_runner) owns the business policy for run
+# boundaries:
+# - EPOCH mode keeps max_epochs and ignores max_steps
+# - STEP mode requires a concrete max_steps and may also keep max_epochs as a secondary cap
 #
 # RunningAgent remains policy-agnostic and simply stops based on the concrete
 # boundaries passed in via RunConfig.
@@ -352,9 +443,10 @@ def train_runner(
     model: nn.Module,
     task: qTaskBase,
     loss_fn: Callable,
-    optimizer: torch.optim.Optimizer,
+    optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[qWarmupScheduler] = None,
     args: Optional[qConfig] = None,
+    logger: Optional[qLogger] = None,
     max_epochs: Optional[int] = None,
     max_steps: Optional[int] = None,
     clip_grad: Optional[float] = None,
@@ -373,18 +465,25 @@ def train_runner(
     allow_auto_offload: bool = False,
 ) -> TrainRunnerResult:
     """
-    Unified training runner
+    Self-contained training runner.
+
+    When called from QPipeline, optimizer/scheduler/logger are typically None
+    and will be created internally from args. Independent callers may pass in
+    pre-built instances to override the defaults.
 
     Args:
         model: Model
         task: Task instance
         loss_fn: Loss function
-        optimizer: Optimizer
-        scheduler: Learning rate scheduler
+        optimizer: Optimizer. If None, created from args.optim config.
+        scheduler: Learning rate scheduler. If None, created from args.optim config.
+                   If a plain LRScheduler (non-qWarmupScheduler), it will be wrapped.
+                   If already a qWarmupScheduler, used directly without re-wrapping.
         args: Object containing command-line arguments and other configurations.
               It is the single source for settings like device, rank, checkpoint, etc.
-        max_epochs: Maximum number of epochs
-        max_steps: Maximum number of steps
+        logger: Optional logger instance. If None, a new qLogger is created for save_dir.
+        max_epochs: Maximum number of epochs.
+        max_steps: Maximum number of optimizer steps.
         clip_grad: Gradient clipping
         distributed: Whether to use distributed training
         save_dir: Directory to save checkpoints
@@ -405,6 +504,11 @@ def train_runner(
     # Handle compatibility parameters
     if args is None:
         raise ValueError("The 'args' parameter is required to configure the runner.")
+    if scheduler is not None and optimizer is None:
+        raise ValueError(
+            "Cannot pass scheduler without optimizer. A scheduler must be bound to "
+            "the optimizer it was created with."
+        )
     if accum_grad is not None:
         if isinstance(accum_grad, bool) or not isinstance(accum_grad, int):
             raise ValueError("accum_grad must be an integer when specified")
@@ -424,6 +528,19 @@ def train_runner(
     init_file = _getattr_or_default(args, "init_file")
     render_type = _getattr_or_default(args, "render_type", "auto")
 
+    if checkpoint_config is None:
+        checkpoint_config = {}
+    if early_stop_config is None:
+        early_stop_config = {}
+
+    effective_input_max_steps, effective_input_max_epochs, inferred_max_step_warnings = _resolve_step_mode_max_steps(
+        run_mode=run_mode,
+        task=task,
+        max_epochs=max_epochs,
+        max_steps=max_steps,
+        accum_grad=accum_grad,
+    )
+
     (
         resolved_run_mode,
         effective_eval_interval,
@@ -433,20 +550,24 @@ def train_runner(
         boundary_policy_warnings,
     ) = _resolve_train_runner_policy(
         run_mode=run_mode,
-        max_epochs=max_epochs,
-        max_steps=max_steps,
+        max_epochs=effective_input_max_epochs,
+        max_steps=effective_input_max_steps,
         eval_interval=1 if eval_interval is None else eval_interval,
         save_interval=save_interval,
     )
+    boundary_policy_warnings = [*inferred_max_step_warnings, *boundary_policy_warnings]
     # Configuration fallback logic
     if not checkpoint_config:
-        checkpoint_config["target"] = early_stop_config.get("target", "val_metric")
-        checkpoint_config["mode"] = early_stop_config.get("mode", "min")
-        checkpoint_config["min_delta"] = early_stop_config.get("min_delta", 0.0)
+        checkpoint_config = {
+            "target": _qconfig_get(early_stop_config, "target", "val_metric"),
+            "mode": _qconfig_get(early_stop_config, "mode", "min"),
+            "min_delta": _qconfig_get(early_stop_config, "min_delta", 0.0),
+            "regular_latest_only": True,
+        }
 
-    if "target" not in early_stop_config:
+    if _qconfig_get(early_stop_config, "target") is None:
         early_stop_config["target"] = "val_metric"
-    if "mode" not in early_stop_config:
+    if _qconfig_get(early_stop_config, "mode") is None:
         early_stop_config["mode"] = "min"
 
     # Create run configuration
@@ -477,7 +598,11 @@ def train_runner(
     if extra_log_keys:
         log_keys.extend(extra_log_keys)
 
-    logger = qLogger(save_dir, console=True)
+    # --- Logger ---
+    owns_logger = logger is None
+    if logger is None:
+        logger = qLogger(save_dir, console=True)
+
     sheet_logger = None
     if log_granularity and config.rank == 0:
         metrics_file = Path(save_dir) / "metrics.csv"
@@ -485,6 +610,14 @@ def train_runner(
     for warning_msg in boundary_policy_warnings:
         logger.warning(warning_msg)
 
+    # --- Config standardization: epoch-suffix resolution ---
+    standardize_epoch_suffixes(args, task, accum_grad, distributed, logger)
+
+    # --- Optimizer creation ---
+    if optimizer is None:
+        optimizer = prepare_optimizer(args, model, logger=logger)
+
+    # --- Scheduler creation ---
     effective_scheduler = None
     if scheduler is not None:
         if isinstance(scheduler, qWarmupScheduler):
@@ -494,12 +627,22 @@ def train_runner(
                 optimizer=optimizer, warmup_steps=0, warmup_factor=1.0, main_scheduler=scheduler
             )
     else:
-        effective_scheduler = qWarmupScheduler(
-            optimizer=optimizer, warmup_steps=0, warmup_factor=1.0, main_scheduler=qt.nn.DoNothing()
-        )
+        optim_cfg = getattr(args, "optim", None)
+        scheduler_name = getattr(optim_cfg, "scheduler", None) if optim_cfg else None
+        if not scheduler_name:
+            logger.info("[Scheduler] Learning rate scheduler is disabled")
+            effective_scheduler = qWarmupScheduler(
+                optimizer=optimizer, warmup_steps=0, warmup_factor=1.0, main_scheduler=qt.nn.DoNothing()
+            )
+        else:
+            effective_scheduler = prepare_scheduler(args, optimizer)
 
     # Create managers and callback listeners
-    checkpoint_manager = CheckpointManager(config.save_dir, config.rank)
+    checkpoint_manager = CheckpointManager(
+        config.save_dir,
+        config.rank,
+        keep_only_latest_regular=_qconfig_get(config.checkpoint, "regular_latest_only", True),
+    )
     early_stopper = EarlyStopper.from_config(config.early_stop)
 
     # Create training agent
@@ -533,8 +676,8 @@ def train_runner(
     )
     eval_summary_listener = EvalSummaryListener(
         logger=logger,
-        target_key=config.checkpoint.get("target", "val_metric"),
-        target_mode=config.checkpoint.get("mode", "min"),
+        target_key=_qconfig_get(config.checkpoint, "target", "val_metric"),
+        target_mode=_qconfig_get(config.checkpoint, "mode", "min"),
     )
 
     progress_tracker = None
@@ -577,6 +720,14 @@ def train_runner(
             run_config=config,
         )
 
+    except NaNDetectedError:
+        terminal_event = _build_and_emit_terminal_event(
+            logger=logger,
+            terminal_cause="nan_detected",
+            state=agent.state,
+            run_config=config,
+        )
+
     except Exception as error:
         terminal_event = _build_and_emit_terminal_event(
             logger=logger,
@@ -593,6 +744,7 @@ def train_runner(
             sheet_logger=sheet_logger,
             progress_tracker=progress_tracker,
             profiler=profiler,
+            owns_logger=owns_logger,
         )
 
     # Return final results
@@ -613,13 +765,63 @@ def train_runner(
     }
 
 
+def evaluate_runner(
+    model: nn.Module,
+    task: qTaskBase,
+    dataloader: DataLoader,
+    args: Optional[qConfig] = None,
+    prefix: str = "test",
+    return_outputs: bool = False,
+    allow_auto_offload: bool = False,
+    logger=None,
+) -> Optional[Dict[str, Any]]:
+    if args is None:
+        raise ValueError("The 'args' parameter is required to configure the runner.")
+
+    device = _getattr_or_default(args, "device", lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    rank = _getattr_or_default(args, "rank", 0)
+    distributed = _getattr_or_default(args, "distributed", False)
+    render_type = _getattr_or_default(args, "render_type", "auto")
+    stage = Stage.TEST if prefix == "test" else Stage.VAL
+
+    config = RunConfig(
+        distributed=distributed,
+        rank=rank,
+        save_dir=_getattr_or_default(args, "log_dir", "./logs"),
+        print_freq=_getattr_or_default(args, "print_freq", 10),
+        render_type=render_type,
+        device=device,
+    )
+    if logger is None:
+        logger = ConsoleLogger(rank=rank) if rank == 0 else None
+
+    agent = RunningAgent(
+        model=model,
+        task=task,
+        loss_fn=None,
+        optimizer=None,
+        config=config,
+        device=device,
+        allow_auto_offload=allow_auto_offload,
+        logger=logger,
+    )
+
+    return agent.evaluate_loader(
+        data_loader=dataloader,
+        prefix=prefix,
+        stage=stage,
+        return_outputs=return_outputs,
+    )
+
+
 def infer_runner(
     model: nn.Module,
     task: qTaskBase,
     dataloader: DataLoader,
     args: Optional[Any] = None,
     distributed: bool = False,
-) -> List[Dict[str, Any]]:
+    logger=None,
+) -> Optional[Dict[str, Any]]:
     """
     Unified inference runner.
 
@@ -630,10 +832,12 @@ def infer_runner(
         args: Object containing command-line arguments and other configurations.
               It's the source for settings like device, rank, and ckp_file.
         distributed: Whether distributed data parallel is used.
+        logger: Optional logger instance. If None, a ConsoleLogger is created for rank 0.
 
     Returns:
-        A list of dictionaries, where each dictionary contains the
-        predictions and labels for a batch.
+        A flat dictionary of concatenated output tensors for the full dataset.
+        In distributed mode, rank 0 returns globally merged outputs and
+        non-zero ranks return None.
     """
     if args is None:
         raise ValueError("The 'args' parameter is required to configure the runner.")
@@ -641,48 +845,17 @@ def infer_runner(
     # Extract configuration from args
     device = _getattr_or_default(args, "device", lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     rank = _getattr_or_default(args, "rank", 0)
-    ckp_file = _getattr_or_default(args, "ckp_file")
     render_type = _getattr_or_default(args, "render_type", "auto")
 
     # Setup logger (rank 0 only)
-    logger = None
-    if rank == 0:
-        logger = ConsoleLogger(rank=rank)
-
-    # Load checkpoint
-    if ckp_file and Path(ckp_file).exists():
-        checkpoint = torch.load(ckp_file, map_location=device)
-        if "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
-        else:  # for backward compatibility
-            model.load_state_dict(checkpoint)
-        if logger:
-            logger.info(f"Loaded model checkpoint from {ckp_file}")
-    else:
-        if logger:
-            logger.warning("No checkpoint file provided or found. Running inference with initial model weights.")
+    if logger is None:
+        logger = ConsoleLogger(rank=rank) if rank == 0 else None
 
     model.to(device)
     model.eval()
 
-    all_results = []
+    output_bank = TensorBank(logger=logger)
 
-    # DDP handling: only rank 0 collects results
-    if distributed and rank != 0:
-        # Non-primary processes still need to run forward pass but don't collect results
-        try:
-            with torch.no_grad():
-                for batch_data in dataloader:
-                    batch_data = move_batch_to_device(batch_data, device)
-                    batch_data = task.pre_batch_forward(batch_data)
-                    task.batch_forward(model, batch_data)
-        except Exception as e:
-            if logger:
-                logger.error(f"Error during inference on rank {rank}: {e}")
-            raise
-        return all_results
-
-    # Rank 0 process: run inference and collect results
     # Determine progress display strategy with fallback
     try:
         from tqdm import tqdm
@@ -708,19 +881,9 @@ def infer_runner(
                 out = task.batch_forward(model, batch_data)
                 out = task.post_batch_forward(out, batch_data)
 
-                # Extract predictions and labels
-                batch_results = {"preds": out}
-                if isinstance(batch_data, dict) and "y" in batch_data:
-                    batch_results["labels"] = batch_data["y"]
-                elif hasattr(batch_data, "y"):
-                    batch_results["labels"] = batch_data.y
-
-                # Detach tensors from the computation graph and move to CPU
-                for key, value in batch_results.items():
-                    if isinstance(value, torch.Tensor):
-                        batch_results[key] = value.detach().cpu()
-
-                all_results.append(batch_results)
+                batch_results = _normalize_output_dict(out)
+                batch_results.update(_extract_auxiliary_output_fields(batch_data))
+                output_bank.add(batch_results)
 
                 # Simple logging fallback (when tqdm not available but render_type != "plain")
                 if use_simple_logging and (batch_idx + 1) % 10 == 0:
@@ -732,5 +895,4 @@ def infer_runner(
             logger.error(f"Error during inference: {e}")
         raise
 
-    return all_results
-
+    return _build_output_bank_result(output_bank=output_bank, distributed=distributed, device=device)

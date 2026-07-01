@@ -115,3 +115,68 @@ class TestCheckpointManager:
         assert state.best_monitored_key is None
         assert state.best_monitored_metric is None
         assert state.best_model_metrics_snapshot == {}
+
+    def test_keep_only_latest_regular_deletes_previous_regular_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CheckpointManager(save_dir=tmpdir, keep_only_latest_regular=True)
+
+            self.optimizer.step()
+            first_path = manager.save(
+                self.state,
+                self.model,
+                self.task,
+                self.optimizer,
+                self.scheduler,
+                self.ema_model,
+                self.early_stopper,
+                self.best_model_manager,
+                is_best=False,
+            )
+
+            next_state = RunningState(epoch=6, global_step=120)
+            second_path = manager.save(
+                next_state,
+                self.model,
+                self.task,
+                self.optimizer,
+                self.scheduler,
+                self.ema_model,
+                self.early_stopper,
+                self.best_model_manager,
+                is_best=False,
+            )
+
+            assert not Path(first_path).exists()
+            assert Path(second_path).exists()
+
+    def test_keep_only_latest_regular_false_keeps_multiple_regular_checkpoints(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CheckpointManager(save_dir=tmpdir, keep_only_latest_regular=False)
+
+            first_path = manager.save(
+                self.state,
+                self.model,
+                self.task,
+                self.optimizer,
+                self.scheduler,
+                self.ema_model,
+                self.early_stopper,
+                self.best_model_manager,
+                is_best=False,
+            )
+
+            next_state = RunningState(epoch=6, global_step=120)
+            second_path = manager.save(
+                next_state,
+                self.model,
+                self.task,
+                self.optimizer,
+                self.scheduler,
+                self.ema_model,
+                self.early_stopper,
+                self.best_model_manager,
+                is_best=False,
+            )
+
+            assert Path(first_path).exists()
+            assert Path(second_path).exists()

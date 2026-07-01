@@ -95,10 +95,6 @@ class TestEvaluationTiming:
         )
         agent = RunningAgent(model, task, loss_fn, optimizer, config=config, device=device, logger=logger)
 
-        # Manually set max_epochs/max_steps for agent state
-        agent.state.max_epochs = config.max_epochs
-        agent.state.max_steps = config.max_steps if config.max_steps is not None else float("inf")
-
         agent.add_listener("on_eval_start", logger.on_eval_start)
         agent.add_listener("on_eval_end", logger.on_eval_end)
 
@@ -165,7 +161,13 @@ class TestEvaluationTiming:
         )
         agent = RunningAgent(model, task, loss_fn, optimizer, config=config, device=device, logger=logger)
 
-        agent.add_listener("on_eval_start", logger.on_eval_start)
+        observed_eval_epochs = []
+
+        def capture_eval_start(context):
+            observed_eval_epochs.append(context.runner.run_state.epoch)
+            logger.on_eval_start(context)
+
+        agent.add_listener("on_eval_start", capture_eval_start)
         agent.add_listener("on_eval_end", logger.on_eval_end)
 
         agent.run()
@@ -178,10 +180,9 @@ class TestEvaluationTiming:
 
         # 验证评估是否在正确的 epoch 触发
         if expected_call_count > 0:
-            start_calls = [call_args[0][0].state.epoch for call_args in logger.on_eval_start.call_args_list]
             assert (
-                start_calls == expected_epochs
-            ), f"Expected on_eval_start at epochs {expected_epochs}, got {start_calls}"
+                observed_eval_epochs == expected_epochs
+            ), f"Expected on_eval_start at epochs {expected_epochs}, got {observed_eval_epochs}"
 
         # 验证最终的训练状态
         assert agent.state.global_step == num_batches_in_epoch * max_epochs
@@ -212,7 +213,13 @@ class TestEvaluationTiming:
         )
         agent = RunningAgent(model, task, loss_fn, optimizer, config=config, device=device, logger=logger)
 
-        agent.add_listener("on_eval_start", logger.on_eval_start)
+        observed_eval_steps = []
+
+        def capture_eval_start(context):
+            observed_eval_steps.append(context.runner.run_state.global_step)
+            logger.on_eval_start(context)
+
+        agent.add_listener("on_eval_start", capture_eval_start)
         agent.add_listener("on_eval_end", logger.on_eval_end)
 
         agent.run()
@@ -225,8 +232,25 @@ class TestEvaluationTiming:
 
         # 验证触发时的 global_step
         if expected_call_count > 0:
-            start_calls = [call_args[0][0].state.global_step for call_args in logger.on_eval_start.call_args_list]
-            assert start_calls == expected_steps, f"Expected eval at steps {expected_steps}, got {start_calls}"
+            assert observed_eval_steps == expected_steps, f"Expected eval at steps {expected_steps}, got {observed_eval_steps}"
 
         # 验证最终状态
         assert agent.state.global_step == max_steps
+
+    def test_step_mode_can_stop_at_secondary_max_epochs_boundary(self, common_setup):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        num_batches_in_epoch = len(task.train_loader)
+
+        config = RunConfig(
+            run_mode=RunMode.STEP,
+            eval_interval=10,
+            max_steps=999,
+            max_epochs=1,
+            device=device,
+        )
+        agent = RunningAgent(model, task, loss_fn, optimizer, config=config, device=device, logger=logger)
+
+        agent.run()
+
+        assert agent.state.epoch == 1
+        assert agent.state.global_step == num_batches_in_epoch

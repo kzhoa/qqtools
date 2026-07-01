@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -10,23 +10,39 @@ import qqtools as qt
 
 __all__ = ["qTaskBase", "PotentialTaskBase"]
 
+if TYPE_CHECKING:
+    from ..runner.events import BaseEventContext, ProgressEventContext, ValidationEndEventContext
+
+TASK_LIFECYCLE_HOOKS: Tuple[str, ...] = (
+    "on_epoch_start",
+    "on_epoch_end",
+    "on_train_batch_end",
+    "on_validation_end",
+    "on_early_stop",
+)
+
 OPTIONAL_METHODS = [
     # === functional hook ===
     "get_loss_fn",
     "batch_cache",
     "epoch_metric",
     "pipe_middle_ware",
+    "init_train_model",
     "to",
     # === lifetime hook ===
-    "onEpochStart",
-    "onEpochEnd",
-    "onBatchEnd",
-    "on_better_model",
+    *TASK_LIFECYCLE_HOOKS,
+    "on_better_model",  # not actually used in current implementation, reserved for future extension
+    # === runner checkpoint related ===
     "state_dict",
     "load_state_dict",
 ]
 
-REQUIRED_METHODS = []
+REQUIRED_METHODS = [
+    "batch_forward",
+    "batch_loss",
+    "batch_metric",
+    "post_metrics_to_value",
+]
 
 
 class qTaskBase(ABC):
@@ -43,8 +59,6 @@ class qTaskBase(ABC):
     test_loader: DataLoader
     meta: Dict[str, Any]  # flow with epoch runner and saved in checkpoint
 
-    _opt_impl = set()  # implemented optional methods
-    _opt_todo = set()  # un-implemented optional methods
     _required = set(REQUIRED_METHODS)
 
     def __init__(self):
@@ -54,6 +68,9 @@ class qTaskBase(ABC):
             - self.val_loader
             - self.test_loader
         """
+        self._opt_impl = set()  # implemented optional methods
+        self._opt_todo = set()  # un-implemented optional methods
+
         for name in OPTIONAL_METHODS:
             if qt.is_override(self, name, qTaskBase):
                 self._opt_impl.add(name)
@@ -129,6 +146,9 @@ class qTaskBase(ABC):
         return output
 
     # other conventions:
+    def init_train_model(self, model, args) -> None:
+        raise NotImplementedError
+
     def get_loss_fn(self, args) -> Callable:
         raise NotImplementedError
 
@@ -171,6 +191,21 @@ class qTaskBase(ABC):
     def on_better_model(self, epoch_agent, current_state) -> None:
         raise NotImplementedError
 
+    def on_epoch_start(self, context: "BaseEventContext") -> None:
+        raise NotImplementedError
+
+    def on_epoch_end(self, context: "BaseEventContext") -> None:
+        raise NotImplementedError
+
+    def on_train_batch_end(self, context: "ProgressEventContext") -> None:
+        raise NotImplementedError
+
+    def on_validation_end(self, context: "ValidationEndEventContext") -> None:
+        raise NotImplementedError
+
+    def on_early_stop(self, context: "BaseEventContext") -> None:
+        raise NotImplementedError
+
     def to(self, device) -> None:
         raise NotImplementedError
 
@@ -179,9 +214,6 @@ class qTaskBase(ABC):
 
     def load_state_dict(self, d: Dict) -> None:
         raise NotImplementedError
-
-    # def pipe_middle_ware(self, pipe: qPipeline):
-    # pass
 
 
 class PotentialTaskBase(qTaskBase):

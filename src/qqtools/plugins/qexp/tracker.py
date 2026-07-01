@@ -7,9 +7,6 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import fsqueue
-from .models import TASK_RUNNING, qExpTask
-
 
 def _parse_visible_gpu_ids_from_env() -> list[int] | None:
     raw = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -79,7 +76,7 @@ def probe_gpu_backend() -> tuple[str | None, list[int]]:
 
 
 @dataclass(slots=True)
-class qExpTracker:
+class Tracker:
     visible_gpu_ids: list[int] = field(default_factory=list)
     reserved_gpu_ids: set[int] = field(default_factory=set)
     task_id_to_gpu_ids: dict[str, list[int]] = field(default_factory=dict)
@@ -90,25 +87,6 @@ class qExpTracker:
         backend_name, visible_gpu_ids = self.gpu_probe()
         self.backend_name = backend_name
         self.visible_gpu_ids = list(visible_gpu_ids)
-
-    def rebuild_reservations(self, root=None, running_tasks: list[qExpTask] | None = None) -> None:
-        self.reserved_gpu_ids = set()
-        self.task_id_to_gpu_ids = {}
-
-        tasks = running_tasks
-        if tasks is None:
-            tasks = fsqueue.iter_tasks(TASK_RUNNING, root)
-
-        for task in tasks:
-            if not task.assigned_gpus:
-                continue
-            gpu_ids = [int(gpu_id) for gpu_id in task.assigned_gpus]
-            self.task_id_to_gpu_ids[task.task_id] = gpu_ids
-            self.reserved_gpu_ids.update(gpu_ids)
-
-    def refresh(self, root=None, running_tasks: list[qExpTask] | None = None) -> None:
-        self.refresh_visibility()
-        self.rebuild_reservations(root=root, running_tasks=running_tasks)
 
     def get_allocatable_gpu_ids(self) -> list[int]:
         return [gpu_id for gpu_id in self.visible_gpu_ids if gpu_id not in self.reserved_gpu_ids]

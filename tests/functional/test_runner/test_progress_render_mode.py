@@ -1,12 +1,4 @@
-import sys
-from pathlib import Path
-
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
-for module_name in list(sys.modules.keys()):
-    if module_name == "qqtools" or module_name.startswith("qqtools."):
-        sys.modules.pop(module_name)
 
 from qqtools.plugins.qpipeline.runner.runner_utils.progress import resolve_render_mode
 

@@ -18,7 +18,8 @@ import sys
 import time
 from typing import Any, Dict, List, Literal, Optional, Protocol
 
-from .types import EventContext
+from ..events import BaseEventContext, ProgressEventContext
+from ..events.types import _EpochStartInternalContext, _EvalEndInternalContext, _EvalStartInternalContext
 
 # Check for optional dependencies
 try:
@@ -55,19 +56,19 @@ def _format_epoch_result_metric(value: Optional[float]) -> str:
 class ProgressStrategy(Protocol):
     """Common protocol for progress rendering strategies."""
 
-    def on_epoch_start(self, context: EventContext) -> None: ...
+    def on_epoch_start(self, context: _EpochStartInternalContext) -> None: ...
 
-    def on_progress_tick(self, context: EventContext) -> None: ...
+    def on_progress_tick(self, context: ProgressEventContext) -> None: ...
 
-    def on_table_update(self, context: EventContext) -> None: ...
+    def on_table_update(self, context: ProgressEventContext) -> None: ...
 
-    def on_epoch_end(self, context: EventContext) -> None: ...
+    def on_epoch_end(self, context: BaseEventContext) -> None: ...
 
     def on_run_end(self) -> None: ...
 
-    def on_eval_start(self, context: EventContext) -> None: ...
+    def on_eval_start(self, context: _EvalStartInternalContext) -> None: ...
 
-    def on_eval_end(self, context: EventContext) -> None: ...
+    def on_eval_end(self, context: _EvalEndInternalContext) -> None: ...
 
 
 # Only define Rich-specific classes if rich is available
@@ -315,18 +316,21 @@ if HAS_RICH:
             self._last_batch_state = None
             self._eval_active = False
 
-        def on_epoch_start(self, context: EventContext):
-            self.current_stage = context.stage or "train"
+        def on_epoch_start(self, context: _EpochStartInternalContext):
+            self.current_stage = context.runner.stage or "train"
             self._eval_active = False
-            # `max_epochs` moved out of RunningState and is injected into EventContext
-            self.displayer.reset_progressbar(context.total_batches, context.state.epoch, context.max_epochs)
+            self.displayer.reset_progressbar(
+                context.total_batches,
+                context.runner.run_state.epoch,
+                context.runner.max_epochs,
+            )
             self.displayer.start()
 
         def on_progress_tick(
             self,
-            context: EventContext,
+            context: ProgressEventContext,
         ):
-            stage = (context.stage or self.current_stage or "train").lower()
+            stage = (context.runner.stage or self.current_stage or "train").lower()
             is_eval_stage = stage.startswith("eval") or stage.startswith("val") or stage.startswith("test")
 
             total = int(context.total_batches or 0)
@@ -337,9 +341,9 @@ if HAS_RICH:
             else:
                 self.displayer.update_progress(completed=completed, total=total)
 
-        def on_table_update(self, context: EventContext):
+        def on_table_update(self, context: ProgressEventContext):
             # Update metrics table (only for training stage to avoid table flickering during eval)
-            stage = (context.stage or self.current_stage or "train").lower()
+            stage = (context.runner.stage or self.current_stage or "train").lower()
             is_eval_stage = stage.startswith("eval") or stage.startswith("val") or stage.startswith("test")
 
             if not is_eval_stage:
@@ -359,7 +363,7 @@ if HAS_RICH:
                     context.lr,
                 )
 
-        def on_epoch_end(self, context: EventContext):
+        def on_epoch_end(self, context: BaseEventContext):
             self.displayer.clear_display()
             pass
 
@@ -369,12 +373,12 @@ if HAS_RICH:
         def __del__(self):
             self.displayer.stop()
 
-        def on_eval_start(self, context: EventContext):
+        def on_eval_start(self, context: _EvalStartInternalContext):
             self._eval_active = True
-            eval_stage = (context.stage or "eval").lower()
+            eval_stage = (context.runner.stage or "eval").lower()
             self.displayer.start_eval_progressbar(context.total_batches, eval_stage)
 
-        def on_eval_end(self, context: EventContext):
+        def on_eval_end(self, context: _EvalEndInternalContext):
             self._eval_active = False
             self.displayer.end_eval_progressbar()
 
@@ -401,16 +405,16 @@ if HAS_TQDM:
             self.pbar = None
             self.current_stage = None
 
-        def on_epoch_start(self, context: EventContext):
-            self.current_stage = context.stage or "train"
+        def on_epoch_start(self, context: _EpochStartInternalContext):
+            self.current_stage = context.runner.stage or "train"
             if self.pbar is not None:
                 self.pbar.close()
-            desc = f"[{self.current_stage.capitalize()}] Epoch {context.state.epoch}"
+            desc = f"[{self.current_stage.capitalize()}] Epoch {context.runner.run_state.epoch}"
             self.pbar = tqdm(total=context.total_batches, desc=desc, leave=False, dynamic_ncols=True)
 
         def on_progress_tick(
             self,
-            context: EventContext,
+            context: ProgressEventContext,
         ):
             if not self.pbar:
                 return
@@ -421,7 +425,7 @@ if HAS_TQDM:
             if advance_n > 0:
                 self.pbar.update(advance_n)
 
-        def on_table_update(self, context: EventContext):
+        def on_table_update(self, context: ProgressEventContext):
             if not self.pbar:
                 return
 
@@ -430,7 +434,7 @@ if HAS_TQDM:
                 postfix["lr"] = f"{context.lr:.6f}"
             self.pbar.set_postfix(postfix)
 
-        def on_epoch_end(self, context: EventContext):
+        def on_epoch_end(self, context: BaseEventContext):
             if self.pbar:
                 self.pbar.close()
                 self.pbar = None
@@ -440,7 +444,7 @@ if HAS_TQDM:
                 self.pbar.close()
                 self.pbar = None
 
-        def on_eval_start(self, context: EventContext):
+        def on_eval_start(self, context: _EvalStartInternalContext):
             if self.pbar:
                 self._saved_state = {
                     "n": getattr(self.pbar, "n", 0),
@@ -451,11 +455,12 @@ if HAS_TQDM:
                 self.pbar.close()
                 self.pbar = None
 
-        def on_eval_end(self, context: EventContext):
+        def on_eval_end(self, context: _EvalEndInternalContext):
             state = getattr(self, "_saved_state", None)
             if state and state.get("total") is not None:
                 desc = (
-                    state.get("desc") or f"[{(self.current_stage or 'train').capitalize()}] Epoch {context.state.epoch}"
+                    state.get("desc")
+                    or f"[{(self.current_stage or 'train').capitalize()}] Epoch {context.runner.run_state.epoch}"
                 )
                 # Use `initial` to restore completed count
                 self.pbar = tqdm(total=state["total"], desc=desc, leave=False, dynamic_ncols=True, initial=state["n"])
@@ -469,33 +474,33 @@ class PlainProgress:
         self.print_freq = print_freq
         self.current_stage = None
 
-    def on_epoch_start(self, context: EventContext):
-        self.current_stage = context.stage or "train"
+    def on_epoch_start(self, context: _EpochStartInternalContext):
+        self.current_stage = context.runner.stage or "train"
 
     def on_progress_tick(
         self,
-        context: EventContext,
+        context: ProgressEventContext,
     ):
         pass
 
-    def on_table_update(self, context: EventContext):
-        stage = context.stage or self.current_stage or "training"
+    def on_table_update(self, context: ProgressEventContext):
+        stage = context.runner.stage or self.current_stage or "training"
         msg_parts = [f"{k}: {v:.4f}" for k, v in context.batch_metrics.items() if isinstance(v, (int, float))]
         msg = f"[{stage.capitalize()}] Batch {context.batch_idx}/{context.total_batches} " + " ".join(msg_parts)
         if context.lr is not None:
             msg += f" LR: {context.lr:.6f}"
         self.logger.info(msg)
 
-    def on_epoch_end(self, context: EventContext):
+    def on_epoch_end(self, context: BaseEventContext):
         pass
 
     def on_run_end(self):
         pass
 
-    def on_eval_start(self, context: EventContext):
+    def on_eval_start(self, context: _EvalStartInternalContext):
         pass
 
-    def on_eval_end(self, context: EventContext):
+    def on_eval_end(self, context: _EvalEndInternalContext):
         pass
 
 
@@ -563,11 +568,15 @@ class ProgressTracker:
         logger: Any,
         print_freq: int = 10,
         render_type: Optional[Literal["auto", "rich", "tqdm", "plain"]] = None,
+        rank: int = 0,
     ):
         """Initialize the LogListener with automatic fallback."""
 
         self.logger = logger
         self.print_freq = print_freq
+
+        if rank != 0:
+            render_type = "plain"
 
         # Resolve render type
         self.render_type, mode_change_message = resolve_render_mode(render_type, HAS_RICH, HAS_TQDM)
@@ -582,53 +591,48 @@ class ProgressTracker:
             else:
                 self.logger.warning(mode_change_message)
 
-    def on_epoch_start(self, context: EventContext):
+    def on_epoch_start(self, context: _EpochStartInternalContext):
         """Callback at the start of an epoch."""
         self.strategy.on_epoch_start(context)
 
-    def on_progress_tick(self, context: EventContext):
+    def on_progress_tick(self, context: ProgressEventContext):
         """Callback when a progress update should be rendered."""
         self.strategy.on_progress_tick(context)
 
-    def on_table_update(self, context: EventContext):
+    def on_table_update(self, context: ProgressEventContext):
         """Callback when the metrics table should be updated."""
         if hasattr(self.strategy, "on_table_update"):
             self.strategy.on_table_update(context)
 
-    def on_epoch_end(self, context: EventContext):
+    def on_epoch_end(self, context: BaseEventContext):
         """Callback at the end of an epoch."""
         self.strategy.on_epoch_end(context)
 
         # Determine epoch number
-        display_epoch = context.state.epoch
+        run_state = context.runner.run_state
+        display_epoch = run_state.epoch
 
         self.logger.info(f"--- Epoch {display_epoch} Results ---")
 
         # Organize and log results
-        if context.state.current_train_metric is not None or context.state.current_train_loss is not None:
+        if run_state.current_train_metric is not None or run_state.current_train_loss is not None:
             train_msg = []
-            if context.state.current_train_loss is not None:
-                train_msg.append(f"loss: {context.state.current_train_loss:.6f}")
-            if context.state.current_train_metric is not None:
-                train_msg.append(f"metric: {context.state.current_train_metric:.6f}")
+            if run_state.current_train_loss is not None:
+                train_msg.append(f"loss: {run_state.current_train_loss:.6f}")
+            if run_state.current_train_metric is not None:
+                train_msg.append(f"metric: {run_state.current_train_metric:.6f}")
             self.logger.info(f"[train] {' '.join(train_msg)}")
 
         self.logger.info(
-            f"[val] metric: {_format_epoch_result_metric(context.state.current_val_metric)} "
-            f"source={context.state.epoch_result_val_metric_source}"
+            f"[val] metric: {_format_epoch_result_metric(run_state.current_val_metric)} "
+            f"source={run_state.epoch_result_val_metric_source}"
         )
         self.logger.info(
-            f"[test] metric: {_format_epoch_result_metric(context.state.current_test_metric)} "
-            f"source={context.state.epoch_result_test_metric_source}"
+            f"[test] metric: {_format_epoch_result_metric(run_state.current_test_metric)} "
+            f"source={run_state.epoch_result_test_metric_source}"
         )
 
-        # Also log any extra eval results if present in context
-        if context.eval_results:
-            for k, v in context.eval_results.items():
-                # Avoid double logging standard metrics if possible, or just log everything in debug
-                pass
-
-    def on_eval_start(self, context: EventContext):
+    def on_eval_start(self, context: _EvalStartInternalContext):
         """Callback before evaluation starts."""
         if hasattr(self.strategy, "on_eval_start"):
             try:
@@ -636,7 +640,7 @@ class ProgressTracker:
             except Exception:
                 pass
 
-    def on_eval_end(self, context: EventContext):
+    def on_eval_end(self, context: _EvalEndInternalContext):
         """Callback after evaluation ends."""
         if hasattr(self.strategy, "on_eval_end"):
             try:

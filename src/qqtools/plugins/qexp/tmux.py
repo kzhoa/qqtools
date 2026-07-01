@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import importlib
-import shlex
 import shutil
-import sys
-from pathlib import Path
 
 TMUX_SESSION_INTERNAL = "qqtools_internal"
 TMUX_SESSION_EXPERIMENTS = "experiments"
@@ -54,20 +51,31 @@ def _mark_session_role(session, role: str) -> None:
     session.set_option(QQTOOLS_SESSION_ROLE_OPTION, role)
 
 
+def _safe_get(query_list, **kwargs):
+    try:
+        return query_list.get(**kwargs)
+    except Exception:
+        return None
+
+
 def ensure_managed_session(
     session_name: str,
     role: str,
     *,
     initial_window_name: str,
+    start_directory: str | None = None,
 ):
     server = _get_server()
-    session = server.sessions.get(session_name=session_name)
+    session = _safe_get(server.sessions, session_name=session_name)
     if session is None:
-        session = server.new_session(
-            session_name=session_name,
-            window_name=initial_window_name,
-            detached=True,
-        )
+        kwargs = {
+            "session_name": session_name,
+            "window_name": initial_window_name,
+            "detached": True,
+        }
+        if start_directory is not None:
+            kwargs["start_directory"] = start_directory
+        session = server.new_session(**kwargs)
         _mark_session_role(session, role)
         return session
 
@@ -84,15 +92,16 @@ def ensure_internal_session():
     return ensure_managed_session(
         TMUX_SESSION_INTERNAL,
         QQTOOLS_SESSION_ROLE_INTERNAL,
-        initial_window_name="daemon",
+        initial_window_name="agent",
     )
 
 
-def ensure_experiments_session():
+def ensure_experiments_session(start_directory: str | None = None):
     return ensure_managed_session(
         TMUX_SESSION_EXPERIMENTS,
         QQTOOLS_SESSION_ROLE_EXPERIMENTS,
         initial_window_name="shell",
+        start_directory=start_directory,
     )
 
 
@@ -100,7 +109,7 @@ def _get_window(window_id: str | None):
     if not window_id:
         return None
     server = _get_server()
-    return server.windows.get(window_id=window_id)
+    return _safe_get(server.windows, window_id=window_id)
 
 
 def _get_primary_pane(window):
@@ -121,46 +130,32 @@ def send_command_to_window(window_id: str, command: str) -> None:
     pane.send_keys(command, enter=True)
 
 
-def launch_background_daemon(root: Path | str) -> str:
-    root_path = Path(root).expanduser().resolve()
-    session = ensure_internal_session()
-    window = session.windows.get(window_name="daemon")
-    if window is None:
-        window = session.new_window(window_name="daemon", attach=False)
-
-    command = " ".join(
-        [
-            shlex.quote(sys.executable),
-            "-m",
-            "qqtools.plugins.qexp.manager",
-            "--foreground",
-            "--root",
-            shlex.quote(str(root_path)),
-        ]
-    )
-    send_command_to_window(str(window.window_id), command)
-    return str(window.window_id)
-
-
-def create_window_for_task(task_id: str, session_name: str = TMUX_SESSION_EXPERIMENTS) -> str:
+def create_window_for_task(
+    task_id: str,
+    session_name: str = TMUX_SESSION_EXPERIMENTS,
+    start_directory: str | None = None,
+) -> str:
     if session_name == TMUX_SESSION_EXPERIMENTS:
-        session = ensure_experiments_session()
+        session = ensure_experiments_session(start_directory=start_directory)
     else:
         session = ensure_managed_session(
             session_name,
             QQTOOLS_SESSION_ROLE_EXPERIMENTS,
             initial_window_name="shell",
+            start_directory=start_directory,
         )
 
     window_name = task_id[:48]
-    window = session.new_window(window_name=window_name, attach=False)
+    kwargs = {"window_name": window_name, "attach": False}
+    if start_directory is not None:
+        kwargs["start_directory"] = start_directory
+    window = session.new_window(**kwargs)
     return str(window.window_id)
 
 
 def window_exists(window_id: str | None) -> bool:
     if not window_id:
         return False
-
     return _get_window(window_id) is not None
 
 

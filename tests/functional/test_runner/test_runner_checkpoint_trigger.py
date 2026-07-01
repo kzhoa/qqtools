@@ -117,3 +117,33 @@ class TestCheckpointTriggerTiming:
             assert "state" in optimizer_state
             assert "param_groups" in optimizer_state
             assert len(optimizer_state["param_groups"]) == len(optimizer.param_groups)
+
+    def test_keep_only_latest_regular_keeps_single_regular_file(self, common_setup):
+        task, model, optimizer, loss_fn, device, logger, _, save_dir = common_setup
+
+        config = RunConfig(
+            run_mode=RunMode.EPOCH,
+            max_epochs=3,
+            eval_interval=10,
+            save_interval=1,
+            device=device,
+        )
+        agent = RunningAgent(model, task, loss_fn, optimizer, config=config, device=device, logger=logger)
+
+        checkpoint_listener = CheckpointListener(
+            checkpoint_manager=CheckpointManager(
+                save_dir=save_dir,
+                keep_only_latest_regular=True,
+            ),
+            model=model,
+            task=task,
+            optimizer=optimizer,
+        )
+        agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
+
+        agent.run()
+
+        saved_files = sorted(save_dir.glob("*.pt"))
+        assert len(saved_files) == 1
+        checkpoint = torch.load(saved_files[0])
+        assert checkpoint["state"]["epoch"] == 2

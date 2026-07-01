@@ -255,11 +255,11 @@ def test_step_mode_eval_interval_counts_optimizer_steps_under_accumulation():
         config=RunConfig(run_mode=RunMode.STEP, max_steps=4, eval_interval=2, accum_grad=2),
         device=torch.device("cpu"),
     )
-    agent.add_listener("on_eval_start", listener)
+    eval_steps = []
+    agent.add_listener("on_eval_start", lambda ctx: eval_steps.append(ctx.runner.run_state.global_step))
 
     agent.run()
 
-    eval_steps = [call_args[0][0].state.global_step for call_args in listener.call_args_list]
     assert eval_steps == [2, 4]
     assert agent.state.global_step == 4
 
@@ -274,8 +274,8 @@ def test_step_mode_save_interval_counts_optimizer_steps_under_accumulation():
     def capture_checkpoint_request(context):
         checkpoint_events.append(
             {
-                "step": context.state.global_step,
-                "batch_idx_in_epoch": context.state.batch_idx_in_epoch,
+                "step": context.runner.run_state.global_step,
+                "batch_idx_in_epoch": context.runner.run_state.batch_idx_in_epoch,
                 "checkpoint_type": context.checkpoint_type,
             }
         )
@@ -313,11 +313,10 @@ def test_step_mode_early_stop_halts_after_first_optimizer_step_under_accumulatio
         return original_step(*args, **kwargs)
 
     def stop_on_first_validation(context):
-        context.signal.should_stop = True
-        context.signal.stop_message = "stop after first accumulated validation"
+        context.signal.request_stop("test", "stop after first accumulated validation")
 
     def capture_batch_end(context):
-        if context.stage == "train":
+        if context.runner.stage == "train":
             processed_batches.append(context.batch_idx)
 
     monkeypatch.setattr(optimizer, "step", counted_step)
@@ -457,7 +456,7 @@ def test_train_batch_events_do_not_report_early_lr_change_for_valid_end_schedule
     )
     agent.add_listener(
         "on_batch_end",
-        lambda context: batch_end_lrs.append(context.lr) if context.stage == "train" else None,
+        lambda context: batch_end_lrs.append(context.lr) if context.runner.stage == "train" else None,
     )
 
     agent.run()

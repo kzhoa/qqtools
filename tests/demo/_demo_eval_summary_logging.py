@@ -2,8 +2,9 @@ import logging
 from types import SimpleNamespace
 
 from qqtools.plugins.qpipeline.qlogger import ConsoleLogger
+from qqtools.plugins.qpipeline.runner.events import RunnerRuntimeView, ValidationEndEventContext
 from qqtools.plugins.qpipeline.runner.runner_utils.eval_formatter import EvalSummaryListener
-from qqtools.plugins.qpipeline.runner.runner_utils.types import EventContext, RunningState
+from qqtools.plugins.qpipeline.runner.runner_utils.types import LoopSignal, RunningState
 
 
 def _make_eval_results(val_metric: float, ema_val_metric: float):
@@ -32,14 +33,20 @@ def _build_context(
     is_best: bool,
     previous_best,
     best_model_tracker,
-) -> EventContext:
-    return EventContext(
-        state=state,
-        stage="eval",
+) -> ValidationEndEventContext:
+    return ValidationEndEventContext(
+        runner=RunnerRuntimeView(
+            run_state=state,
+            stage="eval",
+            max_epochs=None,
+            max_steps=None,
+        ),
         eval_results=eval_results,
         is_best=is_best,
         previous_best=previous_best,
         best_model_tracker=best_model_tracker,
+        lr=None,
+        signal=LoopSignal(),
     )
 
 

@@ -33,7 +33,7 @@ def prompt_runner_params():
     Logical relationships:
     1. Select run mode (epoch/step), dynamically show corresponding parameters
        - epoch mode: requires max_epochs; eval_interval is in epochs
-       - step mode: requires max_steps; eval_interval is in steps
+       - step mode: requires at least one of max_steps/max_epochs, and can infer max_steps from max_epochs; eval_interval is in steps
     2. eval_interval meaning changes based on run_mode
     3. Prompt clip_grad (optional)
     4. Prompt accum_grad (optional)
@@ -101,15 +101,13 @@ def prompt_runner_params():
                 print_formatted_text("❌ Must be an integer.")
 
     else:  # step mode
-        print_formatted_text("\n📍 Step Mode: Training stops after max_steps OR early stopping")
-        print_formatted_text("  💡 max_epochs is omitted here because step mode ignores it.")
+        print_formatted_text("\n📍 Step Mode: Training requires at least one of max_steps or max_epochs, plus early stopping")
+        print_formatted_text("  💡 Leave max_steps empty only if you provide max_epochs and want the runner to infer it.")
 
-        # max_steps (required)
+        # max_steps (optional; can be inferred from max_epochs)
         while True:
-            default_val = RUN_MODE_DEFAULTS["step"]["max_steps"]
-            value = prompt(f"  Max Steps (required, default: {default_val}): ").strip()
+            value = prompt("  Max Steps (optional, press Enter to infer from max_epochs if provided): ").strip()
             if not value:
-                params["max_steps"] = default_val
                 break
             try:
                 steps = int(value)
@@ -120,6 +118,27 @@ def prompt_runner_params():
                 break
             except ValueError:
                 print_formatted_text("❌ Must be an integer.")
+
+        while True:
+            value = prompt("  Max Epochs (optional if max_steps is set; otherwise required for inference, press Enter to skip): ").strip()
+            if not value or value.lower() == "none":
+                break
+            try:
+                epochs = int(value)
+                if epochs < 1:
+                    print_formatted_text("❌ max_epochs must be >= 1.")
+                    continue
+                params["max_epochs"] = epochs
+                break
+            except ValueError:
+                print_formatted_text("❌ Must be an integer.")
+
+        if "max_steps" not in params and "max_epochs" not in params:
+            default_val = RUN_MODE_DEFAULTS["step"]["max_steps"]
+            params["max_steps"] = default_val
+            print_formatted_text(
+                f"  💡 Neither max_steps nor max_epochs was provided; defaulting max_steps to {default_val}."
+            )
 
         # eval_interval (in steps)
         print_formatted_text("  💡 Tip: eval_interval will be counted in optimizer STEPS")
@@ -196,11 +215,14 @@ def prompt_runner_params():
 
     # Step 6: Keep only latest regular checkpoint
     while True:
-        ans = prompt("\nKeep only latest regular checkpoint (deletes old ones)? [y/n] (default: n): ").strip().lower()
-        if not ans or ans in ("n", "no"):
+        ans = prompt(
+            "\nKeep only latest regular checkpoint (deletes old ones)? [y/n] (default: y): "
+        ).strip().lower()
+        if not ans or ans in ("y", "yes"):
+            params["regular_latest_only"] = True
             break
-        if ans in ("y", "yes"):
-            params["keep_latest_ckp"] = True
+        if ans in ("n", "no"):
+            params["regular_latest_only"] = False
             break
         print_formatted_text("❌ Invalid input. Please enter 'y' or 'n'.")
 

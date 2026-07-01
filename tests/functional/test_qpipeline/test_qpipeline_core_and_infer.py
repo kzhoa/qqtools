@@ -5,13 +5,13 @@ import pytest
 import torch
 
 import qqtools as qt
-import qqtools.plugins.qpipeline.runner.runner_utils.progress as progress_module
-import qqtools.plugins.qpipeline.runner.runner as runner_module
 import qqtools.plugins.qpipeline.qpipeline as qpipeline_module
+import qqtools.plugins.qpipeline.runner.runner as runner_module
+import qqtools.plugins.qpipeline.runner.runner_utils.progress as progress_module
 from qqtools.plugins.qpipeline.entry import create_pipeline_class
-from qqtools.plugins.qpipeline.qpipeline import qPipeline
-from qqtools.plugins.qpipeline.qpipeline import prepare_logdir
-from qqtools.plugins.qpipeline.runner.runner import infer_runner
+from qqtools.plugins.qpipeline.qpipeline import prepare_logdir, qPipeline
+from qqtools.plugins.qpipeline.runner.runner import evaluate_runner, infer_runner
+from qqtools.plugins.qpipeline.task.qtask import OPTIONAL_METHODS, TASK_LIFECYCLE_HOOKS, qTaskBase
 
 
 def test_prepare_logdir_writes_config_yaml(tmp_path):
@@ -56,6 +56,112 @@ def test_create_pipeline_class_injects_prepare_methods():
     assert cls.prepare_task(None) == "task"
 
 
+def test_task_lifecycle_hooks_match_optional_methods_contract():
+    lifecycle_hooks_in_optional_methods = {name for name in OPTIONAL_METHODS if name in TASK_LIFECYCLE_HOOKS}
+    assert lifecycle_hooks_in_optional_methods == set(TASK_LIFECYCLE_HOOKS)
+
+
+def test_prepare_training_session_registers_exact_task_lifecycle_hooks(monkeypatch, tmp_path):
+    class LifecycleTask(qTaskBase):
+        def __init__(self):
+            super().__init__()
+            self.train_loader = []
+            self.val_loader = []
+            self.test_loader = []
+            self.meta = {}
+
+        def batch_forward(self, model, batch_data):
+            return {}
+
+        def batch_loss(self, out, batch_data):
+            return {"loss": (torch.tensor(0.0), 1)}
+
+        def batch_metric(self, out, batch_data):
+            return {"metric": (torch.tensor(0.0), 1)}
+
+        def post_metrics_to_value(self, result):
+            return 0.0
+
+        def on_epoch_start(self, context):
+            return None
+
+        def on_epoch_end(self, context):
+            return None
+
+        def on_train_batch_end(self, context):
+            return None
+
+        def on_validation_end(self, context):
+            return None
+
+        def on_early_stop(self, context):
+            return None
+
+    class DummyProgressTracker:
+        def __init__(self, logger, print_freq, render_type=None, rank=0):
+            self.logger = logger
+            self.print_freq = print_freq
+            self.render_type = render_type
+            self.rank = rank
+
+        def on_epoch_start(self, context):
+            return None
+
+        def on_progress_tick(self, context):
+            return None
+
+        def on_table_update(self, context):
+            return None
+
+        def on_epoch_end(self, context):
+            return None
+
+        def on_eval_start(self, context):
+            return None
+
+        def on_eval_end(self, context):
+            return None
+
+    monkeypatch.setattr(runner_module, "ProgressTracker", DummyProgressTracker)
+
+    task = LifecycleTask()
+    agent = Mock()
+    config = qt.qDict(
+        {
+            "ckp_file": None,
+            "print_freq": 1,
+            "render_type": None,
+            "rank": 0,
+            "use_profiler": False,
+        }
+    )
+
+    runner_module._prepare_training_session(
+        config=config,
+        save_dir=str(tmp_path),
+        logger=Mock(),
+        sheet_logger=None,
+        checkpoint_manager=Mock(),
+        agent=agent,
+        early_stopper=Mock(),
+        eval_summary_listener=Mock(on_validation_end=Mock()),
+        early_stop_listener=Mock(on_validation_end=Mock()),
+        checkpoint_listener=Mock(on_checkpoint_request=Mock()),
+        effective_scheduler=None,
+        device=torch.device("cpu"),
+        model=Mock(),
+        task=task,
+        optimizer=Mock(),
+        ema_model=None,
+        log_granularity=None,
+    )
+
+    registered_task_lifecycle_hooks = {
+        call.args[0] for call in agent.add_listener.call_args_list if getattr(call.args[1], "__self__", None) is task
+    }
+    assert registered_task_lifecycle_hooks == set(TASK_LIFECYCLE_HOOKS)
+
+
 def test_infer_runner_without_checkpoint(base_args, tiny_task, tiny_model):
     results = infer_runner(
         model=tiny_model,
@@ -64,13 +170,16 @@ def test_infer_runner_without_checkpoint(base_args, tiny_task, tiny_model):
         args=base_args,
         distributed=False,
     )
-    assert len(results) > 0
-    assert "preds" in results[0]
+    assert results is not None
+    assert "pred" in results
+    assert results["pred"].shape[0] == len(tiny_task.test_loader.dataset)
+    assert "labels" in results
 
 
-def test_infer_runner_distributed_non_zero_rank_returns_empty(base_args, tiny_task, tiny_model):
+def test_infer_runner_distributed_non_zero_rank_returns_none(monkeypatch, base_args, tiny_task, tiny_model):
     args = base_args.copy()
     args.rank = 1
+    monkeypatch.setattr(runner_module.qt.qdist, "get_rank", lambda: 1)
     results = infer_runner(
         model=tiny_model,
         task=tiny_task,
@@ -78,7 +187,7 @@ def test_infer_runner_distributed_non_zero_rank_returns_empty(base_args, tiny_ta
         args=args,
         distributed=True,
     )
-    assert results == []
+    assert results is None
 
 
 def test_infer_runner_args_required(tiny_task, tiny_model):
@@ -90,6 +199,101 @@ def test_infer_runner_args_required(tiny_task, tiny_model):
             args=None,
             distributed=False,
         )
+
+
+def test_evaluate_once_runner_returns_prefixed_metrics(base_args, tiny_task, tiny_model):
+    results = evaluate_runner(
+        model=tiny_model,
+        task=tiny_task,
+        dataloader=tiny_task.test_loader,
+        args=base_args,
+        prefix="test",
+        return_outputs=False,
+    )
+
+    assert results is not None
+    assert "test_metric" in results
+    assert "test_mse" in results
+    assert "pred" not in results
+
+
+def test_evaluate_once_runner_return_outputs_includes_metrics_and_predictions(base_args, tiny_task, tiny_model):
+    results = evaluate_runner(
+        model=tiny_model,
+        task=tiny_task,
+        dataloader=tiny_task.test_loader,
+        args=base_args,
+        prefix="test",
+        return_outputs=True,
+    )
+
+    assert results is not None
+    assert "test_metric" in results
+    assert "test_mse" in results
+    assert "pred" in results
+    assert "labels" in results
+    assert results["pred"].shape[0] == len(tiny_task.test_loader.dataset)
+
+
+def test_qpipeline_uses_args_test_to_enter_test_mode(base_args, tiny_task, tiny_model):
+    args = base_args.copy()
+    args.test = True
+    pipeline_cls = create_pipeline_class(lambda _args: tiny_model, lambda _args: tiny_task)
+
+    pipeline = pipeline_cls(args)
+
+    assert pipeline.mode == "test"
+    assert pipeline.loss_fn is None
+
+
+def test_qpipeline_mode_overrides_args_test(base_args, tiny_task, tiny_model):
+    args = base_args.copy()
+    args.test = True
+    pipeline_cls = create_pipeline_class(lambda _args: tiny_model, lambda _args: tiny_task)
+
+    pipeline = pipeline_cls(args, mode="test")
+    assert pipeline.mode == "test"
+
+    args2 = base_args.copy()
+    args2.test = False
+    pipeline2 = pipeline_cls(args2, mode="test")
+    assert pipeline2.mode == "test"
+
+
+def test_qpipeline_test_mode_evaluate_once_defaults_to_test_loader(base_args, tiny_task, tiny_model):
+    args = base_args.copy()
+    args.test = True
+    pipeline_cls = create_pipeline_class(lambda _args: tiny_model, lambda _args: tiny_task)
+    pipeline = pipeline_cls(args)
+
+    results = pipeline.evaluate_once()
+
+    assert results is not None
+    assert "test_metric" in results
+    assert "test_mse" in results
+
+
+def test_qpipeline_infer_returns_outputs(base_args, tiny_task, tiny_model):
+    args = base_args.copy()
+    args.test = True
+    pipeline_cls = create_pipeline_class(lambda _args: tiny_model, lambda _args: tiny_task)
+    pipeline = pipeline_cls(args)
+
+    results = pipeline.infer()
+
+    assert results is not None
+    assert "pred" in results
+    assert "labels" in results
+
+
+def test_qpipeline_fit_rejects_test_mode(base_args, tiny_task, tiny_model):
+    args = base_args.copy()
+    args.test = True
+    pipeline_cls = create_pipeline_class(lambda _args: tiny_model, lambda _args: tiny_task)
+    pipeline = pipeline_cls(args)
+
+    with pytest.raises(RuntimeError, match="train mode"):
+        pipeline.fit()
 
 
 def test_progress_tracker_auto_mode_logs_info(monkeypatch):
@@ -165,7 +369,7 @@ def test_train_runner_progress_tick_contains_batch_time(monkeypatch, base_args, 
     captured_progress_contexts = []
 
     class _CaptureProgressTracker:
-        def __init__(self, logger, print_freq=10, render_type=None):
+        def __init__(self, logger, print_freq=10, render_type=None, rank=0):
             return None
 
         def on_epoch_start(self, context):
@@ -241,12 +445,12 @@ def test_eval_emits_progress_tick_for_val_and_test_stages(tiny_task, tiny_model,
     captured_stages = []
 
     def _capture_progress_tick(context):
-        captured_stages.append(context.stage)
+        captured_stages.append(context.runner.stage)
 
     agent.add_listener("on_progress_tick", _capture_progress_tick)
 
-    agent._run_evaluation(tiny_model, tiny_task.val_loader, prefix="val", stage="val")
-    agent._run_evaluation(tiny_model, tiny_task.test_loader, prefix="test", stage="test")
+    agent._evaluate_loader(tiny_model, tiny_task.val_loader, prefix="val", stage="val")
+    agent._evaluate_loader(tiny_model, tiny_task.test_loader, prefix="test", stage="test")
 
     val_ticks = [stage for stage in captured_stages if stage == "val"]
     test_ticks = [stage for stage in captured_stages if stage == "test"]
@@ -286,13 +490,13 @@ def test_qpipeline_fit_forwards_accum_grad(monkeypatch, base_args):
 
     pipeline = object.__new__(DummyPipeline)
     pipeline.args = args
+    pipeline.mode = "train"
     pipeline.model = Mock()
     pipeline.task = Mock()
     pipeline.loss_fn = Mock()
-    pipeline.optimizer = Mock()
-    pipeline.scheduler = Mock()
     pipeline.extra_ckp_caches = {"cache_key": "cache_value"}
     pipeline.ema_model = Mock()
+    pipeline.logger = Mock()
 
     pipeline.fit(use_profiler=True)
 

@@ -5,25 +5,32 @@ from types import MappingProxyType
 from typing import Any, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 
 import torch
+import torch.distributed as dist
 
 from qqtools.torch import qdist
 
-TerminalReason = Literal["max_steps", "max_epochs", "early_stop", "user_interrupt", "oom", "exception"]
+TerminalReason = Literal["max_steps", "max_epochs", "early_stop", "user_interrupt", "oom", "exception", "nan_detected"]
 EpochResultMetricSource = Literal["current_eval", "latest_eval_reuse", "missing"]
 
 __all__ = [
+    "Stage",
     "RunMode",
     "RunConfig",
     "RunningState",
     "LoopSignal",
+    "StopReason",
     "FrozenRunningState",
-    "EventType",
-    "EventContext",
     "TerminalReason",
     "EpochResultMetricSource",
     "TerminalEvent",
     "TrainRunnerResult",
 ]
+
+
+class Stage(str, Enum):
+    TRAIN = "train"
+    VAL = "val"
+    TEST = "test"
 
 
 class RunMode(Enum):
@@ -121,8 +128,6 @@ class RunningState:
     # current state
     epoch: int = 0
     global_step: int = 0
-    max_epochs: int = 0
-    max_steps: int = 0
 
     # best state
     best_epoch: int = 0
@@ -193,13 +198,27 @@ class RunningState:
 
 
 @dataclass
+class StopReason:
+    """Structured record of a single stop-triggering event."""
+
+    source: str
+    message: str
+
+
+@dataclass
 class LoopSignal:
     """Mutable signal box consumed by the loop after listeners finish."""
 
     should_stop: bool = False
-    stop_message: Optional[str] = None
+    stop_reasons: List[StopReason] = field(default_factory=list)
+    nan_failure: bool = False
+    nan_failure_source_ranks: List[int] = field(default_factory=list)
     pending_checkpoint_types: List[Literal["best", "regular"]] = field(default_factory=list)
     checkpoint_path: Optional[str] = None
+
+    def request_stop(self, source: str, message: str) -> None:
+        self.should_stop = True
+        self.stop_reasons.append(StopReason(source=source, message=message))
 
     def request_checkpoint(self, checkpoint_type: Literal["best", "regular"]) -> None:
         if checkpoint_type not in ("best", "regular"):
@@ -218,8 +237,26 @@ class LoopSignal:
 
         if reduced_flag > 0:
             if not self.should_stop:
-                self.stop_message = "Stopping triggered by another rank."
+                self.request_stop("ddp_sync", "Stopping triggered by another rank.")
             self.should_stop = True
+
+    def synchronize_nan_failure(self, device: torch.device, distributed: bool) -> None:
+        """Synchronize NaN failure signals across all DDP ranks."""
+        local_nan_flag = 1 if self.nan_failure else 0
+
+        if not distributed:
+            if local_nan_flag > 0 and not self.nan_failure_source_ranks:
+                self.nan_failure_source_ranks = [0]
+            return
+
+        local_flag_tensor = torch.tensor([local_nan_flag], dtype=torch.int64, device=device)
+        gathered_flag_tensors = [torch.empty_like(local_flag_tensor) for _ in range(qdist.get_world_size())]
+        dist.all_gather(gathered_flag_tensors, local_flag_tensor)
+        source_ranks = [rank for rank, flag in enumerate(gathered_flag_tensors) if int(flag.item()) > 0]
+
+        if source_ranks:
+            self.nan_failure = True
+            self.nan_failure_source_ranks = source_ranks
 
 
 def _deep_freeze(value: Any) -> Any:
@@ -270,38 +307,3 @@ class FrozenRunningState:
         state.from_dict(thawed)
         return state
 
-
-class EventType(Enum):
-    ON_EPOCH_START = "on_epoch_start"
-    ON_EPOCH_END = "on_epoch_end"
-    ON_BATCH_START = "on_batch_start"
-    ON_BATCH_END = "on_batch_end"
-    ON_PROGRESS_TICK = "on_progress_tick"
-    ON_TABLE_UPDATE = "on_table_update"
-    ON_TRAIN_BATCH_END = "on_train_batch_end"
-    ON_EVAL_START = "on_eval_start"
-    ON_EVAL_END = "on_eval_end"
-    ON_VALIDATION_END = "on_validation_end"
-    ON_CHECKPOINT_REQUEST = "on_checkpoint_request"
-    ON_EARLY_STOP = "on_early_stop"
-
-
-@dataclass
-class EventContext:
-    state: Union[RunningState, FrozenRunningState]
-    signal: Optional[LoopSignal] = None
-    batch_idx: Optional[int] = None
-    total_batches: Optional[int] = None
-    batch_metrics: Optional[Dict[str, Any]] = None
-    avg_bank: Optional[Dict[str, Any]] = None
-    lr: Optional[float] = None
-    eval_results: Optional[Dict[str, Any]] = None
-    checkpoint_type: Optional[str] = None
-    stage: Optional[str] = None  # Current stage: "training", "validation", "testing"
-    previous_best: Optional[Dict[str, Any]] = None
-    is_best: Optional[bool] = None
-    best_model_tracker: Optional[Any] = None
-    # Provide run limits on the context so listeners can access them without
-    # coupling to RunningState (which no longer carries these fields).
-    max_epochs: Optional[int] = None
-    max_steps: Optional[int] = None

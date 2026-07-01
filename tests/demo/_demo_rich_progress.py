@@ -1,7 +1,9 @@
 import time
 import logging
+from qqtools.plugins.qpipeline.runner.events import ProgressEventContext, RunnerRuntimeView
+from qqtools.plugins.qpipeline.runner.events.types import _EpochStartInternalContext
 from qqtools.plugins.qpipeline.runner.runner_utils.progress import ProgressTracker
-from qqtools.plugins.qpipeline.runner.runner_utils.types import EventContext, RunningState
+from qqtools.plugins.qpipeline.runner.runner_utils.types import RunningState
 from qqtools.plugins.qpipeline.qlogger import ConsoleLogger
 
 
@@ -21,17 +23,35 @@ def main():
     for epoch in range(total_epochs):
         # Fire Epoch Start
         state.epoch = epoch
-        ctx = EventContext(state=state, total_batches=batches_per_epoch, stage="train")
-        tracker.on_epoch_start(ctx)
+        tracker.on_epoch_start(
+            _EpochStartInternalContext(
+                runner=RunnerRuntimeView(
+                    run_state=state,
+                    stage="train",
+                    max_epochs=total_epochs,
+                    max_steps=None,
+                ),
+                total_batches=batches_per_epoch,
+            )
+        )
 
         for batch_idx in range(batches_per_epoch):
             time.sleep(0.05)  # Simulate work
 
             # Fire Progress Tick
-            ctx.batch_idx = batch_idx
-            ctx.batch_metrics = {"loss": 0.5 - batch_idx * 0.001, "acc": 0.1 + batch_idx * 0.01}
-            ctx.avg_bank = {"loss": 0.4}
-            ctx.lr = 0.001
+            ctx = ProgressEventContext(
+                runner=RunnerRuntimeView(
+                    run_state=state,
+                    stage="train",
+                    max_epochs=total_epochs,
+                    max_steps=None,
+                ),
+                batch_idx=batch_idx,
+                total_batches=batches_per_epoch,
+                batch_metrics={"loss": 0.5 - batch_idx * 0.001, "acc": 0.1 + batch_idx * 0.01},
+                avg_bank={"loss": 0.4},
+                lr=0.001,
+            )
             tracker.on_progress_tick(ctx)
 
             # Simulate log output pushing live down

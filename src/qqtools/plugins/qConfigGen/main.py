@@ -30,6 +30,9 @@ from .pts import (
 )
 
 
+RUNNER_CHECKPOINT_KEYS = {"regular_latest_only"}
+
+
 def dump_yaml_with_gaps(config: dict, path: str, order: list | None = None, gap_lines: int = 1) -> None:
     """Dump `config` to `path`, inserting `gap_lines` blank lines between top-level sections.
 
@@ -145,6 +148,15 @@ def main():
     # Step 5: Training runner configuration (moved to later)
     print_formatted_text("\n📌 Step 5/6: Training Runner Configuration")
     runner_config = prompt_runner_params()
+    runner_checkpoint_config = {
+        key: runner_config.pop(key)
+        for key in list(runner_config.keys())
+        if key in RUNNER_CHECKPOINT_KEYS
+    }
+    if runner_checkpoint_config:
+        checkpoint_config = runner_config.get("checkpoint", {})
+        checkpoint_config.update(runner_checkpoint_config)
+        runner_config["checkpoint"] = checkpoint_config
     config["runner"] = runner_config
 
     # Step 6: Save configuration

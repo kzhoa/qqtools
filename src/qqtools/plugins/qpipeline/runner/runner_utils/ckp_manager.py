@@ -7,7 +7,8 @@ import torch.nn as nn
 
 from ...entry_utils.qema import qEMA
 from ...task.qtask import qTaskBase
-from .types import EventContext, RunningState
+from ..events import CheckpointRequestEventContext
+from .types import RunningState
 
 
 def generate_checkpoint_filename(epoch: int, global_step: int, is_best: bool = False) -> str:
@@ -225,13 +226,13 @@ class CheckpointListener:
         self.early_stopper = early_stopper
         self.best_model_tracker = best_model_tracker
 
-    def _clone_state_for_save(self, context: EventContext):
-        state = context.state
+    def _clone_state_for_save(self, context: CheckpointRequestEventContext):
+        state = context.runner.run_state
         if hasattr(state, "to_running_state"):
             return state.to_running_state()
         return copy.copy(state)
 
-    def on_checkpoint_request(self, context: EventContext) -> None:
+    def on_checkpoint_request(self, context: CheckpointRequestEventContext) -> None:
         if self.checkpoint_manager is None:
             return
 
