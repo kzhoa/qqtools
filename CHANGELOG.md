@@ -1,5 +1,9 @@
 # History
 
+## v1.2.28
+
+- chore: squash dev/qq history (v1.2.8 through v1.2.27) onto main as a single commit for cleaner git lineage
+
 ## v1.2.27
 
 - refactor: replace `LoopSignal.stop_message` with structured `stop_reasons: List[StopReason]` — each stop event now records source and message independently, preventing multiple abort reasons from overwriting each other
