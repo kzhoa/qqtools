@@ -29,13 +29,19 @@ def _should_enable_offload(device: torch.device, model: nn.Module, logger: Optio
     return False
 
 
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return model.module
+    return model
+
+
 class _EMAEvaluationSession:
     """One-shot context session for a single evaluation run."""
 
     def __init__(
         self,
         eval_model: nn.Module,
-        main_model: nn.Module,
+        offload_target: nn.Module,
         ema_model: Optional[qEMA],
         device: torch.device,
         use_ema: bool,
@@ -43,7 +49,7 @@ class _EMAEvaluationSession:
         logger: Optional[qLogger] = None,
     ):
         self.eval_model = eval_model
-        self.main_model = main_model
+        self.offload_target = offload_target
         self.ema_model = ema_model
         self.device = device
         self.use_ema = use_ema
@@ -62,8 +68,8 @@ class _EMAEvaluationSession:
             return self.eval_model
 
         if self.use_offload:
-            self._log("Offloading main model to 'cpu' for EMA evaluation.")
-            self.main_model.cpu()
+            self._log("Offloading model parameters to 'cpu' for EMA evaluation.")
+            self.offload_target.cpu()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             self.offloaded = True
@@ -85,8 +91,8 @@ class _EMAEvaluationSession:
                 self.ema_model.to(self.ema_original_device)
 
             if self.offloaded:
-                self._log(f"Restoring main model to '{self.device}' after evaluation.")
-                self.main_model.to(self.device)
+                self._log(f"Restoring model parameters to '{self.device}' after evaluation.")
+                self.offload_target.to(self.device)
 
 
 class EMAOffloadContext:
@@ -108,13 +114,15 @@ class EMAOffloadContext:
         self.should_allow_auto_offload = allow_auto_offload
         self._auto_offload_enabled = False
         if self.should_allow_auto_offload and self.ema_model is not None:
-            self._auto_offload_enabled = _should_enable_offload(self.device, self.main_model, self.logger)
+            offload_target = _unwrap_model(main_model)
+            self._auto_offload_enabled = _should_enable_offload(self.device, offload_target, self.logger)
 
     def __call__(self, model: nn.Module, use_ema: bool) -> _EMAEvaluationSession:
         use_offload = self._auto_offload_enabled and (model is self.main_model)
+        offload_target = _unwrap_model(self.main_model)
         return _EMAEvaluationSession(
             eval_model=model,
-            main_model=self.main_model,
+            offload_target=offload_target,
             ema_model=self.ema_model,
             device=self.device,
             use_ema=use_ema,

@@ -7,8 +7,10 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Dict, List, Optional, Union
 
+from ..events import ProgressEventContext
+from ..events.types import _EvalEndInternalContext
 from .common import _is_periodic_trigger
-from .types import EventContext, RunConfig
+from .types import RunConfig
 
 
 class SheetLogger:
@@ -217,9 +219,9 @@ class SheetLoggerListener:
         else:
             warnings.warn(message)
 
-    def _prepare_data(self, context: EventContext, mode: str) -> Dict[str, Any]:
+    def _prepare_data(self, context: Any, mode: str) -> Dict[str, Any]:
         """Prepare a flat dictionary of metrics for logging."""
-        state = context.state
+        state = context.runner.run_state
         data = {"epoch": state.epoch, "global_step": state.global_step}
 
         source_metrics: Dict[str, Any] = {}
@@ -257,11 +259,11 @@ class SheetLoggerListener:
 
         return data
 
-    def on_eval_end(self, context: EventContext):
+    def on_eval_end(self, context: _EvalEndInternalContext):
         data = self._prepare_data(context, mode="eval")
         self.sheet_logger.write(data)
 
-    def on_train_batch_end(self, context: EventContext):
+    def on_train_batch_end(self, context: ProgressEventContext):
         if "eval" in self.log_granularity:
             is_epoch_end = (
                 context.batch_idx is not None
@@ -271,8 +273,8 @@ class SheetLoggerListener:
             is_eval_trigger = _is_periodic_trigger(
                 run_mode=self.config.run_mode,
                 interval=self.config.eval_interval,
-                global_step=context.state.global_step,
-                epoch=context.state.epoch,
+                global_step=context.runner.run_state.global_step,
+                epoch=context.runner.run_state.epoch,
                 is_epoch_end=is_epoch_end,
             )
             if is_eval_trigger:

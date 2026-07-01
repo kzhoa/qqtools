@@ -1,8 +1,7 @@
-import functools
 import warnings
 from abc import abstractmethod
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 import yaml
@@ -11,7 +10,8 @@ import qqtools as qt
 
 from . import entry_utils
 from .entry_utils.qema import qEMA
-from .runner.runner import infer_runner, train_runner
+from .qlogger import ConsoleLogger, qLogger
+from .runner.runner import evaluate_runner, infer_runner, train_runner
 from .task.qtask import qTaskBase
 
 
@@ -35,23 +35,6 @@ def prepare_logdir(args):
             yaml.dump(args.to_dict(), f)
 
 
-def rank_zero_only(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        if qt.qdist.get_rank() == 0:
-            return fn(*args, **kwargs)
-        else:
-            return None
-
-    return wrapper
-
-
-@rank_zero_only
-def main_print(*args, **kwargs):
-    rank = qt.qdist.get_rank()
-    print(f"[qPipeline:{rank}]", *args, **kwargs)
-
-
 class qPipeline:
     """
     accept args,
@@ -67,72 +50,123 @@ class qPipeline:
     def __init__(
         self,
         args: qt.qDict,
-        train: bool = False,
+        mode: Optional[Literal["train", "test"]] = None,
         task: Optional[qTaskBase] = None,
         model: Optional[torch.nn.Module] = None,
     ):
         self.args = args
-        self.train = train
+        if mode is None:
+            mode = "test" if getattr(args, "test", False) else "train"
+        self.mode = mode
         self.task = task
         self.model = model
+        self.loss_fn = None
+        self.ema_model = None
+        self.extra_ckp_caches = {}
+        self._runtime_ready = False
+        self.logger: Optional[qLogger] = None
 
-        if train:
+        if self.mode == "train":
             self.init_for_train()
-
-    def init_for_train(self):
-        args = self.args
-        task = self.task
-        model = self.model
-
-        self.prepare_env(args)
-        main_print("[qPipeline] use args:\n", args)
-
-        if task is not None:
-            self.task = task
         else:
+            self.init_for_test()
+
+    def _ensure_runtime_ready(self) -> None:
+        if self._runtime_ready:
+            return
+
+        args = self.args
+        self.prepare_env(args)
+
+        # Logger creation — log_dir is now known
+        rank = qt.qdist.get_rank()
+        if args.log_dir:
+            self.logger = qLogger(args.log_dir, console=True)
+        else:
+            self.logger = ConsoleLogger(rank=rank)
+
+        self.logger.info(f"[qPipeline] use args:\n {args}")
+
+        if self.task is None:
             self.task = self.prepare_task(args)
 
-        # convention
-        if task is not None and "pipe_middle_ware" in task._opt_impl:
-            task.pipe_middle_ware(self)
+        if self.task.has_implemented("pipe_middle_ware"):
+            self.task.pipe_middle_ware(self)
 
-        if model is None:
-            model = self.prepare_model(args)
+        if self.model is None:
+            self.model = self.prepare_model(args)
 
-        # handle ema
-        ema_params = args.optim.ema_params or qt.qData(ema=False, ema_decay=0.99)
-        if ema_params.ema is True:
-            ema_model = qEMA(model, ema_params.ema_decay, torch.device("cpu"))
-        else:
-            ema_model = None
-        self.ema_model = ema_model
+        self.model = self._place_model(self.model)
 
+        if "to" in self.task._opt_impl:
+            self.task.to(args.device)
+
+        self._runtime_ready = True
+
+    def _load_state_dict_file(self, state_file: str, *, description: str) -> None:
+        state = torch.load(state_file, map_location="cpu", weights_only=True)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        target_model = (
+            self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+        )
+        target_model.load_state_dict(state)
+        self.logger.info(f"[qPipeline] loaded {description} weights from {state_file}")
+
+    def _place_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        args = self.args
         if not args.distributed:
-            self.model = model.to(args.device)
-            main_print(f"model moved to {args.device}")
-        elif not isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            placed_model = model.to(args.device)
+            self.logger.info(f"model moved to {args.device}")
+            return placed_model
+        if not isinstance(model, torch.nn.parallel.DistributedDataParallel):
             model.to(args.local_rank)
-            self.model = torch.nn.parallel.DistributedDataParallel(
+            placed_model = torch.nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[args.local_rank],
                 find_unused_parameters=False,
             )
-            main_print(f"model with DDP wrapped to {args.local_rank}")
-        else:
-            self.model = model
-            main_print(f"model with DDP already wrapped on {next(model.parameters()).device}")
+            self.logger.info(f"model with DDP wrapped to {args.local_rank}")
+            return placed_model
 
-        # convention: task device check
-        if "to" in self.task._opt_impl:
-            self.task.to(args.device)
+        self.logger.info(f"model with DDP already wrapped on {next(model.parameters()).device}")
+        return model
 
-        # train-only
-        if self.train:
-            self.optimizer, self.scheduler = self.prepare_optim(args, self.model)
-            self.loss_fn = self.prepare_loss(args)
+    def init_for_train(self):
+        args = self.args
+        self._ensure_runtime_ready()
 
-        # other declarations
-        self.extra_ckp_caches = {}
+        if self.task.has_implemented("init_train_model"):
+            target_model = (
+                self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+            )
+            self.task.init_train_model(target_model, args)
+            self.logger.info("[qPipeline] `init_train_model` hook applied.")
+        elif getattr(args, "init_file", None):
+            self._load_state_dict_file(args.init_file, description="init")
+
+        if getattr(args, "init_file", None) and getattr(args, "ckp_file", None):
+            self.logger.warning(
+                "[qPipeline] WARNING: args.init_file and args.ckp_file are both set. "
+                "Checkpoint resume in runner will override the init weights."
+            )
+
+        ema_params = args.optim.ema_params or qt.qData(ema=False, ema_decay=0.99)
+        ema_source_model = (
+            self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+        )
+        self.ema_model = qEMA(ema_source_model, ema_params.ema_decay, torch.device("cpu")) if ema_params.ema else None
+
+        self.loss_fn = self.prepare_loss(args)
+
+    def init_for_test(self):
+        args = self.args
+        self._ensure_runtime_ready()
+
+        if getattr(args, "ckp_file", None):
+            self._load_state_dict_file(args.ckp_file, description="checkpoint")
+        elif getattr(args, "init_file", None):
+            self._load_state_dict_file(args.init_file, description="init")
 
     @staticmethod
     @abstractmethod
@@ -143,11 +177,6 @@ class qPipeline:
     @abstractmethod
     def prepare_model(args):
         raise NotImplementedError
-
-    @staticmethod
-    def prepare_optim(args, model):
-        optimizer, scheduler = entry_utils.prepare_optim(args, model)
-        return optimizer, scheduler
 
     @staticmethod
     def prepare_loss(args):
@@ -180,20 +209,13 @@ class qPipeline:
         prepare_logdir(args)
 
         args.device = qt.parse_device(args.local_rank)
-        torch.cuda.set_device(args.device)
-        main_print(f"Set device to: {args.device}")
+        if args.device.type == "cuda":
+            torch.cuda.set_device(args.device)
 
     def fit(self, use_profiler=False):
-        model, task, loss_fn, optimizer, scheduler, extra_ckp_caches = (
-            self.model,
-            self.task,
-            self.loss_fn,
-            self.optimizer,
-            self.scheduler,
-            self.extra_ckp_caches,
-        )
+        if self.mode != "train":
+            raise RuntimeError("qPipeline.fit() is only available in train mode")
 
-        # unpack
         args = self.args
         max_epochs = args.runner.max_epochs
         max_steps = args.runner.max_steps
@@ -205,18 +227,16 @@ class qPipeline:
 
         extra_log_keys = None
 
-        # interval run configs
         run_mode = args.runner.get("run_mode", "epoch")
         eval_interval = args.runner.get("eval_interval", 1)
         save_interval = args.runner.get("save_interval", None)
 
-        train_runner(
-            model=model,
-            task=task,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            scheduler=scheduler,
+        return train_runner(
+            model=self.model,
+            task=self.task,
+            loss_fn=self.loss_fn,
             args=args,
+            logger=self.logger,
             max_epochs=max_epochs,
             max_steps=max_steps,
             clip_grad=clip_grad,
@@ -224,7 +244,7 @@ class qPipeline:
             save_dir=log_dir,
             print_freq=print_freq,
             extra_log_keys=extra_log_keys,
-            extra_ckp_caches=extra_ckp_caches,
+            extra_ckp_caches=self.extra_ckp_caches,
             use_profiler=use_profiler,
             ema_model=self.ema_model,
             run_mode=run_mode,
@@ -237,7 +257,7 @@ class qPipeline:
         if dataloader is None:
             warnings.warn(Warning("[qPipeline]No dataloader provided, use task.test_loader"))
             dataloader = self.task.test_loader
-        self.infer_only(dataloader)
+        return self.infer_only(dataloader)
 
     def infer_only(self, dataloader):
         assert dataloader is not None
@@ -245,13 +265,28 @@ class qPipeline:
         args = self.args
 
         distributed = args.distributed
-        # print_freq = args.print_freq or 100
 
-        infer_runner(
+        return infer_runner(
             model=model,
             task=task,
             dataloader=dataloader,
             args=args,
             distributed=distributed,
-            # print_freq=print_freq,
+            logger=self.logger,
+        )
+
+    def evaluate_once(self, dataloader=None, prefix: str = "test", return_outputs: bool = False):
+        if dataloader is None:
+            warnings.warn(Warning("[qPipeline]No dataloader provided, use task.test_loader"))
+            dataloader = self.task.test_loader
+        assert dataloader is not None
+
+        return evaluate_runner(
+            model=self.model,
+            task=self.task,
+            dataloader=dataloader,
+            args=self.args,
+            prefix=prefix,
+            return_outputs=return_outputs,
+            logger=self.logger,
         )

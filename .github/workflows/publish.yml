@@ -35,6 +35,68 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install build setuptools wheel
+      - name: Validate tag, version, and changelog
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          tag = os.environ["TAG_NAME"]
+          if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+              sys.stderr.write(f"Unsupported tag format: {tag}\n")
+              sys.exit(1)
+
+          version_file = pathlib.Path("src/qqtools/version.py")
+          version_text = version_file.read_text(encoding="utf-8")
+          match = re.search(r'__version__\s*=\s*"([^"]+)"', version_text)
+          if match is None:
+              sys.stderr.write("Could not parse package version.\n")
+              sys.exit(1)
+
+          version = match.group(1)
+          expected_tag = f"v{version}"
+          if tag != expected_tag:
+              sys.stderr.write(
+                  f"Tag/version mismatch: tag={tag}, package={expected_tag}\n"
+              )
+              sys.exit(1)
+
+          changelog = pathlib.Path("CHANGELOG.md")
+          lines = changelog.read_text(encoding="utf-8").splitlines()
+          header_re = re.compile(rf"^##\s+{re.escape(tag)}(?:\s+\(.*\))?\s*$")
+          next_header_re = re.compile(r"^##\s+")
+
+          start = None
+          for index, line in enumerate(lines):
+              if header_re.match(line):
+                  start = index + 1
+                  break
+
+          if start is None:
+              sys.stderr.write(
+                  f"Missing changelog section for tag {tag} in CHANGELOG.md\n"
+              )
+              sys.exit(1)
+
+          end = len(lines)
+          for index in range(start, len(lines)):
+              if next_header_re.match(lines[index]):
+                  end = index
+                  break
+
+          body = "\n".join(lines[start:end]).strip()
+          if not body:
+              sys.stderr.write(
+                  f"Changelog section for tag {tag} is empty.\n"
+              )
+              sys.exit(1)
+
+          pathlib.Path("RELEASE_BODY.md").write_text(body + "\n", encoding="utf-8")
+          PY
       - name: Build package
         run: python -m build --sdist --wheel
 
@@ -44,13 +106,9 @@ jobs:
         if: github.ref_type == 'tag'
         with:
           draft: false
-          generate_release_notes: true
+          generate_release_notes: false
           token: ${{ secrets.ACCESS_TOKEN }}
-          body: |
-            ## Release Notes for ${{ github.ref_name }}
-
-            - This is an automatically generated release note.
-            - Version: ${{ github.ref_name }}
+          body_path: RELEASE_BODY.md
           files: |
             ./dist/**
 

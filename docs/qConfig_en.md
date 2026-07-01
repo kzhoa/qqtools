@@ -337,13 +337,23 @@ optim:
     eta_min: 1.0e-6 # Minimum learning rate
 ```
 
-| Parameter | Type    | Range | Default | Description                                |
-| --------- | ------- | ----- | ------- | ------------------------------------------ |
-| `T_max`   | Integer | ≥ 1   | None    | Period length in scheduler-step units      |
-| `eta_min` | Float   | ≥ 0   | 0       | Minimum learning rate                      |
+```yaml
+# Epoch-suffix syntax:
+optim:
+  scheduler: cosine
+  scheduler_params:
+    T_max: 5epoch  # Auto-converted to 5 * steps_per_epoch
+    eta_min: 1.0e-6
+```
+
+| Parameter | Type              | Range | Default | Description                                |
+| --------- | ----------------- | ----- | ------- | ------------------------------------------ |
+| `T_max`   | Integer or string | ≥ 1   | None    | Period length in scheduler-step units. Supports epoch-suffix (e.g., `"5epoch"`, `"0.5epoch"`)      |
+| `eta_min` | Float             | ≥ 0   | 0       | Minimum learning rate                      |
 
 - **Effect**: Learning rate decays from initial value to `eta_min` following cosine curve over `T_max` scheduler steps
 - **Default Unit**: completed optimizer updates (`step_on=optimizer_step`)
+- **Epoch-Suffix**: Only allowed when `step_on=optimizer_step`. Not allowed with `step_on=valid_end`.
 - **Applicable For**: Tasks requiring gradual learning rate reduction
 
 ##### Step LR
@@ -356,13 +366,14 @@ optim:
     gamma: 0.1 # Decay factor
 ```
 
-| Parameter   | Type    | Range | Default | Description                             |
-| ----------- | ------- | ----- | ------- | --------------------------------------- |
-| `step_size` | Integer | ≥ 1   | 30      | Decay period in scheduler-step units    |
-| `gamma`     | Float   | 0-1   | 0.1     | Learning rate multiplied by this factor |
+| Parameter   | Type              | Range | Default | Description                             |
+| ----------- | ----------------- | ----- | ------- | --------------------------------------- |
+| `step_size` | Integer or string | ≥ 1   | 30      | Decay period in scheduler-step units. Supports epoch-suffix (e.g., `"2epoch"`)    |
+| `gamma`     | Float             | 0-1   | 0.1     | Learning rate multiplied by this factor |
 
 - **Effect**: Every `step_size` scheduler steps, multiply learning rate by `gamma`
 - **Default Unit**: completed optimizer updates (`step_on=optimizer_step`)
+- **Epoch-Suffix**: Only allowed when `step_on=optimizer_step`.
 - **Example**: If lr=0.1, step_size=1000, gamma=0.1, then after 1000 scheduler steps, lr becomes 0.01
 
 ##### MultiStep LR
@@ -375,13 +386,14 @@ optim:
     gamma: 0.1 # Decay factor
 ```
 
-| Parameter    | Type          | Description                               |
-| ------------ | ------------- | ----------------------------------------- |
-| `milestones` | Integer Array | List of scheduler steps where learning rate decays |
-| `gamma`      | Float         | Decay factor                              |
+| Parameter    | Type                    | Description                               |
+| ------------ | ----------------------- | ----------------------------------------- |
+| `milestones` | Integer/string Array    | List of scheduler steps where learning rate decays. Supports epoch-suffix per element (e.g., `["0.3epoch", "0.6epoch", "0.9epoch"]`) |
+| `gamma`      | Float                   | Decay factor                              |
 
 - **Effect**: Adjust learning rate at specified scheduler steps
 - **Default Unit**: completed optimizer updates (`step_on=optimizer_step`)
+- **Epoch-Suffix**: Only allowed when `step_on=optimizer_step`. Mixed usage (integers and epoch-suffix strings) within the list is supported.
 - **Applicable For**: When optimal decay epochs are known
 
 ##### ReduceLROnPlateau
@@ -441,15 +453,25 @@ or
 ```yaml
 optim:
   warmup_params:
-    warmup_epochs: 5 # Converted to steps
+    warmup_epochs: 5 # Converted to steps (legacy)
     warmup_factor: 0.1
 ```
 
-| Parameter       | Type    | Range | Default | Description                                         |
-| --------------- | ------- | ----- | ------- | --------------------------------------------------- |
-| `warmup_steps`  | Integer | ≥ 0   | 0       | Warmup steps (higher priority than `warmup_epochs`) |
-| `warmup_epochs` | Integer | ≥ 0   | 0       | Warmup epochs (only used if `warmup_steps` ≤ 0)     |
-| `warmup_factor` | Float   | 0-1   | 0.1     | Initial learning rate factor (relative to base lr)  |
+or
+
+```yaml
+# Epoch-suffix syntax (recommended over warmup_epochs):
+optim:
+  warmup_params:
+    warmup_steps: 0.1epoch  # Auto-converted to 0.1 * steps_per_epoch
+    warmup_factor: 0.1
+```
+
+| Parameter       | Type              | Range | Default | Description                                         |
+| --------------- | ----------------- | ----- | ------- | --------------------------------------------------- |
+| `warmup_steps`  | Integer or string | ≥ 0   | 0       | Warmup steps. Supports epoch-suffix (e.g., `"0.1epoch"`). Higher priority than `warmup_epochs` |
+| `warmup_epochs` | Integer           | ≥ 0   | 0       | Warmup epochs (only used if `warmup_steps` ≤ 0)     |
+| `warmup_factor` | Float             | 0-1   | 0.1     | Initial learning rate factor (relative to base lr)  |
 
 - **Effect**:
   - Step 0: lr = base_lr × warmup_factor
@@ -538,18 +560,19 @@ runner:
 - **Characteristics**: Update every N samples (not limited to complete epochs)
 - **When to Use**: Very large datasets, online learning, precise step control
 - **Key Parameters**: `max_steps`, `eval_interval` (counted in steps)
-- **Note**: In this mode, `max_steps` is the only effective training boundary. If `max_epochs` is also specified, the runner logs a warning and ignores it.
+- **Note**: In this mode, you must provide at least one of `max_steps` or `max_epochs`. `max_steps` can be provided explicitly, or inferred from `max_epochs`, `len(task.train_loader)`, and `accum_grad` when omitted. If `max_epochs` is specified, it also remains an epoch-level secondary stopping boundary, and training stops when either limit is reached first.
+- **Epoch-Suffix Auto-Compute**: In step mode, fields that normally require step counts can use `epoch` suffix syntax (e.g., `eval_interval: 0.5epoch`). The framework automatically converts to steps based on `len(task.train_loader)` and `accum_grad`. See [Epoch-Suffix Syntax](#epoch-suffix-syntax) below.
 
 ### Fields Summary
 
 | Field             | Required | Type    | Range      | Default | Description                   |
 | ----------------- | -------- | ------- | ---------- | ------- | ----------------------------- |
 | `run_mode`        | ✅        | String  | epoch/step | epoch   | Training mode                 |
-| `max_epochs`      | ⚠️        | Integer | ≥ 1        | None    | Effective in epoch mode; ignored in step mode |
-| `max_steps`       | ⚠️        | Integer | ≥ 1        | null    | Effective in step mode; ignored in epoch mode |
+| `max_epochs`      | ⚠️        | Integer | ≥ 1        | None    | Required in epoch mode; in step mode, at least one of `max_epochs` or `max_steps` must be provided |
+| `max_steps`       | ⚠️        | Integer | ≥ 1        | null    | Effective in step mode; in step mode, at least one of `max_steps` or `max_epochs` must be provided; ignored in epoch mode |
 | `eval_interval`   | ❌        | Integer | ≥ 1        | 1       | Evaluation interval           |
 | `save_interval`   | ❌        | Integer | ≥ 1        | null    | Regular save interval (units follow run_mode) |
-| `keep_latest_ckp` | ❌        | Boolean | true/false | false   | Keep only latest regular ckp  |
+| `checkpoint.regular_latest_only` | ❌        | Boolean | true/false | true    | Keep only latest regular ckp  |
 | `clip_grad`       | ❌        | Float   | ≥ 0.1      | null    | Gradient clipping threshold   |
 | `accum_grad`      | ❌        | Integer | ≥ 1        | null    | Gradient accumulation factor  |
 | `early_stop`      | ✅        | Object  | -          | -       | Early stopping configuration  |
@@ -574,17 +597,17 @@ runner:
 - **max_epochs**:
   - Type: Integer, ≥ 1
   - Description: Maximum number of training epochs
-  - Required for epoch mode; ignored in step mode
+  - Required for epoch mode; in step mode, at least one of `max_epochs` or `max_steps` must be provided
 
 - **max_steps**:
   - Type: Integer or null
   - Description: Maximum number of training steps
-  - Required for step mode; ignored in epoch mode
+  - In step mode, at least one of `max_steps` or `max_epochs` must be provided; `max_steps` may be omitted only when it can be inferred from `max_epochs`, `len(task.train_loader)`, and `accum_grad`; ignored in epoch mode
 
 - **Logic**:
   - `run_mode='epoch'`: Controlled by `max_epochs`
-  - `run_mode='step'`: Controlled by `max_steps`
-  - Cross-mode boundary fields are ignored with a warning
+  - `run_mode='step'`: Controlled by explicit `max_steps`, or by an inferred `max_steps` derived from `max_epochs`, train-loader length, and `accum_grad`; `max_epochs` can also remain as a secondary epoch cap
+  - `max_steps` in epoch mode is ignored with a warning
 
 ### eval_interval (Evaluation Interval)
 
@@ -593,11 +616,19 @@ runner:
   eval_interval: 5
 ```
 
-- **Type**: Integer, ≥ 1
+```yaml
+# Epoch-suffix syntax (step mode only):
+runner:
+  run_mode: step
+  eval_interval: 0.5epoch  # Evaluate every half epoch
+```
+
+- **Type**: Integer or epoch-suffix string (e.g., `"0.5epoch"`, `"1epoch"`)
 - **Default**: 1
 - **Description**: Evaluation frequency. The unit of this interval is automatically determined by `run_mode`:
-  - If `run_mode='epoch'`: Specifies the number of **epochs** between evaluations.
-  - If `run_mode='step'`: Specifies the number of **steps** between evaluations.
+  - If `run_mode='epoch'`: Specifies the number of **epochs** between evaluations. Epoch-suffix syntax is **not** allowed in this mode.
+  - If `run_mode='step'`: Specifies the number of **steps** between evaluations. Supports epoch-suffix syntax.
+- **Epoch-Suffix**: When using epoch-suffix in step mode, the value is converted to `max(1, int(coeff * steps_per_epoch))` where `steps_per_epoch = ceil(len(train_loader) / accum_grad)`.
 - **Effect**: Triggers validation evaluation, best model checking, early stopping check
 - **Recommendation**:
   - Small datasets: 1-5
@@ -610,33 +641,41 @@ runner:
   save_interval: 1000
 ```
 
-- **Type**: Integer or null
+```yaml
+# Epoch-suffix syntax (step mode only):
+runner:
+  run_mode: step
+  save_interval: 1epoch  # Save every epoch
+```
+
+- **Type**: Integer, null, or epoch-suffix string (e.g., `"1epoch"`, `"0.5epoch"`)
 - **Default**: null (Follows evaluation frequency)
-- **Description**: Regular checkpoint saving interval. Units follow `run_mode`.
+- **Description**: Regular checkpoint saving interval. Units follow `run_mode`. Supports epoch-suffix syntax in step mode (not in epoch mode).
 - **Effect**:
   - null: Automatically saves a regular checkpoint every time an evaluation is triggered based on `eval_interval`.
   - Positive integer in epoch mode: Save checkpoint every N epochs
   - Positive integer in step mode: Save checkpoint every N optimizer steps
+  - Epoch-suffix in step mode: Converted to steps via `max(1, int(coeff * steps_per_epoch))`
 
 - **Note**:
   - Separate from best model checkpoint
   - Protects against interruption during long training
 
-### keep_latest_ckp (Keep Latest Regular Checkpoint Only)
+### checkpoint.regular_latest_only (Keep Latest Regular Checkpoint Only)
 
 ```yaml
 runner:
-  save_interval: 1000
-  keep_latest_ckp: true
+  checkpoint:
+    regular_latest_only: true
 ```
 
 - **Type**: Boolean
-- **Default**: `false`
+- **Default**: `true`
 - **Description**: If `true`, only the most recent regular checkpoint (saved based on `save_interval`) will be kept. Older regular checkpoints will be automatically deleted.
 - **Effect**:
+  - `true`: Saves disk space by removing stale regular checkpoints.
   - `false`: All regular checkpoints are kept.
-  - `true`: Saves disk space by removing stale checkpoints.
-- **Note**: This setting only affects regular checkpoints, not the "best model" checkpoint, which is always preserved.
+- **Note**: This setting lives under `runner.checkpoint` and only affects regular checkpoints, not the "best model" checkpoint, which is always preserved.
 
 ### clip_grad (Gradient Clipping)
 
@@ -728,6 +767,55 @@ runner:
 - **Effect**:
   - Automatically saves the best model checkpoint based on the specified `target` metric.
   - If `checkpoint` is not explicitly set, the framework will fall back to using the same `target`, `mode`, and `min_delta` as configured in `early_stop`.
+
+### Epoch-Suffix Syntax
+
+When `run_mode=step`, many step-count fields support epoch-suffix syntax to eliminate manual step calculation. The framework automatically converts values like `"0.5epoch"` to optimizer step counts.
+
+**Formula**: `resolved_value = max(1, int(coefficient * steps_per_epoch))`
+where `steps_per_epoch = ceil(len(task.train_loader) / accum_grad)`
+
+**Supported fields**:
+
+| Field | Allowed in step mode | Allowed in epoch mode |
+| ----- | -------------------- | --------------------- |
+| `scheduler_params.T_max` | Yes (if `step_on=optimizer_step`) | Yes (if `step_on=optimizer_step`) |
+| `scheduler_params.step_size` | Yes (if `step_on=optimizer_step`) | Yes (if `step_on=optimizer_step`) |
+| `scheduler_params.milestones` | Yes (if `step_on=optimizer_step`) | Yes (if `step_on=optimizer_step`) |
+| `warmup_params.warmup_steps` | Yes | Yes |
+| `runner.eval_interval` | Yes | No |
+| `runner.save_interval` | Yes | No |
+
+**Constraints**:
+- Epoch-suffix is **never** allowed for scheduler parameters when `step_on=valid_end`
+- Epoch-suffix is **never** allowed for `eval_interval`/`save_interval` in epoch mode
+- If both `warmup_steps` and a scheduler parameter use epoch-suffix, the framework emits a warning reminding that scheduler counting begins after warmup completes
+
+**Example**:
+
+```yaml
+runner:
+  run_mode: step
+  max_epochs: 10
+  eval_interval: 0.5epoch
+  save_interval: 1epoch
+  accum_grad: 4
+
+optim:
+  scheduler: cosine
+  scheduler_params:
+    T_max: 5epoch
+    eta_min: 1.0e-6
+  warmup_params:
+    warmup_steps: 0.1epoch
+    warmup_factor: 0.01
+```
+
+With `len(train_loader)=1000` and `accum_grad=4`, `steps_per_epoch=250`, so:
+- `T_max` = 5 * 250 = 1250 steps
+- `eval_interval` = 0.5 * 250 = 125 steps
+- `save_interval` = 1 * 250 = 250 steps
+- `warmup_steps` = 0.1 * 250 = 25 steps
 
 ---
 
@@ -1046,12 +1134,14 @@ Certain fields in the configuration file have logical relationships with each ot
 | --------------------------- | -------- | ------------- | ------------- | --------------------------- |
 | Standard epoch mode         | epoch    | Specified     | Not specified | Stop at max_epochs          |
 | Standard step mode          | step     | Not specified | Specified     | Stop at max_steps           |
-| Misconfiguration in step mode | step   | Specified     | Specified     | Warning: max_epochs ignored |
+| Inferred step mode          | step     | Specified     | Not specified | Infer `max_steps` from loader length and stop at the inferred step boundary or `max_epochs`, whichever comes first |
+| Dual-boundary step mode       | step   | Specified     | Specified     | Stop at whichever limit arrives first |
 | Misconfiguration in epoch mode | epoch | Not specified | Specified     | Warning: max_steps ignored  |
 
 **Special Behaviors**:
 
-- **max_epochs in step mode**: Specifying `max_epochs` in step mode is **ignored** by the framework; only `max_steps` is effective
+- **max_epochs in step mode**: Specifying `max_epochs` in step mode enables an optional second stopping boundary; the run stops when either `max_steps` or `max_epochs` is reached first
+- **max_steps omitted in step mode**: If `max_epochs` is provided and `len(task.train_loader)` is available as a positive integer, the runner infers `max_steps` from `optimizer_steps_per_epoch * max_epochs`, where `optimizer_steps_per_epoch` also respects `accum_grad`
 - **max_steps in epoch mode**: Specifying `max_steps` in epoch mode is **ignored** by the framework; only `max_epochs` is effective
 
 #### Impact of run_mode on eval_interval Meaning
@@ -1139,6 +1229,24 @@ runner:
 - Framework automatically transfers `early_stop` configuration to `checkpoint` configuration
 - Best model is saved based on the same metric and optimization direction
 - If `early_stop.target` shows no improvement, early stopping is triggered and new best models are no longer saved
+
+### 3.1 Default Monitored Target Contract
+
+The framework's canonical default monitored target key is `val_metric`. This key is derived from the task's `post_metrics_to_value(metrics)` hook, which returns a single scalar representing the task's primary validation objective.
+
+**Semantic rules**:
+
+- When `target` is omitted in any runtime component (`early_stop`, `checkpoint`, plateau scheduler), the effective monitored target is `val_metric`
+- `target` is an optional override mechanism for advanced use cases where different components should monitor different metrics (e.g., early stop on `val_loss` for stability while best-checkpoint tracks `val_auc` for business objective)
+- Each component resolves its own `target` independently; there is no global resolution chain
+
+**Per-component defaults**:
+
+| Component | Field | Default |
+| --------- | ----- | ------- |
+| Early stopping | `early_stop.target` | `val_metric` |
+| Best checkpoint | `checkpoint.target` | `val_metric` |
+| Plateau scheduler | `scheduler_params.target` | `val_metric` |
 
 ### 4. Adaptation Between scheduler and run_mode
 
@@ -1282,8 +1390,9 @@ runner:
 **Behavior**:
 
 - Training stops when `global_step >= max_steps`
-- `max_epochs` is ignored by the mutual-exclusion policy, and the framework logs a warning about it
-- Epoch counters may still advance while training is step-bounded, but they do not control stopping in this configuration
+- Training also stops when `epoch >= max_epochs`, whichever limit is reached first
+- The runner logs that `max_epochs` is active as a secondary stopping boundary in step mode
+- Epoch counters still advance normally, and in this configuration they also participate in stopping
 
 #### Scenario B: warmup_steps > max_steps
 

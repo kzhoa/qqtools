@@ -41,6 +41,7 @@ class _FakeSession:
         self._role = role
         self.windows_list = [_FakeWindow("@base", "shell")]
         self.windows = _FakeCollection(self.windows_list, "window_name")
+        self.last_window_start_directory = None
 
     def show_option(self, _name: str):
         return self._role
@@ -48,7 +49,13 @@ class _FakeSession:
     def set_option(self, _name: str, value: str):
         self._role = value
 
-    def new_window(self, window_name: str, attach: bool = False):
+    def new_window(
+        self,
+        window_name: str,
+        attach: bool = False,
+        start_directory: str | None = None,
+    ):
+        self.last_window_start_directory = start_directory
         window = _FakeWindow(f"@{len(self.windows_list) + 1}", window_name)
         self.windows_list.append(window)
         return window
@@ -60,8 +67,16 @@ class _FakeServer:
         self.windows_list = windows or []
         self.sessions = _FakeCollection(self.sessions_list, "session_name")
         self.windows = _FakeCollection(self.windows_list, "window_id")
+        self.last_session_start_directory = None
 
-    def new_session(self, session_name: str, window_name: str, detached: bool = True):
+    def new_session(
+        self,
+        session_name: str,
+        window_name: str,
+        detached: bool = True,
+        start_directory: str | None = None,
+    ):
+        self.last_session_start_directory = start_directory
         session = _FakeSession(session_name)
         session.windows_list = [_FakeWindow("@new", window_name)]
         session.windows = _FakeCollection(session.windows_list, "window_name")
@@ -78,7 +93,7 @@ def test_ensure_managed_session_rejects_unowned_collision(monkeypatch):
 
 
 def test_send_command_to_window_targets_primary_pane(monkeypatch):
-    window = _FakeWindow("@1", "job_demo")
+    window = _FakeWindow("@1", "task_demo")
     server = _FakeServer(windows=[window])
     monkeypatch.setattr(tmux, "_get_server", lambda: server)
 
@@ -97,19 +112,17 @@ def test_require_libtmux_reports_install_hint(monkeypatch):
         tmux.require_libtmux()
 
 
-def test_launch_background_daemon_emits_manager_command_compatible_with_parser(monkeypatch, tmp_path):
-    session = _FakeSession("qqtools_internal", role=tmux.QQTOOLS_SESSION_ROLE_INTERNAL)
-    daemon_window = _FakeWindow("@daemon", "daemon")
-    session.windows_list = [daemon_window]
-    session.windows = _FakeCollection(session.windows_list, "window_name")
-    server = _FakeServer(sessions=[session], windows=[daemon_window])
+def test_create_window_for_task_uses_custom_session(monkeypatch):
+    session = _FakeSession("custom", role=tmux.QQTOOLS_SESSION_ROLE_EXPERIMENTS)
+    server = _FakeServer(sessions=[session])
     monkeypatch.setattr(tmux, "_get_server", lambda: server)
 
-    window_id = tmux.launch_background_daemon(tmp_path)
+    window_id = tmux.create_window_for_task(
+        "task-demo",
+        session_name="custom",
+        start_directory="/tmp/project",
+    )
 
-    assert window_id == "@daemon"
-    command, entered = daemon_window.panes[0].commands[-1]
-    assert entered is True
-    assert "qqtools.plugins.qexp.manager" in command
-    assert "--foreground" in command
-    assert "--root" in command
+    assert window_id == "@2"
+    assert session.windows_list[-1].window_name == "task-demo"
+    assert session.last_window_start_directory == "/tmp/project"

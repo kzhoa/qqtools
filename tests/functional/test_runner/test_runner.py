@@ -6,6 +6,7 @@ import argparse
 import csv
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict
 from unittest.mock import Mock
 
@@ -18,17 +19,26 @@ from qqtools.plugins.qpipeline.qlogger import qLogger
 from qqtools.plugins.qpipeline.runner import agent as agent_module
 from qqtools.plugins.qpipeline.runner import runner as runner_module
 from qqtools.plugins.qpipeline.entry_utils.scheduler import qWarmupScheduler
+from qqtools.plugins.qpipeline.runner.events import (
+    BaseEventContext,
+    EventName,
+    LossComputedEventContext,
+    ProgressEventContext,
+    RunnerRuntimeView,
+    ValidationEndEventContext,
+    emit_batch_end,
+    emit_validation_end,
+)
 from qqtools.plugins.qpipeline.runner.runner import (
     RunningAgent,
     SheetLoggerListener,
     _is_periodic_trigger,
+    _resolve_step_mode_max_steps,
     _resolve_train_runner_policy,
     train_runner,
 )
 from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointListener
 from qqtools.plugins.qpipeline.runner.runner_utils.types import (
-    EventContext,
-    EventType,
     LoopSignal,
     RunConfig,
     RunMode,
@@ -42,6 +52,7 @@ TERMINAL_LINE_PREFIXES = (
     "Training stopped:",
     "Training failed:",
 )
+from qqtools.torch import qdist
 
 
 class DeterministicEarlyStopTask(SimpleTask):
@@ -55,6 +66,21 @@ class DeterministicEarlyStopTask(SimpleTask):
         metric_value = self._val_metric_seq[current_idx]
         self._eval_count += 1
         return metric_value
+
+
+class NaNLossTask(SimpleTask):
+    def __init__(self, nan_on_loss_call: int, num_samples=50, num_features=10):
+        super().__init__(num_samples=num_samples, num_features=num_features)
+        self.nan_on_loss_call = nan_on_loss_call
+        self.loss_call_count = 0
+
+    def batch_loss(self, out: Dict, batch_data, loss_fn=None) -> Dict[str, tuple[torch.Tensor, int]]:
+        self.loss_call_count += 1
+        if self.loss_call_count >= self.nan_on_loss_call:
+            pred = out["pred"]
+            nan_loss = pred.sum() * float("nan")
+            return {"loss": (nan_loss, pred.shape[0])}
+        return super().batch_loss(out, batch_data, loss_fn=loss_fn)
 
 # ============================================================================
 # Unit Tests for RunningState
@@ -166,6 +192,76 @@ class TestQLogger:
         with tempfile.TemporaryDirectory() as tmpdir:
             with pytest.raises(TypeError):
                 qLogger(tmpdir, columns=["epoch", "global_step"])
+
+
+class TestEventContracts:
+    def test_runner_runtime_view_contains_only_macro_fields(self):
+        state = RunningState(epoch=2, global_step=7)
+        view = RunnerRuntimeView(run_state=state, stage="train", max_epochs=5, max_steps=99)
+
+        assert vars(view) == {
+            "run_state": state,
+            "stage": "train",
+            "max_epochs": 5,
+            "max_steps": 99,
+        }
+
+    def test_epoch_start_public_context_hides_total_batches_but_internal_keeps_it(self):
+        task = SimpleTask(num_samples=16, num_features=10)
+        model = SimpleModel(input_dim=10)
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        agent = RunningAgent(model=model, task=task, loss_fn=loss_fn, optimizer=optimizer, config=RunConfig())
+
+        received = {}
+
+        def _capture_public(context: BaseEventContext):
+            received["public"] = context
+
+        def _capture_internal(context):
+            received["internal"] = context
+
+        agent.add_listener("on_epoch_start", _capture_public)
+        agent.add_listener("on_epoch_start_internal", _capture_internal)
+
+        agent._start_new_epoch()
+
+        assert hasattr(received["internal"], "total_batches")
+        assert received["internal"].total_batches == len(task.train_loader)
+        assert not hasattr(received["public"], "total_batches")
+
+    def test_loss_computed_emits_before_backward(self):
+        task = SimpleTask(num_samples=16, num_features=10)
+        model = SimpleModel(input_dim=10)
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        agent = RunningAgent(
+            model=model,
+            task=task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            config=RunConfig(max_steps=1, print_freq=1),
+            device=torch.device("cpu"),
+        )
+        captured = {}
+
+        def _capture_loss(context: LossComputedEventContext):
+            captured["context"] = context
+            assert all(param.grad is None for param in model.parameters())
+
+        agent.add_listener("on_loss_computed", _capture_loss)
+        agent.state.batch_idx_in_epoch = 1
+
+        batch = next(iter(task.train_loader))
+        agent._train_one_batch(batch, emit_events=False)
+
+        context = captured["context"]
+        assert context.runner.stage == "train"
+        assert context.loss_tensor is not None
+        assert context.model_output is not None
+        assert context.batch_replay_ref is None
+        assert context.batch_idx == 0
+        assert context.total_batches == len(task.train_loader)
 
 
 # ============================================================================
@@ -284,7 +380,7 @@ class TestTrainingAgent:
         assert "test_mse" in results
         assert "test_metric" in results
 
-    def test_trigger_passes_mutable_state_and_signal(self):
+    def test_trigger_passes_live_state_and_mutable_signal(self):
         loss_fn = nn.MSELoss()
         optimizer = optim.Adam(self.model.parameters(), lr=0.001)
 
@@ -297,23 +393,29 @@ class TestTrainingAgent:
             device=self.device,
         )
 
-        def _listener(context: EventContext):
-            context.state.epoch = 999
-            context.signal.should_stop = True
-            context.signal.stop_message = "stop now"
+        def _listener(context: ValidationEndEventContext):
+            context.runner.run_state.epoch = 999
+            context.signal.request_stop("test", "stop now")
 
         signal = LoopSignal()
         agent.add_listener("on_validation_end", _listener)
-        agent._trigger(
-            "on_validation_end",
-            snapshot=False,
+        emit_validation_end(
+            agent.dispatcher,
+            state=agent.state,
             signal=signal,
             eval_results={"val_metric": 1.0},
+            lr=None,
+            previous_best=None,
+            is_best=False,
+            best_model_tracker=None,
+            max_epochs=agent.config.max_epochs,
+            max_steps=agent.config.max_steps,
         )
 
         assert agent.state.epoch == 999
         assert signal.should_stop is True
-        assert signal.stop_message == "stop now"
+        assert signal.stop_reasons[0].source == "test"
+        assert signal.stop_reasons[0].message == "stop now"
 
     def test_add_listener_rejects_unknown_event(self):
         loss_fn = nn.MSELoss()
@@ -361,7 +463,7 @@ class TestTrainingAgent:
             )
 
     def test_event_type_registers_on_table_update(self):
-        assert EventType.ON_TABLE_UPDATE.value == "on_table_update"
+        assert EventName.ON_TABLE_UPDATE.value == "on_table_update"
 
     def test_save_regular_checkpoint_calls_manager_with_regular_flag(self):
         loss_fn = nn.MSELoss()
@@ -428,6 +530,57 @@ class TestTrainingAgent:
         assert save_kwargs["is_best"] is True
         assert checkpoint_manager.save.call_count == 1
         assert agent.state.best_ckp_file == "best.pt"
+
+    def test_handle_periodic_events_raises_nan_before_eval_and_regular_checkpoint(self, monkeypatch):
+        loss_fn = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        logger = Mock()
+
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            config=RunConfig(run_mode="epoch", eval_interval=1, save_interval=1),
+            device=self.device,
+            logger=logger,
+        )
+        agent.state.epoch = 1
+        agent.state.global_step = 5
+        agent._latest_train_loss = float("nan")
+
+        eval_mock = Mock()
+        checkpoint_mock = Mock()
+        monkeypatch.setattr(agent, "_run_evaluation_and_update", eval_mock)
+        monkeypatch.setattr(agent, "_request_checkpoint", checkpoint_mock)
+
+        with pytest.raises(agent_module.NaNDetectedError, match="NaN detected before periodic"):
+            agent._handle_periodic_events(is_epoch_end=True)
+
+        eval_mock.assert_not_called()
+        checkpoint_mock.assert_not_called()
+        logger.error.assert_called_once()
+        assert (
+            logger.error.call_args.args[0]
+            == "NaN detected before evaluation and regular checkpoint on ranks=[0] at epoch=1, step=5."
+        )
+
+    def test_loop_signal_synchronize_nan_failure_collects_source_ranks(self, monkeypatch):
+        signal = LoopSignal(nan_failure=True)
+
+        monkeypatch.setattr(qdist, "get_world_size", lambda: 4)
+
+        def _fake_all_gather(gathered_tensors, local_tensor):
+            values = [0, 1, 0, 1]
+            for target_tensor, value in zip(gathered_tensors, values):
+                target_tensor.copy_(torch.tensor([value], dtype=local_tensor.dtype, device=local_tensor.device))
+
+        monkeypatch.setattr("qqtools.plugins.qpipeline.runner.runner_utils.types.dist.all_gather", _fake_all_gather)
+
+        signal.synchronize_nan_failure(device=torch.device("cpu"), distributed=True)
+
+        assert signal.nan_failure is True
+        assert signal.nan_failure_source_ranks == [1, 3]
 
 # ============================================================================
 # Integration Tests for train_runner
@@ -786,6 +939,110 @@ class TestTrainRunner:
             log_text = self._read_debug_log(tmpdir)
             self._assert_single_terminal_line(log_text, "Training failed: reason=oom")
             assert "CUDA out of memory. Tried to allocate 1.00 GiB" not in log_text
+
+    def test_train_runner_emits_nan_detected_terminal_event_in_epoch_mode(self, monkeypatch):
+        captured_terminal_event = {}
+        original_emit = runner_module._emit_terminal_event
+        eval_call_count = {"count": 0}
+
+        def _capture_terminal_event(logger, terminal_event):
+            captured_terminal_event["event"] = terminal_event
+            return original_emit(logger, terminal_event)
+
+        def _capture_eval(self, signal):
+            eval_call_count["count"] += 1
+            return original_eval(self, signal)
+
+        original_eval = runner_module.RunningAgent._run_evaluation_and_update
+        monkeypatch.setattr(runner_module, "_emit_terminal_event", _capture_terminal_event)
+        monkeypatch.setattr(runner_module.RunningAgent, "_run_evaluation_and_update", _capture_eval)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task = NaNLossTask(nan_on_loss_call=1)
+            model = SimpleModel(input_dim=10)
+            loss_fn = nn.MSELoss()
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+            result = train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=2,
+                eval_interval=1,
+                save_interval=1,
+                save_dir=tmpdir,
+                run_mode="epoch",
+            )
+
+            assert result["early_stopped"] is False
+            assert result["terminal_event"] == {
+                "status": "failed",
+                "reason": "nan_detected",
+                "text": "Training failed: reason=nan_detected",
+                "epoch": result["final_epoch"],
+                "step": result["final_step"],
+            }
+            assert captured_terminal_event["event"] == result["terminal_event"]
+            assert eval_call_count["count"] == 0
+            assert list(Path(tmpdir).glob("*.pt")) == []
+
+            log_text = self._read_debug_log(tmpdir)
+            self._assert_single_terminal_line(log_text, "Training failed: reason=nan_detected")
+            assert "NaN detected before evaluation and regular checkpoint on ranks=[0]" in log_text
+
+    def test_train_runner_emits_nan_detected_terminal_event_in_step_mode(self, monkeypatch):
+        captured_terminal_event = {}
+        original_emit = runner_module._emit_terminal_event
+        eval_call_count = {"count": 0}
+
+        def _capture_terminal_event(logger, terminal_event):
+            captured_terminal_event["event"] = terminal_event
+            return original_emit(logger, terminal_event)
+
+        def _capture_eval(self, signal):
+            eval_call_count["count"] += 1
+            return original_eval(self, signal)
+
+        original_eval = runner_module.RunningAgent._run_evaluation_and_update
+        monkeypatch.setattr(runner_module, "_emit_terminal_event", _capture_terminal_event)
+        monkeypatch.setattr(runner_module.RunningAgent, "_run_evaluation_and_update", _capture_eval)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task = NaNLossTask(nan_on_loss_call=2, num_samples=80)
+            model = SimpleModel(input_dim=10)
+            loss_fn = nn.MSELoss()
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+            result = train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_steps=10,
+                eval_interval=2,
+                save_interval=2,
+                save_dir=tmpdir,
+                run_mode="step",
+            )
+
+            assert result["early_stopped"] is False
+            assert result["terminal_event"] == {
+                "status": "failed",
+                "reason": "nan_detected",
+                "text": "Training failed: reason=nan_detected",
+                "epoch": result["final_epoch"],
+                "step": result["final_step"],
+            }
+            assert captured_terminal_event["event"] == result["terminal_event"]
+            assert eval_call_count["count"] == 0
+            assert list(Path(tmpdir).glob("*.pt")) == []
+
+            log_text = self._read_debug_log(tmpdir)
+            self._assert_single_terminal_line(log_text, "Training failed: reason=nan_detected")
+            assert "NaN detected before evaluation and regular checkpoint on ranks=[0]" in log_text
 
     def test_train_runner_auto_offload_default_is_false(self, monkeypatch):
         captured = {}
@@ -1169,6 +1426,9 @@ class TestTrainRunnerPolicy:
             ("epoch", "2", None, "max_epochs must be a positive integer"),
             ("epoch", 0, None, "max_epochs must be a positive integer"),
             ("epoch", -1, None, "max_epochs must be a positive integer"),
+            ("step", "2", 3, "max_epochs must be a positive integer when specified in run_mode='step'"),
+            ("step", 0, 3, "max_epochs must be a positive integer when specified in run_mode='step'"),
+            ("step", -1, 3, "max_epochs must be a positive integer when specified in run_mode='step'"),
             ("step", None, "3", "max_steps must be a positive integer"),
             ("step", None, 0, "max_steps must be a positive integer"),
             ("step", None, -2, "max_steps must be a positive integer"),
@@ -1190,25 +1450,22 @@ class TestTrainRunnerPolicy:
                 save_interval=1,
             )
 
-    @pytest.mark.parametrize(
-        "run_mode,max_epochs,max_steps,expected_message",
-        [
-            ("epoch", None, 5, "max_epochs must be specified when run_mode='epoch'"),
-            ("step", 5, None, "max_steps must be specified when run_mode='step'"),
-        ],
-    )
-    def test_requires_boundary_for_selected_mode(
-        self,
-        run_mode,
-        max_epochs,
-        max_steps,
-        expected_message,
-    ):
-        with pytest.raises(ValueError, match=expected_message):
+    def test_requires_max_epochs_for_epoch_mode(self):
+        with pytest.raises(ValueError, match="max_epochs must be specified when run_mode='epoch'"):
             _resolve_train_runner_policy(
-                run_mode=run_mode,
-                max_epochs=max_epochs,
-                max_steps=max_steps,
+                run_mode="epoch",
+                max_epochs=None,
+                max_steps=5,
+                eval_interval=1,
+                save_interval=1,
+            )
+
+    def test_requires_max_steps_for_step_mode(self):
+        with pytest.raises(ValueError, match="max_steps must be specified when run_mode='step'"):
+            _resolve_train_runner_policy(
+                run_mode="step",
+                max_epochs=None,
+                max_steps=None,
                 eval_interval=1,
                 save_interval=1,
             )
@@ -1235,7 +1492,7 @@ class TestTrainRunnerPolicy:
                 save_interval=save_interval,
             )
 
-    def test_keeps_mutual_exclusion_and_defaults(self):
+    def test_keeps_step_secondary_epoch_boundary_and_defaults(self):
         (
             resolved_run_mode,
             effective_eval_interval,
@@ -1254,9 +1511,65 @@ class TestTrainRunnerPolicy:
         assert resolved_run_mode == RunMode.STEP
         assert effective_eval_interval == 2
         assert effective_save_interval == 2
-        assert effective_max_epochs is None
+        assert effective_max_epochs == 5
         assert effective_max_steps == 4
         assert len(policy_warnings) == 1
+        assert "secondary stopping boundary" in policy_warnings[0]
+
+    def test_keeps_step_mode_with_explicit_max_steps_and_no_epoch_cap(self):
+        (
+            resolved_run_mode,
+            effective_eval_interval,
+            effective_save_interval,
+            effective_max_epochs,
+            effective_max_steps,
+            policy_warnings,
+        ) = _resolve_train_runner_policy(
+            run_mode="step",
+            max_epochs=None,
+            max_steps=4,
+            eval_interval=2,
+            save_interval=None,
+        )
+
+        assert resolved_run_mode == RunMode.STEP
+        assert effective_eval_interval == 2
+        assert effective_save_interval == 2
+        assert effective_max_epochs is None
+        assert effective_max_steps == 4
+        assert policy_warnings == []
+
+    def test_infers_step_mode_max_steps_with_accum_grad_and_keeps_epoch_cap(self):
+        task = SimpleTask(num_samples=100, num_features=10)
+
+        inferred_max_steps, retained_max_epochs, warnings = _resolve_step_mode_max_steps(
+            run_mode="step",
+            task=task,
+            max_epochs=3,
+            max_steps=None,
+            accum_grad=2,
+        )
+
+        expected_steps = ((len(task.train_loader) + 2 - 1) // 2) * 3
+        assert inferred_max_steps == expected_steps
+        assert retained_max_epochs == 3
+        assert len(warnings) == 1
+        assert "accum_grad=2" in warnings[0]
+
+    def test_infer_step_mode_max_steps_requires_train_loader_len(self):
+        task = SimpleNamespace(train_loader=object())
+
+        with pytest.raises(
+            ValueError,
+            match="provide max_steps explicitly or ensure len\\(task.train_loader\\) is available as a positive integer",
+        ):
+            _resolve_step_mode_max_steps(
+                run_mode="step",
+                task=task,
+                max_epochs=3,
+                max_steps=None,
+                accum_grad=1,
+            )
 
 
 class TestPeriodicTrigger:
@@ -1299,12 +1612,16 @@ class TestPeriodicTrigger:
         )
 
         state = RunningState(global_step=2, epoch=0)
-        context = EventContext(
-            state=state,
+        context = ProgressEventContext(
+            runner=RunnerRuntimeView(
+                run_state=state,
+                stage="train",
+                max_epochs=run_config.max_epochs,
+                max_steps=run_config.max_steps,
+            ),
             batch_idx=0,
             total_batches=2,
             batch_metrics={"loss": 1.0},
-            stage="train",
         )
         listener.on_train_batch_end(context)
 
@@ -1338,17 +1655,28 @@ class TestRunningAgentPerformanceOptimizations:
 
     def test_trigger_does_not_return_context(self):
         agent = self._build_agent(max_steps=1)
-        returned_context = agent._trigger("on_batch_end")
+        returned_context = emit_batch_end(
+            agent.dispatcher,
+            state=agent.state,
+            stage="train",
+            batch_idx=0,
+            total_batches=1,
+            batch_metrics={},
+            avg_bank=None,
+            lr=None,
+            max_epochs=agent.config.max_epochs,
+            max_steps=agent.config.max_steps,
+        )
         assert returned_context is None
 
     def test_eval_loop_skips_context_build_when_no_target_listener(self, monkeypatch):
         agent = self._build_agent(max_steps=1)
 
-        def _event_context_should_not_run(*args, **kwargs):  # noqa: ARG001
-            raise AssertionError("EventContext should not be instantiated for disabled event paths")
+        def _emitter_should_not_run(*args, **kwargs):  # noqa: ARG001
+            raise AssertionError("Emitter should not run for disabled event paths")
 
-        monkeypatch.setattr(agent_module, "EventContext", _event_context_should_not_run)
-        results = agent._run_evaluation_loop(
+        monkeypatch.setitem(agent.dispatcher.emitters, "on_progress_tick", _emitter_should_not_run)
+        results = agent._evaluate_loader(
             agent.model,
             self.task.val_loader,
             prefix="val",
@@ -1360,11 +1688,11 @@ class TestRunningAgentPerformanceOptimizations:
         agent = self._build_agent(max_steps=1)
         captured_progress_metrics = []
 
-        def _capture_progress(context: EventContext):
+        def _capture_progress(context: ProgressEventContext):
             captured_progress_metrics.append(context.batch_metrics)
 
         agent.add_listener("on_progress_tick", _capture_progress)
-        results = agent._run_evaluation_loop(
+        results = agent._evaluate_loader(
             agent.model,
             self.task.val_loader,
             prefix="val",
@@ -1379,7 +1707,7 @@ class TestRunningAgentPerformanceOptimizations:
 
     def test_eval_loop_works_with_and_without_progress_listener(self):
         agent_fast = self._build_agent(max_steps=1)
-        fast_results = agent_fast._run_evaluation_loop(
+        fast_results = agent_fast._evaluate_loader(
             agent_fast.model,
             self.task.val_loader,
             prefix="val",
@@ -1388,7 +1716,7 @@ class TestRunningAgentPerformanceOptimizations:
 
         agent_slow = self._build_agent(max_steps=1)
         agent_slow.add_listener("on_progress_tick", lambda context: None)
-        slow_results = agent_slow._run_evaluation_loop(
+        slow_results = agent_slow._evaluate_loader(
             agent_slow.model,
             self.task.val_loader,
             prefix="val",
@@ -1399,10 +1727,149 @@ class TestRunningAgentPerformanceOptimizations:
         assert "val_metric" in slow_results
 
 
+class TestWarmupAvgBankReset:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.model = SimpleModel()
+        self.task = SimpleTask(num_samples=48, num_features=10)
+        self.loss_fn = nn.MSELoss()
+        self.device = torch.device("cpu")
+
+    def _build_agent_with_warmup(self, warmup_steps: int) -> RunningAgent:
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        main_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100)
+        scheduler = qWarmupScheduler(
+            optimizer=optimizer,
+            warmup_steps=warmup_steps,
+            warmup_factor=0.1,
+            main_scheduler=main_scheduler,
+        )
+        config = RunConfig(
+            run_mode=RunMode.STEP,
+            max_steps=100,
+            eval_interval=10_000,
+            save_interval=10_000,
+            print_freq=10_000,
+        )
+        return RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=self.loss_fn,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            config=config,
+            device=self.device,
+        )
+
+    def test_warmup_listener_registered_when_warmup_enabled(self):
+        agent = self._build_agent_with_warmup(warmup_steps=5)
+        assert agent._has_listener("on_train_batch_end")
+
+    def test_warmup_listener_not_registered_when_no_scheduler(self):
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        config = RunConfig(
+            run_mode=RunMode.STEP,
+            max_steps=100,
+            eval_interval=10_000,
+            save_interval=10_000,
+            print_freq=10_000,
+        )
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=self.loss_fn,
+            optimizer=optimizer,
+            config=config,
+            device=self.device,
+        )
+        assert not agent._has_listener("on_train_batch_end")
+
+    def test_warmup_listener_self_removes_after_warmup_ends(self):
+        agent = self._build_agent_with_warmup(warmup_steps=3)
+
+        # Simulate warmup steps by advancing scheduler
+        for _ in range(3):
+            agent.scheduler.step_after_optimizer_update()
+
+        assert agent.scheduler.current_step >= agent.scheduler.warmup_steps
+
+        # Fire the event — listener should detect warmup ended, reset bank, and remove itself
+        from qqtools.plugins.qpipeline.runner.events import emit_train_batch_end
+
+        emit_train_batch_end(
+            agent.dispatcher,
+            state=agent.state,
+            stage="train",
+            batch_idx=0,
+            total_batches=1,
+            batch_metrics={},
+            avg_bank=None,
+            lr=None,
+            max_epochs=agent.config.max_epochs,
+            max_steps=agent.config.max_steps,
+        )
+
+        # Listener should have removed itself
+        assert not agent._has_listener("on_train_batch_end")
+
+    def test_warmup_listener_resets_avg_bank_on_warmup_end(self):
+        agent = self._build_agent_with_warmup(warmup_steps=2)
+
+        # Accumulate some data in avg_bank
+        agent.train_avg_bank.add("loss", 1.5, 1.0)
+        agent.train_avg_bank.add("loss", 2.0, 1.0)
+        assert agent.train_avg_bank.avgMeters  # non-empty
+
+        # Advance past warmup
+        for _ in range(2):
+            agent.scheduler.step_after_optimizer_update()
+
+        from qqtools.plugins.qpipeline.runner.events import emit_train_batch_end
+
+        emit_train_batch_end(
+            agent.dispatcher,
+            state=agent.state,
+            stage="train",
+            batch_idx=0,
+            total_batches=1,
+            batch_metrics={},
+            avg_bank=None,
+            lr=None,
+            max_epochs=agent.config.max_epochs,
+            max_steps=agent.config.max_steps,
+        )
+
+        # avg_bank should have been reset
+        assert not agent.train_avg_bank.avgMeters
+
+    def test_warmup_listener_stays_during_warmup(self):
+        agent = self._build_agent_with_warmup(warmup_steps=5)
+
+        # Only advance 2 steps — still in warmup
+        for _ in range(2):
+            agent.scheduler.step_after_optimizer_update()
+
+        agent.train_avg_bank.add("loss", 1.0, 1.0)
+
+        from qqtools.plugins.qpipeline.runner.events import emit_train_batch_end
+
+        emit_train_batch_end(
+            agent.dispatcher,
+            state=agent.state,
+            stage="train",
+            batch_idx=0,
+            total_batches=1,
+            batch_metrics={},
+            avg_bank=None,
+            lr=None,
+            max_epochs=agent.config.max_epochs,
+            max_steps=agent.config.max_steps,
+        )
+
+        # Still in warmup — listener should NOT have reset or removed itself
+        assert agent._has_listener("on_train_batch_end")
+        assert agent.train_avg_bank.avgMeters
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
-
-
-
-

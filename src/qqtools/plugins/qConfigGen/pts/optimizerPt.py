@@ -9,7 +9,7 @@ from prompt_toolkit import print_formatted_text, prompt
 from prompt_toolkit.completion import WordCompleter
 
 # Supported loss functions
-LOSS_FUNCTIONS = ["mse", "mae", "l1", "l2mae", "bce", "ce", "cross_entropy", "focal", "comboloss"]
+LOSS_FUNCTIONS = ["mse", "rmse", "mae", "l1", "l2mae", "bce", "ce", "cross_entropy", "focal", "comboloss"]
 
 # Supported optimizers and parameters
 OPTIMIZER_PARAMS = {

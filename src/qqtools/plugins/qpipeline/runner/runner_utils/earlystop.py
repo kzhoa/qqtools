@@ -4,7 +4,7 @@ from collections import OrderedDict
 from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from .types import EventContext
+from ..events import ValidationEndEventContext
 
 
 class EarlyStopper:
@@ -240,7 +240,7 @@ class EarlyStopListener:
         self.target = target
         self.logger = logger
 
-    def on_validation_end(self, context: EventContext) -> None:
+    def on_validation_end(self, context: ValidationEndEventContext) -> None:
         if self.early_stopper is None:
             return
 
@@ -256,5 +256,4 @@ class EarlyStopListener:
             self.logger.info(debug_msg)
 
         if should_stop and context.signal is not None:
-            context.signal.should_stop = True
-            context.signal.stop_message = stop_msg
+            context.signal.request_stop("early_stop", stop_msg)

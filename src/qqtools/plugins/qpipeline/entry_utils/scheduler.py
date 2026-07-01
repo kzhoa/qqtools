@@ -365,10 +365,6 @@ def prepare_scheduler(args: qt.qDict, optimizer: Optimizer, batches_per_epoch: i
                     f"batches_per_epoch must be > 0 when using warmup_epochs."
                 )
             warmup_steps = warmup_epochs * batches_per_epoch
-            print(
-                f"[qPipeline] Converting warmup_epochs={warmup_epochs} to warmup_steps={warmup_steps} "
-                f"(batches_per_epoch={batches_per_epoch})"
-            )
 
         warmup_config = WarmupConfig(
             steps=warmup_steps,
@@ -414,7 +410,6 @@ def build_null_scheduler() -> LRScheduler:
     Returns:
         A qWarmupScheduler instance that performs no scheduling operations.
     """
-    print("[qPipeline] Learning rate scheduler is disabled")
     main_scheduler = qt.nn.DoNothing()
     warmup_steps = -1
     warmup_factor = 0

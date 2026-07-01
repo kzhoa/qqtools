@@ -1,5 +1,162 @@
 # History
 
+## v1.2.27
+
+- refactor: replace `LoopSignal.stop_message` with structured `stop_reasons: List[StopReason]` — each stop event now records source and message independently, preventing multiple abort reasons from overwriting each other
+- feat: add `LoopSignal.request_stop(source, message)` as the single entry point for signaling training stop
+- style: change `qDict.__repr__` indentation from tab to 2 spaces
+- docs: add §3.1 "Default Monitored Target Contract" to qConfig spec — formalize `val_metric` as the canonical default monitored target and document per-component `target` as optional override
+- refactor: replace `print` calls in `create_pipeline` with `pipe.logger.info` for consistent logging
+
+## v1.2.26
+
+- breaking: remove `QPipeline.prepare_optim` — optimizer and scheduler creation is now exclusively owned by `train_runner`
+- breaking: `QPipeline` no longer holds `self.optimizer` or `self.scheduler` attributes
+- feat: `train_runner` is now fully self-contained — when called independently (without QPipeline), it auto-creates optimizer, scheduler, and resolves epoch-suffix config from `args`
+- feat: add `logger` parameter to `train_runner`, `evaluate_runner`, and `infer_runner` — QPipeline passes its logger so all diagnostics flow into the same `debug.log`
+- feat: QPipeline creates `qLogger` in `_ensure_runtime_ready` (after `prepare_env` determines `log_dir`), replacing all `main_print` calls with structured logger output
+- feat: add no-weight-decay parameter group auto-discovery — models can implement `no_decay()` or `no_decay_deep()` convention methods on `nn.Module` submodules to automatically split optimizer param groups into decay and no-decay groups
+- feat: auto-reset training metrics (avg_bank) after warmup phase completes, using self-removing event listener on `on_train_batch_end`
+- refactor: move epoch-suffix resolution from QPipeline into `train_runner` config standardization phase, exposed as `standardize_epoch_suffixes` in `runner_utils.epoch_suffix`
+- refactor: `train_runner` validates illegal `scheduler` without `optimizer` combination
+- refactor: add `remove_listener` to `EventDispatcher` and `RunningAgent` for symmetric listener lifecycle management
+- refactor: remove dead-code forwarding methods `_run_evaluation` and `_run_evaluation_loop` from `RunningAgent`
+- refactor: remove `main_print` and `rank_zero_only` from qpipeline module surface
+- test: add 22 functional tests covering no-decay traversal algorithm, param group construction, edge cases (frozen params, non-existent names, zero weight_decay no-op, None children), and end-to-end optimizer integration
+- test: add functional coverage for warmup avg_bank reset (listener registration, self-removal, reset behavior, warmup-period persistence)
+- docs: document `no_decay` / `no_decay_deep` convention methods in qpipeline readme
+
+## v1.2.25
+
+- feat: add epoch-suffix auto-compute for qpipeline step-mode fields — config values like `T_max: 0.5epoch` or `eval_interval: 1epoch` are automatically converted to optimizer step counts based on `len(train_loader)` and `accum_grad`
+- feat: implement `EpochSuffixResolver` with full validation for `step_on`/`run_mode` constraint matrix, warmup coupling warning, and DDP `all_gather` consistency check
+- test: add 43 functional tests covering epoch-suffix resolution, `step_on=valid_end` rejection, `run_mode=epoch` field restrictions, warmup coupling detection, and plateau scheduler inference
+- docs: add pitch for epoch-suffix auto-compute design and resume silent-override detection
+
+## v1.2.24
+
+- feat: add framework-owned qpipeline dotted CLI config overrides with strict validation, type-aware coercion, bool-safe flag-only handling, and post-YAML highest-precedence application
+- docs: document qpipeline dotted override usage and CLI constraints in plugin readme and root README
+- test: add functional coverage for dotted override parsing, reserved-key rejection, path/type safety, negative-value handling, and patch-parser interaction
+
+## v1.2.23
+
+- refactor: unify qPipeline into mode-based API — replace boolean `train` flag with explicit `mode` parameter (`"train"` / `"test"`) and rename `general_train` to `create_pipeline`
+- refactor: introduce lazy `_ensure_runtime_ready` initialization in qPipeline for deferred env/task/model setup
+- refactor: extract `_place_model` helper and add `evaluate_runner` entry point
+- refactor: introduce `Stage` enum (`TRAIN`, `VAL`, `TEST`) in qpipeline runner to replace raw string `stage` literals and remove the redundant `stage="eval"` from lifecycle events (`eval_start`, `eval_end`, `validation_end`)
+- feat: add `init_train_model` task hook for custom model weight initialization in qpipeline, with precedence over `args.init_file` and double-init warning when `ckp_file` is also set
+- fix: correct `pipe_middle_ware` invocation to use `self.task` with `has_implemented` guard instead of raw `_opt_impl` dict access
+- fix: correct qtriplets unit test expectations that were wrong since initial commit — fix periodic offset setup (combined offset must be non-zero), fix manual graph expected values, and fix no-chain test to use a truly disconnected graph
+- fix: replace mock-based eval listener in `test_runner_accum_grad` with direct context capture for `on_eval_start`
+- fix: remove `sys.modules` purge in `test_progress_render_mode` that caused cross-test pollution
+
+## v1.2.22
+
+- fix: keep qpipeline step-mode epoch-end summaries logging `[train]` metrics even when no evaluation fires at the boundary by normalizing epoch train aggregates into `train_*` results
+- test: add functional coverage for step-mode epoch summaries with oversized `eval_interval` and no boundary evaluation
+
+## v1.2.21
+
+- breaking: formalize qpipeline event-context state handling so `context.runner.run_state` is exposed directly as the live `RunningState`, while `signal` remains the default write-back channel
+- feat: split qpipeline runner events into typed public/internal contexts under `runner.events` and add explicit contracts for validation, checkpoint, progress, and loss-computed payloads
+- refactor: remove legacy `EventContext` / `EventType` plumbing, precompile event emitters at dispatcher init, and drop runtime frozen-state wrapping from the qpipeline event path
+- docs: document qpipeline event context access rules, internal `on_epoch_start_internal` usage, and the intended freedom to mutate `run_state` and other payload objects when callers explicitly choose to
+- test: add functional coverage for typed event contracts, live `run_state` behavior, pre-backward loss hooks, and updated lifecycle bridge semantics
+
+## v1.2.20
+
+- fix: return stable graph-batch `num_graphs` metadata for graph-only batches and reserve the field from sample payload collision
+
+## v1.2.19
+
+- feat: formalize supported qpipeline task lifecycle hooks with explicit snake_case hook contracts bridged through runner listener registration
+- docs: document the official qpipeline task lifecycle hook surface and supported runner listener events
+- test: add functional coverage for task lifecycle hook bridging, early-stop callbacks, and unsupported legacy hook names
+
+## v1.2.18
+
+- fix: suppress rich/tqdm progress rendering on non-rank-0 DDP processes to prevent garbled console output in multi-GPU training
+
+## v1.2.17
+
+- feat: add qexp task `working_dir` support across submit/resubmit flows, batch manifests, subprocess execution, and tmux window startup directories
+- fix: allow qpipeline step mode to infer `max_steps` from `max_epochs` and loader length, including accumulated-gradient runs, while preserving secondary epoch stopping boundaries
+
+## v1.2.16
+
+- feat: add `use_ctx` decorator for scoped runtime context mutation
+- docs: document the `qt.ctx` mutation contract in README
+- test: add unit coverage for decorator-based context mutation flows
+
+## v1.2.15
+
+- feat: expose `qt.ctx` as a first-class package instance for scoped runtime context access
+- fix: remove `qcontext` package-init circular import and isolate fresh `ContextVar` contexts from shared default-state pollution
+- test: add unit coverage for qcontext initialization, scoped merging, reset, and fresh-context isolation
+
+## v1.2.14
+
+- feat: restore qpipeline step mode secondary epoch boundary support so `max_epochs` can again act as an optional secondary stop limit while `max_steps` remains required
+- feat: restructure qpipeline loss specs to support RMSE alongside the refreshed loss-entry configuration flow
+
+## v1.2.13
+
+- feat: allow `run_mode=step` to treat `max_epochs` as an optional secondary stopping boundary while keeping `max_steps` required
+- fix: harden qexp machine GPU live view with safer agent/observer handling and add regression coverage for the live machine status path
+
+## v1.2.12
+
+- docs: archive completed qexp truth-domain and derived-index pitch documents under `docs/archive/pitch`
+- docs: keep unfinished qexp machine-gpu-view-repair and PTY stdio contract proposals active under `docs/pitch`
+
+## v1.2.11
+
+- breaking: remove qexp v1 compatibility shims and the transitional `qqtools.plugins.qexp.v2` package surface; only the unified shared-root qexp API/CLI remains
+- feat: add `qexp resubmit` to replace one terminal non-batch task in place with the same `task_id`, persist resubmit operation truth, and surface unfinished replacement state through `inspect`
+- feat: add `qexp doctor repair` to converge unfinished resubmit operations and repair batch metadata inconsistencies in one recovery entrypoint
+- fix: reconcile qexp batch commit-state truth so incomplete `preparing` batches are repaired to committed or aborted with refreshed batch summaries and indexes
+- feat: fail qpipeline runs with `reason=nan_detected` when periodic eval/save boundaries observe NaN training loss
+- feat: synchronize NaN-failure signals across DDP ranks and report source ranks from rank0 logs before unified failed exit
+- docs: sync qexp README/manual/specs with the unified shared-root package surface, project-root `.qexp` contract, `group` semantics, `resubmit`, and `doctor repair`
+- docs: add qpipeline timing manual and update log-format docs for periodic NaN interception behavior
+- test: add qexp coverage for unified package surface, doctor integrity/repair flows, batch commit-state reconciliation, and resubmit transaction semantics
+- test: add functional coverage for NaN terminal events, periodic interception, and distributed NaN-failure signal synchronization
+
+## v1.2.10
+
+- breaking: qpipeline standard config field `runner.keep_latest_ckp` is replaced by `runner.checkpoint.regular_latest_only`
+- feat: qpipeline regular checkpoints now default to keeping only the latest file unless `runner.checkpoint.regular_latest_only: false`
+- feat: upgrade qexp agent lifecycle to machine-scoped `active` / `draining` / `idle` semantics with `state/agent.json` as the single lifecycle source of truth
+- feat: add formal qexp lifecycle contracts for machine worksets, agent snapshots, and machine summary caches
+- fix: prevent on-demand qexp agents from auto-exiting while the current machine still owns `running` task responsibility
+- fix: stop cross-machine qexp status and orphan repair flows from misclassifying healthy remote agents via local PID probes
+- docs: update qConfig docs and standard config generator output for `runner.checkpoint.regular_latest_only`
+- docs: sync qexp manual and runtime/product specs with the final lifecycle contract and lifecycle-state observability rules
+- test: add coverage for regular checkpoint latest-only rotation and config parsing
+- test: add qexp coverage for lifecycle state transitions, cross-machine observer behavior, orphan repair, and contract serialization
+
+## v1.2.9
+
+- feat: add `qexp use` command for CLI context persistence so `--shared-root`, `--machine`, and `--runtime-root` no longer need to be repeated on every command
+- feat: `qexp init` now auto-saves CLI context after successful initialization
+- feat: `_resolve_cfg` fallback chain extended to flags → env vars → context file (`~/.qqtools/qexp-context.json`) → error
+- feat: log learning rate in qpipeline eval summary blocks and summary-table headers
+- docs: refresh qpipeline log-format examples to show eval-summary learning rate output
+- test: add eval-summary formatter coverage for learning-rate rendering
+
+## v1.2.8
+
+- fix: handle libtmux `ObjectDoesNotExist` exception in tmux session/window lookup to support newer libtmux versions where `.get()` raises instead of returning `None`
+
+## v1.2.7
+
+- breaking: qexp now uses the shared-root engine as the only supported runtime
+- feat: qexp — shared-root multi-machine experiment queue with explicit machine identity, CAS-based concurrency, batch support, retry lineage, on-demand agent, and scheduling events
+- feat: qexp subcommands: `init`, `submit`, `cancel`, `retry`, `batch-submit`, `batch-retry-failed`, `batch-retry-cancelled`, `list`, `inspect`, `top`, `batches`, `batch`, `machines`, `logs`, `clean`, `agent start/stop/status`, `doctor verify/rebuild-index/repair-orphans/cleanup-locks`
+- breaking: qexp v1 single-machine engine has been removed
+- docs: add qexp user manual and release workflow checks that publish changelog-backed release notes
+
 ## v1.2.6
 
 - breaking: `train_runner().early_stopped` is now strictly derived from `terminal_event.reason == "early_stop"`; user interruption is exposed as `terminal_event.status=\"stopped\"` and `reason=\"user_interrupt\"`

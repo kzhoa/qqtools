@@ -179,10 +179,25 @@ def test_runner_schema_requires_mode_specific_boundaries():
 
     assert "max_epochs" in epoch_branch["required"]
     assert "max_steps" not in epoch_branch["required"]
-    assert "max_steps" in step_branch["required"]
-    assert "anyOf" not in step_branch
+    assert "max_steps" not in step_branch["required"]
+    assert "anyOf" in step_branch
     assert step_branch["properties"]["max_steps"]["type"] == "integer"
     assert step_branch["properties"]["max_steps"]["minimum"] == 1
+    assert step_branch["properties"]["max_epochs"]["type"] == "integer"
+    assert {"required": ["max_steps"]} in step_branch["anyOf"]
+    assert {"required": ["max_epochs"]} in step_branch["anyOf"]
+
+
+def test_runner_schema_describes_step_mode_max_steps_inference():
+    schema = _load_runner_schema()
+
+    assert "inferred from max_epochs" in schema["properties"]["max_steps"]["description"]
+
+
+def test_runner_schema_describes_step_mode_secondary_epoch_boundary():
+    schema = _load_runner_schema()
+
+    assert "secondary stopping boundary" in schema["properties"]["max_epochs"]["description"]
 
 
 def test_runner_schema_save_interval_description_matches_runtime_semantics():
@@ -191,6 +206,164 @@ def test_runner_schema_save_interval_description_matches_runtime_semantics():
 
     assert "eval_interval" in save_interval_desc
     assert "run_mode" in save_interval_desc
+
+
+def test_runner_schema_supports_regular_latest_only():
+    schema = _load_runner_schema()
+    checkpoint_schema = schema["properties"]["checkpoint"]["properties"]["regular_latest_only"]
+
+    assert checkpoint_schema["type"] == "boolean"
+    assert checkpoint_schema["default"] is True
+
+
+def test_qcgen_main_nests_regular_latest_only_under_checkpoint():
+    from qqtools.plugins.qConfigGen.main import main
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.main.print_formatted_text"),
+        mock.patch("qqtools.plugins.qConfigGen.main.pretty.install"),
+        mock.patch("qqtools.plugins.qConfigGen.main.prompt_global_params") as mock_global,
+        mock.patch("qqtools.plugins.qConfigGen.main.prompt_task_params") as mock_task,
+        mock.patch("qqtools.plugins.qConfigGen.main.prompt_loss_params") as mock_loss,
+        mock.patch("qqtools.plugins.qConfigGen.main.prompt_optimizer_params") as mock_optim,
+        mock.patch("qqtools.plugins.qConfigGen.main.prompt_lr_scheduler_params") as mock_scheduler,
+        mock.patch("qqtools.plugins.qConfigGen.main.prompt_ema_params") as mock_ema,
+        mock.patch("qqtools.plugins.qConfigGen.main.prompt_model_params") as mock_model,
+        mock.patch("qqtools.plugins.qConfigGen.main.prompt_runner_params") as mock_runner,
+        mock.patch("qqtools.plugins.qConfigGen.main.prompt_save_location") as mock_save,
+    ):
+        mock_global.return_value = {"seed": 42, "log_dir": "./tmp/logs"}
+        mock_task.return_value = {"dataset": "imagenet", "dataloader": {"batch_size": 32}}
+        mock_loss.return_value = {"loss": "cross_entropy"}
+        mock_optim.return_value = {"optimizer": "adamw", "lr": 0.001}
+        mock_scheduler.return_value = {}
+        mock_ema.return_value = {}
+        mock_model.return_value = {}
+        mock_runner.return_value = {
+            "run_mode": "epoch",
+            "max_epochs": 100,
+            "regular_latest_only": True,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mock_save.return_value = (tmpdir, "config.yaml")
+
+            main()
+
+            config_file = Path(tmpdir) / "config.yaml"
+            with open(config_file, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+
+        assert config["runner"]["checkpoint"]["regular_latest_only"] is True
+        assert "regular_latest_only" not in config["runner"]
+
+
+def test_prompt_runner_params_can_disable_regular_latest_only():
+    from qqtools.plugins.qConfigGen.pts.runnerPt import prompt_runner_params
+
+    prompt_values = [
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "n",
+    ]
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.prompt", side_effect=prompt_values),
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.print_formatted_text"),
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.prompt_early_stop", return_value={}),
+    ):
+        params = prompt_runner_params()
+
+    assert params["regular_latest_only"] is False
+
+
+def test_prompt_runner_params_accepts_step_mode_secondary_max_epochs():
+    from qqtools.plugins.qConfigGen.pts.runnerPt import prompt_runner_params
+
+    prompt_values = [
+        "step",
+        "500",
+        "7",
+        "",
+        "",
+        "",
+        "",
+        "y",
+    ]
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.prompt", side_effect=prompt_values),
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.print_formatted_text"),
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.prompt_early_stop", return_value={}),
+    ):
+        params = prompt_runner_params()
+
+    assert params["run_mode"] == "step"
+    assert params["max_steps"] == 500
+    assert params["max_epochs"] == 7
+
+
+def test_prompt_runner_params_allows_inferred_step_mode_max_steps():
+    from qqtools.plugins.qConfigGen.pts.runnerPt import RUN_MODE_DEFAULTS, prompt_runner_params
+
+    prompt_values = [
+        "step",
+        "",
+        "7",
+        "",
+        "",
+        "",
+        "",
+        "y",
+    ]
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.prompt", side_effect=prompt_values),
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.print_formatted_text"),
+        mock.patch("qqtools.plugins.qConfigGen.pts.runnerPt.prompt_early_stop", return_value={}),
+    ):
+        params = prompt_runner_params()
+
+    assert params["run_mode"] == "step"
+    assert "max_steps" not in params
+    assert params["max_epochs"] == 7
+    assert RUN_MODE_DEFAULTS["step"]["max_steps"] != params.get("max_steps")
+
+
+def test_prompt_loss_params_accepts_rmse():
+    from qqtools.plugins.qConfigGen.pts.optimizerPt import prompt_loss_params
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.optimizerPt.prompt", side_effect=["rmse"]),
+        mock.patch("qqtools.plugins.qConfigGen.pts.optimizerPt.print_formatted_text"),
+    ):
+        params = prompt_loss_params()
+
+    assert params == {"loss": "rmse"}
+
+
+def test_prompt_loss_params_comboloss_accepts_rmse_target():
+    from qqtools.plugins.qConfigGen.pts.optimizerPt import prompt_loss_params
+
+    prompt_values = [
+        "comboloss",
+        "energy",
+        "rmse",
+        "",
+        "",
+    ]
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.optimizerPt.prompt", side_effect=prompt_values),
+        mock.patch("qqtools.plugins.qConfigGen.pts.optimizerPt.print_formatted_text"),
+    ):
+        params = prompt_loss_params()
+
+    assert params == {"loss": "comboloss", "loss_params": {"energy": ["rmse", 1.0]}}
 
 
 def test_prompt_lr_scheduler_params_defaults_non_plateau_step_on():

@@ -10,16 +10,37 @@
 在py文件中通过这个函数加载config文件中的内容。
 `args = prepare_cmd_args()`
 
-若是希望通过cmd line自定义更多其它参数可以使用`updateParser`
+若是希望通过 cmd line 自定义更多其它参数，可以通过 `patch` 回调向基础 parser 注册额外参数。
+此外，未被显式 parser 消费的 dotted CLI 参数会作为配置树覆盖项处理，例如
+`--task.dataloader.eval_batch_size 32`。
+
+覆盖规则：
+
+- 显式 parser 参数和 `patch` 注册参数优先被 `argparse` 正常消费
+- 未消费的 `--a.b.c value` / `--a.b.c=value` 会在 YAML 加载后写入最终 `args`
+- dotted override 优先级最高，高于 YAML 和基础显式参数合并结果
+- flag-only 形式 `--a.b.c` 只允许用于布尔安全目标
+- 负值或以 `-` 开头的值必须使用等号形式，例如 `--task.threshold=-0.5`
+
 example:
 ```python
 from qqtools.pipeline import prepare_cmd_args
 
-def updateParser(parser: argparse.ArgumentParser):
+def patch(parser: argparse.ArgumentParser):
     parser.add_argument("--file", type=str)
     return parser
-args = prepare_cmd_args(updateParser=updateParser)
+
+args = prepare_cmd_args(patch=patch)
 file = args.file
+```
+
+example:
+```bash
+python train.py \
+  --config configs/train.yaml \
+  --task.dataloader.eval_batch_size 32 \
+  --task.val_split val_ood \
+  --runner.fast_dev_run
 ```
 
 
@@ -35,7 +56,7 @@ file = args.file
 ```python
 model = prepare_model(args)
 task = prepare_task(args)
-pipe = QPipeline(args, test=False, task=task, model=model)
+pipe = QPipeline(args, mode="train", task=task, model=model)
 ```
 
 
@@ -60,7 +81,7 @@ class MyPipeline(QPipeline):
     prepare_task = staticmethod(prepare_task)
 
 
-pipe = MyPipeline(args, test=False)
+pipe = MyPipeline(args, mode="train")
 ```
 
 这两个方法只接受一个标准args入参 （后面会解释为什么是标准args）
@@ -87,6 +108,76 @@ def regist_extra_ckp_caches(self, caches: dict):
 ### 自定义optimizer
  一个常见需求是。
  对不同的参数用不同的lr或者weightdecay。
+
+
+# No Weight Decay 自动发现
+
+qpipeline 支持通过约定方法自动发现哪些参数应该免除 weight decay。
+当 `optim.optimizer_params.weight_decay > 0` 时，框架会递归遍历模型的 module tree，
+根据约定方法将参数自动拆分为两个 optimizer param group：正常衰减组 + 免除衰减组。
+
+## 约定方法
+
+在 `nn.Module` 子类上实现以下方法之一（返回值 `List[str]`）：
+
+### `no_decay() -> List[str]`
+
+返回当前模块中不需要 weight decay 的**局部参数名**列表。
+框架会**继续递归**遍历子模块。
+
+```python
+class MyLayerNorm(nn.LayerNorm):
+    def no_decay(self) -> List[str]:
+        return ["weight", "bias"]
+
+class MyBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.pos_embed = nn.Parameter(torch.randn(1, 64, 128))
+        self.norm = MyLayerNorm(128)
+        self.linear = nn.Linear(128, 128)
+
+    def no_decay(self) -> List[str]:
+        return ["pos_embed"]
+```
+
+上例中，`pos_embed` 由 `MyBlock.no_decay()` 声明免除，
+`norm.weight` 和 `norm.bias` 由 `MyLayerNorm.no_decay()` 声明免除。
+框架在收集 `MyBlock` 的声明后，仍会递归进入 `self.norm`、`self.linear` 检查。
+
+### `no_decay_deep() -> List[str]`
+
+返回不需要 weight decay 的参数名列表（支持带点的子路径）。
+框架遇到此方法后**停止递归**——该模块对其整个子树的 no-decay 声明负全责。
+
+```python
+class PretrainedBackbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.cls_token = nn.Parameter(torch.randn(1, 1, 768))
+        self.pos_embed = nn.Parameter(torch.randn(1, 197, 768))
+        self.blocks = nn.ModuleList([...])
+
+    def no_decay_deep(self) -> List[str]:
+        return [
+            "cls_token",
+            "pos_embed",
+            "blocks.0.norm1.weight",
+            "blocks.0.norm1.bias",
+            # ... 对整个子树的完整声明
+        ]
+```
+
+## 行为规则
+
+- 若同一模块同时实现 `no_decay_deep` 和 `no_decay`，仅 `no_decay_deep` 生效
+- 当 `weight_decay=0` 时，整个发现机制不执行（no-op）
+- 冻结参数（`requires_grad=False`）不会进入任何 optimizer group
+- 返回的参数名不存在于实际模型参数中时，触发 warning 并跳过
+- 最终产生两个 param group，共享 lr、betas 等所有超参，仅 `weight_decay` 不同：
+  - Group 0: `weight_decay = 配置值`
+  - Group 1: `weight_decay = 0.0`
+- 若所有参数都不声明 no_decay，则维持单 param group（与未实现约定方法等价）
 
 
 
@@ -217,21 +308,40 @@ task 为了适应不同的模型，
 ## task的可选方法
 如果task 实现了`.to(device)` 方法,pipeline会在prepare_task后调用
 
-# Runner可选的生命周期
+# Task lifecycle hooks
 
-除了4个必须实现的方法外，
-还可以选择性实现几个生命周期方法，
-上层的runner会检测 `if hasattr(task, "somename")`， 如果实现了就在适当的时候调用它们。
+除了必须实现的方法外，`qTaskBase` 还支持少量显式声明的 task 生命周期 hook。
+这些 hook:
 
+- 必须声明在 `qTaskBase`
+- 必须列在 `OPTIONAL_METHODS`
+- 必须使用固定 typed context 签名：
+  - `on_epoch_start(self, context: BaseEventContext) -> None`
+  - `on_epoch_end(self, context: BaseEventContext) -> None`
+  - `on_train_batch_end(self, context: ProgressEventContext) -> None`
+  - `on_validation_end(self, context: ValidationEndEventContext) -> None`
+  - `on_early_stop(self, context: BaseEventContext) -> None`
 
-- onBatchStart
+目前支持的 task 生命周期 hook:
 
-- extra_batch_metrics()  这里可以看到model，如果想监控model里面的东西
- 
+- `on_epoch_start`
+- `on_epoch_end`
+- `on_train_batch_end`
+- `on_validation_end`
+- `on_early_stop`
 
-(具体逻辑在EpochAgent里
-和task的接口约定都在EpochAgent里。
-)
+这些 hook 会由 runner 自动桥接到内部 listener 事件系统。
+未列入 `qTaskBase` / `OPTIONAL_METHODS` 的生命周期方法，不属于官方支持面。
+
+context 读取约定：
+
+- 宏观运行信息统一走 `context.runner.*`
+- `context.runner.run_state` 默认直接暴露当前 `RunningState`
+- `batch_idx` / `total_batches` 只在 batch/progress 相关事件上可用
+- `signal` 是默认唯一允许 listener 回写主流程的通道
+- `signal` 不是普遍可用字段；仅 `on_validation_end` / `on_early_stop` / `on_checkpoint_request` 等控制型事件保证存在
+- `run_state` 与其它 payload 一样都不做机制上的只读防护；如果用户确实要修改，本框架保留这种自由度，但默认语义仍建议将其视为事件输入数据
+- `on_epoch_start` 的 public context 不承诺 `total_batches`
 
 # qstd Args
 
@@ -250,12 +360,23 @@ task 为了适应不同的模型，
 
 logger类本质上是实现了一系列监听接口，注册在 run agent 的生命周期钩子里。
 
-- onBatchEnd
-- onTrainBatchEnd
-- onEpochStart
-- onEpochEnd
+其中需要区分：
 
-> 实践角度来看目前没有遇到需要onBatchStart的情况，也许未来可以支持一下。
+- 公共生命周期 hook: 面向 task / 外部 listener 的稳定接口
+- 内部 listener hook: 面向 runner 内建组件的内部事件，不属于 task 官方支持面
+
+- on_batch_end
+- on_train_batch_end
+- on_epoch_start_internal
+- on_epoch_end
+
+此外还有：
+
+- on_eval_start
+- on_eval_end
+- on_validation_end
+- on_checkpoint_request
+- on_early_stop
 
 
 
@@ -302,4 +423,3 @@ Demand:
 >还有一个问题，如果要修改的stage2的超参是task wise的
 怎么跟task约定接口？
 task的实现者需要知道什么？
-

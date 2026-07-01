@@ -6,8 +6,8 @@ Design Philosophy:
 4. Trust qt.ensure_scala: Assume it can handle various input types and raise if it cannot convert to a scalar.
 """
 
-import copy
 import gc
+import math
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
@@ -23,12 +23,30 @@ from ..entry_utils.qema import qEMA
 from ..entry_utils.scheduler import qWarmupScheduler
 from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import qTaskBase
+from .events import (
+    EventDispatcher,
+    EventName,
+    emit_batch_end,
+    emit_batch_start,
+    emit_checkpoint_request,
+    emit_early_stop,
+    emit_epoch_end,
+    emit_epoch_start,
+    emit_epoch_start_internal,
+    emit_eval_end,
+    emit_eval_start,
+    emit_loss_computed,
+    emit_progress_tick,
+    emit_table_update,
+    emit_train_batch_end,
+    emit_validation_end,
+)
 from .runner_utils.avgbank import AvgBank
 from .runner_utils.best_model import BestModelTracker
 from .runner_utils.common import _is_periodic_trigger, move_batch_to_device
 from .runner_utils.ema_context import EMAOffloadContext
 from .runner_utils.tensorbank import TensorBank
-from .runner_utils.types import EventContext, EventType, LoopSignal, RunConfig, RunMode, RunningState
+from .runner_utils.types import LoopSignal, RunConfig, RunMode, RunningState, Stage
 
 
 def _get_scalar_metrics(batch_metrics: Dict[str, Any]) -> Dict[str, float]:
@@ -40,13 +58,33 @@ def _get_scalar_metrics(batch_metrics: Dict[str, Any]) -> Dict[str, float]:
     return scalar_metrics
 
 
+class NaNDetectedError(RuntimeError):
+    """Raised when a periodic boundary detects that training loss became NaN."""
+
+
+def _normalize_output_dict(out: Any) -> Dict[str, Any]:
+    if isinstance(out, dict):
+        return dict(out)
+    return {"preds": out}
+
+
+def _extract_auxiliary_output_fields(batch_data: Any) -> Dict[str, Any]:
+    labels = None
+    if isinstance(batch_data, dict) and "y" in batch_data:
+        labels = batch_data["y"]
+    elif hasattr(batch_data, "y"):
+        labels = batch_data.y
+
+    return {"labels": labels} if labels is not None else {}
+
+
 class RunningAgent:
     def __init__(
         self,
         model: nn.Module,
         task: qTaskBase,
-        loss_fn: Callable,
-        optimizer: torch.optim.Optimizer,
+        loss_fn: Optional[Callable],
+        optimizer: Optional[torch.optim.Optimizer],
         scheduler: Optional[qWarmupScheduler] = None,
         config: RunConfig = None,
         device: torch.device = None,
@@ -96,7 +134,8 @@ class RunningAgent:
 
         self.interval_avg_bank = AvgBank()
 
-        self.listeners = {event.value: [] for event in EventType}
+        self.dispatcher = EventDispatcher()
+        self.listeners = self.dispatcher.listeners
         if listeners:
             for event, callbacks in listeners.items():
                 event_name = self._validate_event_name(event)
@@ -116,19 +155,28 @@ class RunningAgent:
             self._apply_train_step_accum if self.has_accum_grad else self._apply_train_step_plain
         )
         self._current_accum_loss_count = 0.0
+        self._latest_train_loss: Optional[float] = None
 
-    def _validate_event_name(self, event: Union[str, EventType]) -> str:
-        event_name = event.value if isinstance(event, EventType) else str(event)
-        if event_name not in self.listeners:
-            allowed_events = ", ".join(sorted(self.listeners.keys()))
-            raise ValueError(
-                f"Unknown event: {event_name}. Register it in EventType first. " f"Allowed events: {allowed_events}"
+        if self.scheduler is not None and getattr(self.scheduler, "warmup_steps", 0) > 0:
+            self.add_listener("on_train_batch_end", self._reset_avg_after_warmup)
+
+    def _reset_avg_after_warmup(self, context) -> None:
+        if self.scheduler.current_step >= self.scheduler.warmup_steps:
+            self.train_avg_bank.reset()
+            self.logger.info(
+                f"Warmup completed at step {self.scheduler.warmup_steps}. "
+                f"Training metrics have been reset."
             )
-        return event_name
+            self.remove_listener("on_train_batch_end", self._reset_avg_after_warmup)
 
-    def add_listener(self, event: Union[str, EventType], listener: Callable):
-        event_name = self._validate_event_name(event)
-        self.listeners[event_name].append(listener)
+    def _validate_event_name(self, event: Union[str, EventName]) -> str:
+        return self.dispatcher._validate_event_name(event)
+
+    def add_listener(self, event: Union[str, EventName], listener: Callable):
+        self.dispatcher.add_listener(event, listener)
+
+    def remove_listener(self, event: Union[str, EventName], listener: Callable):
+        self.dispatcher.remove_listener(event, listener)
 
     def _check_run_period(self, interval: Optional[int], is_epoch_end: bool) -> bool:
         return _is_periodic_trigger(
@@ -139,22 +187,8 @@ class RunningAgent:
             is_epoch_end=is_epoch_end,
         )
 
-    def _trigger(self, event: str, snapshot: bool = True, **kwargs) -> None:
-        """Trigger an event, building context from kwargs."""
-        listeners = self.listeners.get(event)
-        if not listeners:
-            return
-
-        state_to_pass = copy.deepcopy(self.state) if snapshot else self.state
-        context = EventContext(
-            state=state_to_pass, max_epochs=self.config.max_epochs, max_steps=self.config.max_steps, **kwargs
-        )
-
-        for listener in listeners:
-            listener(context)
-
     def _has_listener(self, event: str) -> bool:
-        return bool(self.listeners.get(event))
+        return self.dispatcher.has_listeners(event)
 
     def _prepare_batch(self, batch_data):
         batch_data = move_batch_to_device(batch_data, self.device)
@@ -166,6 +200,14 @@ class RunningAgent:
         out = self.task.post_batch_forward(out, batch_data)
         return out, batch_data
 
+    def _collect_batch_outputs(self, output_bank: Optional[TensorBank], out: Any, batch_data: Any) -> None:
+        if output_bank is None:
+            return
+
+        batch_outputs = _normalize_output_dict(out)
+        batch_outputs.update(_extract_auxiliary_output_fields(batch_data))
+        output_bank.add(batch_outputs)
+
     def _start_new_epoch(self):
         if self.train_tensor_bank:
             self.train_tensor_bank.reset()
@@ -174,44 +216,65 @@ class RunningAgent:
             self.train_loader.sampler.set_epoch(self.state.epoch)
 
         self.state.mark_epoch_end_eval_trigger(eval_triggered=False)
-        self._trigger("on_epoch_start", total_batches=len(self.train_loader), stage="train")
+        total_batches = len(self.train_loader)
+        emit_epoch_start_internal(
+            self.dispatcher,
+            state=self.state,
+            stage=Stage.TRAIN,
+            total_batches=total_batches,
+            max_epochs=self.config.max_epochs,
+            max_steps=self.config.max_steps,
+        )
+        emit_epoch_start(
+            self.dispatcher,
+            state=self.state,
+            stage=Stage.TRAIN,
+            max_epochs=self.config.max_epochs,
+            max_steps=self.config.max_steps,
+        )
 
     def _handle_epoch_end(self):
-        epoch_metrics = self.train_avg_bank.gather_average(self.config.distributed)
+        raw_epoch_metrics = self.train_avg_bank.gather_average(self.config.distributed)
         if self.use_tensor_bank and self.train_tensor_bank:
             gathered_cache = self.train_tensor_bank.gather(self.config.distributed, self.device)
             task_epoch_metrics = self.task.epoch_metric(gathered_cache)
             if task_epoch_metrics:
-                epoch_metrics.update(task_epoch_metrics)
+                raw_epoch_metrics.update(task_epoch_metrics)
+        epoch_results = {f"train_{k}": v for k, v in raw_epoch_metrics.items()}
+        if raw_epoch_metrics:
+            epoch_results["train_metric"] = self.task.post_metrics_to_value(raw_epoch_metrics)
         self.train_avg_bank.reset()
         if self.train_tensor_bank:
             self.train_tensor_bank.reset()
 
-        self.state.update_current_metrics(epoch_metrics)
+        self.state.update_current_metrics(epoch_results)
         self.state.refresh_epoch_result_metric_sources()
-        self._trigger("on_epoch_end")
+        emit_epoch_end(
+            self.dispatcher,
+            state=self.state,
+            stage=Stage.TRAIN,
+            max_epochs=self.config.max_epochs,
+            max_steps=self.config.max_steps,
+        )
         self.state.epoch += 1
         self.state.batch_idx_in_epoch = 0
+
+    def _evaluate_model(self, model: nn.Module) -> Dict[str, Any]:
+        results: Dict[str, Any] = {}
+
+        if self.val_loader is not None:
+            results.update(self._evaluate_loader(model, self.val_loader, prefix="val", stage=Stage.VAL))
+
+        if self.test_loader is not None:
+            results.update(self._evaluate_loader(model, self.test_loader, prefix="test", stage=Stage.TEST))
+
+        return results
 
     def evaluate(self, model: nn.Module = None, use_ema: bool = False) -> Dict[str, Any]:
         base_model = model or self.model
 
         with self._ema_offload_ctx(model=base_model, use_ema=use_ema) as eval_model:
             return self._evaluate_model(eval_model)
-
-    def _evaluate_loaders(self, model: nn.Module) -> Dict[str, Any]:
-        return self._evaluate_model(model)
-
-    def _evaluate_model(self, model: nn.Module) -> Dict[str, Any]:
-        results: Dict[str, Any] = {}
-
-        if self.val_loader is not None:
-            results.update(self._evaluate_loader(model, self.val_loader, prefix="val", stage="val"))
-
-        if self.test_loader is not None:
-            results.update(self._evaluate_loader(model, self.test_loader, prefix="test", stage="test"))
-
-        return results
 
     def evaluate_all_models(self) -> Dict[str, Any]:
         eval_results = self.evaluate(self.model, use_ema=False)
@@ -222,19 +285,34 @@ class RunningAgent:
 
         return eval_results
 
-    def _run_evaluation(
-        self, model: nn.Module, data_loader: DataLoader, prefix: str = "", stage: str = "val"
-    ) -> Dict[str, Any]:
-        return self._evaluate_loader(model=model, data_loader=data_loader, prefix=prefix, stage=stage)
+    def evaluate_loader(
+        self,
+        data_loader: DataLoader,
+        prefix: str = "",
+        stage: Stage = Stage.VAL,
+        return_outputs: bool = False,
+        model: Optional[nn.Module] = None,
+        use_ema: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        base_model = model or self.model
 
-    def _run_evaluation_loop(
-        self, model: nn.Module, data_loader: DataLoader, prefix: str = "", stage: str = "val"
-    ) -> Dict[str, Any]:
-        return self._evaluate_loader(model=model, data_loader=data_loader, prefix=prefix, stage=stage)
+        with self._ema_offload_ctx(model=base_model, use_ema=use_ema) as eval_model:
+            return self._evaluate_loader(
+                model=eval_model,
+                data_loader=data_loader,
+                prefix=prefix,
+                stage=stage,
+                return_outputs=return_outputs,
+            )
 
     def _evaluate_loader(
-        self, model: nn.Module, data_loader: DataLoader, prefix: str = "", stage: str = "val"
-    ) -> Dict[str, Any]:
+        self,
+        model: nn.Module,
+        data_loader: DataLoader,
+        prefix: str = "",
+        stage: Stage = Stage.VAL,
+        return_outputs: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         was_training = model.training
         model.eval()
         total_batches = len(data_loader)
@@ -244,6 +322,7 @@ class RunningAgent:
         has_epoch_metric = self.task.has_implemented("epoch_metric")
         use_tensor_bank_for_eval = has_batch_cache and has_epoch_metric
         eval_tensor_bank = TensorBank(logger=self.logger) if use_tensor_bank_for_eval else None
+        eval_output_bank = TensorBank(logger=self.logger) if return_outputs else None
 
         has_progress_tick = self._has_listener("on_progress_tick")
         should_calc_avg = has_progress_tick
@@ -258,27 +337,36 @@ class RunningAgent:
                     eval_avg_bank.update_from_dict(raw_batch_metrics)
                     if eval_tensor_bank:
                         eval_tensor_bank.add(self.task.batch_cache(out, batch_data))
+                    self._collect_batch_outputs(eval_output_bank, out, batch_data)
 
                     scalar_batch_metrics = _get_scalar_metrics(raw_batch_metrics)
                     avg_metrics = eval_avg_bank.to_dict(self.config.distributed) if should_calc_avg else None
 
-                    self._trigger(
-                        "on_batch_end",
+                    emit_batch_end(
+                        self.dispatcher,
+                        state=self.state,
+                        stage=stage,
                         batch_idx=batch_idx,
                         total_batches=total_batches,
                         batch_metrics=raw_batch_metrics,
                         avg_bank=avg_metrics,
-                        stage=stage,
+                        lr=None,
+                        max_epochs=self.config.max_epochs,
+                        max_steps=self.config.max_steps,
                     )
 
                     if has_progress_tick:
-                        self._trigger(
-                            "on_progress_tick",
+                        emit_progress_tick(
+                            self.dispatcher,
+                            state=self.state,
+                            stage=stage,
                             batch_idx=batch_idx,
                             total_batches=total_batches,
                             batch_metrics=scalar_batch_metrics,
                             avg_bank=avg_metrics,
-                            stage=stage,
+                            lr=None,
+                            max_epochs=self.config.max_epochs,
+                            max_steps=self.config.max_steps,
                         )
 
             avg_metrics = eval_avg_bank.gather_average(self.config.distributed)
@@ -293,6 +381,14 @@ class RunningAgent:
 
             prefixed_metrics = {f"{prefix}_{key}": value for key, value in avg_metrics.items()}
             prefixed_metrics[f"{prefix}_metric"] = self.task.post_metrics_to_value(avg_metrics)
+            if eval_output_bank is None:
+                return prefixed_metrics
+
+            gathered_outputs = eval_output_bank.gather(self.config.distributed, self.device)
+            if self.config.distributed and qt.qdist.get_rank() != 0:
+                return None
+
+            prefixed_metrics.update(gathered_outputs)
             return prefixed_metrics
         finally:
             model.train(was_training)
@@ -328,7 +424,14 @@ class RunningAgent:
     def _run_evaluation_and_update(self, signal: LoopSignal) -> None:
         total_eval_batches = sum(len(loader) for loader in (self.val_loader, self.test_loader) if loader is not None)
 
-        self._trigger("on_eval_start", stage="eval", total_batches=total_eval_batches, signal=signal)
+        emit_eval_start(
+            self.dispatcher,
+            state=self.state,
+            total_batches=total_eval_batches,
+            signal=signal,
+            max_epochs=self.config.max_epochs,
+            max_steps=self.config.max_steps,
+        )
 
         interval_metrics = self.interval_avg_bank.gather_average(self.config.distributed)
         self.interval_avg_bank = AvgBank()
@@ -342,21 +445,30 @@ class RunningAgent:
 
         self.state.update_current_metrics(eval_results)
 
-        self._trigger("on_eval_end", stage="eval", eval_results=eval_results, signal=signal)
+        emit_eval_end(
+            self.dispatcher,
+            state=self.state,
+            eval_results=eval_results,
+            signal=signal,
+            max_epochs=self.config.max_epochs,
+            max_steps=self.config.max_steps,
+        )
 
         is_best, previous_best = self._update_best_model_state(eval_results)
         if is_best:
             self._request_checkpoint("best", signal=signal)
 
-        self._trigger(
-            "on_validation_end",
-            snapshot=False,
-            stage="eval",
+        emit_validation_end(
+            self.dispatcher,
+            state=self.state,
             eval_results=eval_results,
+            lr=self._get_current_lr(),
             previous_best=previous_best,
             is_best=is_best,
             best_model_tracker=self.best_model_tracker,
             signal=signal,
+            max_epochs=self.config.max_epochs,
+            max_steps=self.config.max_steps,
         )
 
     def _request_checkpoint(
@@ -372,11 +484,13 @@ class RunningAgent:
         while target_signal.pending_checkpoint_types:
             checkpoint_type = target_signal.pending_checkpoint_types.pop(0)
 
-            self._trigger(
-                "on_checkpoint_request",
-                snapshot=False,
-                signal=target_signal,
+            emit_checkpoint_request(
+                self.dispatcher,
+                state=self.state,
                 checkpoint_type=checkpoint_type,
+                signal=target_signal,
+                max_epochs=self.config.max_epochs,
+                max_steps=self.config.max_steps,
             )
 
             checkpoint_path = target_signal.checkpoint_path
@@ -401,9 +515,24 @@ class RunningAgent:
                 f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
                 f"\n eval_interval={self.config.eval_interval} save_interval={self.config.save_interval}"
             )
+        is_save_trigger = self._check_run_period(self.config.save_interval, is_epoch_end)
+
+        if is_eval_trigger or is_save_trigger:
+            signal.nan_failure = self._latest_train_loss is not None and math.isnan(self._latest_train_loss)
+            signal.synchronize_nan_failure(self.device, self.config.distributed)
+
+        if signal.nan_failure:
+            parts = (is_eval_trigger * ["evaluation"]) + (is_save_trigger * ["regular checkpoint"])
+            boundary_text = " and ".join(parts) or "periodic boundary"
+            self.logger.error(
+                f"NaN detected before {boundary_text} on ranks={signal.nan_failure_source_ranks} "
+                f"at epoch={self.state.epoch}, step={self.state.global_step}."
+            )
+            raise NaNDetectedError("NaN detected before periodic evaluation/checkpoint boundary.")
+
+        if is_eval_trigger:
             self._run_evaluation_and_update(signal)
 
-        is_save_trigger = self._check_run_period(self.config.save_interval, is_epoch_end)
         if is_save_trigger:
             self._request_checkpoint("regular", signal=signal)
 
@@ -411,9 +540,15 @@ class RunningAgent:
         signal.synchronize_stop(self.device, self.config.distributed)
 
         if signal.should_stop:
-            stop_message = signal.stop_message or "Early stopping triggered."
-            self.logger.debug(stop_message)
-            self._trigger("on_early_stop", signal=signal)
+            reason_text = "; ".join(f"[{r.source}] {r.message}" for r in signal.stop_reasons)
+            self.logger.debug(reason_text or "Early stopping triggered.")
+            emit_early_stop(
+                self.dispatcher,
+                state=self.state,
+                signal=signal,
+                max_epochs=self.config.max_epochs,
+                max_steps=self.config.max_steps,
+            )
             return True
 
         return False
@@ -551,7 +686,15 @@ class RunningAgent:
         batch_start_time = time.time()
 
         if emit_events:
-            self._trigger("on_batch_start", batch_idx=batch_idx, total_batches=total_batches)
+            emit_batch_start(
+                self.dispatcher,
+                state=self.state,
+                stage=Stage.TRAIN,
+                batch_idx=batch_idx,
+                total_batches=total_batches,
+                max_epochs=self.config.max_epochs,
+                max_steps=self.config.max_steps,
+            )
 
         batch_data = self._prepare_batch(batch_data)
         out, batch_data = self._forward_batch(self.model, batch_data)
@@ -563,7 +706,23 @@ class RunningAgent:
 
         losses = self.task.batch_loss(out, batch_data, self.loss_fn)
         loss_tensor, loss_count = self._extract_training_loss(losses)
+        if self._has_listener(EventName.ON_LOSS_COMPUTED.value):
+            emit_loss_computed(
+                self.dispatcher,
+                state=self.state,
+                stage=Stage.TRAIN,
+                batch_idx=batch_idx,
+                total_batches=total_batches,
+                batch_data=batch_data,
+                loss_tensor=loss_tensor,
+                model_output=out,
+                batch_replay_ref=None,
+                lr=self._get_current_lr(),
+                max_epochs=self.config.max_epochs,
+                max_steps=self.config.max_steps,
+            )
         did_optimizer_step = self._apply_train_step_impl(loss_tensor, loss_count, batch_metrics, total_batches)
+        self._latest_train_loss = batch_metrics["loss"]
 
         if not emit_events:
             return batch_metrics, did_optimizer_step
@@ -585,33 +744,64 @@ class RunningAgent:
         is_update_tick = state.batch_idx_in_epoch % self.config.print_freq == 0
         is_update_tick = is_update_tick or state.batch_idx_in_epoch == total_batches
 
-        common_args = dict(
+        emit_batch_end(
+            self.dispatcher,
+            state=self.state,
+            stage=Stage.TRAIN,
             batch_idx=batch_idx,
             total_batches=total_batches,
             batch_metrics=batch_metrics,
+            avg_bank=None,
             lr=current_lr,
-            stage="train",
+            max_epochs=self.config.max_epochs,
+            max_steps=self.config.max_steps,
         )
-        self._trigger("on_batch_end", **common_args)
-        self._trigger("on_train_batch_end", **common_args)
 
         has_progress_tick = self._has_listener("on_progress_tick")
         has_table_update = is_update_tick and self._has_listener("on_table_update")
+        progress_avg_metrics = None
         should_need_progress_avg = has_progress_tick or has_table_update
         if should_need_progress_avg:
             progress_avg_metrics = self.train_avg_bank.to_dict(self.config.distributed)
-            common_progress_args = dict(
-                batch_idx=batch_idx,
-                total_batches=total_batches,
-                batch_metrics=batch_metrics,
-                avg_bank=progress_avg_metrics,
-                lr=current_lr,
-                stage="train",
-            )
             if has_progress_tick:
-                self._trigger("on_progress_tick", **common_progress_args)
+                emit_progress_tick(
+                    self.dispatcher,
+                    state=self.state,
+                    stage=Stage.TRAIN,
+                    batch_idx=batch_idx,
+                    total_batches=total_batches,
+                    batch_metrics=batch_metrics,
+                    avg_bank=progress_avg_metrics,
+                    lr=current_lr,
+                    max_epochs=self.config.max_epochs,
+                    max_steps=self.config.max_steps,
+                )
             if has_table_update:
-                self._trigger("on_table_update", **common_progress_args)
+                emit_table_update(
+                    self.dispatcher,
+                    state=self.state,
+                    stage=Stage.TRAIN,
+                    batch_idx=batch_idx,
+                    total_batches=total_batches,
+                    batch_metrics=batch_metrics,
+                    avg_bank=progress_avg_metrics,
+                    lr=current_lr,
+                    max_epochs=self.config.max_epochs,
+                    max_steps=self.config.max_steps,
+                )
+
+        emit_train_batch_end(
+            self.dispatcher,
+            state=self.state,
+            stage=Stage.TRAIN,
+            batch_idx=batch_idx,
+            total_batches=total_batches,
+            batch_metrics=batch_metrics,
+            avg_bank=progress_avg_metrics,
+            lr=current_lr,
+            max_epochs=self.config.max_epochs,
+            max_steps=self.config.max_steps,
+        )
 
         return batch_metrics, did_optimizer_step
 
@@ -650,6 +840,11 @@ class RunningAgent:
             self._handle_epoch_end()
 
     def run(self) -> bool:
+        if self.loss_fn is None:
+            raise ValueError("RunningAgent.run() requires a non-null loss_fn for training mode")
+        if self.optimizer is None:
+            raise ValueError("RunningAgent.run() requires a non-null optimizer for training mode")
+
         max_epochs_limit = self.config.max_epochs if self.config.max_epochs is not None else float("inf")
         max_steps_limit = self.config.max_steps if self.config.max_steps is not None else float("inf")
         self.logger.info(
@@ -670,5 +865,3 @@ class RunningAgent:
                 self.logger.debug(f"Reached max_epochs={max_epochs_limit}")
 
         return loop_stopped_by_early_stop
-
-

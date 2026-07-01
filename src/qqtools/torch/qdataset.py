@@ -493,7 +493,7 @@ def collate_graph_samples(batch_list, key_types=None):
     if not batch_list:
         return {}  # Return empty dict for empty batch
 
-    reserved_keys = ["num_nodes", "edge_index", "batch"]
+    reserved_keys = ["num_nodes", "edge_index", "batch", "num_graphs"]
     batch_indices = []
     node_count = 0
     graph_data = defaultdict(list)
@@ -712,7 +712,8 @@ def collate_graph_samples(batch_list, key_types=None):
     else:
         batch_combined = torch.empty(0, dtype=torch.long)  # keep consistent type even if empty
 
-    result = qt.qData({"batch": batch_combined, **graph_data})
+    num_graphs = len(batch_list)
+    result = qt.qData({"batch": batch_combined, "num_graphs": num_graphs, **graph_data})
     if has_edge_index:
         result["edge_index"] = torch.cat(edge_index_list, dim=1)
 

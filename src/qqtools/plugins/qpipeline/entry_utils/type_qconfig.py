@@ -96,6 +96,7 @@ class CheckpointConfig:
     target: str = "val_metric"
     mode: str = "min"
     min_delta: float = 0.0
+    regular_latest_only: bool = True
 
 
 @dataclass
