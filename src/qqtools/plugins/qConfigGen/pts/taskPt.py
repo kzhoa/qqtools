@@ -13,6 +13,12 @@ DATALOADER_DEFAULTS = {
     "pin_memory": True,
 }
 
+DDP_DEDUP_DEFAULTS = {
+    "enabled": True,
+    "is_graph": False,
+    "node_aligned_output_keys": [],
+}
+
 
 def prompt_task_params():
     """
@@ -111,4 +117,11 @@ def prompt_task_params():
             print_formatted_text("❌ Must be 'yes' or 'no'.")
 
     params["dataloader"] = dataloader
+    params["eval"] = {
+        "ddp_dedup": {
+            "enabled": DDP_DEDUP_DEFAULTS["enabled"],
+            "is_graph": DDP_DEDUP_DEFAULTS["is_graph"],
+            "node_aligned_output_keys": list(DDP_DEDUP_DEFAULTS["node_aligned_output_keys"]),
+        }
+    }
     return params

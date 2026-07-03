@@ -33,6 +33,30 @@
                     "type": "string",
                     "description": "Target predict label"
                 },
+                "eval": {
+                    "type": "object",
+                    "properties": {
+                        "ddp_dedup": {
+                            "type": "object",
+                            "properties": {
+                                "enabled": {
+                                    "type": "boolean"
+                                },
+                                "is_graph": {
+                                    "type": "boolean"
+                                },
+                                "node_aligned_output_keys": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    }
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                },
                 "dataloader": {
                     "$ref": "./definitions/dataloader.json"
                 }

@@ -6,11 +6,12 @@ import torch
 
 import qqtools as qt
 import qqtools.plugins.qpipeline.qpipeline as qpipeline_module
+import qqtools.plugins.qpipeline.runner.eval_runner as eval_runner_module
 import qqtools.plugins.qpipeline.runner.runner as runner_module
 import qqtools.plugins.qpipeline.runner.runner_utils.progress as progress_module
 from qqtools.plugins.qpipeline.entry import create_pipeline_class
 from qqtools.plugins.qpipeline.qpipeline import prepare_logdir, qPipeline
-from qqtools.plugins.qpipeline.runner.runner import evaluate_runner, infer_runner
+from qqtools.plugins.qpipeline.runner.eval_runner import evaluate_runner, infer_runner
 from qqtools.plugins.qpipeline.task.qtask import OPTIONAL_METHODS, TASK_LIFECYCLE_HOOKS, qTaskBase
 
 
@@ -258,6 +259,58 @@ def test_qpipeline_mode_overrides_args_test(base_args, tiny_task, tiny_model):
     args2.test = False
     pipeline2 = pipeline_cls(args2, mode="test")
     assert pipeline2.mode == "test"
+
+
+def test_qpipeline_imports_eval_runners_from_eval_runner_module():
+    assert qpipeline_module.evaluate_runner is eval_runner_module.evaluate_runner
+    assert qpipeline_module.infer_runner is eval_runner_module.infer_runner
+
+
+def test_evaluate_runner_uses_dedup_runtime_gather(monkeypatch, base_args, tiny_task, tiny_model):
+    class RuntimeStub:
+        enabled = True
+
+        def __init__(self):
+            self.calls = []
+
+        def gather_avg_bank(self, avg_bank, distributed, device):
+            self.calls.append(("avg", sorted(avg_bank.keys()), distributed, str(device)))
+            return {"mse": 123.0}
+
+        def gather_tensor_bank(self, tensor_bank, distributed, device):
+            self.calls.append(("tensor", sorted(tensor_bank.bank.keys()), distributed, str(device)))
+            return {}
+
+        def gather_output_bank(self, output_bank, distributed, device):
+            self.calls.append(("output", sorted(output_bank.bank.keys()), distributed, str(device)))
+            return {"pred": torch.zeros(1, 1), "labels": torch.zeros(1, 1)}
+
+    runtime = RuntimeStub()
+
+    class LoaderWithRuntime:
+        def __iter__(self_nonlocal):
+            return iter(tiny_task.test_loader)
+
+        def __len__(self_nonlocal):
+            return len(tiny_task.test_loader)
+
+        dedup_runtime = runtime
+
+    monkeypatch.setattr(eval_runner_module, "_prepare_eval_loader", lambda dataloader, args: LoaderWithRuntime())
+
+    results = evaluate_runner(
+        model=tiny_model,
+        task=tiny_task,
+        dataloader=tiny_task.test_loader,
+        args=base_args,
+        prefix="test",
+        return_outputs=True,
+    )
+
+    assert results is not None
+    assert results["test_mse"] == 123.0
+    assert any(call[0] == "avg" for call in runtime.calls)
+    assert any(call[0] == "output" for call in runtime.calls)
 
 
 def test_qpipeline_test_mode_evaluate_once_defaults_to_test_loader(base_args, tiny_task, tiny_model):

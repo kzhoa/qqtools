@@ -24,7 +24,7 @@ from ..entry_utils.scheduler import SCHEDULER_STEP_ON_VALID_END, prepare_schedul
 from ..entry_utils.type_qconfig import CheckpointConfig, EarlyStopConfig, qConfig
 from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import TASK_LIFECYCLE_HOOKS, qTaskBase
-from .agent import NaNDetectedError, RunningAgent, _extract_auxiliary_output_fields, _normalize_output_dict
+from .agent import NaNDetectedError, RunningAgent
 from .runner_utils.epoch_suffix import standardize_epoch_suffixes
 from .events import ValidationEndEventContext
 from .runner_utils.ckp_manager import CheckpointListener, CheckpointManager
@@ -33,7 +33,6 @@ from .runner_utils.earlystop import EarlyStopListener, EarlyStopper
 from .runner_utils.eval_formatter import EvalSummaryListener
 from .runner_utils.progress import ProgressTracker
 from .runner_utils.sheet_logger import SheetLogger, SheetLoggerListener
-from .runner_utils.tensorbank import TensorBank
 from .runner_utils.types import (
     RunConfig,
     RunMode,
@@ -44,7 +43,7 @@ from .runner_utils.types import (
     TrainRunnerResult,
 )
 
-__all__ = ["train_runner", "infer_runner", "evaluate_runner", "SheetLoggerListener"]
+__all__ = ["train_runner", "SheetLoggerListener"]
 
 TerminalCause = Literal["normal_finish", "early_stop", "user_interrupt", "exception", "nan_detected"]
 
@@ -216,18 +215,6 @@ def _finalize_train_runner(
     if owns_logger:
         logger.close()
         logging.shutdown()
-
-
-def _build_output_bank_result(
-    *,
-    output_bank: "TensorBank",
-    distributed: bool,
-    device: torch.device,
-) -> Optional[Dict[str, Any]]:
-    gathered_outputs = output_bank.gather(distributed, device)
-    if distributed and qt.qdist.get_rank() != 0:
-        return None
-    return gathered_outputs
 
 
 def _prepare_training_session(
@@ -764,135 +751,3 @@ def train_runner(
         "terminal_event": terminal_event,
     }
 
-
-def evaluate_runner(
-    model: nn.Module,
-    task: qTaskBase,
-    dataloader: DataLoader,
-    args: Optional[qConfig] = None,
-    prefix: str = "test",
-    return_outputs: bool = False,
-    allow_auto_offload: bool = False,
-    logger=None,
-) -> Optional[Dict[str, Any]]:
-    if args is None:
-        raise ValueError("The 'args' parameter is required to configure the runner.")
-
-    device = _getattr_or_default(args, "device", lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    rank = _getattr_or_default(args, "rank", 0)
-    distributed = _getattr_or_default(args, "distributed", False)
-    render_type = _getattr_or_default(args, "render_type", "auto")
-    stage = Stage.TEST if prefix == "test" else Stage.VAL
-
-    config = RunConfig(
-        distributed=distributed,
-        rank=rank,
-        save_dir=_getattr_or_default(args, "log_dir", "./logs"),
-        print_freq=_getattr_or_default(args, "print_freq", 10),
-        render_type=render_type,
-        device=device,
-    )
-    if logger is None:
-        logger = ConsoleLogger(rank=rank) if rank == 0 else None
-
-    agent = RunningAgent(
-        model=model,
-        task=task,
-        loss_fn=None,
-        optimizer=None,
-        config=config,
-        device=device,
-        allow_auto_offload=allow_auto_offload,
-        logger=logger,
-    )
-
-    return agent.evaluate_loader(
-        data_loader=dataloader,
-        prefix=prefix,
-        stage=stage,
-        return_outputs=return_outputs,
-    )
-
-
-def infer_runner(
-    model: nn.Module,
-    task: qTaskBase,
-    dataloader: DataLoader,
-    args: Optional[Any] = None,
-    distributed: bool = False,
-    logger=None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Unified inference runner.
-
-    Args:
-        model: Model for inference.
-        task: Task instance defining inference logic.
-        dataloader: DataLoader for the inference dataset.
-        args: Object containing command-line arguments and other configurations.
-              It's the source for settings like device, rank, and ckp_file.
-        distributed: Whether distributed data parallel is used.
-        logger: Optional logger instance. If None, a ConsoleLogger is created for rank 0.
-
-    Returns:
-        A flat dictionary of concatenated output tensors for the full dataset.
-        In distributed mode, rank 0 returns globally merged outputs and
-        non-zero ranks return None.
-    """
-    if args is None:
-        raise ValueError("The 'args' parameter is required to configure the runner.")
-
-    # Extract configuration from args
-    device = _getattr_or_default(args, "device", lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    rank = _getattr_or_default(args, "rank", 0)
-    render_type = _getattr_or_default(args, "render_type", "auto")
-
-    # Setup logger (rank 0 only)
-    if logger is None:
-        logger = ConsoleLogger(rank=rank) if rank == 0 else None
-
-    model.to(device)
-    model.eval()
-
-    output_bank = TensorBank(logger=logger)
-
-    # Determine progress display strategy with fallback
-    try:
-        from tqdm import tqdm
-
-        has_tqdm = True
-    except ImportError:
-        has_tqdm = False
-
-    # Decide which progress strategy to use
-    use_tqdm = has_tqdm and render_type != "plain"
-    use_simple_logging = render_type != "plain" and not use_tqdm
-
-    progress_iter = dataloader
-    if use_tqdm:
-        progress_iter = tqdm(dataloader, desc="Inference", dynamic_ncols=True)
-
-    try:
-        with torch.no_grad():
-            for batch_idx, batch_data in enumerate(progress_iter):
-                # Forward pass
-                batch_data = move_batch_to_device(batch_data, device)
-                batch_data = task.pre_batch_forward(batch_data)
-                out = task.batch_forward(model, batch_data)
-                out = task.post_batch_forward(out, batch_data)
-
-                batch_results = _normalize_output_dict(out)
-                batch_results.update(_extract_auxiliary_output_fields(batch_data))
-                output_bank.add(batch_results)
-
-                # Simple logging fallback (when tqdm not available but render_type != "plain")
-                if use_simple_logging and (batch_idx + 1) % 10 == 0:
-                    if logger:
-                        logger.info(f"Inference progress: {batch_idx + 1} batches processed")
-
-    except Exception as e:
-        if logger:
-            logger.error(f"Error during inference: {e}")
-        raise
-
-    return _build_output_bank_result(output_bank=output_bank, distributed=distributed, device=device)
