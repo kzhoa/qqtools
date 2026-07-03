@@ -11,7 +11,8 @@ import qqtools as qt
 from . import entry_utils
 from .entry_utils.qema import qEMA
 from .qlogger import ConsoleLogger, qLogger
-from .runner.runner import evaluate_runner, infer_runner, train_runner
+from .runner.eval_runner import evaluate_runner, infer_runner
+from .runner.runner import train_runner
 from .task.qtask import qTaskBase
 
 

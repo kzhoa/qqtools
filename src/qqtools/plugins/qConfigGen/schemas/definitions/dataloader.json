@@ -17,6 +17,11 @@
         "pin_memory": {
             "type": "boolean",
             "description": "Whether to pin memory for faster GPU transfer."
+        },
+        "eval_batch_size": {
+            "type": "integer",
+            "description": "Batch size for eval/infer data loading. Defaults to batch_size when omitted.",
+            "minimum": 1
         }
     },
     "required": [

@@ -62,22 +62,6 @@ class NaNDetectedError(RuntimeError):
     """Raised when a periodic boundary detects that training loss became NaN."""
 
 
-def _normalize_output_dict(out: Any) -> Dict[str, Any]:
-    if isinstance(out, dict):
-        return dict(out)
-    return {"preds": out}
-
-
-def _extract_auxiliary_output_fields(batch_data: Any) -> Dict[str, Any]:
-    labels = None
-    if isinstance(batch_data, dict) and "y" in batch_data:
-        labels = batch_data["y"]
-    elif hasattr(batch_data, "y"):
-        labels = batch_data.y
-
-    return {"labels": labels} if labels is not None else {}
-
-
 class RunningAgent:
     def __init__(
         self,
@@ -200,14 +184,6 @@ class RunningAgent:
         out = self.task.post_batch_forward(out, batch_data)
         return out, batch_data
 
-    def _collect_batch_outputs(self, output_bank: Optional[TensorBank], out: Any, batch_data: Any) -> None:
-        if output_bank is None:
-            return
-
-        batch_outputs = _normalize_output_dict(out)
-        batch_outputs.update(_extract_auxiliary_output_fields(batch_data))
-        output_bank.add(batch_outputs)
-
     def _start_new_epoch(self):
         if self.train_tensor_bank:
             self.train_tensor_bank.reset()
@@ -290,7 +266,6 @@ class RunningAgent:
         data_loader: DataLoader,
         prefix: str = "",
         stage: Stage = Stage.VAL,
-        return_outputs: bool = False,
         model: Optional[nn.Module] = None,
         use_ema: bool = False,
     ) -> Optional[Dict[str, Any]]:
@@ -302,7 +277,6 @@ class RunningAgent:
                 data_loader=data_loader,
                 prefix=prefix,
                 stage=stage,
-                return_outputs=return_outputs,
             )
 
     def _evaluate_loader(
@@ -311,7 +285,6 @@ class RunningAgent:
         data_loader: DataLoader,
         prefix: str = "",
         stage: Stage = Stage.VAL,
-        return_outputs: bool = False,
     ) -> Optional[Dict[str, Any]]:
         was_training = model.training
         model.eval()
@@ -322,7 +295,6 @@ class RunningAgent:
         has_epoch_metric = self.task.has_implemented("epoch_metric")
         use_tensor_bank_for_eval = has_batch_cache and has_epoch_metric
         eval_tensor_bank = TensorBank(logger=self.logger) if use_tensor_bank_for_eval else None
-        eval_output_bank = TensorBank(logger=self.logger) if return_outputs else None
 
         has_progress_tick = self._has_listener("on_progress_tick")
         should_calc_avg = has_progress_tick
@@ -337,7 +309,6 @@ class RunningAgent:
                     eval_avg_bank.update_from_dict(raw_batch_metrics)
                     if eval_tensor_bank:
                         eval_tensor_bank.add(self.task.batch_cache(out, batch_data))
-                    self._collect_batch_outputs(eval_output_bank, out, batch_data)
 
                     scalar_batch_metrics = _get_scalar_metrics(raw_batch_metrics)
                     avg_metrics = eval_avg_bank.to_dict(self.config.distributed) if should_calc_avg else None
@@ -381,14 +352,6 @@ class RunningAgent:
 
             prefixed_metrics = {f"{prefix}_{key}": value for key, value in avg_metrics.items()}
             prefixed_metrics[f"{prefix}_metric"] = self.task.post_metrics_to_value(avg_metrics)
-            if eval_output_bank is None:
-                return prefixed_metrics
-
-            gathered_outputs = eval_output_bank.gather(self.config.distributed, self.device)
-            if self.config.distributed and qt.qdist.get_rank() != 0:
-                return None
-
-            prefixed_metrics.update(gathered_outputs)
             return prefixed_metrics
         finally:
             model.train(was_training)
