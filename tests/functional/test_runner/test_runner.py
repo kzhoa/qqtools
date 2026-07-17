@@ -1048,8 +1048,8 @@ class TestTrainRunner:
         captured = {}
 
         class _FakeAgent:
-            def __init__(self, *args, allow_auto_offload=True, **kwargs):  # noqa: ARG002
-                captured["allow_auto_offload"] = allow_auto_offload
+            def __init__(self, *args, auto_offload=True, **kwargs):  # noqa: ARG002
+                captured["auto_offload"] = auto_offload
                 self.state = RunningState()
                 self.best_model_tracker = Mock()
 
@@ -1076,14 +1076,14 @@ class TestTrainRunner:
                 run_mode="epoch",
             )
 
-        assert captured["allow_auto_offload"] is False
+        assert captured["auto_offload"] is False
 
     def test_train_runner_auto_offload_can_be_enabled(self, monkeypatch):
         captured = {}
 
         class _FakeAgent:
-            def __init__(self, *args, allow_auto_offload=True, **kwargs):  # noqa: ARG002
-                captured["allow_auto_offload"] = allow_auto_offload
+            def __init__(self, *args, auto_offload=True, **kwargs):  # noqa: ARG002
+                captured["auto_offload"] = auto_offload
                 self.state = RunningState()
                 self.best_model_tracker = Mock()
 
@@ -1108,10 +1108,10 @@ class TestTrainRunner:
                 eval_interval=1,
                 save_dir=tmpdir,
                 run_mode="epoch",
-                allow_auto_offload=True,
+                auto_offload=True,
             )
 
-        assert captured["allow_auto_offload"] is True
+        assert captured["auto_offload"] is True
 
     def test_train_runner_writes_eval_sheetdata(self):
         with tempfile.TemporaryDirectory() as tmpdir:

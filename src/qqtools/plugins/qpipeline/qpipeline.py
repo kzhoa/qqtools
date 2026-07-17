@@ -152,7 +152,7 @@ class qPipeline:
                 "Checkpoint resume in runner will override the init weights."
             )
 
-        ema_params = args.optim.ema_params or qt.qData(ema=False, ema_decay=0.99)
+        ema_params = args.optim.get("ema_params") or qt.qData(ema=False, ema_decay=0.99, auto_offload=True)
         ema_source_model = (
             self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
         )
@@ -231,6 +231,8 @@ class qPipeline:
         run_mode = args.runner.get("run_mode", "epoch")
         eval_interval = args.runner.get("eval_interval", 1)
         save_interval = args.runner.get("save_interval", None)
+        ema_params = args.optim.get("ema_params") or qt.qData(auto_offload=True)
+        auto_offload = ema_params.get("auto_offload", True)
 
         return train_runner(
             model=self.model,
@@ -248,6 +250,7 @@ class qPipeline:
             extra_ckp_caches=self.extra_ckp_caches,
             use_profiler=use_profiler,
             ema_model=self.ema_model,
+            auto_offload=auto_offload,
             run_mode=run_mode,
             eval_interval=eval_interval,
             save_interval=save_interval,

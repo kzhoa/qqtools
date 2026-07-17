@@ -73,7 +73,7 @@ class RunningAgent:
         config: RunConfig = None,
         device: torch.device = None,
         ema_model: Optional[qEMA] = None,
-        allow_auto_offload: bool = True,
+        auto_offload: bool = True,
         logger: Optional[qLogger] = None,
         listeners: Optional[Dict[str, List[Callable]]] = None,
         state: Optional[RunningState] = None,
@@ -130,7 +130,7 @@ class RunningAgent:
             ema_model=self.ema_model,
             device=self.device,
             logger=self.logger,
-            allow_auto_offload=allow_auto_offload,
+            auto_offload=auto_offload,
         )
         config_accum_grad = self.config.accum_grad
         self.accum_grad = 1 if config_accum_grad in (None, 1) else int(config_accum_grad)

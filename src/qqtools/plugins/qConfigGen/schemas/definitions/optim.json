@@ -100,6 +100,11 @@
                 "ema": {
                     "type": "boolean",
                     "description": "Enable exponential moving average (EMA) of model parameters"
+                },
+                "auto_offload": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Offload the main model during EMA evaluation"
                 }
             },
             "description": "controls for exponential moving average (EMA) of model parameters"

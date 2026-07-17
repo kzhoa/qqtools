@@ -18,6 +18,12 @@ def _load_runner_schema():
         return json.load(f)
 
 
+def _load_optim_schema():
+    schema_path = Path(__file__).resolve().parents[3] / "src/qqtools/plugins/qConfigGen/schemas/definitions/optim.json"
+    with open(schema_path, "r") as f:
+        return json.load(f)
+
+
 def test_qcgen_import():
     """Test that qcgen CLI module can be imported"""
     from qqtools.cli import qcgen
@@ -31,6 +37,31 @@ def test_qcgen_main_callable():
     from qqtools.cli.qcgen import main
 
     assert callable(main)
+
+
+@pytest.mark.parametrize(
+    ("prompt_values", "expected_auto_offload"),
+    [(["yes", "", ""], True), (["yes", "", "no"], False)],
+)
+def test_prompt_ema_params_configures_auto_offload(prompt_values, expected_auto_offload):
+    from qqtools.plugins.qConfigGen.pts.optimizerPt import prompt_ema_params
+
+    with (
+        mock.patch("qqtools.plugins.qConfigGen.pts.optimizerPt.prompt", side_effect=prompt_values),
+        mock.patch("qqtools.plugins.qConfigGen.pts.optimizerPt.print_formatted_text"),
+    ):
+        params = prompt_ema_params()
+
+    assert params["ema"] is True
+    assert params["auto_offload"] is expected_auto_offload
+
+
+def test_optim_schema_supports_auto_offload_default():
+    schema = _load_optim_schema()
+    auto_offload_schema = schema["properties"]["ema_params"]["properties"]["auto_offload"]
+
+    assert auto_offload_schema["type"] == "boolean"
+    assert auto_offload_schema["default"] is True
 
 
 def test_qcgen_full_workflow():
@@ -57,7 +88,7 @@ def test_qcgen_full_workflow():
         mock_loss.return_value = {"loss": "cross_entropy"}
         mock_optim.return_value = {"optimizer": "adamw", "lr": 0.001}
         mock_scheduler.return_value = {"scheduler": "cosine"}
-        mock_ema.return_value = {"ema_decay": 0.99}
+        mock_ema.return_value = {"ema": True, "ema_decay": 0.99, "auto_offload": True}
         mock_model.return_value = {"model_type": "resnet50"}
         mock_runner.return_value = {"run_mode": "epoch", "max_epochs": 100}
 
@@ -83,6 +114,7 @@ def test_qcgen_full_workflow():
             assert "task" in config
             assert "optim" in config
             assert "runner" in config
+            assert config["optim"]["ema_params"]["auto_offload"] is True
 
 
 def test_qcgen_yaml_output_format():

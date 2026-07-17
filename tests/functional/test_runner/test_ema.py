@@ -10,7 +10,6 @@ from torch.utils.data import DataLoader, Dataset
 
 from qqtools.plugins.qpipeline.entry_utils.qema import qEMA
 from qqtools.plugins.qpipeline.runner import runner as runner_module
-from qqtools.plugins.qpipeline.runner.runner_utils import ema_context as ema_context_module
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
 
 RunningAgent = runner_module.RunningAgent
@@ -72,7 +71,7 @@ class SimpleTask(qTaskBase):
 
 
 def _build_agent_for_offload_tests(
-    allow_auto_offload: bool,
+    auto_offload: bool,
     device: torch.device = torch.device("cpu"),
 ):
     model = SimpleModel().to(device)
@@ -93,7 +92,7 @@ def _build_agent_for_offload_tests(
         config=config,
         device=device,
         ema_model=ema_model,
-        allow_auto_offload=allow_auto_offload,
+        auto_offload=auto_offload,
         logger=MagicMock(),
     )
     return agent, model, ema_model, device
@@ -194,31 +193,18 @@ def test_ema_update_and_evaluation(setup_agent_with_ema):
     assert next(ema_model.module.parameters()).device == device
 
 
-def test_auto_offload_detector_called_once_on_agent_init(monkeypatch):
-    calls = []
+def test_enabled_auto_offload_always_offloads_for_ema_evaluation():
+    agent, model, _, _ = _build_agent_for_offload_tests(auto_offload=True)
 
-    def _fake_should_enable_offload(device, model, logger):
-        calls.append((device, model, logger))
-        return True
+    with patch.object(model, "cpu", wraps=model.cpu) as cpu_spy:
+        agent.evaluate(use_ema=True)
 
-    monkeypatch.setattr(ema_context_module, "_should_enable_offload", _fake_should_enable_offload)
-
-    agent, model, _, device = _build_agent_for_offload_tests(allow_auto_offload=True)
-
-    assert len(calls) == 1
-    assert calls[0][0] == device
-    assert calls[0][1] is model
-    assert calls[0][2] is agent.logger
+    cpu_spy.assert_called_once()
     assert agent._ema_offload_ctx._auto_offload_enabled is True
 
 
-def test_disable_auto_offload_skips_detector_and_never_offloads(monkeypatch):
-    def _raise_if_called(*args, **kwargs):
-        raise AssertionError("_should_enable_offload should not be called when auto offload is disabled")
-
-    monkeypatch.setattr(ema_context_module, "_should_enable_offload", _raise_if_called)
-
-    agent, model, _, _ = _build_agent_for_offload_tests(allow_auto_offload=False)
+def test_disabled_auto_offload_never_offloads():
+    agent, model, _, _ = _build_agent_for_offload_tests(auto_offload=False)
 
     with patch.object(model, "cpu", wraps=model.cpu) as cpu_spy:
         agent.evaluate(use_ema=True)
@@ -227,10 +213,8 @@ def test_disable_auto_offload_skips_detector_and_never_offloads(monkeypatch):
     assert agent._ema_offload_ctx._auto_offload_enabled is False
 
 
-def test_non_main_model_eval_does_not_offload_main_model(monkeypatch):
-    monkeypatch.setattr(ema_context_module, "_should_enable_offload", lambda device, model, logger: True)
-
-    agent, model, _, device = _build_agent_for_offload_tests(allow_auto_offload=True)
+def test_non_main_model_eval_does_not_offload_main_model():
+    agent, model, _, device = _build_agent_for_offload_tests(auto_offload=True)
     external_model = SimpleModel().to(device)
 
     with patch.object(model, "cpu", wraps=model.cpu) as cpu_spy:

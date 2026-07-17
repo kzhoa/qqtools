@@ -44,6 +44,7 @@ OPTIMIZER_DEFAULTS = {
 EMA_DEFAULTS = {
     "ema": False,
     "ema_decay": 0.99,
+    "auto_offload": True,
 }
 
 
@@ -200,10 +201,10 @@ def prompt_ema_params():
 
     Logical relationships:
     1. First ask whether to enable EMA
-    2. Only prompt ema_decay parameter when enabled
+    2. Only prompt EMA settings when enabled
 
     Returns:
-        dict: EMA configuration containing ema and ema_decay; return empty dict if not enabled
+        dict: EMA configuration; return empty dict if not enabled
     """
     print_formatted_text("\n[ EMA (Exponential Moving Average) Configuration ]")
 
@@ -240,4 +241,24 @@ def prompt_ema_params():
                 print_formatted_text("  ❌ Must be a float.")
                 continue
 
-        return {"ema": True, "ema_decay": ema_decay}
+        break
+
+    while True:
+        default_val = EMA_DEFAULTS["auto_offload"]
+        default_text = "yes" if default_val else "no"
+        value = prompt(
+            "  Automatically offload the main model for EMA evaluation? "
+            f"(yes/no, default: {default_text}): "
+        ).strip().lower()
+        if value in ("y", "yes"):
+            auto_offload = True
+            break
+        if value in ("n", "no"):
+            auto_offload = False
+            break
+        if not value:
+            auto_offload = default_val
+            break
+        print_formatted_text("  ❌ Invalid input. Please enter 'yes' or 'no'.")
+
+    return {"ema": True, "ema_decay": ema_decay, "auto_offload": auto_offload}

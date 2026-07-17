@@ -3,30 +3,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from ...entry_utils.info import get_model_size_bytes
 from ...entry_utils.qema import qEMA
 from ...qlogger import qLogger
-
-
-def _should_enable_offload(device: torch.device, model: nn.Module, logger: Optional[qLogger]) -> bool:
-    """Check if model offloading should be enabled based on GPU capacity."""
-    if device.type != "cuda":
-        return False
-
-    model_size_bytes = get_model_size_bytes(model)
-    try:
-        gpu_capacity_bytes = torch.cuda.get_device_properties(device).total_memory
-    except Exception:
-        return False
-
-    if model_size_bytes > (gpu_capacity_bytes * 0.5):
-        if logger:
-            logger.info(
-                f"Model size ({model_size_bytes / 1024**2:.2f} MB) > 50% of GPU capacity. "
-                "Enabling mutual offloading during evaluation."
-            )
-        return True
-    return False
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
@@ -104,18 +82,14 @@ class EMAOffloadContext:
         ema_model: Optional[qEMA],
         device: torch.device,
         logger: Optional[qLogger] = None,
-        allow_auto_offload: bool = True,
+        auto_offload: bool = True,
     ):
         self.main_model = main_model
         self.ema_model = ema_model
         self.device = device
         self.logger = logger
 
-        self.should_allow_auto_offload = allow_auto_offload
-        self._auto_offload_enabled = False
-        if self.should_allow_auto_offload and self.ema_model is not None:
-            offload_target = _unwrap_model(main_model)
-            self._auto_offload_enabled = _should_enable_offload(self.device, offload_target, self.logger)
+        self._auto_offload_enabled = auto_offload and self.ema_model is not None
 
     def __call__(self, model: nn.Module, use_ema: bool) -> _EMAEvaluationSession:
         use_offload = self._auto_offload_enabled and (model is self.main_model)

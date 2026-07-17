@@ -61,6 +61,7 @@ class EmaParamsConfig:
 
     ema: bool = False
     ema_decay: float = 0.99
+    auto_offload: bool = True
 
 
 @dataclass
