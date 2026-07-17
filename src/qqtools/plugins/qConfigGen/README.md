@@ -16,6 +16,10 @@ optim: # required
     scheduler":  # optional
     scheduler_params": # optional
     warmup":   # optional
+    ema_params: # optional
+        ema: # enable EMA
+        ema_decay: # optional, default 0.99
+        auto_offload: # optional, default true; offload the main model during EMA evaluation
     
 runner: # required
     epochs:  # required

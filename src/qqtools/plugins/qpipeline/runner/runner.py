@@ -449,7 +449,7 @@ def train_runner(
     save_interval: Optional[int] = None,
     accum_grad: Optional[int] = None,
     log_granularity: Optional[List[Literal["eval", "batch"]]] = ["eval"],
-    allow_auto_offload: bool = False,
+    auto_offload: bool = False,
 ) -> TrainRunnerResult:
     """
     Self-contained training runner.
@@ -483,7 +483,7 @@ def train_runner(
         eval_interval: Evaluation interval (interpreted as epochs or steps depending on run_mode)
         save_interval: Regular checkpoint saving interval (interpreted as epochs or steps depending on run_mode)
         accum_grad: Optional gradient accumulation factor. `None` disables accumulation.
-        allow_auto_offload: Whether to enable automatic EMA/model offload policy
+        auto_offload: Whether to offload the main model during EMA evaluation
 
     Returns:
         Structured training result with terminal contract fields
@@ -642,7 +642,7 @@ def train_runner(
         config=config,
         device=device,
         ema_model=ema_model,
-        allow_auto_offload=allow_auto_offload,
+        auto_offload=auto_offload,
         logger=logger,
     )
 
@@ -750,4 +750,3 @@ def train_runner(
         "early_stopped": terminal_event["reason"] == "early_stop",
         "terminal_event": terminal_event,
     }
-

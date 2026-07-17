@@ -1,5 +1,11 @@
 # History
 
+## Unreleased
+
+- feat: add `optim.ema_params.auto_offload` (default `true`) to control main-model offloading during EMA evaluation through QPipeline YAML configuration
+- refactor: rename the QPipeline and `train_runner` EMA offload parameter to `auto_offload`; when enabled, EMA evaluation always offloads the main model without model-size heuristics
+- feat: add qConfigGen support and documentation for EMA `auto_offload`
+
 ## v1.2.28
 
 - chore: squash dev/qq history (v1.2.8 through v1.2.27) onto main as a single commit for cleaner git lineage

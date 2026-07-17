@@ -495,12 +495,14 @@ optim:
   ema_params:
     ema: true
     ema_decay: 0.99
+    auto_offload: true
 ```
 
-| Parameter   | Type    | Range | Default | Description                                         |
-| ----------- | ------- | ----- | ------- | --------------------------------------------------- |
-| `ema`       | Boolean | -     | false   | Enable EMA                                          |
-| `ema_decay` | Float   | 0-1   | 0.99    | EMA decay coefficient (closer to 1 = slower change) |
+| Parameter      | Type    | Range | Default | Description                                           |
+| -------------- | ------- | ----- | ------- | ----------------------------------------------------- |
+| `ema`          | Boolean | -     | false   | Enable EMA                                            |
+| `ema_decay`    | Float   | 0-1   | 0.99    | EMA decay coefficient (closer to 1 = slower change) |
+| `auto_offload` | Boolean | -     | true    | Offload the main model during EMA evaluation         |
 
 - **Effect**:
   - During training: Update both main and EMA model
@@ -965,6 +967,7 @@ optim:
   ema_params:
     ema: true
     ema_decay: 0.99
+    auto_offload: true
 
 runner:
   run_mode: step

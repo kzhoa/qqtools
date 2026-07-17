@@ -512,7 +512,13 @@ def test_eval_emits_progress_tick_for_val_and_test_stages(tiny_task, tiny_model,
     assert len(test_ticks) == len(tiny_task.test_loader)
 
 
-def test_qpipeline_fit_forwards_accum_grad(monkeypatch, base_args):
+@pytest.mark.parametrize(
+    ("ema_params", "expected_auto_offload"),
+    [({}, True), ({"auto_offload": False}, False)],
+)
+def test_qpipeline_fit_forwards_accum_grad_and_ema_auto_offload(
+    monkeypatch, base_args, ema_params, expected_auto_offload
+):
     captured_kwargs = {}
 
     class DummyPipeline(qPipeline):
@@ -538,6 +544,7 @@ def test_qpipeline_fit_forwards_accum_grad(monkeypatch, base_args):
             "accum_grad": 4,
         }
     )
+    args["optim"] = {"ema_params": ema_params}
 
     monkeypatch.setattr(qpipeline_module, "train_runner", fake_train_runner)
 
@@ -559,3 +566,4 @@ def test_qpipeline_fit_forwards_accum_grad(monkeypatch, base_args):
     assert captured_kwargs["eval_interval"] == 3
     assert captured_kwargs["save_interval"] == 6
     assert captured_kwargs["use_profiler"] is True
+    assert captured_kwargs["auto_offload"] is expected_auto_offload
