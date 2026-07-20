@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 import torch.distributed as dist
 from torch.utils.data import BatchSampler, Sampler
 
-from qqtools.data.qbalance import compute_global_even_sort_order
+from qqtools.data.qbalance import (
+    assign_window_to_ranks,
+    compute_global_even_sort_order,
+    validate_balance_strategy,
+)
 
 
 def _normalize_sample_costs(sample_costs: Sequence[float] | np.ndarray) -> np.ndarray:
@@ -79,65 +83,6 @@ def _resolve_rank_and_world_size(
     return resolved_rank, resolved_world_size
 
 
-def assign_chunk_lpt(
-    chunk_indices: Sequence[int] | np.ndarray,
-    sample_costs: Sequence[float] | np.ndarray,
-    world_size: int,
-    batch_size: int,
-) -> list[list[int]]:
-    if world_size <= 0:
-        raise ValueError(f"world_size must be positive, got {world_size}")
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
-
-    costs = _normalize_sample_costs(sample_costs)
-    chunk = np.asarray(chunk_indices, dtype=np.int64)
-    if chunk.ndim != 1:
-        raise ValueError(f"chunk_indices must be 1D, got shape {chunk.shape}")
-    if len(chunk) == 0:
-        return [[] for _ in range(world_size)]
-    if np.any(chunk < 0) or np.any(chunk >= costs.shape[0]):
-        raise ValueError("chunk_indices contains out-of-range sample indices")
-
-    sorted_positions = np.argsort(-costs[chunk], kind="stable")
-    rank_to_items: list[list[int]] = [[] for _ in range(world_size)]
-    rank_loads = np.zeros(world_size, dtype=np.float64)
-    rank_counts = np.zeros(world_size, dtype=np.int64)
-
-    def _locality_cost(rank_idx: int, sample_idx: int) -> float:
-        if not rank_to_items[rank_idx]:
-            return float("inf")
-        return float(min(abs(sample_idx - existing_idx) for existing_idx in rank_to_items[rank_idx]))
-
-    def _choose_rank(sample_idx: int, candidate_ranks: Iterable[int]) -> int:
-        return min(
-            candidate_ranks,
-            key=lambda rank_idx: (
-                float(rank_loads[rank_idx]),
-                int(rank_counts[rank_idx]),
-                _locality_cost(rank_idx, sample_idx),
-                int(rank_idx),
-            ),
-        )
-
-    for position in sorted_positions:
-        sample_idx = int(chunk[position])
-        chosen_rank = _choose_rank(sample_idx, range(world_size))
-        if rank_counts[chosen_rank] >= batch_size:
-            available_ranks = [
-                rank_idx for rank_idx in range(world_size) if rank_counts[rank_idx] < batch_size
-            ]
-            if not available_ranks:
-                raise RuntimeError("No available rank left while assigning chunk")
-            chosen_rank = _choose_rank(sample_idx, available_ranks)
-
-        rank_to_items[chosen_rank].append(sample_idx)
-        rank_loads[chosen_rank] += costs[sample_idx]
-        rank_counts[chosen_rank] += 1
-
-    return rank_to_items
-
-
 @dataclass
 class _BalancedPlanCache:
     sample_costs: np.ndarray
@@ -198,9 +143,9 @@ class _BalancedPlanCache:
 
         rank_chunks: list[np.ndarray] = []
         for start in range(0, int(global_order.shape[0]), global_chunk_size):
-            chunk = global_order[start : start + global_chunk_size]
-            assignment = assign_chunk_lpt(
-                chunk_indices=chunk,
+            window = global_order[start : start + global_chunk_size]
+            assignment = assign_window_to_ranks(
+                window_indices=window,
                 sample_costs=self.sample_costs,
                 world_size=self.world_size,
                 batch_size=self.batch_size,
@@ -229,6 +174,7 @@ class BalancedDistributedSampler(Sampler[int]):
         strategy: str = "v3",
     ) -> None:
         costs = _normalize_sample_costs(sample_costs)
+        validated_strategy = validate_balance_strategy(strategy)
         validated_order = None
         if sample_order is not None:
             validated_order = _validate_sample_order(sample_order, int(costs.shape[0]))
@@ -242,7 +188,7 @@ class BalancedDistributedSampler(Sampler[int]):
             seed=int(seed),
             drop_last=bool(drop_last),
             sample_order=validated_order,
-            strategy=strategy,
+            strategy=validated_strategy,
         )
 
     def __iter__(self):
@@ -269,27 +215,35 @@ class BalancedBatchSampler(BatchSampler):
         sample_order: Sequence[int] | np.ndarray | None = None,
         strategy: str = "v3",
     ) -> None:
-        costs = _normalize_sample_costs(sample_costs)
-        validated_order = None
-        if sample_order is not None:
-            validated_order = _validate_sample_order(sample_order, int(costs.shape[0]))
-        resolved_rank, resolved_world_size = _resolve_rank_and_world_size(rank, world_size)
+        self.sampler = BalancedDistributedSampler(
+            sample_costs,
+            batch_size=batch_size,
+            rank=rank,
+            world_size=world_size,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=drop_last,
+            sample_order=sample_order,
+            strategy=strategy,
+        )
         self.batch_size = int(batch_size)
         self.drop_last = bool(drop_last)
         self._plan_cache = _BalancedPlanCache(
-            sample_costs=costs,
+            sample_costs=self.sampler._plan_cache.sample_costs,
             batch_size=self.batch_size,
-            rank=resolved_rank,
-            world_size=resolved_world_size,
-            shuffle=bool(shuffle),
-            seed=int(seed),
+            rank=self.sampler._plan_cache.rank,
+            world_size=self.sampler._plan_cache.world_size,
+            shuffle=self.sampler._plan_cache.shuffle,
+            seed=self.sampler._plan_cache.seed,
             drop_last=self.drop_last,
-            sample_order=validated_order,
-            strategy=strategy,
+            sample_order=self.sampler._plan_cache.sample_order,
+            strategy=self.sampler._plan_cache.strategy,
+            epoch=self.sampler._plan_cache.epoch,
+            rank_local_plan=self.sampler._plan_cache.rank_local_plan.copy(),
         )
 
     def __iter__(self):
-        plan = self._plan_cache.rank_local_plan
+        plan = self.sampler._plan_cache.rank_local_plan
         for start in range(0, int(plan.shape[0]), self.batch_size):
             batch = plan[start : start + self.batch_size]
             if batch.shape[0] < self.batch_size and self.drop_last:
@@ -297,11 +251,13 @@ class BalancedBatchSampler(BatchSampler):
             yield batch.tolist()
 
     def __len__(self) -> int:
-        plan_len = int(self._plan_cache.rank_local_plan.shape[0])
+        plan_len = len(self.sampler)
         full_batches, remainder = divmod(plan_len, self.batch_size)
         if remainder and not self.drop_last:
             return full_batches + 1
         return full_batches
 
     def set_epoch(self, epoch: int) -> None:
-        self._plan_cache.set_epoch(epoch)
+        self.sampler.set_epoch(epoch)
+        self._plan_cache.epoch = self.sampler._plan_cache.epoch
+        self._plan_cache.rank_local_plan = self.sampler._plan_cache.rank_local_plan.copy()

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Iterable
 
 import numpy as np
 
-
 _BalanceStrategy = Callable[[np.ndarray, int], np.ndarray]
+
+
+__all__ = [
+    "assign_window_to_ranks",
+    "compute_global_even_sort_order",
+    "validate_balance_strategy",
+]
 
 
 def _normalize_sample_costs(sample_costs: np.ndarray | list[float]) -> np.ndarray:
@@ -22,9 +28,7 @@ def _normalize_sample_costs(sample_costs: np.ndarray | list[float]) -> np.ndarra
 def _validate_permutation(order: np.ndarray, total: int) -> np.ndarray:
     permutation = np.asarray(order, dtype=np.int64)
     if permutation.shape != (total,):
-        raise ValueError(
-            f"Unexpected permutation length: {permutation.shape}, expected {(total,)}"
-        )
+        raise ValueError(f"Unexpected permutation length: {permutation.shape}, expected {(total,)}")
     if total == 0:
         return permutation
     if len(np.unique(permutation)) != total:
@@ -149,6 +153,12 @@ _STRATEGIES: dict[str, _BalanceStrategy] = {
 }
 
 
+def validate_balance_strategy(strategy: str) -> str:
+    if strategy not in _STRATEGIES:
+        raise ValueError(f"Unsupported strategy {strategy!r}. Expected one of {tuple(_STRATEGIES)}")
+    return strategy
+
+
 def compute_global_even_sort_order(
     sample_costs: np.ndarray | list[float],
     *,
@@ -156,9 +166,63 @@ def compute_global_even_sort_order(
     strategy: str = "v3",
 ) -> np.ndarray:
     costs = _normalize_sample_costs(sample_costs)
-    if strategy not in _STRATEGIES:
-        raise ValueError(
-            f"Unsupported strategy {strategy!r}. Expected one of {tuple(_STRATEGIES)}"
-        )
-    order = _STRATEGIES[strategy](costs, int(seed))
+    validated_strategy = validate_balance_strategy(strategy)
+    order = _STRATEGIES[validated_strategy](costs, int(seed))
     return _validate_permutation(order, int(costs.shape[0]))
+
+
+def assign_window_to_ranks(
+    window_indices: np.ndarray | list[int],
+    sample_costs: np.ndarray | list[float],
+    world_size: int,
+    batch_size: int,
+) -> list[list[int]]:
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+    costs = _normalize_sample_costs(sample_costs)
+    window = np.asarray(window_indices, dtype=np.int64)
+    if window.ndim != 1:
+        raise ValueError(f"window_indices must be 1D, got shape {window.shape}")
+    if len(window) == 0:
+        return [[] for _ in range(world_size)]
+    if np.any(window < 0) or np.any(window >= costs.shape[0]):
+        raise ValueError("window_indices contains out-of-range sample indices")
+
+    sorted_positions = np.argsort(-costs[window], kind="stable")
+    rank_to_items: list[list[int]] = [[] for _ in range(world_size)]
+    rank_loads = np.zeros(world_size, dtype=np.float64)
+    rank_counts = np.zeros(world_size, dtype=np.int64)
+
+    def _locality_cost(rank_idx: int, sample_idx: int) -> float:
+        if not rank_to_items[rank_idx]:
+            return float("inf")
+        return float(min(abs(sample_idx - existing_idx) for existing_idx in rank_to_items[rank_idx]))
+
+    def _choose_rank(sample_idx: int, candidate_ranks: Iterable[int]) -> int:
+        return min(
+            candidate_ranks,
+            key=lambda rank_idx: (
+                float(rank_loads[rank_idx]),
+                int(rank_counts[rank_idx]),
+                _locality_cost(rank_idx, sample_idx),
+                int(rank_idx),
+            ),
+        )
+
+    for position in sorted_positions:
+        sample_idx = int(window[position])
+        chosen_rank = _choose_rank(sample_idx, range(world_size))
+        if rank_counts[chosen_rank] >= batch_size:
+            available_ranks = [rank_idx for rank_idx in range(world_size) if rank_counts[rank_idx] < batch_size]
+            if not available_ranks:
+                raise RuntimeError("No available rank left while assigning window")
+            chosen_rank = _choose_rank(sample_idx, available_ranks)
+
+        rank_to_items[chosen_rank].append(sample_idx)
+        rank_loads[chosen_rank] += costs[sample_idx]
+        rank_counts[chosen_rank] += 1
+
+    return rank_to_items

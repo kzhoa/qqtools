@@ -1,5 +1,8 @@
 from .list_utils import pad_sequences
-from .qbalance import compute_global_even_sort_order
-from .qbalanced_partition import qbalanced_partition
+from .qbalance import (
+    assign_window_to_ranks,
+    compute_global_even_sort_order,
+    validate_balance_strategy,
+)
 from .qdatalist import qDataList
 from .qscaladict import qScalaDict
