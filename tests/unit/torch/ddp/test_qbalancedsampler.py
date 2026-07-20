@@ -1,11 +1,11 @@
 import numpy as np
 import pytest
 
+from qqtools.data import assign_window_to_ranks
 import qqtools.torch.ddp.qbalancedsampler as qbs
 from qqtools.torch.ddp import (
     BalancedBatchSampler,
     BalancedDistributedSampler,
-    assign_chunk_lpt,
 )
 
 
@@ -23,47 +23,47 @@ def _mock_dist_state(
     monkeypatch.setattr(qbs.dist, "get_world_size", lambda: world_size)
 
 
-def test_assign_chunk_lpt_empty_chunk():
-    assignment = assign_chunk_lpt([], [1.0, 2.0], world_size=2, batch_size=2)
+def test_assign_window_to_ranks_empty_window():
+    assignment = assign_window_to_ranks([], [1.0, 2.0], world_size=2, batch_size=2)
     assert assignment == [[], []]
 
 
-def test_assign_chunk_lpt_full_chunk_balances_normal_case():
-    assignment = assign_chunk_lpt([0, 1, 2, 3], [9.0, 8.0, 7.0, 6.0], world_size=2, batch_size=2)
+def test_assign_window_to_ranks_balances_normal_case():
+    assignment = assign_window_to_ranks([0, 1, 2, 3], [9.0, 8.0, 7.0, 6.0], world_size=2, batch_size=2)
     assert assignment == [[0, 3], [1, 2]]
 
 
-def test_assign_chunk_lpt_keeps_equal_cost_processing_stable():
-    assignment = assign_chunk_lpt([0, 1, 2, 3], [1.0, 1.0, 1.0, 1.0], world_size=2, batch_size=2)
+def test_assign_window_to_ranks_keeps_equal_cost_processing_stable():
+    assignment = assign_window_to_ranks([0, 1, 2, 3], [1.0, 1.0, 1.0, 1.0], world_size=2, batch_size=2)
     assert assignment == [[0, 3], [1, 2]]
 
 
-def test_assign_chunk_lpt_uses_locality_tie_break():
+def test_assign_window_to_ranks_uses_locality_tie_break():
     sample_costs = np.zeros(11, dtype=np.float64)
     sample_costs[0] = 5.0
     sample_costs[10] = 5.0
     sample_costs[1] = 1.0
 
-    assignment = assign_chunk_lpt([0, 10, 1], sample_costs, world_size=2, batch_size=2)
+    assignment = assign_window_to_ranks([0, 10, 1], sample_costs, world_size=2, batch_size=2)
 
     assert assignment == [[0, 1], [10]]
 
 
-def test_assign_chunk_lpt_falls_back_when_preferred_rank_is_full():
+def test_assign_window_to_ranks_falls_back_when_preferred_rank_is_full():
     sample_costs = np.zeros(12, dtype=np.float64)
     sample_costs[10] = 10.0
     sample_costs[0] = 2.0
     sample_costs[1] = 1.0
     sample_costs[11] = 1.0
 
-    assignment = assign_chunk_lpt([0, 1, 10, 11], sample_costs, world_size=2, batch_size=2)
+    assignment = assign_window_to_ranks([0, 1, 10, 11], sample_costs, world_size=2, batch_size=2)
 
     assert assignment == [[10, 11], [0, 1]]
 
 
-def test_assign_chunk_lpt_rejects_invalid_numeric_input():
+def test_assign_window_to_ranks_rejects_invalid_numeric_input():
     with pytest.raises(ValueError):
-        assign_chunk_lpt([0, 1], [1.0, np.nan], world_size=2, batch_size=2)
+        assign_window_to_ranks([0, 1], [1.0, np.nan], world_size=2, batch_size=2)
 
 
 def test_balanced_distributed_sampler_eager_validation_failures(monkeypatch):
@@ -77,6 +77,9 @@ def test_balanced_distributed_sampler_eager_validation_failures(monkeypatch):
 
     with pytest.raises(ValueError):
         BalancedDistributedSampler([1.0, 2.0], batch_size=2, rank=0, world_size=2)
+
+    with pytest.raises(ValueError):
+        BalancedDistributedSampler([1.0, 2.0], batch_size=2, strategy="bad")
 
 
 def test_balanced_distributed_sampler_shuffle_epoch_changes_and_preserves_equal_lengths(monkeypatch):
@@ -234,6 +237,22 @@ def test_balanced_batch_sampler_yields_list_batches(monkeypatch):
     assert all(isinstance(batch, list) for batch in batches)
 
 
+def test_balanced_batch_sampler_exposes_underlying_sampler_contract(monkeypatch):
+    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
+
+    sampler = BalancedBatchSampler(
+        [5.0, 4.0, 3.0, 2.0, 1.0],
+        batch_size=2,
+        rank=0,
+        world_size=2,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    assert isinstance(sampler.sampler, BalancedDistributedSampler)
+    assert list(sampler.sampler) == [0, 3, 0, 4]
+
+
 def test_balanced_batch_sampler_is_view_over_distributed_plan(monkeypatch):
     _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
     kwargs = dict(
@@ -308,3 +327,17 @@ def test_balanced_batch_sampler_len_reports_batch_count(monkeypatch):
     )
 
     assert len(sampler) == 2
+
+
+def test_balanced_batch_sampler_rejects_invalid_strategy_even_without_shuffle(monkeypatch):
+    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
+
+    with pytest.raises(ValueError):
+        BalancedBatchSampler(
+            [5.0, 4.0, 3.0, 2.0, 1.0],
+            batch_size=2,
+            rank=0,
+            world_size=2,
+            shuffle=False,
+            strategy="bad",
+        )
