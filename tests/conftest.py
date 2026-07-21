@@ -10,6 +10,7 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
 TMP_ROOT = PROJECT_ROOT / "tmp"
 
 
@@ -122,3 +123,15 @@ def tmp_path(request):
         yield case_dir
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
+
+
+@pytest.fixture
+def checkout_subprocess_env() -> dict[str, str]:
+    """Build an environment that imports qqtools from the current checkout."""
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    pythonpath_entries = [str(SRC_ROOT)]
+    if existing_pythonpath:
+        pythonpath_entries.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    return env

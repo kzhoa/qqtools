@@ -1,90 +1,100 @@
 import numpy as np
 import pytest
 
-from qqtools.data import compute_global_even_sort_order
+from qqtools.data import (
+    assign_window_to_ranks,
+    compute_global_even_sort_order,
+    validate_balance_strategy,
+)
 
 
 @pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])
-def test_compute_global_even_sort_order_empty_input(strategy):
+def test_global_even_sort_returns_deterministic_full_permutation(strategy):
+    costs = np.asarray([0.5, 3.0, 1.5, 4.5, 2.0, 6.0, 1.0, 5.5])
+
+    first = compute_global_even_sort_order(costs, seed=7, strategy=strategy)
+    second = compute_global_even_sort_order(costs, seed=7, strategy=strategy)
+
+    assert first.dtype == np.int64
+    assert sorted(first.tolist()) == list(range(costs.shape[0]))
+    assert np.array_equal(first, second)
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected"),
+    [
+        ("v1", [0, 6, 7, 2, 4, 5, 1, 3]),
+        ("v2", [0, 6, 2, 4, 1, 3, 7, 5]),
+        ("v3", [1, 4, 3, 2, 6, 0, 7, 5]),
+    ],
+)
+def test_global_even_sort_strategy_characterization(strategy, expected):
+    costs = np.asarray([0.5, 3.0, 1.5, 4.5, 2.0, 6.0, 1.0, 5.5])
+
+    order = compute_global_even_sort_order(costs, seed=7, strategy=strategy)
+
+    assert order.tolist() == expected
+
+
+@pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])
+def test_global_even_sort_supports_empty_input(strategy):
     order = compute_global_even_sort_order([], strategy=strategy)
+
     assert order.dtype == np.int64
     assert order.shape == (0,)
 
 
 @pytest.mark.parametrize(
-    "sample_costs",
+    "costs",
     [
-        np.array([[1.0, 2.0], [3.0, 4.0]]),
-        np.array([1.0, np.nan]),
-        np.array([1.0, np.inf]),
-        np.array([1.0, -1.0]),
+        np.asarray([[1.0, 2.0], [3.0, 4.0]]),
+        np.asarray([1.0, np.nan]),
+        np.asarray([1.0, np.inf]),
+        np.asarray([1.0, -1.0]),
     ],
 )
-def test_compute_global_even_sort_order_rejects_invalid_costs(sample_costs):
+def test_global_even_sort_rejects_invalid_costs(costs):
     with pytest.raises(ValueError):
-        compute_global_even_sort_order(sample_costs)
+        compute_global_even_sort_order(costs)
 
 
-@pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])
-def test_compute_global_even_sort_order_returns_full_permutation(strategy):
-    sample_costs = np.array([3.5, 1.0, 4.0, 2.0, 0.5, 7.0], dtype=np.float64)
-    order = compute_global_even_sort_order(sample_costs, seed=11, strategy=strategy)
-
-    assert order.dtype == np.int64
-    assert sorted(order.tolist()) == list(range(sample_costs.shape[0]))
+def test_validate_balance_strategy_rejects_unknown_strategy():
+    with pytest.raises(ValueError, match="Unsupported strategy"):
+        validate_balance_strategy("unknown")
 
 
-def test_compute_global_even_sort_order_is_deterministic_for_same_seed():
-    sample_costs = np.array([0.5, 3.0, 1.5, 4.5, 2.0, 6.0, 1.0, 5.5], dtype=np.float64)
+def test_assign_window_to_ranks_balances_cost_and_preserves_capacity():
+    assignment = assign_window_to_ranks(
+        [0, 1, 2, 3],
+        [9.0, 8.0, 7.0, 6.0],
+        world_size=2,
+        batch_size=2,
+    )
 
-    first = compute_global_even_sort_order(sample_costs, seed=7, strategy="v3")
-    second = compute_global_even_sort_order(sample_costs, seed=7, strategy="v3")
-
-    assert np.array_equal(first, second)
+    assert assignment == [[0, 3], [1, 2]]
+    assert [sum([9.0, 8.0, 7.0, 6.0][idx] for idx in rank) for rank in assignment] == [15.0, 15.0]
 
 
-def test_compute_global_even_sort_order_selects_distinct_strategies():
-    sample_costs = np.array([0.5, 3.0, 1.5, 4.5, 2.0, 6.0, 1.0, 5.5], dtype=np.float64)
+def test_assign_window_to_ranks_uses_locality_for_equal_loads():
+    costs = np.zeros(11, dtype=np.float64)
+    costs[[0, 10]] = 5.0
+    costs[1] = 1.0
 
-    v1 = compute_global_even_sort_order(sample_costs, seed=7, strategy="v1").tolist()
-    v2 = compute_global_even_sort_order(sample_costs, seed=7, strategy="v2").tolist()
-    v3 = compute_global_even_sort_order(sample_costs, seed=7, strategy="v3").tolist()
+    assignment = assign_window_to_ranks([0, 10, 1], costs, world_size=2, batch_size=2)
 
-    assert len({tuple(v1), tuple(v2), tuple(v3)}) == 3
+    assert assignment == [[0, 1], [10]]
 
 
 @pytest.mark.parametrize(
-    ("sample_costs", "seed", "expected_orders"),
+    "kwargs",
     [
-        (
-            np.array([0.5, 3.0, 1.5, 4.5, 2.0, 6.0, 1.0, 5.5], dtype=np.float64),
-            7,
-            {
-                "v1": [0, 6, 7, 2, 4, 5, 1, 3],
-                "v2": [0, 6, 2, 4, 1, 3, 7, 5],
-                "v3": [1, 4, 3, 2, 6, 0, 7, 5],
-            },
-        ),
-        (
-            np.array([3.0, 3.0, 0.0, 7.0, 1.0, 2.0, 9.0, 4.0, 8.0], dtype=np.float64),
-            0,
-            {
-                "v1": [4, 5, 2, 6, 3, 8, 7, 0, 1],
-                "v2": [2, 4, 5, 0, 1, 7, 3, 8, 6],
-                "v3": [7, 0, 1, 5, 3, 4, 8, 2, 6],
-            },
-        ),
+        {"window_indices": [0], "sample_costs": [1.0], "world_size": 0, "batch_size": 1},
+        {"window_indices": [0], "sample_costs": [1.0], "world_size": 1, "batch_size": 0},
+        {"window_indices": [[0]], "sample_costs": [1.0], "world_size": 1, "batch_size": 1},
+        {"window_indices": [1], "sample_costs": [1.0], "world_size": 1, "batch_size": 1},
+        {"window_indices": [0], "sample_costs": [np.nan], "world_size": 1, "batch_size": 1},
     ],
 )
-def test_compute_global_even_sort_order_matches_characterization(
-    sample_costs,
-    seed,
-    expected_orders,
-):
-    for strategy, expected in expected_orders.items():
-        actual = compute_global_even_sort_order(
-            sample_costs,
-            seed=seed,
-            strategy=strategy,
-        ).tolist()
-        assert actual == expected
+def test_assign_window_to_ranks_rejects_invalid_inputs(kwargs):
+    with pytest.raises(ValueError):
+        assign_window_to_ranks(**kwargs)

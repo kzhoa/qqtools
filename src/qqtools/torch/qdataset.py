@@ -1,7 +1,9 @@
 import copy
+import multiprocessing
 import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import List, Sequence, Union
 
@@ -17,6 +19,16 @@ from ..utils.warning import QDataWarning
 from .qsplit import get_data_splits
 
 lmdb = LazyImport("lmdb")
+
+__all__ = [
+    "qDictDataset",
+    "qDictDataloader",
+    "qData",
+    "smart_combine",
+    "collate_dict_samples",
+    "collate_graph_samples",
+    "determine_graph_key_types",
+]
 
 
 class qData(qt.qDict):
@@ -998,6 +1010,51 @@ class qDictDataset(torch.utils.data.Dataset, ABC):
         )
 
 
+class _StatefulGraphCollator:
+    """Pickle-safe graph collator that caches inferred key types per worker."""
+
+    def __init__(self):
+        self._cached_key_types = None
+
+    def __call__(self, batch_list):
+        if self._cached_key_types is None:
+            self._cached_key_types = determine_graph_key_types(batch_list)
+        return collate_graph_samples(batch_list, key_types=self._cached_key_types)
+
+
+def _validate_multiprocessing_collate_fn(
+    collate_fn,
+    *,
+    num_workers,
+    multiprocessing_context,
+):
+    if not isinstance(num_workers, int) or num_workers <= 0:
+        return
+
+    if multiprocessing_context is None:
+        start_method = multiprocessing.get_context().get_start_method()
+    elif isinstance(multiprocessing_context, str):
+        start_method = multiprocessing_context
+    else:
+        get_start_method = getattr(multiprocessing_context, "get_start_method", None)
+        if not callable(get_start_method):
+            return
+        start_method = get_start_method()
+
+    if start_method not in {"spawn", "forkserver"}:
+        return
+
+    try:
+        ForkingPickler.dumps(collate_fn)
+    except Exception as exc:
+        raise TypeError(
+            "`collate_fn` must be pickleable when `num_workers > 0` and the "
+            f"multiprocessing start method is {start_method!r}. Define it as a "
+            "module-level function or module-level callable class; do not use a lambda, "
+            "nested function, or closure. Alternatively, use `num_workers=0`."
+        ) from exc
+
+
 class qDictDataloader(torch.utils.data.DataLoader):
     """
     A specialized DataLoader for handling dictionary-based datasets with automatic collation.
@@ -1013,7 +1070,16 @@ class qDictDataloader(torch.utils.data.DataLoader):
         >>> loader = qDictDataloader(dataset, batch_size=8, collate_fn=my_collate_fn)
     """
 
-    def __init__(self, dataset, batch_size, shuffle=False, collate_fn=None, is_graph=False, **kwargs):
+    def __init__(
+        self,
+        dataset,
+        batch_size=None,
+        shuffle=False,
+        collate_fn=None,
+        is_graph=False,
+        batch_sampler=None,
+        **kwargs,
+    ):
         """
         Initialize the qDictDataloader.
 
@@ -1022,6 +1088,8 @@ class qDictDataloader(torch.utils.data.DataLoader):
                              when indexed. For graph data, dictionaries should contain
                              'edge_index' and node/edge attributes.
             batch_size (int): Number of samples per batch.
+            batch_sampler (BatchSampler, optional): Supplies complete batches of sample indices.
+                This is mutually exclusive with batch_size, shuffle=True, and drop_last=True.
             shuffle (bool, optional): Whether to shuffle the data at every epoch.
                                     Default: False.
             collate_fn (callable, optional): Custom function to collate samples into batches.
@@ -1044,29 +1112,46 @@ class qDictDataloader(torch.utils.data.DataLoader):
 
         if collate_fn is None:
             if is_graph:
-                # Create the stateful collate fn that caches key type inference results for efficiency
-                _collate_fn_to_use = self._create_stateful_graph_collate()
-                print(f"qDictDataloader: is_graph=True. Using stateful graph collator: {_collate_fn_to_use.__name__}")
+                _collate_fn_to_use = _StatefulGraphCollator()
+                print("qDictDataloader: is_graph=True. Using stateful graph collator.")
             else:
                 _collate_fn_to_use = collate_dict_samples
                 print("qDictDataloader: is_graph=False. Using default collate_dict_samples.")
 
-        super().__init__(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=_collate_fn_to_use, **kwargs)
+        _validate_multiprocessing_collate_fn(
+            _collate_fn_to_use,
+            num_workers=kwargs.get("num_workers", 0),
+            multiprocessing_context=kwargs.get("multiprocessing_context"),
+        )
 
-    def _create_stateful_graph_collate(self):
-        self._cached_key_types = None
+        if batch_sampler is None:
+            if batch_size is None:
+                raise ValueError("`batch_size` is required when `batch_sampler` is not provided.")
+            super().__init__(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                collate_fn=_collate_fn_to_use,
+                **kwargs,
+            )
+            return
 
-        def stateful_graph_collate(batch_list):
-            if self._cached_key_types is None:
-                inferred_types = determine_graph_key_types(batch_list)
-                self._cached_key_types = inferred_types
-            return collate_graph_samples(batch_list, key_types=self._cached_key_types)
+        if batch_size is not None:
+            raise ValueError("`batch_size` must be None when `batch_sampler` is provided.")
+        if shuffle:
+            raise ValueError("`shuffle` must be False when `batch_sampler` is provided.")
+        if kwargs.get("drop_last", False):
+            raise ValueError("`drop_last` must be False when `batch_sampler` is provided.")
 
-        stateful_graph_collate.__name__ = "_stateful_graph_collate_internal"
-        return stateful_graph_collate
+        super().__init__(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=_collate_fn_to_use,
+            **kwargs,
+        )
 
 
-class qLmdbDataset(qDictDataset):
+class qLmdbDatasetSimple(qDictDataset):
     """
     LMDB dataset that acts like a dictionary.
     A consumer of qDictDataset, keep the storage behavior the same.
