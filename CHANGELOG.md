@@ -1,6 +1,6 @@
 # History
 
-## Unreleased
+## v1.2.29
 
 - breaking: remove `qLmdbDataset` from `qqtools.torch.qdataset`; use the supported `from qqtools import qLmdbDataset` or `from qqtools.torch import qLmdbDataset` entry points instead, with no compatibility forwarding from the old module
 - breaking: remove the legacy `qbalanced_partition` helper and its package exports; use `assign_window_to_ranks` and the balanced sampler APIs for cost-aware distributed assignment
