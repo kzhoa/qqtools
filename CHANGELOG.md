@@ -2,8 +2,20 @@
 
 ## Unreleased
 
+- breaking: remove `qLmdbDataset` from `qqtools.torch.qdataset`; use the supported `from qqtools import qLmdbDataset` or `from qqtools.torch import qLmdbDataset` entry points instead, with no compatibility forwarding from the old module
+- breaking: remove the legacy `qbalanced_partition` helper and its package exports; use `assign_window_to_ranks` and the balanced sampler APIs for cost-aware distributed assignment
+- feat: add a reusable `qLmdbDataset` foundation with sorted multi-shard reads, lazy PID-safe LMDB handles, customizable payload decoding, balance metadata, deterministic sample ordering, and optional physical rewrite materialization
+- feat: make LMDB balance and rewrite artifact initialization safe across DDP processes through a reusable file-lock write guard with lock-free readiness checks, lock-scoped double checking, and post-write validation
+- feat: add `qLmdbDataset.to_dataloader` with balance-aware batching and automatic worker context selection that prefers `forkserver` and falls back to `spawn`
+- feat: add `compute_global_even_sort_order`, `assign_window_to_ranks`, and `validate_balance_strategy` as the balance-planning primitives under `qqtools.data`
+- feat: add `BalancedDistributedSampler` and `BalancedBatchSampler` under `qqtools.torch.ddp` with deterministic epoch reseeding, rank-aware cost balancing, optional fixed sample order, and drop-or-pad handling for incomplete global windows
+- feat: add standalone `evaluate_runner` and `infer_runner` entry points with DDP sampler-padding deduplication, globally reduced metrics, gathered outputs, and graph output alignment validation
+- feat: add `task.eval.ddp_dedup` and `task.dataloader.eval_batch_size` to qpipeline configuration and qConfigGen schemas
 - feat: add `optim.ema_params.auto_offload` (default `true`) to control main-model offloading during EMA evaluation through QPipeline YAML configuration
 - refactor: rename the QPipeline and `train_runner` EMA offload parameter to `auto_offload`; when enabled, EMA evaluation always offloads the main model without model-size heuristics
+- refactor: extend `qDictDataloader` with explicit `batch_sampler` support so balanced and ordinary dictionary datasets share the same collation and worker-validation path
+- fix: make the stateful graph collator pickle-safe under `spawn` and `forkserver`, and reject non-pickleable custom collators before worker startup only when the selected multiprocessing context requires pickling
+- test: add regression coverage for all balance strategies, multi-rank sampling, epoch reseeding, padding, drop-last behavior, invalid sampler inputs, real `spawn` and `forkserver` graph collation, LMDB reads, and concurrent rewrite initialization
 - feat: add qConfigGen support and documentation for EMA `auto_offload`
 
 ## v1.2.28

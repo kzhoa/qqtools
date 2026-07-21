@@ -1,343 +1,247 @@
 import numpy as np
 import pytest
 
-from qqtools.data import assign_window_to_ranks
 import qqtools.torch.ddp.qbalancedsampler as qbs
-from qqtools.torch.ddp import (
-    BalancedBatchSampler,
-    BalancedDistributedSampler,
-)
+from qqtools.torch.ddp import BalancedBatchSampler, BalancedDistributedSampler
 
 
-def _mock_dist_state(
+def _mock_dist(
     monkeypatch,
     *,
-    is_available: bool,
-    is_initialized: bool,
+    is_initialized: bool = False,
     rank: int = 0,
     world_size: int = 1,
 ):
-    monkeypatch.setattr(qbs.dist, "is_available", lambda: is_available)
+    monkeypatch.setattr(qbs.dist, "is_available", lambda: True)
     monkeypatch.setattr(qbs.dist, "is_initialized", lambda: is_initialized)
     monkeypatch.setattr(qbs.dist, "get_rank", lambda: rank)
     monkeypatch.setattr(qbs.dist, "get_world_size", lambda: world_size)
 
 
-def test_assign_window_to_ranks_empty_window():
-    assignment = assign_window_to_ranks([], [1.0, 2.0], world_size=2, batch_size=2)
-    assert assignment == [[], []]
+def _rank_plans(sample_costs, **kwargs):
+    world_size = kwargs["world_size"]
+    return [
+        list(
+            BalancedDistributedSampler(
+                sample_costs,
+                rank=rank,
+                **kwargs,
+            )
+        )
+        for rank in range(world_size)
+    ]
 
 
-def test_assign_window_to_ranks_balances_normal_case():
-    assignment = assign_window_to_ranks([0, 1, 2, 3], [9.0, 8.0, 7.0, 6.0], world_size=2, batch_size=2)
-    assert assignment == [[0, 3], [1, 2]]
+@pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])
+def test_sampler_covers_each_sample_once_across_ranks_without_padding(
+    monkeypatch,
+    strategy,
+):
+    _mock_dist(monkeypatch)
+    costs = [9.0, 1.0, 8.0, 2.0, 7.0, 3.0, 6.0, 4.0]
 
-
-def test_assign_window_to_ranks_keeps_equal_cost_processing_stable():
-    assignment = assign_window_to_ranks([0, 1, 2, 3], [1.0, 1.0, 1.0, 1.0], world_size=2, batch_size=2)
-    assert assignment == [[0, 3], [1, 2]]
-
-
-def test_assign_window_to_ranks_uses_locality_tie_break():
-    sample_costs = np.zeros(11, dtype=np.float64)
-    sample_costs[0] = 5.0
-    sample_costs[10] = 5.0
-    sample_costs[1] = 1.0
-
-    assignment = assign_window_to_ranks([0, 10, 1], sample_costs, world_size=2, batch_size=2)
-
-    assert assignment == [[0, 1], [10]]
-
-
-def test_assign_window_to_ranks_falls_back_when_preferred_rank_is_full():
-    sample_costs = np.zeros(12, dtype=np.float64)
-    sample_costs[10] = 10.0
-    sample_costs[0] = 2.0
-    sample_costs[1] = 1.0
-    sample_costs[11] = 1.0
-
-    assignment = assign_window_to_ranks([0, 1, 10, 11], sample_costs, world_size=2, batch_size=2)
-
-    assert assignment == [[10, 11], [0, 1]]
-
-
-def test_assign_window_to_ranks_rejects_invalid_numeric_input():
-    with pytest.raises(ValueError):
-        assign_window_to_ranks([0, 1], [1.0, np.nan], world_size=2, batch_size=2)
-
-
-def test_balanced_distributed_sampler_eager_validation_failures(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=True, is_initialized=True, rank=1, world_size=2)
-
-    with pytest.raises(ValueError):
-        BalancedDistributedSampler([1.0, np.nan], batch_size=2)
-
-    with pytest.raises(ValueError):
-        BalancedDistributedSampler([1.0, 2.0], batch_size=2, sample_order=[0, 0])
-
-    with pytest.raises(ValueError):
-        BalancedDistributedSampler([1.0, 2.0], batch_size=2, rank=0, world_size=2)
-
-    with pytest.raises(ValueError):
-        BalancedDistributedSampler([1.0, 2.0], batch_size=2, strategy="bad")
-
-
-def test_balanced_distributed_sampler_shuffle_epoch_changes_and_preserves_equal_lengths(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
-    sample_costs = [9.0, 1.0, 8.0, 2.0, 7.0, 3.0, 6.0]
-
-    rank0 = BalancedDistributedSampler(
-        sample_costs,
+    plans = _rank_plans(
+        costs,
         batch_size=2,
-        rank=0,
         world_size=2,
         shuffle=True,
-        seed=5,
-        strategy="v1",
-    )
-    rank1 = BalancedDistributedSampler(
-        sample_costs,
-        batch_size=2,
-        rank=1,
-        world_size=2,
-        shuffle=True,
-        seed=5,
-        strategy="v1",
-    )
-
-    epoch0_rank0 = list(rank0)
-    epoch0_rank1 = list(rank1)
-
-    rank0.set_epoch(1)
-    rank1.set_epoch(1)
-
-    epoch1_rank0 = list(rank0)
-    epoch1_rank1 = list(rank1)
-
-    assert len(epoch0_rank0) == len(epoch0_rank1)
-    assert len(epoch1_rank0) == len(epoch1_rank1)
-    assert epoch0_rank0 != epoch1_rank0
-    assert epoch0_rank1 != epoch1_rank1
-
-
-def test_balanced_distributed_sampler_prefix_padding_handles_tiny_dataset(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
-
-    rank0 = BalancedDistributedSampler(
-        [4.0],
-        batch_size=3,
-        rank=0,
-        world_size=2,
-        shuffle=True,
-        seed=0,
+        seed=7,
         drop_last=False,
-    )
-    rank1 = BalancedDistributedSampler(
-        [4.0],
-        batch_size=3,
-        rank=1,
-        world_size=2,
-        shuffle=True,
-        seed=0,
-        drop_last=False,
+        strategy=strategy,
     )
 
-    assert list(rank0) == [0, 0, 0]
-    assert list(rank1) == [0, 0, 0]
-    assert len(rank0) == len(rank1) == 3
+    assert [len(plan) for plan in plans] == [4, 4]
+    assert sorted(index for plan in plans for index in plan) == list(range(len(costs)))
+    for batch_start in range(0, 4, 2):
+        global_window = [
+            index
+            for plan in plans
+            for index in plan[batch_start : batch_start + 2]
+        ]
+        assert len(global_window) == len(set(global_window)) == 4
 
 
-def test_balanced_distributed_sampler_without_shuffle_reuses_plan_and_ignores_epoch(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
+@pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])
+def test_shuffle_epoch_is_deterministic_and_changes_plan(monkeypatch, strategy):
+    _mock_dist(monkeypatch)
+    costs = np.linspace(1.0, 256.0, num=256)
+    kwargs = {
+        "batch_size": 4,
+        "rank": 0,
+        "world_size": 2,
+        "shuffle": True,
+        "seed": 13,
+        "strategy": strategy,
+    }
+    first = BalancedDistributedSampler(costs, **kwargs)
+    second = BalancedDistributedSampler(costs, **kwargs)
 
+    epoch0 = list(first)
+    first.set_epoch(1)
+    second.set_epoch(1)
+
+    assert list(first) == list(second)
+    assert list(first) != epoch0
+
+
+def test_non_shuffled_sampler_ignores_epoch_and_respects_sample_order(monkeypatch):
+    _mock_dist(monkeypatch)
     sampler = BalancedDistributedSampler(
-        [5.0, 4.0, 3.0, 2.0, 1.0],
+        [5.0, 4.0, 3.0, 2.0],
         batch_size=2,
         rank=0,
         world_size=2,
         shuffle=False,
-        drop_last=False,
-        sample_order=[4, 3, 2, 1, 0],
+        sample_order=[3, 2, 1, 0],
     )
 
     before = list(sampler)
     sampler.set_epoch(99)
-    after = list(sampler)
 
-    assert before == after
+    assert list(sampler) == before
+    assert set(before).issubset({0, 1, 2, 3})
 
 
-def test_balanced_distributed_sampler_drop_last_without_shuffle_drops_incomplete_global_chunk(
-    monkeypatch,
-):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
+def test_sampler_prefix_padding_equalizes_rank_lengths(monkeypatch):
+    _mock_dist(monkeypatch)
+    costs = [5.0, 4.0, 3.0, 2.0, 1.0]
 
-    rank0 = BalancedDistributedSampler(
-        [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0],
+    plans = _rank_plans(
+        costs,
         batch_size=2,
-        rank=0,
-        world_size=2,
-        shuffle=False,
-        drop_last=True,
-    )
-    rank1 = BalancedDistributedSampler(
-        [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0],
-        batch_size=2,
-        rank=1,
-        world_size=2,
-        shuffle=False,
-        drop_last=True,
-    )
-
-    assert list(rank0) == [0, 3]
-    assert list(rank1) == [1, 2]
-    assert len(rank0) == len(rank1) == 2
-
-
-def test_balanced_distributed_sampler_len_matches_emitted_indices(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
-
-    rank0 = BalancedDistributedSampler(
-        [5.0, 4.0, 3.0, 2.0, 1.0],
-        batch_size=2,
-        rank=0,
-        world_size=2,
-        shuffle=False,
-        drop_last=False,
-    )
-    rank1 = BalancedDistributedSampler(
-        [5.0, 4.0, 3.0, 2.0, 1.0],
-        batch_size=2,
-        rank=1,
         world_size=2,
         shuffle=False,
         drop_last=False,
     )
 
-    assert list(rank0) == [0, 3, 0, 4]
-    assert list(rank1) == [1, 2, 1, 2]
-    assert len(rank0) == len(rank1) == 4
+    assert [len(plan) for plan in plans] == [4, 4]
+    assert set(range(len(costs))).issubset({index for plan in plans for index in plan})
+    assert sum(len(plan) for plan in plans) == 8
 
 
-def test_balanced_batch_sampler_yields_list_batches(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
+def test_sampler_prefix_padding_handles_dataset_smaller_than_global_batch(monkeypatch):
+    _mock_dist(monkeypatch)
 
-    sampler = BalancedBatchSampler(
-        [5.0, 4.0, 3.0, 2.0, 1.0],
-        batch_size=2,
-        rank=0,
-        world_size=2,
-        shuffle=False,
-        drop_last=False,
-    )
-
-    batches = list(sampler)
-
-    assert batches == [[0, 3], [0, 4]]
-    assert all(isinstance(batch, list) for batch in batches)
-
-
-def test_balanced_batch_sampler_exposes_underlying_sampler_contract(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
-
-    sampler = BalancedBatchSampler(
-        [5.0, 4.0, 3.0, 2.0, 1.0],
-        batch_size=2,
-        rank=0,
-        world_size=2,
-        shuffle=False,
-        drop_last=False,
-    )
-
-    assert isinstance(sampler.sampler, BalancedDistributedSampler)
-    assert list(sampler.sampler) == [0, 3, 0, 4]
-
-
-def test_balanced_batch_sampler_is_view_over_distributed_plan(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
-    kwargs = dict(
-        sample_costs=[9.0, 1.0, 8.0, 2.0, 7.0],
-        batch_size=2,
-        rank=0,
+    plans = _rank_plans(
+        [4.0],
+        batch_size=3,
         world_size=2,
         shuffle=True,
-        seed=3,
-        strategy="v1",
+        seed=0,
         drop_last=False,
     )
 
-    distributed = BalancedDistributedSampler(**kwargs)
-    batch_sampler = BalancedBatchSampler(**kwargs)
-
-    flattened = [index for batch in batch_sampler for index in batch]
-
-    assert flattened == list(distributed)
+    assert plans == [[0, 0, 0], [0, 0, 0]]
 
 
-def test_balanced_batch_sampler_without_shuffle_drop_last_false_uses_prefix_padding(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
+def test_sampler_drop_last_removes_incomplete_global_window(monkeypatch):
+    _mock_dist(monkeypatch)
+    costs = [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0]
 
-    sampler = BalancedBatchSampler(
-        [5.0, 4.0, 3.0, 2.0, 1.0],
+    plans = _rank_plans(
+        costs,
         batch_size=2,
-        rank=0,
-        world_size=2,
-        shuffle=False,
-        drop_last=False,
-    )
-
-    assert list(sampler) == [[0, 3], [0, 4]]
-
-
-def test_balanced_batch_sampler_drop_last_preserves_equal_batch_counts(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
-
-    rank0 = BalancedBatchSampler(
-        [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0],
-        batch_size=2,
-        rank=0,
         world_size=2,
         shuffle=False,
         drop_last=True,
     )
-    rank1 = BalancedBatchSampler(
-        [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0],
+
+    assert plans == [[0, 3], [1, 2]]
+    assert [len(plan) for plan in plans] == [2, 2]
+
+
+def test_batch_sampler_is_batched_view_of_distributed_sampler(monkeypatch):
+    _mock_dist(monkeypatch)
+    kwargs = {
+        "sample_costs": [9.0, 1.0, 8.0, 2.0, 7.0],
+        "batch_size": 2,
+        "rank": 0,
+        "world_size": 2,
+        "shuffle": True,
+        "seed": 3,
+        "strategy": "v1",
+        "drop_last": False,
+    }
+    distributed = BalancedDistributedSampler(**kwargs)
+    batched = BalancedBatchSampler(**kwargs)
+
+    batches = list(batched)
+
+    assert [index for batch in batches for index in batch] == list(distributed)
+    assert all(isinstance(batch, list) and len(batch) == 2 for batch in batches)
+    assert len(batched) == len(batches)
+
+    distributed.set_epoch(1)
+    batched.set_epoch(1)
+    assert [index for batch in batched for index in batch] == list(distributed)
+
+
+def test_batch_sampler_drop_last_preserves_equal_full_batches_per_rank(monkeypatch):
+    _mock_dist(monkeypatch)
+    costs = [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0]
+    samplers = [
+        BalancedBatchSampler(
+            costs,
+            batch_size=2,
+            rank=rank,
+            world_size=2,
+            shuffle=False,
+            drop_last=True,
+        )
+        for rank in range(2)
+    ]
+
+    batches_by_rank = [list(sampler) for sampler in samplers]
+
+    assert batches_by_rank == [[[0, 3]], [[1, 2]]]
+    assert [len(sampler) for sampler in samplers] == [1, 1]
+
+
+def test_sampler_uses_initialized_distributed_rank_and_world_size(monkeypatch):
+    _mock_dist(monkeypatch, is_initialized=True, rank=1, world_size=2)
+    runtime_sampler = BalancedDistributedSampler(
+        [5.0, 4.0, 3.0, 2.0],
+        batch_size=2,
+        shuffle=False,
+    )
+    explicit_sampler = BalancedDistributedSampler(
+        [5.0, 4.0, 3.0, 2.0],
         batch_size=2,
         rank=1,
         world_size=2,
         shuffle=False,
-        drop_last=True,
     )
 
-    assert list(rank0) == [[0, 3]]
-    assert list(rank1) == [[1, 2]]
-    assert len(rank0) == len(rank1) == 1
+    assert list(runtime_sampler) == list(explicit_sampler)
 
 
-def test_balanced_batch_sampler_len_reports_batch_count(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
-
-    sampler = BalancedBatchSampler(
-        [5.0, 4.0, 3.0, 2.0, 1.0],
-        batch_size=2,
-        rank=0,
-        world_size=2,
-        shuffle=False,
-        drop_last=False,
-    )
-
-    assert len(sampler) == 2
-
-
-def test_balanced_batch_sampler_rejects_invalid_strategy_even_without_shuffle(monkeypatch):
-    _mock_dist_state(monkeypatch, is_available=False, is_initialized=False)
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"sample_costs": [1.0, np.nan], "batch_size": 1},
+        {"sample_costs": [1.0, 2.0], "batch_size": 0},
+        {"sample_costs": [1.0, 2.0], "batch_size": 1, "world_size": 0},
+        {"sample_costs": [1.0, 2.0], "batch_size": 1, "rank": 2, "world_size": 2},
+        {"sample_costs": [1.0, 2.0], "batch_size": 1, "sample_order": [0, 0]},
+        {"sample_costs": [1.0, 2.0], "batch_size": 1, "sample_order": [0]},
+        {"sample_costs": [1.0, 2.0], "batch_size": 1, "sample_order": [0, 2]},
+        {"sample_costs": [1.0, 2.0], "batch_size": 1, "strategy": "unknown"},
+    ],
+)
+def test_sampler_rejects_invalid_configuration(monkeypatch, kwargs):
+    _mock_dist(monkeypatch)
 
     with pytest.raises(ValueError):
-        BalancedBatchSampler(
-            [5.0, 4.0, 3.0, 2.0, 1.0],
-            batch_size=2,
+        BalancedDistributedSampler(**kwargs)
+
+
+def test_sampler_rejects_rank_override_that_conflicts_with_runtime(monkeypatch):
+    _mock_dist(monkeypatch, is_initialized=True, rank=1, world_size=2)
+
+    with pytest.raises(ValueError, match="does not match"):
+        BalancedDistributedSampler(
+            [1.0, 2.0],
+            batch_size=1,
             rank=0,
             world_size=2,
-            shuffle=False,
-            strategy="bad",
         )
