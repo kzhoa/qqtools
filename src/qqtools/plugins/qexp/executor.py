@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .layout import RootConfig
+from .config_types import RootConfig
 from .runtime.records import AttemptRecord
 from .tmux import (create_window_for_task, is_tmux_launch_available, kill_window,
                    send_command_to_window, window_exists)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from ..layout import RootConfig
+from ..config_types import RootConfig
 from ..runtime.locks import group_lock, task_lock
 from ..runtime.paths import attempt_path, group_path, shared_paths
 from ..runtime.records import (AttemptRecord, TaskRecord, new_group, new_id,

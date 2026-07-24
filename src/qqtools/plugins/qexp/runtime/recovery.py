@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from ..layout import RootConfig
+from ..config_types import RootConfig
 from ..scheduler import authority_locks, _manifest_supervisor
 from .paths import attempt_path, group_path
 from .records import AttemptRecord, utc_now

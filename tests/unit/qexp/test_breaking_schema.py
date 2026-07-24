@@ -2,7 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp.layout import init_shared_root, load_root_config, validate_root_contract
+from qqtools.plugins.qexp.layout import load_root_config, validate_root_contract
+from qqtools.plugins.qexp.machine_config import init_shared_root
 from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.store import atomic_replace
 

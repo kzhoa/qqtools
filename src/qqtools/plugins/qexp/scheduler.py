@@ -11,7 +11,7 @@ from typing import Any, Iterator
 
 from .events import write_event
 from .executor import Executor
-from .layout import RootConfig
+from .config_types import RootConfig
 from .runtime.locks import group_lock, task_lock
 from .runtime.paths import attempt_path, group_path, shared_paths, submission_path
 from .runtime.records import AttemptRecord, TaskRecord, utc_now
@@ -328,6 +328,13 @@ def run_dispatch_cycle(cfg: RootConfig, *, available_gpus: list[int] | None = No
         except Exception:
             fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "executor_launch_failed")
     return launched
+
+
+def has_eligible_local_work(cfg: RootConfig) -> bool:
+    for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
+        if _eligible(cfg, load_task(cfg, path.stem)):
+            return True
+    return False
 
 
 def renew_attempt_lease(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int,

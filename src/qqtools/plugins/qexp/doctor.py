@@ -6,7 +6,8 @@ from typing import Any
 
 from .commands.cleanup import reconcile_cleanup_operations
 from .commands.group import reconcile_group_cancel_operations
-from .layout import RootConfig, validate_root_contract
+from .config_types import RootConfig
+from .layout import validate_root_contract
 from .runtime.locks import group_lock, task_lock
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
 from .runtime.records import AttemptRecord, TaskRecord, utc_now

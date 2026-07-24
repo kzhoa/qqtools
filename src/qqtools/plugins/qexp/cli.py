@@ -10,11 +10,15 @@ import sys
 import time
 from pathlib import Path
 
+from .activation import ensure_local_agent_active
 from .agent import get_agent_status, run_agent_loop
+from .agent_process import spawn_agent_process
 from .commands import cleanup, group as group_commands, logs as log_commands, task as task_commands
+from .models import AGENT_MODE_DAEMON
 from .doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
-from .layout import (clear_context, init_shared_root, load_context, load_root_config,
+from .layout import (clear_context, load_context, load_root_config,
                      runtime_pid_path, save_context)
+from .machine_config import init_shared_root, load_machine_policy
 from . import observer
 
 
@@ -39,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-root")
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init")
-    init.add_argument("--agent-mode", choices=["on_demand", "persistent"], default="on_demand")
+    init.add_argument("--agent-mode", choices=["on_demand", "daemon"], default="on_demand")
     submit = commands.add_parser("submit")
     for action in (submit,):
         action.add_argument("--task-id"); action.add_argument("--name"); action.add_argument("--group")
@@ -75,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "remove": action.add_argument("--terminate-running", action="store_true")
     agent = commands.add_parser("agent")
     agent_sub = agent.add_subparsers(dest="agent_action", required=True)
-    start = agent_sub.add_parser("start"); start.add_argument("--persistent", action="store_true"); start.add_argument("--background", action="store_true")
+    start = agent_sub.add_parser("start"); start.add_argument("--background", action="store_true")
     agent_sub.add_parser("status"); agent_sub.add_parser("stop")
     commands.add_parser("top")
     commands.add_parser("machines")
@@ -107,8 +111,6 @@ def _try_save_context(shared_root: str, machine: str, runtime_root: str | None) 
             f"at {exc.filename or '~/.qqtools/qexp-context.json'}: {exc}",
             file=sys.stderr,
         )
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -130,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
             task_value = task_commands.submit(cfg, _command(args.argv), requested_gpus=args.gpus, task_id=args.task_id, name=args.name,
                                               group=args.group, working_dir=args.cwd, sharing_mode=args.sharing,
                                               offer_after_seconds=args.offer_after_seconds, idempotency_key=args.idempotency_key)
+            ensure_local_agent_active(cfg, reason="submit")
             print(task_value.task_id); return 0
         if args.command == "batch-submit":
             def print_prepared(operation_id: str, idempotency_key: str) -> None:
@@ -138,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
 
             values = task_commands.batch_submit(cfg, Path(args.manifest_file), group=args.group,
                                                 idempotency_key=args.idempotency_key, on_prepared=print_prepared)
+            ensure_local_agent_active(cfg, reason="batch-submit")
             print(json.dumps({"task_ids": [value.task_id for value in values], "state": "committed"})); return 0
         if args.command == "task":
             if args.task_action == "cancel":
@@ -160,8 +164,12 @@ def main(argv: list[str] | None = None) -> int:
                     args.task_id,
                     acknowledge_duplicate_risk=args.acknowledge_duplicate_risk,
                 )
+                ensure_local_agent_active(cfg, reason="task-retry")
                 print(task_value.task_id)
-            elif args.task_action == "offer": print(task_commands.offer(cfg, args.task_id).task_id)
+            elif args.task_action == "offer":
+                task_value = task_commands.offer(cfg, args.task_id)
+                ensure_local_agent_active(cfg, reason="task-offer")
+                print(task_value.task_id)
             elif args.task_action == "list": print(json.dumps(observer.list_tasks(cfg, phase=args.phase, group=args.group, limit=args.limit)))
             elif args.task_action == "show": print(json.dumps(observer.inspect_task(cfg, args.task_id), indent=2))
             elif args.task_action == "logs": print(log_commands.read_logs(cfg, args.task_id), end="")
@@ -170,34 +178,28 @@ def main(argv: list[str] | None = None) -> int:
             if args.group_action == "create": result = group_commands.create_group(cfg, args.name, args.workers)
             elif args.group_action == "list": result = observer.list_groups(cfg)
             elif args.group_action == "show": result = group_commands.show_group(cfg, args.name)
-            elif args.group_action == "retry-failed": result = {"task_ids": [task_value.task_id for task_value in group_commands.group_retry_failed(cfg, args.name)]}
+            elif args.group_action == "retry-failed":
+                result = {"task_ids": [task_value.task_id for task_value in group_commands.group_retry_failed(cfg, args.name)]}
+                ensure_local_agent_active(cfg, reason="group-retry-failed")
             elif args.group_action == "machines": result = group_commands.change_worker(
                 cfg, args.group_name, args.worker_machine, args.machine_action,
                 terminate_running=getattr(args, "terminate_running", False))
-            else: result = group_commands.group_control(cfg, args.name, args.group_action,
-                                                        terminate_running=getattr(args, "terminate_running", False))
+            else:
+                result = group_commands.group_control(cfg, args.name, args.group_action,
+                                                      terminate_running=getattr(args, "terminate_running", False))
+                if args.group_action == "resume":
+                    ensure_local_agent_active(cfg, reason="group-resume")
             print(json.dumps(result)); return 0
         if args.command == "agent":
             if args.agent_action == "status": print(json.dumps(get_agent_status(cfg)))
             elif args.agent_action == "start":
+                policy = load_machine_policy(cfg)
                 if args.background:
-                    if not args.persistent:
-                        raise ValueError("--background requires --persistent.")
-                    process = subprocess.Popen(
-                        [sys.executable, "-m", "qqtools.plugins.qexp.cli",
-                         "--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,
-                         "--runtime-root", str(cfg.runtime_root), "agent", "start", "--persistent"],
-                        env=os.environ.copy(),
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
-                    )
-                    pid_path = runtime_pid_path(cfg)
-                    pid_path.parent.mkdir(parents=True, exist_ok=True)
-                    pid_path.write_text(str(process.pid), encoding="utf-8")
+                    if policy.agent_mode != AGENT_MODE_DAEMON:
+                        raise ValueError("--background requires agent_mode=daemon.")
+                    spawn_agent_process(cfg)
                 else:
-                    run_agent_loop(cfg, persistent=args.persistent)
+                    run_agent_loop(cfg, exit_when_idle=policy.exit_when_idle)
             elif args.agent_action == "stop":
                 status = get_agent_status(cfg)
                 if status.get("pid"):

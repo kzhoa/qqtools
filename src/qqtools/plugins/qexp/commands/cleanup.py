@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from ..layout import RootConfig
+from ..config_types import RootConfig
 from ..runtime.locks import group_lock, schema_lock, task_lock
 from ..runtime.paths import group_path, local_paths, shared_paths, task_path
 from ..runtime.records import AttemptRecord, TaskRecord, new_id, utc_now

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from qqtools.plugins.qexp.executor import Executor
-from qqtools.plugins.qexp.layout import RootConfig
+from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
 
 
