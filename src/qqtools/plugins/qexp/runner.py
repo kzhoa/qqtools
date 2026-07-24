@@ -1,255 +1,193 @@
-"""qexp task wrapper process.
-
-Invoked by the executor inside a tmux window::
-
-    python -m qqtools.plugins.qexp.runner \
-        --shared-root /mnt/share/qexp \
-        --machine gpu2a \
-        --task-id abc123def456 \
-        [--runtime-root ~/.qqtools/qexp-runtime]
-
-Lifecycle:
-    1. Load task, validate phase == starting
-    2. CAS: starting → running (set wrapper_pid, process_group_id)
-    3. Spawn child process with CUDA_VISIBLE_DEVICES
-    4. Stream stdout+stderr to log file and stdout
-    5. On exit: classify result, CAS: running → succeeded/failed/cancelled
-    6. Write scheduling event
-    7. Release claim
-"""
+"""Token-aware local process runner for one Attempt."""
 from __future__ import annotations
 
 import argparse
 import os
 import signal
 import subprocess
-import sys
+import time
 from pathlib import Path
-from typing import Any
 
-from .events import write_event
-from .indexes import update_index_on_phase_change
-from .layout import (
-    RootConfig,
-    load_root_config,
-    runtime_log_path,
-)
-from .models import (
-    PHASE_CANCELLED,
-    PHASE_FAILED,
-    PHASE_RUNNING,
-    PHASE_STARTING,
-    PHASE_SUCCEEDED,
-    utc_now_iso,
-)
-from .storage import (
-    CASConflict,
-    cas_update_task,
-    load_task,
-    release_claim,
-)
+from .layout import RootConfig, load_root_config, runtime_log_path
+from .runtime.paths import attempt_path
+from .runtime.records import AttemptRecord, utc_now
+from .runtime.reservations import release
+from .runtime.store import atomic_replace, read_json
+from .runtime.tasks import load_task, save_task
+from .scheduler import (authority_locks, authorize_launch, renew_attempt_lease,
+                        _process_start_time_ticks)
 
 
-# ---------------------------------------------------------------------------
-# Child process helpers
-# ---------------------------------------------------------------------------
-
-
-def build_child_environment(
-    assigned_gpus: list[int],
-    extra_env: dict[str, str] | None = None,
-) -> dict[str, str]:
-    env = os.environ.copy()
-    if assigned_gpus:
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in assigned_gpus)
-    if extra_env:
-        env.update(extra_env)
-    return env
-
-
-def build_child_command(command: list[str]) -> list[str]:
-    """Wrap command for exec via bash."""
-    import shlex
-
-    joined = shlex.join(command)
-    return ["bash", "-c", f"exec {joined}"]
-
-
-def classify_exit(return_code: int) -> tuple[str, str | None]:
-    """Return (phase, terminal_reason) based on child exit code."""
-    if return_code == 0:
-        return PHASE_SUCCEEDED, None
-    if return_code < 0 and abs(return_code) in (signal.SIGTERM, signal.SIGKILL):
-        return PHASE_CANCELLED, "cancelled_by_signal"
-    return PHASE_FAILED, "nonzero_exit"
-
-
-def stream_output(stream: Any, log_handle: Any) -> None:
-    """Read child stdout/stderr and tee to log file + stdout."""
-    if stream is None:
-        return
-    while True:
-        chunk = stream.read1(8192)
-        if not chunk:
-            break
-        sys.stdout.buffer.write(chunk)
-        sys.stdout.buffer.flush()
-        log_handle.write(chunk)
-        log_handle.flush()
-
-
-# ---------------------------------------------------------------------------
-# Main runner
-# ---------------------------------------------------------------------------
-
-
-def run_task(
-    cfg: RootConfig,
-    task_id: str,
-    *,
-    popen_factory: Any = subprocess.Popen,
-) -> int:
-    """Execute a single task through its full lifecycle.
-
-    Returns the child process exit code (0 on success).
-    """
-    task = load_task(cfg, task_id)
-
-    if task.status.phase != PHASE_STARTING:
-        raise RuntimeError(
-            f"Runner expected task in 'starting' phase, got {task.status.phase!r}."
-        )
-
-    # CAS: starting → running
-    old_rev = task.meta.revision
-    task.status.phase = PHASE_RUNNING
-    task.runtime.wrapper_pid = os.getpid()
-    task.timestamps.started_at = utc_now_iso()
-    try:
-        task = cas_update_task(cfg, task, old_rev)
-        update_index_on_phase_change(cfg, task_id, PHASE_STARTING, PHASE_RUNNING)
-    except CASConflict:
-        raise RuntimeError(f"CAS conflict transitioning task {task_id} to running.")
-
-    write_event(cfg, "task_started", task_id=task_id)
-
-    # Prepare log
-    log_path = runtime_log_path(cfg, task_id)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Build child
-    child_env = build_child_environment(task.runtime.assigned_gpus)
-    child_cmd = build_child_command(task.spec.command)
-
-    child: subprocess.Popen | None = None
-    return_code: int = -1
-
-    # Forward SIGTERM to child process group
-    def _forward_signal(sig: int, frame: Any) -> None:
-        if child is not None and child.poll() is None:
+def _terminate_child(child: object, *, timeout: float = 5.0) -> int:
+    """Terminate a process group and wait before releasing execution resources."""
+    if child.poll() is None:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.monotonic() + timeout
+        while child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if child.poll() is None:
             try:
-                os.killpg(child.pid, sig)
+                os.killpg(child.pid, signal.SIGKILL)
             except OSError:
                 pass
+    try:
+        return child.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, TypeError):
+        return child.returncode if child.returncode is not None else 137
 
-    signal.signal(signal.SIGTERM, _forward_signal)
-    signal.signal(signal.SIGINT, _forward_signal)
 
-    with log_path.open("ab") as log_handle:
-        try:
-            child = popen_factory(
-                child_cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                env=child_env,
-                cwd=task.spec.working_dir,
-            )
-        except Exception as exc:
-            _finalize_task(
-                cfg, task, PHASE_FAILED,
-                exit_code=None,
-                terminal_reason=f"launch_failed:{type(exc).__name__}",
-            )
-            raise
+def _adopt_manifest_token(cfg: RootConfig, manifest_path: Path, task_id: str,
+                          attempt_id: str, current_token: int) -> int:
+    """Adopt a recovery-issued fencing token only from this local manifest."""
+    manifest = read_json(manifest_path).get("process", {})
+    token = manifest.get("fencing_token")
+    if not isinstance(token, int) or token == current_token:
+        return current_token
+    task = load_task(cfg, task_id)
+    claim = task.claim_control.get("active_claim") or {}
+    attempt = _load_attempt(cfg, task_id, attempt_id)
+    if (claim.get("attempt_id") == attempt_id and claim.get("fencing_token") == token
+            and attempt.current_fencing_token == token):
+        return token
+    return current_token
 
-        # Update process_group_id
-        old_rev = task.meta.revision
-        task.runtime.process_group_id = child.pid
-        try:
-            task = cas_update_task(cfg, task, old_rev)
-        except CASConflict:
-            pass  # Best-effort; non-critical field
 
-        # Stream output
-        stream_output(child.stdout, log_handle)
-        return_code = child.wait()
+def _load_attempt(cfg: RootConfig, task_id: str, attempt_id: str) -> AttemptRecord:
+    for path in (cfg.shared_root / "attempts" / task_id).glob("*.json"):
+        data = read_json(path)
+        if data["attempt"]["attempt_id"] == attempt_id:
+            return AttemptRecord.from_dict(data)
+    raise FileNotFoundError(f"Attempt {attempt_id!r} not found for Task {task_id!r}.")
 
-    # Finalize
-    terminal_phase, terminal_reason = classify_exit(return_code)
-    _finalize_task(
-        cfg, task, terminal_phase,
-        exit_code=return_code,
-        terminal_reason=terminal_reason,
-    )
 
+def _publish_process_manifest(cfg: RootConfig, attempt: AttemptRecord, task: object, child: object) -> Path:
+    path = cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json"
+    wrapper_start = _process_start_time_ticks(os.getpid())
+    process_start = _process_start_time_ticks(child.pid)
+    atomic_replace(path, {"process": {"attempt_id": attempt.attempt_id, "task_id": attempt.task_id,
+        "fencing_token": attempt.current_fencing_token, "wrapper_pid": os.getpid(),
+        "wrapper_start_time_ticks": wrapper_start, "process_group_id": child.pid,
+        "process_group_start_time_ticks": process_start, "gpu_ids": attempt.assigned_gpus,
+        "command": task.spec.command, "working_directory": task.spec.working_directory,
+        "created_at": utc_now(), "observed_state": "running", "supervisor": "runner",
+        "exit_code": None, "signal": None}})
+    return path
+
+
+def run_attempt(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int,
+                popen_factory=subprocess.Popen, poll_interval: float = 0.5) -> int:
+    task = load_task(cfg, task_id)
+    attempt = _load_attempt(cfg, task_id, attempt_id)
+    claim = task.claim_control.get("active_claim") or {}
+    if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
+        raise RuntimeError("stale fencing token cannot launch Attempt.")
+    if not authorize_launch(cfg, task_id, attempt_id, fencing_token):
+        raise RuntimeError("launch authorization was fenced by current Group or Task control state.")
+    attempt = _load_attempt(cfg, task_id, attempt_id)
+    attempt.phase = "starting"
+    attempt.timestamps["launch_authorized_at"] = utc_now()
+    atomic_replace(attempt_path(cfg.shared_root, task_id, attempt.attempt_number), attempt.to_dict())
+    environment = os.environ.copy()
+    if attempt.assigned_gpus:
+        environment["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, attempt.assigned_gpus))
+    log_path = runtime_log_path(cfg, task_id, attempt_id)
+    child = None
+    manifest_path: Path | None = None
+    return_code = 127
+    try:
+        with log_path.open("ab") as log:
+            child = popen_factory(list(task.spec.command), cwd=task.spec.working_directory, env=environment,
+                                  stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            manifest_path = _publish_process_manifest(cfg, attempt, task, child)
+            attempt.process.update({"wrapper_pid": os.getpid(), "process_group_id": child.pid,
+                                    "wrapper_start_time_ticks":
+                                        _process_start_time_ticks(os.getpid()),
+                                    "process_group_start_time_ticks":
+                                        _process_start_time_ticks(child.pid),
+                                    "local_process_manifest": str(manifest_path),
+                                    "log_references": [str(log_path)]})
+            attempt.phase = "running"
+            attempt.timestamps["process_created_at"] = utc_now()
+            attempt.timestamps["running_at"] = utc_now()
+            atomic_replace(attempt_path(cfg.shared_root, task_id, attempt.attempt_number), attempt.to_dict())
+            while child.poll() is None:
+                if manifest_path:
+                    fencing_token = _adopt_manifest_token(cfg, manifest_path, task_id, attempt_id, fencing_token)
+                current = load_task(cfg, task_id)
+                if current.control.get("terminate_running"):
+                    return_code = _terminate_child(child)
+                    break
+                if not renew_attempt_lease(cfg, task_id, attempt_id, fencing_token):
+                    if manifest_path:
+                        recovered_token = _adopt_manifest_token(
+                            cfg, manifest_path, task_id, attempt_id, fencing_token
+                        )
+                        if recovered_token != fencing_token:
+                            fencing_token = recovered_token
+                            continue
+                    # Lost fencing authority means this process must not keep producing side effects.
+                    return_code = _terminate_child(child)
+                    break
+                time.sleep(poll_interval)
+            if return_code == 127:
+                return_code = child.returncode
+    except Exception as exc:
+        attempt.result["reason"] = f"launch_failed:{type(exc).__name__}"
+        if child is not None:
+            return_code = _terminate_child(child)
+    finally:
+        if manifest_path:
+            manifest = read_json(manifest_path)
+            manifest["process"].update({"observed_state": "exited", "exit_code": return_code})
+            atomic_replace(manifest_path, manifest)
+        _publish_terminal(cfg, task_id, attempt_id, fencing_token, return_code, attempt)
     return return_code
 
 
-def _finalize_task(
-    cfg: RootConfig,
-    task: Any,
-    terminal_phase: str,
-    exit_code: int | None,
-    terminal_reason: str | None,
-) -> None:
-    """Write terminal state, event, and release claim."""
-    old_phase = task.status.phase
-    old_rev = task.meta.revision
-
-    task.status.phase = terminal_phase
-    task.status.reason = terminal_reason
-    task.result.exit_code = exit_code
-    task.result.terminal_reason = terminal_reason
-    task.timestamps.finished_at = utc_now_iso()
-
-    try:
-        cas_update_task(cfg, task, old_rev)
-        update_index_on_phase_change(cfg, task.task_id, old_phase, terminal_phase)
-    except CASConflict:
-        pass  # Best-effort on finalization
-
-    # Write event
-    event_type = {
-        PHASE_SUCCEEDED: "task_finished",
-        PHASE_FAILED: "task_failed",
-        PHASE_CANCELLED: "task_cancelled",
-    }.get(terminal_phase, "task_finished")
-    write_event(cfg, event_type, task_id=task.task_id, details={
-        "exit_code": exit_code,
-        "terminal_reason": terminal_reason,
-    })
-
-    # Release claim
-    release_claim(cfg, task.task_id, terminal_reason or "completed")
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
+def _publish_terminal(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int,
+                      return_code: int, attempt: AttemptRecord) -> None:
+    task = load_task(cfg, task_id)
+    with authority_locks(cfg, task):
+        task = load_task(cfg, task_id)
+        claim = task.claim_control.get("active_claim") or {}
+        if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
+            return
+        path = attempt_path(cfg.shared_root, task_id, task.attempt_control["current_attempt_number"])
+        current = AttemptRecord.from_dict(read_json(path))
+        cancelled = task.control.get("terminate_running")
+        current.phase = "cancelled" if cancelled else ("succeeded" if return_code == 0 else "failed")
+        current.result.update({"exit_code": return_code, "reason": "cancelled_by_user" if cancelled else
+                               ("completed" if return_code == 0 else "nonzero_exit")})
+        current.timestamps["finished_at"] = utc_now()
+        if cancelled:
+            current.termination.update({"acknowledged_at": utc_now(), "result": "terminated"})
+        atomic_replace(path, current.to_dict())
+        release(cfg.runtime_root, claim["reservation_id"], current.result["reason"])
+        task.claim_control["active_claim"] = None
+        task.attempt_control["current_attempt_id"] = None
+        task.state.update({"projection": current.phase, "reason": current.result["reason"]})
+        if cancelled:
+            task.control.update({"termination_acknowledged_at": utc_now(),
+                                 "termination_result": "terminated"})
+        task.meta["revision"] += 1
+        task.meta["updated_at"] = utc_now()
+        save_task(cfg, task)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="qexp task wrapper")
-    parser.add_argument("--shared-root", required=True, type=str)
-    parser.add_argument("--machine", required=True, type=str)
-    parser.add_argument("--task-id", required=True, type=str)
-    parser.add_argument("--runtime-root", type=str, default=None)
+    parser = argparse.ArgumentParser(description="qexp Attempt runner")
+    parser.add_argument("--shared-root", required=True)
+    parser.add_argument("--machine", required=True)
+    parser.add_argument("--task-id", required=True)
+    parser.add_argument("--attempt-id", required=True)
+    parser.add_argument("--fencing-token", required=True, type=int)
+    parser.add_argument("--runtime-root")
     args = parser.parse_args(argv)
-
-    cfg = load_root_config(args.shared_root, args.machine, args.runtime_root)
-    return run_task(cfg, args.task_id)
+    cfg = load_root_config(args.shared_root, args.machine, args.runtime_root, require_initialized=True)
+    return run_attempt(cfg, args.task_id, args.attempt_id, args.fencing_token)
 
 
 if __name__ == "__main__":

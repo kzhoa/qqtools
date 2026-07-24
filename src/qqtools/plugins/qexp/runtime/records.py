@@ -1,0 +1,247 @@
+"""Validated records for the schema-5 qexp runtime."""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+SCHEMA_VERSION = 5
+TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+MACHINE_PATTERN = TASK_ID_PATTERN
+GROUP_PATTERN = TASK_ID_PATTERN
+
+TASK_PHASES = ("queued", "running", "succeeded", "failed", "cancelled", "blocked")
+ATTEMPT_PHASES = ("claimed", "starting", "running", "succeeded", "failed", "cancelled", "orphaned")
+QUEUE_SCOPES = ("home", "shared")
+SHARING_MODES = ("private", "spillover")
+GROUP_ADMISSION_STATES = ("open", "sealed")
+GROUP_DISPATCH_STATES = ("active", "paused")
+WORKER_STATES = ("active", "draining", "removing")
+SUBMISSION_STATES = ("preparing", "committing", "committed", "aborted", "blocked")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def new_id() -> str:
+    return uuid.uuid4().hex[:16]
+
+
+def validate_identifier(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value or not TASK_ID_PATTERN.fullmatch(value):
+        raise ValueError(f"{label} must contain only letters, digits, '.', '_' and '-'.")
+    return value
+
+
+def validate_group_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > 64 or not GROUP_PATTERN.fullmatch(value):
+        raise ValueError("group must be a non-empty identifier of at most 64 characters.")
+    if value[0] in ".-" or value in {"experiments", "qqtools_internal"}:
+        raise ValueError(f"group name {value!r} is reserved or invalid.")
+    return value
+
+
+def _meta(machine: str, revision: int = 1, created_at: str | None = None) -> dict[str, Any]:
+    now = created_at or utc_now()
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "revision": revision,
+        "created_at": now,
+        "updated_at": now,
+        "updated_by": {"actor_type": "cli", "machine_name": machine, "process_id": str(uuid.uuid4())},
+    }
+
+
+def _check_meta(data: dict[str, Any]) -> None:
+    required = {"schema_version", "revision", "created_at", "updated_at", "updated_by"}
+    if set(data) != required:
+        raise ValueError("record meta has missing or unknown fields.")
+    if data["schema_version"] != SCHEMA_VERSION or not isinstance(data["revision"], int):
+        raise ValueError("record schema version or revision is invalid.")
+
+
+@dataclass(slots=True)
+class TaskSpec:
+    command: list[str]
+    working_directory: str
+    requested_gpus: int
+
+    def __post_init__(self) -> None:
+        if not self.command or any(not isinstance(item, str) for item in self.command):
+            raise ValueError("command must be a non-empty list of strings.")
+        if not self.working_directory.startswith("/"):
+            raise ValueError("working_directory must be absolute.")
+        if not isinstance(self.requested_gpus, int) or self.requested_gpus <= 0:
+            raise ValueError("requested_gpus must be a positive integer.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"command": list(self.command), "working_directory": self.working_directory, "requested_gpus": self.requested_gpus}
+
+
+@dataclass(slots=True)
+class TaskRecord:
+    task_id: str
+    group_name: str | None
+    group_membership_sequence: int | None
+    submission_operation_id: str | None
+    name: str | None
+    spec: TaskSpec
+    placement_policy: dict[str, Any]
+    placement_runtime: dict[str, Any]
+    state: dict[str, Any]
+    control: dict[str, Any]
+    attempt_control: dict[str, Any]
+    claim_control: dict[str, Any]
+    meta: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        validate_identifier(self.task_id, "task_id")
+        validate_group_name(self.group_name)
+        _check_meta(self.meta)
+        if self.state.get("projection") not in TASK_PHASES:
+            raise ValueError("task state projection is invalid.")
+        if self.placement_policy.get("sharing_mode") not in SHARING_MODES:
+            raise ValueError("task sharing_mode is invalid.")
+        if self.placement_policy["sharing_mode"] == "private" and self.placement_runtime["queue_scope"] == "shared":
+            raise ValueError("private tasks cannot enter the shared queue.")
+
+    @classmethod
+    def new(cls, *, task_id: str, machine: str, spec: TaskSpec, group_name: str | None = None,
+            name: str | None = None, sharing_mode: str = "private", fallback_machines: str | list[str] = "group",
+            offer_after_seconds: int | None = None, operation_id: str | None = None) -> "TaskRecord":
+        validate_identifier(task_id, "task_id")
+        validate_identifier(machine, "machine_name")
+        validate_group_name(group_name)
+        if group_name is None and sharing_mode != "private":
+            raise ValueError("ungrouped tasks must use private placement.")
+        if sharing_mode not in SHARING_MODES:
+            raise ValueError("sharing_mode must be 'private' or 'spillover'.")
+        now = utc_now()
+        offer_eligible_at = None
+        if offer_after_seconds is not None:
+            if not isinstance(offer_after_seconds, int) or offer_after_seconds < 0:
+                raise ValueError("offer_after_seconds must be a non-negative integer or null.")
+            offer_eligible_at = (datetime.now(timezone.utc) + timedelta(seconds=offer_after_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return cls(
+            task_id=task_id, group_name=group_name, group_membership_sequence=None,
+            submission_operation_id=operation_id, name=name, spec=spec,
+            placement_policy={"home_machine": machine, "sharing_mode": sharing_mode,
+                              "fallback_constraint": fallback_machines, "offer_after_seconds": offer_after_seconds},
+            placement_runtime={"queue_scope": "home", "queued_home_at": now,
+                               "offer_eligible_at": offer_eligible_at, "offered_at": None, "offer_reason": None, "offered_by": None},
+            state={"projection": "queued", "reason": None},
+            control={"cancellation_requested_at": None, "cancellation_operation_id": None,
+                     "terminate_running": False, "requested_by": None, "termination_acknowledged_at": None,
+                     "termination_result": None, "cleanup_operation_id": None,
+                     "cleanup_state": None},
+            attempt_control={"next_attempt_number": 1, "current_attempt_id": None, "current_attempt_number": None},
+            claim_control={"fencing_epoch": 0, "active_claim": None}, meta=_meta(machine),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"meta": self.meta, "task": {"task_id": self.task_id, "group_name": self.group_name,
+                "group_membership_sequence": self.group_membership_sequence,
+                "submission_operation_id": self.submission_operation_id, "name": self.name,
+                "spec": self.spec.to_dict(), "placement_policy": self.placement_policy,
+                "placement_runtime": self.placement_runtime, "state": self.state, "control": self.control,
+                "attempt_control": self.attempt_control, "claim_control": self.claim_control}}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TaskRecord":
+        task = data["task"]
+        control = task["control"]
+        control.setdefault("cleanup_operation_id", None)
+        control.setdefault("cleanup_state", None)
+        return cls(meta=data["meta"], task_id=task["task_id"], group_name=task.get("group_name"),
+                   group_membership_sequence=task.get("group_membership_sequence"),
+                   submission_operation_id=task.get("submission_operation_id"), name=task.get("name"),
+                   spec=TaskSpec(**task["spec"]), placement_policy=task["placement_policy"],
+                   placement_runtime=task["placement_runtime"], state=task["state"], control=control,
+                   attempt_control=task["attempt_control"], claim_control=task["claim_control"])
+
+
+@dataclass(slots=True)
+class AttemptRecord:
+    attempt_id: str
+    task_id: str
+    attempt_number: int
+    phase: str
+    machine_name: str
+    assigned_gpus: list[int]
+    reservation_id: str
+    current_fencing_token: int
+    token_history: list[int]
+    lease: dict[str, Any]
+    authorization: dict[str, Any]
+    process: dict[str, Any]
+    termination: dict[str, Any]
+    timestamps: dict[str, Any]
+    result: dict[str, Any]
+    meta: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        validate_identifier(self.attempt_id, "attempt_id")
+        validate_identifier(self.task_id, "task_id")
+        validate_identifier(self.machine_name, "machine_name")
+        if self.phase not in ATTEMPT_PHASES:
+            raise ValueError("attempt phase is invalid.")
+        _check_meta(self.meta)
+
+    @classmethod
+    def claimed(cls, task: TaskRecord, machine: str, gpus: list[int], reservation_id: str, token: int,
+                lease_seconds: int = 60, attempt_id: str | None = None) -> "AttemptRecord":
+        attempt_id = attempt_id or new_id()
+        now = utc_now()
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return cls(attempt_id, task.task_id, task.attempt_control["next_attempt_number"], "claimed", machine,
+                   list(gpus), reservation_id, token, [token], {"claimed_at": now, "renewed_at": now,
+                   "expires_at": expires}, {"group_name": task.group_name, "group_dispatch_epoch": None,
+                   "group_worker_set_epoch": None}, {"wrapper_pid": None, "process_group_id": None,
+                   "tmux_reference": None, "local_process_manifest": "", "log_references": []},
+                   {"requested_by_operation_id": None, "requested_at": None, "acknowledged_at": None,
+                    "result": None}, {"launch_authorized_at": None, "process_created_at": None,
+                    "running_at": None, "orphaned_at": None, "recovered_at": None,
+                    "finished_at": None}, {"exit_code": None, "signal": None,
+                    "category": None, "reason": None}, _meta(machine))
+
+    def to_dict(self) -> dict[str, Any]:
+        values = {key: getattr(self, key) for key in ("attempt_id", "task_id", "attempt_number", "phase",
+                 "machine_name", "assigned_gpus", "reservation_id", "current_fencing_token", "token_history",
+                 "lease", "authorization", "process", "termination", "timestamps", "result")}
+        return {"meta": self.meta, "attempt": values}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AttemptRecord":
+        return cls(meta=data["meta"], **data["attempt"])
+
+
+def new_group(name: str, machine: str) -> dict[str, Any]:
+    validate_group_name(name)
+    return {"meta": _meta(machine), "group": {"name": name, "admission_state": "open",
+        "dispatch_state": "active", "dispatch_epoch": 0, "worker_set_epoch": 0,
+        "next_membership_sequence": 1, "pending_submission_commit": None, "worker_set": {},
+        "cancellation_barriers": []}}
+
+
+def new_worker_member(*, added_by_operation: str | None = None) -> dict[str, Any]:
+    return {"state": "active", "state_epoch": 0, "added_at": utc_now(),
+            "added_by_operation": added_by_operation, "drain_requested_at": None,
+            "remove_requested_at": None, "terminate_running": False}
+
+
+def new_submission(*, operation_id: str, kind: str, key: str, raw_digest: str, machine: str,
+                   target_group: str | None, resolved_context: dict[str, Any]) -> dict[str, Any]:
+    return {"meta": _meta(machine), "submission": {"operation_id": operation_id, "kind": kind,
+        "idempotency_key": key, "raw_request_digest": raw_digest,
+        "resolved_context_digest": hashlib.sha256(json.dumps(resolved_context, sort_keys=True).encode()).hexdigest(),
+        "original_submitting_machine": machine, "target_group": target_group, "state": "preparing",
+        "resolved_context": resolved_context, "commit_plan": {"group_membership_sequences": None,
+        "pending_group_revision": None}, "staged_task_count": len(resolved_context["task_ids"]),
+        "committed_at": None, "failure_reason": None}}
