@@ -7,12 +7,14 @@ import os
 import subprocess
 import signal
 import sys
+import time
 from pathlib import Path
 
 from .agent import get_agent_status, run_agent_loop
 from .commands import cleanup, group as group_commands, logs as log_commands, task as task_commands
 from .doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
-from .layout import clear_context, init_shared_root, load_context, load_root_config, save_context
+from .layout import (clear_context, init_shared_root, load_context, load_root_config,
+                     runtime_pid_path, save_context)
 from . import observer
 
 
@@ -181,16 +183,34 @@ def main(argv: list[str] | None = None) -> int:
                 if args.background:
                     if not args.persistent:
                         raise ValueError("--background requires --persistent.")
-                    subprocess.Popen([sys.executable, "-m", "qqtools.plugins.qexp.cli",
-                                      "--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,
-                                      "--runtime-root", str(cfg.runtime_root), "agent", "start", "--persistent"],
-                                     start_new_session=True)
+                    process = subprocess.Popen(
+                        [sys.executable, "-m", "qqtools.plugins.qexp.cli",
+                         "--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,
+                         "--runtime-root", str(cfg.runtime_root), "agent", "start", "--persistent"],
+                        env=os.environ.copy(),
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    pid_path = runtime_pid_path(cfg)
+                    pid_path.parent.mkdir(parents=True, exist_ok=True)
+                    pid_path.write_text(str(process.pid), encoding="utf-8")
                 else:
                     run_agent_loop(cfg, persistent=args.persistent)
             elif args.agent_action == "stop":
                 status = get_agent_status(cfg)
                 if status.get("pid"):
-                    os.kill(status["pid"], signal.SIGTERM)
+                    pid = status["pid"]
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline and os.path.exists(f"/proc/{pid}"):
+                        time.sleep(0.05)
+                    if not os.path.exists(f"/proc/{pid}"):
+                        runtime_pid_path(cfg).unlink(missing_ok=True)
             return 0
         if args.command == "top": print(json.dumps(observer.top_view(cfg, all_machines=True))); return 0
         if args.command == "machines": print(json.dumps(observer.list_machines(cfg))); return 0

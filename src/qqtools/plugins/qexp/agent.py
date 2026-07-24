@@ -22,6 +22,17 @@ from .runtime.tasks import load_task
 from .scheduler import reconcile_running_tasks, run_dispatch_cycle
 
 
+def _runtime_pid_value(pid_path) -> int:
+    if pid_path.exists():
+        try:
+            existing = int(pid_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            existing = 0
+        if existing > 0 and _pid_alive(existing):
+            return existing
+    return os.getpid()
+
+
 def get_agent_status(cfg: RootConfig, probe_local_pid: bool = True) -> dict[str, Any]:
     pid_path = runtime_pid_path(cfg)
     pid = int(pid_path.read_text().strip()) if pid_path.exists() else None
@@ -60,7 +71,7 @@ def run_agent_loop(cfg: RootConfig, *, persistent: bool = False, loop_interval: 
     cfg.runtime_root.mkdir(parents=True, exist_ok=True)
     pid_path = runtime_pid_path(cfg)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(str(os.getpid()), encoding="utf-8")
+    pid_path.write_text(str(_runtime_pid_value(pid_path)), encoding="utf-8")
     executor = executor or Executor()
     started = time.monotonic()
     try:
