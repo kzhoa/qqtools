@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.2.31
+
 - fix: allow `qexp init` to succeed when saving the default CLI context under `~/.qqtools/qexp-context.json` fails; shared-root initialization still completes and the CLI now emits a warning instead of aborting
 - fix: allow `qexp` to execute tasks without `tmux` by falling back to a detached local runner process when the tmux launch stack is unavailable, while still recording the runtime log path and process manifest through the standard runner path
 - fix: harden background `qexp agent` lifecycle handling for non-interactive and sandboxed environments by detaching stdio, persisting a parent-visible pid file, and clearing stale pid files during `agent stop`
