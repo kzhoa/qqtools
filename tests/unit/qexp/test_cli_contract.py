@@ -1,8 +1,11 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.layout import load_root_config
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import (authorize_launch, claim_task, expire_claim,
                                              fail_attempt)
@@ -63,3 +66,36 @@ def test_clean_cli_reports_dry_run_candidates(tmp_path: Path, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["candidates"] == [task.task_id]
     assert output["removed"] == []
+
+
+def test_init_succeeds_when_context_save_fails(tmp_path: Path, monkeypatch, capsys):
+    root = tmp_path / ".qexp"
+    runtime_root = tmp_path / "rt"
+
+    def fail_save_context(*args, **kwargs):
+        raise OSError(30, "Read-only file system", "/readonly/.qqtools/qexp-context.json")
+
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.save_context", fail_save_context)
+
+    assert main([
+        "--shared-root", str(root), "--machine", "gpu-1", "--runtime-root", str(runtime_root), "init"
+    ]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == str(root.resolve())
+    assert "initialized successfully, but failed to save CLI context" in captured.err
+    cfg = load_root_config(root, "gpu-1", runtime_root, require_initialized=True)
+    assert cfg.shared_root == root.resolve()
+
+
+def test_use_still_fails_when_context_save_fails(tmp_path: Path, monkeypatch):
+    def fail_save_context(*args, **kwargs):
+        raise OSError(30, "Read-only file system", "/readonly/.qqtools/qexp-context.json")
+
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.save_context", fail_save_context)
+
+    with pytest.raises(OSError, match="Read-only file system"):
+        main([
+            "use", "--shared-root", str(tmp_path / ".qexp"), "--machine", "gpu-1", "--runtime-root",
+            str(tmp_path / "rt")
+        ])
