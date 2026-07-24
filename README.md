@@ -219,3 +219,26 @@ Under `src/qqtools/plugins/`, there are also:
 ```bash
 tox
 ```
+# qexp schema-5
+
+qexp now uses the breaking Experiment Group, Task, and Attempt runtime. Initialize a
+fresh `.qexp` root; existing Batch-era roots are rejected rather than migrated.
+
+```bash
+qexp init --shared-root /path/to/project/.qexp --machine gpu1
+qexp submit --group sweep -- python train.py --config a.yaml
+qexp batch-submit --group sweep --file runs.yaml
+qexp group pause sweep
+qexp task retry TASK_ID
+qexp task retry TASK_ID --acknowledge-duplicate-risk
+qexp clean --task-id TASK_ID --dry-run
+qexp clean --older-than-days 30 --limit 100
+```
+
+Cleanup waits for required machines to acknowledge removal of matching local GPU reservations,
+process manifests, and logs before deleting shared Task and Attempt records. Required machines
+are the Task home machine, historical Attempt machines, and the machine that prepared cleanup.
+Pending operations report `waiting_ack` and the remaining machine names. Cleanup blocks retry,
+claim, cancel, and offer, and its tombstone permanently reserves the Task ID.
+
+`batch-submit` is only a bulk-input command and does not create a public Batch identity.

@@ -470,3 +470,10 @@
 - tests/unit/timer
 - tests/unit/lazyimporterrorproxy
 - tests/functional/qlmdbdataset
+# Unreleased
+
+- Replaced qexp Batch-era truth with schema-5 Experiment Group, Task, Attempt, claim, and
+  submission-operation records.
+- Removed public Batch, resubmit, and peer-task retry paths without compatibility readers.
+- Added atomic shared records, fencing-aware claims, Group controls, and shared-filesystem
+  qualification checks.

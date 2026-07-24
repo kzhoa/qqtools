@@ -1,73 +1,17 @@
-from __future__ import annotations
-
-from .api import (
-    batch_retry_cancelled,
-    batch_retry_failed,
-    batch_submit,
-    cancel,
-    clean,
-    get_log_path,
-    read_logs,
-    resubmit,
-    retry,
-    submit,
-    tail_log,
-)
+"""qexp public package surface for schema 5."""
+from .commands.cleanup import clean
+from .commands.logs import get_log_path, read_logs, tail_log
+from .commands.task import batch_submit, cancel, offer, retry, submit
 from .layout import RootConfig, init_shared_root, load_root_config
-from .models import (
-    AGENT_MODE_ON_DEMAND,
-    AGENT_MODE_PERSISTENT,
-    Batch,
-    PHASE_CANCELLED,
-    PHASE_DISPATCHING,
-    PHASE_FAILED,
-    PHASE_ORPHANED,
-    PHASE_QUEUED,
-    PHASE_RUNNING,
-    PHASE_STARTING,
-    PHASE_SUCCEEDED,
-    Task,
-)
-from .observer import (
-    inspect_batch,
-    inspect_task,
-    list_batches,
-    list_machines,
-    list_tasks,
-    top_view,
-)
+from .models import (AGENT_MODE_ON_DEMAND, AGENT_MODE_PERSISTENT, PHASE_BLOCKED, PHASE_CANCELLED,
+                     PHASE_FAILED, PHASE_QUEUED, PHASE_RUNNING, PHASE_SUCCEEDED)
+from .observer import inspect_task, list_groups, list_machines, list_tasks, top_view
+from .runtime.records import AttemptRecord, TaskRecord, TaskSpec
 
-__all__ = [
-    "AGENT_MODE_ON_DEMAND",
-    "AGENT_MODE_PERSISTENT",
-    "Batch",
-    "PHASE_CANCELLED",
-    "PHASE_DISPATCHING",
-    "PHASE_FAILED",
-    "PHASE_ORPHANED",
-    "PHASE_QUEUED",
-    "PHASE_RUNNING",
-    "PHASE_STARTING",
-    "PHASE_SUCCEEDED",
-    "RootConfig",
-    "Task",
-    "batch_retry_cancelled",
-    "batch_retry_failed",
-    "batch_submit",
-    "cancel",
-    "clean",
-    "get_log_path",
-    "init_shared_root",
-    "inspect_batch",
-    "inspect_task",
-    "list_batches",
-    "list_machines",
-    "list_tasks",
-    "load_root_config",
-    "read_logs",
-    "resubmit",
-    "retry",
-    "submit",
-    "tail_log",
-    "top_view",
-]
+Task = TaskRecord
+
+__all__ = ["AGENT_MODE_ON_DEMAND", "AGENT_MODE_PERSISTENT", "AttemptRecord", "RootConfig", "Task",
+           "TaskRecord", "TaskSpec", "batch_submit", "cancel", "clean", "get_log_path", "init_shared_root",
+           "inspect_task", "list_groups", "list_machines", "list_tasks", "load_root_config", "offer", "read_logs",
+           "retry", "submit", "tail_log", "top_view", "PHASE_BLOCKED", "PHASE_CANCELLED", "PHASE_FAILED",
+           "PHASE_QUEUED", "PHASE_RUNNING", "PHASE_SUCCEEDED"]

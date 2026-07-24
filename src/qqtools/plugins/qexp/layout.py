@@ -1,27 +1,15 @@
+"""Schema-5 qexp root initialization and configuration."""
 from __future__ import annotations
 
 import json
 import os
-import socket
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from .models import (
-    AGENT_MODE_ON_DEMAND,
-    AGENT_MODES,
-    ROOT_SCOPE_PROJECT,
-    SCHEMA_VERSION,
-    GpuInventory,
-    Machine,
-    RootManifest,
-    generate_id,
-    utc_now_iso,
-    validate_machine_name,
-)
-
-DEFAULT_RUNTIME_BASE = "~/.qqtools/qexp-runtime"
-DEFAULT_CONTEXT_FILE = "~/.qqtools/qexp-context.json"
-FORBIDDEN_TRUTH_LAYOUT_DIRS = ("groups", "experiments")
+from .runtime.paths import local_paths, machine_path, shared_paths
+from .runtime.records import SCHEMA_VERSION, utc_now
+from .runtime.store import atomic_replace, read_json
 
 
 @dataclass(slots=True)
@@ -32,417 +20,140 @@ class RootConfig:
     runtime_root: Path
 
     def __post_init__(self) -> None:
-        validate_machine_name(self.machine_name)
         self.shared_root = Path(self.shared_root).expanduser().resolve()
         self.project_root = Path(self.project_root).expanduser().resolve()
         self.runtime_root = Path(self.runtime_root).expanduser().resolve()
-
-
-# ---------------------------------------------------------------------------
-# Path helpers — shared root
-# ---------------------------------------------------------------------------
-
-
-def global_dir(cfg: RootConfig) -> Path:
-    return cfg.shared_root / "global"
-
-
-def global_schema_dir(cfg: RootConfig) -> Path:
-    return global_dir(cfg) / "schema"
-
-
-def global_tasks_dir(cfg: RootConfig) -> Path:
-    return global_dir(cfg) / "tasks"
-
-
-def global_batches_dir(cfg: RootConfig) -> Path:
-    return global_dir(cfg) / "batches"
-
-
-def global_indexes_dir(cfg: RootConfig) -> Path:
-    return global_dir(cfg) / "indexes"
-
-
-def global_operations_dir(cfg: RootConfig) -> Path:
-    return global_dir(cfg) / "operations"
-
-
-def global_resubmit_operations_dir(cfg: RootConfig) -> Path:
-    return global_operations_dir(cfg) / "resubmit"
-
-
-def global_locks_dir(cfg: RootConfig) -> Path:
-    return global_dir(cfg) / "locks"
-
-
-def global_events_dir(cfg: RootConfig) -> Path:
-    return global_dir(cfg) / "events"
-
-
-def machine_dir(cfg: RootConfig) -> Path:
-    return cfg.shared_root / "machines" / cfg.machine_name
-
-
-def machine_claims_active_dir(cfg: RootConfig) -> Path:
-    return machine_dir(cfg) / "claims" / "active"
-
-
-def machine_claims_released_dir(cfg: RootConfig) -> Path:
-    return machine_dir(cfg) / "claims" / "released"
-
-
-def machine_events_dir(cfg: RootConfig) -> Path:
-    return machine_dir(cfg) / "events"
-
-
-def machine_state_dir(cfg: RootConfig) -> Path:
-    return machine_dir(cfg) / "state"
-
-
-# Specific file paths
-
-
-def task_path(cfg: RootConfig, task_id: str) -> Path:
-    return global_tasks_dir(cfg) / f"{task_id}.json"
-
-
-def batch_path(cfg: RootConfig, batch_id: str) -> Path:
-    return global_batches_dir(cfg) / f"{batch_id}.json"
-
-
-def resubmit_operation_path(cfg: RootConfig, task_id: str) -> Path:
-    return global_resubmit_operations_dir(cfg) / f"{task_id}.json"
-
-
-def machine_json_path(cfg: RootConfig) -> Path:
-    return machine_dir(cfg) / "machine.json"
-
-
-def schema_version_path(cfg: RootConfig) -> Path:
-    return global_schema_dir(cfg) / "version.json"
-
-
-def root_manifest_path(cfg: RootConfig) -> Path:
-    return global_schema_dir(cfg) / "root.json"
-
-
-def agent_state_path(cfg: RootConfig) -> Path:
-    return machine_state_dir(cfg) / "agent.json"
-
-
-def gpu_state_path(cfg: RootConfig) -> Path:
-    return machine_state_dir(cfg) / "gpu.json"
-
-
-def summary_state_path(cfg: RootConfig) -> Path:
-    return machine_state_dir(cfg) / "summary.json"
-
-
-# Runtime paths (local only, not shared)
-
-
-def runtime_logs_dir(cfg: RootConfig) -> Path:
-    return cfg.runtime_root / "logs"
-
-
-def runtime_log_path(cfg: RootConfig, task_id: str) -> Path:
-    return runtime_logs_dir(cfg) / f"{task_id}.log"
-
-
-def runtime_pid_path(cfg: RootConfig) -> Path:
-    return cfg.runtime_root / "agent.pid"
-
-
-# Index directories
-
-
-def index_by_state_dir(cfg: RootConfig) -> Path:
-    return global_indexes_dir(cfg) / "tasks_by_state"
-
-
-# Lock paths
-
-
-def submit_lock_path(cfg: RootConfig) -> Path:
-    return global_locks_dir(cfg) / "submit"
-
-
-def batch_lock_path(cfg: RootConfig) -> Path:
-    return global_locks_dir(cfg) / "batch"
-
-
-def migrate_lock_path(cfg: RootConfig) -> Path:
-    return global_locks_dir(cfg) / "migrate"
-
-
-def clean_lock_path(cfg: RootConfig) -> Path:
-    return global_locks_dir(cfg) / "clean"
-
-
-def task_operation_lock_path(cfg: RootConfig, task_id: str) -> Path:
-    return global_locks_dir(cfg) / "tasks" / f"{task_id}.lock"
-
-
-# ---------------------------------------------------------------------------
-# Layout creation
-# ---------------------------------------------------------------------------
-
-_SHARED_DIRS = [
-    global_schema_dir,
-    global_tasks_dir,
-    global_batches_dir,
-    global_resubmit_operations_dir,
-    global_locks_dir,
-    global_events_dir,
-    index_by_state_dir,
-]
-
-_MACHINE_DIRS = [
-    machine_claims_active_dir,
-    machine_claims_released_dir,
-    machine_events_dir,
-    machine_state_dir,
-]
+        if self.shared_root.name != ".qexp":
+            raise ValueError("shared_root must point to a project control root named '.qexp'.")
+        if not self.machine_name or "/" in self.machine_name or "\\" in self.machine_name or ".." in self.machine_name:
+            raise ValueError("machine_name is invalid.")
+
+
+def _schema_path(cfg: RootConfig) -> Path:
+    return shared_paths(cfg.shared_root)["schema"] / "version.json"
+
+
+def read_schema_version(cfg: RootConfig) -> int | None:
+    path = _schema_path(cfg)
+    if not path.exists():
+        return None
+    value = read_json(path)
+    schema = value.get("schema")
+    if not isinstance(schema, dict):
+        raise RuntimeError("qexp schema/version.json is malformed.")
+    version = schema.get("version")
+    if version != SCHEMA_VERSION:
+        return version
+    if set(schema) != {"name", "version", "minimum_reader_version", "created_at"}:
+        raise RuntimeError("qexp schema/version.json is malformed.")
+    return version
+
+
+def validate_root_contract(cfg: RootConfig) -> None:
+    version = read_schema_version(cfg)
+    if version != SCHEMA_VERSION:
+        if version is None:
+            raise RuntimeError("qexp root is uninitialized; run qexp init first.")
+        raise RuntimeError(f"Unsupported qexp schema {version!r}; expected schema {SCHEMA_VERSION}.")
+    forbidden = {"global", "batches", "resubmit", "resubmit_operations"}
+    present = forbidden.intersection(path.name for path in cfg.shared_root.iterdir())
+    if present:
+        raise RuntimeError(f"Mixed qexp schema root contains obsolete paths: {sorted(present)}.")
+    required = {"schema", "project", "groups", "tasks", "attempts", "operations", "idempotency",
+                "claims", "machines", "locks", "events", "indexes"}
+    missing = sorted(name for name in required if not (cfg.shared_root / name).exists())
+    if missing:
+        raise RuntimeError(f"qexp schema-5 root is incomplete; missing {missing}.")
 
 
 def ensure_shared_layout(cfg: RootConfig) -> None:
-    for dir_fn in _SHARED_DIRS:
-        dir_fn(cfg).mkdir(parents=True, exist_ok=True)
+    paths = shared_paths(cfg.shared_root)
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True)
+    (paths["locks"] / "groups").mkdir(exist_ok=True)
+    (paths["locks"] / "tasks").mkdir(exist_ok=True)
 
 
 def ensure_machine_layout(cfg: RootConfig) -> None:
-    for dir_fn in _MACHINE_DIRS:
-        dir_fn(cfg).mkdir(parents=True, exist_ok=True)
+    for path in local_paths(cfg.runtime_root).values():
+        path.mkdir(parents=True, exist_ok=True)
+    machine_dir = shared_paths(cfg.shared_root)["machines"] / cfg.machine_name
+    for name in ("state", "events"):
+        (machine_dir / name).mkdir(parents=True, exist_ok=True)
 
 
-def ensure_runtime_layout(cfg: RootConfig) -> None:
-    try:
-        cfg.runtime_root.mkdir(parents=True, exist_ok=True)
-        runtime_logs_dir(cfg).mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise RuntimeError(
-            f"Cannot create runtime directory at {cfg.runtime_root}: {exc}. "
-            f"Set --runtime-root or QEXP_RUNTIME_ROOT to a writable location."
-        ) from exc
-
-
-def write_schema_version(cfg: RootConfig, version: str = SCHEMA_VERSION) -> None:
-    path = schema_version_path(cfg)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    payload = json.dumps({"schema_version": version}, indent=2)
-    tmp.write_text(payload, encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def read_schema_version(cfg: RootConfig) -> str | None:
-    path = schema_version_path(cfg)
-    if not path.is_file():
-        return None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return data.get("schema_version")
-
-
-def _resolve_project_root(shared_root: Path) -> Path:
-    resolved = Path(shared_root).expanduser().resolve()
-    if resolved.name != ".qexp":
-        raise ValueError(
-            "shared_root must be the project control directory named '.qexp'. "
-            f"Got {resolved}."
-        )
-    return resolved.parent
-
-
-def create_root_manifest(cfg: RootConfig) -> RootManifest:
-    return RootManifest(
-        schema_version=SCHEMA_VERSION,
-        root_scope=ROOT_SCOPE_PROJECT,
-        control_plane_id=f"cp_{generate_id()}",
-        shared_root=str(cfg.shared_root),
-        project_root=str(cfg.project_root),
-        layout_version=SCHEMA_VERSION,
-        created_at=utc_now_iso(),
-        created_by_machine=cfg.machine_name,
-    )
-
-
-def write_root_manifest(cfg: RootConfig, manifest: RootManifest | None = None) -> RootManifest:
-    if manifest is None:
-        manifest = create_root_manifest(cfg)
-    path = root_manifest_path(cfg)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps(manifest.to_dict(), indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    os.replace(tmp, path)
-    return manifest
-
-
-def read_root_manifest(cfg: RootConfig) -> RootManifest | None:
-    path = root_manifest_path(cfg)
-    if not path.is_file():
-        return None
-    return RootManifest.from_dict(json.loads(path.read_text(encoding="utf-8")))
-
-
-def ensure_root_manifest(cfg: RootConfig) -> RootManifest:
-    manifest = read_root_manifest(cfg)
-    if manifest is not None:
-        return manifest
-    return write_root_manifest(cfg)
-
-
-def list_forbidden_truth_layout_dirs(cfg: RootConfig) -> list[Path]:
-    return [
-        cfg.shared_root / dirname
-        for dirname in FORBIDDEN_TRUTH_LAYOUT_DIRS
-        if (cfg.shared_root / dirname).exists()
-    ]
-
-
-def validate_root_contract(cfg: RootConfig) -> RootManifest:
-    manifest = read_root_manifest(cfg)
-    if manifest is None:
-        raise FileNotFoundError(
-            f"Root manifest not found at {root_manifest_path(cfg)}. "
-            "Run 'qexp init' to initialize the project control root."
-        )
-    if Path(manifest.shared_root).resolve() != cfg.shared_root:
-        raise ValueError(
-            "shared_root does not match the initialized control-plane manifest: "
-            f"manifest={manifest.shared_root}, requested={cfg.shared_root}."
-        )
-    if Path(manifest.project_root).resolve() != cfg.project_root:
-        raise ValueError(
-            "project_root does not match the initialized control-plane manifest: "
-            f"manifest={manifest.project_root}, inferred={cfg.project_root}."
-        )
-
-    for path in list_forbidden_truth_layout_dirs(cfg):
-        if path.exists():
-            raise ValueError(
-                f"Forbidden truth-layout directory detected at {path}. "
-                "qexp only permits global object truth and machine-private directories."
-            )
-    return manifest
-
-
-# ---------------------------------------------------------------------------
-# RootConfig construction
-# ---------------------------------------------------------------------------
-
-
-def load_root_config(
-    shared_root: str | Path,
-    machine_name: str,
-    runtime_root: str | Path | None = None,
-    require_initialized: bool = False,
-) -> RootConfig:
-    shared_root_path = Path(shared_root)
-    project_root = _resolve_project_root(shared_root_path)
-    if runtime_root is None:
-        runtime_root = Path(DEFAULT_RUNTIME_BASE).expanduser() / machine_name
-    cfg = RootConfig(
-        shared_root=shared_root_path,
-        project_root=project_root,
-        machine_name=machine_name,
-        runtime_root=Path(runtime_root),
-    )
-    if require_initialized:
+def init_shared_root(shared_root: Path, machine_name: str, *, agent_mode: str = "on_demand",
+                     runtime_root: Path | None = None) -> RootConfig:
+    shared_root = Path(shared_root).expanduser().resolve()
+    project_root = shared_root.parent
+    runtime_root = runtime_root or Path.home() / ".qqtools" / "qexp-runtime" / project_id(shared_root) / machine_name
+    cfg = RootConfig(shared_root, project_root, machine_name, runtime_root)
+    existing = read_schema_version(cfg)
+    if existing is not None and existing != SCHEMA_VERSION:
+        raise RuntimeError(f"Unsupported qexp schema {existing!r}; refusing mixed-schema initialization.")
+    if existing == SCHEMA_VERSION:
         validate_root_contract(cfg)
-    elif root_manifest_path(cfg).is_file():
-        validate_root_contract(cfg)
-    return cfg
-
-
-# ---------------------------------------------------------------------------
-# Init command
-# ---------------------------------------------------------------------------
-
-
-def init_shared_root(
-    shared_root: Path,
-    machine_name: str,
-    agent_mode: str = AGENT_MODE_ON_DEMAND,
-    runtime_root: Path | None = None,
-) -> RootConfig:
-    if agent_mode not in AGENT_MODES:
-        raise ValueError(f"agent_mode must be one of {AGENT_MODES}, got {agent_mode!r}.")
-
-    cfg = load_root_config(shared_root, machine_name, runtime_root)
     ensure_shared_layout(cfg)
     ensure_machine_layout(cfg)
-    ensure_runtime_layout(cfg)
-    write_schema_version(cfg)
-    ensure_root_manifest(cfg)
-    validate_root_contract(cfg)
-
-    machine = Machine(
-        machine_name=cfg.machine_name,
-        hostname=socket.gethostname(),
-        shared_root=str(cfg.shared_root),
-        runtime_root=str(cfg.runtime_root),
-        agent_mode=agent_mode,
-        gpu_inventory=GpuInventory(),
-    )
-
-    machine_path = machine_json_path(cfg)
-    tmp = machine_path.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps(machine.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
-    )
-    os.replace(tmp, machine_path)
-
+    schema = {"schema": {"name": "qexp-runtime", "version": SCHEMA_VERSION,
+                          "minimum_reader_version": SCHEMA_VERSION, "created_at": utc_now()}}
+    atomic_replace(_schema_path(cfg), schema)
+    identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
+    if not identity_path.exists():
+        atomic_replace(identity_path, {"project": {"project_id": project_id(shared_root),
+                                                     "shared_root": str(shared_root)}})
+    machine = {"machine": {"machine_name": machine_name, "hostname": os.uname().nodename,
+                            "project_id": project_id(shared_root), "shared_root": str(shared_root),
+                            "runtime_root": str(runtime_root), "agent_mode": agent_mode}}
+    atomic_replace(machine_path(shared_root, machine_name), machine)
     return cfg
 
 
-# ---------------------------------------------------------------------------
-# CLI context persistence
-# ---------------------------------------------------------------------------
-
-_context_file_override: str | None = None
+def project_id(shared_root: Path) -> str:
+    import hashlib
+    return hashlib.sha256(str(shared_root).encode()).hexdigest()[:16]
 
 
-def _context_path() -> Path:
-    if _context_file_override is not None:
-        return Path(_context_file_override)
-    return Path(DEFAULT_CONTEXT_FILE).expanduser()
+def load_root_config(shared_root: str | Path, machine_name: str, runtime_root: str | Path | None = None,
+                     *, require_initialized: bool = False) -> RootConfig:
+    shared_root = Path(shared_root).expanduser().resolve()
+    cfg = RootConfig(shared_root, shared_root.parent, machine_name,
+                     Path(runtime_root) if runtime_root else Path.home() / ".qqtools" / "qexp-runtime" / project_id(shared_root) / machine_name)
+    if require_initialized:
+        validate_root_contract(cfg)
+    return cfg
 
 
-def save_context(
-    shared_root: str,
-    machine_name: str,
-    runtime_root: str | None = None,
-) -> Path:
-    path = _context_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "shared_root": shared_root,
-        "machine": machine_name,
-    }
-    if runtime_root is not None:
-        payload["runtime_root"] = runtime_root
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
-    return path
+_CONTEXT_PATH = Path.home() / ".qqtools" / "qexp-context.json"
 
 
-def load_context() -> dict | None:
-    path = _context_path()
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
+def save_context(shared_root: str, machine: str, runtime_root: str | None = None) -> Path:
+    _CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_replace(_CONTEXT_PATH, {"shared_root": shared_root, "machine": machine, "runtime_root": runtime_root})
+    return _CONTEXT_PATH
+
+
+def load_context() -> dict[str, Any] | None:
+    return read_json(_CONTEXT_PATH) if _CONTEXT_PATH.exists() else None
 
 
 def clear_context() -> bool:
-    path = _context_path()
-    if path.is_file():
-        path.unlink()
-        return True
-    return False
+    if not _CONTEXT_PATH.exists():
+        return False
+    _CONTEXT_PATH.unlink()
+    return True
+
+
+def machine_state_path(cfg: RootConfig, name: str) -> Path:
+    return shared_paths(cfg.shared_root)["machines"] / cfg.machine_name / "state" / name
+
+
+def runtime_log_path(cfg: RootConfig, task_id: str, attempt_id: str | None = None) -> Path:
+    suffix = attempt_id or "current"
+    path = cfg.runtime_root / "logs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path / f"{task_id}-{suffix}.log"
+
+
+def runtime_pid_path(cfg: RootConfig) -> Path:
+    return cfg.runtime_root / "agent" / "agent.pid"
