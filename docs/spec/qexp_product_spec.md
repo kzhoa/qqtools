@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-07-22
+updated_at: 2026-07-24
 archived_at:
 ---
 
@@ -86,7 +86,12 @@ It is local-first:
 
 - a Task defaults to the machine from which it is submitted
 - each machine runs its own lightweight agent
-- process, PID, tmux, GPU reservation, and log operations remain machine-local
+- process, PID, local launch backend, GPU reservation, and log operations remain machine-local
+
+`tmux` is the primary interactive launch and observation backend that qexp is designed to
+work with. qexp also permits degraded operation when `tmux` is unavailable by launching
+local detached processes directly, but feature depth and performance commitments are made
+for the `tmux` path first.
 
 It may optionally cooperate across machines:
 
@@ -141,7 +146,7 @@ Typical users have:
 - one shared project `.qexp` control root
 - one registered qexp machine identity per server
 - one local agent per registered machine
-- machine-local GPU, PID, tmux, and runtime state
+- machine-local GPU, PID, local launch backend state, and runtime state
 - experiment sets containing tens or hundreds of independent commands
 
 The project source is usually edited once on the shared filesystem. Machines execute the
@@ -288,7 +293,7 @@ Attempt owns:
 - assigned machine and GPU IDs
 - claim and fencing token
 - lease timestamps
-- PID, process group, tmux, and log references
+- PID, process group, optional tmux reference, and log references
 - start and finish timestamps
 - exit code, signal, and terminal reason
 
@@ -314,7 +319,7 @@ It owns:
 - machine identity
 - local agent lifecycle
 - local qexp GPU reservations
-- local tmux and process namespace
+- local process namespace and optional tmux-managed interactive sessions
 - machine heartbeat and snapshots
 
 A Machine may be a Task's home machine, a fallback worker, or both.
@@ -1067,9 +1072,15 @@ qexp agent start --persistent
 Only the owning machine agent may:
 
 - start or signal its processes
-- operate its tmux sessions
+- operate its local launch backend, including tmux sessions when present
 - manage its local GPU reservations
 - confirm local process termination
+
+`tmux` is the primary supported operating mode for interactive execution and observation.
+When `tmux` is absent, qexp may fall back to a reduced detached-process path so the machine
+can still execute work, but that fallback is a compatibility path rather than the primary
+feature target. qexp does not guarantee parity of operational ergonomics or performance for
+non-`tmux` deployments.
 
 Cross-machine commands write shared intent and wait for acknowledgements. They do not
 directly operate remote PIDs.
