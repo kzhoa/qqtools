@@ -1,5 +1,16 @@
 # History
 
+## v1.2.30
+
+- breaking: upgrade `qexp` to schema 5 group/task/attempt runtime; existing Batch-era `.qexp` roots are rejected instead of being migrated, so this release requires initializing a fresh shared root
+- breaking: remove the public Batch identity and related package surface from `qexp`; `batch-submit` remains as a bulk input command only, while runtime management now centers on tasks, groups, and attempts
+- feat: add the schema 5 shared-filesystem runtime for `qexp`, including dedicated submission, record, reservation, claim, recovery, lock, placement, and task modules under `qqtools.plugins.qexp.runtime`
+- feat: add task- and group-oriented CLI flows for `qexp`, including grouped submission, task retry/cancel handling, group control commands, and a slimmer command router built around explicit command modules
+- feat: add cleanup orchestration that waits for required machine acknowledgements before deleting shared task artifacts, blocks conflicting operations while cleanup is pending, and permanently tombstones cleaned task IDs
+- refactor: simplify the `qexp` public package surface around `TaskRecord`, `AttemptRecord`, `TaskSpec`, task/group observers, and the new schema 5 command modules while removing legacy batch/index/lifecycle APIs
+- docs: add the shared-filesystem coordination ADR, document the schema 5 product/runtime contract, and refresh the root README with the new `qexp` workflow and cleanup semantics
+- test: add regression coverage for schema-version rejection, runtime store/submission/record helpers, task/group CLI contracts, cleanup flows, submission freezing, scheduling recovery, and the updated package surface
+
 ## v1.2.29
 
 - breaking: remove `qLmdbDataset` from `qqtools.torch.qdataset`; use the supported `from qqtools import qLmdbDataset` or `from qqtools.torch import qLmdbDataset` entry points instead, with no compatibility forwarding from the old module
