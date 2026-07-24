@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-07-22
+updated_at: 2026-07-24
 archived_at:
 ---
 
@@ -80,7 +80,12 @@ The primary deployment assumes:
 - project code and configurations are visible on all machines at the same absolute path
 - `.qexp` truth is visible through the same shared filesystem
 - machine identities are registered explicitly and are administratively trusted
-- processes, PIDs, tmux sessions, GPU reservations, and wrapper state remain local
+- processes, PIDs, local launch backend state, GPU reservations, and wrapper state remain local
+
+The runtime is primarily designed for machines where `tmux` is available and can serve as
+the interactive launch backend. When `tmux` is unavailable, the runtime may launch local
+detached processes directly as a degraded compatibility path. The runtime contract does not
+guarantee equal observability, ergonomics, or performance for that non-`tmux` path.
 
 qexp does not snapshot source code. A Task executes the files visible on its execution
 machine at launch time.
@@ -99,7 +104,7 @@ It contains:
 - provisional and active GPU reservations
 - local Attempt process manifests
 - wrapper control files
-- tmux and log references
+- optional tmux and log references
 - machine-local recovery evidence
 
 Local runtime files are never global scheduling authority.
