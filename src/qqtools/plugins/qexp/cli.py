@@ -96,6 +96,17 @@ def _command(argv: list[str]) -> list[str]:
     return argv
 
 
+def _try_save_context(shared_root: str, machine: str, runtime_root: str | None) -> None:
+    try:
+        save_context(shared_root, machine, runtime_root)
+    except OSError as exc:
+        print(
+            "qexp: initialized successfully, but failed to save CLI context "
+            f"at {exc.filename or '~/.qqtools/qexp-context.json'}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -104,7 +115,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("init requires --shared-root and --machine.")
             cfg = init_shared_root(Path(args.shared_root), args.machine, agent_mode=args.agent_mode,
                                    runtime_root=Path(args.runtime_root) if args.runtime_root else None)
-            save_context(str(cfg.shared_root), cfg.machine_name, str(cfg.runtime_root)); print(cfg.shared_root); return 0
+            _try_save_context(str(cfg.shared_root), cfg.machine_name, str(cfg.runtime_root))
+            print(cfg.shared_root)
+            return 0
         if args.command == "use":
             if args.clear: clear_context(); return 0
             if args.show: print(json.dumps(load_context() or {}, indent=2)); return 0

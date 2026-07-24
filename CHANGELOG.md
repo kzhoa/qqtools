@@ -1,5 +1,10 @@
 # History
 
+## Unreleased
+
+- fix: allow `qexp init` to succeed when saving the default CLI context under `~/.qqtools/qexp-context.json` fails; shared-root initialization still completes and the CLI now emits a warning instead of aborting
+- test: add regression coverage for the split context-save contract so `qexp init` tolerates context write failure while `qexp use` still fails strictly
+
 ## v1.2.30
 
 - breaking: upgrade `qexp` to schema 5 group/task/attempt runtime; existing Batch-era `.qexp` roots are rejected instead of being migrated, so this release requires initializing a fresh shared root
