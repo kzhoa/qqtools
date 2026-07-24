@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import shlex
+import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from .layout import RootConfig
 from .runtime.records import AttemptRecord
-from .tmux import create_window_for_task, kill_window, send_command_to_window, window_exists
+from .tmux import (create_window_for_task, is_tmux_launch_available, kill_window,
+                   send_command_to_window, window_exists)
 
 
 @dataclass(slots=True)
@@ -17,18 +19,52 @@ class Executor:
     send_command: Callable[[str, str], None] = send_command_to_window
     destroy_window: Callable[[str | None], None] = kill_window
     check_window: Callable[[str | None], bool] = window_exists
+    tmux_available: Callable[[], bool] = is_tmux_launch_available
+    spawn_runner: Callable[..., Any] = subprocess.Popen
 
     def build_runner_command(self, cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int) -> str:
-        parts = [shlex.quote(sys.executable), "-m", "qqtools.plugins.qexp.runner", "--shared-root",
-                 shlex.quote(str(cfg.shared_root)), "--machine", shlex.quote(cfg.machine_name),
-                 "--task-id", shlex.quote(task_id), "--attempt-id", shlex.quote(attempt_id),
-                 "--fencing-token", str(fencing_token), "--runtime-root", shlex.quote(str(cfg.runtime_root))]
+        parts = [shlex.quote(part) for part in self.build_runner_argv(
+            cfg, task_id, attempt_id, fencing_token
+        )]
         return " ".join(parts)
 
+    def build_runner_argv(self, cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "qqtools.plugins.qexp.runner",
+            "--shared-root",
+            str(cfg.shared_root),
+            "--machine",
+            cfg.machine_name,
+            "--task-id",
+            task_id,
+            "--attempt-id",
+            attempt_id,
+            "--fencing-token",
+            str(fencing_token),
+            "--runtime-root",
+            str(cfg.runtime_root),
+        ]
+
     def launch_attempt(self, cfg: RootConfig, task_id: str, attempt: AttemptRecord, session_name: str = "experiments") -> str:
-        window_id = self.create_window(task_id, session_name, None)
-        self.send_command(window_id, self.build_runner_command(cfg, task_id, attempt.attempt_id, attempt.current_fencing_token))
-        return window_id
+        if self.tmux_available():
+            window_id = self.create_window(task_id, session_name, None)
+            self.send_command(
+                window_id,
+                self.build_runner_command(cfg, task_id, attempt.attempt_id, attempt.current_fencing_token),
+            )
+            return window_id
+
+        process = self.spawn_runner(
+            self.build_runner_argv(cfg, task_id, attempt.attempt_id, attempt.current_fencing_token),
+            cwd=str(cfg.project_root),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return f"pid:{process.pid}"
 
     def cleanup_window(self, window_id: str | None) -> None:
         self.destroy_window(window_id)

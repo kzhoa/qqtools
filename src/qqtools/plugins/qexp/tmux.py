@@ -14,6 +14,18 @@ def is_tmux_executable_available() -> bool:
     return shutil.which("tmux") is not None
 
 
+def is_libtmux_available() -> bool:
+    try:
+        importlib.import_module("libtmux")
+    except Exception:
+        return False
+    return True
+
+
+def is_tmux_launch_available() -> bool:
+    return is_tmux_executable_available() and is_libtmux_available()
+
+
 def require_libtmux():
     try:
         return importlib.import_module("libtmux")
