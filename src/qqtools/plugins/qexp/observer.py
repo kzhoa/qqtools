@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .layout import RootConfig
+from .config_types import RootConfig
 from .runtime.paths import group_path, machine_path, shared_paths, task_path
 from .runtime.records import TaskRecord
 from .runtime.store import iter_json, read_json

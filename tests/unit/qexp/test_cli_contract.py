@@ -3,8 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp import AGENT_MODE_DAEMON, init_shared_root, submit
 from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.agent import get_agent_status
 from qqtools.plugins.qexp.layout import load_root_config, runtime_pid_path
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import (authorize_launch, claim_task, expire_claim,
@@ -102,15 +103,140 @@ def test_use_still_fails_when_context_save_fails(tmp_path: Path, monkeypatch):
 
 
 def test_background_agent_start_records_parent_visible_pid(tmp_path: Path, monkeypatch):
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    cfg = init_shared_root(
+        tmp_path / ".qexp",
+        "gpu-1",
+        agent_mode=AGENT_MODE_DAEMON,
+        runtime_root=tmp_path / "rt",
+    )
 
     class FakeProcess:
         pid = 4321
 
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+    def spawn(cfg):
+        pid_path = runtime_pid_path(cfg)
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(FakeProcess.pid), encoding="utf-8")
+        return FakeProcess()
 
-    assert main([*_base_args(cfg), "agent", "start", "--persistent", "--background"]) == 0
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.spawn_agent_process", spawn)
+
+    assert main([*_base_args(cfg), "agent", "start", "--background"]) == 0
     assert runtime_pid_path(cfg).read_text(encoding="utf-8").strip() == "4321"
+
+
+def test_submit_tolerates_a_malformed_runtime_pid_file(tmp_path: Path, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    pid_path = runtime_pid_path(cfg)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("not-a-pid", encoding="utf-8")
+
+    assert get_agent_status(cfg)["is_running"] is False
+    assert main([*_base_args(cfg), "submit", "--", "echo", "ok"]) == 0
+    assert capsys.readouterr().out.strip()
+
+
+def test_agent_start_rejects_background_for_on_demand(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    assert main([*_base_args(cfg), "agent", "start", "--background"]) == 2
+
+
+def test_agent_start_rejects_legacy_persistent_flag(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    with pytest.raises(SystemExit):
+        main([*_base_args(cfg), "agent", "start", "--persistent"])
+
+
+def test_submit_requests_local_agent_activation(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    reasons: list[str] = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        lambda cfg, *, reason: reasons.append(reason) or True,
+    )
+
+    assert main([*_base_args(cfg), "submit", "--", "echo", "ok"]) == 0
+    assert reasons == ["submit"]
+
+
+def test_batch_submit_requests_local_agent_activation(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    manifest = tmp_path / "runs.yaml"
+    manifest.write_text("tasks:\n  - command: ['echo', 'ok']\n", encoding="utf-8")
+    reasons: list[str] = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        lambda cfg, *, reason: reasons.append(reason) or True,
+    )
+
+    assert main([*_base_args(cfg), "batch-submit", "--file", str(manifest), "--group", "demo"]) == 0
+    assert reasons == ["batch-submit"]
+
+
+def test_retry_requests_local_agent_activation(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(
+        tmp_path / ".qexp",
+        "gpu-1",
+        runtime_root=tmp_path / "rt",
+    )
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    reasons: list[str] = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        lambda cfg, *, reason: reasons.append(reason) or True,
+    )
+
+    assert main([*_base_args(cfg), "task", "retry", task.task_id, "--acknowledge-duplicate-risk"]) == 0
+    assert reasons == ["task-retry"]
+
+
+def test_offer_requests_local_agent_activation(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"], group="demo", sharing_mode="spillover")
+    reasons: list[str] = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        lambda cfg, *, reason: reasons.append(reason) or True,
+    )
+
+    assert main([*_base_args(cfg), "task", "offer", task.task_id]) == 0
+    assert reasons == ["task-offer"]
+
+
+def test_group_resume_requests_local_agent_activation(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    main([*_base_args(cfg), "group", "create", "demo"])
+    main([*_base_args(cfg), "group", "pause", "demo"])
+    reasons: list[str] = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        lambda cfg, *, reason: reasons.append(reason) or True,
+    )
+
+    assert main([*_base_args(cfg), "group", "resume", "demo"]) == 0
+    assert reasons == ["group-resume"]
+
+
+def test_group_retry_failed_requests_local_agent_activation(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"], group="demo")
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert fail_attempt(
+        cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure"
+    )
+    reasons: list[str] = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        lambda cfg, *, reason: reasons.append(reason) or True,
+    )
+
+    assert main([*_base_args(cfg), "group", "retry-failed", "demo"]) == 0
+    assert reasons == ["group-retry-failed"]
 
 
 def test_agent_stop_clears_stale_pid_file(tmp_path: Path, monkeypatch):

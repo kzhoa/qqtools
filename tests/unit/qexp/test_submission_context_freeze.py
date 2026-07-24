@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.layout import RootConfig
+from qqtools.plugins.qexp.config_types import RootConfig
 
 
 def test_cross_machine_idempotency_reuses_original_home_and_workers(tmp_path: Path):

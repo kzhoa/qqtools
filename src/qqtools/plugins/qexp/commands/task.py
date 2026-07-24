@@ -6,7 +6,8 @@ from typing import Any, Callable
 
 import yaml
 
-from ..layout import (RootConfig, ensure_machine_layout, ensure_shared_layout,
+from ..config_types import RootConfig
+from ..layout import (ensure_machine_layout, ensure_shared_layout,
                       validate_root_contract)
 from ..runtime.locks import task_lock
 from ..runtime.paths import attempt_path, shared_paths

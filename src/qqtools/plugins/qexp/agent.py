@@ -8,7 +8,8 @@ import time
 from typing import Any
 
 from .executor import Executor
-from .layout import RootConfig, runtime_pid_path
+from .config_types import RootConfig
+from .layout import runtime_pid_path
 from .runtime.reservations import active_reservations, release, release_expired_provisionals, reserved_gpu_ids, retag
 from .commands.cleanup import reconcile_cleanup_operations
 from .commands.group import reconcile_group_cancel_operations
@@ -35,7 +36,10 @@ def _runtime_pid_value(pid_path) -> int:
 
 def get_agent_status(cfg: RootConfig, probe_local_pid: bool = True) -> dict[str, Any]:
     pid_path = runtime_pid_path(cfg)
-    pid = int(pid_path.read_text().strip()) if pid_path.exists() else None
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip()) if pid_path.exists() else None
+    except (OSError, ValueError):
+        pid = None
     running = bool(pid and (not probe_local_pid or _pid_alive(pid)))
     return {"machine_name": cfg.machine_name, "agent_state": "active" if running else "stopped",
             "pid": pid, "is_running": running}
@@ -65,7 +69,7 @@ def _visible_gpus(cfg: RootConfig) -> list[int]:
         return []
 
 
-def run_agent_loop(cfg: RootConfig, *, persistent: bool = False, loop_interval: float = 5.0,
+def run_agent_loop(cfg: RootConfig, *, exit_when_idle: bool = True, loop_interval: float = 5.0,
                    idle_timeout: int = 600, available_gpus: list[int] | None = None,
                    executor: Executor | None = None) -> None:
     cfg.runtime_root.mkdir(parents=True, exist_ok=True)
@@ -75,7 +79,7 @@ def run_agent_loop(cfg: RootConfig, *, persistent: bool = False, loop_interval: 
     executor = executor or Executor()
     started = time.monotonic()
     try:
-        while persistent or time.monotonic() - started < idle_timeout:
+        while not exit_when_idle or time.monotonic() - started < idle_timeout:
             release_expired_provisionals(cfg.runtime_root)
             _reconcile_reservations(cfg)
             reconcile_running_tasks(cfg, executor=executor)
@@ -128,5 +132,5 @@ def _offer_due_tasks(cfg: RootConfig) -> None:
             continue
 
 
-def start_agent(cfg: RootConfig, *, persistent: bool = False, idle_timeout: int = 600) -> None:
-    run_agent_loop(cfg, persistent=persistent, idle_timeout=idle_timeout)
+def start_agent(cfg: RootConfig, *, exit_when_idle: bool = True, idle_timeout: int = 600) -> None:
+    run_agent_loop(cfg, exit_when_idle=exit_when_idle, idle_timeout=idle_timeout)

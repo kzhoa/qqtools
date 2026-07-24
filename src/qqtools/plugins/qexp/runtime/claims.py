@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..layout import RootConfig
+from ..config_types import RootConfig
 from .locks import task_lock
 from .records import utc_now
 from .tasks import load_task, save_task

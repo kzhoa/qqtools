@@ -1058,14 +1058,14 @@ Default behavior:
 - agent exits after true idleness
 - qexp does not remotely wake other machines
 
-Persistent mode is opt-in:
+Daemon mode is opt-in:
 
 ```bash
-qexp init --shared-root /path/to/project/.qexp --machine gpu2a --agent-mode persistent
-qexp agent start --persistent
+qexp init --shared-root /path/to/project/.qexp --machine gpu2a --agent-mode daemon
+qexp agent start
 ```
 
-`qexp agent start --persistent --background` must preserve persistent mode.
+`qexp agent start --background` requires `agent_mode=daemon` and must preserve daemon mode.
 
 ### 15.4 Local Process Ownership
 

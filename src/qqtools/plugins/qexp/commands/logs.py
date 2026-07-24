@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..layout import RootConfig, runtime_log_path
+from ..config_types import RootConfig
+from ..layout import runtime_log_path
 from ..runtime.paths import attempt_path, shared_paths
 from ..runtime.records import AttemptRecord, TaskRecord
 from ..runtime.store import iter_json, read_json

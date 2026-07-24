@@ -8,7 +8,8 @@ import subprocess
 import time
 from pathlib import Path
 
-from .layout import RootConfig, load_root_config, runtime_log_path
+from .config_types import RootConfig
+from .layout import load_root_config, runtime_log_path
 from .runtime.paths import attempt_path
 from .runtime.records import AttemptRecord, utc_now
 from .runtime.reservations import release

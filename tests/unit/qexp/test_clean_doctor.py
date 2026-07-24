@@ -10,7 +10,7 @@ from qqtools.plugins.qexp.commands.group import (group_control,
                                                 reconcile_group_cancel_operations)
 from qqtools.plugins.qexp.commands.task import offer, retry
 from qqtools.plugins.qexp.doctor import repair_metadata, repair_orphans, verify_integrity
-from qqtools.plugins.qexp.layout import RootConfig
+from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.runtime.locks import group_lock, task_lock
 from qqtools.plugins.qexp.runtime.paths import attempt_path, group_path, task_path
 from qqtools.plugins.qexp.runtime.reservations import attach, reserve, reserved_gpu_ids

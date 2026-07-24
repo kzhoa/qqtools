@@ -651,7 +651,7 @@ Hostname is never the primary machine key.
 
 It contains:
 
-- configured mode: `on_demand | persistent`
+- configured mode: `on_demand | daemon`
 - observed state: `stopped | starting | active | draining | idle | stale | failed`
 - agent instance ID and PID
 - started, heartbeat, idle, and transition timestamps
@@ -1280,16 +1280,16 @@ Default behavior:
 - provisional reservations, active processes, pending termination, and repair work prevent
   idle exit
 
-### 17.2 Persistent Mode
+### 17.2 Daemon Mode
 
-Persistent mode remains active until explicit stop or unrecoverable local failure.
+Daemon mode remains active until explicit stop or unrecoverable local failure.
 
 ```bash
-qexp agent start --persistent
-qexp agent start --persistent --background
+qexp agent start
+qexp agent start --background
 ```
 
-Background startup must preserve the persistent flag.
+Background startup requires `agent_mode=daemon` and must preserve daemon mode.
 
 ### 17.3 Agent Startup Reconciliation
 
@@ -1420,7 +1420,7 @@ The runtime implementation is not releasable until tests demonstrate:
 - duplicate-risk retry requires explicit acknowledgement and is excluded from Group retry
 - Group cancellation progress and pending acknowledgements survive process restart
 - on-demand idle exit does not abandon processes, reservations, or repair work
-- persistent background startup preserves persistent mode
+- daemon background startup preserves daemon mode
 - unsupported Batch-era schema fails before mutation
 - indexes and summaries rebuild without changing truth
 

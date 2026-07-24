@@ -2,31 +2,13 @@
 from __future__ import annotations
 
 import json
-import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .config_types import RootConfig
 from .runtime.paths import local_paths, machine_path, shared_paths
 from .runtime.records import SCHEMA_VERSION, utc_now
 from .runtime.store import atomic_replace, read_json
-
-
-@dataclass(slots=True)
-class RootConfig:
-    shared_root: Path
-    project_root: Path
-    machine_name: str
-    runtime_root: Path
-
-    def __post_init__(self) -> None:
-        self.shared_root = Path(self.shared_root).expanduser().resolve()
-        self.project_root = Path(self.project_root).expanduser().resolve()
-        self.runtime_root = Path(self.runtime_root).expanduser().resolve()
-        if self.shared_root.name != ".qexp":
-            raise ValueError("shared_root must point to a project control root named '.qexp'.")
-        if not self.machine_name or "/" in self.machine_name or "\\" in self.machine_name or ".." in self.machine_name:
-            raise ValueError("machine_name is invalid.")
 
 
 def _schema_path(cfg: RootConfig) -> Path:
@@ -82,12 +64,7 @@ def ensure_machine_layout(cfg: RootConfig) -> None:
         (machine_dir / name).mkdir(parents=True, exist_ok=True)
 
 
-def init_shared_root(shared_root: Path, machine_name: str, *, agent_mode: str = "on_demand",
-                     runtime_root: Path | None = None) -> RootConfig:
-    shared_root = Path(shared_root).expanduser().resolve()
-    project_root = shared_root.parent
-    runtime_root = runtime_root or Path.home() / ".qqtools" / "qexp-runtime" / project_id(shared_root) / machine_name
-    cfg = RootConfig(shared_root, project_root, machine_name, runtime_root)
+def initialize_shared_root(cfg: RootConfig) -> None:
     existing = read_schema_version(cfg)
     if existing is not None and existing != SCHEMA_VERSION:
         raise RuntimeError(f"Unsupported qexp schema {existing!r}; refusing mixed-schema initialization.")
@@ -100,13 +77,17 @@ def init_shared_root(shared_root: Path, machine_name: str, *, agent_mode: str = 
     atomic_replace(_schema_path(cfg), schema)
     identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
     if not identity_path.exists():
-        atomic_replace(identity_path, {"project": {"project_id": project_id(shared_root),
-                                                     "shared_root": str(shared_root)}})
-    machine = {"machine": {"machine_name": machine_name, "hostname": os.uname().nodename,
-                            "project_id": project_id(shared_root), "shared_root": str(shared_root),
-                            "runtime_root": str(runtime_root), "agent_mode": agent_mode}}
-    atomic_replace(machine_path(shared_root, machine_name), machine)
-    return cfg
+        atomic_replace(identity_path, {"project": {"project_id": project_id(cfg.shared_root),
+                                                     "shared_root": str(cfg.shared_root)}})
+
+
+def load_machine_record(cfg: RootConfig) -> dict[str, Any] | None:
+    path = machine_path(cfg.shared_root, cfg.machine_name)
+    return read_json(path) if path.exists() else None
+
+
+def save_machine_record(cfg: RootConfig, record: dict[str, Any]) -> None:
+    atomic_replace(machine_path(cfg.shared_root, cfg.machine_name), record)
 
 
 def project_id(shared_root: Path) -> str:
