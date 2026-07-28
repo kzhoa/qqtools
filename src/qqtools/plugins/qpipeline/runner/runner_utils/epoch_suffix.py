@@ -43,7 +43,7 @@ class EpochSuffixResolver:
 
     def __init__(
         self,
-        run_mode: str,
+        run_mode: Any,
         step_on: Optional[str],
         train_loader_length: int,
         accum_grad: Optional[int] = None,
@@ -70,7 +70,16 @@ class EpochSuffixResolver:
                 "train_loader supports __len__."
             )
 
-        self.run_mode = run_mode.lower() if isinstance(run_mode, str) else run_mode
+        normalized_run_mode = getattr(run_mode, "value", run_mode)
+        if normalized_run_mode is None:
+            raise ValueError("run_mode cannot be None")
+        if not isinstance(normalized_run_mode, str) or normalized_run_mode.lower() not in {
+            "epoch",
+            "step",
+        }:
+            raise ValueError(f"run_mode must be 'epoch' or 'step', got {run_mode!r}.")
+
+        self.run_mode = normalized_run_mode.lower()
         self.step_on = self._resolve_effective_step_on(step_on, scheduler_name)
         self.train_loader_length = train_loader_length
         self.effective_accum_grad = accum_grad if accum_grad and accum_grad >= 1 else 1
@@ -83,6 +92,7 @@ class EpochSuffixResolver:
         self._scheduler_resolved_fields: List[str] = []
         self._warnings: List[str] = []
         self._logs: List[str] = []
+        self._is_ddp_consistency_checked = False
 
     @staticmethod
     def _resolve_effective_step_on(step_on: Optional[str], scheduler_name: Optional[str]) -> str:
@@ -92,12 +102,11 @@ class EpochSuffixResolver:
             return "valid_end"
         return "optimizer_step"
 
-    def resolve(self, args) -> "ResolveResult":
+    def resolve(self, args: Any, runner_fields: Any) -> "ResolveResult":
         """Parse all epoch-suffix fields in args, rewrite to integers, return result."""
-        self._check_ddp_consistency()
         self._resolve_scheduler_params(args)
         self._resolve_warmup(args)
-        self._resolve_runner_fields(args)
+        self._resolve_runner_fields(runner_fields)
         self._check_warmup_coupling()
         self._build_summary_log()
         return ResolveResult(
@@ -108,6 +117,18 @@ class EpochSuffixResolver:
         )
 
     # ─── DDP consistency ───────────────────────────────────────────────
+
+    def _parse_epoch_suffix(self, value: Any) -> Optional[float]:
+        coefficient = _parse_epoch_suffix(value)
+        if coefficient is not None:
+            self._ensure_ddp_consistency()
+        return coefficient
+
+    def _ensure_ddp_consistency(self) -> None:
+        if self._is_ddp_consistency_checked:
+            return
+        self._check_ddp_consistency()
+        self._is_ddp_consistency_checked = True
 
     def _check_ddp_consistency(self) -> None:
         if not self.distributed:
@@ -148,7 +169,7 @@ class EpochSuffixResolver:
             raw = self._get_field(scheduler_params, field)
             if raw is None:
                 continue
-            coeff = _parse_epoch_suffix(raw)
+            coeff = self._parse_epoch_suffix(raw)
             if coeff is None:
                 continue
             resolved = self._convert_scheduler_field(field, coeff)
@@ -163,7 +184,7 @@ class EpochSuffixResolver:
             new_list = []
             any_resolved = False
             for i, item in enumerate(raw_list):
-                coeff = _parse_epoch_suffix(item)
+                coeff = self._parse_epoch_suffix(item)
                 if coeff is not None:
                     resolved = self._convert_scheduler_field(f"{field}[{i}]", coeff)
                     new_list.append(resolved)
@@ -207,7 +228,7 @@ class EpochSuffixResolver:
         raw = self._get_field(warmup_params, "warmup_steps")
         if raw is None:
             return
-        coeff = _parse_epoch_suffix(raw)
+        coeff = self._parse_epoch_suffix(raw)
         if coeff is None:
             return
 
@@ -219,16 +240,12 @@ class EpochSuffixResolver:
 
     # ─── Runner fields ─────────────────────────────────────────────────
 
-    def _resolve_runner_fields(self, args) -> None:
-        runner = self._get_runner(args)
-        if runner is None:
-            return
-
+    def _resolve_runner_fields(self, runner: Any) -> None:
         for field in _RUNNER_FIELDS:
             raw = self._get_field(runner, field)
             if raw is None:
                 continue
-            coeff = _parse_epoch_suffix(raw)
+            coeff = self._parse_epoch_suffix(raw)
             if coeff is None:
                 continue
             resolved = self._convert_runner_field(field, coeff)
@@ -305,10 +322,6 @@ class EpochSuffixResolver:
         return getattr(optim, "warmup_params", None)
 
     @staticmethod
-    def _get_runner(args) -> Optional[Any]:
-        return getattr(args, "runner", None)
-
-    @staticmethod
     def _get_field(obj: Any, key: str) -> Any:
         if isinstance(obj, dict):
             return obj.get(key)
@@ -347,22 +360,25 @@ class ResolveResult:
 def standardize_epoch_suffixes(
     args: Any,
     task: Any,
+    run_mode: Any,
+    eval_interval: Any,
+    save_interval: Any,
     accum_grad: Optional[int],
     distributed: bool,
-    logger: Any,
-) -> None:
-    """Resolve all epoch-suffix config values in args as part of config standardization.
-
-    This is the public entry point called by train_runner. It extracts the necessary
-    context from args and task, constructs an EpochSuffixResolver, and applies
-    the resolution. Logs are emitted to the provided logger.
+) -> Tuple[Any, Any, List[str]]:
+    """Resolve epoch-suffix values before runner and scheduler construction.
 
     Args:
         args: The full config object (qDict or Namespace).
         task: Task instance with a train_loader attribute.
+        run_mode: Effective runner mode passed to train_runner.
+        eval_interval: Effective evaluation interval passed to train_runner.
+        save_interval: Effective save interval passed to train_runner.
         accum_grad: Gradient accumulation factor.
         distributed: Whether DDP is active.
-        logger: Logger instance supporting .info() and .warning().
+
+    Returns:
+        Resolved eval interval, resolved save interval, and informational log lines.
     """
     try:
         train_loader_length = len(task.train_loader)
@@ -370,7 +386,17 @@ def standardize_epoch_suffixes(
         train_loader_length = None
 
     if train_loader_length is None or train_loader_length <= 0:
-        return
+        has_interval_suffix = (
+            _parse_epoch_suffix(eval_interval) is not None
+            or _parse_epoch_suffix(save_interval) is not None
+        )
+        if has_interval_suffix:
+            raise ValueError(
+                "epoch-suffix auto-compute requires len(task.train_loader) "
+                "to be a positive integer. "
+                "Provide explicit integer intervals or ensure train_loader supports __len__."
+            )
+        return eval_interval, save_interval, []
 
     optim_cfg = getattr(args, "optim", None)
     scheduler_params = getattr(optim_cfg, "scheduler_params", None) if optim_cfg else None
@@ -384,14 +410,6 @@ def standardize_epoch_suffixes(
     if optim_cfg is not None:
         scheduler_name = getattr(optim_cfg, "scheduler", None)
 
-    runner_cfg = getattr(args, "runner", None)
-    if runner_cfg is None:
-        run_mode = "epoch"
-    elif hasattr(runner_cfg, "get"):
-        run_mode = runner_cfg.get("run_mode", "epoch")
-    else:
-        run_mode = getattr(runner_cfg, "run_mode", "epoch")
-
     resolver = EpochSuffixResolver(
         run_mode=run_mode,
         step_on=step_on,
@@ -400,9 +418,13 @@ def standardize_epoch_suffixes(
         distributed=distributed,
         scheduler_name=scheduler_name,
     )
-    result = resolver.resolve(args)
+    runner_fields = {
+        "eval_interval": eval_interval,
+        "save_interval": save_interval,
+    }
+    result = resolver.resolve(args, runner_fields)
 
-    for log_line in result.logs:
-        logger.info(log_line)
     for warning_line in result.warnings:
         _warnings.warn(warning_line, stacklevel=2)
+
+    return runner_fields["eval_interval"], runner_fields["save_interval"], result.logs

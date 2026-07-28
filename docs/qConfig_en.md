@@ -559,11 +559,24 @@ runner:
     mode: min
 ```
 
-- **Characteristics**: Update every N samples (not limited to complete epochs)
+- **Characteristics**: Control training boundaries and periodic actions by completed optimizer updates rather than dataloader iterations
 - **When to Use**: Very large datasets, online learning, precise step control
 - **Key Parameters**: `max_steps`, `eval_interval` (counted in steps)
 - **Note**: In this mode, you must provide at least one of `max_steps` or `max_epochs`. `max_steps` can be provided explicitly, or inferred from `max_epochs`, `len(task.train_loader)`, and `accum_grad` when omitted. If `max_epochs` is specified, it also remains an epoch-level secondary stopping boundary, and training stops when either limit is reached first.
 - **Epoch-Suffix Auto-Compute**: In step mode, fields that normally require step counts can use `epoch` suffix syntax (e.g., `eval_interval: 0.5epoch`). The framework automatically converts to steps based on `len(task.train_loader)` and `accum_grad`. See [Epoch-Suffix Syntax](#epoch-suffix-syntax) below.
+
+### Global Step and Optimizer-Step Semantics
+
+`global_step` counts completed optimizer updates. It does not count dataloader iterations, gradient-accumulation microbatches, or individual samples. The counter increments immediately after a successful `optimizer.step()`.
+
+When `accum_grad=N`, an optimizer step normally occurs after every `N` microbatches. If an epoch ends with an incomplete accumulation window, the remaining gradients are applied at epoch end, and that optimizer update also increments `global_step`.
+
+In `run_mode: step`, the following values are measured in completed optimizer steps:
+
+- `global_step`
+- `max_steps`
+- `eval_interval`
+- `save_interval`
 
 ### Fields Summary
 
@@ -572,8 +585,8 @@ runner:
 | `run_mode`        | ✅        | String  | epoch/step | epoch   | Training mode                 |
 | `max_epochs`      | ⚠️        | Integer | ≥ 1        | None    | Required in epoch mode; in step mode, at least one of `max_epochs` or `max_steps` must be provided |
 | `max_steps`       | ⚠️        | Integer | ≥ 1        | null    | Effective in step mode; in step mode, at least one of `max_steps` or `max_epochs` must be provided; ignored in epoch mode |
-| `eval_interval`   | ❌        | Integer | ≥ 1        | 1       | Evaluation interval           |
-| `save_interval`   | ❌        | Integer | ≥ 1        | null    | Regular save interval (units follow run_mode) |
+| `eval_interval`   | ❌        | Integer or epoch-suffix string | Integer ≥ 1; suffix coefficient > 0 | 1 | Evaluation interval |
+| `save_interval`   | ❌        | Integer, epoch-suffix string, or null | Integer ≥ 1; suffix coefficient > 0 | null | Regular save interval (units follow run_mode) |
 | `checkpoint.regular_latest_only` | ❌        | Boolean | true/false | true    | Keep only latest regular ckp  |
 | `clip_grad`       | ❌        | Float   | ≥ 0.1      | null    | Gradient clipping threshold   |
 | `accum_grad`      | ❌        | Integer | ≥ 1        | null    | Gradient accumulation factor  |
@@ -630,7 +643,7 @@ runner:
 - **Description**: Evaluation frequency. The unit of this interval is automatically determined by `run_mode`:
   - If `run_mode='epoch'`: Specifies the number of **epochs** between evaluations. Epoch-suffix syntax is **not** allowed in this mode.
   - If `run_mode='step'`: Specifies the number of **steps** between evaluations. Supports epoch-suffix syntax.
-- **Epoch-Suffix**: When using epoch-suffix in step mode, the value is converted to `max(1, int(coeff * steps_per_epoch))` where `steps_per_epoch = ceil(len(train_loader) / accum_grad)`.
+- **Epoch-Suffix**: In step mode, the value is converted to optimizer steps using the rules in [Epoch-Suffix Syntax](#epoch-suffix-syntax).
 - **Effect**: Triggers validation evaluation, best model checking, early stopping check
 - **Recommendation**:
   - Small datasets: 1-5
@@ -657,7 +670,7 @@ runner:
   - null: Automatically saves a regular checkpoint every time an evaluation is triggered based on `eval_interval`.
   - Positive integer in epoch mode: Save checkpoint every N epochs
   - Positive integer in step mode: Save checkpoint every N optimizer steps
-  - Epoch-suffix in step mode: Converted to steps via `max(1, int(coeff * steps_per_epoch))`
+  - Epoch-suffix in step mode: Converted to optimizer steps using the rules in [Epoch-Suffix Syntax](#epoch-suffix-syntax)
 
 - **Note**:
   - Separate from best model checkpoint
@@ -774,8 +787,24 @@ runner:
 
 When `run_mode=step`, many step-count fields support epoch-suffix syntax to eliminate manual step calculation. The framework automatically converts values like `"0.5epoch"` to optimizer step counts.
 
-**Formula**: `resolved_value = max(1, int(coefficient * steps_per_epoch))`
-where `steps_per_epoch = ceil(len(task.train_loader) / accum_grad)`
+The conversion uses the following definitions:
+
+```text
+effective_accum_grad = accum_grad if accum_grad is set else 1
+optimizer_steps_per_epoch = ceil(len(task.train_loader) / effective_accum_grad)
+resolved_steps = max(1, int(epoch_coefficient * optimizer_steps_per_epoch))
+```
+
+Conversion rules:
+
+- `len(task.train_loader)` is the number of training microbatches per epoch on the current rank.
+- In DDP, data partitioning is already reflected in each rank's loader length. Do not divide by `world_size` again.
+- Dividing by `effective_accum_grad` converts microbatch counts to optimizer-step counts.
+- `ceil()` accounts for the incomplete accumulation window that is flushed at epoch end.
+- Because the epoch coefficient is positive, `int()` rounds a fractional result down to the nearest integer.
+- The resolved value is clamped to a minimum of one optimizer step.
+- `accum_grad=None` and `accum_grad=1` are equivalent for this conversion.
+- When epoch-suffix syntax is used under DDP, all ranks must have identical `len(task.train_loader)` values. The runner raises an error if they differ.
 
 **Supported fields**:
 
@@ -783,6 +812,7 @@ where `steps_per_epoch = ceil(len(task.train_loader) / accum_grad)`
 | ----- | -------------------- | --------------------- |
 | `scheduler_params.T_max` | Yes (if `step_on=optimizer_step`) | Yes (if `step_on=optimizer_step`) |
 | `scheduler_params.step_size` | Yes (if `step_on=optimizer_step`) | Yes (if `step_on=optimizer_step`) |
+| `scheduler_params.T_0` | Yes (if `step_on=optimizer_step`) | Yes (if `step_on=optimizer_step`) |
 | `scheduler_params.milestones` | Yes (if `step_on=optimizer_step`) | Yes (if `step_on=optimizer_step`) |
 | `warmup_params.warmup_steps` | Yes | Yes |
 | `runner.eval_interval` | Yes | No |
@@ -794,6 +824,25 @@ where `steps_per_epoch = ceil(len(task.train_loader) / accum_grad)`
 - If both `warmup_steps` and a scheduler parameter use epoch-suffix, the framework emits a warning reminding that scheduler counting begins after warmup completes
 
 **Example**:
+
+```yaml
+runner:
+  run_mode: step
+  max_steps: 10000
+  accum_grad: 2
+  eval_interval: 0.25epoch
+```
+
+If `len(task.train_loader)=1000` microbatches per rank:
+
+```text
+optimizer_steps_per_epoch = ceil(1000 / 2) = 500
+eval_interval = max(1, int(0.25 * 500)) = 125
+```
+
+Evaluation therefore runs every 125 completed optimizer updates, corresponding to approximately 250 microbatches.
+
+The same conversion also applies to supported scheduler and warmup fields. For example:
 
 ```yaml
 runner:
@@ -813,7 +862,7 @@ optim:
     warmup_factor: 0.01
 ```
 
-With `len(train_loader)=1000` and `accum_grad=4`, `steps_per_epoch=250`, so:
+With `len(task.train_loader)=1000` and `accum_grad=4`, `optimizer_steps_per_epoch=250`, so:
 - `T_max` = 5 * 250 = 1250 steps
 - `eval_interval` = 0.5 * 250 = 125 steps
 - `save_interval` = 1 * 250 = 250 steps

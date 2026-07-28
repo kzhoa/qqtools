@@ -25,11 +25,11 @@ from ..entry_utils.type_qconfig import CheckpointConfig, EarlyStopConfig, qConfi
 from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import TASK_LIFECYCLE_HOOKS, qTaskBase
 from .agent import NaNDetectedError, RunningAgent
-from .runner_utils.epoch_suffix import standardize_epoch_suffixes
 from .events import ValidationEndEventContext
 from .runner_utils.ckp_manager import CheckpointListener, CheckpointManager
 from .runner_utils.common import _getattr_or_default, _is_periodic_trigger, move_batch_to_device
 from .runner_utils.earlystop import EarlyStopListener, EarlyStopper
+from .runner_utils.epoch_suffix import standardize_epoch_suffixes
 from .runner_utils.eval_formatter import EvalSummaryListener
 from .runner_utils.progress import ProgressTracker
 from .runner_utils.sheet_logger import SheetLogger, SheetLoggerListener
@@ -445,8 +445,8 @@ def train_runner(
     use_profiler: bool = False,
     ema_model: Optional[qEMA] = None,
     run_mode: Union[str, RunMode] = "epoch",
-    eval_interval: int = 1,
-    save_interval: Optional[int] = None,
+    eval_interval: Union[int, str, None] = 1,
+    save_interval: Optional[Union[int, str]] = None,
     accum_grad: Optional[int] = None,
     log_granularity: Optional[List[Literal["eval", "batch"]]] = ["eval"],
     auto_offload: bool = False,
@@ -480,8 +480,8 @@ def train_runner(
         use_profiler: Whether to use profiler
         ema_model: EMA model
         run_mode: Running mode ("epoch" or "step")
-        eval_interval: Evaluation interval (interpreted as epochs or steps depending on run_mode)
-        save_interval: Regular checkpoint saving interval (interpreted as epochs or steps depending on run_mode)
+        eval_interval: Evaluation interval. Epoch-suffix strings are converted to optimizer steps.
+        save_interval: Checkpoint interval. Epoch-suffix strings are converted to optimizer steps.
         accum_grad: Optional gradient accumulation factor. `None` disables accumulation.
         auto_offload: Whether to offload the main model during EMA evaluation
 
@@ -519,6 +519,16 @@ def train_runner(
         checkpoint_config = {}
     if early_stop_config is None:
         early_stop_config = {}
+
+    eval_interval, save_interval, epoch_suffix_logs = standardize_epoch_suffixes(
+        args=args,
+        task=task,
+        run_mode=run_mode,
+        eval_interval=eval_interval,
+        save_interval=save_interval,
+        accum_grad=accum_grad,
+        distributed=distributed,
+    )
 
     effective_input_max_steps, effective_input_max_epochs, inferred_max_step_warnings = _resolve_step_mode_max_steps(
         run_mode=run_mode,
@@ -590,15 +600,15 @@ def train_runner(
     if logger is None:
         logger = qLogger(save_dir, console=True)
 
+    for log_line in epoch_suffix_logs:
+        logger.info(log_line)
+
     sheet_logger = None
     if log_granularity and config.rank == 0:
         metrics_file = Path(save_dir) / "metrics.csv"
         sheet_logger = SheetLogger(metrics_file, columns=log_keys)
     for warning_msg in boundary_policy_warnings:
         logger.warning(warning_msg)
-
-    # --- Config standardization: epoch-suffix resolution ---
-    standardize_epoch_suffixes(args, task, accum_grad, distributed, logger)
 
     # --- Optimizer creation ---
     if optimizer is None:

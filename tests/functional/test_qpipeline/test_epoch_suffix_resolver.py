@@ -1,13 +1,15 @@
 """Tests for EpochSuffixResolver — epoch-suffix auto-compute for step-mode fields."""
 
+from unittest.mock import patch
+
 import pytest
 
 import qqtools as qt
 from qqtools.plugins.qpipeline.runner.runner_utils.epoch_suffix import (
     EpochSuffixResolver,
     _parse_epoch_suffix,
+    standardize_epoch_suffixes,
 )
-
 
 # ─── Unit tests for _parse_epoch_suffix ────────────────────────────────────────
 
@@ -36,6 +38,144 @@ class TestParseEpochSuffix:
 
     def test_large_float(self):
         assert _parse_epoch_suffix("10.5epoch") == 10.5
+
+
+class TestStandardizeEpochSuffixes:
+    class _NoLenTask:
+        class _NoLenLoader:
+            def __iter__(self):
+                return iter(())
+
+        train_loader = _NoLenLoader()
+
+    def test_suffix_requires_train_loader_length(self):
+        args = _make_args()
+
+        with pytest.raises(ValueError, match=r"requires len\(task.train_loader\)"):
+            standardize_epoch_suffixes(
+                args=args,
+                task=self._NoLenTask(),
+                run_mode="step",
+                eval_interval="0.5epoch",
+                save_interval=None,
+                accum_grad=None,
+                distributed=False,
+            )
+
+    def test_plain_intervals_do_not_require_train_loader_length(self):
+        args = _make_args()
+
+        eval_interval, save_interval, logs = standardize_epoch_suffixes(
+            args=args,
+            task=self._NoLenTask(),
+            run_mode="step",
+            eval_interval=3,
+            save_interval=None,
+            accum_grad=None,
+            distributed=False,
+        )
+
+        assert eval_interval == 3
+        assert save_interval is None
+        assert logs == []
+
+
+class TestDdpConsistencyCheck:
+    def test_plain_values_do_not_check_ddp_consistency(self):
+        args = _make_args(
+            scheduler_params={"T_max": 100, "milestones": [25, 50]},
+            warmup_params={"warmup_steps": 10},
+            eval_interval=5,
+            save_interval=10,
+        )
+        resolver = EpochSuffixResolver(
+            run_mode="step",
+            step_on=None,
+            train_loader_length=100,
+            accum_grad=1,
+            distributed=True,
+        )
+
+        with patch.object(resolver, "_check_ddp_consistency") as check:
+            resolver.resolve(args, args.runner)
+
+        check.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("scheduler_params", "warmup_params", "eval_interval"),
+        [
+            ({"T_max": "1epoch"}, None, 5),
+            ({"milestones": [25, "1epoch"]}, None, 5),
+            ({"T_max": 100}, {"warmup_steps": "1epoch"}, 5),
+            ({"T_max": 100}, None, "1epoch"),
+        ],
+    )
+    def test_each_supported_area_checks_ddp_consistency_once(
+        self, scheduler_params, warmup_params, eval_interval
+    ):
+        args = _make_args(
+            scheduler_params=scheduler_params,
+            warmup_params=warmup_params,
+            eval_interval=eval_interval,
+        )
+        resolver = EpochSuffixResolver(
+            run_mode="step",
+            step_on=None,
+            train_loader_length=100,
+            accum_grad=1,
+            distributed=True,
+        )
+
+        with patch.object(resolver, "_check_ddp_consistency") as check:
+            resolver.resolve(args, args.runner)
+
+        check.assert_called_once_with()
+
+    def test_multiple_suffixes_check_ddp_consistency_once(self):
+        args = _make_args(
+            scheduler_params={"T_max": "2epoch", "milestones": ["1epoch", "2epoch"]},
+            warmup_params={"warmup_steps": "0.1epoch"},
+            eval_interval="0.5epoch",
+            save_interval="1epoch",
+        )
+        resolver = EpochSuffixResolver(
+            run_mode="step",
+            step_on=None,
+            train_loader_length=100,
+            accum_grad=1,
+            distributed=True,
+        )
+
+        with patch.object(resolver, "_check_ddp_consistency") as check:
+            resolver.resolve(args, args.runner)
+
+        check.assert_called_once_with()
+
+    def test_failed_ddp_consistency_check_does_not_mutate_config(self):
+        args = _make_args(
+            scheduler_params={"T_max": "2epoch"},
+            warmup_params={"warmup_steps": "0.1epoch"},
+            eval_interval="0.5epoch",
+        )
+        resolver = EpochSuffixResolver(
+            run_mode="step",
+            step_on=None,
+            train_loader_length=100,
+            accum_grad=1,
+            distributed=True,
+        )
+
+        with patch.object(
+            resolver,
+            "_check_ddp_consistency",
+            side_effect=RuntimeError("inconsistent loader lengths"),
+        ):
+            with pytest.raises(RuntimeError, match="inconsistent loader lengths"):
+                resolver.resolve(args, args.runner)
+
+        assert args.optim.scheduler_params.T_max == "2epoch"
+        assert args.optim.warmup_params.warmup_steps == "0.1epoch"
+        assert args.runner.eval_interval == "0.5epoch"
 
 
 # ─── Fixtures ──────────────────────────────────────────────────────────────────
@@ -84,7 +224,7 @@ class TestStepModeBasicResolution:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=2
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.scheduler_params.T_max == 250  # 5 * 50
 
     def test_t_max_float_epoch(self):
@@ -92,7 +232,7 @@ class TestStepModeBasicResolution:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=1000, accum_grad=4
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.scheduler_params.T_max == 125  # 0.5 * 250
 
     def test_eval_interval_epoch(self):
@@ -100,7 +240,7 @@ class TestStepModeBasicResolution:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=200, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.runner.eval_interval == 200
 
     def test_save_interval_epoch(self):
@@ -108,7 +248,7 @@ class TestStepModeBasicResolution:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=200, accum_grad=2
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.runner.save_interval == 50  # 0.5 * 100
 
     def test_warmup_steps_epoch(self):
@@ -116,7 +256,7 @@ class TestStepModeBasicResolution:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=1000, accum_grad=4
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.warmup_params.warmup_steps == 25  # 0.1 * 250
 
     def test_step_size_epoch(self):
@@ -124,7 +264,7 @@ class TestStepModeBasicResolution:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.scheduler_params.step_size == 200
 
     def test_milestones_epoch(self):
@@ -135,7 +275,7 @@ class TestStepModeBasicResolution:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.scheduler_params.milestones == [30, 60, 90]
 
     def test_no_epoch_suffix_passthrough(self):
@@ -143,7 +283,7 @@ class TestStepModeBasicResolution:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=200, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.scheduler_params.T_max == 100
         assert args.runner.eval_interval == 5
         assert not result.has_resolved
@@ -154,7 +294,7 @@ class TestStepModeBasicResolution:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=10, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.scheduler_params.T_max == 1
 
 
@@ -167,7 +307,7 @@ class TestAccumGradFallback:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=None
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.scheduler_params.T_max == 100  # 1 * (100/1)
 
     def test_accum_grad_explicit(self):
@@ -175,7 +315,7 @@ class TestAccumGradFallback:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=4
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.scheduler_params.T_max == 25  # 1 * ceil(100/4)
 
 
@@ -189,7 +329,7 @@ class TestStepOnValidEnd:
             run_mode="step", step_on="valid_end", train_loader_length=100, accum_grad=1
         )
         with pytest.raises(ValueError, match="step_on='valid_end'"):
-            resolver.resolve(args)
+            resolver.resolve(args, args.runner)
 
     def test_step_size_valid_end_raises(self):
         args = _make_args(scheduler="step", scheduler_params={"step_size": "2epoch"}, step_on="valid_end")
@@ -197,7 +337,7 @@ class TestStepOnValidEnd:
             run_mode="step", step_on="valid_end", train_loader_length=100, accum_grad=1
         )
         with pytest.raises(ValueError, match="step_on='valid_end'"):
-            resolver.resolve(args)
+            resolver.resolve(args, args.runner)
 
     def test_warmup_steps_allowed_with_valid_end(self):
         args = _make_args(
@@ -208,7 +348,7 @@ class TestStepOnValidEnd:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on="valid_end", train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.warmup_params.warmup_steps == 10  # 0.1 * 100
 
     def test_runner_fields_allowed_with_valid_end(self):
@@ -216,7 +356,7 @@ class TestStepOnValidEnd:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on="valid_end", train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.runner.eval_interval == 100
 
 
@@ -230,7 +370,7 @@ class TestEpochModeConstraints:
             run_mode="epoch", step_on=None, train_loader_length=100, accum_grad=1
         )
         with pytest.raises(ValueError, match="run_mode='epoch'"):
-            resolver.resolve(args)
+            resolver.resolve(args, args.runner)
 
     def test_save_interval_epoch_suffix_raises(self):
         args = _make_args(run_mode="epoch", save_interval="2epoch")
@@ -238,14 +378,14 @@ class TestEpochModeConstraints:
             run_mode="epoch", step_on=None, train_loader_length=100, accum_grad=1
         )
         with pytest.raises(ValueError, match="run_mode='epoch'"):
-            resolver.resolve(args)
+            resolver.resolve(args, args.runner)
 
     def test_scheduler_params_allowed_in_epoch_mode(self):
         args = _make_args(run_mode="epoch", scheduler_params={"T_max": "5epoch"})
         resolver = EpochSuffixResolver(
             run_mode="epoch", step_on=None, train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.scheduler_params.T_max == 500  # 5 * 100
 
     def test_scheduler_params_valid_end_raises_in_epoch_mode(self):
@@ -254,7 +394,7 @@ class TestEpochModeConstraints:
             run_mode="epoch", step_on="valid_end", train_loader_length=100, accum_grad=1
         )
         with pytest.raises(ValueError, match="step_on='valid_end'"):
-            resolver.resolve(args)
+            resolver.resolve(args, args.runner)
 
     def test_warmup_allowed_in_epoch_mode(self):
         args = _make_args(
@@ -263,7 +403,7 @@ class TestEpochModeConstraints:
         resolver = EpochSuffixResolver(
             run_mode="epoch", step_on=None, train_loader_length=100, accum_grad=2
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.warmup_params.warmup_steps == 10  # 0.2 * 50
 
 
@@ -279,7 +419,7 @@ class TestWarmupCouplingWarning:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert len(result.warnings) == 1
         assert "warmup" in result.warnings[0].lower() or "AFTER" in result.warnings[0]
 
@@ -291,7 +431,7 @@ class TestWarmupCouplingWarning:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert len(result.warnings) == 0
 
     def test_only_scheduler_no_warning(self):
@@ -302,7 +442,7 @@ class TestWarmupCouplingWarning:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert len(result.warnings) == 0
 
 
@@ -316,7 +456,7 @@ class TestErrorConditions:
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=1
         )
         with pytest.raises(ValueError, match="positive"):
-            resolver.resolve(args)
+            resolver.resolve(args, args.runner)
 
     def test_invalid_train_loader_length_raises(self):
         with pytest.raises(ValueError, match="positive integer"):
@@ -340,7 +480,7 @@ class TestResolveResult:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert result.has_resolved
 
     def test_has_resolved_false(self):
@@ -348,7 +488,7 @@ class TestResolveResult:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert not result.has_resolved
 
     def test_logs_contain_resolution_info(self):
@@ -356,7 +496,7 @@ class TestResolveResult:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert len(result.logs) == 1
         log = result.logs[0]
         assert "len_loader=100" in log
@@ -370,7 +510,7 @@ class TestResolveResult:
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=4
         )
         args = _make_args(scheduler_params={"T_max": 100})
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert result.steps_per_epoch == 25
 
 
@@ -388,7 +528,7 @@ class TestMilestoneMixed:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=100, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.optim.scheduler_params.milestones == [30, 50, 90]
 
     def test_milestones_valid_end_raises(self):
@@ -401,7 +541,7 @@ class TestMilestoneMixed:
             run_mode="step", step_on="valid_end", train_loader_length=100, accum_grad=1
         )
         with pytest.raises(ValueError, match="step_on='valid_end'"):
-            resolver.resolve(args)
+            resolver.resolve(args, args.runner)
 
 
 class TestMultipleFieldsCombined:
@@ -416,7 +556,7 @@ class TestMultipleFieldsCombined:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=200, accum_grad=2
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         # steps_per_epoch = ceil(200/2) = 100
         assert args.optim.scheduler_params.T_max == 1000
         assert args.runner.eval_interval == 50
@@ -433,7 +573,7 @@ class TestMultipleFieldsCombined:
         resolver = EpochSuffixResolver(
             run_mode="step", step_on=None, train_loader_length=50, accum_grad=1
         )
-        result = resolver.resolve(args)
+        result = resolver.resolve(args, args.runner)
         assert args.runner.eval_interval == 50
 
 
@@ -451,4 +591,4 @@ class TestPlateuSchedulerInference:
             scheduler_name="plateau",
         )
         with pytest.raises(ValueError, match="step_on='valid_end'"):
-            resolver.resolve(args)
+            resolver.resolve(args, args.runner)

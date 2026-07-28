@@ -95,6 +95,35 @@ def test_train_runner_step_mode_dual_boundaries(base_args, tiny_task, tiny_model
     assert "secondary stopping boundary" in log_text
 
 
+def test_train_runner_resolves_explicit_epoch_suffix_intervals(base_args, tiny_task, tiny_model):
+    args = base_args.copy()
+    args.runner.early_stop.patience = 999
+    args.runner.run_mode = "epoch"
+    args.runner.eval_interval = "99epoch"
+    args.runner.save_interval = "99epoch"
+
+    result = train_runner(
+        model=tiny_model,
+        task=tiny_task,
+        loss_fn=torch.nn.MSELoss(),
+        optimizer=torch.optim.Adam(tiny_model.parameters(), lr=1.0e-3),
+        args=args,
+        run_mode="step",
+        max_steps=3,
+        eval_interval="1epoch",
+        save_interval="0.5epoch",
+        save_dir=args.log_dir,
+        print_freq=3,
+    )
+
+    assert result["final_step"] == 3
+    assert args.runner.eval_interval == "99epoch"
+    assert args.runner.save_interval == "99epoch"
+    log_text = (Path(args.log_dir) / "debug.log").read_text(encoding="utf-8")
+    assert "runner.eval_interval: 1epoch -> 3" in log_text
+    assert "runner.save_interval: 0.5epoch -> 1" in log_text
+
+
 def test_train_runner_step_mode_epoch_summary_logs_train_metrics_without_eval(
     base_args, tiny_task, tiny_model
 ):

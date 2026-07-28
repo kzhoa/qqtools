@@ -193,6 +193,8 @@ evaluation 是否触发由以下条件决定：
 
 `eval_interval` 的单位是全局 step，其中 step 指真实完成的 `optimizer.step()` 次数。
 
+`global_step`、梯度累积以及 epoch-suffix 换算的完整定义见 [`qConfig_en.md`](qConfig_en.md#global-step-and-optimizer-step-semantics)。
+
 示例：
 
 - `eval_interval=100` 表示每完成 100 次真实优化步就做一次 evaluation
