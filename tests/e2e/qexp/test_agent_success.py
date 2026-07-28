@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from qexp_smoke import (
+from qexp_e2e import (
     ensure_site_packages_import,
     jrun,
     make_env,

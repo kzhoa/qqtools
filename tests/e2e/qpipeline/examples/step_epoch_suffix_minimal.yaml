@@ -1,0 +1,25 @@
+seed: 42
+log_dir: ./logs/step_epoch_suffix
+print_freq: 1
+optim:
+  loss: mse
+  optimizer: adam
+  optimizer_params:
+    lr: 1.0e-3
+  scheduler: ""
+runner:
+  run_mode: step
+  max_epochs: null
+  max_steps: 2
+  clip_grad: null
+  accum_grad: 1
+  eval_interval: 0.5epoch
+  save_interval: 1epoch
+  early_stop:
+    target: val_metric
+    patience: 99
+    mode: min
+task:
+  dataset: tiny
+  dataloader:
+    batch_size: 8

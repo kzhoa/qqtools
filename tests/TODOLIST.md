@@ -1,14 +1,16 @@
-# Unit Test TODOLIST
+# Test Coverage TODOLIST
 
-Scope: identify modules not covered by `tests/unit` under local source (`PYTHONPATH=src`),
-and track modules that should be covered by `tests/functional`.
+Scope: track uncovered public behavior and test modules under local source
+(`PYTHONPATH=src`). Test location follows behavior boundaries, not source paths.
 
-## Classification Rule
+## Migration Queue
 
-- **base**: modules that are not `full` and do not depend on the std optional packages above
-- **standard**: modules that depend on optional std packages in `pyproject.toml` (`lmdb`, `tqdm`, `requests`)
-- **full**: modules that require functional/integration tests under `tests/functional`
-  (including plugin-focused tests, multi-module integration tests, and user-side simulation tests)
+- Completed: `test_epoch_suffix_resolver.py` moved to
+  `tests/unit/plugins/qpipeline/`.
+- Pending: classify qpipeline config/entry utilities, runner policy/trigger/checkpoint
+  tests, qcgen and gau-reader user flows, then split the mixed runner test module.
+- `tests/functional` accepts maintenance of historical tests only; new tests belong
+  in `unit`, `integration`, or `e2e`.
 
 ## Base modules not covered (`0%` in `tests/unit`)
 
@@ -24,9 +26,13 @@ and track modules that should be covered by `tests/functional`.
 - `src/qqtools/qm/units.py`
 - `src/qqtools/qm/utils.py`
 
-## Full modules not covered (`tests/functional`)
+## Public behavior gaps
 
-- `src/qqtools/plugins/**` (plugin module tests + user-side integration scenarios)
+- Scheduler epoch-suffix public integration coverage remains to be added.
+- Checkpoint resume needs an explicit public-entry e2e scenario.
+- Installed `qexp` CLI remains covered by release E2E.
+
+## Other uncovered public modules
 
 - `src/qqtools/cli/qcgen.py`
 - `src/qqtools/cli/qread.py`

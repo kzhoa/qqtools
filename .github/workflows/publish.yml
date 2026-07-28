@@ -100,12 +100,12 @@ jobs:
       - name: Build package
         run: python -m build --sdist --wheel
 
-      - name: Smoke test installed wheel
+      - name: Run installed-wheel e2e tests
         run: |
           set -euo pipefail
           wheels=(dist/*.whl)
           test "${#wheels[@]}" -eq 1
-          tox run -e smoke --installpkg "${wheels[0]}"
+          tox run -e release-e2e --installpkg "${wheels[0]}"
 
       - name: Release
         uses: softprops/action-gh-release@v2
