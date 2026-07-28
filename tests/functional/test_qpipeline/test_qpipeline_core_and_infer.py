@@ -539,8 +539,8 @@ def test_qpipeline_fit_forwards_accum_grad_and_ema_auto_offload(
         {
             "run_mode": "step",
             "max_steps": 12,
-            "eval_interval": 3,
-            "save_interval": 6,
+            "eval_interval": "0.5epoch",
+            "save_interval": "1epoch",
             "accum_grad": 4,
         }
     )
@@ -563,7 +563,7 @@ def test_qpipeline_fit_forwards_accum_grad_and_ema_auto_offload(
     assert captured_kwargs["accum_grad"] == 4
     assert captured_kwargs["run_mode"] == "step"
     assert captured_kwargs["max_steps"] == 12
-    assert captured_kwargs["eval_interval"] == 3
-    assert captured_kwargs["save_interval"] == 6
+    assert captured_kwargs["eval_interval"] == "0.5epoch"
+    assert captured_kwargs["save_interval"] == "1epoch"
     assert captured_kwargs["use_profiler"] is True
     assert captured_kwargs["auto_offload"] is expected_auto_offload
