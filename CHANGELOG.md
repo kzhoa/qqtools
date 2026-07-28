@@ -7,6 +7,7 @@
 ## v1.2.32
 
 - breaking: reject the legacy qexp `persistent` agent mode; configure machines with `daemon` or `on_demand`
+- fix: require qexp's optional `libtmux` dependency at version 0.62.0 or later for pytest 9-compatible release E2E collection
 - refactor: separate qexp configuration types, policy, layout storage, and machine metadata normalization responsibilities
 - test: add release-only qexp E2E coverage that builds, installs, and exercises the exact wheel selected for publication
 
