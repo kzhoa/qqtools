@@ -1,61 +1,43 @@
-# Tests Directory Convention
+# Test Suite Convention
 
-This document defines how test files should be organized under `tests/` and what
-source scope each test suite is responsible for.
+Test placement is determined by the behavior boundary under test, never by the
+location of production code.
 
-## Directory Responsibilities
+## Test Layers
 
-- `tests/unit`
-  - Fast, isolated tests for single modules/functions/classes.
-  - Prefer no filesystem/network side effects.
-  - Default home for core modules under `src/qqtools/**` unless explicitly
-    classified as `full` (functional/integration scope).
+- `tests/unit`: one function, class, or local module. Avoid complete training,
+  network access, and persistent side effects.
+- `tests/integration`: two or more real modules collaborating. Tests must assert
+  effective state or output, not only that no exception was raised.
+- `tests/e2e`: a public YAML, CLI, or Python entry point completing a user-visible
+  workflow with a tiny local model/dataset.
+- `tests/e2e/qexp`: release E2E tests that validate a built, installed wheel.
+- `tests/demo`: manually runnable demonstrations. Demos do not provide regression
+  protection.
 
-- `tests/functional`
-  - Integration and user-side behavior tests.
-  - Can cover interactions across multiple modules and realistic workflows.
-  - Includes plugin behavior, plugin-composed flows, and CLI behavior that
-    depends on plugin execution paths.
+`tests/functional` is a migration-only directory. Do not add new tests there;
+classify new coverage as unit, integration, or e2e instead.
 
-- `tests/demo`
-  - Runnable examples for logging/format/output demonstration.
-  - Not a substitute for assertions in `tests/unit` or `tests/functional`.
+## Markers and Commands
 
-## Coverage Classification Rule
+Use module-level markers for suite ownership and add `slow`, `gpu`, or `ddp` only
+when the runtime requirement is real. Markers must not hide a flaky test.
 
-- `base`
-  - Modules that are not `full` and do not rely on optional std deps listed in
-    `pyproject.toml` (`lmdb`, `tqdm`, `requests`).
-  - Expected primary coverage: `tests/unit`.
+```bash
+PYTHONPATH=src python -m pytest tests/unit -q
+PYTHONPATH=src python -m pytest tests/integration -q
+PYTHONPATH=src python -m pytest tests/e2e -q
+tox run -e unit
+tox run -e integration
+tox run -e e2e
+tox run -e release-e2e
+```
 
-- `standard`
-  - Modules depending on optional std deps (`lmdb`, `tqdm`, `requests`).
-  - Expected primary coverage: `tests/unit` (with dependency-aware test design).
+Default pytest collection excludes `tests/e2e/qexp`. `tox run -e release-e2e`
+builds and validates a wheel from the current checkout; use
+`tox run -e release-e2e --installpkg <wheel>` when validating a selected,
+non-editable release artifact rather than a checkout or arbitrary installed package.
 
-- `full`
-  - Modules requiring functional/integration tests in `tests/functional`.
-  - Includes:
-    - plugin module tests (`src/qqtools/plugins/**`)
-    - plugin-based multi-module tests or user-side simulation tests
-    - CLI command tests that involve plugin flows (`src/qqtools/cli/**`)
-
-## Module-to-Suite Mapping
-
-- `src/qqtools/plugins/**` -> `tests/functional`
-- `src/qqtools/cli/**` -> `tests/functional` (when command path depends on plugins)
-- `src/qqtools/qm/**` -> `tests/unit`
-- other `src/qqtools/**` modules -> `tests/unit` by default, unless promoted to
-  `full` for integration reasons
-
-## Tracking and Source of Truth
-
-- Detailed uncovered-module tracking lives in:
-  - `tests/TODOLIST.md`
-- When rules in this file and TODO entries conflict, this file is the convention
-  source; update TODO entries accordingly.
-
-## Historical Notes
-
-- Older rough planning content was replaced by this convention-focused document.
-- Keep future updates here concise and policy-oriented; keep progress snapshots in
-  `tests/TODOLIST.md`.
+`CONTRACT_MATRIX.md` tracks public behavior and links it to protecting tests.
+`TODOLIST.md` tracks unfinished test work. Coverage reports only show executed
+code and do not prove public behavior is protected.

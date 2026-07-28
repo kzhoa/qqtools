@@ -1,4 +1,4 @@
-"""Shared subprocess helpers for installed-wheel qexp smoke tests."""
+"""Shared subprocess helpers for installed-wheel qexp E2E tests."""
 from __future__ import annotations
 
 import json

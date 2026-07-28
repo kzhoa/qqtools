@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from qexp_smoke import ensure_site_packages_import, jrun, make_env, make_layout, run
+from qexp_e2e import ensure_site_packages_import, jrun, make_env, make_layout, run
 
 
 def test_installed_wheel_cli_flow(tmp_path):
@@ -18,15 +18,15 @@ def test_installed_wheel_cli_flow(tmp_path):
     ]
 
     run([*common, "init", "--agent-mode", "daemon"], env=env)
-    group = jrun([*common, "group", "create", "smoke", "--workers", "gpu-1"], env=env)
+    group = jrun([*common, "group", "create", "release-e2e", "--workers", "gpu-1"], env=env)
     submit = run(
         [
             *common,
             "submit",
             "--group",
-            "smoke",
+            "release-e2e",
             "--name",
-            "cli-smoke",
+            "cli-release-e2e",
             "--",
             "python",
             "-c",
@@ -41,9 +41,9 @@ def test_installed_wheel_cli_flow(tmp_path):
     machines = jrun([*common, "machines"], env=env)
 
     assert "site-packages" in imported_from
-    assert group["group"]["name"] == "smoke"
+    assert group["group"]["name"] == "release-e2e"
     assert task["task"]["task_id"] == task_id
-    assert task["task"]["group_name"] == "smoke"
+    assert task["task"]["group_name"] == "release-e2e"
     assert any(item["task_id"] == task_id for item in tasks)
-    assert any(item["group"]["name"] == "smoke" for item in groups)
+    assert any(item["group"]["name"] == "release-e2e" for item in groups)
     assert any(item["machine"]["machine_name"] == "gpu-1" for item in machines)

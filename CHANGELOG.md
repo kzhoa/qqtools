@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- fix: resolve explicit qpipeline runner eval/save epoch suffixes before policy validation
+
+## v1.2.32
+
+- breaking: reject the legacy qexp `persistent` agent mode; configure machines with `daemon` or `on_demand`
+- refactor: separate qexp configuration types, policy, layout storage, and machine metadata normalization responsibilities
+- test: add release-only qexp E2E coverage that builds, installs, and exercises the exact wheel selected for publication
+
 ## v1.2.31
 
 - fix: allow `qexp init` to succeed when saving the default CLI context under `~/.qqtools/qexp-context.json` fails; shared-root initialization still completes and the CLI now emits a warning instead of aborting
