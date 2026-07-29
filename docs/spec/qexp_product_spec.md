@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-07-24
+updated_at: 2026-07-29
 archived_at:
 ---
 
@@ -86,7 +86,8 @@ It is local-first:
 
 - a Task defaults to the machine from which it is submitted
 - each machine runs its own lightweight agent
-- process, PID, local launch backend, GPU reservation, and log operations remain machine-local
+- process, PID, local launch backend, and GPU reservation remain machine-local; qexp-captured
+  Attempt stdout/stderr logs are shared for cross-machine inspection
 
 `tmux` is the primary interactive launch and observation backend that qexp is designed to
 work with. qexp also permits degraded operation when `tmux` is unavailable by launching

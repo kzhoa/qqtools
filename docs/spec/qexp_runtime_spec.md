@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-07-24
+updated_at: 2026-07-29
 archived_at:
 ---
 
@@ -104,7 +104,7 @@ It contains:
 - provisional and active GPU reservations
 - local Attempt process manifests
 - wrapper control files
-- optional tmux and log references
+- optional tmux references
 - machine-local recovery evidence
 
 Local runtime files are never global scheduling authority.
@@ -228,6 +228,9 @@ The target layout is:
     archive/
       <task-id>/
         <fencing-token>.json
+    pending/
+      <task-id>/
+        <fencing-token>.json
   machines/
     <machine-name>/
       machine.json
@@ -251,6 +254,9 @@ The target layout is:
     tasks-by-state/
     tasks-by-group/
     offer-deadlines/
+  logs/
+    <task-id>/
+      <attempt-id>.log
 ```
 
 Layout rules:
@@ -259,9 +265,13 @@ Layout rules:
 - active claim truth is embedded in the Task record, not split across machine-private
   claim directories
 - archived claim records are immutable audit history
+- pending claim records retain an archive retry payload; they must be reconciled before Task
+  cleanup deletes the corresponding Attempt truth
 - machine state is writable only by that machine, except repair metadata explicitly
   written by `doctor`
 - indexes and summaries may be deleted and rebuilt without losing truth
+- captured Attempt stdout/stderr logs are shared observability artifacts; process evidence,
+  PIDs, reservations, wrappers, and locks remain machine-local
 
 ## 7. Common Record Envelope
 
@@ -659,7 +669,9 @@ It contains:
 - stop or drain reason
 
 `state/gpu.json` and `state/summary.json` are advisory snapshots. They must not authorize a
-claim, prove physical GPU idleness, or override local reservation truth.
+claim, prove physical GPU idleness, or override local reservation truth. The agent refreshes
+the snapshots with its heartbeat; observers may mark a machine stale without treating that as
+proof that a local process stopped.
 
 ### 8.9 Cross-Record Ordering
 

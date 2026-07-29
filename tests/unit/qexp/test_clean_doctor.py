@@ -15,6 +15,7 @@ from qqtools.plugins.qexp.runtime.locks import group_lock, task_lock
 from qqtools.plugins.qexp.runtime.paths import attempt_path, group_path, task_path
 from qqtools.plugins.qexp.runtime.reservations import attach, reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.records import new_id, utc_now
+from qqtools.plugins.qexp.runtime.claims import reconcile_claim_archives
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -116,7 +117,7 @@ def test_clean_waits_for_remote_machine_local_cleanup(tmp_path: Path):
     atomic_replace(manifest, {"process": {"task_id": task.task_id,
                                            "attempt_id": "old-attempt",
                                            "observed_state": "exited"}})
-    log = cfg1.runtime_root / "logs" / f"{task.task_id}-old-attempt.log"
+    log = shared_root / "logs" / task.task_id / "old-attempt.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("finished", encoding="utf-8")
 
@@ -357,6 +358,49 @@ def test_clean_rejects_nonterminal_task(tmp_path: Path):
     task = submit(cfg, ["echo", "queued"])
     with pytest.raises(ValueError, match="task_state:queued"):
         clean(cfg, task_id=task.task_id)
+
+
+def test_group_prelaunch_cancellation_archives_claim(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+
+    group_control(cfg, "exp", "cancel")
+
+    archive = read_json(
+        cfg.shared_root / "claims" / "archive" / task.task_id / f"{attempt.current_fencing_token}.json"
+    )["claim_archive"]
+    assert archive["reason"] == "group_cancelled_before_launch"
+    assert archive["claim"]["attempt_id"] == attempt.attempt_id
+
+
+def test_claim_archive_io_failure_does_not_block_terminal_task(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    from qqtools.plugins.qexp.runtime import claims
+    original_create_if_absent = claims.create_if_absent
+
+    def fail_archive_once(path, value):
+        if path.parent.parent.name == "archive":
+            raise OSError("archive unavailable")
+        original_create_if_absent(path, value)
+
+    monkeypatch.setattr(claims, "create_if_absent", fail_archive_once)
+
+    assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure")
+    stored = load_task(cfg, task.task_id)
+    assert stored.state["projection"] == "failed"
+    assert stored.claim_control["active_claim"] is None
+    pending = cfg.shared_root / "claims" / "pending" / task.task_id / "1.json"
+    assert pending.exists()
+
+    monkeypatch.setattr(claims, "create_if_absent", original_create_if_absent)
+    assert reconcile_claim_archives(cfg, task.task_id)
+    assert not pending.exists()
+    assert (cfg.shared_root / "claims" / "archive" / task.task_id / "1.json").exists()
 
 
 def test_missing_group_barrier_remains_blocked_during_reconciliation(tmp_path: Path):

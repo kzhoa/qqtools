@@ -2,7 +2,7 @@ import json
 import os
 from pathlib import Path
 
-from qqtools.plugins.qexp import init_shared_root, read_logs, submit
+from qqtools.plugins.qexp import init_shared_root, load_root_config, read_logs, submit
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runner import run_attempt
@@ -52,8 +52,18 @@ def test_read_logs_uses_attempt_log_written_by_runner(tmp_path: Path, monkeypatc
     assert run_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token,
                        popen_factory=popen_factory) == 0
 
+    remote_cfg = load_root_config(cfg.shared_root, "gpu-2", tmp_path / "remote-runtime",
+                                  require_initialized=True)
+    log_path = cfg.shared_root / "logs" / task.task_id / f"{attempt.attempt_id}.log"
+    assert log_path.exists()
     assert read_logs(cfg, task.task_id) == "attempt output\n"
-    assert not (cfg.runtime_root / "logs" / f"{task.task_id}-current.log").exists()
+    assert read_logs(remote_cfg, task.task_id) == "attempt output\n"
+    assert not (cfg.runtime_root / "logs").exists()
+
+    archive_path = cfg.shared_root / "claims" / "archive" / task.task_id / "1.json"
+    archive = json.loads(archive_path.read_text(encoding="utf-8"))["claim_archive"]
+    assert archive["reason"] == "completed"
+    assert archive["claim"]["attempt_id"] == attempt.attempt_id
 
 
 def test_read_logs_prefers_persisted_attempt_log_reference(tmp_path: Path):

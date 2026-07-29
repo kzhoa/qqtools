@@ -9,6 +9,7 @@ from typing import Any
 
 from ..config_types import RootConfig
 from ..runtime.locks import group_lock, schema_lock, task_lock
+from ..runtime.claims import reconcile_claim_archives
 from ..runtime.paths import group_path, local_paths, shared_paths, task_path
 from ..runtime.records import AttemptRecord, TaskRecord, new_id, utc_now
 from ..runtime.store import atomic_replace, iter_json, read_json
@@ -131,6 +132,8 @@ def _finalize_cleanup_operation(cfg: RootConfig, operation: dict[str, Any]) -> l
     from ..events import write_event
     cleanup = operation["cleanup"]
     task_id = cleanup["task_id"]
+    if not reconcile_claim_archives(cfg, task_id):
+        return []
     removed: list[str] = []
     path = task_path(cfg.shared_root, task_id)
     if path.exists():
@@ -140,6 +143,10 @@ def _finalize_cleanup_operation(cfg: RootConfig, operation: dict[str, Any]) -> l
     if attempts_dir.exists():
         shutil.rmtree(attempts_dir)
         removed.append(str(attempts_dir))
+    logs_dir = shared_paths(cfg.shared_root)["logs"] / task_id
+    if logs_dir.exists():
+        shutil.rmtree(logs_dir)
+        removed.append(str(logs_dir))
     write_event(cfg, "task_cleaned", task_id=task_id, details={
         "operation_id": cleanup["operation_id"], "group_name": cleanup.get("group_name"),
         "submission_operation_id": cleanup.get("submission_operation_id"),

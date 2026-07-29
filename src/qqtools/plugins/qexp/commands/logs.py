@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..config_types import RootConfig
-from ..layout import runtime_log_path
+from ..layout import shared_attempt_log_path
 from ..runtime.paths import attempt_path, shared_paths
 from ..runtime.records import AttemptRecord, TaskRecord
 from ..runtime.store import iter_json, read_json
@@ -29,7 +29,7 @@ def get_log_path(cfg: RootConfig, task_id: str) -> Path:
     log_references = attempt.process.get("log_references") or []
     if log_references:
         return Path(log_references[0])
-    return runtime_log_path(cfg, task_id, attempt.attempt_id)
+    return shared_attempt_log_path(cfg, task_id, attempt.attempt_id)
 
 
 def read_logs(cfg: RootConfig, task_id: str) -> str:

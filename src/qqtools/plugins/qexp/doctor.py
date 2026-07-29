@@ -7,6 +7,7 @@ from typing import Any
 from .commands.cleanup import reconcile_cleanup_operations
 from .commands.group import reconcile_group_cancel_operations
 from .config_types import RootConfig
+from .runtime.claims import archive_claim
 from .layout import validate_root_contract
 from .runtime.locks import group_lock, task_lock
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
@@ -300,6 +301,7 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
                             attempt.result["reason"] = "group_cancelled_before_launch"
                             attempt.timestamps["finished_at"] = utc_now()
                             atomic_replace(attempt_file, attempt.to_dict())
+                        archive_claim(cfg, task.task_id, claim, "group_cancelled_before_launch")
                         task.claim_control["active_claim"] = None
                         task.attempt_control["current_attempt_id"] = None
                         task.state.update({"projection": "cancelled", "reason": "group_cancelled_before_launch"})
