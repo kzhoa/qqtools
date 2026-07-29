@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.2.33
+
 - perf: lazily resolve root `qqtools` and `qpipeline` exports to avoid importing `torch` during
   package import; add IDE stubs and release-preflight validation for export/stub drift
 - breaking: make `qexp agent start` always launch in the background, remove `--background`, and
