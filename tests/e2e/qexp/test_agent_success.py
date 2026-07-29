@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 
 from qexp_e2e import (
+    TASK_TERMINAL_TIMEOUT_SECONDS,
     ensure_site_packages_import,
     jrun,
     make_env,
@@ -32,7 +33,7 @@ def test_installed_wheel_agent_completes_task(tmp_path):
     try:
         run([*common, "init", "--agent-mode", "daemon"], env=env)
         started = subprocess.run(
-            [*common, "agent", "start", "--background"],
+            [*common, "agent", "start"],
             env=env,
             text=True,
             capture_output=True,
@@ -59,7 +60,7 @@ def test_installed_wheel_agent_completes_task(tmp_path):
             task = jrun([*common, "task", "show", task_id], env=env)
             return task["task"]["state"]["projection"] in {"succeeded", "failed", "cancelled"}
 
-        wait_for(is_done, timeout=25, label="task terminal state")
+        wait_for(is_done, timeout=TASK_TERMINAL_TIMEOUT_SECONDS, label="task terminal state")
         task = jrun([*common, "task", "show", task_id], env=env)
         logs = run([*common, "logs", task_id], env=env).stdout
 

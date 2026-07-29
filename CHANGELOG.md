@@ -4,6 +4,12 @@
 
 - perf: lazily resolve root `qqtools` and `qpipeline` exports to avoid importing `torch` during
   package import; add IDE stubs and release-preflight validation for export/stub drift
+- breaking: make `qexp agent start` always launch in the background, remove `--background`, and
+  add explicit `agent run` and `agent restart` lifecycle commands
+- feat: automatically activate a stopped local qexp agent for eligible submitted work in both
+  `on_demand` and `daemon` modes; lifecycle commands now return structured JSON status
+- fix: keep on-demand qexp agents alive while a local GPU reservation remains active, preventing
+  the idle timeout from ending task coordination during long-running attempts
 - fix: resolve explicit qpipeline runner eval/save epoch suffixes before policy validation
 
 ## v1.2.32

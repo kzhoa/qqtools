@@ -1274,7 +1274,7 @@ used by automatic retry or Group retry-failed.
 
 Default behavior:
 
-- local submission may start the current machine's agent
+- local submission starts the current machine's agent when it has eligible local work
 - the agent polls or watches eligible local/shared work
 - it exits only after true idleness
 - provisional reservations, active processes, pending termination, and repair work prevent
@@ -1286,10 +1286,12 @@ Daemon mode remains active until explicit stop or unrecoverable local failure.
 
 ```bash
 qexp agent start
-qexp agent start --background
+qexp agent run
 ```
 
-Background startup requires `agent_mode=daemon` and must preserve daemon mode.
+`agent start` always starts a detached agent, regardless of configured mode. `agent run` keeps
+the agent in the current terminal for debugging. Both modes auto-start after local submission;
+they differ only in whether true idleness ends the agent process.
 
 ### 17.3 Agent Startup Reconciliation
 

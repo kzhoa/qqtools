@@ -18,5 +18,5 @@ def normalize_agent_mode(agent_mode: str | None) -> str:
 def resolve_machine_policy(agent_mode: str | None) -> MachinePolicy:
     normalized = normalize_agent_mode(agent_mode)
     if normalized == AGENT_MODE_ON_DEMAND:
-        return MachinePolicy(agent_mode=normalized, autostart_local=True, exit_when_idle=True)
-    return MachinePolicy(agent_mode=normalized, autostart_local=False, exit_when_idle=False)
+        return MachinePolicy(agent_mode=normalized, exit_when_idle=True)
+    return MachinePolicy(agent_mode=normalized, exit_when_idle=False)

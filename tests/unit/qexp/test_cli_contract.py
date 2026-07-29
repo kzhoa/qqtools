@@ -102,7 +102,7 @@ def test_use_still_fails_when_context_save_fails(tmp_path: Path, monkeypatch):
         ])
 
 
-def test_background_agent_start_records_parent_visible_pid(tmp_path: Path, monkeypatch):
+def test_agent_start_records_parent_visible_pid(tmp_path: Path, monkeypatch, capsys):
     cfg = init_shared_root(
         tmp_path / ".qexp",
         "gpu-1",
@@ -119,9 +119,10 @@ def test_background_agent_start_records_parent_visible_pid(tmp_path: Path, monke
         pid_path.write_text(str(FakeProcess.pid), encoding="utf-8")
         return FakeProcess()
 
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.spawn_agent_process", spawn)
+    monkeypatch.setattr("qqtools.plugins.qexp.activation.spawn_agent_process", spawn)
 
-    assert main([*_base_args(cfg), "agent", "start", "--background"]) == 0
+    assert main([*_base_args(cfg), "agent", "start"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "started"
     assert runtime_pid_path(cfg).read_text(encoding="utf-8").strip() == "4321"
 
 
@@ -136,9 +137,25 @@ def test_submit_tolerates_a_malformed_runtime_pid_file(tmp_path: Path, capsys):
     assert capsys.readouterr().out.strip()
 
 
-def test_agent_start_rejects_background_for_on_demand(tmp_path: Path):
+def test_agent_start_rejects_removed_background_flag(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
-    assert main([*_base_args(cfg), "agent", "start", "--background"]) == 2
+    with pytest.raises(SystemExit):
+        main([*_base_args(cfg), "agent", "start", "--background"])
+
+
+def test_agent_run_reports_foreground_start(tmp_path: Path, monkeypatch, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    received = []
+
+    def run_foreground(cfg, *, reason, on_started):
+        received.append(reason)
+        on_started({"machine_name": cfg.machine_name, "agent_state": "active", "pid": 123, "is_running": True})
+
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.run_local_agent_foreground", run_foreground)
+
+    assert main([*_base_args(cfg), "agent", "run"]) == 0
+    assert received == ["manual_run"]
+    assert json.loads(capsys.readouterr().out)["action"] == "running"
 
 
 def test_agent_start_rejects_legacy_persistent_flag(tmp_path: Path):
@@ -239,34 +256,23 @@ def test_group_retry_failed_requests_local_agent_activation(tmp_path: Path, monk
     assert reasons == ["group-retry-failed"]
 
 
-def test_agent_stop_clears_stale_pid_file(tmp_path: Path, monkeypatch):
+def test_agent_stop_returns_structured_status(tmp_path: Path, monkeypatch, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
-    pid_path = runtime_pid_path(cfg)
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text("4321", encoding="utf-8")
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.os.kill",
-                        lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.stop_local_agent",
+        lambda cfg: ("already_stopped", {"machine_name": cfg.machine_name, "agent_state": "stopped", "pid": None, "is_running": False}),
+    )
 
     assert main([*_base_args(cfg), "agent", "stop"]) == 0
-    assert not pid_path.exists()
+    assert json.loads(capsys.readouterr().out)["action"] == "already_stopped"
 
 
-def test_agent_stop_clears_pid_file_after_process_exits(tmp_path: Path, monkeypatch):
+def test_agent_restart_returns_structured_status(tmp_path: Path, monkeypatch, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
-    pid_path = runtime_pid_path(cfg)
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text("4321", encoding="utf-8")
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.os.kill", lambda pid, sig: None)
-    probe = {"count": 0}
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.restart_local_agent",
+        lambda cfg: ("restarted", {"machine_name": cfg.machine_name, "agent_state": "active", "pid": 987, "is_running": True, "previous_pid": 432}),
+    )
 
-    def fake_exists(path: str) -> bool:
-        if path != "/proc/4321":
-            return True
-        probe["count"] += 1
-        return probe["count"] == 1
-
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.os.path.exists", fake_exists)
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.time.sleep", lambda _: None)
-
-    assert main([*_base_args(cfg), "agent", "stop"]) == 0
-    assert not pid_path.exists()
+    assert main([*_base_args(cfg), "agent", "restart"]) == 0
+    assert json.loads(capsys.readouterr().out)["previous_pid"] == 432
