@@ -1,6 +1,8 @@
 import time
 
-import torch
+from .qimport import LazyImport
+
+torch = LazyImport("torch")
 
 
 class Timer:

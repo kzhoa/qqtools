@@ -46,20 +46,19 @@ class LazyImport:
         except Exception as e:
             raise ImportError(f"Failed to import {self.module_name}") from e
 
-    def __getattr__(self, name):
+    def resolve(self):
         if self._target is None:
             self._load_target()
-        return getattr(self._target, name)
+        return self._target
+
+    def __getattr__(self, name):
+        return getattr(self.resolve(), name)
 
     def __getitem__(self, key):
-        if self._target is None:
-            self._load_target()
-        return self._target[key]
+        return self.resolve()[key]
 
     def __call__(self, *args, **kwargs):
-        if self._target is None:
-            self._load_target()
-        return self._target(*args, **kwargs)
+        return self.resolve()(*args, **kwargs)
 
     def __repr__(self):
         return f"<qLazyImport {self.module_name}.{self.object_name or ''}>"

@@ -48,6 +48,9 @@ where = ["src"]
 include = ["qqtools*"]
 exclude = ["tests*"]
 
+[tool.setuptools.package-data]
+qqtools = ["py.typed", "*.pyi", "**/*.pyi"]
+
 
 [tool.setuptools.dynamic]
 version = { attr = "qqtools.version.__version__" }

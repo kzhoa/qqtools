@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- perf: lazily resolve root `qqtools` and `qpipeline` exports to avoid importing `torch` during
+  package import; add IDE stubs and release-preflight validation for export/stub drift
 - fix: resolve explicit qpipeline runner eval/save epoch suffixes before policy validation
 
 ## v1.2.32

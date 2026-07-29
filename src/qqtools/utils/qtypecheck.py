@@ -8,7 +8,10 @@ import math
 from typing import List, Union
 
 import numpy as np
-import torch
+
+from ..qimport import LazyImport
+
+torch = LazyImport("torch")
 
 __all__ = [
     "is_number",

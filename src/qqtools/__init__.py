@@ -1,49 +1,85 @@
 # isort:skip_file
-from .version import __version__
+import importlib
+import sys
+
+_lazy_exports: dict[str, tuple[str, str]] = {}
+
+
+def lazy_export(module_name: str, *object_names: str) -> None:
+    if not object_names:
+        raise ValueError("lazy_export requires at least one object name")
+
+    for object_name in object_names:
+        if object_name in _lazy_exports:
+            raise ValueError(f"lazy export {object_name!r} is already registered")
+        _lazy_exports[object_name] = (module_name, object_name)
+
 
 # first-class instance
+from .version import __version__
 from .qcontext import ctx, use_ctx
 
 # first-class class
+from .qimport import LazyImport
 from .qdict import qDict
-from .qtimer import Timer
-from .data.qdatalist import qDataList, qList
-from .torch.qdataset import qData, qDictDataloader, qDictDataset
-from .torch.qlmdbdataset import qLmdbDataset
-from .torch.nn.donothing import Donothing
-from .qimport import LazyImportErrorProxy, LazyImport
+
+lazy_export(".data.qdatalist", "qDataList", "qList")
+
+# -- torch related class--
+lazy_export(".qtimer", "Timer")
+lazy_export(".torch.qdataset", "qData", "qDictDataloader", "qDictDataset")
+lazy_export(".torch.qlmdbdataset", "qLmdbDataset")
+lazy_export(".torch.nn.donothing", "Donothing")
 
 # first-class module
-from .torch import nn
-from .torch import qdist
-from .torch import qcheckpoint, qscatter, qsparse
-from .torch import qcontextprovider
-from . import data
+nn = LazyImport("qqtools.torch.nn")
+qdist = LazyImport("qqtools.torch.qdist")
+data = LazyImport("qqtools.data")
 
-# first-class funciton
-from .qimport import import_common
-from .config.qssert import batch_assert_type
-from .config.yaml import dump_yaml, load_yaml
-from .config.qpickle import load_pickle, save_pickle
-from .config.qjson import load_json, save_json
-from .config.qsyspath import find_root, update_sys
-from .config.qlmdb import operate_lmdb, open_lmdb, count_lmdb, iter_lmdb
-from .torch.qcontextprovider import qContextProvider
-from .torch.qmgraph import qtriplets
-from .qm.refe import calc_refe
+# first-class function
+lazy_export(".qimport", "import_common")
+lazy_export(".config.qssert", "batch_assert_type")
+lazy_export(".config.yaml", "dump_yaml", "load_yaml")
+lazy_export(".config.qpickle", "load_pickle", "save_pickle")
+lazy_export(".config.qjson", "load_json", "save_json")
+lazy_export(".config.qsyspath", "find_root", "update_sys")
+lazy_export(".config.qlmdb", "operate_lmdb", "open_lmdb", "count_lmdb", "iter_lmdb")
+lazy_export(".torch.qcontextprovider", "qContextProvider")
+lazy_export(".torch.qmgraph", "qtriplets")
+lazy_export(".qm.refe", "calc_refe")
 
 # training
-from .torch.qcheckpoint import recover, save_ckp
-from .torch.qgpu import parse_device
-from .torch.qfreeze import freeze_rand, freeze_module, unfreeze_module
-from .torch.qsplit import random_split_train_valid, random_split_train_valid_test, get_data_splits
-from .torch.nn.donothing import donothing
-from .torch.qscatter import scatter, softmax
+lazy_export(".torch.qcheckpoint", "recover", "save_ckp")
+lazy_export(".torch.qgpu", "parse_device")
+lazy_export(".torch.qfreeze", "freeze_rand", "freeze_module", "unfreeze_module")
+lazy_export(
+    ".torch.qsplit",
+    "random_split_train_valid",
+    "random_split_train_valid_test",
+    "get_data_splits",
+)
+lazy_export(".torch.nn.donothing", "donothing")
+lazy_export(".torch.qscatter", "scatter", "softmax")
 
 # type & check
-from .utils.qtyping import Bool, Float,Long, Float16, Float32, Float64, Int32, Int64, Float32Array, Float64Array, BoolArray, Int32Array, Int64Array # fmt: skip
-from .utils.qtypecheck import ensure_scala, ensure_numpy, str2number, is_number, is_inf
-from .utils.check import check_values_allowed, is_alias_exists
+lazy_export(
+    ".utils.qtyping",
+    "Bool",
+    "Float",
+    "Long",
+    "Float16",
+    "Float32",
+    "Float64",
+    "Int32",
+    "Int64",
+    "Float32Array",
+    "Float64Array",
+    "BoolArray",
+    "Int32Array",
+    "Int64Array",
+)
+lazy_export(".utils.qtypecheck", "ensure_scala", "ensure_numpy", "str2number", "is_number", "is_inf")
+lazy_export(".utils.check", "check_values_allowed", "is_alias_exists")
 
 # attr
 from .utils.qattr import hasattr_safe, getmultiattr, is_override
@@ -56,7 +92,14 @@ from .config.fetch.gdown import download_from_gdrive_sharelink
 # plugins
 def __getattr__(name):
     if name == "plugins":
-        import importlib
 
         return importlib.import_module(".plugins", __name__)
-    raise AttributeError(f"module {__name__} has no attribute {name}")
+
+    try:
+        module_name, object_name = _lazy_exports[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+
+    value = getattr(importlib.import_module(module_name, __name__), object_name)
+    setattr(sys.modules[__name__], name, value)
+    return value
