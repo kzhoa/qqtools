@@ -59,18 +59,27 @@ numpy
 """
 
 
-class Array(Generic[Unpack[ShapeT]]):
-    def __repr__(self):
-        args = self.__args__ if hasattr(self, "__args__") else ()
-        return f"Shape[{', '.join(map(str, args))}]"
+class Array:
+    dtype: type[np.generic]
+
+    @classmethod
+    def __class_getitem__(cls, shapes):
+        if isinstance(shapes, tuple):
+            shape_str = ", ".join([str(shape) for shape in shapes])
+        elif isinstance(shapes, str):
+            shape_str = shapes
+        else:
+            raise TypeError("shape must be tuple or str")
+
+        return Annotated[npt.NDArray[cls.dtype], shape_str]
 
 
 # fmt: off
-class Float32Array(npt.NDArray[np.float32], Array): pass
-class Float64Array(npt.NDArray[np.float64], Array): pass
-class BoolArray(npt.NDArray[np.bool_], Array): pass
-class Int32Array(npt.NDArray[np.int32], Array): pass
-class Int64Array(npt.NDArray[np.int64], Array): pass
+class Float32Array(Array): dtype = np.float32
+class Float64Array(Array): dtype = np.float64
+class BoolArray(Array): dtype = np.bool_
+class Int32Array(Array): dtype = np.int32
+class Int64Array(Array): dtype = np.int64
 # alias
 FloatArray = Float32Array
 LongArray = Int64Array
