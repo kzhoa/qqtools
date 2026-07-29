@@ -16,7 +16,10 @@ from typing import Annotated, Generic, TypeVar, TypeVarTuple, Unpack
 
 import numpy as np
 import numpy.typing as npt
-from torch import Tensor
+
+from ..qimport import LazyImport
+
+Tensor = LazyImport("torch", "Tensor")
 
 __all__ = ["Bool", "Float16", "Float32", "Float64", "Int32", "Int64"]
 
@@ -40,7 +43,7 @@ class TensorType(Generic[Unpack[ShapeT]]):
         else:
             raise TypeError("shape must be tuple or str")
 
-        return Annotated[Tensor, cls.dtype, shape_str]
+        return Annotated[Tensor.resolve(), cls.dtype, shape_str]
 
 
 # fmt: off
