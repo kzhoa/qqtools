@@ -9,9 +9,10 @@ import time
 from pathlib import Path
 
 from .config_types import RootConfig
-from .layout import load_root_config, runtime_log_path
+from .layout import load_root_config, shared_attempt_log_path
 from .runtime.paths import attempt_path
 from .runtime.records import AttemptRecord, utc_now
+from .runtime.claims import archive_claim
 from .runtime.reservations import release
 from .runtime.store import atomic_replace, read_json
 from .runtime.tasks import load_task, save_task
@@ -94,7 +95,7 @@ def run_attempt(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: i
     environment = os.environ.copy()
     if attempt.assigned_gpus:
         environment["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, attempt.assigned_gpus))
-    log_path = runtime_log_path(cfg, task_id, attempt_id)
+    log_path = shared_attempt_log_path(cfg, task_id, attempt_id)
     child = None
     manifest_path: Path | None = None
     return_code = 127
@@ -167,6 +168,7 @@ def _publish_terminal(cfg: RootConfig, task_id: str, attempt_id: str, fencing_to
             current.termination.update({"acknowledged_at": utc_now(), "result": "terminated"})
         atomic_replace(path, current.to_dict())
         release(cfg.runtime_root, claim["reservation_id"], current.result["reason"])
+        archive_claim(cfg, task_id, claim, current.result["reason"])
         task.claim_control["active_claim"] = None
         task.attempt_control["current_attempt_id"] = None
         task.state.update({"projection": current.phase, "reason": current.result["reason"]})

@@ -2,6 +2,12 @@ from pathlib import Path
 
 from qqtools.plugins.qexp.agent import _runtime_pid_value, run_agent_loop
 from qqtools.plugins.qexp.machine_config import init_shared_root
+from qqtools.plugins.qexp.machine_state import (
+    publish_machine_snapshots,
+    publish_machine_stop_snapshot,
+)
+from qqtools.plugins.qexp.observer import list_machines
+from qqtools.plugins.qexp.runtime.store import read_json
 
 
 def test_runtime_pid_value_preserves_existing_live_pid(tmp_path: Path, monkeypatch):
@@ -44,3 +50,29 @@ def test_on_demand_agent_stays_active_while_reservation_exists(tmp_path: Path, m
     run_agent_loop(cfg, idle_timeout=10, available_gpus=[0])
 
     assert len(dispatch_calls) == 3
+    state_dir = cfg.shared_root / "machines" / "gpu-1" / "state"
+    agent = read_json(state_dir / "agent.json")["agent"]
+    gpu = read_json(state_dir / "gpu.json")["gpu"]
+    assert agent["observed_state"] == "stopped"
+    assert agent["stop_reason"] == "idle_timeout"
+    assert gpu["visible_gpu_ids"] == [0]
+    machine = list_machines(cfg)[0]
+    assert machine["state"]["summary"]["summary"]["machine_name"] == "gpu-1"
+
+
+def test_stopping_old_agent_does_not_replace_newer_machine_snapshot(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    publish_machine_snapshots(
+        cfg, instance_id="new-agent", pid=123, agent_mode="daemon", observed_state="active",
+        active_attempt_ids=[], visible_gpu_ids=[0], reserved_gpu_ids=[],
+        heartbeat_interval_seconds=5, started_at="2026-07-29T00:00:00Z", idle_since_at=None,
+    )
+
+    assert not publish_machine_stop_snapshot(
+        cfg, instance_id="old-agent", pid=None, agent_mode="daemon", visible_gpu_ids=[0],
+        reserved_gpu_ids=[], heartbeat_interval_seconds=5, started_at="2026-07-28T00:00:00Z",
+        idle_since_at=None, stop_reason="stopped",
+    )
+    agent = read_json(cfg.shared_root / "machines" / "gpu-1" / "state" / "agent.json")["agent"]
+    assert agent["instance_id"] == "new-agent"
+    assert agent["observed_state"] == "active"

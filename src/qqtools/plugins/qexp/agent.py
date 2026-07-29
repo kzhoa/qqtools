@@ -2,20 +2,25 @@
 from __future__ import annotations
 
 import os
+import signal
 import shutil
 import subprocess
 import time
+import uuid
 from typing import Any
 
 from .executor import Executor
 from .config_types import RootConfig
 from .layout import runtime_pid_path
+from .machine_config import load_machine_policy
+from .machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from .runtime.reservations import active_reservations, release, release_expired_provisionals, reserved_gpu_ids, retag
+from .runtime.claims import reconcile_claim_archives
 from .commands.cleanup import reconcile_cleanup_operations
 from .commands.group import reconcile_group_cancel_operations
 from .commands.task import offer
 from .runtime.paths import attempt_path, shared_paths
-from .runtime.records import AttemptRecord
+from .runtime.records import AttemptRecord, utc_now
 from .runtime.store import read_json
 from .runtime.placement import offer_due
 from .runtime.store import iter_json
@@ -75,28 +80,81 @@ def run_agent_loop(cfg: RootConfig, *, exit_when_idle: bool = True, loop_interva
     cfg.runtime_root.mkdir(parents=True, exist_ok=True)
     pid_path = runtime_pid_path(cfg)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(str(_runtime_pid_value(pid_path)), encoding="utf-8")
+    pid = _runtime_pid_value(pid_path)
+    pid_path.write_text(str(pid), encoding="utf-8")
     executor = executor or Executor()
     idle_since = time.monotonic()
+    idle_since_at = utc_now()
+    started_at = utc_now()
+    instance_id = uuid.uuid4().hex
+    policy = load_machine_policy(cfg)
+    stop_reason = "stopped"
+    visible_gpu_ids: list[int] = []
+    reserved_gpu_ids_value: set[int] = set()
+    publish_machine_snapshots(
+        cfg, instance_id=instance_id, pid=pid, agent_mode=policy.agent_mode,
+        observed_state="active", active_attempt_ids=[], visible_gpu_ids=[], reserved_gpu_ids=[],
+        heartbeat_interval_seconds=loop_interval, started_at=started_at, idle_since_at=idle_since_at,
+    )
+    previous_sigterm_handler = None
+
+    def handle_sigterm(_signal_number: int, _frame: object) -> None:
+        nonlocal stop_reason
+        stop_reason = "stopped_by_signal"
+        raise SystemExit
+
+    try:
+        previous_sigterm_handler = signal.signal(signal.SIGTERM, handle_sigterm)
+    except ValueError:
+        pass
     try:
         while True:
+            reconcile_claim_archives(cfg)
             release_expired_provisionals(cfg.runtime_root)
             _reconcile_reservations(cfg)
             reconcile_running_tasks(cfg, executor=executor)
             reconcile_group_cancel_operations(cfg)
             reconcile_cleanup_operations(cfg)
             _offer_due_tasks(cfg)
-            visible = available_gpus if available_gpus is not None else _visible_gpus(cfg)
-            reserved = reserved_gpu_ids(cfg.runtime_root)
-            free = [gpu for gpu in visible if gpu not in reserved]
+            visible_gpu_ids = available_gpus if available_gpus is not None else _visible_gpus(cfg)
+            reserved_before_dispatch = reserved_gpu_ids(cfg.runtime_root)
+            free = [gpu for gpu in visible_gpu_ids if gpu not in reserved_before_dispatch]
             launched = run_dispatch_cycle(cfg, available_gpus=free, executor=executor)
-            if launched or reserved:
+            reservations = active_reservations(cfg.runtime_root)
+            reserved_gpu_ids_value = {
+                gpu_id for reservation in reservations for gpu_id in reservation.get("gpu_ids", [])
+            }
+            attempts = [reservation.get("attempt_id") for reservation in reservations]
+            active_attempt_ids = [attempt_id for attempt_id in attempts if isinstance(attempt_id, str)]
+            observed_state = "active" if reserved_gpu_ids_value else "idle"
+            if observed_state == "active":
+                idle_since_at = None
+            elif idle_since_at is None:
+                idle_since_at = utc_now()
+            publish_machine_snapshots(
+                cfg, instance_id=instance_id, pid=pid, agent_mode=policy.agent_mode,
+                observed_state=observed_state, active_attempt_ids=active_attempt_ids,
+                visible_gpu_ids=visible_gpu_ids, reserved_gpu_ids=reserved_gpu_ids_value,
+                heartbeat_interval_seconds=loop_interval, started_at=started_at,
+                idle_since_at=idle_since_at,
+            )
+            if launched or reserved_before_dispatch:
                 idle_since = time.monotonic()
             elif exit_when_idle and time.monotonic() - idle_since >= idle_timeout:
+                stop_reason = "idle_timeout"
                 break
             time.sleep(loop_interval)
     finally:
+        publish_machine_stop_snapshot(
+            cfg, instance_id=instance_id, pid=None, agent_mode=policy.agent_mode,
+            visible_gpu_ids=visible_gpu_ids,
+            reserved_gpu_ids=reserved_gpu_ids_value,
+            heartbeat_interval_seconds=loop_interval, started_at=started_at, idle_since_at=idle_since_at,
+            stop_reason=stop_reason,
+        )
         pid_path.unlink(missing_ok=True)
+        if previous_sigterm_handler is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 def _reconcile_reservations(cfg: RootConfig) -> None:

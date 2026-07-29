@@ -5,6 +5,7 @@ import os
 from typing import Any
 
 from ..config_types import RootConfig
+from ..runtime.claims import archive_claim
 from ..runtime.locks import group_lock, task_lock
 from ..runtime.paths import attempt_path, group_path, shared_paths
 from ..runtime.records import (AttemptRecord, TaskRecord, new_group, new_id,
@@ -78,6 +79,7 @@ def group_control(cfg: RootConfig, name: str, action: str, *, terminate_running:
                         if claim.get("machine_name") == cfg.machine_name:
                             from ..runtime.reservations import release
                             release(cfg.runtime_root, claim["reservation_id"], "group_cancelled_before_launch")
+                        archive_claim(cfg, task.task_id, claim, "group_cancelled_before_launch")
                         task.claim_control["active_claim"] = None
                         task.attempt_control["current_attempt_id"] = None
                         task.state.update({"projection": "cancelled", "reason": "group_cancelled_before_launch"})

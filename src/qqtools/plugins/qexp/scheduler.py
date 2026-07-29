@@ -13,6 +13,7 @@ from .events import write_event
 from .executor import Executor
 from .config_types import RootConfig
 from .runtime.locks import group_lock, task_lock
+from .runtime.claims import archive_claim
 from .runtime.paths import attempt_path, group_path, shared_paths, submission_path
 from .runtime.records import AttemptRecord, TaskRecord, utc_now
 from .runtime.reservations import attach, release, reserve
@@ -209,6 +210,7 @@ def _release_claim_locked(cfg: RootConfig, task: TaskRecord, token: int, reason:
     claim = task.claim_control.get("active_claim") or {}
     if claim.get("fencing_token") != token:
         return
+    archive_claim(cfg, task.task_id, claim, reason)
     task.claim_control["active_claim"] = None
     task.attempt_control["current_attempt_id"] = None
     task.state.update({"projection": "queued", "reason": reason})
@@ -273,6 +275,8 @@ def _cancel_prelaunch_locked(cfg: RootConfig, task: TaskRecord, reason: str) -> 
                 atomic_replace(path, attempt.to_dict())
     if claim and claim.get("machine_name") == cfg.machine_name:
         release(cfg.runtime_root, claim["reservation_id"], reason)
+    if claim:
+        archive_claim(cfg, task.task_id, claim, reason)
     task.claim_control["active_claim"] = None
     task.attempt_control["current_attempt_id"] = None
     task.state.update({"projection": "cancelled", "reason": reason})
@@ -383,6 +387,7 @@ def expire_claim(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: 
         if attempt.phase != "orphaned":
             attempt.timestamps["finished_at"] = utc_now()
         atomic_replace(path, attempt.to_dict())
+        archive_claim(cfg, task_id, claim, "lease_expired")
         task.claim_control["active_claim"] = None
         task.attempt_control["current_attempt_id"] = None
         task.meta["revision"] += 1
@@ -413,6 +418,7 @@ def fail_attempt(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: 
         attempt.timestamps["finished_at"] = utc_now()
         atomic_replace(path, attempt.to_dict())
         release(cfg.runtime_root, claim["reservation_id"], reason)
+        archive_claim(cfg, task_id, claim, reason)
         task.claim_control["active_claim"] = None
         task.attempt_control["current_attempt_id"] = None
         task.state.update({"projection": "failed", "reason": reason})
@@ -446,6 +452,7 @@ def finalize_agent_supervised_attempt(cfg: RootConfig, task_id: str, attempt_id:
         if was_terminated:
             attempt.termination.update({"acknowledged_at": utc_now(), "result": "terminated"})
         atomic_replace(path, attempt.to_dict())
+        archive_claim(cfg, task_id, claim, reason)
         task.claim_control["active_claim"] = None
         task.attempt_control["current_attempt_id"] = None
         task.state.update({"projection": phase, "reason": reason})

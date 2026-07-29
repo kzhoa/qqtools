@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config_types import RootConfig
-from .runtime.paths import local_paths, machine_path, shared_paths
+from .runtime.paths import local_paths, machine_path, shared_log_path, shared_paths
 from .runtime.records import SCHEMA_VERSION, utc_now
 from .runtime.store import atomic_replace, read_json
 
@@ -129,11 +129,10 @@ def machine_state_path(cfg: RootConfig, name: str) -> Path:
     return shared_paths(cfg.shared_root)["machines"] / cfg.machine_name / "state" / name
 
 
-def runtime_log_path(cfg: RootConfig, task_id: str, attempt_id: str | None = None) -> Path:
-    suffix = attempt_id or "current"
-    path = cfg.runtime_root / "logs"
-    path.mkdir(parents=True, exist_ok=True)
-    return path / f"{task_id}-{suffix}.log"
+def shared_attempt_log_path(cfg: RootConfig, task_id: str, attempt_id: str) -> Path:
+    path = shared_log_path(cfg.shared_root, task_id, attempt_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def runtime_pid_path(cfg: RootConfig) -> Path:

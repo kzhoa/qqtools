@@ -10,6 +10,11 @@
   `on_demand` and `daemon` modes; lifecycle commands now return structured JSON status
 - fix: keep on-demand qexp agents alive while a local GPU reservation remains active, preventing
   the idle timeout from ending task coordination during long-running attempts
+- fix: store qexp-captured Attempt stdout/stderr logs under the shared root so `qexp logs` works
+  across machines; cleanup now removes shared logs only after required machines acknowledge
+  local resource cleanup
+- feat: publish shared qexp agent/GPU/summary snapshots for cross-machine observation and retain
+  immutable fenced-claim archives after Task cleanup
 - fix: resolve explicit qpipeline runner eval/save epoch suffixes before policy validation
 
 ## v1.2.32

@@ -1,6 +1,7 @@
 """Truth-derived qexp projections."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from .config_types import RootConfig
@@ -47,7 +48,31 @@ def list_groups(cfg: RootConfig) -> list[dict[str, Any]]:
 
 def list_machines(cfg: RootConfig) -> list[dict[str, Any]]:
     machines = shared_paths(cfg.shared_root)["machines"]
-    return [read_json(path) for path in sorted(machines.glob("*/machine.json"))]
+    return [_machine_view(cfg, path) for path in sorted(machines.glob("*/machine.json"))]
+
+
+def _machine_view(cfg: RootConfig, machine_path_value: Any) -> dict[str, Any]:
+    record = read_json(machine_path_value)
+    machine_name = record.get("machine", {}).get("machine_name")
+    if not isinstance(machine_name, str):
+        return record
+    state_dir = shared_paths(cfg.shared_root)["machines"] / machine_name / "state"
+    state = {name: read_json(path) for name in ("agent", "gpu", "summary")
+             if (path := state_dir / f"{name}.json").exists()}
+    agent = state.get("agent", {})
+    heartbeat = agent.get("heartbeat_at") if isinstance(agent, dict) else None
+    interval = agent.get("heartbeat_interval_seconds") if isinstance(agent, dict) else None
+    if isinstance(heartbeat, str) and isinstance(interval, (int, float)):
+        try:
+            elapsed = (datetime.now(timezone.utc) -
+                       datetime.fromisoformat(heartbeat.replace("Z", "+00:00"))).total_seconds()
+            state["freshness"] = "stale" if elapsed > interval * 3 else "fresh"
+        except ValueError:
+            state["freshness"] = "unknown"
+    else:
+        state["freshness"] = "unknown"
+    record["state"] = state
+    return record
 
 
 def top_view(cfg: RootConfig, *, all_machines: bool = False) -> dict[str, Any]:
