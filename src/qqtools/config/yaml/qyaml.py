@@ -6,8 +6,10 @@ from pathlib import Path
 import yaml
 
 from ...qdict import qDict
-from ...torch.qgpu import parse_device
+from ...qimport import LazyImport
 from .qInheritLoader import InheritLoader
+
+parse_device = LazyImport("qqtools.torch.qgpu", object_name="parse_device")
 
 
 def parse_none(cfg):
