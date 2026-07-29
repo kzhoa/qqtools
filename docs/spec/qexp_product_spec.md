@@ -1054,8 +1054,8 @@ Hostname is descriptive metadata, not the primary identity.
 
 Default behavior:
 
-- agent may auto-start for work submitted on the current machine
-- agent exits after true idleness
+- local work submission automatically starts the current machine's agent when needed
+- `on_demand` agents exit after true idleness; `daemon` agents remain active
 - qexp does not remotely wake other machines
 
 Daemon mode is opt-in:
@@ -1065,7 +1065,8 @@ qexp init --shared-root /path/to/project/.qexp --machine gpu2a --agent-mode daem
 qexp agent start
 ```
 
-`qexp agent start --background` requires `agent_mode=daemon` and must preserve daemon mode.
+`agent start` always starts a detached process. Use `qexp agent run` for foreground debugging.
+`init` only records machine configuration; it does not start a long-lived process.
 
 ### 15.4 Local Process Ownership
 
@@ -1142,6 +1143,8 @@ are exposed through Task/Group JSON, events, and `doctor` only.
 ### 16.4 Low-Frequency Commands
 
 - `qexp agent start`
+- `qexp agent run`
+- `qexp agent restart`
 - `qexp agent stop`
 - `qexp agent status`
 - `qexp doctor`

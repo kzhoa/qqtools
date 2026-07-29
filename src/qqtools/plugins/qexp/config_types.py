@@ -25,5 +25,4 @@ class RootConfig:
 @dataclass(frozen=True, slots=True)
 class MachinePolicy:
     agent_mode: str
-    autostart_local: bool
     exit_when_idle: bool

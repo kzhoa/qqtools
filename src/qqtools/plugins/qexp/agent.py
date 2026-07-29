@@ -77,9 +77,9 @@ def run_agent_loop(cfg: RootConfig, *, exit_when_idle: bool = True, loop_interva
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(_runtime_pid_value(pid_path)), encoding="utf-8")
     executor = executor or Executor()
-    started = time.monotonic()
+    idle_since = time.monotonic()
     try:
-        while not exit_when_idle or time.monotonic() - started < idle_timeout:
+        while True:
             release_expired_provisionals(cfg.runtime_root)
             _reconcile_reservations(cfg)
             reconcile_running_tasks(cfg, executor=executor)
@@ -87,10 +87,13 @@ def run_agent_loop(cfg: RootConfig, *, exit_when_idle: bool = True, loop_interva
             reconcile_cleanup_operations(cfg)
             _offer_due_tasks(cfg)
             visible = available_gpus if available_gpus is not None else _visible_gpus(cfg)
-            free = [gpu for gpu in visible if gpu not in reserved_gpu_ids(cfg.runtime_root)]
+            reserved = reserved_gpu_ids(cfg.runtime_root)
+            free = [gpu for gpu in visible if gpu not in reserved]
             launched = run_dispatch_cycle(cfg, available_gpus=free, executor=executor)
-            if launched:
-                started = time.monotonic()
+            if launched or reserved:
+                idle_since = time.monotonic()
+            elif exit_when_idle and time.monotonic() - idle_since >= idle_timeout:
+                break
             time.sleep(loop_interval)
     finally:
         pid_path.unlink(missing_ok=True)

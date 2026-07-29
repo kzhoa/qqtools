@@ -8,6 +8,10 @@ import time
 from pathlib import Path
 
 
+# A release-wheel task starts an agent and a runner in fresh Python interpreters.
+TASK_TERMINAL_TIMEOUT_SECONDS = 90.0
+
+
 def ensure_site_packages_import() -> str:
     import qqtools
 

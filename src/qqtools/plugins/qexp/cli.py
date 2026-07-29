@@ -5,19 +5,15 @@ import argparse
 import json
 import os
 import subprocess
-import signal
 import sys
-import time
 from pathlib import Path
 
-from .activation import ensure_local_agent_active
-from .agent import get_agent_status, run_agent_loop
-from .agent_process import spawn_agent_process
+from .activation import (ensure_local_agent_active, restart_local_agent, run_local_agent_foreground,
+                         start_local_agent, stop_local_agent)
+from .agent import get_agent_status
 from .commands import cleanup, group as group_commands, logs as log_commands, task as task_commands
-from .models import AGENT_MODE_DAEMON
 from .doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
-from .layout import (clear_context, load_context, load_root_config,
-                     runtime_pid_path, save_context)
+from .layout import clear_context, load_context, load_root_config, save_context
 from .machine_config import init_shared_root, load_machine_policy
 from . import observer
 
@@ -79,8 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "remove": action.add_argument("--terminate-running", action="store_true")
     agent = commands.add_parser("agent")
     agent_sub = agent.add_subparsers(dest="agent_action", required=True)
-    start = agent_sub.add_parser("start"); start.add_argument("--background", action="store_true")
-    agent_sub.add_parser("status"); agent_sub.add_parser("stop")
+    agent_sub.add_parser("start"); agent_sub.add_parser("run")
+    agent_sub.add_parser("restart"); agent_sub.add_parser("status"); agent_sub.add_parser("stop")
     commands.add_parser("top")
     commands.add_parser("machines")
     logs_top = commands.add_parser("logs"); logs_top.add_argument("task_id")
@@ -191,28 +187,26 @@ def main(argv: list[str] | None = None) -> int:
                     ensure_local_agent_active(cfg, reason="group-resume")
             print(json.dumps(result)); return 0
         if args.command == "agent":
-            if args.agent_action == "status": print(json.dumps(get_agent_status(cfg)))
+            policy = load_machine_policy(cfg)
+            if args.agent_action == "status":
+                print(json.dumps({"action": "status", "agent_mode": policy.agent_mode, **get_agent_status(cfg)}))
             elif args.agent_action == "start":
-                policy = load_machine_policy(cfg)
-                if args.background:
-                    if policy.agent_mode != AGENT_MODE_DAEMON:
-                        raise ValueError("--background requires agent_mode=daemon.")
-                    spawn_agent_process(cfg)
-                else:
-                    run_agent_loop(cfg, exit_when_idle=policy.exit_when_idle)
+                action, status = start_local_agent(cfg, reason="manual_start", require_eligible_work=False)
+                print(json.dumps({"action": action, "agent_mode": policy.agent_mode, **status}))
+            elif args.agent_action == "run":
+                run_local_agent_foreground(
+                    cfg,
+                    reason="manual_run",
+                    on_started=lambda status: print(json.dumps({
+                        "action": "running", "agent_mode": policy.agent_mode, **status,
+                    }), flush=True),
+                )
+            elif args.agent_action == "restart":
+                action, status = restart_local_agent(cfg)
+                print(json.dumps({"action": action, "agent_mode": policy.agent_mode, **status}))
             elif args.agent_action == "stop":
-                status = get_agent_status(cfg)
-                if status.get("pid"):
-                    pid = status["pid"]
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    deadline = time.monotonic() + 2.0
-                    while time.monotonic() < deadline and os.path.exists(f"/proc/{pid}"):
-                        time.sleep(0.05)
-                    if not os.path.exists(f"/proc/{pid}"):
-                        runtime_pid_path(cfg).unlink(missing_ok=True)
+                action, status = stop_local_agent(cfg)
+                print(json.dumps({"action": action, "agent_mode": policy.agent_mode, **status}))
             return 0
         if args.command == "top": print(json.dumps(observer.top_view(cfg, all_machines=True))); return 0
         if args.command == "machines": print(json.dumps(observer.list_machines(cfg))); return 0
