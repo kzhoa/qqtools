@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from qqtools.plugins.qpipeline import Stage
 import qqtools.plugins.qpipeline.runner.runner as runner_module
 from qqtools.plugins.qpipeline.runner.runner import train_runner
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
@@ -66,6 +67,34 @@ def test_train_runner_epoch_mode_uses_max_epochs(base_args, tiny_task, tiny_mode
     assert result["best_monitored_metric"] is not None
 
 
+def test_train_runner_passes_stage_to_stage_aware_task(base_args, tiny_task, tiny_model):
+    args = base_args.copy()
+    args.runner.early_stop.patience = 999
+    received_stages = []
+
+    def post_metrics_to_value(result, *, stage):
+        received_stages.append(stage)
+        return result["mse"]
+
+    tiny_task.post_metrics_to_value = post_metrics_to_value
+    train_runner(
+        model=tiny_model,
+        task=tiny_task,
+        loss_fn=torch.nn.MSELoss(),
+        optimizer=torch.optim.Adam(tiny_model.parameters(), lr=1.0e-3),
+        args=args,
+        run_mode="epoch",
+        max_epochs=1,
+        eval_interval=1,
+        save_dir=args.log_dir,
+        print_freq=5,
+    )
+
+    assert Stage.TRAIN in received_stages
+    assert Stage.VAL in received_stages
+    assert Stage.TEST in received_stages
+
+
 def test_train_runner_step_mode_dual_boundaries(base_args, tiny_task, tiny_model):
     args = base_args.copy()
     args.runner.early_stop.patience = 999
@@ -95,9 +124,7 @@ def test_train_runner_step_mode_dual_boundaries(base_args, tiny_task, tiny_model
     assert "secondary stopping boundary" in log_text
 
 
-def test_train_runner_step_mode_epoch_summary_logs_train_metrics_without_eval(
-    base_args, tiny_task, tiny_model
-):
+def test_train_runner_step_mode_epoch_summary_logs_train_metrics_without_eval(base_args, tiny_task, tiny_model):
     args = base_args.copy()
     args.runner.early_stop.patience = 999
 

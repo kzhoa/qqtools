@@ -17,3 +17,4 @@ from .entry_utils.scheduler import prepare_scheduler as prepare_scheduler
 from .middleware.ef import middleware_extra_ckp_caches as middleware_extra_ckp_caches
 from .qpipeline import qPipeline as qPipeline
 from .task.qtask import PotentialTaskBase as PotentialTaskBase, qTaskBase as qTaskBase
+from .types import Stage as Stage

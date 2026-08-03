@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- breaking: qpipeline `qTask.post_metrics_to_value` now validates its signature during runner
+  setup; use the required parameter name `result` (not `metrics` or another alias), and declare
+  optional execution context explicitly as `stage`. Positional-only parameters, `*args`, and
+  `**kwargs` are no longer accepted for this hook.
+- feat: bind qpipeline task metric hooks once during initialization, allowing stage-aware
+  `post_metrics_to_value(result, *, stage)` implementations while preserving the legacy
+  `post_metrics_to_value(result)` form; standalone evaluation now accepts explicit `stage`.
+
 ## v1.2.33
 
 - perf: lazily resolve root `qqtools` and `qpipeline` exports to avoid importing `torch` during

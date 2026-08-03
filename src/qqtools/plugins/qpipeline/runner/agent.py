@@ -23,6 +23,7 @@ from ..entry_utils.qema import qEMA
 from ..entry_utils.scheduler import qWarmupScheduler
 from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import qTaskBase
+from ..types import Stage
 from .events import (
     EventDispatcher,
     EventName,
@@ -45,8 +46,9 @@ from .runner_utils.avgbank import AvgBank
 from .runner_utils.best_model import BestModelTracker
 from .runner_utils.common import _is_periodic_trigger, move_batch_to_device
 from .runner_utils.ema_context import EMAOffloadContext
+from .runner_utils.hook_binding import bind_post_metrics_to_value
 from .runner_utils.tensorbank import TensorBank
-from .runner_utils.types import LoopSignal, RunConfig, RunMode, RunningState, Stage
+from .runner_utils.types import LoopSignal, RunConfig, RunMode, RunningState
 
 
 def _get_scalar_metrics(batch_metrics: Dict[str, Any]) -> Dict[str, float]:
@@ -82,6 +84,7 @@ class RunningAgent:
     ):
         self.model = model
         self.task = task
+        self._post_metrics_to_value = bind_post_metrics_to_value(task)
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -148,8 +151,7 @@ class RunningAgent:
         if self.scheduler.current_step >= self.scheduler.warmup_steps:
             self.train_avg_bank.reset()
             self.logger.info(
-                f"Warmup completed at step {self.scheduler.warmup_steps}. "
-                f"Training metrics have been reset."
+                f"Warmup completed at step {self.scheduler.warmup_steps}. " f"Training metrics have been reset."
             )
             self.remove_listener("on_train_batch_end", self._reset_avg_after_warmup)
 
@@ -218,7 +220,10 @@ class RunningAgent:
                 raw_epoch_metrics.update(task_epoch_metrics)
         epoch_results = {f"train_{k}": v for k, v in raw_epoch_metrics.items()}
         if raw_epoch_metrics:
-            epoch_results["train_metric"] = self.task.post_metrics_to_value(raw_epoch_metrics)
+            epoch_results["train_metric"] = self._post_metrics_to_value(
+                result=raw_epoch_metrics,
+                stage=Stage.TRAIN,
+            )
         self.train_avg_bank.reset()
         if self.train_tensor_bank:
             self.train_tensor_bank.reset()
@@ -351,7 +356,9 @@ class RunningAgent:
                 eval_tensor_bank.reset()
 
             prefixed_metrics = {f"{prefix}_{key}": value for key, value in avg_metrics.items()}
-            prefixed_metrics[f"{prefix}_metric"] = self.task.post_metrics_to_value(avg_metrics)
+            canonical_metric = self._post_metrics_to_value(result=avg_metrics, stage=stage)
+            if canonical_metric is not None or stage is not Stage.TEST:
+                prefixed_metrics[f"{prefix}_metric"] = canonical_metric
             return prefixed_metrics
         finally:
             model.train(was_training)
@@ -402,7 +409,7 @@ class RunningAgent:
         eval_results = self.evaluate_all_models()
 
         if interval_metrics:
-            train_metric = self.task.post_metrics_to_value(interval_metrics)
+            train_metric = self._post_metrics_to_value(result=interval_metrics, stage=Stage.TRAIN)
             eval_results.update({f"train_{k}": v for k, v in interval_metrics.items()})
             eval_results["train_metric"] = train_metric
 

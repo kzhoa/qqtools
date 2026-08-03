@@ -24,6 +24,7 @@ from ..entry_utils.scheduler import SCHEDULER_STEP_ON_VALID_END, prepare_schedul
 from ..entry_utils.type_qconfig import CheckpointConfig, EarlyStopConfig, qConfig
 from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import TASK_LIFECYCLE_HOOKS, qTaskBase
+from ..types import Stage
 from .agent import NaNDetectedError, RunningAgent
 from .events import ValidationEndEventContext
 from .runner_utils.ckp_manager import CheckpointListener, CheckpointManager
@@ -37,7 +38,6 @@ from .runner_utils.types import (
     RunConfig,
     RunMode,
     RunningState,
-    Stage,
     TerminalEvent,
     TerminalReason,
     TrainRunnerResult,
