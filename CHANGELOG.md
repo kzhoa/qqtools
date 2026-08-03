@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- feat: make qpipeline `metrics.csv` a dynamically expanding wide CSV; runtime metric keys are
+  preserved in first-observed order, with atomic schema migrations and recover validation
+- feat: add SheetLogger `close()`/`abort()` commit semantics; asynchronous `abort()` drains rows
+  already accepted by `write()` without materializing an otherwise empty run, and successful-training
+  log finalization failures are reported as the `logger_failure` terminal reason
 - breaking: qpipeline `qTask.post_metrics_to_value` now validates its signature during runner
   setup; use the required parameter name `result` (not `metrics` or another alias), and declare
   optional execution context explicitly as `stage`. Positional-only parameters, `*args`, and
