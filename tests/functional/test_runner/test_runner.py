@@ -1134,7 +1134,10 @@ class TestTrainRunner:
             assert metrics_file.exists()
 
             fieldnames, rows = self._read_metrics_rows(metrics_file)
-            assert fieldnames == ["epoch", "global_step", "train_metric", "val_metric", "test_metric", "train_loss"]
+            assert fieldnames[:6] == [
+                "epoch", "global_step", "train_metric", "val_metric", "test_metric", "train_loss"
+            ]
+            assert {"train_mse", "val_mse", "test_mse"}.issubset(fieldnames)
             assert len(rows) >= 1
             assert any(row["val_metric"] != "" for row in rows)
 

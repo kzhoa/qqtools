@@ -33,7 +33,7 @@ from .runner_utils.earlystop import EarlyStopListener, EarlyStopper
 from .runner_utils.epoch_suffix import standardize_epoch_suffixes
 from .runner_utils.eval_formatter import EvalSummaryListener
 from .runner_utils.progress import ProgressTracker
-from .runner_utils.sheet_logger import SheetLogger, SheetLoggerListener
+from .runner_utils.sheet_logger import SheetLogger, SheetLoggerListener, adapt_qpipeline_metric_row
 from .runner_utils.types import (
     RunConfig,
     RunMode,
@@ -45,7 +45,9 @@ from .runner_utils.types import (
 
 __all__ = ["train_runner", "SheetLoggerListener"]
 
-TerminalCause = Literal["normal_finish", "early_stop", "user_interrupt", "exception", "nan_detected"]
+TerminalCause = Literal[
+    "normal_finish", "early_stop", "user_interrupt", "exception", "nan_detected", "logger_failure",
+]
 
 
 def _qconfig_get(config: Any, key: str, default: Any = None) -> Any:
@@ -125,6 +127,15 @@ def _build_terminal_event_for_cause(
             reason="nan_detected",
             epoch=state.epoch,
             step=state.global_step,
+        )
+
+    if terminal_cause == "logger_failure":
+        return _build_terminal_event(
+            status="failed",
+            reason="logger_failure",
+            epoch=state.epoch,
+            step=state.global_step,
+            exception=exception,
         )
 
     if terminal_cause == "early_stop":
@@ -210,8 +221,9 @@ def _finalize_train_runner(
             exc_info=True,
         )
 
-    if sheet_logger is not None:
-        sheet_logger.close()
+
+
+def _close_runner_logger(logger: qLogger, owns_logger: bool) -> None:
     if owns_logger:
         logger.close()
         logging.shutdown()
@@ -606,7 +618,7 @@ def train_runner(
     sheet_logger = None
     if log_granularity and config.rank == 0:
         metrics_file = Path(save_dir) / "metrics.csv"
-        sheet_logger = SheetLogger(metrics_file, columns=log_keys)
+        sheet_logger = SheetLogger(metrics_file, columns=log_keys, row_adapter=adapt_qpipeline_metric_row)
     for warning_msg in boundary_policy_warnings:
         logger.warning(warning_msg)
 
@@ -680,6 +692,9 @@ def train_runner(
     progress_tracker = None
     profiler = None
     terminal_event: Optional[TerminalEvent] = None
+    terminal_cause: Optional[TerminalCause] = None
+    primary_exception: Optional[BaseException] = None
+    primary_traceback = None
 
     try:
         progress_tracker, profiler = _prepare_training_session(
@@ -702,38 +717,18 @@ def train_runner(
             log_granularity=log_granularity,
         )
         loop_stopped_by_early_stop = agent.run()
-        terminal_event = _build_and_emit_terminal_event(
-            logger=logger,
-            terminal_cause="early_stop" if loop_stopped_by_early_stop else "normal_finish",
-            state=agent.state,
-            run_config=config,
-        )
+        terminal_cause = "early_stop" if loop_stopped_by_early_stop else "normal_finish"
 
     except KeyboardInterrupt:
-        terminal_event = _build_and_emit_terminal_event(
-            logger=logger,
-            terminal_cause="user_interrupt",
-            state=agent.state,
-            run_config=config,
-        )
+        terminal_cause = "user_interrupt"
 
     except NaNDetectedError:
-        terminal_event = _build_and_emit_terminal_event(
-            logger=logger,
-            terminal_cause="nan_detected",
-            state=agent.state,
-            run_config=config,
-        )
+        terminal_cause = "nan_detected"
 
     except Exception as error:
-        terminal_event = _build_and_emit_terminal_event(
-            logger=logger,
-            terminal_cause="exception",
-            state=agent.state,
-            run_config=config,
-            exception=error,
-        )
-        raise
+        terminal_cause = "exception"
+        primary_exception = error
+        primary_traceback = error.__traceback__
 
     finally:
         _finalize_train_runner(
@@ -743,6 +738,46 @@ def train_runner(
             profiler=profiler,
             owns_logger=owns_logger,
         )
+
+    logger_error: Optional[BaseException] = None
+    if sheet_logger is not None:
+        try:
+            if terminal_cause in {"normal_finish", "early_stop"}:
+                sheet_logger.close()
+            else:
+                sheet_logger.abort()
+        except BaseException as error:
+            logger_error = error
+            logger.error("SheetLogger finalization failed: %s", error, exc_info=True)
+
+    if primary_exception is not None:
+        if logger_error is not None:
+            primary_exception.add_note(f"SheetLogger finalization failed: {logger_error!r}")
+        terminal_event = _build_and_emit_terminal_event(
+            logger=logger,
+            terminal_cause="exception",
+            state=agent.state,
+            run_config=config,
+            exception=primary_exception,
+        )
+        _close_runner_logger(logger, owns_logger)
+        raise primary_exception.with_traceback(primary_traceback)
+
+    if logger_error is not None:
+        terminal_cause = "logger_failure"
+    if terminal_cause is None:
+        _close_runner_logger(logger, owns_logger)
+        raise RuntimeError("train_runner completed without terminal cause")
+    terminal_event = _build_and_emit_terminal_event(
+        logger=logger,
+        terminal_cause=terminal_cause,
+        state=agent.state,
+        run_config=config,
+        exception=logger_error,
+    )
+    _close_runner_logger(logger, owns_logger)
+    if logger_error is not None:
+        raise logger_error
 
     # Return final results
     if terminal_event is None:

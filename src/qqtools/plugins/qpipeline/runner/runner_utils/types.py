@@ -9,7 +9,10 @@ import torch.distributed as dist
 
 from qqtools.torch import qdist
 
-TerminalReason = Literal["max_steps", "max_epochs", "early_stop", "user_interrupt", "oom", "exception", "nan_detected"]
+TerminalReason = Literal[
+    "max_steps", "max_epochs", "early_stop", "user_interrupt", "oom", "exception",
+    "nan_detected", "logger_failure",
+]
 EpochResultMetricSource = Literal["current_eval", "latest_eval_reuse", "missing"]
 
 __all__ = [
