@@ -1,3 +1,4 @@
+import json
 import tempfile
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from qqtools.plugins.qpipeline.runner.runner import RunningAgent
 from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMode
 from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointManager
 from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointListener
+from qqtools.plugins.qpipeline.runner.runner_utils.metrics_jsonl import MetricsJsonlLogger
 
 # Re-using components from conftest for consistency
 from .conftest import SimpleModel, SimpleTask
@@ -147,3 +149,60 @@ class TestCheckpointTriggerTiming:
         assert len(saved_files) == 1
         checkpoint = torch.load(saved_files[0])
         assert checkpoint["state"]["epoch"] == 2
+
+    def test_checkpoint_listener_logs_absolute_path_after_successful_save(self, common_setup):
+        task, model, optimizer, loss_fn, device, logger, checkpoint_manager, save_dir = common_setup
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(device=device),
+            device=device,
+            logger=logger,
+        )
+        checkpoint_listener = CheckpointListener(
+            checkpoint_manager=checkpoint_manager,
+            model=model,
+            task=task,
+            optimizer=optimizer,
+            logger=logger,
+        )
+        agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
+
+        agent._request_checkpoint("regular")
+        agent._flush_checkpoint_requests()
+
+        checkpoint_path = next(save_dir.glob("*.pt")).resolve()
+        logger.info.assert_any_call(f"[Checkpoint Saved] type=regular path={checkpoint_path}")
+
+    def test_checkpoint_listener_writes_jsonl_event_after_successful_save(self, common_setup):
+        task, model, optimizer, loss_fn, device, logger, checkpoint_manager, save_dir = common_setup
+        event_logger = MetricsJsonlLogger(save_dir / "metrics.jsonl")
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(device=device),
+            device=device,
+            logger=logger,
+        )
+        checkpoint_listener = CheckpointListener(
+            checkpoint_manager=checkpoint_manager,
+            model=model,
+            task=task,
+            optimizer=optimizer,
+            logger=logger,
+            event_logger=event_logger,
+        )
+        agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
+
+        agent._request_checkpoint("regular")
+        agent._flush_checkpoint_requests()
+        event_logger.close()
+
+        event = json.loads((save_dir / "metrics.jsonl").read_text().strip())
+        assert event["event"] == "checkpoint_saved"
+        assert event["type"] == "regular"
+        assert event["path"] == str(next(save_dir.glob("*.pt")).resolve())

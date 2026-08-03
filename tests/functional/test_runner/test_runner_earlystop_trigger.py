@@ -276,8 +276,8 @@ class TestEarlyStopTrigger:
                 save_dir=tmpdir,
             )
 
-    def test_earlystop_metric_none(self):
-        """Test early stopping when metric is None should not trigger early stop."""
+    def test_validation_metric_none_skips_control_consumers(self):
+        """An unavailable stage score skips control updates without aborting training."""
 
         class NoneMetricTask(DummyTask):
             def post_metrics_to_value(self, result):
@@ -327,18 +327,17 @@ class TestEarlyStopTrigger:
         loss_fn = nn.MSELoss()
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         task = MissingMetricTask([0.5] * 5)
-        result = train_runner(
-            model=model,
-            task=task,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            args=args,
-            max_epochs=5,
-            eval_interval=1,
-            save_dir=tmpdir,
-        )
-        assert result["early_stopped"] is False
-        assert result["final_epoch"] == 5
+        with pytest.raises(ValueError, match="Unsupported score target"):
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=args,
+                max_epochs=5,
+                eval_interval=1,
+                save_dir=tmpdir,
+            )
 
     def test_earlystop_resume_count(self):
         """Test early stopping counter after simulated resume (patience计数是否正确)。"""

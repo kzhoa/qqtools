@@ -2,11 +2,13 @@
 
 ## Unreleased
 
-- feat: make qpipeline `metrics.csv` a dynamically expanding wide CSV; runtime metric keys are
-  preserved in first-observed order, with atomic schema migrations and recover validation
-- feat: add SheetLogger `close()`/`abort()` commit semantics; asynchronous `abort()` drains rows
-  already accepted by `write()` without materializing an otherwise empty run, and successful-training
-  log finalization failures are reported as the `logger_failure` terminal reason
+- feat: support named multi-loader validation and test evaluation through `val_loader` and
+  `test_loader` mappings, with task-owned stage-level canonical metrics and runtime-safe loader
+  replacement between evaluation boundaries
+- breaking: qpipeline evaluation event contexts now expose structured `EvaluationResult`; migrate
+  listener reads to model, stage, loader, and score fields
+- docs: add the v1.2.34 qpipeline multi-evaluation-loader upgrade guide
+- breaking: replace the temporary dynamic CSV sheet logger with structured `metrics.jsonl` events
 - breaking: qpipeline `qTask.post_metrics_to_value` now validates its signature during runner
   setup; use the required parameter name `result` (not `metrics` or another alias), and declare
   optional execution context explicitly as `stage`. Positional-only parameters, `*args`, and
@@ -14,6 +16,9 @@
 - feat: bind qpipeline task metric hooks once during initialization, allowing stage-aware
   `post_metrics_to_value(result, *, stage)` implementations while preserving the legacy
   `post_metrics_to_value(result)` form; standalone evaluation now accepts explicit `stage`.
+- breaking: replace qpipeline flat evaluation metric dictionaries with structured `EvaluationResult`
+  objects and use the stable score targets `val_metric`, `test_metric`, `train_metric`,
+  `ema_val_metric`, or `ema_test_metric`
 
 ## v1.2.33
 

@@ -216,6 +216,8 @@ class CheckpointListener:
         ema_model: Optional[qEMA] = None,
         early_stopper: Optional[Any] = None,
         best_model_tracker: Optional[Any] = None,
+        logger: Optional[Any] = None,
+        event_logger: Optional[Any] = None,
     ) -> None:
         self.checkpoint_manager = checkpoint_manager
         self.model = model
@@ -225,6 +227,8 @@ class CheckpointListener:
         self.ema_model = ema_model
         self.early_stopper = early_stopper
         self.best_model_tracker = best_model_tracker
+        self.logger = logger
+        self.event_logger = event_logger
 
     def _clone_state_for_save(self, context: CheckpointRequestEventContext):
         state = context.runner.run_state
@@ -251,3 +255,15 @@ class CheckpointListener:
         )
         if context.signal:
             context.signal.checkpoint_path = ckp_path
+        if ckp_path and self.logger is not None:
+            self.logger.info(f"[Checkpoint Saved] type={checkpoint_type} path={Path(ckp_path).resolve()}")
+        if ckp_path and self.event_logger is not None:
+            self.event_logger.write(
+                {
+                    "event": "checkpoint_saved",
+                    "epoch": context.runner.run_state.epoch,
+                    "global_step": context.runner.run_state.global_step,
+                    "type": checkpoint_type,
+                    "path": str(Path(ckp_path).resolve()),
+                }
+            )

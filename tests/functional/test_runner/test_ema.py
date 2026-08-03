@@ -183,15 +183,22 @@ def test_ema_update_and_evaluation(setup_agent_with_ema):
     assert agent.model.training, "Original model's state should be restored after evaluation"
     assert ema_model.module.training, "EMA model's state should not be affected by original model evaluation"
 
-    # Ensure batch_data and model parameters are on the same device during evaluation
-    # This is implicitly tested by the fact that the evaluation runs without device errors.
-    # We can add a more explicit check if needed, but _prepare_batch handles data movement.
-    # The agent.device is 'cpu' and both models are moved to 'cpu' in setup_agent_with_ema.
-    # _prepare_batch also moves batch_data to agent.device.
     assert agent.device == device
     assert next(model.parameters()).device == device
     assert next(ema_model.module.parameters()).device == device
 
+
+def test_direct_ema_evaluation_preserves_standard_metric_keys(setup_agent_with_ema):
+    agent, _, _, _ = setup_agent_with_ema
+
+    standard_results = agent.evaluate(use_ema=False)
+    ema_results = agent.evaluate(use_ema=True)
+    aggregated_results = agent.evaluate_all_models()
+
+    assert standard_results.models[0].variant == "standard"
+    assert ema_results.models[0].variant == "ema"
+    assert ema_results.target_value("ema_val_metric") is not None
+    assert aggregated_results.target_value("ema_val_metric") is not None
 
 def test_enabled_auto_offload_always_offloads_for_ema_evaluation():
     agent, model, _, _ = _build_agent_for_offload_tests(auto_offload=True)
@@ -270,6 +277,4 @@ def test_best_snapshot_uses_ema_prefixed_metrics_when_target_is_ema_val_metric(t
     snapshot = result["best_model_metrics_snapshot"]
     assert result["best_monitored_key"] == "ema_val_metric"
     assert result["best_monitored_metric"] is not None
-    assert "ema_val_metric" in snapshot
-    assert any(key.startswith("ema_") for key in snapshot)
-    assert all((not ("ema" in key)) or key.startswith("ema_") for key in snapshot)
+    assert any(model["variant"] == "ema" for model in snapshot["models"])

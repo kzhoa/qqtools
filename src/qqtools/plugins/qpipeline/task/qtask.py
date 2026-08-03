@@ -57,8 +57,8 @@ class qTaskBase(ABC):
     """
 
     train_loader: DataLoader
-    val_loader: DataLoader
-    test_loader: DataLoader
+    val_loader: Optional[Union[DataLoader, Dict[str, DataLoader]]]
+    test_loader: Optional[Union[DataLoader, Dict[str, DataLoader]]]
     meta: Dict[str, Any]  # flow with epoch runner and saved in checkpoint
 
     _required = set(REQUIRED_METHODS)

@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 
 from ...types import Stage
 from ..runner_utils.types import LoopSignal, RunningState
+from ..runner_utils.evaluation import EvaluationResult
 from .dispatcher import EventDispatcher
 
 
@@ -216,7 +217,7 @@ def emit_eval_end(
     dispatcher: EventDispatcher,
     *,
     state: RunningState,
-    eval_results: Dict[str, Any],
+    evaluation: EvaluationResult,
     signal: LoopSignal,
     max_epochs: Optional[int],
     max_steps: Optional[int],
@@ -226,7 +227,7 @@ def emit_eval_end(
         "on_eval_end",
         state=state,
         stage=None,
-        eval_results=eval_results,
+        evaluation=evaluation,
         signal=signal,
         max_epochs=max_epochs,
         max_steps=max_steps,
@@ -237,7 +238,7 @@ def emit_validation_end(
     dispatcher: EventDispatcher,
     *,
     state: RunningState,
-    eval_results: Dict[str, Any],
+    evaluation: EvaluationResult,
     lr: Optional[float],
     previous_best: Optional[Dict[str, Any]],
     is_best: bool,
@@ -251,7 +252,7 @@ def emit_validation_end(
         "on_validation_end",
         state=state,
         stage=None,
-        eval_results=eval_results,
+        evaluation=evaluation,
         lr=lr,
         previous_best=previous_best,
         is_best=is_best,

@@ -46,6 +46,14 @@ from .runner_utils.avgbank import AvgBank
 from .runner_utils.best_model import BestModelTracker
 from .runner_utils.common import _is_periodic_trigger, move_batch_to_device
 from .runner_utils.ema_context import EMAOffloadContext
+from .runner_utils.evaluation import (
+    EvaluationResult,
+    LoaderEvaluation,
+    ModelEvaluation,
+    StageEvaluation,
+    TrainingResult,
+    resolve_loader_group,
+)
 from .runner_utils.hook_binding import bind_post_metrics_to_value
 from .runner_utils.tensorbank import TensorBank
 from .runner_utils.types import LoopSignal, RunConfig, RunMode, RunningState
@@ -104,9 +112,6 @@ class RunningAgent:
         self._ad_hoc_signal = LoopSignal()
 
         self.train_loader = task.train_loader
-        self.val_loader = task.val_loader
-        self.test_loader = task.test_loader
-
         self.train_avg_bank = avg_bank or AvgBank()
 
         has_batch_cache = self.task.has_implemented("batch_cache")
@@ -240,57 +245,112 @@ class RunningAgent:
         self.state.epoch += 1
         self.state.batch_idx_in_epoch = 0
 
-    def _evaluate_model(self, model: nn.Module) -> Dict[str, Any]:
-        results: Dict[str, Any] = {}
+    def _resolve_evaluation_loaders(
+        self,
+    ) -> Tuple[list[tuple[Optional[str], DataLoader]], list[tuple[Optional[str], DataLoader]]]:
+        return (
+            resolve_loader_group(self.task.val_loader, group_name="validation"),
+            resolve_loader_group(self.task.test_loader, group_name="test"),
+        )
 
-        if self.val_loader is not None:
-            results.update(self._evaluate_loader(model, self.val_loader, prefix="val", stage=Stage.VAL))
+    def _evaluate_loader_group(
+        self,
+        model: nn.Module,
+        loaders: list[tuple[Optional[str], DataLoader]],
+        stage: Stage,
+    ) -> Optional[StageEvaluation]:
+        loader_results: list[LoaderEvaluation] = []
+        grouped_metrics: Dict[str, Dict[str, Any]] = {}
+        for loader_name, data_loader in loaders:
+            metrics = self._evaluate_loader(model=model, data_loader=data_loader, stage=stage)
+            loader_results.append(
+                LoaderEvaluation(name=loader_name, metrics=metrics)
+            )
+            if loader_name is not None:
+                grouped_metrics[loader_name] = metrics
 
-        if self.test_loader is not None:
-            results.update(self._evaluate_loader(model, self.test_loader, prefix="test", stage=Stage.TEST))
+        if not loader_results:
+            return None
+        result: Dict[str, Any]
+        if len(loader_results) == 1 and loader_results[0].name is None:
+            result = dict(loader_results[0].metrics)
+        else:
+            result = grouped_metrics
+        score = self._post_metrics_to_value(result=result, stage=stage)
+        return StageEvaluation(stage=stage, loaders=tuple(loader_results), score=score)
 
-        return results
+    def _evaluate_model(
+        self,
+        model: nn.Module,
+        val_loaders: list[tuple[Optional[str], DataLoader]],
+        test_loaders: list[tuple[Optional[str], DataLoader]],
+        model_variant: str,
+    ) -> ModelEvaluation:
+        stages = []
+        for loaders, stage in ((val_loaders, Stage.VAL), (test_loaders, Stage.TEST)):
+            stage_result = self._evaluate_loader_group(model, loaders, stage)
+            if stage_result is not None:
+                stages.append(stage_result)
+        return ModelEvaluation(variant=model_variant, stages=tuple(stages))
 
-    def evaluate(self, model: nn.Module = None, use_ema: bool = False) -> Dict[str, Any]:
+    def evaluate(self, model: nn.Module = None, use_ema: bool = False) -> EvaluationResult:
         base_model = model or self.model
-
+        val_loaders, test_loaders = self._resolve_evaluation_loaders()
         with self._ema_offload_ctx(model=base_model, use_ema=use_ema) as eval_model:
-            return self._evaluate_model(eval_model)
+            model_result = self._evaluate_model(
+                eval_model,
+                val_loaders,
+                test_loaders,
+                "ema" if use_ema else "standard",
+            )
+            return EvaluationResult(models=(model_result,))
 
-    def evaluate_all_models(self) -> Dict[str, Any]:
-        eval_results = self.evaluate(self.model, use_ema=False)
+    def evaluate_all_models(
+        self,
+        val_loaders: Optional[list[tuple[Optional[str], DataLoader]]] = None,
+        test_loaders: Optional[list[tuple[Optional[str], DataLoader]]] = None,
+    ) -> EvaluationResult:
+        if val_loaders is None or test_loaders is None:
+            val_loaders, test_loaders = self._resolve_evaluation_loaders()
 
+        with self._ema_offload_ctx(model=self.model, use_ema=False) as eval_model:
+            standard_result = self._evaluate_model(
+                eval_model, val_loaders, test_loaders, "standard"
+            )
+        model_results = [standard_result]
         if self.ema_model is not None:
-            ema_results = self.evaluate(self.model, use_ema=True)
-            eval_results.update({f"ema_{key}": value for key, value in ema_results.items()})
-
-        return eval_results
+            with self._ema_offload_ctx(model=self.model, use_ema=True) as eval_model:
+                ema_result = self._evaluate_model(
+                    eval_model, val_loaders, test_loaders, "ema"
+                )
+            model_results.append(ema_result)
+        return EvaluationResult(models=tuple(model_results))
 
     def evaluate_loader(
         self,
         data_loader: DataLoader,
-        prefix: str = "",
         stage: Stage = Stage.VAL,
         model: Optional[nn.Module] = None,
         use_ema: bool = False,
-    ) -> Optional[Dict[str, Any]]:
+        loader_name: Optional[str] = None,
+    ) -> EvaluationResult:
         base_model = model or self.model
 
         with self._ema_offload_ctx(model=base_model, use_ema=use_ema) as eval_model:
-            return self._evaluate_loader(
-                model=eval_model,
-                data_loader=data_loader,
-                prefix=prefix,
-                stage=stage,
+            stage_result = self._evaluate_loader_group(
+                eval_model, [(loader_name, data_loader)], stage
+            )
+            assert stage_result is not None
+            return EvaluationResult(
+                models=(ModelEvaluation(variant="ema" if use_ema else "standard", stages=(stage_result,)),)
             )
 
     def _evaluate_loader(
         self,
         model: nn.Module,
         data_loader: DataLoader,
-        prefix: str = "",
         stage: Stage = Stage.VAL,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         was_training = model.training
         model.eval()
         total_batches = len(data_loader)
@@ -355,15 +415,11 @@ class RunningAgent:
             if eval_tensor_bank:
                 eval_tensor_bank.reset()
 
-            prefixed_metrics = {f"{prefix}_{key}": value for key, value in avg_metrics.items()}
-            canonical_metric = self._post_metrics_to_value(result=avg_metrics, stage=stage)
-            if canonical_metric is not None or stage is not Stage.TEST:
-                prefixed_metrics[f"{prefix}_metric"] = canonical_metric
-            return prefixed_metrics
+            return avg_metrics
         finally:
             model.train(was_training)
 
-    def _update_best_model_state(self, eval_results: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    def _update_best_model_state(self, evaluation: EvaluationResult) -> Tuple[bool, Optional[Dict[str, Any]]]:
         tracker = self.best_model_tracker
         if not tracker:
             return False, None
@@ -375,8 +431,17 @@ class RunningAgent:
         }
 
         target_key = getattr(tracker, "target", None)
-        current_val = eval_results.get(target_key)
-        if not target_key or current_val is None:
+        if not target_key:
+            return False, previous_best
+        current_val = evaluation.target_value(target_key)
+        if current_val is None:
+            self.logger.debug(
+                "BestModelTracker skipped: target=%r default=skip_compare_and_checkpoint "
+                "epoch=%s step=%s.",
+                target_key,
+                self.state.epoch,
+                self.state.global_step,
+            )
             return False, previous_best
 
         monitored_metric = qt.ensure_scala(current_val)
@@ -388,11 +453,12 @@ class RunningAgent:
         self.state.best_step = self.state.global_step
         self.state.best_monitored_key = target_key
         self.state.best_monitored_metric = monitored_metric
-        self.state.best_model_metrics_snapshot = dict(eval_results)
+        self.state.best_model_metrics_snapshot = evaluation.to_dict()
         return True, previous_best
 
     def _run_evaluation_and_update(self, signal: LoopSignal) -> None:
-        total_eval_batches = sum(len(loader) for loader in (self.val_loader, self.test_loader) if loader is not None)
+        val_loaders, test_loaders = self._resolve_evaluation_loaders()
+        total_eval_batches = sum(len(loader) for _, loader in (*val_loaders, *test_loaders))
 
         emit_eval_start(
             self.dispatcher,
@@ -406,32 +472,42 @@ class RunningAgent:
         interval_metrics = self.interval_avg_bank.gather_average(self.config.distributed)
         self.interval_avg_bank = AvgBank()
 
-        eval_results = self.evaluate_all_models()
-
+        evaluation = self.evaluate_all_models(val_loaders, test_loaders)
+        training = None
         if interval_metrics:
-            train_metric = self._post_metrics_to_value(result=interval_metrics, stage=Stage.TRAIN)
-            eval_results.update({f"train_{k}": v for k, v in interval_metrics.items()})
-            eval_results["train_metric"] = train_metric
+            training = TrainingResult(
+                metrics=dict(interval_metrics),
+                score=self._post_metrics_to_value(result=interval_metrics, stage=Stage.TRAIN),
+            )
+            evaluation = EvaluationResult(models=evaluation.models, training=training)
 
-        self.state.update_current_metrics(eval_results)
+        state_metrics: Dict[str, Any] = {}
+        if training is not None:
+            state_metrics["train_metric"] = training.score
+            state_metrics.update({f"train_{name}": value for name, value in training.metrics.items()})
+        for target, key in (("val_metric", "val_metric"), ("test_metric", "test_metric")):
+            value = evaluation.target_value(target)
+            if value is not None:
+                state_metrics[key] = value
+        self.state.update_current_metrics(state_metrics, is_evaluation_boundary=True)
 
         emit_eval_end(
             self.dispatcher,
             state=self.state,
-            eval_results=eval_results,
+            evaluation=evaluation,
             signal=signal,
             max_epochs=self.config.max_epochs,
             max_steps=self.config.max_steps,
         )
 
-        is_best, previous_best = self._update_best_model_state(eval_results)
+        is_best, previous_best = self._update_best_model_state(evaluation)
         if is_best:
             self._request_checkpoint("best", signal=signal)
 
         emit_validation_end(
             self.dispatcher,
             state=self.state,
-            eval_results=eval_results,
+            evaluation=evaluation,
             lr=self._get_current_lr(),
             previous_best=previous_best,
             is_best=is_best,

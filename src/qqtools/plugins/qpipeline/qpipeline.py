@@ -227,7 +227,6 @@ class qPipeline:
         log_dir = args.log_dir
         print_freq = args.print_freq or 100
 
-        extra_log_keys = None
 
         run_mode = args.runner.get("run_mode", "epoch")
         eval_interval = args.runner.get("eval_interval", 1)
@@ -247,7 +246,6 @@ class qPipeline:
             distributed=distributed,
             save_dir=log_dir,
             print_freq=print_freq,
-            extra_log_keys=extra_log_keys,
             extra_ckp_caches=self.extra_ckp_caches,
             use_profiler=use_profiler,
             ema_model=self.ema_model,
@@ -262,6 +260,11 @@ class qPipeline:
         if dataloader is None:
             warnings.warn(Warning("[qPipeline]No dataloader provided, use task.test_loader"))
             dataloader = self.task.test_loader
+            if isinstance(dataloader, dict):
+                raise ValueError(
+                    "qPipeline.infer() requires an explicit dataloader when task.test_loader contains "
+                    "multiple named loaders."
+                )
         return self.infer_only(dataloader)
 
     def infer_only(self, dataloader):
@@ -283,7 +286,6 @@ class qPipeline:
     def evaluate_once(
         self,
         dataloader=None,
-        prefix: str = "test",
         return_outputs: bool = False,
         *,
         stage: Stage = Stage.TEST,
@@ -291,6 +293,11 @@ class qPipeline:
         if dataloader is None:
             warnings.warn(Warning("[qPipeline]No dataloader provided, use task.test_loader"))
             dataloader = self.task.test_loader
+            if isinstance(dataloader, dict):
+                raise ValueError(
+                    "qPipeline.evaluate_once() requires an explicit dataloader when task.test_loader "
+                    "contains multiple named loaders."
+                )
         assert dataloader is not None
 
         return evaluate_runner(
@@ -298,7 +305,6 @@ class qPipeline:
             task=self.task,
             dataloader=dataloader,
             args=self.args,
-            prefix=prefix,
             return_outputs=return_outputs,
             logger=self.logger,
             stage=stage,
