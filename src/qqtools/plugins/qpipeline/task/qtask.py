@@ -1,12 +1,14 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
 
 import qqtools as qt
+
+from ..types import Stage
 
 __all__ = ["qTaskBase", "PotentialTaskBase"]
 
@@ -110,13 +112,15 @@ class qTaskBase(ABC):
         pass
 
     @abstractmethod
-    def post_metrics_to_value(self, result) -> float:
+    def post_metrics_to_value(self, result: Mapping[str, Any], *, stage: Stage) -> float:
         """
         In cases where multiple metrics are available, the error metric must be prioritized
         to identify the optimal validation performance.
 
         Args:
-            result: Dict[metric_name, metric_avg]
+            result: Read-only metric mapping for the current stage. Future multi-loader
+                evaluation represents each named source as a nested mapping.
+            stage: Runtime stage that produced result.
 
         Returns:
             float: The performance error value.

@@ -13,7 +13,6 @@ TerminalReason = Literal["max_steps", "max_epochs", "early_stop", "user_interrup
 EpochResultMetricSource = Literal["current_eval", "latest_eval_reuse", "missing"]
 
 __all__ = [
-    "Stage",
     "RunMode",
     "RunConfig",
     "RunningState",
@@ -25,12 +24,6 @@ __all__ = [
     "TerminalEvent",
     "TrainRunnerResult",
 ]
-
-
-class Stage(str, Enum):
-    TRAIN = "train"
-    VAL = "val"
-    TEST = "test"
 
 
 class RunMode(Enum):
@@ -306,4 +299,3 @@ class FrozenRunningState:
         thawed = {key: _deep_thaw(value) for key, value in self._snapshot.items()}
         state.from_dict(thawed)
         return state
-

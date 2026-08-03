@@ -14,6 +14,7 @@ from .qlogger import ConsoleLogger, qLogger
 from .runner.eval_runner import evaluate_runner, infer_runner
 from .runner.runner import train_runner
 from .task.qtask import qTaskBase
+from .types import Stage
 
 
 @qt.qdist.ddp_safe
@@ -279,7 +280,14 @@ class qPipeline:
             logger=self.logger,
         )
 
-    def evaluate_once(self, dataloader=None, prefix: str = "test", return_outputs: bool = False):
+    def evaluate_once(
+        self,
+        dataloader=None,
+        prefix: str = "test",
+        return_outputs: bool = False,
+        *,
+        stage: Stage = Stage.TEST,
+    ):
         if dataloader is None:
             warnings.warn(Warning("[qPipeline]No dataloader provided, use task.test_loader"))
             dataloader = self.task.test_loader
@@ -293,4 +301,5 @@ class qPipeline:
             prefix=prefix,
             return_outputs=return_outputs,
             logger=self.logger,
+            stage=stage,
         )

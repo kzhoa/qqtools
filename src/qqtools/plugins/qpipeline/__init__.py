@@ -27,6 +27,7 @@ middleware_extra_ckp_caches = LazyImport("qqtools.plugins.qpipeline.middleware.e
 
 _lazy_export(".qpipeline", "qPipeline")
 _lazy_export(".task.qtask", "PotentialTaskBase", "qTaskBase")
+_lazy_export(".types", "Stage")
 
 
 def __getattr__(name: str):

@@ -1284,7 +1284,7 @@ runner:
 
 ### 3.1 Default Monitored Target Contract
 
-The framework's canonical default monitored target key is `val_metric`. This key is derived from the task's `post_metrics_to_value(metrics)` hook, which returns a single scalar representing the task's primary validation objective.
+The framework's canonical default monitored target key is `val_metric`. This key is derived from the task's `post_metrics_to_value(result, *, stage)` hook, which returns a single scalar representing the task's primary validation objective. Existing tasks that implement `post_metrics_to_value(result)` remain supported.
 
 **Semantic rules**:
 

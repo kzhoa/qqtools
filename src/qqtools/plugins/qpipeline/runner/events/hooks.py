@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from ..runner_utils.types import LoopSignal, RunningState, Stage
+from ...types import Stage
+from ..runner_utils.types import LoopSignal, RunningState
 from .dispatcher import EventDispatcher
 
 

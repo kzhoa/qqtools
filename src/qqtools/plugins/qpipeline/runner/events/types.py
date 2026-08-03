@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Optional, Type
 
-from ..runner_utils.types import LoopSignal, RunningState, Stage
+from ...types import Stage
+from ..runner_utils.types import LoopSignal, RunningState
 
 
 class EventName(Enum):

@@ -21,12 +21,12 @@ class DummyTask(SimpleTask):
         self._val_metric_seq = val_metric_seq
         self._eval_count = 0
 
-    def post_metrics_to_value(self, metrics):
+    def post_metrics_to_value(self, result):
         # 根据当前 epoch 返回对应的 val_metric_seq 值，避免提前停滞
         epoch = getattr(self, "_last_epoch", 0)
-        # 尝试从 metrics 或 RunningState 获取当前 epoch
-        if "epoch" in metrics:
-            epoch = metrics["epoch"]
+        # 尝试从 result 或 RunningState 获取当前 epoch
+        if "epoch" in result:
+            epoch = result["epoch"]
         elif hasattr(self, "state") and hasattr(self.state, "epoch"):
             epoch = self.state.epoch
         # 取序列值
@@ -185,14 +185,14 @@ class TestEarlyStopTrigger:
         """Should trigger early stop on custom metric target."""
 
         class CustomTask(DummyTask):
-            def post_metrics_to_value(self, metrics):
+            def post_metrics_to_value(self, result):
                 # Use train_metric sequence for early stop
                 if self._eval_count < len(self._val_metric_seq):
                     val = self._val_metric_seq[self._eval_count]
                 else:
                     val = self._val_metric_seq[-1]
                 self._eval_count += 1
-                metrics["train_metric"] = val
+                result["train_metric"] = val
                 return val
 
         train_metric_seq = [0.5, 0.6, 0.6, 0.6, 0.6]
@@ -280,7 +280,7 @@ class TestEarlyStopTrigger:
         """Test early stopping when metric is None should not trigger early stop."""
 
         class NoneMetricTask(DummyTask):
-            def post_metrics_to_value(self, metrics):
+            def post_metrics_to_value(self, result):
                 return None
 
         tmpdir = self.tmpdir.name
@@ -312,7 +312,7 @@ class TestEarlyStopTrigger:
         """Test early stopping when metric is missing from eval_results should not trigger early stop."""
 
         class MissingMetricTask(DummyTask):
-            def post_metrics_to_value(self, metrics):
+            def post_metrics_to_value(self, result):
                 return 0.5
 
         tmpdir = self.tmpdir.name

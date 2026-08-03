@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import qqtools as qt
+from qqtools.plugins.qpipeline import Stage
 import qqtools.plugins.qpipeline.qpipeline as qpipeline_module
 import qqtools.plugins.qpipeline.runner.eval_runner as eval_runner_module
 import qqtools.plugins.qpipeline.runner.runner as runner_module
@@ -324,6 +325,64 @@ def test_qpipeline_test_mode_evaluate_once_defaults_to_test_loader(base_args, ti
     assert results is not None
     assert "test_metric" in results
     assert "test_mse" in results
+
+
+def test_evaluate_runner_passes_explicit_stage_independently_of_prefix(base_args, tiny_task, tiny_model):
+    received_stages = []
+
+    def post_metrics_to_value(result, *, stage):
+        received_stages.append(stage)
+        return result["mse"]
+
+    tiny_task.post_metrics_to_value = post_metrics_to_value
+    results = evaluate_runner(
+        model=tiny_model,
+        task=tiny_task,
+        dataloader=tiny_task.test_loader,
+        args=base_args,
+        prefix="benchmark_a",
+        stage=Stage.VAL,
+    )
+
+    assert results is not None
+    assert "benchmark_a_metric" in results
+    assert received_stages == [Stage.VAL]
+
+
+def test_evaluate_runner_omits_test_metric_when_task_returns_none(base_args, tiny_task, tiny_model):
+    def post_metrics_to_value(result, *, stage):
+        assert stage is Stage.TEST
+        return None
+
+    tiny_task.post_metrics_to_value = post_metrics_to_value
+    results = evaluate_runner(
+        model=tiny_model,
+        task=tiny_task,
+        dataloader=tiny_task.test_loader,
+        args=base_args,
+    )
+
+    assert results is not None
+    assert "test_mse" in results
+    assert "test_metric" not in results
+
+
+def test_qpipeline_evaluate_once_forwards_stage(monkeypatch, base_args, tiny_task, tiny_model):
+    args = base_args.copy()
+    args.test = True
+    pipeline_cls = create_pipeline_class(lambda _args: tiny_model, lambda _args: tiny_task)
+    pipeline = pipeline_cls(args)
+    received_kwargs = {}
+
+    def evaluate_runner_stub(**kwargs):
+        received_kwargs.update(kwargs)
+        return {"benchmark_a_metric": 1.0}
+
+    monkeypatch.setattr(qpipeline_module, "evaluate_runner", evaluate_runner_stub)
+    pipeline.evaluate_once(prefix="benchmark_a", stage=Stage.VAL)
+
+    assert received_kwargs["stage"] is Stage.VAL
+    assert received_kwargs["prefix"] == "benchmark_a"
 
 
 def test_qpipeline_infer_returns_outputs(base_args, tiny_task, tiny_model):

@@ -48,8 +48,8 @@ class FixedBatchTask(qTaskBase):
         mse = nn.MSELoss()(out["pred"], out["target"])
         return {"mse": (mse, out["pred"].shape[0])}
 
-    def post_metrics_to_value(self, metrics):
-        return metrics.get("val_mse", 0.0)
+    def post_metrics_to_value(self, result):
+        return result.get("val_mse", 0.0)
 
     def state_dict(self):
         return {}
@@ -79,8 +79,8 @@ class FixedTensorTask(qTaskBase):
         mse = nn.MSELoss()(out["pred"], out["target"])
         return {"mse": (mse, out["pred"].shape[0])}
 
-    def post_metrics_to_value(self, metrics):
-        return metrics.get("val_mse", 0.0)
+    def post_metrics_to_value(self, result):
+        return result.get("val_mse", 0.0)
 
     def state_dict(self):
         return {}

@@ -65,9 +65,9 @@ class SimpleTask(qTaskBase):
         pred = model(batch_data[0])
         return {"pred": pred}
 
-    def post_metrics_to_value(self, metrics):
+    def post_metrics_to_value(self, result):
         # Follow qTaskBase contract: must return scalar.
-        return float(metrics.get("dummy_metric", 0.0))
+        return float(result.get("dummy_metric", 0.0))
 
 
 def _build_agent_for_offload_tests(
@@ -231,8 +231,8 @@ def test_best_snapshot_uses_ema_prefixed_metrics_when_target_is_ema_val_metric(t
         def load_state_dict(self, state_dict):
             return None
 
-        def post_metrics_to_value(self, metrics):
-            return float(metrics.get("dummy_metric", 0.0))
+        def post_metrics_to_value(self, result):
+            return float(result.get("dummy_metric", 0.0))
 
     task = CheckpointSafeTask()
     model = SimpleModel()

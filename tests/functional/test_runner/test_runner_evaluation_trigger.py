@@ -58,9 +58,9 @@ class SimpleTask(qTaskBase):
         pred = model(batch_data[0])
         return {"pred": pred}
 
-    def post_metrics_to_value(self, metrics):
+    def post_metrics_to_value(self, result):
         # For simplicity, just return dummy value for now
-        return metrics.get("val_dummy_metric", 0.0)
+        return result.get("val_dummy_metric", 0.0)
 
 
 class TestEvaluationTiming:

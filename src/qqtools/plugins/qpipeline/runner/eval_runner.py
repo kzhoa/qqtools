@@ -11,9 +11,11 @@ import qqtools as qt
 from ..entry_utils.type_qconfig import qConfig
 from ..qlogger import ConsoleLogger
 from ..task.qtask import qTaskBase
+from ..types import Stage
 from .runner_utils.avgbank import AvgBank
 from .runner_utils.common import _getattr_or_default, move_batch_to_device
 from .runner_utils.ddpdeduper import EvalDedupRuntime, unwrap_eval_batch, wrap_eval_dataloader_for_ddp_dedup
+from .runner_utils.hook_binding import bind_post_metrics_to_value
 from .runner_utils.tensorbank import TensorBank
 
 __all__ = ["evaluate_runner", "infer_runner"]
@@ -94,10 +96,13 @@ def evaluate_runner(
     return_outputs: bool = False,
     allow_auto_offload: bool = False,
     logger=None,
+    *,
+    stage: Stage = Stage.TEST,
 ) -> Optional[Dict[str, Any]]:
     if args is None:
         raise ValueError("The 'args' parameter is required to configure the runner.")
     del allow_auto_offload
+    post_metrics_to_value = bind_post_metrics_to_value(task)
 
     dataloader = _prepare_eval_loader(dataloader, args)
     runtime = _get_runtime(dataloader)
@@ -155,7 +160,9 @@ def evaluate_runner(
                 avg_metrics.update(task_epoch_metrics)
 
         prefixed_metrics = {f"{prefix}_{key}": value for key, value in avg_metrics.items()}
-        prefixed_metrics[f"{prefix}_metric"] = task.post_metrics_to_value(avg_metrics)
+        canonical_metric = post_metrics_to_value(result=avg_metrics, stage=stage)
+        if canonical_metric is not None or stage is not Stage.TEST:
+            prefixed_metrics[f"{prefix}_metric"] = canonical_metric
         if eval_output_bank is None:
             return prefixed_metrics
 
