@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Any, Dict, Optional, Type
 
 from ...types import Stage
+from ..runner_utils.evaluation import EvaluationResult
 from ..runner_utils.types import LoopSignal, RunningState
 
 
@@ -50,7 +51,7 @@ class ProgressEventContext(BaseEventContext):
 
 @dataclass(kw_only=True)
 class ValidationEndEventContext(BaseEventContext):
-    eval_results: Dict[str, Any]
+    evaluation: EvaluationResult
     lr: Optional[float]
     previous_best: Optional[Dict[str, Any]]
     is_best: bool
@@ -97,7 +98,7 @@ class _EvalStartInternalContext(BaseEventContext):
 
 @dataclass(kw_only=True)
 class _EvalEndInternalContext(BaseEventContext):
-    eval_results: Dict[str, Any]
+    evaluation: EvaluationResult
     signal: LoopSignal
 
 

@@ -3,7 +3,7 @@ Test cases for runner2.py - Unified Training Runner
 """
 
 import argparse
-import csv
+import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,13 +31,14 @@ from qqtools.plugins.qpipeline.runner.events import (
 )
 from qqtools.plugins.qpipeline.runner.runner import (
     RunningAgent,
-    SheetLoggerListener,
+    MetricsJsonlListener,
     _is_periodic_trigger,
     _resolve_step_mode_max_steps,
     _resolve_train_runner_policy,
     train_runner,
 )
 from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointListener
+from qqtools.plugins.qpipeline.runner.runner_utils.evaluation import EvaluationResult, ModelEvaluation, StageEvaluation
 from qqtools.plugins.qpipeline.runner.runner_utils.types import (
     LoopSignal,
     RunConfig,
@@ -375,10 +376,9 @@ class TestTrainingAgent:
 
         results = agent.evaluate(use_ema=False)
 
-        assert "val_mse" in results
-        assert "val_metric" in results
-        assert "test_mse" in results
-        assert "test_metric" in results
+        assert results.target_value("val_metric") is not None
+        assert results.target_value("test_metric") is not None
+        assert "mse" in results.models[0].stages[0].loaders[0].metrics
 
     def test_trigger_passes_live_state_and_mutable_signal(self):
         loss_fn = nn.MSELoss()
@@ -403,7 +403,9 @@ class TestTrainingAgent:
             agent.dispatcher,
             state=agent.state,
             signal=signal,
-            eval_results={"val_metric": 1.0},
+            evaluation=EvaluationResult(
+                models=(ModelEvaluation("standard", (StageEvaluation("val", (), 1.0),)),)
+            ),
             lr=None,
             previous_best=None,
             is_best=False,
@@ -619,10 +621,7 @@ class TestTrainRunner:
 
     @staticmethod
     def _read_metrics_rows(metrics_file: Path):
-        with metrics_file.open("r", newline="") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-        return reader.fieldnames, rows
+        return [json.loads(line) for line in metrics_file.read_text(encoding="utf-8").splitlines()]
 
     @staticmethod
     def _read_debug_log(log_dir: str) -> str:
@@ -667,7 +666,7 @@ class TestTrainRunner:
             assert result["final_epoch"] == 2
             assert result["best_monitored_key"] == "val_metric"
             assert result["best_monitored_metric"] is not None
-            assert "val_metric" in result["best_model_metrics_snapshot"]
+            assert result["best_model_metrics_snapshot"]["models"][0]["stages"][0]["score"] is not None
             assert result["total_train_time"] > 0
             assert result["early_stopped"] is False
             assert result["terminal_event"] == {
@@ -1130,16 +1129,14 @@ class TestTrainRunner:
                 log_granularity=["eval"],
             )
 
-            metrics_file = Path(tmpdir) / "metrics.csv"
+            metrics_file = Path(tmpdir) / "metrics.jsonl"
             assert metrics_file.exists()
 
-            fieldnames, rows = self._read_metrics_rows(metrics_file)
-            assert fieldnames[:6] == [
-                "epoch", "global_step", "train_metric", "val_metric", "test_metric", "train_loss"
-            ]
-            assert {"train_mse", "val_mse", "test_mse"}.issubset(fieldnames)
+            rows = self._read_metrics_rows(metrics_file)
             assert len(rows) >= 1
-            assert any(row["val_metric"] != "" for row in rows)
+            evaluations = [row for row in rows if row["event"] == "evaluation"]
+            assert evaluations
+            assert evaluations[0]["evaluation"]["models"][0]["stages"][0]["score"] is not None
 
     def test_train_runner_writes_batch_sheetdata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1158,12 +1155,12 @@ class TestTrainRunner:
                 log_granularity=["batch"],
             )
 
-            metrics_file = Path(tmpdir) / "metrics.csv"
+            metrics_file = Path(tmpdir) / "metrics.jsonl"
             assert metrics_file.exists()
 
-            _, rows = self._read_metrics_rows(metrics_file)
+            rows = self._read_metrics_rows(metrics_file)
             assert len(rows) >= 1
-            assert any(row["train_loss"] != "" for row in rows)
+            assert any(row["event"] == "train_batch" and "loss" in row["metrics"] for row in rows)
 
     def test_train_runner_rank_nonzero_skips_sheetdata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1184,7 +1181,7 @@ class TestTrainRunner:
                 log_granularity=["eval", "batch"],
             )
 
-            metrics_file = Path(tmpdir) / "metrics.csv"
+            metrics_file = Path(tmpdir) / "metrics.jsonl"
             assert not metrics_file.exists()
 
     def test_train_runner_with_gradient_clipping(self):
@@ -1341,6 +1338,42 @@ class TestTrainRunner:
             )
 
             assert optimizer.param_groups[0]["lr"] == pytest.approx(0.01 * (0.5**2))
+
+    def test_missing_target_logs_each_consumer_boundary(self):
+        task, model, loss_fn, optimizer = self._create_training_components()
+        task.val_loader = None
+        task.test_loader = None
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min")
+        logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                args=self.args,
+                logger=logger,
+                max_epochs=1,
+                eval_interval=1,
+                save_dir=tmpdir,
+            )
+
+        expected_boundary = ("val_metric", 0, len(task.train_loader))
+        assert (
+            "BestModelTracker skipped: target=%r default=skip_compare_and_checkpoint "
+            "epoch=%s step=%s.",
+            *expected_boundary,
+        ) in [call.args for call in logger.debug.call_args_list]
+        assert (
+            "Plateau scheduler skipped: target=%r default=skip_metric_step epoch=%s step=%s.",
+            *expected_boundary,
+        ) in [call.args for call in logger.debug.call_args_list]
+        assert (
+            "EarlyStopper skipped: target=%r default=skip_patience_update epoch=%s step=%s.",
+            *expected_boundary,
+        ) in [call.args for call in logger.debug.call_args_list]
 
     def test_train_runner_with_plateau_lrscheduler(self):
         """Test train_runner with a ReduceLROnPlateau scheduler"""
@@ -1602,16 +1635,13 @@ class TestPeriodicTrigger:
             == expected
         )
 
-    def test_sheet_logger_listener_uses_completed_step_trigger_semantics(self):
-        sheet_logger = Mock()
-        sheet_logger.columns = []
-        logger = Mock()
+    def test_metrics_jsonl_listener_uses_completed_step_trigger_semantics(self):
+        metrics_logger = Mock()
         run_config = RunConfig(run_mode=RunMode.STEP, eval_interval=2, max_steps=4)
-        listener = SheetLoggerListener(
-            sheet_logger=sheet_logger,
+        listener = MetricsJsonlListener(
+            logger=metrics_logger,
             run_config=run_config,
             log_granularity=["eval", "batch"],
-            logger=logger,
         )
 
         state = RunningState(global_step=2, epoch=0)
@@ -1628,7 +1658,7 @@ class TestPeriodicTrigger:
         )
         listener.on_train_batch_end(context)
 
-        sheet_logger.write.assert_not_called()
+        metrics_logger.write.assert_not_called()
 
 
 class TestRunningAgentPerformanceOptimizations:
@@ -1682,10 +1712,9 @@ class TestRunningAgentPerformanceOptimizations:
         results = agent._evaluate_loader(
             agent.model,
             self.task.val_loader,
-            prefix="val",
             stage="val",
         )
-        assert "val_metric" in results
+        assert "mse" in results
 
     def test_eval_loop_emits_scalar_progress_metrics_when_listener_registered(self):
         agent = self._build_agent(max_steps=1)
@@ -1698,11 +1727,10 @@ class TestRunningAgentPerformanceOptimizations:
         results = agent._evaluate_loader(
             agent.model,
             self.task.val_loader,
-            prefix="val",
             stage="val",
         )
 
-        assert "val_metric" in results
+        assert "mse" in results
         assert len(captured_progress_metrics) == len(self.task.val_loader)
         for progress_metrics in captured_progress_metrics:
             assert progress_metrics is not None
@@ -1713,7 +1741,6 @@ class TestRunningAgentPerformanceOptimizations:
         fast_results = agent_fast._evaluate_loader(
             agent_fast.model,
             self.task.val_loader,
-            prefix="val",
             stage="val",
         )
 
@@ -1722,12 +1749,11 @@ class TestRunningAgentPerformanceOptimizations:
         slow_results = agent_slow._evaluate_loader(
             agent_slow.model,
             self.task.val_loader,
-            prefix="val",
             stage="val",
         )
 
-        assert "val_metric" in fast_results
-        assert "val_metric" in slow_results
+        assert "mse" in fast_results
+        assert "mse" in slow_results
 
 
 class TestWarmupAvgBankReset:

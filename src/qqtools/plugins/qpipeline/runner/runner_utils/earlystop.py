@@ -244,11 +244,18 @@ class EarlyStopListener:
         if self.early_stopper is None:
             return
 
-        eval_results = context.eval_results or {}
-        current_metric = eval_results.get(self.target)
-        metrics_for_early_stop = {}
-        if current_metric is not None:
-            metrics_for_early_stop[self.target] = current_metric
+        current_metric = context.evaluation.target_value(self.target)
+        if current_metric is None:
+            if self.logger is not None:
+                state = context.runner.run_state
+                self.logger.debug(
+                    "EarlyStopper skipped: target=%r default=skip_patience_update epoch=%s step=%s.",
+                    self.target,
+                    state.epoch,
+                    state.global_step,
+                )
+            return
+        metrics_for_early_stop = {self.target: current_metric}
 
         should_stop, stop_msg, debug_msg = self.early_stopper(metrics_for_early_stop)
 

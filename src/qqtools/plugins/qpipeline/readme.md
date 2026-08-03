@@ -55,17 +55,12 @@ occurrences will be preserved as distinct outputs.
 
 # trainPipeline
 
-## Training metrics CSV
+## Training metrics JSONL
 
-When sheet logging is enabled, qpipeline writes `metrics.csv` as a wide CSV. The standard
-columns (`epoch`, `global_step`, `train_metric`, `val_metric`, `test_metric`, `train_loss`) are
-created first, while metrics that appear later are appended as new columns in first-observed
-order. Earlier rows receive empty cells for those new metrics.
-
-`extra_log_keys` remains useful for predeclaring preferred initial columns, but it is no longer a
-whitelist: task and evaluation metrics are retained automatically. CSV schema changes and recovery
-updates are atomically committed. A successful run commits the logger with `close()`; failed or
-interrupted runs use `abort()` and do not replace an untouched `recover=False` log.
+When logging is enabled, qpipeline writes `metrics.jsonl`. Every line is an independent JSON event:
+`train_batch`, `evaluation`, or `checkpoint_saved`. Evaluation records preserve the complete
+model → stage → loader hierarchy and each stage's task-derived score, so multi-loader metrics do
+not rely on ambiguous flattened column names.
 
 
 

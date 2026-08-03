@@ -1,15 +1,16 @@
-from pathlib import Path
+"""Console formatting for structured qpipeline evaluation results."""
+
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import qqtools as qt
 
-from .ckp_manager import generate_checkpoint_filename
 from ..events import ValidationEndEventContext
+from .evaluation import EvaluationResult
 
 
 class EvalFormatter:
-    """Stateless formatter for evaluation summaries."""
+    """Stateless formatter for structured evaluation summaries."""
 
     @staticmethod
     def _to_scalar_if_possible(value: Any) -> Any:
@@ -37,397 +38,100 @@ class EvalFormatter:
         return cls._format_metric_value(lr, "lr", precision=6)
 
     @staticmethod
-    def _format_delta_with_arrow(delta: Optional[float]) -> Tuple[str, str]:
+    def _format_delta(delta: Optional[float]) -> str:
         if delta is None:
-            return "n/a", "-"
-        if delta > 0:
-            return f"+{delta:.4f}", "\u2191"
-        if delta < 0:
-            return f"{delta:.4f}", "\u2193"
-        return f"{delta:.4f}", "\u2192"
+            return "n/a"
+        return f"{delta:+.4f} {'↑' if delta > 0 else '↓' if delta < 0 else '→'}"
 
     @staticmethod
-    def _parse_target_key(target_key: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-        if not target_key:
-            return None, None, None
-
-        family = "standard"
-        body = target_key
-        if body.startswith("ema_"):
-            family = "ema"
-            body = body[len("ema_") :]
-
-        if "_" not in body:
-            return None, None, None
-
-        stage, metric_name = body.split("_", 1)
-        if stage not in {"train", "val", "test"} or not metric_name:
-            return None, None, None
-        return family, stage, metric_name
-
-    @classmethod
-    def _partition_eval_metrics(
-        cls, eval_results: Dict[str, Any]
-    ) -> Tuple[Dict[str, Dict[str, Dict[str, Any]]], Dict[str, Any]]:
-        stages = ("train", "val", "test")
-        grouped = {
-            "standard": {stage: {} for stage in stages},
-            "ema": {stage: {} for stage in stages},
-        }
-        others = {}
-
-        for key in sorted(eval_results.keys()):
-            value = eval_results[key]
-            family = "standard"
-            body = key
-            if body.startswith("ema_"):
-                family = "ema"
-                body = body[len("ema_") :]
-
-            if "_" not in body:
-                others[key] = value
-                continue
-
-            stage, metric_name = body.split("_", 1)
-            if stage not in stages or not metric_name:
-                others[key] = value
-                continue
-
-            grouped[family][stage][metric_name] = value
-
-        return grouped, others
-
-    @staticmethod
-    def _ordered_metric_names(metrics: Dict[str, Any], stage: str) -> List[str]:
-        preferred = (
-            ["loss", "metric", "batch_time", "mae", "mse"]
-            if stage == "train"
-            else ["metric", "mae", "mse", "loss", "batch_time"]
-        )
+    def _ordered_metric_names(metrics: Dict[str, Any]) -> List[str]:
+        preferred = ["score", "metric", "mae", "mse", "loss"]
         ordered = [name for name in preferred if name in metrics]
         ordered.extend(sorted(name for name in metrics if name not in ordered))
         return ordered
 
-    @classmethod
-    def _format_stage_metrics(cls, metrics: Dict[str, Any], stage: str) -> str:
-        ordered = cls._ordered_metric_names(metrics, stage)
-        return ", ".join(f"{name}: {cls._format_metric_value(metrics[name], name)}" for name in ordered)
-
     @staticmethod
     def _render_text_table(headers: List[str], rows: List[List[str]]) -> List[str]:
-        widths = [len(col) for col in headers]
+        widths = [len(column) for column in headers]
         for row in rows:
-            for idx, cell in enumerate(row):
-                widths[idx] = max(widths[idx], len(cell))
-
-        lines = []
-        lines.append("  ".join(headers[idx].ljust(widths[idx]) for idx in range(len(headers))))
-        lines.append("  ".join("-" * widths[idx] for idx in range(len(headers))))
-        lines.extend("  ".join(row[idx].ljust(widths[idx]) for idx in range(len(headers))) for row in rows)
-        return lines
-
-    @classmethod
-    def _build_best_info(
-        cls,
-        target_val: Any,
-        is_best: bool,
-        previous_best: Optional[Dict[str, Any]],
-        best_model_tracker: Optional[Any],
-        target_mode: str,
-    ) -> Dict[str, Any]:
-        mode = target_mode
-        best_metric = None
-        best_epoch = None
-        best_step = None
-        if best_model_tracker is not None:
-            mode = getattr(best_model_tracker, "mode", mode)
-            best_metric = getattr(best_model_tracker, "best_metric", None)
-            best_epoch = getattr(best_model_tracker, "best_epoch", None)
-            best_step = getattr(best_model_tracker, "best_step", None)
-
-        current = cls._to_scalar_if_possible(target_val) if target_val is not None else None
-        best = cls._to_scalar_if_possible(best_metric) if best_metric is not None else None
-        last_best = cls._to_scalar_if_possible(previous_best.get("metric")) if previous_best else None
-        last_best_epoch = previous_best.get("epoch") if previous_best else None
-        last_best_step = previous_best.get("step") if previous_best else None
-
-        delta_current_vs_best = None
-        if cls._is_numeric(current) and cls._is_numeric(best):
-            delta_current_vs_best = float(current) - float(best)
-
-        delta_current_vs_last = None
-        if cls._is_numeric(current) and cls._is_numeric(last_best):
-            delta_current_vs_last = float(current) - float(last_best)
-
-        status = "NO_TARGET"
-        if current is not None:
-            if is_best:
-                status = "NEW_BEST"
-            elif best is None:
-                status = "NO_BEST_YET"
-            else:
-                status = "NOT_BEST"
-
-        return {
-            "status": status,
-            "mode": mode,
-            "current": current,
-            "best": best,
-            "best_epoch": best_epoch,
-            "best_step": best_step,
-            "last_best": last_best,
-            "last_best_epoch": last_best_epoch,
-            "last_best_step": last_best_step,
-            "delta_current_vs_best": delta_current_vs_best,
-            "delta_current_vs_last": delta_current_vs_last,
-        }
-
-    @classmethod
-    def _build_hierarchical_summary_lines(
-        cls,
-        target_key: str,
-        target_val: Any,
-        best_info: Dict[str, Any],
-        grouped: Dict[str, Dict[str, Dict[str, Any]]],
-        others: Dict[str, Any],
-        lr: Optional[float],
-        color_new_best: bool,
-    ) -> Tuple[List[str], bool]:
-        lines = [f"\n[Eval Summary] Epoch: {best_info['epoch']}, Step: {best_info['step']}"]
-        has_markup = False
-        lines.append(f"  - Learning Rate: {cls._format_learning_rate(lr)}")
-
-        if target_val is not None:
-            lines.append(
-                f"  - Primary Target: {target_key}: {cls._format_metric_value(target_val, target_key, precision=6)}"
-            )
-        else:
-            lines.append(f"  - Primary Target: {target_key}: n/a (not found in eval_results)")
-
-        best_display = (
-            cls._format_metric_value(best_info["best"], target_key, precision=6)
-            if best_info["best"] is not None
-            else "n/a"
-        )
-        best_epoch_display = best_info["best_epoch"] if best_info["best_epoch"] is not None else "-"
-        best_step_display = best_info["best_step"] if best_info["best_step"] is not None else "-"
-        tracker_label = f"{'Best Tracker':<12}"
-        best_line = (
-            f"  - {tracker_label}: epoch: {best_epoch_display}, step: {best_step_display}, {target_key}: {best_display}"
-        )
-
-        if best_info["status"] == "NEW_BEST":
-            new_best_text = "[green]NewBest[/green]" if color_new_best else "NewBest"
-            has_markup = color_new_best
-            delta_str, arrow = cls._format_delta_with_arrow(best_info["delta_current_vs_last"])
-            if delta_str == "n/a":
-                best_line = f"{best_line} ({new_best_text})"
-            else:
-                best_line = f"{best_line} ({new_best_text}, Delta: {delta_str} {arrow})"
-        lines.append(best_line)
-
-        if best_info["status"] == "NEW_BEST" and best_info["last_best"] is not None:
-            last_best = cls._format_metric_value(best_info["last_best"], target_key, precision=6)
-            last_indent = " " * 14
-            lines.append(
-                f"{last_indent}Last: epoch {best_info['last_best_epoch']}, step: {best_info['last_best_step']}, {target_key}: {last_best}"
-            )
-
-        target_family, target_stage, _ = cls._parse_target_key(target_key)
-        stage_labels = {"val": "Validation", "test": "Testing", "train": "Training"}
-        for stage in ("val", "test", "train"):
-            standard_metrics = grouped["standard"][stage]
-            ema_metrics = grouped["ema"][stage]
-            if not standard_metrics and not ema_metrics:
-                continue
-
-            lines.append(f"  - {stage_labels[stage]}:")
-            if standard_metrics:
-                marker = "  (*)" if target_family == "standard" and target_stage == stage else ""
-                lines.append(f"    - [Main]     {cls._format_stage_metrics(standard_metrics, stage)}{marker}")
-            if ema_metrics:
-                marker = "  (*)" if target_family == "ema" and target_stage == stage else ""
-                lines.append(f"    - [EMA]      {cls._format_stage_metrics(ema_metrics, stage)}{marker}")
-
-        if others:
-            lines.append("  - Others:")
-            for key in sorted(others.keys()):
-                lines.append(f"    - {key}: {cls._format_metric_value(others[key], key)}")
-
-        return lines, has_markup
-
-    @classmethod
-    def _build_table_summary_lines(
-        cls,
-        eval_results: Dict[str, Any],
-        target_key: str,
-        target_val: Any,
-        best_info: Dict[str, Any],
-        grouped: Dict[str, Dict[str, Dict[str, Any]]],
-        lr: Optional[float],
-        regular_checkpoint_path: Optional[str],
-        new_best_checkpoint_path: Optional[str],
-        color_new_best: bool,
-    ) -> Tuple[List[str], bool]:
-        target_str = cls._format_metric_value(target_val, target_key, precision=6) if target_val is not None else "n/a"
-        lines = [
-            f"\n[Eval Summary Table] Epoch: {best_info['epoch']} | Step: {best_info['step']} | LR: {cls._format_learning_rate(lr)} | Target: {target_key}({target_str})"
-        ]
-        has_markup = False
-
-        best_display = (
-            cls._format_metric_value(best_info["best"], target_key, precision=6)
-            if best_info["best"] is not None
-            else "n/a"
-        )
-        best_epoch_display = best_info["best_epoch"] if best_info["best_epoch"] is not None else "-"
-        best_step_display = best_info["best_step"] if best_info["best_step"] is not None else "-"
-        tracker_label = f"{'Best Tracker':<12}"
-        best_line = (
-            f"{tracker_label}: epoch: {best_epoch_display}, step: {best_step_display}, {target_key}: {best_display}"
-        )
-        if best_info["status"] == "NEW_BEST":
-            new_best_text = "[green]NewBest[/green]" if color_new_best else "NewBest"
-            has_markup = color_new_best
-            delta_str, arrow = cls._format_delta_with_arrow(best_info["delta_current_vs_last"])
-            if delta_str == "n/a":
-                best_line = f"{best_line} ({new_best_text})"
-            else:
-                best_line = f"{best_line} ({new_best_text}, Delta: {delta_str} {arrow})"
-        lines.append(best_line)
-
-        if best_info["status"] == "NEW_BEST" and best_info["last_best"] is not None:
-            last_best = cls._format_metric_value(best_info["last_best"], target_key, precision=6)
-            last_label = f"{'Last':<12}"
-            lines.append(
-                f"{last_label}: epoch {best_info['last_best_epoch']}, step: {best_info['last_best_step']}, {target_key}: {last_best}"
-            )
-
-        columns = [
-            ("Train", "standard", "train"),
-            ("Val", "standard", "val"),
-            ("Test", "standard", "test"),
-            ("EMA-Val", "ema", "val"),
-            ("EMA-Test", "ema", "test"),
+            for index, cell in enumerate(row):
+                widths[index] = max(widths[index], len(cell))
+        return [
+            "  ".join(headers[index].ljust(widths[index]) for index in range(len(headers))),
+            "  ".join("-" * width for width in widths),
+            *(
+                "  ".join(row[index].ljust(widths[index]) for index in range(len(headers)))
+                for row in rows
+            ),
         ]
 
-        metric_names = set()
-        for _, family, stage in columns:
-            metric_names.update(grouped[family][stage].keys())
-
-        target_family, target_stage, target_metric = cls._parse_target_key(target_key)
-        table_row_metrics = {name for name in metric_names if not name.endswith("time")}
-        # Keep table compact by default, but always include target metric if it exists.
-        if target_metric and target_metric in metric_names:
-            table_row_metrics.add(target_metric)
-        preferred = ["metric", "mae", "mse", "loss"]
-        row_order = [name for name in preferred if name in table_row_metrics]
-        row_order.extend(sorted(name for name in table_row_metrics if name not in row_order))
-
-        represented_keys = set()
-        has_target_marker_in_table = False
-        rows = []
-        for metric_name in row_order:
-            row = [metric_name]
-            for _, family, stage in columns:
-                value = grouped[family][stage].get(metric_name)
-                if value is None:
-                    row.append("-")
-                    continue
-
-                full_key = f"{stage}_{metric_name}" if family == "standard" else f"ema_{stage}_{metric_name}"
-                represented_keys.add(full_key)
-
-                cell = cls._format_metric_value(value, metric_name)
-                if family == target_family and stage == target_stage and metric_name == target_metric:
-                    cell = f"{cell} (*)"
-                    has_target_marker_in_table = True
-                row.append(cell)
-            rows.append(row)
-
-        headers = ["Metric"] + [col_name for col_name, _, _ in columns]
-        if rows:
-            lines.extend(cls._render_text_table(headers, rows))
-        else:
-            lines.append("Metric  Train  Val  Test  EMA-Val  EMA-Test")
-            lines.append("------  -----  ---  ----  -------  --------")
-            lines.append("(no comparable metrics)")
-
-        others_for_table = []
-        has_target_marker_in_others = False
-        for key in sorted(eval_results.keys()):
-            if key not in represented_keys:
-                item = f"{key}: {cls._format_metric_value(eval_results[key], key)}"
-                if key == target_key and not has_target_marker_in_table:
-                    item = f"{item} (*)"
-                    has_target_marker_in_others = True
-                others_for_table.append(item)
-
-        if others_for_table:
-            lines.append(f"Others: {', '.join(others_for_table)}")
-
-        if has_target_marker_in_table:
-            lines.append("(*) marks the primary target cell in table.")
-        elif has_target_marker_in_others:
-            lines.append("(*) marks the primary target metric in Others.")
-        else:
-            lines.append("(*) primary target is unavailable in current eval results.")
-
-        lines.append(f"Regular checkpoint write path: {regular_checkpoint_path or 'n/a'}")
-        if best_info["status"] == "NEW_BEST":
-            lines.append(f"New best checkpoint write path: {new_best_checkpoint_path or 'n/a'}")
-        return lines, has_markup
-
     @classmethod
-    def format_all(
+    def format_evaluation(
         cls,
-        eval_results: Dict[str, Any],
+        evaluation: EvaluationResult,
+        *,
         epoch: int,
         step: int,
         target_key: str,
-        target_mode: str,
-        is_best: bool,
-        previous_best: Optional[Dict[str, Any]],
-        best_model_tracker: Optional[Any],
+        is_best: bool = False,
+        previous_best: Optional[Dict[str, Any]] = None,
+        best_model_tracker: Optional[Any] = None,
         lr: Optional[float] = None,
-        regular_checkpoint_path: Optional[str] = None,
-        new_best_checkpoint_path: Optional[str] = None,
         color_new_best: bool = True,
     ) -> Tuple[List[str], bool, List[str], bool]:
-        target_val = eval_results.get(target_key)
-        grouped, others = cls._partition_eval_metrics(eval_results)
-        best_info = cls._build_best_info(
-            target_val=target_val,
-            is_best=is_best,
-            previous_best=previous_best,
-            best_model_tracker=best_model_tracker,
-            target_mode=target_mode,
-        )
-        best_info["epoch"] = epoch
-        best_info["step"] = step
+        """Render control state and raw loader measurements without flat metric keys."""
+        target_val = evaluation.target_value(target_key)
+        tracker = best_model_tracker
+        best_metric = cls._to_scalar_if_possible(getattr(tracker, "best_metric", None))
+        best_epoch = getattr(tracker, "best_epoch", None)
+        best_step = getattr(tracker, "best_step", None)
+        lines = [f"\n[Evaluation] Epoch: {epoch} | Step: {step} | LR: {cls._format_learning_rate(lr)}"]
+        if target_val is None:
+            lines.append(f"  Target: {target_key} not produced; best state unchanged")
+        else:
+            lines.append(f"  Target: {target_key} = {cls._format_metric_value(target_val, target_key, 6)}")
+        if best_metric is not None:
+            lines.append(
+                f"  Best: {target_key} = {cls._format_metric_value(best_metric, target_key, 6)} "
+                f"@ epoch {best_epoch}, step {best_step}"
+            )
+        if is_best:
+            previous = previous_best.get("metric") if previous_best else None
+            delta = None
+            if cls._is_numeric(target_val) and cls._is_numeric(previous):
+                delta = float(target_val) - float(previous)
+            label = "[green]NewBest[/green]" if color_new_best else "NewBest"
+            lines.append(f"  {label}: previous best delta {cls._format_delta(delta)}")
+            lines.append("  Checkpoint: best requested")
 
-        summary_lines, summary_has_markup = cls._build_hierarchical_summary_lines(
-            target_key=target_key,
-            target_val=target_val,
-            best_info=best_info,
-            grouped=grouped,
-            others=others,
-            lr=lr,
-            color_new_best=color_new_best,
-        )
-        table_lines, table_has_markup = cls._build_table_summary_lines(
-            eval_results=eval_results,
-            target_key=target_key,
-            target_val=target_val,
-            best_info=best_info,
-            grouped=grouped,
-            lr=lr,
-            regular_checkpoint_path=regular_checkpoint_path,
-            new_best_checkpoint_path=new_best_checkpoint_path,
-            color_new_best=color_new_best,
-        )
-        return summary_lines, summary_has_markup, table_lines, table_has_markup
+        rows: List[Tuple[str, Dict[str, Any]]] = []
+        metric_names = set()
+        if evaluation.training is not None:
+            training_metrics = {**evaluation.training.metrics, "score": evaluation.training.score}
+            rows.append(("train:interval", training_metrics))
+            metric_names.update(training_metrics)
+        for model in evaluation.models:
+            variant_prefix = "" if model.variant == "standard" else f"{model.variant}_"
+            for stage in model.stages:
+                stage_label = f"{variant_prefix}{stage.stage.value}"
+                rows.append((f"{stage_label}:score", {"score": stage.score}))
+                metric_names.add("score")
+                for loader in stage.loaders:
+                    loader_label = stage.stage.value if loader.name is None else f"{stage.stage.value}:{loader.name}"
+                    rows.append((f"{variant_prefix}{loader_label}", dict(loader.metrics)))
+                    metric_names.update(loader.metrics)
 
+        headers = ["Scope / loader", *cls._ordered_metric_names({name: None for name in metric_names})]
+        table_lines = ["\n[Evaluation Metrics]"]
+        if rows:
+            table_rows = [
+                [label, *(cls._format_metric_value(metrics[name], name) if name in metrics else "-" for name in headers[1:])]
+                for label, metrics in rows
+            ]
+            table_lines.extend(cls._render_text_table(headers, table_rows))
+        else:
+            table_lines.append("(no evaluation loaders executed)")
+        return lines, is_best and color_new_best, table_lines, False
 
 
 class EvalSummaryListener:
@@ -437,63 +141,35 @@ class EvalSummaryListener:
         self,
         logger: Any,
         target_key: str = "val_metric",
-        target_mode: str = "min",
-        save_dir: Optional[str] = None,
         color_new_best: bool = True,
     ) -> None:
         self.logger = logger
         self.target_key = target_key
-        self.target_mode = target_mode
-        self.save_dir = save_dir
         self.color_new_best = color_new_best
 
     def on_validation_end(self, context: ValidationEndEventContext) -> None:
-        eval_results = context.eval_results or {}
         state = context.runner.run_state
-        epoch = getattr(state, "epoch", 0)
-        step = getattr(state, "global_step", 0)
-
-        save_dir = self.save_dir or getattr(self.logger, "log_dir", None)
-        regular_checkpoint_path = None
-        new_best_checkpoint_path = None
-        if save_dir:
-            regular_checkpoint_path = str(
-                Path(save_dir) / generate_checkpoint_filename(epoch=epoch, global_step=step, is_best=False)
-            )
-            if bool(context.is_best):
-                new_best_checkpoint_path = str(
-                    Path(save_dir) / generate_checkpoint_filename(epoch=epoch, global_step=step, is_best=True)
-                )
-
-        tracker_for_log = context.best_model_tracker or SimpleNamespace(
-            mode=self.target_mode,
+        tracker = context.best_model_tracker or SimpleNamespace(
             best_metric=getattr(state, "best_monitored_metric", None),
-            best_epoch=getattr(state, "best_epoch", 0),
-            best_step=getattr(state, "best_step", 0),
+            best_epoch=getattr(state, "best_epoch", None),
+            best_step=getattr(state, "best_step", None),
         )
-
-        summary_lines, summary_has_markup, table_lines, table_has_markup = EvalFormatter.format_all(
-            eval_results=eval_results,
-            epoch=epoch,
-            step=step,
+        summary_lines, summary_has_markup, table_lines, table_has_markup = EvalFormatter.format_evaluation(
+            evaluation=context.evaluation,
+            epoch=getattr(state, "epoch", 0),
+            step=getattr(state, "global_step", 0),
             target_key=self.target_key,
-            target_mode=self.target_mode,
             is_best=bool(context.is_best),
             previous_best=context.previous_best,
-            best_model_tracker=tracker_for_log,
+            best_model_tracker=tracker,
             lr=context.lr,
-            regular_checkpoint_path=regular_checkpoint_path,
-            new_best_checkpoint_path=new_best_checkpoint_path,
             color_new_best=self.color_new_best,
         )
-
         if summary_has_markup:
             self.logger.info("\n".join(summary_lines), extra={"markup": True})
         else:
             self.logger.info("\n".join(summary_lines))
-
         if table_has_markup:
             self.logger.info("\n".join(table_lines), extra={"markup": True})
         else:
             self.logger.info("\n".join(table_lines))
-

@@ -108,7 +108,7 @@ When a target key is absent:
 - the corresponding current canonical metric becomes `None` while its latest valid value is retained.
 
 Non-target boundary consumers continue normally. This includes task callbacks, regular checkpoint
-triggers, SheetLogger boundary rows, evaluation events, and non-plateau schedulers explicitly driven
+triggers, JSONL boundary events, evaluation events, and non-plateau schedulers explicitly driven
 by `valid_end`.
 
 Every target-based consumer that applies a missing-target default must emit its own DEBUG record at
@@ -120,25 +120,15 @@ not fall under this rule.
 
 ### Evaluation-pass result representation
 
-Runner uses `EvaluationPassResult` as the canonical result for one evaluation boundary. It contains:
+Runner uses `EvaluationResult` as the canonical result for one evaluation boundary. It contains an
+optional training interval, ordered model variants, ordered stages, and ordered loader records. Each
+stage owns one task-derived score while every loader retains its raw metric mapping. A loader without
+an explicit name uses `None`, not a reserved string.
 
-- `loader_results`, an ordered tuple of `LoaderEvaluationResult` records, each carrying model
-  variant, stage, loader name, and its metric mapping;
-- `flat_metrics` for existing target keys, logging, and checkpoint output;
-- a derived `executed_stages` property for distinguishing boundary occurrence from actual model
-  forward execution.
-
-The contract uses evaluation-loader terminology rather than the ambiguous term "surface". Formatters
-and events iterate `loader_results`; they must not infer loader identity by parsing flat metric
-keys, because a rendered key such as `val_b1_force_mae` is inherently ambiguous.
-
-The result does not use a composite-key mapping. Tuple order follows the deterministic evaluation-pass
-plan. Every executed loader produces a `LoaderEvaluationResult`, including when its metric mapping is
-empty, so `executed_stages` is derived rather than stored as duplicate state.
-
-Internal evaluation functions and emitters migrate directly to `EvaluationPassResult` without a
-legacy dict adapter. Public event contexts expose it through `evaluation`; the old
-`context.eval_results` field and compatibility property are not retained.
+The result does not use a composite-key mapping. Formatters and events traverse the model → stage →
+loader structure, so loader identity is never reconstructed from a rendered metric key. Public event
+contexts expose the result through `evaluation`; the old `context.eval_results` field and all flat
+metric compatibility views are not retained.
 
 ### Canonical control metric
 
@@ -184,8 +174,8 @@ Standalone evaluation binds the same contract once at the start of each independ
 because it has no long-lived training Runner instance to own the binding. Runtime evaluation must
 not repeatedly inspect the signature or catch `TypeError` to guess the call shape.
 
-Standalone evaluation receives an explicit `stage: Stage = Stage.TEST` parameter. Its output
-`prefix` is presentation-only and must never be parsed to infer the stage.
+Standalone evaluation receives an explicit `stage: Stage = Stage.TEST` parameter. Its structured
+result records the stage directly and is never inferred from a presentation string.
 
 Runner does not perform generic scalar-conversion, return-type, or finiteness validation on every
 evaluation pass. The contract requires validation to return a float. Apart from the documented TEST

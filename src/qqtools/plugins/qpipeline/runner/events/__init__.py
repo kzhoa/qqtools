@@ -25,6 +25,13 @@ from .types import (
     RunnerRuntimeView,
     ValidationEndEventContext,
 )
+from ..runner_utils.evaluation import (
+    EvaluationResult,
+    LoaderEvaluation,
+    ModelEvaluation,
+    StageEvaluation,
+    TrainingResult,
+)
 
 __all__ = [
     "BaseEventContext",
@@ -32,9 +39,14 @@ __all__ = [
     "EventDispatcher",
     "EventName",
     "EventSpec",
+    "EvaluationResult",
     "LossComputedEventContext",
+    "LoaderEvaluation",
+    "ModelEvaluation",
     "ProgressEventContext",
     "RunnerRuntimeView",
+    "StageEvaluation",
+    "TrainingResult",
     "ValidationEndEventContext",
     "emit_batch_end",
     "emit_batch_start",

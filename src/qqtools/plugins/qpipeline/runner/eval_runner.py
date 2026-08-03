@@ -15,6 +15,7 @@ from ..types import Stage
 from .runner_utils.avgbank import AvgBank
 from .runner_utils.common import _getattr_or_default, move_batch_to_device
 from .runner_utils.ddpdeduper import EvalDedupRuntime, unwrap_eval_batch, wrap_eval_dataloader_for_ddp_dedup
+from .runner_utils.evaluation import EvaluationResult, LoaderEvaluation, ModelEvaluation, StageEvaluation
 from .runner_utils.hook_binding import bind_post_metrics_to_value
 from .runner_utils.tensorbank import TensorBank
 
@@ -92,16 +93,13 @@ def evaluate_runner(
     task: qTaskBase,
     dataloader: DataLoader,
     args: Optional[qConfig] = None,
-    prefix: str = "test",
     return_outputs: bool = False,
-    allow_auto_offload: bool = False,
     logger=None,
     *,
     stage: Stage = Stage.TEST,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[EvaluationResult]:
     if args is None:
         raise ValueError("The 'args' parameter is required to configure the runner.")
-    del allow_auto_offload
     post_metrics_to_value = bind_post_metrics_to_value(task)
 
     dataloader = _prepare_eval_loader(dataloader, args)
@@ -159,23 +157,21 @@ def evaluate_runner(
             if task_epoch_metrics:
                 avg_metrics.update(task_epoch_metrics)
 
-        prefixed_metrics = {f"{prefix}_{key}": value for key, value in avg_metrics.items()}
-        canonical_metric = post_metrics_to_value(result=avg_metrics, stage=stage)
-        if canonical_metric is not None or stage is not Stage.TEST:
-            prefixed_metrics[f"{prefix}_metric"] = canonical_metric
-        if eval_output_bank is None:
-            return prefixed_metrics
+        score = post_metrics_to_value(result=avg_metrics, stage=stage)
 
-        gathered_outputs = _build_output_bank_result(
-            output_bank=eval_output_bank,
-            distributed=distributed,
-            device=device,
-            runtime=runtime,
-        )
-        if gathered_outputs is None:
-            return None
-        prefixed_metrics.update(gathered_outputs)
-        return prefixed_metrics
+        outputs = None
+        if eval_output_bank is not None:
+            outputs = _build_output_bank_result(
+                output_bank=eval_output_bank,
+                distributed=distributed,
+                device=device,
+                runtime=runtime,
+            )
+            if outputs is None:
+                return None
+        loader = LoaderEvaluation(name=None, metrics=avg_metrics, outputs=outputs)
+        stage_result = StageEvaluation(stage=stage, loaders=(loader,), score=score)
+        return EvaluationResult(models=(ModelEvaluation(variant="standard", stages=(stage_result,)),))
     finally:
         model.train(was_training)
 

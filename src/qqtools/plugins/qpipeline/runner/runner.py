@@ -31,9 +31,10 @@ from .runner_utils.ckp_manager import CheckpointListener, CheckpointManager
 from .runner_utils.common import _getattr_or_default, _is_periodic_trigger, move_batch_to_device
 from .runner_utils.earlystop import EarlyStopListener, EarlyStopper
 from .runner_utils.epoch_suffix import standardize_epoch_suffixes
+from .runner_utils.evaluation import EvaluationResult
 from .runner_utils.eval_formatter import EvalSummaryListener
 from .runner_utils.progress import ProgressTracker
-from .runner_utils.sheet_logger import SheetLogger, SheetLoggerListener, adapt_qpipeline_metric_row
+from .runner_utils.metrics_jsonl import MetricsJsonlListener, MetricsJsonlLogger
 from .runner_utils.types import (
     RunConfig,
     RunMode,
@@ -43,7 +44,7 @@ from .runner_utils.types import (
     TrainRunnerResult,
 )
 
-__all__ = ["train_runner", "SheetLoggerListener"]
+__all__ = ["train_runner", "MetricsJsonlListener"]
 
 TerminalCause = Literal[
     "normal_finish", "early_stop", "user_interrupt", "exception", "nan_detected", "logger_failure",
@@ -200,7 +201,6 @@ def _build_and_emit_terminal_event(
 def _finalize_train_runner(
     *,
     logger: qLogger,
-    sheet_logger: Optional[SheetLogger],
     progress_tracker: Optional[ProgressTracker],
     profiler: Optional[profile],
     owns_logger: bool = True,
@@ -234,7 +234,7 @@ def _prepare_training_session(
     config: RunConfig,
     save_dir: str,
     logger: qLogger,
-    sheet_logger: Optional[SheetLogger],
+    metrics_logger: Optional[MetricsJsonlLogger],
     checkpoint_manager: CheckpointManager,
     agent: RunningAgent,
     early_stopper: EarlyStopper,
@@ -242,6 +242,7 @@ def _prepare_training_session(
     early_stop_listener: EarlyStopListener,
     checkpoint_listener: CheckpointListener,
     effective_scheduler: Optional[qWarmupScheduler],
+    scheduler_target: str = "val_metric",
     device: torch.device,
     model: nn.Module,
     task: qTaskBase,
@@ -278,8 +279,17 @@ def _prepare_training_session(
         if effective_scheduler.step_on != SCHEDULER_STEP_ON_VALID_END:
             return
 
-        eval_results = context.eval_results or {}
-        effective_scheduler.step_main(metrics=eval_results.get("val_metric"))
+        metric = context.evaluation.target_value(scheduler_target)
+        if metric is None:
+            state = context.runner.run_state
+            logger.debug(
+                "Plateau scheduler skipped: target=%r default=skip_metric_step epoch=%s step=%s.",
+                scheduler_target,
+                state.epoch,
+                state.global_step,
+            )
+            return
+        effective_scheduler.step_main(metrics=metric)
 
     agent.add_listener("on_validation_end", _on_validation_end_step_scheduler)
     agent.add_listener("on_validation_end", eval_summary_listener.on_validation_end)
@@ -294,17 +304,16 @@ def _prepare_training_session(
     agent.add_listener("on_eval_start", progress_tracker.on_eval_start)
     agent.add_listener("on_eval_end", progress_tracker.on_eval_end)
 
-    if log_granularity and sheet_logger is not None:
-        sheet_logger_listener = SheetLoggerListener(
-            sheet_logger=sheet_logger,
+    if log_granularity and metrics_logger is not None:
+        metrics_listener = MetricsJsonlListener(
+            logger=metrics_logger,
             run_config=config,
             log_granularity=log_granularity,
-            logger=logger,
         )
         if "eval" in log_granularity:
-            agent.add_listener("on_eval_end", sheet_logger_listener.on_eval_end)
+            agent.add_listener("on_eval_end", metrics_listener.on_eval_end)
         if "batch" in log_granularity:
-            agent.add_listener("on_train_batch_end", sheet_logger_listener.on_train_batch_end)
+            agent.add_listener("on_train_batch_end", metrics_listener.on_train_batch_end)
 
     if config.use_profiler:
         profiler = profile(
@@ -452,7 +461,6 @@ def train_runner(
     distributed: bool = False,
     save_dir: str = "./logs",
     print_freq: int = 10,
-    extra_log_keys: Optional[List[str]] = None,
     extra_ckp_caches: Optional[Dict[str, Any]] = None,
     use_profiler: bool = False,
     ema_model: Optional[qEMA] = None,
@@ -487,7 +495,6 @@ def train_runner(
         distributed: Whether to use distributed training
         save_dir: Directory to save checkpoints
         print_freq: Frequency of printing logs
-        extra_log_keys: Extra log keys
         extra_ckp_caches: Extra checkpoint caches
         use_profiler: Whether to use profiler
         ema_model: EMA model
@@ -601,11 +608,16 @@ def train_runner(
         checkpoint=checkpoint_config,
         early_stop=early_stop_config,
     )
-
-    # Define structured sheet-log columns.
-    log_keys = ["epoch", "global_step", "train_metric", "val_metric", "test_metric", "train_loss"]
-    if extra_log_keys:
-        log_keys.extend(extra_log_keys)
+    scheduler_target = _qconfig_get(
+        _qconfig_get(getattr(args, "optim", None), "scheduler_params", None), "target", "val_metric"
+    ) or "val_metric"
+    targets = (
+        config.checkpoint.get("target", "val_metric"),
+        config.early_stop.get("target", "val_metric"),
+        scheduler_target,
+    )
+    for target in targets:
+        EvaluationResult.validate_target(target)
 
     # --- Logger ---
     owns_logger = logger is None
@@ -615,10 +627,10 @@ def train_runner(
     for log_line in epoch_suffix_logs:
         logger.info(log_line)
 
-    sheet_logger = None
+    metrics_logger = None
     if log_granularity and config.rank == 0:
-        metrics_file = Path(save_dir) / "metrics.csv"
-        sheet_logger = SheetLogger(metrics_file, columns=log_keys, row_adapter=adapt_qpipeline_metric_row)
+        metrics_file = Path(save_dir) / "metrics.jsonl"
+        metrics_logger = MetricsJsonlLogger(metrics_file)
     for warning_msg in boundary_policy_warnings:
         logger.warning(warning_msg)
 
@@ -677,6 +689,8 @@ def train_runner(
         ema_model=ema_model,
         early_stopper=early_stopper,
         best_model_tracker=agent.best_model_tracker,
+        logger=logger,
+        event_logger=metrics_logger,
     )
     early_stop_listener = EarlyStopListener(
         early_stopper=early_stopper,
@@ -686,7 +700,6 @@ def train_runner(
     eval_summary_listener = EvalSummaryListener(
         logger=logger,
         target_key=_qconfig_get(config.checkpoint, "target", "val_metric"),
-        target_mode=_qconfig_get(config.checkpoint, "mode", "min"),
     )
 
     progress_tracker = None
@@ -701,7 +714,7 @@ def train_runner(
             config=config,
             save_dir=save_dir,
             logger=logger,
-            sheet_logger=sheet_logger,
+            metrics_logger=metrics_logger,
             checkpoint_manager=checkpoint_manager,
             agent=agent,
             early_stopper=early_stopper,
@@ -709,6 +722,7 @@ def train_runner(
             early_stop_listener=early_stop_listener,
             checkpoint_listener=checkpoint_listener,
             effective_scheduler=effective_scheduler,
+            scheduler_target=scheduler_target,
             device=device,
             model=model,
             task=task,
@@ -733,26 +747,25 @@ def train_runner(
     finally:
         _finalize_train_runner(
             logger=logger,
-            sheet_logger=sheet_logger,
             progress_tracker=progress_tracker,
             profiler=profiler,
             owns_logger=owns_logger,
         )
 
     logger_error: Optional[BaseException] = None
-    if sheet_logger is not None:
+    if metrics_logger is not None:
         try:
             if terminal_cause in {"normal_finish", "early_stop"}:
-                sheet_logger.close()
+                metrics_logger.close()
             else:
-                sheet_logger.abort()
+                metrics_logger.abort()
         except BaseException as error:
             logger_error = error
-            logger.error("SheetLogger finalization failed: %s", error, exc_info=True)
+            logger.error("Metrics JSONL finalization failed: %s", error, exc_info=True)
 
     if primary_exception is not None:
         if logger_error is not None:
-            primary_exception.add_note(f"SheetLogger finalization failed: {logger_error!r}")
+            primary_exception.add_note(f"Metrics JSONL finalization failed: {logger_error!r}")
         terminal_event = _build_and_emit_terminal_event(
             logger=logger,
             terminal_cause="exception",

@@ -452,7 +452,7 @@ def test_train_batch_events_do_not_report_early_lr_change_for_valid_end_schedule
     )
     agent.add_listener(
         "on_validation_end",
-        lambda context: scheduler.step_main(metrics=(context.eval_results or {}).get("val_metric")),
+        lambda context: scheduler.step_main(metrics=context.evaluation.target_value("val_metric")),
     )
     agent.add_listener(
         "on_batch_end",

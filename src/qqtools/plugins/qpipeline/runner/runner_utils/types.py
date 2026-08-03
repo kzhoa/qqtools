@@ -138,6 +138,8 @@ class RunningState:
     current_train_metric: Optional[float] = None
     current_val_metric: Optional[float] = None
     current_test_metric: Optional[float] = None
+    latest_val_metric: Optional[float] = None
+    latest_test_metric: Optional[float] = None
     epoch_end_eval_triggered: bool = False
     epoch_result_val_metric_source: EpochResultMetricSource = "missing"
     epoch_result_test_metric_source: EpochResultMetricSource = "missing"
@@ -150,13 +152,21 @@ class RunningState:
     # Batch tracking for resuming from mid-epoch checkpoints
     batch_idx_in_epoch: int = 0
 
-    def update_current_metrics(self, metrics: Dict[str, Any]):
+    def update_current_metrics(self, metrics: Dict[str, Any], *, is_evaluation_boundary: bool = False):
         if "train_metric" in metrics:
             self.current_train_metric = metrics["train_metric"]
-        if "val_metric" in metrics:
-            self.current_val_metric = metrics["val_metric"]
-        if "test_metric" in metrics:
-            self.current_test_metric = metrics["test_metric"]
+        if is_evaluation_boundary:
+            self.current_val_metric = metrics.get("val_metric")
+            self.current_test_metric = metrics.get("test_metric")
+            if "val_metric" in metrics:
+                self.latest_val_metric = metrics["val_metric"]
+            if "test_metric" in metrics:
+                self.latest_test_metric = metrics["test_metric"]
+        else:
+            if "val_metric" in metrics:
+                self.current_val_metric = metrics["val_metric"]
+            if "test_metric" in metrics:
+                self.current_test_metric = metrics["test_metric"]
         if "train_loss" in metrics:
             self.current_train_loss = metrics["train_loss"]
 
@@ -184,6 +194,10 @@ class RunningState:
             "best_monitored_metric": self.best_monitored_metric,
             "best_model_metrics_snapshot": self.best_model_metrics_snapshot,
             "best_ckp_file": self.best_ckp_file,
+            "current_val_metric": self.current_val_metric,
+            "current_test_metric": self.current_test_metric,
+            "latest_val_metric": self.latest_val_metric,
+            "latest_test_metric": self.latest_test_metric,
             "batch_idx_in_epoch": self.batch_idx_in_epoch,
         }
 

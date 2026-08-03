@@ -600,8 +600,8 @@ def test_train_runner_bridges_task_lifecycle_hooks(base_args, tiny_model):
     assert first_train_batch.lr is not None
     validation_context = received["on_validation_end"]
     assert validation_context.runner.stage is None
-    assert validation_context.eval_results is not None
-    assert "val_metric" in validation_context.eval_results
+    assert validation_context.evaluation is not None
+    assert validation_context.evaluation.target_value("val_metric") is not None
     assert validation_context.signal is not None
 
 

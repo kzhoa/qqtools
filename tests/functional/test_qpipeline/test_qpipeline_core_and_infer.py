@@ -142,7 +142,7 @@ def test_prepare_training_session_registers_exact_task_lifecycle_hooks(monkeypat
         config=config,
         save_dir=str(tmp_path),
         logger=Mock(),
-        sheet_logger=None,
+        metrics_logger=None,
         checkpoint_manager=Mock(),
         agent=agent,
         early_stopper=Mock(),
@@ -203,20 +203,20 @@ def test_infer_runner_args_required(tiny_task, tiny_model):
         )
 
 
-def test_evaluate_once_runner_returns_prefixed_metrics(base_args, tiny_task, tiny_model):
+def test_evaluate_once_runner_returns_structured_result(base_args, tiny_task, tiny_model):
     results = evaluate_runner(
         model=tiny_model,
         task=tiny_task,
         dataloader=tiny_task.test_loader,
         args=base_args,
-        prefix="test",
         return_outputs=False,
     )
 
     assert results is not None
-    assert "test_metric" in results
-    assert "test_mse" in results
-    assert "pred" not in results
+    stage = results.models[0].stages[0]
+    assert stage.score is not None
+    assert "mse" in stage.loaders[0].metrics
+    assert stage.loaders[0].outputs is None
 
 
 def test_evaluate_once_runner_return_outputs_includes_metrics_and_predictions(base_args, tiny_task, tiny_model):
@@ -225,16 +225,15 @@ def test_evaluate_once_runner_return_outputs_includes_metrics_and_predictions(ba
         task=tiny_task,
         dataloader=tiny_task.test_loader,
         args=base_args,
-        prefix="test",
         return_outputs=True,
     )
 
     assert results is not None
-    assert "test_metric" in results
-    assert "test_mse" in results
-    assert "pred" in results
-    assert "labels" in results
-    assert results["pred"].shape[0] == len(tiny_task.test_loader.dataset)
+    loader = results.models[0].stages[0].loaders[0]
+    assert loader.outputs is not None
+    assert "pred" in loader.outputs
+    assert "labels" in loader.outputs
+    assert loader.outputs["pred"].shape[0] == len(tiny_task.test_loader.dataset)
 
 
 def test_qpipeline_uses_args_test_to_enter_test_mode(base_args, tiny_task, tiny_model):
@@ -304,14 +303,43 @@ def test_evaluate_runner_uses_dedup_runtime_gather(monkeypatch, base_args, tiny_
         task=tiny_task,
         dataloader=tiny_task.test_loader,
         args=base_args,
-        prefix="test",
         return_outputs=True,
     )
 
     assert results is not None
-    assert results["test_mse"] == 123.0
+    assert results.models[0].stages[0].loaders[0].metrics["mse"] == 123.0
     assert any(call[0] == "avg" for call in runtime.calls)
     assert any(call[0] == "output" for call in runtime.calls)
+
+
+def test_evaluate_runner_runs_score_hook_before_non_primary_output_return(
+    monkeypatch, base_args, tiny_task, tiny_model
+):
+    hook_calls = []
+
+    def post_metrics_to_value(result, *, stage):
+        hook_calls.append((result, stage))
+        return result["mse"]
+
+    tiny_task.post_metrics_to_value = post_metrics_to_value
+    monkeypatch.setattr(
+        eval_runner_module,
+        "_build_output_bank_result",
+        lambda **_kwargs: None,
+    )
+
+    results = evaluate_runner(
+        model=tiny_model,
+        task=tiny_task,
+        dataloader=tiny_task.test_loader,
+        args=base_args,
+        return_outputs=True,
+    )
+
+    assert results is None
+    assert len(hook_calls) == 1
+    assert "mse" in hook_calls[0][0]
+    assert hook_calls[0][1] is Stage.TEST
 
 
 def test_qpipeline_test_mode_evaluate_once_defaults_to_test_loader(base_args, tiny_task, tiny_model):
@@ -323,11 +351,10 @@ def test_qpipeline_test_mode_evaluate_once_defaults_to_test_loader(base_args, ti
     results = pipeline.evaluate_once()
 
     assert results is not None
-    assert "test_metric" in results
-    assert "test_mse" in results
+    assert results.target_value("test_metric") is not None
 
 
-def test_evaluate_runner_passes_explicit_stage_independently_of_prefix(base_args, tiny_task, tiny_model):
+def test_evaluate_runner_passes_explicit_stage(base_args, tiny_task, tiny_model):
     received_stages = []
 
     def post_metrics_to_value(result, *, stage):
@@ -340,16 +367,15 @@ def test_evaluate_runner_passes_explicit_stage_independently_of_prefix(base_args
         task=tiny_task,
         dataloader=tiny_task.test_loader,
         args=base_args,
-        prefix="benchmark_a",
         stage=Stage.VAL,
     )
 
     assert results is not None
-    assert "benchmark_a_metric" in results
+    assert results.target_value("val_metric") is not None
     assert received_stages == [Stage.VAL]
 
 
-def test_evaluate_runner_omits_test_metric_when_task_returns_none(base_args, tiny_task, tiny_model):
+def test_evaluate_runner_exposes_none_test_score(base_args, tiny_task, tiny_model):
     def post_metrics_to_value(result, *, stage):
         assert stage is Stage.TEST
         return None
@@ -363,8 +389,8 @@ def test_evaluate_runner_omits_test_metric_when_task_returns_none(base_args, tin
     )
 
     assert results is not None
-    assert "test_mse" in results
-    assert "test_metric" not in results
+    assert "mse" in results.models[0].stages[0].loaders[0].metrics
+    assert results.target_value("test_metric") is None
 
 
 def test_qpipeline_evaluate_once_forwards_stage(monkeypatch, base_args, tiny_task, tiny_model):
@@ -376,13 +402,12 @@ def test_qpipeline_evaluate_once_forwards_stage(monkeypatch, base_args, tiny_tas
 
     def evaluate_runner_stub(**kwargs):
         received_kwargs.update(kwargs)
-        return {"benchmark_a_metric": 1.0}
+        return object()
 
     monkeypatch.setattr(qpipeline_module, "evaluate_runner", evaluate_runner_stub)
-    pipeline.evaluate_once(prefix="benchmark_a", stage=Stage.VAL)
+    pipeline.evaluate_once(stage=Stage.VAL)
 
     assert received_kwargs["stage"] is Stage.VAL
-    assert received_kwargs["prefix"] == "benchmark_a"
 
 
 def test_qpipeline_infer_returns_outputs(base_args, tiny_task, tiny_model):
@@ -561,8 +586,8 @@ def test_eval_emits_progress_tick_for_val_and_test_stages(tiny_task, tiny_model,
 
     agent.add_listener("on_progress_tick", _capture_progress_tick)
 
-    agent._evaluate_loader(tiny_model, tiny_task.val_loader, prefix="val", stage="val")
-    agent._evaluate_loader(tiny_model, tiny_task.test_loader, prefix="test", stage="test")
+    agent._evaluate_loader(tiny_model, tiny_task.val_loader, stage="val")
+    agent._evaluate_loader(tiny_model, tiny_task.test_loader, stage="test")
 
     val_ticks = [stage for stage in captured_stages if stage == "val"]
     test_ticks = [stage for stage in captured_stages if stage == "test"]

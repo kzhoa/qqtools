@@ -46,11 +46,12 @@ positional-only parameters, `*args`, and `**kwargs` before training or evaluatio
 ## Standalone evaluation
 
 `evaluate_runner(...)` and `qPipeline.evaluate_once(...)` accept keyword-only
-`stage: Stage = Stage.TEST`. `prefix` only names returned metrics; it never determines the stage.
+`stage: Stage = Stage.TEST` and return an `EvaluationResult`. The returned stage holds its
+task-derived `score` separately from each loader's raw `metrics`.
 
 ```python
-pipeline.evaluate_once(prefix="benchmark_a", stage=Stage.VAL)
+pipeline.evaluate_once(stage=Stage.VAL)
 ```
 
 The public hook contract remains `-> float`. For `Stage.TEST` only, returning `None` omits the
-canonical `<prefix>_metric` while preserving the raw test metrics.
+stage score while preserving the raw test metrics.
