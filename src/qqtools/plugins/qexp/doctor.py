@@ -13,6 +13,7 @@ from .runtime.locks import group_lock, task_lock
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
 from .runtime.records import AttemptRecord, TaskRecord, utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
+from .runtime.termination import list_decisions
 from .runtime.tasks import load_task
 
 
@@ -232,7 +233,16 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
         evidence_state = _process_evidence_state(attempt, process)
         if evidence_state in {"mismatch", "unverifiable"}:
             _issue(issues, f"process_identity_{evidence_state}", manifest_path, "high")
-    return {"schema_version": 5, "tasks_checked": checked, "issues": issues, "healthy": not issues}
+    for decision_path in list_decisions(cfg):
+        try:
+            decision = read_json(decision_path).get("termination_decision", {})
+            if decision.get("shared_reconciliation") == "blocked":
+                _issue(issues, "termination_reconciliation_blocked", decision_path, "high")
+            if decision.get("state") not in {"confirmed", "superseded"}:
+                _issue(issues, "termination_decision_incomplete", decision_path, "high")
+        except (OSError, ValueError):
+            _issue(issues, "termination_decision_invalid", decision_path, "high")
+    return {"schema_version": 6, "tasks_checked": checked, "issues": issues, "healthy": not issues}
 
 
 def repair_metadata(cfg: RootConfig) -> dict[str, Any]:

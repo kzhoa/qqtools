@@ -14,7 +14,7 @@ from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.runtime.locks import group_lock, task_lock
 from qqtools.plugins.qexp.runtime.paths import attempt_path, group_path, task_path
 from qqtools.plugins.qexp.runtime.reservations import attach, reserve, reserved_gpu_ids
-from qqtools.plugins.qexp.runtime.records import new_id, utc_now
+from qqtools.plugins.qexp.runtime.records import SCHEMA_VERSION, new_id, utc_now
 from qqtools.plugins.qexp.runtime.claims import reconcile_claim_archives
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -201,7 +201,7 @@ def test_submission_rechecks_cleanup_tombstone_before_task_creation(
             now = utc_now()
             atomic_replace(
                 cfg.shared_root / "operations" / "cleanup" / f"{task_id}.json",
-                {"meta": {"schema_version": 5, "revision": 1, "created_at": now,
+                {"meta": {"schema_version": SCHEMA_VERSION, "revision": 1, "created_at": now,
                           "updated_at": now, "updated_by": {"actor_type": "test",
                           "machine_name": cfg.machine_name, "process_id": "0"}},
                  "cleanup": {"operation_id": new_id(), "task_id": task_id,

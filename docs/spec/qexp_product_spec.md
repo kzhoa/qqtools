@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-07-29
+updated_at: 2026-08-04
 archived_at:
 ---
 
@@ -20,26 +20,19 @@ This document defines the product contract of `qexp`:
 Runtime truth layout, locking, claims, leases, fencing, and repair implementation belong
 in [qexp_runtime_spec.md](qexp_runtime_spec.md).
 
-The future model and evolution rationale are developed in
-[qexp-experiment-group-task-scheduling.md](../pitch/qexp-experiment-group-task-scheduling.md).
+The Group/Task/Attempt model rationale and delivery history are recorded in
+[021-qexp-experiment-group-task-scheduling.md](../pitch/arxiv/021-qexp-experiment-group-task-scheduling.md).
+The schema-6 authority ownership delivery history is recorded in
+[027-qexp-agent-owned-authority.md](../pitch/arxiv/027-qexp-agent-owned-authority.md).
 
 ## 2. Contract Status
 
-This is the authoritative target product contract. The current implementation and runtime
-spec may lag behind parts of it, especially:
-
-- first-class Experiment Group truth
-- explicit Attempt truth
-- removal of public Batch identity
-- home-first spillover scheduling
-- cross-machine global claims, leases, and fencing
-
-Until runtime truth and concurrency primitives are upgraded, current-machine behavior is
-the safe implemented baseline.
+This is the authoritative schema-6 product contract. The installed implementation uses the
+Group, Task, and Attempt model, including cross-machine claims, leases, and fencing.
 
 Where the current runtime spec conflicts with this document, this document defines the
-target product behavior and the runtime spec describes the implementation that will be
-replaced by the new schema.
+target product behavior and the runtime spec defines the corresponding persistence and
+recovery protocol.
 
 Document authority is divided as follows:
 
@@ -62,20 +55,22 @@ Recommended reading order:
 
 ### Breaking Schema Cutover
 
-The new Group/Task/Attempt model intentionally does not provide backward compatibility for
-existing Batch-era control data.
+The Group/Task/Attempt model intentionally does not provide backward compatibility for
+Batch-era control data.
 
 Rules:
 
-- old Batch, Task, retry-lineage, and index records are not migrated
+- Batch-era control data is not migrated
 - the new implementation does not provide legacy readers or compatibility commands
-- an old `.qexp` root is unsupported after cutover
+- unsupported schemas fail before any agent or mutating command starts
 - the implementation should fail fast on an unsupported schema instead of partially
   interpreting old truth
-- users must start from a fresh new-schema control root
+- a drained schema-5 root may be upgraded by `qexp migrate --to-schema 6`; it must have
+  no active claim or running Attempt, and no mixed-schema runtime is supported
 
-Loss of access to old qexp scheduling metadata is a known and accepted product risk. This
-project does not mitigate that risk with migration, export, or compatibility tooling.
+Loss of Batch-era qexp scheduling metadata is a known and accepted product risk. The schema-5
+to schema-6 migration is a one-way control-root upgrade, not Batch-era compatibility, export,
+or a legacy reader.
 
 ## 3. Product Summary
 
@@ -791,6 +786,17 @@ For a running Attempt, heartbeat staleness and lease expiry have different meani
 - when the lease expires, archive the claim as expired with its fencing token preserved,
   mark the Attempt orphaned, and project the Task as blocked
 - do not change the Task to `queued_home` or `queued_shared`
+
+Schema-6 treats an individual renewal I/O failure as a visible `suspect` condition, not as
+an immediate task failure. The running process and its GPUs remain reserved while qexp
+retries within the authoritative lease. Users can inspect lease diagnostics and any pending
+termination reconciliation through `qexp doctor verify`.
+
+The shared default lease policy is 120 seconds with a 10 second renewal interval. Long
+training may use a larger authoritative TTL after a maintenance-window policy change. A holder
+that loses shared storage does not use a runner-local grace period or auto-terminate at TTL:
+its agent retains the process and reservation in `isolated` state until shared authority is
+available again. Quarantine remains disabled.
 
 The resulting state is:
 

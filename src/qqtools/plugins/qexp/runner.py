@@ -1,60 +1,23 @@
-"""Token-aware local process runner for one Attempt."""
+"""Passive local process wrapper for one already-authorized Attempt."""
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import signal
 import subprocess
-import time
+import sys
 from pathlib import Path
 
 from .config_types import RootConfig
 from .layout import load_root_config, shared_attempt_log_path
-from .runtime.paths import attempt_path
+from .runtime.paths import local_paths
 from .runtime.records import AttemptRecord, utc_now
-from .runtime.claims import archive_claim
-from .runtime.reservations import release
-from .runtime.store import atomic_replace, read_json
-from .runtime.tasks import load_task, save_task
-from .scheduler import (authority_locks, authorize_launch, renew_attempt_lease,
-                        _process_start_time_ticks)
+from .runtime.store import atomic_replace, create_if_absent, read_json
+from .runtime.tasks import load_task
+from .scheduler import _process_start_time_ticks
 
-
-def _terminate_child(child: object, *, timeout: float = 5.0) -> int:
-    """Terminate a process group and wait before releasing execution resources."""
-    if child.poll() is None:
-        try:
-            os.killpg(child.pid, signal.SIGTERM)
-        except OSError:
-            pass
-        deadline = time.monotonic() + timeout
-        while child.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if child.poll() is None:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except OSError:
-                pass
-    try:
-        return child.wait(timeout=timeout)
-    except (subprocess.TimeoutExpired, TypeError):
-        return child.returncode if child.returncode is not None else 137
-
-
-def _adopt_manifest_token(cfg: RootConfig, manifest_path: Path, task_id: str,
-                          attempt_id: str, current_token: int) -> int:
-    """Adopt a recovery-issued fencing token only from this local manifest."""
-    manifest = read_json(manifest_path).get("process", {})
-    token = manifest.get("fencing_token")
-    if not isinstance(token, int) or token == current_token:
-        return current_token
-    task = load_task(cfg, task_id)
-    claim = task.claim_control.get("active_claim") or {}
-    attempt = _load_attempt(cfg, task_id, attempt_id)
-    if (claim.get("attempt_id") == attempt_id and claim.get("fencing_token") == token
-            and attempt.current_fencing_token == token):
-        return token
-    return current_token
+LOCAL_PROCESS_PROTOCOL_VERSION = 1
 
 
 def _load_attempt(cfg: RootConfig, task_id: str, attempt_id: str) -> AttemptRecord:
@@ -65,122 +28,143 @@ def _load_attempt(cfg: RootConfig, task_id: str, attempt_id: str) -> AttemptReco
     raise FileNotFoundError(f"Attempt {attempt_id!r} not found for Task {task_id!r}.")
 
 
-def _publish_process_manifest(cfg: RootConfig, attempt: AttemptRecord, task: object, child: object) -> Path:
-    path = cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json"
-    wrapper_start = _process_start_time_ticks(os.getpid())
-    process_start = _process_start_time_ticks(child.pid)
-    atomic_replace(path, {"process": {"attempt_id": attempt.attempt_id, "task_id": attempt.task_id,
-        "fencing_token": attempt.current_fencing_token, "wrapper_pid": os.getpid(),
-        "wrapper_start_time_ticks": wrapper_start, "process_group_id": child.pid,
-        "process_group_start_time_ticks": process_start, "gpu_ids": attempt.assigned_gpus,
-        "command": task.spec.command, "working_directory": task.spec.working_directory,
-        "created_at": utc_now(), "observed_state": "running", "supervisor": "runner",
-        "exit_code": None, "signal": None}})
+def registration_path(cfg: RootConfig, attempt_id: str) -> Path:
+    return local_paths(cfg.runtime_root)["registrations"] / f"{attempt_id}.json"
+
+
+def observation_path(cfg: RootConfig, attempt_id: str) -> Path:
+    return local_paths(cfg.runtime_root)["observations"] / f"{attempt_id}.json"
+
+
+def launch_intent_path(cfg: RootConfig, attempt_id: str) -> Path:
+    return local_paths(cfg.runtime_root)["launch_intents"] / f"{attempt_id}.json"
+
+
+def _publish_launch_intent(cfg: RootConfig, attempt: AttemptRecord, task: object) -> Path:
+    """Persist wrapper identity before creating the training process."""
+    path = launch_intent_path(cfg, attempt.attempt_id)
+    if path.exists():
+        raise RuntimeError(f"launch intent already exists for {attempt.attempt_id!r}.")
+    create_if_absent(path, {"launch_intent": {
+        "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
+        "attempt_id": attempt.attempt_id,
+        "task_id": attempt.task_id,
+        "fencing_token": attempt.current_fencing_token,
+        "wrapper_pid": os.getpid(),
+        "wrapper_start_time_ticks": _process_start_time_ticks(os.getpid()),
+        "gpu_ids": attempt.assigned_gpus,
+        "command": task.spec.command,
+        "working_directory": task.spec.working_directory,
+        "lease_expires_at": (task.claim_control.get("active_claim") or {}).get("lease_expires_at"),
+        "created_at": utc_now(),
+    }})
     return path
+
+
+def _kill_owned_process_group(_signal_number: int, _frame: object) -> None:
+    """Immediately kill the runner's private process group after its parent dies."""
+    try:
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+    finally:
+        os._exit(128 + signal.SIGUSR1)
+
+
+def _configure_process_group_guardian(expected_parent_pid: int) -> None:
+    """Configure the private guardian to kill its group if the runner dies."""
+    if os.name != "posix":
+        raise RuntimeError("qexp process-group guardian requires POSIX")
+    if os.getppid() != expected_parent_pid:
+        _kill_owned_process_group(signal.SIGUSR1, None)
+    signal.signal(signal.SIGUSR1, _kill_owned_process_group)
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        prctl = libc.prctl
+    except AttributeError as exc:
+        raise RuntimeError("qexp process-group guardian requires Linux prctl") from exc
+    if prctl(1, signal.SIGUSR1, 0, 0, 0) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, "prctl(PR_SET_PDEATHSIG) failed")
+    if os.getppid() != expected_parent_pid:
+        _kill_owned_process_group(signal.SIGUSR1, None)
+
+
+def _run_guardian(command: list[str], expected_parent_pid: int) -> int:
+    """Run training inside a group that dies when the passive runner dies."""
+    _configure_process_group_guardian(expected_parent_pid)
+    return subprocess.Popen(command).wait()
+
+
+def _publish_registration(cfg: RootConfig, attempt: AttemptRecord, task: object, child: object) -> Path:
+    """Publish immutable child identity; the agent owns the mutable process manifest."""
+    path = registration_path(cfg, attempt.attempt_id)
+    if path.exists():
+        raise RuntimeError(f"process registration already exists for {attempt.attempt_id!r}.")
+    create_if_absent(path, {"process_registration": {
+        "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
+        "attempt_id": attempt.attempt_id,
+        "task_id": attempt.task_id,
+        "fencing_token": attempt.current_fencing_token,
+        "wrapper_pid": os.getpid(),
+        "wrapper_start_time_ticks": _process_start_time_ticks(os.getpid()),
+        "process_group_id": child.pid,
+        "process_group_start_time_ticks": _process_start_time_ticks(child.pid),
+        "gpu_ids": attempt.assigned_gpus,
+        "command": task.spec.command,
+        "working_directory": task.spec.working_directory,
+        "lease_expires_at": (task.claim_control.get("active_claim") or {}).get("lease_expires_at"),
+        "created_at": utc_now(),
+    }})
+    return path
+
+
+def _publish_exit_observation(cfg: RootConfig, attempt_id: str, return_code: int) -> None:
+    atomic_replace(observation_path(cfg, attempt_id), {"exit_observation": {
+        "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
+        "attempt_id": attempt_id,
+        "observed_exit_code": return_code,
+        "observed_at": utc_now(),
+    }})
 
 
 def run_attempt(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int,
                 popen_factory=subprocess.Popen, poll_interval: float = 0.5) -> int:
+    """Start and observe a process without participating in execution authority."""
+    del poll_interval
     task = load_task(cfg, task_id)
     attempt = _load_attempt(cfg, task_id, attempt_id)
-    claim = task.claim_control.get("active_claim") or {}
-    if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
+    if attempt.current_fencing_token != fencing_token:
         raise RuntimeError("stale fencing token cannot launch Attempt.")
-    if not authorize_launch(cfg, task_id, attempt_id, fencing_token):
-        raise RuntimeError("launch authorization was fenced by current Group or Task control state.")
-    attempt = _load_attempt(cfg, task_id, attempt_id)
-    attempt.phase = "starting"
-    attempt.timestamps["launch_authorized_at"] = utc_now()
-    atomic_replace(attempt_path(cfg.shared_root, task_id, attempt.attempt_number), attempt.to_dict())
     environment = os.environ.copy()
     if attempt.assigned_gpus:
         environment["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, attempt.assigned_gpus))
     log_path = shared_attempt_log_path(cfg, task_id, attempt_id)
-    child = None
-    manifest_path: Path | None = None
-    return_code = 127
-    try:
-        with log_path.open("ab") as log:
-            child = popen_factory(list(task.spec.command), cwd=task.spec.working_directory, env=environment,
-                                  stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            manifest_path = _publish_process_manifest(cfg, attempt, task, child)
-            attempt.process.update({"wrapper_pid": os.getpid(), "process_group_id": child.pid,
-                                    "wrapper_start_time_ticks":
-                                        _process_start_time_ticks(os.getpid()),
-                                    "process_group_start_time_ticks":
-                                        _process_start_time_ticks(child.pid),
-                                    "local_process_manifest": str(manifest_path),
-                                    "log_references": [str(log_path)]})
-            attempt.phase = "running"
-            attempt.timestamps["process_created_at"] = utc_now()
-            attempt.timestamps["running_at"] = utc_now()
-            atomic_replace(attempt_path(cfg.shared_root, task_id, attempt.attempt_number), attempt.to_dict())
-            while child.poll() is None:
-                if manifest_path:
-                    fencing_token = _adopt_manifest_token(cfg, manifest_path, task_id, attempt_id, fencing_token)
-                current = load_task(cfg, task_id)
-                if current.control.get("terminate_running"):
-                    return_code = _terminate_child(child)
-                    break
-                if not renew_attempt_lease(cfg, task_id, attempt_id, fencing_token):
-                    if manifest_path:
-                        recovered_token = _adopt_manifest_token(
-                            cfg, manifest_path, task_id, attempt_id, fencing_token
-                        )
-                        if recovered_token != fencing_token:
-                            fencing_token = recovered_token
-                            continue
-                    # Lost fencing authority means this process must not keep producing side effects.
-                    return_code = _terminate_child(child)
-                    break
-                time.sleep(poll_interval)
-            if return_code == 127:
-                return_code = child.returncode
-    except Exception as exc:
-        attempt.result["reason"] = f"launch_failed:{type(exc).__name__}"
-        if child is not None:
-            return_code = _terminate_child(child)
-    finally:
-        if manifest_path:
-            manifest = read_json(manifest_path)
-            manifest["process"].update({"observed_state": "exited", "exit_code": return_code})
-            atomic_replace(manifest_path, manifest)
-        _publish_terminal(cfg, task_id, attempt_id, fencing_token, return_code, attempt)
+    _publish_launch_intent(cfg, attempt, task)
+    with log_path.open("ab") as log:
+        guardian_command = [sys.executable, "-m", "qqtools.plugins.qexp.runner", "--guardian",
+                            "--parent-pid", str(os.getpid()), "--", *task.spec.command]
+        child = popen_factory(guardian_command, cwd=task.spec.working_directory, env=environment,
+                              stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        _publish_registration(cfg, attempt, task, child)
+        return_code = child.wait()
+    _publish_exit_observation(cfg, attempt_id, return_code)
     return return_code
 
 
-def _publish_terminal(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int,
-                      return_code: int, attempt: AttemptRecord) -> None:
-    task = load_task(cfg, task_id)
-    with authority_locks(cfg, task):
-        task = load_task(cfg, task_id)
-        claim = task.claim_control.get("active_claim") or {}
-        if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
-            return
-        path = attempt_path(cfg.shared_root, task_id, task.attempt_control["current_attempt_number"])
-        current = AttemptRecord.from_dict(read_json(path))
-        cancelled = task.control.get("terminate_running")
-        current.phase = "cancelled" if cancelled else ("succeeded" if return_code == 0 else "failed")
-        current.result.update({"exit_code": return_code, "reason": "cancelled_by_user" if cancelled else
-                               ("completed" if return_code == 0 else "nonzero_exit")})
-        current.timestamps["finished_at"] = utc_now()
-        if cancelled:
-            current.termination.update({"acknowledged_at": utc_now(), "result": "terminated"})
-        atomic_replace(path, current.to_dict())
-        release(cfg.runtime_root, claim["reservation_id"], current.result["reason"])
-        archive_claim(cfg, task_id, claim, current.result["reason"])
-        task.claim_control["active_claim"] = None
-        task.attempt_control["current_attempt_id"] = None
-        task.state.update({"projection": current.phase, "reason": current.result["reason"]})
-        if cancelled:
-            task.control.update({"termination_acknowledged_at": utc_now(),
-                                 "termination_result": "terminated"})
-        task.meta["revision"] += 1
-        task.meta["updated_at"] = utc_now()
-        save_task(cfg, task)
-
-
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "--guardian":
+        if len(argv) < 4 or argv[1] != "--parent-pid":
+            raise RuntimeError("qexp guardian requires its runner parent PID")
+        try:
+            expected_parent_pid = int(argv[2])
+        except ValueError as exc:
+            raise RuntimeError("qexp guardian parent PID must be an integer") from exc
+        command = argv[3:]
+        if command[:1] == ["--"]:
+            command = command[1:]
+        if not command:
+            raise RuntimeError("qexp guardian requires a training command")
+        return _run_guardian(command, expected_parent_pid)
     parser = argparse.ArgumentParser(description="qexp Attempt runner")
     parser.add_argument("--shared-root", required=True)
     parser.add_argument("--machine", required=True)

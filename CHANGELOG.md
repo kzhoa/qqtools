@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- breaking: make qexp schema-6 runner a passive process registration/exit-observation wrapper;
+  agent exclusively owns lease authority, Recovery, termination, terminal publication, and GPU release
+- fix: retain training and reservations through transient or prolonged shared-filesystem loss using
+  the schema-6 `suspect` and `isolated` lease states; only explicit authority changes terminate
+- fix: require PGID/start-time identity absence before confirming durable qexp termination decisions
+- breaking: upgrade qexp shared roots to schema 6; migrate drained schema-5 roots with
+  `qexp migrate --to-schema 6` before starting any schema-6 agent
+- fix: classify qexp lease renewal failures and retry transient shared-state errors within the
+  authoritative lease instead of immediately terminating a healthy training process
+- feat: add durable qexp termination decisions, local diagnostic event spooling, recovery
+  fencing, and structured lease-policy management through `qexp lease-policy`
+- feat: add qexp lease/recovery fault-injection coverage for retryable renewal failures,
+  chrony clock bounds, schema migration, and irreversible local termination commitments
+- docs: archive the completed qexp lease-renewal and Recovery-race hardening pitch
 - feat: support named multi-loader validation and test evaluation through `val_loader` and
   `test_loader` mappings, with task-owned stage-level canonical metrics and runtime-safe loader
   replacement between evaluation boundaries

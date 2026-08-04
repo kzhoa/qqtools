@@ -1,4 +1,4 @@
-"""qexp command line routing for the schema-5 product contract."""
+"""qexp command line routing for the schema-6 product contract."""
 from __future__ import annotations
 
 import argparse
@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from .activation import (ensure_local_agent_active, restart_local_agent, run_local_agent_foreground,
@@ -13,7 +14,11 @@ from .activation import (ensure_local_agent_active, restart_local_agent, run_loc
 from .agent import get_agent_status
 from .commands import cleanup, group as group_commands, logs as log_commands, task as task_commands
 from .doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
-from .layout import clear_context, load_context, load_root_config, save_context
+from .layout import clear_context, load_context, load_root_config, migrate_schema5_to_schema6, save_context
+from .config_types import RootConfig
+from .lease import LeasePolicy, load_lease_policy, save_lease_policy
+from .runtime.paths import shared_paths
+from .runtime.store import iter_json, read_json
 from .machine_config import init_shared_root, load_machine_policy
 from . import observer
 
@@ -33,13 +38,23 @@ def _resolve_cfg(args: argparse.Namespace):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="qexp schema-5 experiment queue")
+    parser = argparse.ArgumentParser(description="qexp schema-6 experiment queue")
     parser.add_argument("--shared-root")
     parser.add_argument("--machine")
     parser.add_argument("--runtime-root")
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init")
     init.add_argument("--agent-mode", choices=["on_demand", "daemon"], default="on_demand")
+    migrate = commands.add_parser("migrate")
+    migrate.add_argument("--to-schema", type=int, required=True)
+    lease_policy = commands.add_parser("lease-policy")
+    lease_policy_sub = lease_policy.add_subparsers(dest="lease_policy_action", required=True)
+    lease_policy_sub.add_parser("show")
+    policy_set = lease_policy_sub.add_parser("set")
+    policy_set.add_argument("--ttl-seconds", type=int)
+    policy_set.add_argument("--renew-interval-seconds", type=float)
+    policy_set.add_argument("--max-clock-skew-seconds", type=float)
+    policy_set.add_argument("--renewal-commit-margin-seconds", type=float)
     submit = commands.add_parser("submit")
     for action in (submit,):
         action.add_argument("--task-id"); action.add_argument("--name"); action.add_argument("--group")
@@ -118,12 +133,47 @@ def main(argv: list[str] | None = None) -> int:
             _try_save_context(str(cfg.shared_root), cfg.machine_name, str(cfg.runtime_root))
             print(cfg.shared_root)
             return 0
+        if args.command == "migrate":
+            if not args.shared_root or not args.machine:
+                raise ValueError("migrate requires --shared-root and --machine.")
+            if args.to_schema != 6:
+                raise ValueError("only --to-schema 6 is supported.")
+            root = Path(args.shared_root).expanduser().resolve()
+            runtime = Path(args.runtime_root) if args.runtime_root else root.parent / ".qexp-runtime" / args.machine
+            migrate_schema5_to_schema6(RootConfig(root, root.parent, args.machine, runtime))
+            print(root)
+            return 0
         if args.command == "use":
             if args.clear: clear_context(); return 0
             if args.show: print(json.dumps(load_context() or {}, indent=2)); return 0
             if not args.use_shared_root or not args.use_machine: raise ValueError("use requires --shared-root and --machine.")
             save_context(args.use_shared_root, args.use_machine, args.use_runtime_root); return 0
         cfg = _resolve_cfg(args)
+        if args.command == "lease-policy":
+            current = load_lease_policy(cfg)
+            if args.lease_policy_action == "show":
+                print(json.dumps({"lease_policy": asdict(current)}, indent=2))
+                return 0
+            has_active_claim = any(
+                bool(data.get("task", {}).get("claim_control", {}).get("active_claim"))
+                for path in iter_json(shared_paths(cfg.shared_root)["tasks"])
+                for data in [read_json(path)]
+            )
+            if has_active_claim:
+                raise RuntimeError("lease policy cannot change while an active claim exists.")
+            values = asdict(current)
+            for field, value in {
+                "ttl_seconds": args.ttl_seconds,
+                "renew_interval_seconds": args.renew_interval_seconds,
+                "max_clock_skew_seconds": args.max_clock_skew_seconds,
+                "renewal_commit_margin_seconds": args.renewal_commit_margin_seconds,
+            }.items():
+                if value is not None:
+                    values[field] = value
+            updated = LeasePolicy(**values)
+            save_lease_policy(cfg, updated)
+            print(json.dumps({"lease_policy": values}, indent=2))
+            return 0
         if args.command == "submit":
             task_value = task_commands.submit(cfg, _command(args.argv), requested_gpus=args.gpus, task_id=args.task_id, name=args.name,
                                               group=args.group, working_dir=args.cwd, sharing_mode=args.sharing,
