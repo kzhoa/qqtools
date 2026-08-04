@@ -2,6 +2,8 @@
 
 ## v1.3.0
 
+- test: make the qexp installed-wheel release E2E provide a deterministic bounded-clock
+  observation instead of depending on the GitHub runner's chrony service
 - breaking: make qexp schema-6 runner a passive process registration/exit-observation wrapper;
   agent exclusively owns lease authority, Recovery, termination, terminal publication, and GPU release
 - fix: retain training and reservations through transient or prolonged shared-filesystem loss using
