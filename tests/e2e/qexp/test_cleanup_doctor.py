@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -63,6 +64,15 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
         wait_for(is_done, timeout=TASK_TERMINAL_TIMEOUT_SECONDS, label="failing task terminal state")
         task = jrun([*common, "task", "show", task_id], env=env)
         logs = run([*common, "logs", task_id], env=env).stdout
+        process_dir = Path(runtime_root) / "processes"
+
+        def has_exited_process() -> bool:
+            return any(
+                json.loads(path.read_text(encoding="utf-8"))["process"].get("observed_state") == "exited"
+                for path in process_dir.glob("*.json")
+            )
+
+        wait_for(has_exited_process, timeout=10, label="agent process-exit reconciliation")
         clean = jrun([*common, "clean", "--task-id", task_id], env=env)
         verify = jrun([*common, "doctor", "verify"], env=env)
 

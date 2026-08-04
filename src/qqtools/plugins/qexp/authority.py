@@ -274,3 +274,10 @@ class AuthoritySupervisor:
             task.meta["updated_at"] = utc_now()
             save_task(self.cfg, task)
         release(self.cfg.runtime_root, claim["reservation_id"], reason)
+        manifest_path = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
+        process = read_json(manifest_path).get("process", {})
+        if (process.get("task_id") == task_id and process.get("attempt_id") == attempt_id
+                and process.get("fencing_token") == token):
+            process.update({"observed_state": "exited", "observed_exit_code": code,
+                            "observed_exited_at": utc_now()})
+            atomic_replace(manifest_path, {"process": process})
