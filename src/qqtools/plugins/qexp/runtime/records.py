@@ -1,4 +1,4 @@
-"""Validated records for the schema-5 qexp runtime."""
+"""Validated records for the schema-6 qexp runtime."""
 from __future__ import annotations
 
 import hashlib
@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 MACHINE_PATTERN = TASK_ID_PATTERN
 GROUP_PATTERN = TASK_ID_PATTERN

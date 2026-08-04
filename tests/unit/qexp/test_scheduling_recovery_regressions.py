@@ -4,6 +4,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent import _offer_due_tasks, _reconcile_reservations
+from qqtools.plugins.qexp.authority import AuthoritySupervisor
 from qqtools.plugins.qexp.commands.group import (change_worker, group_control,
                                                 reconcile_group_cancel_operations,
                                                 show_group)
@@ -38,17 +39,18 @@ class FakeChild:
         return 0
 
 
-def test_scheduler_leaves_final_launch_gate_to_runner(tmp_path: Path):
+def test_scheduler_commits_launch_gate_before_starting_runner(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     executor = RecordingExecutor()
     run_dispatch_cycle(cfg, available_gpus=[0], executor=executor)
     stored = load_task(cfg, task.task_id)
-    assert stored.claim_control["active_claim"]["launch_state"] == "claimed"
+    assert stored.claim_control["active_claim"]["launch_state"] == "starting"
     assert executor.attempts
     attempt = executor.attempts[0]
     assert run_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token,
                        popen_factory=lambda *args, **kwargs: FakeChild()) == 0
+    AuthoritySupervisor(cfg).tick()
     assert load_task(cfg, task.task_id).state["projection"] == "succeeded"
 
 

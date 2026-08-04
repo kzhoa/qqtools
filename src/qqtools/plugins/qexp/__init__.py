@@ -1,4 +1,4 @@
-"""qexp public package surface for schema 5."""
+"""qexp public package surface for schema 6."""
 from .commands.cleanup import clean
 from .commands.logs import get_log_path, read_logs, tail_log
 from .commands.task import batch_submit, cancel, offer, retry, submit

@@ -8,6 +8,7 @@ def shared_paths(root: Path) -> dict[str, Path]:
     return {
         "schema": root / "schema",
         "project": root / "project",
+        "lease_policy": root / "project" / "lease-policy.json",
         "groups": root / "groups",
         "tasks": root / "tasks",
         "attempts": root / "attempts",
@@ -32,7 +33,15 @@ def local_paths(root: Path) -> dict[str, Path]:
         "active": root / "reservations" / "active",
         "released": root / "reservations" / "released",
         "processes": root / "processes",
+        "registrations": root / "process-registrations",
+        "observations": root / "process-observations",
+        "launch_intents": root / "launch-intents",
         "wrappers": root / "wrappers",
+        "authority_diagnostics": root / "authority-diagnostics",
+        "events": root / "events",
+        "clock_health": root / "agent" / "clock-health.json",
+        "lease_policy_cache": root / "agent" / "lease-policy.json",
+        "termination_decisions": root / "termination-decisions",
         "locks": root / "locks",
     }
 
@@ -68,6 +77,10 @@ def lock_path(root: Path, kind: str, identifier: str | None = None) -> Path:
     if kind not in {"groups", "tasks"} or identifier is None:
         raise ValueError("kind must be schema, groups, or tasks with an identifier.")
     return base / kind / f"{identifier}.lock"
+
+
+def attempt_control_lock_path(root: Path, attempt_id: str) -> Path:
+    return local_paths(root)["locks"] / "attempt-control" / f"{attempt_id}.lock"
 
 
 def shared_log_path(root: Path, task_id: str, attempt_id: str) -> Path:

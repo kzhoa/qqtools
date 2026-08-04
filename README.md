@@ -139,6 +139,53 @@ qexp agent status
 qexp agent stop
 ```
 
+### Schema 6 operation
+
+qexp schema 6 uses the Group, Task, and Attempt runtime. Batch-era roots are not
+compatible. A drained schema-5 root can be upgraded only when it has no active claim or
+running Attempt:
+
+```bash
+qexp migrate --shared-root /path/to/project/.qexp --machine gpu1 --to-schema 6
+```
+
+The agent owns lease renewal, Recovery, termination, terminal publication, and GPU
+reservation release. The runner only starts the training process and writes local process
+registration and exit-observation records. Inspect or change the shared lease policy only
+while no active claim exists:
+
+```bash
+qexp lease-policy show
+qexp lease-policy set --ttl-seconds 180 --renew-interval-seconds 10
+qexp doctor verify
+```
+
+For normal task and cleanup workflows:
+
+```bash
+qexp submit --group sweep -- python train.py --config a.yaml
+qexp batch-submit --group sweep --file runs.yaml
+qexp group pause sweep
+qexp task retry TASK_ID
+qexp task retry TASK_ID --acknowledge-duplicate-risk
+qexp clean --task-id TASK_ID --dry-run
+qexp clean --older-than-days 30 --limit 100
+```
+
+During a shared-filesystem outage, the owning agent retains the training process and GPU
+reservation in `suspect` and then `isolated` state; it does not create a replacement Attempt
+or impose an automatic kill deadline. When shared authority becomes available again, the agent
+renews the same claim, recovers the same orphaned Attempt with a new token, or terminates the
+old process through its durable termination-decision path if authority changed.
+
+Cleanup waits for required machines to acknowledge removal of matching local GPU reservations,
+process manifests, and logs before deleting shared Task and Attempt records. Required machines
+are the Task home machine, historical Attempt machines, and the machine that prepared cleanup.
+Pending operations report `waiting_ack` and the remaining machine names. Cleanup blocks retry,
+claim, cancel, and offer, and its tombstone permanently reserves the Task ID.
+
+`batch-submit` is only a bulk-input command and does not create a public Batch identity.
+
 Python API:
 
 ```python
@@ -231,26 +278,3 @@ Under `src/qqtools/plugins/`, there are also:
 ```bash
 tox
 ```
-# qexp schema-5
-
-qexp now uses the breaking Experiment Group, Task, and Attempt runtime. Initialize a
-fresh `.qexp` root; existing Batch-era roots are rejected rather than migrated.
-
-```bash
-qexp init --shared-root /path/to/project/.qexp --machine gpu1
-qexp submit --group sweep -- python train.py --config a.yaml
-qexp batch-submit --group sweep --file runs.yaml
-qexp group pause sweep
-qexp task retry TASK_ID
-qexp task retry TASK_ID --acknowledge-duplicate-risk
-qexp clean --task-id TASK_ID --dry-run
-qexp clean --older-than-days 30 --limit 100
-```
-
-Cleanup waits for required machines to acknowledge removal of matching local GPU reservations,
-process manifests, and logs before deleting shared Task and Attempt records. Required machines
-are the Task home machine, historical Attempt machines, and the machine that prepared cleanup.
-Pending operations report `waiting_ack` and the remaining machine names. Cleanup blocks retry,
-claim, cancel, and offer, and its tombstone permanently reserves the Task ID.
-
-`batch-submit` is only a bulk-input command and does not create a public Batch identity.

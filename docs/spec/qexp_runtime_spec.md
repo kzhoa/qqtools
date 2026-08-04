@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-07-29
+updated_at: 2026-08-04
 archived_at:
 ---
 
@@ -27,8 +27,10 @@ User-facing concepts, command names, and product behavior belong in
 [qexp_product_spec.md](qexp_product_spec.md). This runtime spec may reference canonical
 commands to identify a transition, but it must not define a competing CLI surface.
 
-The rationale and delivery sequence are recorded in
-[qexp-experiment-group-task-scheduling.md](../pitch/qexp-experiment-group-task-scheduling.md).
+The Group/Task/Attempt model rationale and delivery history are recorded in
+[021-qexp-experiment-group-task-scheduling.md](../pitch/arxiv/021-qexp-experiment-group-task-scheduling.md).
+The schema-6 authority ownership delivery history is recorded in
+[027-qexp-agent-owned-authority.md](../pitch/arxiv/027-qexp-agent-owned-authority.md).
 
 Where documents overlap:
 
@@ -38,19 +40,19 @@ Where documents overlap:
 
 ## 2. Status and Cutover
 
-This is the target runtime contract. The installed implementation may still use the old
-Batch and fixed-machine layout until the new schema is implemented.
-
-The transition is intentionally destructive:
+This is the installed schema-6 runtime contract. The Batch-era transition was intentionally
+destructive:
 
 - no Batch-era truth is read or migrated
-- no old Task, Batch, retry-lineage, index, claim, or operation record is imported
+- no Batch-era Task, retry-lineage, index, claim, or operation record is imported
 - no mixed-schema runtime is supported
 - no legacy reader or compatibility repair path is provided
 - an unsupported `.qexp` schema fails before any agent or mutating command starts
-- users initialize a fresh control root for the new runtime
+- a drained schema-5 root may be upgraded with `qexp migrate --to-schema 6`; migration
+  rejects any root with an active claim or running Attempt
 
-Loss of access to old scheduling metadata is a known and accepted product risk.
+Loss of Batch-era scheduling metadata is a known and accepted product risk. The schema-5 to
+schema-6 migration is a one-way control-root upgrade, not a legacy reader or repair path.
 
 ## 3. Deployment Model
 
@@ -791,6 +793,18 @@ This manifest is machine-local recovery evidence. PID identity requires both the
 the Linux `/proc/<pid>/stat` start-time ticks to match. It does not supersede the shared
 Task fencing token.
 
+Before `Popen`, the runner writes an immutable `launch-intents/<attempt-id>.json` containing
+the Attempt/token, wrapper PID/start-time, GPU assignment, command and lease expiry. On Linux,
+the runner starts a private-session guardian, which owns the training process group and receives
+a parent-death notification if the runner dies. The guardian then sends `SIGKILL` to its entire
+process group, covering the training leader and descendants that remain in that group. The immutable
+`process-registrations/<attempt-id>.json` is still written immediately after creation. If an
+agent recovers an intent whose wrapper identity is absent but which has no registration, it
+materializes only a `launch_unverifiable` manifest, retains the reservation, and records a
+local diagnostic. It must not automatically release, recover, retry, or signal that Attempt.
+Programs that explicitly leave the guardian process group (`setsid()` / `setpgid()`) are outside
+this guarantee and require cgroup-level containment to govern.
+
 Reconciliation distinguishes three outcomes:
 
 - matching identity with a live process permits Recovery CAS
@@ -1111,13 +1125,13 @@ A plain read followed by process creation is invalid.
 
 ### 13.5 Process Creation
 
-After launch authorization, the agent:
-
-1. creates the local wrapper/process under the assigned GPUs
-2. persists the local process manifest with the fencing token
-3. updates Task active claim to `running`
-4. updates Attempt to `running` with process references
-5. begins lease renewal and process reconciliation
+After launch authorization, the agent starts a passive runner. The runner writes its immutable
+launch intent, creates the guardian-owned training process under the assigned GPUs, writes one
+immutable local process registration, and later writes a separate exit observation. The agent
+materializes the mutable local process manifest from that registration and exclusively owns all
+authority transitions. It then renews the lease and reconciles process state; only the agent may
+publish shared running or terminal truth, perform Recovery, release the reservation, or issue a
+qexp signal.
 
 If local process creation fails, the Attempt becomes failed and claim and reservation are
 released idempotently.
@@ -1158,6 +1172,29 @@ The owning agent renews before expiry by presenting:
 
 Renewal updates Task active claim and Attempt lease idempotently. A mismatched token,
 Attempt, machine, or agent authority is rejected.
+
+Schema-6 renewal returns a tagged outcome rather than a boolean. `renewed`,
+`retryable_error`, `authority_changed`, `orphaned_recovery_required`, and
+`termination_requested` have distinct required handling. A retryable error enters local
+`suspect`, retains the reservation, records a durable diagnostic event, and retries only
+before the holder safe deadline. It is not evidence that the token changed.
+
+The agent caches every successfully validated lease policy in local storage. If the shared
+policy or Task root cannot be read, it continues local process supervision and writes an
+`authority-diagnostics/<attempt-id>.json` event. It uses the cached policy and last known
+lease expiry to move from `suspect` to `isolated`; without a cached deadline it remains
+`suspect`. Shared I/O failures are non-fatal to the agent loop and never authorize a signal,
+reservation release, Recovery, or replacement Attempt.
+
+The shared lease policy is stored at `project/lease-policy.json`. The default is a 120
+second TTL, 10 second normal renewal interval, bounded jittered retry, 1 second maximum
+clock skew and 5 second renewal commit margin. Holders stop ordinary work at
+`lease_expires_at - max_clock_skew_seconds`; reclaimers wait until
+`lease_expires_at + max_clock_skew_seconds`. The authority gate requires healthy chrony
+tracking. `lease_loss_action` is fixed to `isolate`. A retryable renewal failure enters
+`suspect`; after the holder safe deadline it enters `isolated`, retains its GPU reservation, and
+continues the training process without publishing new shared qexp state. Isolation has no
+automatic kill deadline; explicit authority changes use durable termination.
 
 Machine heartbeat and Attempt lease are distinct:
 
@@ -1230,7 +1267,27 @@ Success:
 Failure means the local process is obsolete or no longer permitted to resume authority.
 The agent must terminate or quarantine it and must not publish scheduler truth.
 
-### 15.5 Other Return Cases
+Before any Recovery CAS, agent and doctor acquire the local per-Attempt control lock and inspect
+durable termination decisions. Runner never performs Recovery. A decision with shared commitment
+`committed` or `unavailable`, or local state `signal_committed` or later, rejects Recovery.
+
+### 15.5 Durable Termination
+
+Every qexp-initiated signal has a local durable decision under
+`termination-decisions/<attempt-id>/<decision-id>.json`. Its irreversible sequence is
+`pending -> signal_committed -> sigterm_sent -> sigkill_sent -> confirmed`.
+
+Only agent or a doctor holding the local Attempt control lock may issue a qexp signal. The runner's
+`wait()` result is an exit observation only; it never confirms a termination decision. `confirmed`
+is written only after the recorded PGID and start-time identity is absent. For normal authority
+loss, the Task lock first commits `termination_decision_id` and token;
+Recovery CAS then rejects that Attempt. When authority is unavailable after the holder
+safe deadline, qexp fsyncs `shared_commitment=unavailable` before `signal_committed` and
+the signal. This local exception prevents an unsafe local recovery and is reconciled by
+`decision_id` after shared storage returns. A process exit caused by this path records its
+lease termination reason and must not become `process_exited_without_status`.
+
+### 15.6 Other Return Cases
 
 - finished process: for a grouped Task acquire Group then Task lock, use a
   recovery-finalize CAS with the same no-successor and token preconditions, publish the
@@ -1309,11 +1366,15 @@ they differ only in whether true idleness ends the agent process.
 
 Before claiming new work, an agent:
 
-1. acquires its local lifecycle lock
-2. reconciles local process manifests
-3. reconciles provisional and active reservations
-4. compares every local token with shared Task truth
-5. terminates or quarantines obsolete local processes
+1. acquires its local lifecycle lock and scans launch intents, immutable process registrations,
+   and exit observations
+2. materializes missing agent-owned manifests; a dead wrapper with no registration becomes
+   `launch_unverifiable`, retains its reservation, and remains isolated for manual verification
+3. scans unfinished termination decisions and, under each Attempt control lock, replays signals
+   or confirms recorded process-group identity absence
+4. validates shared authority for every remaining local Attempt, then renews, recovers,
+   finalizes, or isolates it as its durable evidence permits
+5. reconciles provisional and active reservations after authority work completes
 6. publishes fresh agent and GPU snapshots
 7. starts normal claim scanning
 

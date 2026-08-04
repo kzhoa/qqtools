@@ -7,8 +7,10 @@ from typing import Any
 
 from .config_types import RootConfig
 from .runtime.paths import local_paths, machine_path, shared_log_path, shared_paths
+from .runtime.locks import schema_lock
 from .runtime.records import SCHEMA_VERSION, utc_now
 from .runtime.store import atomic_replace, read_json
+from .lease import default_lease_policy_document
 
 
 def _schema_path(cfg: RootConfig) -> Path:
@@ -50,14 +52,19 @@ def validate_root_contract(cfg: RootConfig) -> None:
 
 def ensure_shared_layout(cfg: RootConfig) -> None:
     paths = shared_paths(cfg.shared_root)
-    for path in paths.values():
+    for name, path in paths.items():
+        if name == "lease_policy":
+            continue
         path.mkdir(parents=True, exist_ok=True)
     (paths["locks"] / "groups").mkdir(exist_ok=True)
     (paths["locks"] / "tasks").mkdir(exist_ok=True)
 
 
 def ensure_machine_layout(cfg: RootConfig) -> None:
-    for path in local_paths(cfg.runtime_root).values():
+    paths = local_paths(cfg.runtime_root)
+    for name, path in paths.items():
+        if name in {"clock_health", "lease_policy_cache"}:
+            continue
         path.mkdir(parents=True, exist_ok=True)
     machine_dir = shared_paths(cfg.shared_root)["machines"] / cfg.machine_name
     for name in ("state", "events"):
@@ -79,6 +86,45 @@ def initialize_shared_root(cfg: RootConfig) -> None:
     if not identity_path.exists():
         atomic_replace(identity_path, {"project": {"project_id": project_id(cfg.shared_root),
                                                      "shared_root": str(cfg.shared_root)}})
+    policy_path = shared_paths(cfg.shared_root)["lease_policy"]
+    if not policy_path.exists():
+        atomic_replace(policy_path, default_lease_policy_document())
+
+
+def migrate_schema5_to_schema6(cfg: RootConfig) -> None:
+    """Hard-cut a drained schema-5 root to schema-6 lease semantics."""
+    with schema_lock(cfg.shared_root):
+        _migrate_schema5_to_schema6_locked(cfg)
+
+
+def _migrate_schema5_to_schema6_locked(cfg: RootConfig) -> None:
+    path = _schema_path(cfg)
+    if not path.exists():
+        raise RuntimeError("qexp root is uninitialized; cannot migrate.")
+    version = read_json(path).get("schema", {}).get("version")
+    if version == SCHEMA_VERSION:
+        validate_root_contract(cfg)
+        return
+    if version != 5:
+        raise RuntimeError(f"schema migration supports only schema 5, got {version!r}.")
+    for task_path in shared_paths(cfg.shared_root)["tasks"].glob("*.json"):
+        task = read_json(task_path).get("task", {})
+        if task.get("claim_control", {}).get("active_claim") or task.get("state", {}).get("projection") == "running":
+            raise RuntimeError("schema-6 migration requires no active claims or running Attempts.")
+    ensure_shared_layout(cfg)
+    ensure_machine_layout(cfg)
+    policy_path = shared_paths(cfg.shared_root)["lease_policy"]
+    if not policy_path.exists():
+        atomic_replace(policy_path, default_lease_policy_document())
+    for record_path in cfg.shared_root.rglob("*.json"):
+        if record_path == path or record_path == policy_path:
+            continue
+        record = read_json(record_path)
+        if isinstance(record.get("meta"), dict):
+            record["meta"]["schema_version"] = SCHEMA_VERSION
+            atomic_replace(record_path, record)
+    atomic_replace(path, {"schema": {"name": "qexp-runtime", "version": SCHEMA_VERSION,
+                                      "minimum_reader_version": SCHEMA_VERSION, "created_at": utc_now()}})
 
 
 def load_machine_record(cfg: RootConfig) -> dict[str, Any] | None:

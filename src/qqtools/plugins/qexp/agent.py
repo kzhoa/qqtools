@@ -10,6 +10,7 @@ import uuid
 from typing import Any
 
 from .executor import Executor
+from .events import flush_local_events
 from .config_types import RootConfig
 from .layout import runtime_pid_path
 from .machine_config import load_machine_policy
@@ -26,6 +27,7 @@ from .runtime.placement import offer_due
 from .runtime.store import iter_json
 from .runtime.tasks import load_task
 from .scheduler import reconcile_running_tasks, run_dispatch_cycle
+from .authority import AuthoritySupervisor
 
 
 def _runtime_pid_value(pid_path) -> int:
@@ -83,6 +85,8 @@ def run_agent_loop(cfg: RootConfig, *, exit_when_idle: bool = True, loop_interva
     pid = _runtime_pid_value(pid_path)
     pid_path.write_text(str(pid), encoding="utf-8")
     executor = executor or Executor()
+    authority = AuthoritySupervisor(cfg)
+    authority.recover_startup()
     idle_since = time.monotonic()
     idle_since_at = utc_now()
     started_at = utc_now()
@@ -91,11 +95,14 @@ def run_agent_loop(cfg: RootConfig, *, exit_when_idle: bool = True, loop_interva
     stop_reason = "stopped"
     visible_gpu_ids: list[int] = []
     reserved_gpu_ids_value: set[int] = set()
-    publish_machine_snapshots(
-        cfg, instance_id=instance_id, pid=pid, agent_mode=policy.agent_mode,
-        observed_state="active", active_attempt_ids=[], visible_gpu_ids=[], reserved_gpu_ids=[],
-        heartbeat_interval_seconds=loop_interval, started_at=started_at, idle_since_at=idle_since_at,
-    )
+    try:
+        publish_machine_snapshots(
+            cfg, instance_id=instance_id, pid=pid, agent_mode=policy.agent_mode,
+            observed_state="active", active_attempt_ids=[], visible_gpu_ids=[], reserved_gpu_ids=[],
+            heartbeat_interval_seconds=loop_interval, started_at=started_at, idle_since_at=idle_since_at,
+        )
+    except OSError:
+        pass
     previous_sigterm_handler = None
 
     def handle_sigterm(_signal_number: int, _frame: object) -> None:
@@ -109,35 +116,40 @@ def run_agent_loop(cfg: RootConfig, *, exit_when_idle: bool = True, loop_interva
         pass
     try:
         while True:
-            reconcile_claim_archives(cfg)
-            release_expired_provisionals(cfg.runtime_root)
-            _reconcile_reservations(cfg)
-            reconcile_running_tasks(cfg, executor=executor)
-            reconcile_group_cancel_operations(cfg)
-            reconcile_cleanup_operations(cfg)
-            _offer_due_tasks(cfg)
-            visible_gpu_ids = available_gpus if available_gpus is not None else _visible_gpus(cfg)
-            reserved_before_dispatch = reserved_gpu_ids(cfg.runtime_root)
-            free = [gpu for gpu in visible_gpu_ids if gpu not in reserved_before_dispatch]
-            launched = run_dispatch_cycle(cfg, available_gpus=free, executor=executor)
-            reservations = active_reservations(cfg.runtime_root)
-            reserved_gpu_ids_value = {
-                gpu_id for reservation in reservations for gpu_id in reservation.get("gpu_ids", [])
-            }
-            attempts = [reservation.get("attempt_id") for reservation in reservations]
-            active_attempt_ids = [attempt_id for attempt_id in attempts if isinstance(attempt_id, str)]
-            observed_state = "active" if reserved_gpu_ids_value else "idle"
-            if observed_state == "active":
-                idle_since_at = None
-            elif idle_since_at is None:
-                idle_since_at = utc_now()
-            publish_machine_snapshots(
-                cfg, instance_id=instance_id, pid=pid, agent_mode=policy.agent_mode,
-                observed_state=observed_state, active_attempt_ids=active_attempt_ids,
-                visible_gpu_ids=visible_gpu_ids, reserved_gpu_ids=reserved_gpu_ids_value,
-                heartbeat_interval_seconds=loop_interval, started_at=started_at,
-                idle_since_at=idle_since_at,
-            )
+            authority.tick()
+            try:
+                flush_local_events(cfg)
+                reconcile_claim_archives(cfg)
+                release_expired_provisionals(cfg.runtime_root)
+                _reconcile_reservations(cfg)
+                reconcile_group_cancel_operations(cfg)
+                reconcile_cleanup_operations(cfg)
+                _offer_due_tasks(cfg)
+                visible_gpu_ids = available_gpus if available_gpus is not None else _visible_gpus(cfg)
+                reserved_before_dispatch = reserved_gpu_ids(cfg.runtime_root)
+                free = [gpu for gpu in visible_gpu_ids if gpu not in reserved_before_dispatch]
+                launched = run_dispatch_cycle(cfg, available_gpus=free, executor=executor)
+                reservations = active_reservations(cfg.runtime_root)
+                reserved_gpu_ids_value = {
+                    gpu_id for reservation in reservations for gpu_id in reservation.get("gpu_ids", [])
+                }
+                attempts = [reservation.get("attempt_id") for reservation in reservations]
+                active_attempt_ids = [attempt_id for attempt_id in attempts if isinstance(attempt_id, str)]
+                observed_state = "active" if reserved_gpu_ids_value else "idle"
+                if observed_state == "active":
+                    idle_since_at = None
+                elif idle_since_at is None:
+                    idle_since_at = utc_now()
+                publish_machine_snapshots(
+                    cfg, instance_id=instance_id, pid=pid, agent_mode=policy.agent_mode,
+                    observed_state=observed_state, active_attempt_ids=active_attempt_ids,
+                    visible_gpu_ids=visible_gpu_ids, reserved_gpu_ids=reserved_gpu_ids_value,
+                    heartbeat_interval_seconds=loop_interval, started_at=started_at,
+                    idle_since_at=idle_since_at,
+                )
+            except OSError:
+                time.sleep(loop_interval)
+                continue
             if launched or reserved_before_dispatch:
                 idle_since = time.monotonic()
             elif exit_when_idle and time.monotonic() - idle_since >= idle_timeout:
@@ -145,13 +157,16 @@ def run_agent_loop(cfg: RootConfig, *, exit_when_idle: bool = True, loop_interva
                 break
             time.sleep(loop_interval)
     finally:
-        publish_machine_stop_snapshot(
-            cfg, instance_id=instance_id, pid=None, agent_mode=policy.agent_mode,
-            visible_gpu_ids=visible_gpu_ids,
-            reserved_gpu_ids=reserved_gpu_ids_value,
-            heartbeat_interval_seconds=loop_interval, started_at=started_at, idle_since_at=idle_since_at,
-            stop_reason=stop_reason,
-        )
+        try:
+            publish_machine_stop_snapshot(
+                cfg, instance_id=instance_id, pid=None, agent_mode=policy.agent_mode,
+                visible_gpu_ids=visible_gpu_ids,
+                reserved_gpu_ids=reserved_gpu_ids_value,
+                heartbeat_interval_seconds=loop_interval, started_at=started_at, idle_since_at=idle_since_at,
+                stop_reason=stop_reason,
+            )
+        except OSError:
+            pass
         pid_path.unlink(missing_ok=True)
         if previous_sigterm_handler is not None:
             signal.signal(signal.SIGTERM, previous_sigterm_handler)
