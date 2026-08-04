@@ -24,11 +24,25 @@ def ensure_site_packages_import() -> str:
 def make_env(base: Path) -> dict[str, str]:
     home = base / "home"
     home.mkdir(parents=True, exist_ok=True)
+    bin_dir = base / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    chronyc = bin_dir / "chronyc"
+    chronyc.write_text(
+        "#!/bin/sh\n"
+        "cat <<'EOF'\n"
+        "System time     : 0.000001 seconds fast of NTP time\n"
+        "Root dispersion : 0.000001 seconds\n"
+        "Leap status     : Normal\n"
+        "EOF\n",
+        encoding="utf-8",
+    )
+    chronyc.chmod(0o755)
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     env["HOME"] = str(home)
     env["MPLCONFIGDIR"] = str(base / "mplconfig")
     env["QEXP_VISIBLE_GPUS"] = "0"
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
     return env
 
 
