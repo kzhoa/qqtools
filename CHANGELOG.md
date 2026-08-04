@@ -1,6 +1,6 @@
 # History
 
-## Unreleased
+## v1.3.0
 
 - breaking: make qexp schema-6 runner a passive process registration/exit-observation wrapper;
   agent exclusively owns lease authority, Recovery, termination, terminal publication, and GPU release
