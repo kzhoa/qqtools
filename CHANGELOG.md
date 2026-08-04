@@ -2,6 +2,8 @@
 
 ## v1.3.0
 
+- fix: mark qexp agent-owned local process manifests exited after terminal publication so
+  cleanup does not retain finished Attempts as running processes
 - test: make the qexp installed-wheel release E2E provide a deterministic bounded-clock
   observation instead of depending on the GitHub runner's chrony service
 - breaking: make qexp schema-6 runner a passive process registration/exit-observation wrapper;
