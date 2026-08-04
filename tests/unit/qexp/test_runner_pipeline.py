@@ -93,6 +93,9 @@ def test_read_logs_uses_attempt_log_written_by_runner(tmp_path: Path, monkeypatc
     archive = json.loads(archive_path.read_text(encoding="utf-8"))["claim_archive"]
     assert archive["reason"] == "completed"
     assert archive["claim"]["attempt_id"] == attempt.attempt_id
+    manifest = read_json(cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json")["process"]
+    assert manifest["observed_state"] == "exited"
+    assert manifest["observed_exit_code"] == 0
 
 
 def test_read_logs_prefers_persisted_attempt_log_reference(tmp_path: Path):
