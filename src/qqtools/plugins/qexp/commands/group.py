@@ -8,7 +8,7 @@ from ..config_types import RootConfig
 from ..runtime.claims import archive_claim
 from ..runtime.locks import group_lock, task_lock
 from ..runtime.paths import attempt_path, group_path, shared_paths
-from ..runtime.records import (AttemptRecord, TaskRecord, new_group, new_id,
+from ..runtime.records import (AttemptRecord, SCHEMA_VERSION, TaskRecord, new_group, new_id,
                                new_worker_member, utc_now, validate_group_name)
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.tasks import load_task, save_task
@@ -29,7 +29,7 @@ def group_control(cfg: RootConfig, name: str, action: str, *, terminate_running:
             operation_id = new_id()
             high_watermark = group["next_membership_sequence"] - 1
             operation_path = shared_paths(cfg.shared_root)["group_control"] / f"{operation_id}.json"
-            operation = {"meta": {"schema_version": 5, "revision": 1, "created_at": utc_now(),
+            operation = {"meta": {"schema_version": SCHEMA_VERSION, "revision": 1, "created_at": utc_now(),
                 "updated_at": utc_now(), "updated_by": {"actor_type": "cli", "machine_name": cfg.machine_name,
                 "process_id": str(os.getpid())}}, "group_control": {"operation_id": operation_id,
                 "operation_type": "cancel", "group_name": name, "state": "preparing",
@@ -267,7 +267,7 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
             data["meta"]["updated_at"] = utc_now()
             atomic_replace(path, data)
             operation_path = shared_paths(cfg.shared_root)["group_control"] / f"{operation_id}.json"
-            operation = {"meta": {"schema_version": 5, "revision": 1, "created_at": utc_now(),
+            operation = {"meta": {"schema_version": SCHEMA_VERSION, "revision": 1, "created_at": utc_now(),
                 "updated_at": utc_now(), "updated_by": {"actor_type": "cli", "machine_name": cfg.machine_name,
                 "process_id": str(os.getpid())}}, "group_control": {"operation_id": operation_id,
                 "operation_type": "worker_remove", "group_name": group_name, "machine_name": machine,

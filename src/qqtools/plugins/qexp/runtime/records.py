@@ -22,6 +22,7 @@ GROUP_ADMISSION_STATES = ("open", "sealed")
 GROUP_DISPATCH_STATES = ("active", "paused")
 WORKER_STATES = ("active", "draining", "removing")
 SUBMISSION_STATES = ("preparing", "committing", "committed", "aborted", "blocked")
+AUTHORITY_MODES = ("bounded_lease", "holder_bound", "legacy_migrated")
 
 
 def utc_now() -> str:
@@ -111,11 +112,37 @@ class TaskRecord:
             raise ValueError("task sharing_mode is invalid.")
         if self.placement_policy["sharing_mode"] == "private" and self.placement_runtime["queue_scope"] == "shared":
             raise ValueError("private tasks cannot enter the shared queue.")
+        proof = self.placement_runtime.get("offer_clock_evidence")
+        if proof is not None:
+            required = {"creator_observation", "deadline_monotonic_at"}
+            observation_fields = {
+                "observation_id", "provider", "observed_at", "monotonic_observed_at", "boot_id",
+                "lower_error_seconds", "upper_error_seconds", "max_drift_rate", "provider_margin_seconds",
+            }
+            observation = proof.get("creator_observation") if isinstance(proof, dict) else None
+            if (not isinstance(proof, dict) or set(proof) != required or not isinstance(observation, dict)
+                    or set(observation) != observation_fields
+                    or not isinstance(proof["deadline_monotonic_at"], (int, float))):
+                raise ValueError("timed offer clock proof is invalid.")
+        claim = self.claim_control.get("active_claim")
+        if claim is not None:
+            if not isinstance(claim, dict) or claim.get("authority_mode") not in {
+                    "bounded_lease", "holder_bound"}:
+                raise ValueError("active claim authority mode is invalid.")
+            if claim["authority_mode"] == "bounded_lease":
+                required = {"clock_error_bound_seconds", "clock_provider", "clock_observation_id", "lease_expires_at"}
+                if not required.issubset(claim):
+                    raise ValueError("bounded lease claim lacks clock evidence.")
+            elif any(claim.get(key) is not None for key in (
+                    "clock_error_bound_seconds", "clock_provider", "clock_observation_id", "lease_expires_at")):
+                raise ValueError("holder-bound claim cannot contain lease evidence.")
 
     @classmethod
     def new(cls, *, task_id: str, machine: str, spec: TaskSpec, group_name: str | None = None,
             name: str | None = None, sharing_mode: str = "private", fallback_machines: str | list[str] = "group",
-            offer_after_seconds: int | None = None, operation_id: str | None = None) -> "TaskRecord":
+            offer_after_seconds: int | None = None, offer_eligible_at: str | None = None,
+            offer_clock_evidence: dict[str, Any] | None = None,
+            operation_id: str | None = None) -> "TaskRecord":
         validate_identifier(task_id, "task_id")
         validate_identifier(machine, "machine_name")
         validate_group_name(group_name)
@@ -123,19 +150,24 @@ class TaskRecord:
             raise ValueError("ungrouped tasks must use private placement.")
         if sharing_mode not in SHARING_MODES:
             raise ValueError("sharing_mode must be 'private' or 'spillover'.")
+        if offer_after_seconds is not None and sharing_mode != "spillover":
+            raise ValueError("offer_after_seconds requires spillover placement.")
         now = utc_now()
-        offer_eligible_at = None
         if offer_after_seconds is not None:
             if not isinstance(offer_after_seconds, int) or offer_after_seconds < 0:
                 raise ValueError("offer_after_seconds must be a non-negative integer or null.")
-            offer_eligible_at = (datetime.now(timezone.utc) + timedelta(seconds=offer_after_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            if not isinstance(offer_eligible_at, str) or offer_clock_evidence is None:
+                raise ValueError("timed offer requires a deadline and qualified clock proof.")
+        elif offer_eligible_at is not None or offer_clock_evidence is not None:
+            raise ValueError("only timed offers may contain clock proof data.")
         return cls(
             task_id=task_id, group_name=group_name, group_membership_sequence=None,
             submission_operation_id=operation_id, name=name, spec=spec,
             placement_policy={"home_machine": machine, "sharing_mode": sharing_mode,
                               "fallback_constraint": fallback_machines, "offer_after_seconds": offer_after_seconds},
             placement_runtime={"queue_scope": "home", "queued_home_at": now,
-                               "offer_eligible_at": offer_eligible_at, "offered_at": None, "offer_reason": None, "offered_by": None},
+                               "offer_eligible_at": offer_eligible_at, "offer_clock_evidence": offer_clock_evidence,
+                               "offered_at": None, "offer_reason": None, "offered_by": None},
             state={"projection": "queued", "reason": None},
             control={"cancellation_requested_at": None, "cancellation_operation_id": None,
                      "terminate_running": False, "requested_by": None, "termination_acknowledged_at": None,
@@ -156,14 +188,11 @@ class TaskRecord:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskRecord":
         task = data["task"]
-        control = task["control"]
-        control.setdefault("cleanup_operation_id", None)
-        control.setdefault("cleanup_state", None)
         return cls(meta=data["meta"], task_id=task["task_id"], group_name=task.get("group_name"),
                    group_membership_sequence=task.get("group_membership_sequence"),
                    submission_operation_id=task.get("submission_operation_id"), name=task.get("name"),
                    spec=TaskSpec(**task["spec"]), placement_policy=task["placement_policy"],
-                   placement_runtime=task["placement_runtime"], state=task["state"], control=control,
+                   placement_runtime=task["placement_runtime"], state=task["state"], control=task["control"],
                    attempt_control=task["attempt_control"], claim_control=task["claim_control"])
 
 
@@ -179,6 +208,7 @@ class AttemptRecord:
     current_fencing_token: int
     token_history: list[int]
     lease: dict[str, Any]
+    authority_mode: str
     authorization: dict[str, Any]
     process: dict[str, Any]
     termination: dict[str, Any]
@@ -192,17 +222,24 @@ class AttemptRecord:
         validate_identifier(self.machine_name, "machine_name")
         if self.phase not in ATTEMPT_PHASES:
             raise ValueError("attempt phase is invalid.")
+        if self.authority_mode not in AUTHORITY_MODES:
+            raise ValueError("attempt authority mode is invalid.")
+        if self.authority_mode == "legacy_migrated" and self.phase in {
+                "claimed", "starting", "running", "orphaned"}:
+            raise ValueError("legacy-migrated attempts cannot retain execution authority.")
         _check_meta(self.meta)
 
     @classmethod
     def claimed(cls, task: TaskRecord, machine: str, gpus: list[int], reservation_id: str, token: int,
+                *, authority_mode: str, clock_evidence: dict[str, Any] | None,
                 lease_seconds: int = 60, attempt_id: str | None = None) -> "AttemptRecord":
         attempt_id = attempt_id or new_id()
         now = utc_now()
-        expires = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        expires = None if authority_mode == "holder_bound" else (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         return cls(attempt_id, task.task_id, task.attempt_control["next_attempt_number"], "claimed", machine,
                    list(gpus), reservation_id, token, [token], {"claimed_at": now, "renewed_at": now,
-                   "expires_at": expires}, {"group_name": task.group_name, "group_dispatch_epoch": None,
+                   "expires_at": expires, "clock_evidence": clock_evidence}, authority_mode,
+                   {"group_name": task.group_name, "group_dispatch_epoch": None,
                    "group_worker_set_epoch": None}, {"wrapper_pid": None, "process_group_id": None,
                    "tmux_reference": None, "local_process_manifest": "", "log_references": []},
                    {"requested_by_operation_id": None, "requested_at": None, "acknowledged_at": None,
@@ -214,12 +251,13 @@ class AttemptRecord:
     def to_dict(self) -> dict[str, Any]:
         values = {key: getattr(self, key) for key in ("attempt_id", "task_id", "attempt_number", "phase",
                  "machine_name", "assigned_gpus", "reservation_id", "current_fencing_token", "token_history",
-                 "lease", "authorization", "process", "termination", "timestamps", "result")}
+                 "lease", "authority_mode", "authorization", "process", "termination", "timestamps", "result")}
         return {"meta": self.meta, "attempt": values}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AttemptRecord":
-        return cls(meta=data["meta"], **data["attempt"])
+        value = dict(data["attempt"])
+        return cls(meta=data["meta"], **value)
 
 
 def new_group(name: str, machine: str) -> dict[str, Any]:

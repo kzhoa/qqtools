@@ -15,6 +15,7 @@ from .runtime.records import AttemptRecord, TaskRecord, utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.termination import list_decisions
 from .runtime.tasks import load_task
+from .lease import clock_capability
 
 
 def _cleaned_task_ids(cfg: RootConfig) -> set[str]:
@@ -78,6 +79,7 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
         elif cleanup.get("state") == "completed" and task_exists:
             _issue(issues, "cleanup_completed_task_present", cleanup_path, "critical")
     checked = 0
+    capability = clock_capability(cfg)
     for path in iter_json(paths["tasks"]):
         checked += 1
         try:
@@ -102,6 +104,17 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
             claim = task.claim_control.get("active_claim") or {}
             number = task.attempt_control.get("current_attempt_number")
             if claim:
+                mode = claim.get("authority_mode")
+                if mode not in {"bounded_lease", "holder_bound"}:
+                    _issue(issues, "authority_mode_evidence_invalid", path, "critical")
+                if mode == "bounded_lease":
+                    required_evidence = {"clock_error_bound_seconds", "clock_provider", "clock_observation_id", "lease_expires_at"}
+                    if not required_evidence.issubset(claim) or not isinstance(
+                            claim.get("clock_error_bound_seconds"), (int, float)):
+                        _issue(issues, "authority_mode_evidence_invalid", path, "critical")
+                if mode == "holder_bound" and any(claim.get(key) is not None for key in (
+                        "clock_error_bound_seconds", "clock_provider", "clock_observation_id", "lease_expires_at")):
+                    _issue(issues, "authority_mode_evidence_invalid", path, "critical")
                 if number is None:
                     _issue(issues, "claim_attempt_number_missing", path, "critical")
                 else:
@@ -111,8 +124,11 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
                     else:
                         attempt = AttemptRecord.from_dict(read_json(attempt_file))
                         if (attempt.attempt_id != claim.get("attempt_id")
-                                or attempt.current_fencing_token != claim.get("fencing_token")):
+                                or attempt.current_fencing_token != claim.get("fencing_token")
+                                or attempt.authority_mode != mode):
                             _issue(issues, "claim_attempt_token_mismatch", attempt_file, "critical")
+                        if mode == "holder_bound" and attempt.machine_name != claim.get("machine_name"):
+                            _issue(issues, "holder_bound_machine_mismatch", attempt_file, "critical")
                 try:
                     expires_at = datetime.fromisoformat(
                         claim["lease_expires_at"].replace("Z", "+00:00")
@@ -229,6 +245,11 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
             _issue(issues, "process_manifest_attempt_mismatch", manifest_path, "critical")
         if process.get("fencing_token") not in attempt.token_history:
             _issue(issues, "process_manifest_token_unknown", manifest_path, "critical")
+        claim = task.claim_control.get("active_claim") or {}
+        if (claim.get("authority_mode") == "holder_bound"
+                and (process.get("machine_name") != claim.get("machine_name")
+                     or attempt.machine_name != claim.get("machine_name"))):
+            _issue(issues, "holder_bound_machine_mismatch", manifest_path, "critical")
         from .scheduler import _process_evidence_state
         evidence_state = _process_evidence_state(attempt, process)
         if evidence_state in {"mismatch", "unverifiable"}:
@@ -242,7 +263,11 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
                 _issue(issues, "termination_decision_incomplete", decision_path, "high")
         except (OSError, ValueError):
             _issue(issues, "termination_decision_invalid", decision_path, "high")
-    return {"schema_version": 6, "tasks_checked": checked, "issues": issues, "healthy": not issues}
+    return {"schema_version": 6, "tasks_checked": checked, "issues": issues, "healthy": not issues,
+            "clock_capability": {"status": capability.status, "reason": capability.reason,
+                                 "provider": capability.observation.provider if capability.observation else None,
+                                 "observation_id": capability.observation.observation_id if capability.observation else None,
+                                 "scheduling_capability": "full" if capability.is_healthy else "local-safe"}}
 
 
 def repair_metadata(cfg: RootConfig) -> dict[str, Any]:

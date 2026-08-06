@@ -1,11 +1,34 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-04
+updated_at: 2026-08-06
 archived_at:
 ---
 
 # qexp Runtime Spec
+
+## Schema 6 clock-capability authority contract
+
+This section supersedes prior chrony-only, single-skew lease, and bare wall-clock offer rules.
+Each authority operation obtains a provider observation with a conservative UTC error interval,
+monotonic observation age, drift bound, provider margin, and immutable ID. Chrony and Linux
+`adjtimex(2)` are the supported providers; configured priority selects one only after all
+qualifying provider intervals overlap. Missing, stale, over-limit, or conflicting evidence is
+fail-closed for cross-machine time authority.
+
+Active claims and Attempts explicitly record `authority_mode`. `bounded_lease` persists holder
+clock evidence and permits reclaim only at `expiry + holder_bound + reclaimer_bound`.
+`holder_bound` has null lease evidence, can only be supervised or restarted by its holder
+machine with matching process identity, and never expires, enters remote Recovery, or receives
+an automatic successor. Timed offers persist the complete creator observation and the creator
+monotonic instant corresponding to their deadline; the home agent projects that evidence through
+its drift bound, then commits only when its current UTC lower bound reaches the resulting deadline
+upper bound. The proof and transition are revalidated under the Task authority lock. User-driven
+share and offer are not elapsed-time authority operations.
+
+Schema-5 cutover is fully drained, backed up and fsynced before final schema-6 configuration is
+staged; the schema version replacement is the commit point. Old roots are not runtime-readable
+after cutover.
 
 ## 1. Purpose and Authority
 

@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import re
 from dataclasses import asdict
 from pathlib import Path
 
@@ -54,6 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
     policy_set.add_argument("--ttl-seconds", type=int)
     policy_set.add_argument("--renew-interval-seconds", type=float)
     policy_set.add_argument("--max-clock-skew-seconds", type=float)
+    policy_set.add_argument("--clock-observation-max-age-seconds", type=float)
+    policy_set.add_argument("--clock-provider-margin-seconds", type=float)
+    policy_set.add_argument("--clock-provider-priority")
     policy_set.add_argument("--renewal-commit-margin-seconds", type=float)
     submit = commands.add_parser("submit")
     for action in (submit,):
@@ -71,6 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
     retry = task_sub.add_parser("retry"); retry.add_argument("task_id")
     retry.add_argument("--acknowledge-duplicate-risk", action="store_true")
     offer = task_sub.add_parser("offer"); offer.add_argument("task_id")
+    share = task_sub.add_parser("share"); share.add_argument("task_id")
+    share.add_argument("--after"); share.add_argument("--with", dest="helper_machines", action="append")
+    keep_local = task_sub.add_parser("keep-local"); keep_local.add_argument("task_id")
     listing = task_sub.add_parser("list"); listing.add_argument("--phase"); listing.add_argument("--group"); listing.add_argument("--limit", type=int, default=50)
     show = task_sub.add_parser("show"); show.add_argument("task_id")
     logs = task_sub.add_parser("logs"); logs.add_argument("task_id")
@@ -111,6 +118,14 @@ def _command(argv: list[str]) -> list[str]:
     if not argv:
         raise ValueError("submit requires a command after '--'.")
     return argv
+
+
+def _duration_seconds(value: str) -> int:
+    matched = re.fullmatch(r"([0-9]+)([smh])", value)
+    if not matched:
+        raise ValueError("duration must use an explicit s, m, or h unit, for example 10m.")
+    amount = int(matched.group(1))
+    return amount * {"s": 1, "m": 60, "h": 3600}[matched.group(2)]
 
 
 def _try_save_context(shared_root: str, machine: str, runtime_root: str | None) -> None:
@@ -166,10 +181,16 @@ def main(argv: list[str] | None = None) -> int:
                 "ttl_seconds": args.ttl_seconds,
                 "renew_interval_seconds": args.renew_interval_seconds,
                 "max_clock_skew_seconds": args.max_clock_skew_seconds,
+                "clock_observation_max_age_seconds": args.clock_observation_max_age_seconds,
+                "clock_provider_margin_seconds": args.clock_provider_margin_seconds,
                 "renewal_commit_margin_seconds": args.renewal_commit_margin_seconds,
             }.items():
                 if value is not None:
                     values[field] = value
+            if args.clock_provider_priority is not None:
+                values["clock_provider_priority"] = tuple(
+                    item.strip() for item in args.clock_provider_priority.split(",") if item.strip()
+                )
             updated = LeasePolicy(**values)
             save_lease_policy(cfg, updated)
             print(json.dumps({"lease_policy": values}, indent=2))
@@ -215,6 +236,17 @@ def main(argv: list[str] | None = None) -> int:
             elif args.task_action == "offer":
                 task_value = task_commands.offer(cfg, args.task_id)
                 ensure_local_agent_active(cfg, reason="task-offer")
+                print(task_value.task_id)
+            elif args.task_action == "share":
+                after_seconds = _duration_seconds(args.after) if args.after is not None else None
+                task_value = task_commands.share(
+                    cfg, args.task_id, after_seconds=after_seconds, helper_machines=args.helper_machines
+                )
+                ensure_local_agent_active(cfg, reason="task-share")
+                print(task_value.task_id)
+            elif args.task_action == "keep-local":
+                task_value = task_commands.keep_local(cfg, args.task_id)
+                ensure_local_agent_active(cfg, reason="task-keep-local")
                 print(task_value.task_id)
             elif args.task_action == "list": print(json.dumps(observer.list_tasks(cfg, phase=args.phase, group=args.group, limit=args.limit)))
             elif args.task_action == "show": print(json.dumps(observer.inspect_task(cfg, args.task_id), indent=2))

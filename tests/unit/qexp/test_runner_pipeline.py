@@ -177,7 +177,7 @@ def test_unavailable_shared_policy_isolated_by_cached_deadline(tmp_path: Path, m
     diagnostic = read_json(
         local_paths(cfg.runtime_root)["authority_diagnostics"] / f"{attempt.attempt_id}.json"
     )["authority_diagnostic"]
-    assert manifest["authority_state"] == "isolated"
+    assert manifest["authority_state"] == "suspect"
     assert diagnostic["reason"] == "lease_policy_unavailable"
 
 

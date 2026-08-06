@@ -33,7 +33,13 @@ def _attempt() -> AttemptRecord:
                 "claimed_at": "2026-07-24T00:00:00Z",
                 "renewed_at": "2026-07-24T00:00:00Z",
                 "expires_at": "2026-07-24T00:01:00Z",
+                "clock_evidence": {
+                    "clock_error_bound_seconds": 0.1,
+                    "clock_provider": "chrony",
+                    "clock_observation_id": "test-observation",
+                },
             },
+            "authority_mode": "bounded_lease",
             "authorization": {"group_name": None, "group_dispatch_epoch": None, "group_worker_set_epoch": None},
             "process": {
                 "wrapper_pid": None,

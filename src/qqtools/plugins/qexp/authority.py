@@ -100,9 +100,14 @@ class AuthoritySupervisor:
         attempt_id = process.get("attempt_id")
         if not isinstance(attempt_id, str):
             return
+        if process.get("authority_mode") == "holder_bound":
+            self._set_authority_state(process, "local_safe")
+            return
         policy = self._policy
         expires = self._lease_expiries.get(attempt_id) or process.get("lease_expires_at")
-        if policy and isinstance(expires, str) and datetime.now(timezone.utc) >= holder_safe_deadline(expires, policy):
+        holder_bound = process.get("clock_error_bound_seconds")
+        if (policy and isinstance(expires, str) and isinstance(holder_bound, (int, float))
+                and datetime.now(timezone.utc) >= holder_safe_deadline(expires, holder_bound)):
             self._set_authority_state(process, "isolated")
         else:
             self._set_authority_state(process, "suspect")
@@ -195,6 +200,9 @@ class AuthoritySupervisor:
             return
         self._last_renewal[attempt_id] = now
         renewal = renew_attempt_lease(self.cfg, task_id, attempt_id, token)
+        if renewal.outcome is LeaseRenewalOutcome.NOT_REQUIRED:
+            self._set_authority_state(process, "local_safe")
+            return
         if renewal.outcome is LeaseRenewalOutcome.RENEWED:
             self._failures[attempt_id] = 0
             if renewal.lease_expires_at:
@@ -204,7 +212,9 @@ class AuthoritySupervisor:
         if renewal.outcome is LeaseRenewalOutcome.RETRYABLE_ERROR:
             self._failures[attempt_id] = self._failures.get(attempt_id, 0) + 1
             expires = renewal.lease_expires_at or self._lease_expiries.get(attempt_id) or process.get("lease_expires_at")
-            if isinstance(expires, str) and datetime.now(timezone.utc) >= holder_safe_deadline(expires, policy):
+            holder_bound = process.get("clock_error_bound_seconds")
+            if (isinstance(expires, str) and isinstance(holder_bound, (int, float))
+                    and datetime.now(timezone.utc) >= holder_safe_deadline(expires, holder_bound)):
                 self._set_authority_state(process, "isolated")
             else:
                 self._set_authority_state(process, "suspect")

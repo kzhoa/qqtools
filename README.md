@@ -160,6 +160,17 @@ qexp lease-policy set --ttl-seconds 180 --renew-interval-seconds 10
 qexp doctor verify
 ```
 
+Schema 6 detects clock capability instead of requiring `chronyc` on every host. A qualified
+provider permits full bounded-lease coordination; otherwise eligible work runs in holder-bound
+local-safe mode and is never expired, remotely recovered, or automatically replaced. `qexp
+doctor verify` and `qexp agent status` expose the provider, authority mode, and blocker.
+
+```bash
+qexp task share TASK_ID
+qexp task share TASK_ID --after 10m --with gpu-b --with gpu-c
+qexp task keep-local TASK_ID
+```
+
 For normal task and cleanup workflows:
 
 ```bash

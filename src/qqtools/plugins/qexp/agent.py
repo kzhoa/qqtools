@@ -28,6 +28,7 @@ from .runtime.store import iter_json
 from .runtime.tasks import load_task
 from .scheduler import reconcile_running_tasks, run_dispatch_cycle
 from .authority import AuthoritySupervisor
+from .lease import clock_capability
 
 
 def _runtime_pid_value(pid_path) -> int:
@@ -48,8 +49,12 @@ def get_agent_status(cfg: RootConfig, probe_local_pid: bool = True) -> dict[str,
     except (OSError, ValueError):
         pid = None
     running = bool(pid and (not probe_local_pid or _pid_alive(pid)))
+    capability = clock_capability(cfg)
     return {"machine_name": cfg.machine_name, "agent_state": "active" if running else "stopped",
-            "pid": pid, "is_running": running}
+            "pid": pid, "is_running": running, "clock_capability": capability.status,
+            "clock_reason": capability.reason,
+            "clock_provider": capability.observation.provider if capability.observation else None,
+            "scheduling_capability": "full" if capability.is_healthy else "local-safe"}
 
 
 def _pid_alive(pid: int) -> bool:
