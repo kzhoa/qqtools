@@ -476,11 +476,18 @@ Defaults:
 - `group.name` in a manifest is invalid rather than a second source with precedence rules
 - a manifest `group` configuration block requires `--group` and configures fields such as
   the initial or additional Worker Set
+- `group.workers` is the only manifest Worker Set input; root `workers` and
+  `defaults.placement.workers` are invalid
 - omitted `home_machine` resolves to the submitting machine
 - omitted `sharing.mode` means `private`
+- Task `placement` overlays `defaults.placement` field-by-field rather than replacing the whole
+  object
 - no Task is remotely claimable unless the user explicitly permits it
 - an ungrouped Task must remain private because no Group Worker Set exists to bound remote
   execution
+- legacy Task-level `sharing_mode`, `fallback_machines`, and `offer_after_seconds` are accepted
+  only as deprecated aliases for the nested fields; declaring both forms for the same semantic
+  field is invalid
 
 `home_machine` expresses first refusal. It must not create an execution claim at
 submission time.
