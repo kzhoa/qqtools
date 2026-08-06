@@ -11,6 +11,7 @@ from .paths import group_path, idempotency_path, shared_paths, submission_path, 
 from .records import (TaskRecord, TaskSpec, new_group, new_id, new_submission,
                       new_worker_member, utc_now)
 from .store import atomic_replace, create_if_absent, read_json
+from .availability import remove_deadline_index, sync_deadline_index
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
 
 
@@ -155,6 +156,7 @@ def submit_specs(cfg: Any, specs: list[dict[str, Any]], *, group_name: str | Non
                     if current.submission_operation_id != operation_id or current.spec.to_dict() != TaskSpec(
                             item["command"], item["working_directory"], item["requested_gpus"]).to_dict():
                         raise ValueError(f"Task {item['task_id']!r} already exists with different truth.")
+                    sync_deadline_index(cfg, current)
                     staged.append(current)
                     continue
                 task = TaskRecord.new(task_id=item["task_id"], machine=item["home_machine"],
@@ -166,6 +168,7 @@ def submit_specs(cfg: Any, specs: list[dict[str, Any]], *, group_name: str | Non
                     operation_id=operation_id)
                 task.group_membership_sequence = sequence
                 atomic_replace(path, task.to_dict())
+                sync_deadline_index(cfg, task)
                 staged.append(task)
             if group_name:
                 with group_lock(cfg.shared_root, group_name):
@@ -198,7 +201,15 @@ def submit_specs(cfg: Any, specs: list[dict[str, Any]], *, group_name: str | Non
                             group["meta"]["revision"] += 1
                             group["meta"]["updated_at"] = utc_now()
                             atomic_replace(group_file, group)
-            for task in staged:
-                if task.submission_operation_id == operation_id:
-                    task_path(cfg.shared_root, task.task_id).unlink(missing_ok=True)
+            for item in operation["submission"]["resolved_context"].get("task_specs", []):
+                task_id = item["task_id"]
+                path = task_path(cfg.shared_root, task_id)
+                try:
+                    current = TaskRecord.from_dict(read_json(path))
+                except FileNotFoundError:
+                    remove_deadline_index(cfg, task_id)
+                    continue
+                if current.submission_operation_id == operation_id:
+                    remove_deadline_index(cfg, task_id)
+                    path.unlink(missing_ok=True)
             raise

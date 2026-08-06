@@ -7,6 +7,7 @@ from typing import Any
 from .commands.cleanup import reconcile_cleanup_operations
 from .commands.group import reconcile_group_cancel_operations
 from .config_types import RootConfig
+from .runtime.availability import rebuild_deadline_indexes, reconcile_availability_operations
 from .runtime.claims import archive_claim
 from .layout import validate_root_contract
 from .runtime.locks import group_lock, task_lock
@@ -63,6 +64,18 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
     )
     group_records = _records_by_stem(paths["groups"], "group", issues, "group_invalid")
     groups = {name: {"group": group} for name, group in group_records.items()}
+    deadline_task_ids: set[str] = set()
+    for deadline_path in iter_json(paths["offer_deadlines"]):
+        try:
+            deadline = read_json(deadline_path).get("offer_deadline", {})
+        except (OSError, ValueError) as exc:
+            _issue(issues, "offer_deadline_index_invalid", deadline_path, "high", str(exc))
+            continue
+        task_id = deadline.get("task_id")
+        if isinstance(task_id, str):
+            deadline_task_ids.add(task_id)
+        if task_id != deadline_path.stem or not task_path(cfg.shared_root, str(task_id)).exists():
+            _issue(issues, "offer_deadline_index_stale", deadline_path, "high")
     for cleanup_path in iter_json(paths["cleanup"]):
         try:
             cleanup = read_json(cleanup_path).get("cleanup", {})
@@ -101,6 +114,12 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
                 elif task.placement_policy["home_machine"] not in group_data["group"].get(
                         "worker_set", {}):
                     _issue(issues, "task_home_outside_worker_set", path, "high")
+            has_timed_offer = bool(task.placement_runtime.get("offer_eligible_at")
+                                   and task.placement_runtime.get("offer_clock_evidence")
+                                   and task.placement_runtime.get("queue_scope") == "home"
+                                   and task.placement_policy.get("sharing_mode") == "spillover")
+            if has_timed_offer and task.task_id not in deadline_task_ids:
+                _issue(issues, "offer_deadline_index_missing", path, "high")
             claim = task.claim_control.get("active_claim") or {}
             number = task.attempt_control.get("current_attempt_number")
             if claim:
@@ -176,6 +195,21 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
         barriers = group_data["group"].get("cancellation_barriers", []) if group_data else []
         if not any(item.get("operation_id") == control.get("operation_id") for item in barriers):
             _issue(issues, "cancellation_operation_barrier_missing", operation_path, "critical")
+    for operation_path in iter_json(paths["availability"]):
+        try:
+            operation = read_json(operation_path).get("availability_operation", {})
+        except (OSError, ValueError) as exc:
+            _issue(issues, "availability_operation_invalid", operation_path, "high", str(exc))
+            continue
+        task_id = operation.get("task_id")
+        if operation.get("operation_id") != operation_path.stem or not isinstance(task_id, str):
+            _issue(issues, "availability_operation_invalid", operation_path, "high")
+            continue
+        if (operation.get("state") == "prepared"
+                or (operation.get("state") == "blocked" and not operation.get("blocked_reason"))):
+            _issue(issues, "availability_operation_incomplete", operation_path, "high")
+        if not task_path(cfg.shared_root, task_id).exists() and task_id not in cleaned:
+            _issue(issues, "availability_operation_task_missing", operation_path, "high")
     for reservation_path in iter_json(local_paths(cfg.runtime_root)["active"]):
         try:
             reservation = read_json(reservation_path)["reservation"]
@@ -299,6 +333,11 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
             repaired.append(result["operation_id"])
         else:
             blocked.append(result["operation_id"])
+    for result in reconcile_availability_operations(cfg):
+        repaired.append(result["operation_id"])
+    rebuilt_deadline_indexes = rebuild_deadline_indexes(cfg)
+    if rebuilt_deadline_indexes:
+        repaired.append(f"offer_deadline_indexes:{rebuilt_deadline_indexes}")
     group_controls = shared_paths(cfg.shared_root)["group_control"]
     for path in iter_json(group_controls):
         data = read_json(path)
@@ -448,7 +487,9 @@ def repair_orphans(cfg: RootConfig) -> dict[str, Any]:
 
 
 def rebuild_indexes(cfg: RootConfig) -> dict[str, Any]:
-    return {"rebuilt": False, "message": "Indexes are derived and are not required for truth reads."}
+    rebuilt = rebuild_deadline_indexes(cfg)
+    return {"rebuilt": bool(rebuilt), "rebuilt_records": rebuilt,
+            "message": "Derived deadline indexes rebuilt from Task truth."}
 
 
 def cleanup_stale_locks(cfg: RootConfig) -> dict[str, Any]:

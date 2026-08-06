@@ -14,6 +14,7 @@ from ..runtime.paths import group_path, local_paths, shared_paths, task_path
 from ..runtime.records import AttemptRecord, SCHEMA_VERSION, TaskRecord, new_id, utc_now
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.tasks import load_task, save_task
+from ..runtime.availability import remove_deadline_index
 
 
 def _clean_blockers(cfg: RootConfig, task: TaskRecord) -> list[str]:
@@ -139,6 +140,10 @@ def _finalize_cleanup_operation(cfg: RootConfig, operation: dict[str, Any]) -> l
     if path.exists():
         path.unlink()
         removed.append(str(path))
+    deadline_index = shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task_id}.json"
+    if deadline_index.exists():
+        remove_deadline_index(cfg, task_id)
+        removed.append(str(deadline_index))
     attempts_dir = shared_paths(cfg.shared_root)["attempts"] / task_id
     if attempts_dir.exists():
         shutil.rmtree(attempts_dir)

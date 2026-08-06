@@ -242,6 +242,8 @@ The target layout is:
   operations/
     submissions/
       <operation-id>.json
+    availability/
+      <operation-id>.json
     group-control/
       <operation-id>.json
     cleanup/
@@ -1028,14 +1030,44 @@ active claim. It acquires Group then Task lock and validates:
 - changing private to spillover is explicit user intent
 - an agent-initiated transition changes queue scope only and never broadens policy
 
-Rehoming resets queue scope to home and recomputes `queued_home_at` and
-`offer_eligible_at`. An active Attempt rejects placement mutation; any future-Attempt
-override requires a separate product contract.
+All queued availability changes use the same durable operation path:
+
+1. write `operations/availability/<operation-id>.json` in `prepared` state
+2. acquire Group then Task lock, or only Task lock for standalone idempotent `keep-local`
+3. re-read Task truth and validate submission, projection, claim, cleanup, cancellation, Group,
+   home worker, and helper worker state
+4. commit at most one Task revision when policy or queue scope changes
+5. write deterministic `task_availability_changed` audit event
+6. update or remove `indexes/offer-deadlines/<task-id>.json`
+7. mark the operation `completed`
+
+If Task truth is committed but audit or index writing is interrupted, the operation remains
+replayable. Agent startup and `qexp doctor repair` reconcile incomplete availability operations
+and rebuild advisory deadline indexes from Task truth.
+
+Supported actions:
+
+- `share_now`: private or spillover policy becomes spillover, helper scope is committed, and
+  queue scope becomes shared.
+- `share_after`: policy becomes spillover but queue scope remains home until a bounded deadline
+  is proven elapsed.
+- `keep_local`: policy becomes private, queue scope becomes home, and delayed offer state is
+  cleared.
+- `manual_offer`: queue scope becomes shared only when policy is already spillover.
+- `elapsed_offer`: queue scope becomes shared only when creator/evaluator clock evidence proves
+  the persisted deadline elapsed.
+
+An active Attempt rejects placement mutation; any future-Attempt override requires a separate
+product contract.
 
 ## 12. Offer Protocol
 
 The first release supports exactly:
 
+- `qexp task share <task-id>`
+- `qexp task share <task-id> --after <duration>`
+- `qexp task share <task-id> --with <machine>`
+- `qexp task keep-local <task-id>`
 - `qexp task offer <task-id>`
 - persisted `after_seconds` eligibility
 
@@ -1064,8 +1096,9 @@ acquires the Task lock and validates authoritative Task truth:
 - manual request is authorized or current time is at/after `offer_eligible_at`
 
 The winning transition sets queue scope to shared and records reason, actor, and time.
-Repeated offers succeed idempotently. A concurrent claim changes Task revision and causes
-the offer CAS to fail.
+Repeated offers succeed idempotently without increasing Task revision. A concurrent claim,
+cancel, cleanup, worker drain, share, keep-local, manual offer, or elapsed offer linearizes
+through the same Task lock and only one state change can win.
 
 Heartbeat staleness does not bypass `after_seconds` in the first release. Automatic
 overload and heartbeat-based early offering require separate future contracts.

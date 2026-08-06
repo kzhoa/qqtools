@@ -20,6 +20,8 @@ from .runtime.claims import reconcile_claim_archives
 from .commands.cleanup import reconcile_cleanup_operations
 from .commands.group import reconcile_group_cancel_operations
 from .commands.task import offer
+from .runtime.availability import (elapsed_offer_is_proven, reconcile_availability_operations,
+                                   remove_deadline_index, sync_deadline_index)
 from .runtime.paths import attempt_path, shared_paths
 from .runtime.records import AttemptRecord, utc_now
 from .runtime.store import read_json
@@ -129,6 +131,7 @@ def run_agent_loop(cfg: RootConfig, *, exit_when_idle: bool = True, loop_interva
                 _reconcile_reservations(cfg)
                 reconcile_group_cancel_operations(cfg)
                 reconcile_cleanup_operations(cfg)
+                reconcile_availability_operations(cfg)
                 _offer_due_tasks(cfg)
                 visible_gpu_ids = available_gpus if available_gpus is not None else _visible_gpus(cfg)
                 reserved_before_dispatch = reserved_gpu_ids(cfg.runtime_root)
@@ -203,9 +206,24 @@ def _reconcile_reservations(cfg: RootConfig) -> None:
 
 
 def _offer_due_tasks(cfg: RootConfig) -> None:
-    for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
-        task = load_task(cfg, path.stem)
+    seen: set[str] = set()
+    candidate_paths = list(iter_json(shared_paths(cfg.shared_root)["offer_deadlines"]))
+    candidate_paths.extend(iter_json(shared_paths(cfg.shared_root)["tasks"]))
+    for path in candidate_paths:
+        task_id = path.stem
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        try:
+            task = load_task(cfg, task_id)
+        except FileNotFoundError:
+            if path.parent == shared_paths(cfg.shared_root)["offer_deadlines"]:
+                remove_deadline_index(cfg, task_id)
+            continue
+        sync_deadline_index(cfg, task)
         if task.placement_policy["home_machine"] != cfg.machine_name or not offer_due(task):
+            continue
+        if not elapsed_offer_is_proven(cfg, task):
             continue
         try:
             offer(cfg, task.task_id, reason="elapsed")

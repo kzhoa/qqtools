@@ -75,9 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
     retry = task_sub.add_parser("retry"); retry.add_argument("task_id")
     retry.add_argument("--acknowledge-duplicate-risk", action="store_true")
     offer = task_sub.add_parser("offer"); offer.add_argument("task_id")
+    offer.add_argument("--format", choices=["text", "json"], default="text")
     share = task_sub.add_parser("share"); share.add_argument("task_id")
     share.add_argument("--after"); share.add_argument("--with", dest="helper_machines", action="append")
+    share.add_argument("--format", choices=["text", "json"], default="text")
     keep_local = task_sub.add_parser("keep-local"); keep_local.add_argument("task_id")
+    keep_local.add_argument("--format", choices=["text", "json"], default="text")
     listing = task_sub.add_parser("list"); listing.add_argument("--phase"); listing.add_argument("--group"); listing.add_argument("--limit", type=int, default=50)
     show = task_sub.add_parser("show"); show.add_argument("task_id")
     logs = task_sub.add_parser("logs"); logs.add_argument("task_id")
@@ -137,6 +140,15 @@ def _try_save_context(shared_root: str, machine: str, runtime_root: str | None) 
             f"at {exc.filename or '~/.qqtools/qexp-context.json'}: {exc}",
             file=sys.stderr,
         )
+
+
+def _print_availability_result(result: Any, output_format: str) -> None:
+    if output_format == "json":
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        print(result.message)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -234,20 +246,20 @@ def main(argv: list[str] | None = None) -> int:
                 ensure_local_agent_active(cfg, reason="task-retry")
                 print(task_value.task_id)
             elif args.task_action == "offer":
-                task_value = task_commands.offer(cfg, args.task_id)
+                result = task_commands.offer(cfg, args.task_id)
                 ensure_local_agent_active(cfg, reason="task-offer")
-                print(task_value.task_id)
+                _print_availability_result(result, args.format)
             elif args.task_action == "share":
                 after_seconds = _duration_seconds(args.after) if args.after is not None else None
-                task_value = task_commands.share(
+                result = task_commands.share(
                     cfg, args.task_id, after_seconds=after_seconds, helper_machines=args.helper_machines
                 )
                 ensure_local_agent_active(cfg, reason="task-share")
-                print(task_value.task_id)
+                _print_availability_result(result, args.format)
             elif args.task_action == "keep-local":
-                task_value = task_commands.keep_local(cfg, args.task_id)
+                result = task_commands.keep_local(cfg, args.task_id)
                 ensure_local_agent_active(cfg, reason="task-keep-local")
-                print(task_value.task_id)
+                _print_availability_result(result, args.format)
             elif args.task_action == "list": print(json.dumps(observer.list_tasks(cfg, phase=args.phase, group=args.group, limit=args.limit)))
             elif args.task_action == "show": print(json.dumps(observer.inspect_task(cfg, args.task_id), indent=2))
             elif args.task_action == "logs": print(log_commands.read_logs(cfg, args.task_id), end="")
