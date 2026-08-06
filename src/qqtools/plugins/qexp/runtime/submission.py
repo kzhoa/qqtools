@@ -11,6 +11,7 @@ from .paths import group_path, idempotency_path, shared_paths, submission_path, 
 from .records import (TaskRecord, TaskSpec, new_group, new_id, new_submission,
                       new_worker_member, utc_now)
 from .store import atomic_replace, create_if_absent, read_json
+from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
 
 
 class IdempotencyConflict(ValueError):
@@ -78,6 +79,20 @@ def submit_specs(cfg: Any, specs: list[dict[str, Any]], *, group_name: str | Non
             resolved = submission["resolved_context"]["task_specs"]
         else:
             resolved = _resolved_specs(specs, cfg.machine_name)
+            if any(item["offer_after_seconds"] is not None for item in resolved):
+                capability = clock_capability(cfg)
+                if not capability.is_healthy or capability.observation is None:
+                    raise ValueError(
+                        "timed offer requires a healthy clock capability; use an immediate share instead."
+                    )
+                persist_clock_observation(cfg, capability.observation)
+                for item in resolved:
+                    if item["offer_after_seconds"] is not None:
+                        deadline, proof = new_timed_offer_proof(
+                            capability.observation, item["offer_after_seconds"]
+                        )
+                        item["offer_eligible_at"] = deadline
+                        item["offer_clock_evidence"] = proof
             _reject_cleanup_tombstones(cfg, resolved)
             context = {"task_ids": [item["task_id"] for item in resolved], "task_specs": resolved,
                        "create_group": bool(group_name), "worker_set_additions": list(worker_set or []),
@@ -146,6 +161,8 @@ def submit_specs(cfg: Any, specs: list[dict[str, Any]], *, group_name: str | Non
                     spec=TaskSpec(item["command"], item["working_directory"], item["requested_gpus"]),
                     group_name=group_name, name=item["name"], sharing_mode=item["sharing_mode"],
                     fallback_machines=item["fallback_machines"], offer_after_seconds=item["offer_after_seconds"],
+                    offer_eligible_at=item.get("offer_eligible_at"),
+                    offer_clock_evidence=item.get("offer_clock_evidence"),
                     operation_id=operation_id)
                 task.group_membership_sequence = sequence
                 atomic_replace(path, task.to_dict())

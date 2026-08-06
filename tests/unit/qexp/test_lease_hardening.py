@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.lease import (LeasePolicy, LeaseRenewalOutcome, chrony_health,
-                                        load_lease_policy, save_lease_policy)
+from qqtools.plugins.qexp.lease import (ClockCapability, LeasePolicy, LeaseRenewalOutcome,
+                                        chrony_health, load_lease_policy, save_lease_policy)
 from qqtools.plugins.qexp.layout import load_root_config, migrate_schema5_to_schema6
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -47,30 +47,23 @@ def test_local_irreversible_commitment_blocks_recovery(tmp_path: Path):
 def test_chrony_health_rejects_large_offset():
     class Completed:
         returncode = 0
-        stdout = "System time     : 2.0 seconds slow of NTP time\nRoot dispersion : 0.1 seconds\nLeap status     : Normal\n"
+        stdout = ("System time     : 2.0 seconds slow of NTP time\nRoot delay      : 0.1 seconds\n"
+                  "Root dispersion : 0.1 seconds\nSkew            : 0.01 ppm\nLeap status     : Normal\n")
 
-    assert chrony_health(LeasePolicy(), run=lambda *_args, **_kwargs: Completed()) == (False, "chrony_offset_exceeds_policy")
+    assert chrony_health(LeasePolicy(), run=lambda *_args, **_kwargs: Completed()) == (False, "chrony_error_bound_exceeds_policy")
 
 
-def test_clock_gate_blocks_claim_renewal_recovery_and_expiry(tmp_path: Path, monkeypatch):
+def test_unqualified_clock_creates_local_safe_claim_and_blocks_expiry(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler.authority_clock_health",
-                        lambda *_args: (False, "chrony_unavailable"))
-    assert claim_task(cfg, task.task_id, [0]) is None
-
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler.authority_clock_health",
-                        lambda *_args: (True, "healthy"))
+    monkeypatch.setattr("qqtools.plugins.qexp.scheduler.clock_capability",
+                        lambda *_args: ClockCapability("unavailable", "no_qualified_provider"))
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler.authority_clock_health",
-                        lambda *_args: (False, "chrony_unavailable"))
+    assert attempt.authority_mode == "holder_bound"
     renewal = renew_attempt_lease(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert renewal.outcome is LeaseRenewalOutcome.RETRYABLE_ERROR
-    assert renewal.error and renewal.error.error_type == "ClockHealthError"
+    assert renewal.outcome is LeaseRenewalOutcome.NOT_REQUIRED
     assert not expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    monkeypatch.setattr("qqtools.plugins.qexp.runtime.recovery.authority_clock_health",
-                        lambda *_args: (False, "chrony_unavailable"))
     assert recover_running_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token) is None
 
 
@@ -223,3 +216,47 @@ def test_schema5_migration_rejects_active_claim(tmp_path: Path):
     atomic_replace(schema, value)
     with pytest.raises(RuntimeError, match="requires no active claims"):
         migrate_schema5_to_schema6(cfg)
+
+
+def test_schema5_migration_recovers_after_source_is_parked(tmp_path: Path, monkeypatch):
+    import qqtools.plugins.qexp.layout as layout
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    task_file = cfg.shared_root / "tasks" / f"{task.task_id}.json"
+    legacy_task = read_json(task_file)
+    legacy_task["meta"]["schema_version"] = 5
+    legacy_task["task"]["control"].pop("cleanup_operation_id")
+    legacy_task["task"]["control"].pop("cleanup_state")
+    legacy_task["task"]["placement_runtime"].pop("offer_clock_evidence")
+    atomic_replace(task_file, legacy_task)
+    schema = cfg.shared_root / "schema" / "version.json"
+    value = read_json(schema)
+    value["schema"].update({"version": 5, "minimum_reader_version": 5})
+    atomic_replace(schema, value)
+
+    original_rename = layout.os.rename
+    is_crash_injected = False
+
+    def crash_after_parking(source, destination):
+        nonlocal is_crash_injected
+        if source.name == ".qexp" and ".schema6-stage-" in str(source.parent):
+            is_crash_injected = True
+            raise OSError("simulated crash before staged-root promotion")
+        return original_rename(source, destination)
+
+    monkeypatch.setattr(layout.os, "rename", crash_after_parking)
+    with pytest.raises(OSError, match="simulated crash"):
+        migrate_schema5_to_schema6(cfg)
+    assert is_crash_injected
+    assert not cfg.shared_root.exists()
+
+    monkeypatch.setattr(layout.os, "rename", original_rename)
+    migrate_schema5_to_schema6(cfg)
+    upgraded = load_root_config(cfg.shared_root, "g1", cfg.runtime_root, require_initialized=True)
+    restored = read_json(upgraded.shared_root / "tasks" / f"{task.task_id}.json")
+    assert restored["meta"]["schema_version"] == 6
+    assert restored["task"]["control"]["cleanup_operation_id"] is None
+    backup = next(tmp_path.glob(".qexp.schema5-backup-*"))
+    original = read_json(backup / "tasks" / f"{task.task_id}.json")
+    assert original == legacy_task

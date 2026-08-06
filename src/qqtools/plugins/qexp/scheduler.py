@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .events import write_diagnostic_event, write_event
-from .lease import (AuthorityResolution, AuthorityResolutionOutcome, LeaseFailureDetails,
-                    LeaseRenewalOutcome, LeaseRenewalResult, authority_clock_health, lease_expiry,
-                    load_lease_policy, reclaim_allowed_at)
+from .lease import (AuthorityResolution, AuthorityResolutionOutcome, ClockObservation,
+                    LeaseFailureDetails, LeaseRenewalOutcome, LeaseRenewalResult, clock_capability,
+                    lease_expiry, load_lease_policy, persist_clock_observation, reclaim_allowed_at)
 from .executor import Executor
 from .config_types import RootConfig
 from .runtime.locks import group_lock, task_lock
@@ -163,7 +163,13 @@ def _eligible(cfg: RootConfig, task: TaskRecord) -> bool:
     return group_file.exists() and _group_allows(read_json(group_file), task, cfg.machine_name)
 
 
-def _claim(cfg: RootConfig, task_id: str, reservation: dict[str, Any], *, lease_seconds: int) -> AttemptRecord | None:
+def _clock_evidence(observation: ClockObservation) -> dict[str, Any]:
+    return {"clock_error_bound_seconds": observation.bound_at(time.monotonic()),
+            "provider": observation.provider, "observation_id": observation.observation_id}
+
+
+def _claim(cfg: RootConfig, task_id: str, reservation: dict[str, Any], *, lease_seconds: int,
+           authority_mode: str, clock_evidence: dict[str, Any] | None) -> AttemptRecord | None:
     task = load_task(cfg, task_id)
     if not _eligible(cfg, task):
         return None
@@ -176,11 +182,16 @@ def _claim(cfg: RootConfig, task_id: str, reservation: dict[str, Any], *, lease_
         token = task.claim_control["fencing_epoch"] + 1
         attempt = AttemptRecord.claimed(task, cfg.machine_name, reservation["reservation"]["gpu_ids"],
                                         reservation["reservation"]["reservation_id"], token,
+                                        authority_mode=authority_mode, clock_evidence=clock_evidence,
                                         lease_seconds=lease_seconds, attempt_id=attempt_id)
         claim = {"claim_id": attempt_id, "attempt_id": attempt_id, "attempt_number": attempt_number,
                  "machine_name": cfg.machine_name, "reservation_id": attempt.reservation_id,
                  "queue_origin": task.placement_runtime["queue_scope"], "fencing_token": token,
-                 "claimed_at": utc_now(), "lease_expires_at": attempt.lease["expires_at"],
+                 "claimed_at": utc_now(), "authority_mode": authority_mode,
+                 "clock_error_bound_seconds": (clock_evidence or {}).get("clock_error_bound_seconds"),
+                 "clock_provider": (clock_evidence or {}).get("provider"),
+                 "clock_observation_id": (clock_evidence or {}).get("observation_id"),
+                 "lease_expires_at": attempt.lease["expires_at"],
                  "launch_state": "claimed", "launch_authorized_at": None,
                  "group_dispatch_epoch": None, "group_worker_set_epoch": None}
         if task.group_name:
@@ -226,13 +237,18 @@ def _release_claim_locked(cfg: RootConfig, task: TaskRecord, token: int, reason:
 def claim_task(cfg: RootConfig, task_id: str, assigned_gpus: list[int], *,
                lease_seconds: int | None = None) -> AttemptRecord | None:
     policy = load_lease_policy(cfg)
-    if not authority_clock_health(cfg, policy)[0]:
-        return None
+    capability = clock_capability(cfg, policy)
+    authority_mode = "bounded_lease" if capability.is_healthy else "holder_bound"
+    evidence = None
+    if capability.observation:
+        persist_clock_observation(cfg, capability.observation)
+        evidence = _clock_evidence(capability.observation)
     if lease_seconds is None:
         lease_seconds = policy.ttl_seconds
     reservation = reserve(cfg.runtime_root, task_id, assigned_gpus)
     try:
-        attempt = _claim(cfg, task_id, reservation, lease_seconds=lease_seconds)
+        attempt = _claim(cfg, task_id, reservation, lease_seconds=lease_seconds,
+                         authority_mode=authority_mode, clock_evidence=evidence)
     except Exception:
         release(cfg.runtime_root, reservation["reservation"]["reservation_id"], "claim_failed")
         raise
@@ -242,12 +258,18 @@ def claim_task(cfg: RootConfig, task_id: str, assigned_gpus: list[int], *,
 
 
 def authorize_launch(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int) -> bool:
-    if not authority_clock_health(cfg)[0]:
-        return False
     task = load_task(cfg, task_id)
     with authority_locks(cfg, task):
         task = load_task(cfg, task_id)
         claim = task.claim_control.get("active_claim") or {}
+        if claim.get("machine_name") != cfg.machine_name:
+            return False
+        if claim.get("authority_mode") not in {"bounded_lease", "holder_bound"}:
+            return False
+        if claim.get("authority_mode") == "bounded_lease" and not clock_capability(cfg).is_healthy:
+            return False
+        if claim.get("authority_mode") == "holder_bound" and claim.get("machine_name") != cfg.machine_name:
+            return False
         if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
             return False
         if (shared_paths(cfg.shared_root)["cleanup"] / f"{task.task_id}.json").exists():
@@ -360,20 +382,13 @@ def renew_attempt_lease(cfg: RootConfig, task_id: str, attempt_id: str, fencing_
     """Renew an Attempt lease without collapsing errors into fencing decisions."""
     try:
         policy = load_lease_policy(cfg)
-        is_clock_healthy, clock_reason = authority_clock_health(cfg, policy)
-        if not is_clock_healthy:
-            return LeaseRenewalResult(
-                LeaseRenewalOutcome.RETRYABLE_ERROR,
-                attempt_id,
-                error=LeaseFailureDetails("ClockHealthError", clock_reason),
-            )
-        expires = lease_expiry(policy) if lease_seconds is None else (
-            datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
-        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         task = load_task(cfg, task_id)
         with authority_locks(cfg, task):
             task = load_task(cfg, task_id)
             claim = task.claim_control.get("active_claim") or {}
+            if claim.get("machine_name") != cfg.machine_name:
+                return LeaseRenewalResult(LeaseRenewalOutcome.AUTHORITY_CHANGED, attempt_id,
+                                          observed_token=claim.get("fencing_token"))
             if task.control.get("terminate_running"):
                 return LeaseRenewalResult(LeaseRenewalOutcome.TERMINATION_REQUESTED, attempt_id)
             if claim.get("termination_decision_id"):
@@ -391,8 +406,28 @@ def renew_attempt_lease(cfg: RootConfig, task_id: str, attempt_id: str, fencing_
             if attempt.current_fencing_token != fencing_token:
                 return LeaseRenewalResult(LeaseRenewalOutcome.AUTHORITY_CHANGED, attempt_id,
                                           observed_token=attempt.current_fencing_token)
+            if claim.get("authority_mode") != attempt.authority_mode:
+                return LeaseRenewalResult(LeaseRenewalOutcome.AUTHORITY_CHANGED, attempt_id)
+            if attempt.authority_mode == "holder_bound":
+                return LeaseRenewalResult(LeaseRenewalOutcome.NOT_REQUIRED, attempt_id,
+                                          observed_token=fencing_token)
+            capability = clock_capability(cfg, policy)
+            if not capability.is_healthy or capability.observation is None:
+                return LeaseRenewalResult(
+                    LeaseRenewalOutcome.RETRYABLE_ERROR, attempt_id,
+                    error=LeaseFailureDetails("ClockHealthError", capability.reason),
+                )
+            persist_clock_observation(cfg, capability.observation)
+            evidence = _clock_evidence(capability.observation)
+            expires = lease_expiry(policy) if lease_seconds is None else (
+                datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             claim["lease_expires_at"] = expires
-            attempt.lease.update({"renewed_at": utc_now(), "expires_at": expires})
+            claim.update({"clock_error_bound_seconds": evidence["clock_error_bound_seconds"],
+                          "clock_provider": evidence["provider"],
+                          "clock_observation_id": evidence["observation_id"]})
+            attempt.lease.update({"renewed_at": utc_now(), "expires_at": expires,
+                                  "clock_evidence": evidence})
             atomic_replace(path, attempt.to_dict())
             task.meta["revision"] += 1
             task.meta["updated_at"] = utc_now()
@@ -414,7 +449,7 @@ def resolve_execution_authority(cfg: RootConfig, task_id: str, attempt_id: str,
     except Exception as exc:  # defensive: resolver is the sole fail-closed authority boundary
         return AuthorityResolution(AuthorityResolutionOutcome.AUTHORITY_UNAVAILABLE, decision_id,
                                    attempt_id, fencing_token, reason=type(exc).__name__)
-    if result.outcome is LeaseRenewalOutcome.RENEWED:
+    if result.outcome in {LeaseRenewalOutcome.RENEWED, LeaseRenewalOutcome.NOT_REQUIRED}:
         return AuthorityResolution(AuthorityResolutionOutcome.RENEWED, decision_id, attempt_id,
                                    fencing_token, fencing_token, result.lease_expires_at)
     if result.outcome is LeaseRenewalOutcome.ORPHANED_RECOVERY_REQUIRED:
@@ -485,13 +520,26 @@ def _continue_committed_termination(cfg: RootConfig, task_id: str, attempt_id: s
 
 def expire_claim(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int) -> bool:
     """Converge an expired claim without creating replacement execution authority."""
-    if not authority_clock_health(cfg)[0]:
+    policy = load_lease_policy(cfg)
+    capability = clock_capability(cfg, policy)
+    if not capability.is_healthy or capability.observation is None:
         return False
     task = load_task(cfg, task_id)
     with authority_locks(cfg, task):
         task = load_task(cfg, task_id)
         claim = task.claim_control.get("active_claim") or {}
         if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
+            return False
+        if claim.get("authority_mode") != "bounded_lease":
+            return False
+        holder_bound = claim.get("clock_error_bound_seconds")
+        expires = claim.get("lease_expires_at")
+        if not isinstance(holder_bound, (int, float)) or not isinstance(expires, str):
+            task.state.update({"projection": "blocked", "reason": "authority_mode_evidence_invalid"})
+            save_task(cfg, task)
+            return False
+        reclaimer_bound = capability.observation.bound_at(time.monotonic())
+        if datetime.now(timezone.utc) < reclaim_allowed_at(expires, holder_bound, reclaimer_bound):
             return False
         path = attempt_path(cfg.shared_root, task_id, task.attempt_control["current_attempt_number"])
         attempt = AttemptRecord.from_dict(read_json(path))
@@ -739,9 +787,8 @@ def reconcile_running_tasks(cfg: RootConfig, *, executor: Executor | None = None
         expires = claim.get("lease_expires_at")
         if not claim or not expires:
             continue
-        expires_at = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-        policy = load_lease_policy(cfg)
-        if reclaim_allowed_at(expires, policy) <= datetime.now(timezone.utc):
+        if (claim.get("authority_mode") == "bounded_lease"
+                and datetime.fromisoformat(expires.replace("Z", "+00:00")) <= datetime.now(timezone.utc)):
             if expire_claim(cfg, task.task_id, claim["attempt_id"], claim["fencing_token"]):
                 reconciled.append(task.task_id)
     return reconciled

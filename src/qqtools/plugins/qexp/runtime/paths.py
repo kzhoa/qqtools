@@ -9,6 +9,7 @@ def shared_paths(root: Path) -> dict[str, Path]:
         "schema": root / "schema",
         "project": root / "project",
         "lease_policy": root / "project" / "lease-policy.json",
+        "clock_observations": root / "clock-observations",
         "groups": root / "groups",
         "tasks": root / "tasks",
         "attempts": root / "attempts",

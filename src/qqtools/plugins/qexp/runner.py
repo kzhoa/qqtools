@@ -99,11 +99,15 @@ def _publish_registration(cfg: RootConfig, attempt: AttemptRecord, task: object,
     path = registration_path(cfg, attempt.attempt_id)
     if path.exists():
         raise RuntimeError(f"process registration already exists for {attempt.attempt_id!r}.")
+    claim = task.claim_control.get("active_claim") or {}
     create_if_absent(path, {"process_registration": {
         "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
         "attempt_id": attempt.attempt_id,
         "task_id": attempt.task_id,
         "fencing_token": attempt.current_fencing_token,
+        "machine_name": cfg.machine_name,
+        "authority_mode": attempt.authority_mode,
+        "clock_error_bound_seconds": claim.get("clock_error_bound_seconds"),
         "wrapper_pid": os.getpid(),
         "wrapper_start_time_ticks": _process_start_time_ticks(os.getpid()),
         "process_group_id": child.pid,
@@ -111,7 +115,7 @@ def _publish_registration(cfg: RootConfig, attempt: AttemptRecord, task: object,
         "gpu_ids": attempt.assigned_gpus,
         "command": task.spec.command,
         "working_directory": task.spec.working_directory,
-        "lease_expires_at": (task.claim_control.get("active_claim") or {}).get("lease_expires_at"),
+        "lease_expires_at": claim.get("lease_expires_at"),
         "created_at": utc_now(),
     }})
     return path

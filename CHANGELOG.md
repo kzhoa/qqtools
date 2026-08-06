@@ -1,5 +1,12 @@
 # History
 
+## Unreleased
+
+- qexp schema 6 now evaluates clock-capability evidence and permits holder-bound local-safe
+  execution when cross-machine lease expiry cannot be proven.
+- Added `qexp task share` and `qexp task keep-local`; delayed sharing is conservatively gated by
+  creator and evaluator clock bounds.
+
 ## v1.3.0
 
 - fix: mark qexp agent-owned local process manifests exited after terminal publication so

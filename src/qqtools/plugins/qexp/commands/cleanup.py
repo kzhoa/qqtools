@@ -11,7 +11,7 @@ from ..config_types import RootConfig
 from ..runtime.locks import group_lock, schema_lock, task_lock
 from ..runtime.claims import reconcile_claim_archives
 from ..runtime.paths import group_path, local_paths, shared_paths, task_path
-from ..runtime.records import AttemptRecord, TaskRecord, new_id, utc_now
+from ..runtime.records import AttemptRecord, SCHEMA_VERSION, TaskRecord, new_id, utc_now
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.tasks import load_task, save_task
 
@@ -75,7 +75,7 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
             save_task(cfg, task)
         return operation
     now = utc_now()
-    operation = {"meta": {"schema_version": 5, "revision": 1, "created_at": now,
+    operation = {"meta": {"schema_version": SCHEMA_VERSION, "revision": 1, "created_at": now,
         "updated_at": now, "updated_by": {"actor_type": "cli",
         "machine_name": cfg.machine_name, "process_id": str(os.getpid())}},
         "cleanup": {"operation_id": new_id(), "task_id": task.task_id,

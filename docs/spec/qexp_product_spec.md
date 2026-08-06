@@ -1,11 +1,25 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-04
+updated_at: 2026-08-06
 archived_at:
 ---
 
 # qexp Product Spec
+
+## Schema 6 clock capability and local-safe execution
+
+This section supersedes prior statements that every qexp path needs chrony. Qualified clock
+capability permits `bounded_lease`; without it, machines that already satisfy Task queue scope,
+Worker Set, and fallback rules may win `holder_bound` claims. Locks, CAS, fencing, process
+identity, and local GPU reservations still serialize initial execution, while time-based
+cross-machine takeover is deliberately disabled.
+
+`queued_home` remains home-only. In `queued_shared`, home and eligible remote workers compete
+and the winning machine's clock capability decides authority mode. Users can use `qexp task
+share`, `share --after 10m`, repeated `--with`, and `qexp task keep-local`; `task offer` remains
+the immediate operation for an existing spillover policy. Doctor and agent status show provider,
+full/local-safe capability, authority mode, and exact blocked reasons.
 
 ## 1. Purpose
 
