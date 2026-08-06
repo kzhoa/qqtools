@@ -216,6 +216,18 @@ The required behavior is owner-first work stealing:
 4. any eligible idle agent may claim it
 5. the home agent may also claim it later if it becomes free
 
+Users express this through story-level controls rather than editing placement fields:
+
+```bash
+qexp task share <task-id>
+qexp task share <task-id> --after 10m
+qexp task share <task-id> --with g2 --with g3
+qexp task keep-local <task-id>
+```
+
+`share` expands the candidate set; it does not transfer ownership away from the home machine.
+`keep-local` clears sharing policy and deadlines while preserving the Task home machine.
+
 ### 4.5 Why Failure Recovery Is Conservative
 
 A missing heartbeat does not prove that a process stopped. The machine may be computing
@@ -543,20 +555,27 @@ queued_home | queued_shared
 The home agent does not need a separate operation to take work back. It competes for the
 same shared Task when it becomes idle.
 
-### 9.4 Offering Work
+### 9.4 Sharing And Offering Work
 
-A home agent may offer only committed, unclaimed `queued_home` Tasks.
+Queued placement controls may change only committed, unclaimed queued Tasks. They do not migrate
+or stop a running Attempt.
 
-Offering may be triggered by:
+Supported controls:
 
-- explicit user action
-- elapsed local wait time
+- `qexp task share <task-id>` makes a grouped Task immediately available to eligible Group
+  helpers while retaining home eligibility.
+- `qexp task share <task-id> --after 10m` records a bounded deadline. The home agent offers it
+  only after current clock evidence proves the deadline has elapsed.
+- `qexp task share <task-id> --with g2 --with g3` restricts helper eligibility to active Group
+  workers. The home machine must not be listed because it remains eligible by definition.
+- `qexp task keep-local <task-id>` resets policy to private, queue scope to home, and clears
+  delayed-offer state.
+- `qexp task offer <task-id>` is retained for already-spillover Tasks. It cannot convert a
+  private Task into spillover.
 
-Required manual command:
-
-```bash
-qexp task offer <task-id>
-```
+Successful placement controls return a human-readable result by default and a stable JSON
+envelope with `--format json`. The envelope contains action, Task, Group, home machine, eligible
+helpers, effective time, resulting queue state, idempotency, operation id, and message.
 
 These are the only first-release triggers. The first-release manifest does not accept or
 advertise `on_overload`, `min_local_wait_seconds`, `max_offer_per_cycle`, or

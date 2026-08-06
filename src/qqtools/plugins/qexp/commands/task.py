@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
-import time
 from typing import Any, Callable
 
 import yaml
@@ -11,14 +9,14 @@ import yaml
 from ..config_types import RootConfig
 from ..layout import (ensure_machine_layout, ensure_shared_layout,
                       validate_root_contract)
-from ..runtime.locks import task_lock
-from ..runtime.paths import attempt_path, group_path, shared_paths
+from ..runtime.availability import (AvailabilityTransitionRequest,
+                                    AvailabilityTransitionResult,
+                                    apply_availability_transition)
+from ..runtime.paths import attempt_path, shared_paths
 from ..runtime.records import AttemptRecord, TaskRecord, utc_now, validate_group_name
 from ..runtime.store import read_json
 from ..runtime.submission import submit_specs
 from ..runtime.tasks import load_task, save_task
-from ..lease import (ClockObservation, clock_capability, new_timed_offer_proof,
-                     persist_clock_observation, timed_offer_deadline_upper)
 
 
 def is_cleanup_blocked(task: TaskRecord) -> bool:
@@ -137,118 +135,28 @@ def retry(
         return task
 
 
-def _clock_evidence(cfg: RootConfig) -> tuple[ClockObservation, datetime, float]:
-    capability = clock_capability(cfg)
-    if not capability.is_healthy or capability.observation is None:
-        raise ValueError("timed sharing requires a healthy clock capability; use immediate share instead.")
-    persist_clock_observation(cfg, capability.observation)
-    # Taking monotonic time after wall time makes the evaluator lower bound conservative.
-    return capability.observation, datetime.now(timezone.utc), time.monotonic()
-
-
-def _elapsed_offer_is_proven(cfg: RootConfig, task: TaskRecord) -> bool:
-    proof = task.placement_runtime.get("offer_clock_evidence")
-    deadline = task.placement_runtime.get("offer_eligible_at")
-    if not isinstance(proof, dict) or not isinstance(deadline, str):
-        return False
-    try:
-        observation, now, monotonic_now = _clock_evidence(cfg)
-    except ValueError:
-        return False
-    evaluator_lower = now - timedelta(seconds=observation.bound_at(monotonic_now))
-    try:
-        deadline_upper = timed_offer_deadline_upper(deadline, proof)
-    except (TypeError, ValueError, OverflowError):
-        return False
-    return evaluator_lower >= deadline_upper
-
-
-def _transition(cfg: RootConfig, task_id: str, *, action: str, reason: str,
-                helper_machines: list[str] | None = None, after_seconds: int | None = None) -> TaskRecord:
-    from ..scheduler import authority_locks
-
-    initial = load_task(cfg, task_id)
-    with authority_locks(cfg, initial):
-        task = load_task(cfg, task_id)
-        reject_cleanup_blocked(cfg, task, action)
-        if action == "offer" and reason == "elapsed":
-            if task.placement_policy["home_machine"] != cfg.machine_name:
-                return task
-            if not _elapsed_offer_is_proven(cfg, task):
-                return task
-        if (action == "offer" and task.state["projection"] == "queued"
-                and task.placement_runtime["queue_scope"] == "shared"
-                and task.placement_policy["sharing_mode"] == "spillover"):
-            return task
-        if task.state["projection"] != "queued" or task.claim_control.get("active_claim"):
-            raise ValueError("placement can only change while a Task is queued and unclaimed.")
-        if task.control.get("cancellation_requested_at"):
-            raise ValueError("cancelled Tasks cannot change placement.")
-        if action == "keep_local":
-            if task.group_name is None and task.placement_policy["sharing_mode"] == "private":
-                return task
-            task.placement_policy.update({"sharing_mode": "private", "fallback_constraint": "group",
-                                         "offer_after_seconds": None})
-            task.placement_runtime.update({"queue_scope": "home", "queued_home_at": utc_now(),
-                                           "offer_eligible_at": None, "offer_clock_evidence": None,
-                                           "offered_at": None, "offer_reason": None, "offered_by": cfg.machine_name})
-        else:
-            if action == "share" and task.group_name is None:
-                raise ValueError(
-                    f"Task {task_id!r} is local-only because it does not belong to a Group. "
-                    "Submit the work to a Group to let other machines help."
-                )
-            if action == "offer" and task.placement_policy["sharing_mode"] != "spillover":
-                raise ValueError("private Tasks cannot be offered to shared workers; use task share.")
-            fallback: str | list[str] = task.placement_policy["fallback_constraint"]
-            if helper_machines is not None:
-                if len(set(helper_machines)) != len(helper_machines):
-                    raise ValueError("shared helper machines must be unique.")
-                if task.placement_policy["home_machine"] in helper_machines:
-                    raise ValueError("the home machine is already eligible and cannot be a helper.")
-                if task.group_name:
-                    workers = read_json(group_path(cfg.shared_root, task.group_name))["group"]["worker_set"]
-                    invalid = [machine for machine in helper_machines
-                               if workers.get(machine, {}).get("state") != "active"]
-                    if invalid:
-                        raise ValueError(f"shared helpers are not active Group workers: {invalid}")
-                fallback = helper_machines or "group"
-            if action == "share":
-                task.placement_policy["sharing_mode"] = "spillover"
-                task.placement_policy["fallback_constraint"] = fallback
-            if after_seconds is not None:
-                if task.placement_runtime["queue_scope"] != "home":
-                    raise ValueError("share --after requires a home-queued Task; use keep-local first.")
-                observation, wall_now, monotonic_now = _clock_evidence(cfg)
-                deadline, proof = new_timed_offer_proof(
-                    observation, after_seconds, wall_now=wall_now, monotonic_now=monotonic_now
-                )
-                task.placement_policy["offer_after_seconds"] = after_seconds
-                task.placement_runtime.update({
-                    "queue_scope": "home", "queued_home_at": utc_now(),
-                    "offer_eligible_at": deadline, "offer_clock_evidence": proof, "offered_at": None,
-                    "offer_reason": None, "offered_by": cfg.machine_name,
-                })
-            else:
-                task.placement_runtime.update({"queue_scope": "shared", "offered_at": utc_now(),
-                                               "offer_reason": reason, "offered_by": cfg.machine_name})
-        task.meta["revision"] += 1
-        task.meta["updated_at"] = utc_now()
-        save_task(cfg, task)
-        return task
-
-
 def share(cfg: RootConfig, task_id: str, *, after_seconds: int | None = None,
-          helper_machines: list[str] | None = None) -> TaskRecord:
+          helper_machines: list[str] | None = None) -> AvailabilityTransitionResult:
     if after_seconds is not None and after_seconds < 0:
         raise ValueError("share --after must be non-negative.")
-    return _transition(cfg, task_id, action="share", reason="manual", helper_machines=helper_machines,
-                       after_seconds=after_seconds)
+    action = "share_after" if after_seconds is not None else "share_now"
+    return apply_availability_transition(
+        cfg,
+        AvailabilityTransitionRequest(
+            action=action, task_id=task_id, helper_machines=helper_machines,
+            after_seconds=after_seconds, reason="manual",
+        ),
+    )
 
 
-def keep_local(cfg: RootConfig, task_id: str) -> TaskRecord:
-    return _transition(cfg, task_id, action="keep_local", reason="manual")
+def keep_local(cfg: RootConfig, task_id: str) -> AvailabilityTransitionResult:
+    return apply_availability_transition(
+        cfg, AvailabilityTransitionRequest(action="keep_local", task_id=task_id, reason="manual")
+    )
 
 
-def offer(cfg: RootConfig, task_id: str, *, reason: str = "manual") -> TaskRecord:
-    return _transition(cfg, task_id, action="offer", reason=reason)
+def offer(cfg: RootConfig, task_id: str, *, reason: str = "manual") -> AvailabilityTransitionResult:
+    action = "elapsed_offer" if reason == "elapsed" else "manual_offer"
+    return apply_availability_transition(
+        cfg, AvailabilityTransitionRequest(action=action, task_id=task_id, reason=reason)
+    )

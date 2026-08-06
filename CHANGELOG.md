@@ -6,6 +6,9 @@
   execution when cross-machine lease expiry cannot be proven.
 - Added `qexp task share` and `qexp task keep-local`; delayed sharing is conservatively gated by
   creator and evaluator clock bounds.
+- Added durable queued-availability operations, deterministic availability audit events, advisory
+  offer-deadline indexes, and text/JSON result envelopes for `task share`, `task keep-local`, and
+  `task offer`.
 
 ## v1.3.0
 

@@ -52,6 +52,14 @@ def validate_root_contract(cfg: RootConfig) -> None:
     missing = sorted(name for name in required if not (cfg.shared_root / name).exists())
     if missing:
         raise RuntimeError(f"qexp schema-6 root is incomplete; missing {missing}.")
+    required_subdirs = [
+        shared_paths(cfg.shared_root)["availability"],
+        shared_paths(cfg.shared_root)["offer_deadlines"],
+    ]
+    missing_subdirs = sorted(str(path.relative_to(cfg.shared_root))
+                             for path in required_subdirs if not path.exists())
+    if missing_subdirs:
+        raise RuntimeError(f"qexp schema-6 root is incomplete; missing {missing_subdirs}.")
 
 
 def ensure_shared_layout(cfg: RootConfig) -> None:
@@ -162,7 +170,7 @@ def _migration_blockers(cfg: RootConfig) -> list[str]:
         state = read_json(operation_path).get("submission", {}).get("state")
         if state not in {"committed", "aborted"}:
             blockers.append(f"submission:{operation_path.stem}:{state}")
-    for name in ("group_control", "cleanup", "claim_pending"):
+    for name in ("group_control", "cleanup", "availability", "claim_pending"):
         directory = shared_paths(cfg.shared_root)[name]
         if directory.exists() and any(directory.iterdir()):
             blockers.append(f"shared_runtime_evidence:{directory.name}")

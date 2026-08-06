@@ -5,6 +5,7 @@ from pathlib import Path
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
+from qqtools.plugins.qexp.runtime import availability as availability_runtime
 from qqtools.plugins.qexp.lease import ClockCapability, ClockObservation, LeasePolicy, clock_capability
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -64,7 +65,7 @@ def test_elapsed_offer_requires_conservative_two_host_proof(tmp_path: Path, monk
         monotonic_observed_at=1.0, boot_id="creator-boot", lower_error_seconds=-0.7,
         upper_error_seconds=0.7, max_drift_rate=0.0, provider_margin_seconds=0.0,
     )
-    monkeypatch.setattr(task_commands, "_clock_evidence", lambda _cfg: (creator, start, 2.0))
+    monkeypatch.setattr(availability_runtime, "clock_evidence", lambda _cfg: (creator, start, 2.0))
     task_commands.share(cfg, task.task_id, after_seconds=10)
     reader = ClockObservation(
         observation_id="reader", provider="chrony", observed_at=start.isoformat(),
@@ -72,15 +73,15 @@ def test_elapsed_offer_requires_conservative_two_host_proof(tmp_path: Path, monk
         upper_error_seconds=0.8, max_drift_rate=0.0, provider_margin_seconds=0.0,
     )
     monkeypatch.setattr(
-        task_commands,
-        "_clock_evidence",
+        availability_runtime,
+        "clock_evidence",
         lambda _cfg: (reader, start + timedelta(seconds=11), 2.0),
     )
     task_commands.offer(cfg, task.task_id, reason="elapsed")
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "home"
     monkeypatch.setattr(
-        task_commands,
-        "_clock_evidence",
+        availability_runtime,
+        "clock_evidence",
         lambda _cfg: (reader, start + timedelta(seconds=12), 2.0),
     )
     task_commands.offer(cfg, task.task_id, reason="elapsed")
@@ -96,7 +97,7 @@ def test_elapsed_offer_ages_creator_evidence_through_long_delay(tmp_path: Path, 
         monotonic_observed_at=1.0, boot_id="creator-boot", lower_error_seconds=-0.1,
         upper_error_seconds=0.1, max_drift_rate=0.1, provider_margin_seconds=0.0,
     )
-    monkeypatch.setattr(task_commands, "_clock_evidence", lambda _cfg: (creator, start, 2.0))
+    monkeypatch.setattr(availability_runtime, "clock_evidence", lambda _cfg: (creator, start, 2.0))
     task_commands.share(cfg, task.task_id, after_seconds=3600)
     proof = load_task(cfg, task.task_id).placement_runtime["offer_clock_evidence"]
     assert proof["creator_observation"]["max_drift_rate"] == 0.1
@@ -108,16 +109,16 @@ def test_elapsed_offer_ages_creator_evidence_through_long_delay(tmp_path: Path, 
         upper_error_seconds=0.1, max_drift_rate=0.0, provider_margin_seconds=0.0,
     )
     monkeypatch.setattr(
-        task_commands,
-        "_clock_evidence",
+        availability_runtime,
+        "clock_evidence",
         lambda _cfg: (reader, start + timedelta(seconds=3601), 2.0),
     )
     task_commands.offer(cfg, task.task_id, reason="elapsed")
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "home"
 
     monkeypatch.setattr(
-        task_commands,
-        "_clock_evidence",
+        availability_runtime,
+        "clock_evidence",
         lambda _cfg: (reader, start + timedelta(seconds=3961), 2.0),
     )
     task_commands.offer(cfg, task.task_id, reason="elapsed")

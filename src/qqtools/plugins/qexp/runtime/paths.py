@@ -14,6 +14,7 @@ def shared_paths(root: Path) -> dict[str, Path]:
         "tasks": root / "tasks",
         "attempts": root / "attempts",
         "submissions": root / "operations" / "submissions",
+        "availability": root / "operations" / "availability",
         "group_control": root / "operations" / "group-control",
         "cleanup": root / "operations" / "cleanup",
         "idempotency": root / "idempotency" / "submissions",
@@ -23,6 +24,7 @@ def shared_paths(root: Path) -> dict[str, Path]:
         "locks": root / "locks",
         "events": root / "events",
         "indexes": root / "indexes",
+        "offer_deadlines": root / "indexes" / "offer-deadlines",
         "logs": root / "logs",
     }
 

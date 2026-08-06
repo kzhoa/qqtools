@@ -8,11 +8,12 @@ from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands.cleanup import clean, reconcile_cleanup_operations
 from qqtools.plugins.qexp.commands.group import (group_control,
                                                 reconcile_group_cancel_operations)
+from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.task import offer, retry
 from qqtools.plugins.qexp.doctor import repair_metadata, repair_orphans, verify_integrity
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.runtime.locks import group_lock, task_lock
-from qqtools.plugins.qexp.runtime.paths import attempt_path, group_path, task_path
+from qqtools.plugins.qexp.runtime.paths import attempt_path, group_path, shared_paths, task_path
 from qqtools.plugins.qexp.runtime.reservations import attach, reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.records import SCHEMA_VERSION, new_id, utc_now
 from qqtools.plugins.qexp.runtime.claims import reconcile_claim_archives
@@ -79,6 +80,50 @@ def test_clean_exact_terminal_task_supports_dry_run_and_audit(tmp_path: Path):
     events = [read_json(path) for path in (cfg.shared_root / "events").glob("*/*.json")]
     assert any(event.get("event_type") == "task_cleaned" for event in events)
     assert verify_integrity(cfg)["healthy"] is True
+
+
+def test_clean_removes_timed_offer_deadline_index(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    task_commands.share(cfg, task.task_id, after_seconds=3600)
+    index_path = shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task.task_id}.json"
+    assert index_path.exists()
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert fail_attempt(
+        cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure"
+    )
+
+    clean(cfg, task_id=task.task_id)
+
+    assert not task_path(cfg.shared_root, task.task_id).exists()
+    assert not index_path.exists()
+
+
+def test_submission_rollback_removes_task_and_deadline_index(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task_id = "rollback-index-task"
+    original_atomic_replace = submission_runtime.atomic_replace
+    has_failed = False
+
+    def fail_after_task_and_index_are_staged(path, value):
+        nonlocal has_failed
+        task_file = task_path(cfg.shared_root, task_id)
+        if (not has_failed and path == group_path(cfg.shared_root, "exp")
+                and task_file.exists()
+                and value.get("group", {}).get("pending_submission_commit") is None):
+            has_failed = True
+            raise OSError("injected final group commit failure")
+        return original_atomic_replace(path, value)
+
+    monkeypatch.setattr(submission_runtime, "atomic_replace", fail_after_task_and_index_are_staged)
+
+    with pytest.raises(OSError, match="injected final group commit failure"):
+        submit(cfg, ["echo", "ok"], task_id=task_id, group="exp", sharing_mode="spillover",
+               offer_after_seconds=3600)
+
+    assert not task_path(cfg.shared_root, task_id).exists()
+    assert not (shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task_id}.json").exists()
 
 
 def test_clean_bulk_is_bounded_by_retention_and_limit(tmp_path: Path):
