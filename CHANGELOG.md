@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Implemented the qexp batch manifest nested `placement` contract for defaults and per-Task
+  overrides, with strict allow-list validation, frozen `current` home resolution, planned Worker
+  Set checks, and deprecation warnings for legacy flat Task sharing fields.
 - qexp schema 6 now evaluates clock-capability evidence and permits holder-bound local-safe
   execution when cross-machine lease expiry cannot be proven.
 - Added `qexp task share` and `qexp task keep-local`; delayed sharing is conservatively gated by

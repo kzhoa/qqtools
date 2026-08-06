@@ -190,6 +190,26 @@ qexp clean --task-id TASK_ID --dry-run
 qexp clean --older-than-days 30 --limit 100
 ```
 
+`batch-submit` manifests may set Group workers and nested placement defaults, with per-Task
+overrides:
+
+```yaml
+group:
+  workers: [g1, g2]
+defaults:
+  placement:
+    home_machine: current
+    sharing:
+      mode: spillover
+      fallback_machines: group
+tasks:
+  - command: [python, train.py]
+  - placement:
+      sharing:
+        mode: private
+    command: [python, control.py]
+```
+
 During a shared-filesystem outage, the owning agent retains the training process and GPU
 reservation in `suspect` and then `isolated` state; it does not create a replacement Attempt
 or impose an automatic kill deadline. When shared authority becomes available again, the agent

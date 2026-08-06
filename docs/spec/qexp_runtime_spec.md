@@ -574,7 +574,11 @@ submission:
     task_specs: list[object]
     create_group: bool
     worker_set_additions: list[str]
-    group_revision_precondition: int | null
+    group_precondition:
+      exists: bool
+      revision: int | null
+      worker_set_epoch: int | null
+    planned_worker_set: list[str]
   commit_plan:
     group_membership_sequences: list[int] | null
     pending_group_revision: int | null
@@ -598,8 +602,11 @@ Submission rules:
 - YAML formatting, key order, and manifest path are not semantic input
 - `--group` is the sole source of Group identity
 - manifest `group.name` is invalid
+- manifest Worker Set changes come only from `group.workers`; root `workers` and
+  `defaults.placement.workers` are invalid
 - the first operation resolves `home_machine: current`, generated Task IDs, placement
-  defaults, original submitting machine, and Worker Set additions exactly once
+  defaults, original submitting machine, planned Worker Set, Group revision/worker-set epoch, and
+  Worker Set additions exactly once
 - retries load the existing operation before resolving machine-relative values
 - the same key and raw request reuse the stored resolved context across machines
 - the same key with different raw input fails with an idempotency conflict
@@ -862,7 +869,7 @@ Submission executes:
 4. if existing, validate the raw digest and reuse its stored resolved context
 5. if new, acquire the Group lock when grouped
 6. resolve whether the Group must be created, plus Task IDs, homes, placement, and Worker
-   Set additions
+   Set additions against the planned active Worker Set
 7. persist the Submission Operation in `preparing`
 8. release the Group lock
 

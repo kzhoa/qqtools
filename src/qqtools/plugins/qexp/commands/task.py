@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
-
-import yaml
+from typing import Callable
 
 from ..config_types import RootConfig
 from ..layout import (ensure_machine_layout, ensure_shared_layout,
                       validate_root_contract)
+from ..manifest import parse_batch_manifest
 from ..runtime.availability import (AvailabilityTransitionRequest,
                                     AvailabilityTransitionResult,
                                     apply_availability_transition)
@@ -50,30 +49,11 @@ def batch_submit(cfg: RootConfig, manifest_path: Path, *, group: str | None = No
                  idempotency_key: str | None = None,
                  on_prepared: Callable[[str, str], None] | None = None) -> list[TaskRecord]:
     validate_root_contract(cfg)
-    raw = yaml.safe_load(Path(manifest_path).read_text(encoding="utf-8")) or {}
-    if "name" in raw.get("group", {}):
-        raise ValueError("manifest group.name is invalid; pass --group explicitly.")
-    tasks = raw.get("tasks")
-    if not isinstance(tasks, list) or not tasks:
-        raise ValueError("manifest must contain a non-empty tasks list.")
-    defaults = raw.get("defaults", {}) or {}
-    placement = defaults.get("placement", {}) or {}
-    sharing = placement.get("sharing", {}) or {}
-    normalized: list[dict[str, Any]] = []
-    for entry in tasks:
-        if not isinstance(entry, dict) or not entry.get("command"):
-            raise ValueError("each manifest task requires command.")
-        normalized.append({"task_id": entry.get("task_id"), "name": entry.get("name"),
-            "command": list(entry["command"]), "requested_gpus": entry.get("requested_gpus", defaults.get("requested_gpus", 1)),
-            "working_directory": entry.get("working_directory", defaults.get("working_directory", str(Path.cwd()))),
-            "sharing_mode": entry.get("sharing_mode", sharing.get("mode", "private")),
-            "fallback_machines": entry.get("fallback_machines", sharing.get("fallback_machines", "group")),
-            "offer_after_seconds": entry.get("offer_after_seconds", (sharing.get("offer") or {}).get("after_seconds"))})
-    workers = (raw.get("workers") or raw.get("group", {}).get("workers") or
-               (raw.get("defaults", {}).get("placement", {}) or {}).get("workers"))
-    return submit_specs(cfg, normalized, group_name=validate_group_name(group),
+    group_name = validate_group_name(group)
+    normalized, workers = parse_batch_manifest(Path(manifest_path), group_name=group_name)
+    return submit_specs(cfg, normalized, group_name=group_name,
                         idempotency_key=idempotency_key, kind="bulk",
-                        worker_set=list(workers or []), on_prepared=on_prepared)
+                        worker_set=workers, on_prepared=on_prepared)
 
 
 def cancel(cfg: RootConfig, task_id: str, *, terminate_running: bool = True) -> TaskRecord:
