@@ -11,6 +11,36 @@ from .runtime.records import new_id
 from .runtime.store import atomic_replace, iter_json, read_json
 
 
+def write_notification_diagnostic(cfg: Any, event_type: str, event: Any, *,
+                                  reason_code: str, error_type: str | None = None,
+                                  notification_key: str | None = None,
+                                  outcome: str | None = None, http_status: int | None = None,
+                                  business_code: str | None = None,
+                                  duration_ms: int | None = None) -> None:
+    """Write a bounded notification diagnostic without exception or secret text."""
+    details = {
+        "attempt_id": event.attempt_id,
+        "attempt_number": event.attempt_number,
+        "phase": event.phase,
+        "notifier": "feishu",
+        "execution_machine_name": event.execution_machine_name,
+        "dispatching_machine_name": event.dispatching_machine_name,
+        "notification_key": notification_key or "",
+        "outcome": outcome or event_type.removeprefix("notification_"),
+        "reason_code": reason_code,
+    }
+    if isinstance(http_status, int):
+        details["http_status"] = http_status
+    if isinstance(business_code, str) and len(business_code) <= 64:
+        details["business_code"] = business_code
+    if isinstance(error_type, str):
+        details["error_type"] = error_type
+    if isinstance(duration_ms, int) and duration_ms >= 0:
+        details["duration_ms"] = duration_ms
+    write_diagnostic_event(cfg, event_type, task_id=event.task_id,
+                           attempt_id=event.attempt_id, details=details)
+
+
 def write_event(cfg: Any, event_type: str, *, task_id: str | None = None,
                 details: dict[str, Any] | None = None) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")

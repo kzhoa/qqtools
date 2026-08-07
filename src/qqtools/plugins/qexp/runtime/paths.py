@@ -26,6 +26,7 @@ def shared_paths(root: Path) -> dict[str, Path]:
         "indexes": root / "indexes",
         "offer_deadlines": root / "indexes" / "offer-deadlines",
         "logs": root / "logs",
+        "notifications": root / "notifications",
     }
 
 
@@ -77,8 +78,8 @@ def lock_path(root: Path, kind: str, identifier: str | None = None) -> Path:
     base = shared_paths(root)["locks"]
     if kind == "schema":
         return base / "schema.lock"
-    if kind not in {"groups", "tasks"} or identifier is None:
-        raise ValueError("kind must be schema, groups, or tasks with an identifier.")
+    if kind not in {"groups", "tasks", "machines"} or identifier is None:
+        raise ValueError("kind must be schema, groups, tasks, or machines with an identifier.")
     return base / kind / f"{identifier}.lock"
 
 

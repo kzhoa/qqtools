@@ -51,6 +51,42 @@ def test_cancelled_prelaunch_claim_is_not_launchable(tmp_path: Path):
     assert reserved_gpu_ids(cfg.runtime_root) == set()
 
 
+def test_prelaunch_cancel_with_missing_attempt_still_clears_claim_and_reservation(
+        tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number).unlink()
+
+    cancelled = cancel(cfg, task.task_id)
+
+    assert cancelled.state == {"projection": "cancelled", "reason": "cancelled_before_launch"}
+    assert cancelled.claim_control["active_claim"] is None
+    assert cancelled.attempt_control["current_attempt_id"] is None
+    assert reserved_gpu_ids(cfg.runtime_root) == set()
+
+
+def test_prelaunch_cancel_increments_revision_once_and_event_matches_final_task(
+        tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    revision_before_cancel = load_task(cfg, task.task_id).meta["revision"]
+    events = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.dispatch_task_lifecycle_hooks_noexcept",
+        lambda _cfg, event: events.append(event),
+    )
+
+    cancelled = cancel(cfg, task.task_id)
+
+    assert cancelled.meta["revision"] == revision_before_cancel + 1
+    assert len(events) == 1
+    assert events[0].task_revision == cancelled.meta["revision"]
+
+
 def test_cancel_running_task_persists_termination_intent_by_default(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])

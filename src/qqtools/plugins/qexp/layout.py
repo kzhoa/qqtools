@@ -65,7 +65,7 @@ def validate_root_contract(cfg: RootConfig) -> None:
 def ensure_shared_layout(cfg: RootConfig) -> None:
     paths = shared_paths(cfg.shared_root)
     for name, path in paths.items():
-        if name == "lease_policy":
+        if name in {"lease_policy", "notifications"}:
             continue
         path.mkdir(parents=True, exist_ok=True)
     (paths["locks"] / "groups").mkdir(exist_ok=True)

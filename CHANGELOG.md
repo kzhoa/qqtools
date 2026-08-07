@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- feat: add qexp terminal lifecycle notifications with a built-in Feishu webhook provider,
+  unified terminal-transition events, at-most-one send-attempt claims, and failure-isolated
+  dispatch from the process that commits terminal state
+- feat: add machine-scoped notification configuration through `qexp config notifications`, with
+  environment-backed credentials by default and an explicitly acknowledged shared-root webhook
+  storage option for operators who choose it
+- test: add qexp regression coverage for lifecycle dispatch, notification configuration, Feishu
+  response handling, and terminal scheduling paths
+
 ## v1.3.1
 
 - Implemented the qexp batch manifest nested `placement` contract for defaults and per-Task

@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .events import write_diagnostic_event, write_event
+from .lifecycle import (TerminalTransition, commit_terminal_transition_locked,
+                         dispatch_task_lifecycle_hooks_noexcept)
 from .lease import (AuthorityResolution, AuthorityResolutionOutcome, ClockObservation,
                     LeaseFailureDetails, LeaseRenewalOutcome, LeaseRenewalResult, clock_capability,
                     lease_expiry, load_lease_policy, persist_clock_observation, reclaim_allowed_at)
@@ -259,6 +261,7 @@ def claim_task(cfg: RootConfig, task_id: str, assigned_gpus: list[int], *,
 
 def authorize_launch(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int) -> bool:
     task = load_task(cfg, task_id)
+    cancel_result = None
     with authority_locks(cfg, task):
         task = load_task(cfg, task_id)
         claim = task.claim_control.get("active_claim") or {}
@@ -277,49 +280,46 @@ def authorize_launch(cfg: RootConfig, task_id: str, attempt_id: str, fencing_tok
         if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
             return False
         if claim.get("launch_state") != "claimed" or task.control.get("cancellation_requested_at"):
-            _cancel_prelaunch_locked(cfg, task, "launch_gate_lost")
-            return False
-        if task.group_name:
+            cancel_result = _cancel_prelaunch_locked(cfg, task, "launch_gate_lost")
+        elif task.group_name:
             group = read_json(group_path(cfg.shared_root, task.group_name))
             if not _group_allows(group, task, cfg.machine_name):
-                _cancel_prelaunch_locked(cfg, task, "worker_or_dispatch_changed")
-                return False
-            claim["group_dispatch_epoch"] = group["group"]["dispatch_epoch"]
-            claim["group_worker_set_epoch"] = group["group"]["worker_set_epoch"]
-        claim["launch_state"] = "starting"
-        claim["launch_authorized_at"] = utc_now()
-        task.meta["revision"] += 1
-        task.meta["updated_at"] = utc_now()
-        save_task(cfg, task)
-        return True
+                cancel_result = _cancel_prelaunch_locked(cfg, task, "worker_or_dispatch_changed")
+            else:
+                claim["group_dispatch_epoch"] = group["group"]["dispatch_epoch"]
+                claim["group_worker_set_epoch"] = group["group"]["worker_set_epoch"]
+        if cancel_result is not None:
+            pass
+        else:
+            claim["launch_state"] = "starting"
+            claim["launch_authorized_at"] = utc_now()
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task)
+    if cancel_result is not None:
+        if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
+            release(cfg.runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled")
+        if cancel_result.event:
+            dispatch_task_lifecycle_hooks_noexcept(cfg, cancel_result.event)
+        return False
+    return True
 
 
-def _cancel_prelaunch_locked(cfg: RootConfig, task: TaskRecord, reason: str) -> None:
+def _cancel_prelaunch_locked(cfg: RootConfig, task: TaskRecord, reason: str):
     claim = task.claim_control.get("active_claim") or {}
     attempt_id = task.attempt_control.get("current_attempt_id")
-    if attempt_id:
-        path = attempt_path(cfg.shared_root, task.task_id, task.attempt_control["current_attempt_number"])
-        if path.exists():
-            attempt = AttemptRecord.from_dict(read_json(path))
-            if attempt.phase == "claimed":
-                attempt.phase = "cancelled"
-                attempt.result["reason"] = reason
-                attempt.timestamps["finished_at"] = utc_now()
-                atomic_replace(path, attempt.to_dict())
-    if claim and claim.get("machine_name") == cfg.machine_name:
-        release(cfg.runtime_root, claim["reservation_id"], reason)
-    if claim:
-        archive_claim(cfg, task.task_id, claim, reason)
-    task.claim_control["active_claim"] = None
-    task.attempt_control["current_attempt_id"] = None
-    task.state.update({"projection": "cancelled", "reason": reason})
-    task.meta["revision"] += 1
-    task.meta["updated_at"] = utc_now()
-    save_task(cfg, task)
+    if not attempt_id:
+        return None
+    return commit_terminal_transition_locked(
+        cfg, task, TerminalTransition(task.task_id, attempt_id,
+            task.attempt_control["current_attempt_number"], claim.get("fencing_token", 0),
+            "cancelled", reason, None, frozenset({"running"}), frozenset({"claimed"}), "active",
+            allow_missing_attempt=True))
 
 
 def cancel_task(cfg: RootConfig, task_id: str, *, terminate_running: bool = True) -> TaskRecord:
     task = load_task(cfg, task_id)
+    cancel_result = None
     with authority_locks(cfg, task):
         task = load_task(cfg, task_id)
         if (task.control.get("cleanup_operation_id") or task.control.get("cleanup_state")
@@ -328,17 +328,28 @@ def cancel_task(cfg: RootConfig, task_id: str, *, terminate_running: bool = True
         if task.state["projection"] in {"succeeded", "failed", "cancelled"}:
             return task
         claim = task.claim_control.get("active_claim") or {}
+        has_saved_task = False
         task.control.update({"cancellation_requested_at": utc_now(), "terminate_running": terminate_running,
                              "requested_by": cfg.machine_name})
         if claim and claim.get("launch_state") == "claimed":
-            _cancel_prelaunch_locked(cfg, task, "cancelled_before_launch")
-            return load_task(cfg, task_id)
+            cancel_result = _cancel_prelaunch_locked(cfg, task, "cancelled_before_launch")
+            has_saved_task = cancel_result is not None and cancel_result.outcome == "committed"
+            result_task = load_task(cfg, task_id) if cancel_result is None else None
+        else:
+            result_task = None
         if not claim and task.state["projection"] == "queued":
             task.state.update({"projection": "cancelled", "reason": "cancelled_by_user"})
-        task.meta["revision"] += 1
-        task.meta["updated_at"] = utc_now()
-        save_task(cfg, task)
-        return task
+        if not has_saved_task:
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task)
+    if cancel_result is not None:
+        if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
+            release(cfg.runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled_before_launch")
+        if cancel_result.event:
+            dispatch_task_lifecycle_hooks_noexcept(cfg, cancel_result.event)
+        return load_task(cfg, task_id)
+    return result_task or load_task(cfg, task_id)
 
 
 def run_dispatch_cycle(cfg: RootConfig, *, available_gpus: list[int] | None = None,
@@ -580,32 +591,30 @@ def expire_claim(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: 
 
 def fail_attempt(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int, reason: str) -> bool:
     task = load_task(cfg, task_id)
+    result = None
     with authority_locks(cfg, task):
         task = load_task(cfg, task_id)
         claim = task.claim_control.get("active_claim") or {}
         if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
             return False
-        path = attempt_path(cfg.shared_root, task_id, task.attempt_control["current_attempt_number"])
-        attempt = AttemptRecord.from_dict(read_json(path))
-        attempt.phase = "failed"
-        attempt.result["reason"] = reason
-        attempt.timestamps["finished_at"] = utc_now()
-        atomic_replace(path, attempt.to_dict())
-        release(cfg.runtime_root, claim["reservation_id"], reason)
-        archive_claim(cfg, task_id, claim, reason)
-        task.claim_control["active_claim"] = None
-        task.attempt_control["current_attempt_id"] = None
-        task.state.update({"projection": "failed", "reason": reason})
-        task.meta["revision"] += 1
-        task.meta["updated_at"] = utc_now()
-        save_task(cfg, task)
-        return True
+        result = commit_terminal_transition_locked(
+            cfg, task, TerminalTransition(task_id, attempt_id,
+                task.attempt_control["current_attempt_number"], fencing_token, "failed", reason,
+                None, frozenset({"running"}), frozenset({"claimed", "starting", "running"}), "active"))
+    if result.outcome != "committed":
+        return False
+    if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
+        release(cfg.runtime_root, result.reservation_id, reason)
+    if result.event:
+        dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
+    return True
 
 
 def finalize_agent_supervised_attempt(cfg: RootConfig, task_id: str, attempt_id: str,
                                       fencing_token: int, *, was_terminated: bool) -> bool:
     """Publish terminal truth after the agent confirms a recovered process is absent."""
     task = load_task(cfg, task_id)
+    result = None
     with authority_locks(cfg, task):
         task = load_task(cfg, task_id)
         claim = task.claim_control.get("active_claim") or {}
@@ -614,30 +623,19 @@ def finalize_agent_supervised_attempt(cfg: RootConfig, task_id: str, attempt_id:
         number = task.attempt_control.get("current_attempt_number")
         if number is None:
             return False
-        path = attempt_path(cfg.shared_root, task_id, number)
-        attempt = AttemptRecord.from_dict(read_json(path))
-        if attempt.attempt_id != attempt_id or attempt.current_fencing_token != fencing_token:
-            return False
         reason = "terminated_by_agent" if was_terminated else "process_exited_without_status"
         phase = "cancelled" if was_terminated else "failed"
-        attempt.phase = phase
-        attempt.result.update({"exit_code": None, "reason": reason})
-        attempt.timestamps["finished_at"] = utc_now()
-        if was_terminated:
-            attempt.termination.update({"acknowledged_at": utc_now(), "result": "terminated"})
-        atomic_replace(path, attempt.to_dict())
-        archive_claim(cfg, task_id, claim, reason)
-        task.claim_control["active_claim"] = None
-        task.attempt_control["current_attempt_id"] = None
-        task.state.update({"projection": phase, "reason": reason})
-        if was_terminated:
-            task.control.update({"termination_acknowledged_at": utc_now(),
-                                 "termination_result": "terminated"})
-        task.meta["revision"] += 1
-        task.meta["updated_at"] = utc_now()
-        save_task(cfg, task)
-        release(cfg.runtime_root, claim["reservation_id"], reason)
-        return True
+        result = commit_terminal_transition_locked(
+            cfg, task, TerminalTransition(task_id, attempt_id, number, fencing_token, phase, reason,
+                None, frozenset({"running"}), frozenset({"claimed", "starting", "running"}),
+                "active", "terminated" if was_terminated else None))
+    if result.outcome != "committed":
+        return False
+    if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
+        release(cfg.runtime_root, result.reservation_id, reason)
+    if result.event:
+        dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
+    return True
 
 
 def finalize_orphaned_attempt(
@@ -645,6 +643,7 @@ def finalize_orphaned_attempt(
         *, exit_code: int | None, was_terminated: bool) -> bool:
     """Resolve a blocked orphan after local evidence confirms its process is absent."""
     task = load_task(cfg, task_id)
+    result = None
     with authority_locks(cfg, task):
         task = load_task(cfg, task_id)
         if task.state["projection"] != "blocked" or task.claim_control.get("active_claim"):
@@ -673,26 +672,17 @@ def finalize_orphaned_attempt(
             phase = "failed"
             reason = "process_exited_without_status"
             termination_result = None
-        attempt.phase = phase
-        attempt.result.update({"exit_code": exit_code, "reason": reason})
-        attempt.timestamps["finished_at"] = utc_now()
-        if was_terminated:
-            attempt.termination.update({"acknowledged_at": utc_now(),
-                                        "result": termination_result})
-        atomic_replace(path, attempt.to_dict())
-        task.claim_control["fencing_epoch"] = max(
-            task.claim_control["fencing_epoch"], attempt.current_fencing_token
-        )
-        task.attempt_control["current_attempt_id"] = None
-        task.state.update({"projection": phase, "reason": reason})
-        if was_terminated:
-            task.control.update({"termination_acknowledged_at": utc_now(),
-                                 "termination_result": termination_result})
-        task.meta["revision"] += 1
-        task.meta["updated_at"] = utc_now()
-        save_task(cfg, task)
-        release(cfg.runtime_root, attempt.reservation_id, reason)
-        return True
+        result = commit_terminal_transition_locked(
+            cfg, task, TerminalTransition(task_id, attempt_id, number, fencing_token, phase, reason,
+                exit_code, frozenset({"blocked"}), frozenset({"orphaned", "running"}), "detached",
+                termination_result))
+    if result.outcome != "committed":
+        return False
+    if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
+        release(cfg.runtime_root, result.reservation_id, reason)
+    if result.event:
+        dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
+    return True
 
 
 def reconcile_running_tasks(cfg: RootConfig, *, executor: Executor | None = None) -> list[str]:

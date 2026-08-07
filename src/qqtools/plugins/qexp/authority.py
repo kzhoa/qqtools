@@ -5,6 +5,8 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from .config_types import RootConfig
+from .lifecycle import (TerminalTransition, commit_terminal_transition_locked,
+                         dispatch_task_lifecycle_hooks_noexcept)
 from .lease import (AuthorityResolutionOutcome, LeasePolicy, LeaseRenewalOutcome,
                     holder_safe_deadline, load_lease_policy)
 from .runtime.claims import archive_claim
@@ -247,6 +249,7 @@ class AuthoritySupervisor:
     def _finalize(self, task_id: str, attempt_id: str, token: int, exit_code: object,
                   *, was_terminated: bool) -> None:
         task = load_task(self.cfg, task_id)
+        result = None
         with authority_locks(self.cfg, task):
             task = load_task(self.cfg, task_id)
             claim = task.claim_control.get("active_claim") or {}
@@ -255,10 +258,6 @@ class AuthoritySupervisor:
             number = task.attempt_control.get("current_attempt_number")
             if not isinstance(number, int):
                 return
-            path = attempt_path(self.cfg.shared_root, task_id, number)
-            attempt = AttemptRecord.from_dict(read_json(path))
-            if attempt.current_fencing_token != token:
-                return
             code = exit_code if isinstance(exit_code, int) else None
             was_cancel_requested = bool(task.control.get("terminate_running"))
             was_terminated = was_terminated or was_cancel_requested
@@ -266,24 +265,15 @@ class AuthoritySupervisor:
             reason = ("termination_process_already_exited" if was_cancel_requested else
                       ("terminated_by_agent" if was_terminated else
                        ("completed" if code == 0 else "nonzero_exit")))
-            attempt.phase = phase
-            attempt.result.update({"exit_code": code, "reason": reason})
-            attempt.timestamps["finished_at"] = utc_now()
-            if was_terminated:
-                termination_result = "already_exited" if was_cancel_requested else "terminated"
-                attempt.termination.update({"acknowledged_at": utc_now(), "result": termination_result})
-            atomic_replace(path, attempt.to_dict())
-            archive_claim(self.cfg, task_id, claim, reason)
-            task.claim_control["active_claim"] = None
-            task.attempt_control["current_attempt_id"] = None
-            task.state.update({"projection": phase, "reason": reason})
-            if was_terminated:
-                task.control.update({"termination_acknowledged_at": utc_now(),
-                                     "termination_result": termination_result})
-            task.meta["revision"] += 1
-            task.meta["updated_at"] = utc_now()
-            save_task(self.cfg, task)
-        release(self.cfg.runtime_root, claim["reservation_id"], reason)
+            result = commit_terminal_transition_locked(
+                self.cfg, task, TerminalTransition(task_id, attempt_id, number, token, phase, reason,
+                    code, frozenset({"running", "starting", "claimed"}),
+                    frozenset({"claimed", "starting", "running"}), "active",
+                    "already_exited" if was_cancel_requested else ("terminated" if was_terminated else None)))
+        if result.outcome != "committed":
+            return
+        if result.reservation_id and result.reservation_machine_name == self.cfg.machine_name:
+            release(self.cfg.runtime_root, result.reservation_id, reason)
         manifest_path = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
         process = read_json(manifest_path).get("process", {})
         if (process.get("task_id") == task_id and process.get("attempt_id") == attempt_id
@@ -291,3 +281,5 @@ class AuthoritySupervisor:
             process.update({"observed_state": "exited", "observed_exit_code": code,
                             "observed_exited_at": utc_now()})
             atomic_replace(manifest_path, {"process": process})
+        if result.event:
+            dispatch_task_lifecycle_hooks_noexcept(self.cfg, result.event)
