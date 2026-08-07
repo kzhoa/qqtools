@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fix: advance custom DataLoader samplers and batch samplers at every qpipeline training epoch,
+  including single-process runs, while avoiding duplicate calls for a shared sampler object
 - feat: add qexp terminal lifecycle notifications with a built-in Feishu webhook provider,
   unified terminal-transition events, at-most-one send-attempt claims, and failure-isolated
   dispatch from the process that commits terminal state
