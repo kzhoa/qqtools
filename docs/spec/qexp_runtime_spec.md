@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-06
+updated_at: 2026-08-07
 archived_at:
 ---
 
@@ -76,6 +76,23 @@ destructive:
 
 Loss of Batch-era scheduling metadata is a known and accepted product risk. The schema-5 to
 schema-6 migration is a one-way control-root upgrade, not a legacy reader or repair path.
+
+## Lifecycle terminal boundary and notifications
+
+Every attempt-backed terminal transition (`succeeded`, `failed`, or `cancelled`) is committed
+through one locked terminal-transition primitive. The primitive validates task/attempt identity,
+fencing and source phases, writes Attempt and Task truth, archives an active claim, and returns an
+immutable lifecycle event. Reservation release, local process-manifest updates, and lifecycle hook
+dispatch occur after Group/Task locks are released. Hook and notifier failures are isolated from
+authoritative state.
+
+The process that successfully commits the transition dispatches using its own machine configuration;
+therefore a controller cancelling a remote pre-launch Attempt sends the notification. Events retain
+both execution and dispatching machine names. Machine notification configuration is additive and
+default-off. Feishu uses the environment by default; an explicitly acknowledged `shared_file`
+webhook source may persist a URL in that machine's shared control-root secrets directory, while a
+signing secret remains environment-only. Notification records use an atomic claimed key and provide
+at-most-one HTTP send attempt, without retry or exactly-once delivery guarantees.
 
 ## 3. Deployment Model
 

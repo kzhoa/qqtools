@@ -8,20 +8,22 @@ from .config_types import MachinePolicy, RootConfig
 from .layout import (initialize_shared_root, load_machine_record, project_id,
                      save_machine_record)
 from .policy import normalize_agent_mode, resolve_machine_policy
+from .runtime.locks import machine_lock
 
 
 def save_machine_config(cfg: RootConfig, *, agent_mode: str | None) -> None:
     """Normalize and persist the current machine's metadata record."""
-    save_machine_record(cfg, {
-        "machine": {
+    with machine_lock(cfg.shared_root, cfg.machine_name):
+        current = load_machine_record(cfg) or {}
+        current["machine"] = {
             "machine_name": cfg.machine_name,
             "hostname": os.uname().nodename,
             "project_id": project_id(cfg.shared_root),
             "shared_root": str(cfg.shared_root),
             "runtime_root": str(cfg.runtime_root),
             "agent_mode": normalize_agent_mode(agent_mode),
-        },
-    })
+        }
+        save_machine_record(cfg, current)
 
 
 def load_machine_policy(cfg: RootConfig) -> MachinePolicy:

@@ -21,6 +21,8 @@ from .lease import LeasePolicy, load_lease_policy, save_lease_policy
 from .runtime.paths import shared_paths
 from .runtime.store import iter_json, read_json
 from .machine_config import init_shared_root, load_machine_policy
+from .notification_config import (DEFAULT_WEBHOOK_ENV, load_notifications,
+                                  update_notifications, write_shared_feishu_webhook)
 from . import observer
 
 
@@ -59,6 +61,27 @@ def build_parser() -> argparse.ArgumentParser:
     policy_set.add_argument("--clock-provider-margin-seconds", type=float)
     policy_set.add_argument("--clock-provider-priority")
     policy_set.add_argument("--renewal-commit-margin-seconds", type=float)
+    config = commands.add_parser("config")
+    config_sub = config.add_subparsers(dest="config_action", required=True)
+    notifications = config_sub.add_parser("notifications")
+    notifications_sub = notifications.add_subparsers(dest="notifications_action", required=True)
+    notifications_sub.add_parser("show")
+    notifications_set = notifications_sub.add_parser("set")
+    notifications_set.add_argument("--enabled", action="store_true")
+    notifications_set.add_argument("--disabled", action="store_true")
+    provider = notifications_sub.add_parser("provider")
+    provider_sub = provider.add_subparsers(dest="provider_action", required=True)
+    provider_set = provider_sub.add_parser("set")
+    provider_set.add_argument("provider")
+    provider_set.add_argument("--enabled", action="store_true")
+    provider_set.add_argument("--disabled", action="store_true")
+    provider_set.add_argument("--webhook-env")
+    provider_set.add_argument("--credential-source", choices=["env", "shared_file"])
+    provider_set.add_argument("--webhook-stdin", action="store_true")
+    provider_set.add_argument("--acknowledge-shared-secret-risk", action="store_true")
+    provider_set.add_argument("--secret-env")
+    provider_set.add_argument("--unset-secret-env", action="store_true")
+    provider_set.add_argument("--timeout-seconds", type=float)
     submit = commands.add_parser("submit")
     for action in (submit,):
         action.add_argument("--task-id"); action.add_argument("--name"); action.add_argument("--group")
@@ -176,6 +199,59 @@ def main(argv: list[str] | None = None) -> int:
             if not args.use_shared_root or not args.use_machine: raise ValueError("use requires --shared-root and --machine.")
             save_context(args.use_shared_root, args.use_machine, args.use_runtime_root); return 0
         cfg = _resolve_cfg(args)
+        if args.command == "config":
+            if args.config_action != "notifications":
+                raise ValueError("unknown config action")
+            if args.notifications_action == "show":
+                print(json.dumps(load_notifications(cfg), indent=2, sort_keys=True))
+                return 0
+            if args.notifications_action == "set":
+                if args.enabled and args.disabled:
+                    raise ValueError("--enabled and --disabled are mutually exclusive")
+                if not args.enabled and not args.disabled:
+                    raise ValueError("one of --enabled or --disabled is required")
+                value = update_notifications(cfg, lambda current: {
+                    **current, "enabled": args.enabled,
+                })
+                print(json.dumps(value, indent=2, sort_keys=True)); return 0
+            if args.provider_action == "set":
+                if args.provider != "feishu":
+                    raise ValueError(f"unknown notification provider {args.provider!r}")
+                if args.enabled and args.disabled:
+                    raise ValueError("--enabled and --disabled are mutually exclusive")
+                if args.secret_env and args.unset_secret_env:
+                    raise ValueError("--secret-env and --unset-secret-env are mutually exclusive")
+                if args.webhook_stdin and args.credential_source != "shared_file":
+                    raise ValueError("--webhook-stdin requires --credential-source shared_file")
+                if args.credential_source == "shared_file" and not args.acknowledge_shared_secret_risk:
+                    raise ValueError(
+                        "--credential-source shared_file requires --acknowledge-shared-secret-risk"
+                    )
+                shared_webhook = None
+                if args.webhook_stdin:
+                    shared_webhook = sys.stdin.readline().rstrip("\r\n")
+                    if not shared_webhook:
+                        raise ValueError("--webhook-stdin requires a non-empty first input line")
+                def update_provider(current):
+                    providers = dict(current["providers"])
+                    provider_value = dict(providers.get("feishu", {
+                        "enabled": False, "webhook_env": DEFAULT_WEBHOOK_ENV,
+                        "secret_env": None, "timeout_seconds": 5, "credential_source": "env",
+                    }))
+                    if args.enabled: provider_value["enabled"] = True
+                    if args.disabled: provider_value["enabled"] = False
+                    if args.credential_source is not None:
+                        provider_value["credential_source"] = args.credential_source
+                    if args.webhook_env is not None: provider_value["webhook_env"] = args.webhook_env
+                    if args.secret_env is not None: provider_value["secret_env"] = args.secret_env
+                    if args.unset_secret_env: provider_value["secret_env"] = None
+                    if args.timeout_seconds is not None: provider_value["timeout_seconds"] = args.timeout_seconds
+                    providers["feishu"] = provider_value
+                    return {**current, "providers": providers}
+                value = update_notifications(cfg, update_provider)
+                if shared_webhook is not None:
+                    write_shared_feishu_webhook(cfg, shared_webhook)
+                print(json.dumps(value, indent=2, sort_keys=True)); return 0
         if args.command == "lease-policy":
             current = load_lease_policy(cfg)
             if args.lease_policy_action == "show":

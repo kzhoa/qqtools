@@ -190,6 +190,38 @@ qexp clean --task-id TASK_ID --dry-run
 qexp clean --older-than-days 30 --limit 100
 ```
 
+Terminal notifications are disabled by default. Configure the machine-local Feishu Incoming
+Webhook from the agent environment (the default, recommended mode):
+
+```bash
+qexp config notifications set --enabled
+qexp config notifications provider set feishu --enabled \
+  --webhook-env QEXP_FEISHU_WEBHOOK --secret-env QEXP_FEISHU_SECRET
+export QEXP_FEISHU_WEBHOOK='https://open.feishu.cn/open-apis/bot/v2/hook/...'
+export QEXP_FEISHU_SECRET='...'
+qexp config notifications show
+```
+
+For installations that deliberately accept the shared-root credential risk, a webhook can instead
+be persisted under that machine's `.qexp/machines/<machine>/secrets/` directory. The URL is read
+from standard input so it does not enter shell history; the explicit acknowledgement is required:
+
+```bash
+printf '%s\n' 'https://open.feishu.cn/open-apis/bot/v2/hook/...' |
+  qexp config notifications provider set feishu \
+    --enabled --credential-source shared_file --webhook-stdin --acknowledge-shared-secret-risk
+```
+
+This file is requested as owner-private (`0600`) but remains on the shared control root. Anyone
+with access to that storage or its backups may be able to read it. `qexp config notifications show`
+never prints the URL. A signing secret, when configured, remains environment-only.
+
+The webhook and secret are read by the process that commits the terminal transition. Non-sensitive
+configuration is read at dispatch time, so changes affect future terminal events. Environment
+variable value changes require restarting that agent; restarting the agent does not terminate the
+running task process. Delivery is synchronous and no-throw with at-most-one send attempt: crashes
+or network ambiguity can permanently lose a notification, and qexp does not retry it.
+
 `batch-submit` manifests may set Group workers and nested placement defaults, with per-Task
 overrides:
 

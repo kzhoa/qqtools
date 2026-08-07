@@ -47,4 +47,10 @@ def group_lock(root: Path, name: str, *, blocking: bool = True) -> Iterator[bool
 @contextmanager
 def task_lock(root: Path, task_id: str, *, blocking: bool = True) -> Iterator[bool]:
     with exclusive(lock_path(root, "tasks", task_id), blocking=blocking) as acquired:
+            yield acquired
+
+
+@contextmanager
+def machine_lock(root: Path, machine_name: str, *, blocking: bool = True) -> Iterator[bool]:
+    with exclusive(lock_path(root, "machines", machine_name), blocking=blocking) as acquired:
         yield acquired

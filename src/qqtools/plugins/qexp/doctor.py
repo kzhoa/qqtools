@@ -7,6 +7,8 @@ from typing import Any
 from .commands.cleanup import reconcile_cleanup_operations
 from .commands.group import reconcile_group_cancel_operations
 from .config_types import RootConfig
+from .lifecycle import (TerminalTransition, commit_terminal_transition_locked,
+                        dispatch_task_lifecycle_hooks_noexcept)
 from .runtime.availability import rebuild_deadline_indexes, reconcile_availability_operations
 from .runtime.claims import archive_claim
 from .layout import validate_root_contract
@@ -346,6 +348,7 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
             continue
         high_watermark = control["membership_high_watermark"]
         group_name = control["group_name"]
+        post_commit_results = []
         with group_lock(cfg.shared_root, group_name):
             group_file = group_path(cfg.shared_root, group_name)
             if not group_file.exists():
@@ -364,29 +367,34 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
                     continue
                 with task_lock(cfg.shared_root, task.task_id):
                     task = load_task(cfg, task.task_id)
+                    has_saved_task = False
                     claim = task.claim_control.get("active_claim") or {}
                     if task.state["projection"] == "queued" and not claim:
                         task.state.update({"projection": "cancelled", "reason": "group_cancelled"})
                     elif claim.get("launch_state") == "claimed":
-                        attempt_file = attempt_path(cfg.shared_root, task.task_id, task.attempt_control["current_attempt_number"])
-                        if attempt_file.exists():
-                            attempt = AttemptRecord.from_dict(read_json(attempt_file))
-                            attempt.phase = "cancelled"
-                            attempt.result["reason"] = "group_cancelled_before_launch"
-                            attempt.timestamps["finished_at"] = utc_now()
-                            atomic_replace(attempt_file, attempt.to_dict())
-                        archive_claim(cfg, task.task_id, claim, "group_cancelled_before_launch")
-                        task.claim_control["active_claim"] = None
-                        task.attempt_control["current_attempt_id"] = None
-                        task.state.update({"projection": "cancelled", "reason": "group_cancelled_before_launch"})
+                        result = commit_terminal_transition_locked(
+                            cfg, task, TerminalTransition(task.task_id, claim["attempt_id"],
+                                task.attempt_control["current_attempt_number"], claim["fencing_token"],
+                                "cancelled", "group_cancelled_before_launch", None,
+                                frozenset({"running"}), frozenset({"claimed"}), "active",
+                                allow_missing_attempt=True))
+                        post_commit_results.append(result)
+                        has_saved_task = result.outcome == "committed"
                     elif task.state["projection"] == "running" and control["terminate_running"]:
                         task.control.update({"cancellation_requested_at": utc_now(),
                                              "cancellation_operation_id": control["operation_id"],
                                              "terminate_running": True,
                                              "requested_by": cfg.machine_name})
-                    task.meta["revision"] += 1
-                    task.meta["updated_at"] = utc_now()
-                    atomic_replace(task_path(cfg.shared_root, task.task_id), task.to_dict())
+                    if not has_saved_task:
+                        task.meta["revision"] += 1
+                        task.meta["updated_at"] = utc_now()
+                        atomic_replace(task_path(cfg.shared_root, task.task_id), task.to_dict())
+        for result in post_commit_results:
+            if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
+                from .runtime.reservations import release
+                release(cfg.runtime_root, result.reservation_id, "group_cancelled_before_launch")
+            if result.event:
+                dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
         pending: dict[str, list[str]] = {}
         acknowledged = 0
         blocked_tasks = 0
