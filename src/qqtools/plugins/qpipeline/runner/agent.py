@@ -195,8 +195,15 @@ class RunningAgent:
         if self.train_tensor_bank:
             self.train_tensor_bank.reset()
 
-        if self.config.distributed and hasattr(self.train_loader.sampler, "set_epoch"):
-            self.train_loader.sampler.set_epoch(self.state.epoch)
+        seen_sampler_ids = set()
+        for sampler in (
+            getattr(self.train_loader, "sampler", None),
+            getattr(self.train_loader, "batch_sampler", None),
+        ):
+            set_epoch = getattr(sampler, "set_epoch", None)
+            if callable(set_epoch) and id(sampler) not in seen_sampler_ids:
+                set_epoch(self.state.epoch)
+                seen_sampler_ids.add(id(sampler))
 
         self.state.mark_epoch_end_eval_trigger(eval_triggered=False)
         total_batches = len(self.train_loader)

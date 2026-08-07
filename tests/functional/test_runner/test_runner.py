@@ -10,10 +10,12 @@ from types import SimpleNamespace
 from typing import Dict
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
 from qqtools.plugins.qpipeline.qlogger import qLogger
 from qqtools.plugins.qpipeline.runner import agent as agent_module
@@ -45,6 +47,7 @@ from qqtools.plugins.qpipeline.runner.runner_utils.types import (
     RunMode,
     RunningState,
 )
+from qqtools.torch.ddp import BalancedBatchSampler
 
 from .conftest import SimpleModel, SimpleTask
 
@@ -230,6 +233,72 @@ class TestEventContracts:
         assert hasattr(received["internal"], "total_batches")
         assert received["internal"].total_batches == len(task.train_loader)
         assert not hasattr(received["public"], "total_batches")
+
+    def test_epoch_start_advances_custom_batch_sampler_without_distributed(self):
+        batch_sampler = BalancedBatchSampler(
+            np.linspace(1.0, 256.0, num=256),
+            batch_size=4,
+            rank=0,
+            world_size=2,
+            shuffle=True,
+            seed=13,
+        )
+        task = SimpleTask(num_samples=16, num_features=10)
+        task.train_loader = DataLoader(
+            TensorDataset(torch.arange(256)),
+            batch_sampler=batch_sampler,
+        )
+        model = SimpleModel(input_dim=10)
+        agent = RunningAgent(
+            model=model,
+            task=task,
+            loss_fn=nn.MSELoss(),
+            optimizer=optim.Adam(model.parameters(), lr=0.001),
+            config=RunConfig(distributed=False),
+            state=RunningState(epoch=0),
+        )
+
+        agent._start_new_epoch()
+        epoch_zero_plan = list(batch_sampler)
+
+        agent.state.epoch = 1
+        agent._start_new_epoch()
+
+        assert batch_sampler._plan_cache.epoch == 1
+        assert list(batch_sampler) != epoch_zero_plan
+
+    def test_epoch_start_calls_shared_sampler_once(self):
+        class EpochRecorder:
+            def __init__(self):
+                self.epochs = []
+
+            def set_epoch(self, epoch):
+                self.epochs.append(epoch)
+
+        class SharedSamplerLoader:
+            def __init__(self, sampler):
+                self.sampler = sampler
+                self.batch_sampler = sampler
+
+            def __len__(self):
+                return 1
+
+        recorder = EpochRecorder()
+        task = SimpleTask(num_samples=16, num_features=10)
+        task.train_loader = SharedSamplerLoader(recorder)
+        model = SimpleModel(input_dim=10)
+        agent = RunningAgent(
+            model=model,
+            task=task,
+            loss_fn=nn.MSELoss(),
+            optimizer=optim.Adam(model.parameters(), lr=0.001),
+            config=RunConfig(distributed=False),
+            state=RunningState(epoch=3),
+        )
+
+        agent._start_new_epoch()
+
+        assert recorder.epochs == [3]
 
     def test_loss_computed_emits_before_backward(self):
         task = SimpleTask(num_samples=16, num_features=10)
