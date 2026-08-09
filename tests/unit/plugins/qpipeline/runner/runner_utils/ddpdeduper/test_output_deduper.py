@@ -4,6 +4,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from qqtools.torch.ddp import BalancedDistributedSampler
 from qqtools.plugins.qpipeline.runner.runner_utils.avgbank import AvgBank
 from qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.eval_contract import EvalBatch, EvalDedupRuntime
 from qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper import DDPOutputDeduper
@@ -30,6 +31,14 @@ class RawDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.values[idx]
+
+
+def _collate_as_list(batch):
+    return list(batch)
+
+
+def _to_batches(indices, batch_size):
+    return [indices[start : start + batch_size] for start in range(0, len(indices), batch_size)]
 
 
 def _mock_gather(monkeypatch, gathered_batches, gathered_real_ids):
@@ -120,6 +129,182 @@ def test_deduper_batch_sampler_fallback(monkeypatch):
 
     assert batches[0].control.all_duplicate is False
     assert batches[0].payload == [10, 12]
+
+
+def test_deduper_collects_worker_real_ids_in_main_process(monkeypatch):
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_world_size",
+        lambda: 2,
+    )
+    sample_costs = [5.0, 4.0, 3.0, 2.0, 1.0]
+    local_indices = list(
+        BalancedDistributedSampler(
+            sample_costs,
+            batch_size=2,
+            rank=0,
+            world_size=2,
+            shuffle=False,
+        )
+    )
+    remote_indices = list(
+        BalancedDistributedSampler(
+            sample_costs,
+            batch_size=2,
+            rank=1,
+            world_size=2,
+            shuffle=False,
+        )
+    )
+    local_batches = _to_batches(local_indices, batch_size=2)
+    remote_batches = _to_batches(remote_indices, batch_size=2)
+    remote_real_ids = []
+    seen_ids = set()
+    for step_idx in range(max(len(local_batches), len(remote_batches))):
+        for rank_idx, rank_batches in enumerate((local_batches, remote_batches)):
+            if step_idx >= len(rank_batches):
+                continue
+            for logical_id in rank_batches[step_idx]:
+                is_real = logical_id not in seen_ids
+                seen_ids.add(logical_id)
+                if rank_idx == 1 and is_real:
+                    remote_real_ids.append(logical_id)
+
+    collected_ids_by_main_process = []
+
+    def _fake_gather(value):
+        if value and isinstance(value[0], list):
+            return [local_batches, remote_batches]
+        collected_ids_by_main_process.append(list(value))
+        return [list(value), remote_real_ids]
+
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper._all_gather_object",
+        _fake_gather,
+    )
+    sampler = BalancedDistributedSampler(
+        sample_costs,
+        batch_size=2,
+        rank=0,
+        world_size=2,
+        shuffle=False,
+    )
+    loader = DataLoader(
+        RawDataset(range(len(sample_costs))),
+        batch_size=2,
+        sampler=sampler,
+        collate_fn=_collate_as_list,
+        num_workers=1,
+    )
+
+    batches = list(DDPOutputDeduper(loader).wrap())
+
+    local_real_ids = []
+    for batch in batches:
+        local_real_ids.extend(batch.control.real_logical_sample_ids)
+    assert collected_ids_by_main_process == [local_real_ids]
+    assert set(local_real_ids).isdisjoint(remote_real_ids)
+    assert set(local_real_ids).union(remote_real_ids) == set(range(len(sample_costs)))
+
+
+def test_deduper_skips_completion_assertion_after_early_exit(monkeypatch):
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_world_size",
+        lambda: 1,
+    )
+    gather_calls = []
+
+    def _fake_gather(value):
+        gather_calls.append(value)
+        return [value]
+
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper._all_gather_object",
+        _fake_gather,
+    )
+    loader = DataLoader(RawDataset([0, 1, 2]), batch_size=1, collate_fn=_collate_as_list)
+    wrapped = DDPOutputDeduper(loader).wrap()
+
+    iterator = iter(wrapped)
+    next(iterator)
+    iterator.close()
+
+    assert len(gather_calls) == 1
+
+
+def test_deduper_repeated_iteration_keeps_audit_state_isolated(monkeypatch):
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_world_size",
+        lambda: 1,
+    )
+    completion_records = []
+
+    def _fake_gather(value):
+        if value and isinstance(value[0], list):
+            return [value]
+        completion_records.append(list(value))
+        return [value]
+
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper._all_gather_object",
+        _fake_gather,
+    )
+    loader = DataLoader(RawDataset([0, 1, 2]), batch_size=2, collate_fn=_collate_as_list)
+    wrapped = DDPOutputDeduper(loader).wrap()
+
+    list(wrapped)
+    list(wrapped)
+
+    assert completion_records == [[0, 1, 2], [0, 1, 2]]
+
+
+def test_deduper_persistent_workers_keep_audit_state_isolated(monkeypatch):
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_world_size",
+        lambda: 1,
+    )
+    completion_records = []
+
+    def _fake_gather(value):
+        if value and isinstance(value[0], list):
+            return [value]
+        completion_records.append(list(value))
+        return [value]
+
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper._all_gather_object",
+        _fake_gather,
+    )
+    wrapped = DDPOutputDeduper(
+        DataLoader(
+            RawDataset([0, 1, 2]),
+            batch_size=2,
+            collate_fn=_collate_as_list,
+            num_workers=1,
+            persistent_workers=True,
+            multiprocessing_context="spawn",
+        )
+    ).wrap()
+
+    list(wrapped)
+    list(wrapped)
+
+    assert completion_records == [[0, 1, 2], [0, 1, 2]]
 
 
 def test_deduper_rejects_iterable_dataset(monkeypatch):

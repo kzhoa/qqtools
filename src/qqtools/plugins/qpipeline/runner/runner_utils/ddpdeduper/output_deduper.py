@@ -61,9 +61,8 @@ class _OccurrenceBatchSampler(Sampler[list[OccurrenceKey]]):
 
 
 class _DedupCollate:
-    def __init__(self, collate_fn, deduper: "DDPOutputDeduper"):
+    def __init__(self, collate_fn):
         self._collate_fn = collate_fn
-        self._deduper = deduper
 
     def __call__(self, batch_list: Sequence[_SampleEnvelope]) -> EvalBatch:
         if not batch_list:
@@ -74,7 +73,6 @@ class _DedupCollate:
         collate_source = [item.payload for item in batch_list] if is_all_duplicate else [item.payload for item in real_items]
         payload = self._collate_fn(collate_source)
         real_logical_ids = tuple(item.occurrence.logical_sample_id for item in real_items)
-        self._deduper.record_real_logical_ids(real_logical_ids)
         return EvalBatch(
             payload=payload,
             control=EvalBatchControl(
@@ -95,14 +93,15 @@ class _DedupedDataLoader:
 
     def __iter__(self):
         completed_naturally = False
-        self._deduper.reset_iteration_state()
+        collected_real_logical_ids: list[Any] = []
         try:
             for batch in self._loader:
+                collected_real_logical_ids.extend(batch.control.real_logical_sample_ids)
                 yield batch
             completed_naturally = True
         finally:
             if completed_naturally:
-                self._deduper.assert_natural_completion()
+                self._deduper.assert_natural_completion(collected_real_logical_ids)
 
 
 class DDPOutputDeduper:
@@ -133,7 +132,6 @@ class DDPOutputDeduper:
         self.rank = qt.qdist.get_rank()
         self.world_size = qt.qdist.get_world_size()
 
-        self._collected_real_logical_ids: list[Any] = []
         self._target_logical_sample_ids: set[Any] = set()
 
     def wrap(self):
@@ -142,7 +140,7 @@ class DDPOutputDeduper:
         self._target_logical_sample_ids = target_ids
 
         wrapped_dataset = _WrappedDataset(self.loader.dataset, slot_is_real=slot_is_real)
-        wrapped_collate = _DedupCollate(self.loader.collate_fn, deduper=self)
+        wrapped_collate = _DedupCollate(self.loader.collate_fn)
         wrapped_loader = DataLoader(
             dataset=wrapped_dataset,
             batch_sampler=_OccurrenceBatchSampler(occurrence_batches),
@@ -167,14 +165,8 @@ class DDPOutputDeduper:
         )
         return _DedupedDataLoader(wrapped_loader, deduper=self, runtime=runtime)
 
-    def reset_iteration_state(self) -> None:
-        self._collected_real_logical_ids = []
-
-    def record_real_logical_ids(self, logical_ids: Sequence[Any]) -> None:
-        self._collected_real_logical_ids.extend(logical_ids)
-
-    def assert_natural_completion(self) -> None:
-        gathered_real_ids = _all_gather_object(list(self._collected_real_logical_ids))
+    def assert_natural_completion(self, collected_real_logical_ids: Sequence[Any]) -> None:
+        gathered_real_ids = _all_gather_object(list(collected_real_logical_ids))
         flattened = [logical_id for rank_ids in gathered_real_ids for logical_id in rank_ids]
         if len(flattened) != len(self._target_logical_sample_ids):
             raise AssertionError(
