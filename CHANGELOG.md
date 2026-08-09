@@ -1,6 +1,6 @@
 # History
 
-## Unreleased
+## v1.3.3
 
 - fix: collect qpipeline DDP eval/infer dedup audit IDs in the main-process loader iterator so
   natural-completion assertions work with multi-worker DataLoaders
