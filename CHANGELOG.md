@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- fix: collect qpipeline DDP eval/infer dedup audit IDs in the main-process loader iterator so
+  natural-completion assertions work with multi-worker DataLoaders
+
 ## v1.3.2
 
 - fix: advance custom DataLoader samplers and batch samplers at every qpipeline training epoch,
