@@ -10,7 +10,13 @@ import qqtools as qt
 
 from .eval_contract import EvalBatch, EvalBatchControl, EvalDedupRuntime, _all_gather_object
 
-__all__ = ["DDPOutputDeduper", "wrap_eval_dataloader_for_ddp_dedup"]
+__all__ = [
+    "DDPOutputDeduper",
+    "prepare_eval_loader_for_ddp",
+    "resolve_loader_is_graph",
+    "validate_eval_loader_batch_counts",
+    "wrap_eval_dataloader_for_ddp_dedup",
+]
 
 
 @dataclass(frozen=True)
@@ -70,7 +76,11 @@ class _DedupCollate:
 
         real_items = [item for item in batch_list if item.is_real]
         is_all_duplicate = len(real_items) == 0
-        collate_source = [item.payload for item in batch_list] if is_all_duplicate else [item.payload for item in real_items]
+        collate_source = (
+            [item.payload for item in batch_list]
+            if is_all_duplicate
+            else [item.payload for item in real_items]
+        )
         payload = self._collate_fn(collate_source)
         real_logical_ids = tuple(item.occurrence.logical_sample_id for item in real_items)
         return EvalBatch(
@@ -269,3 +279,73 @@ def wrap_eval_dataloader_for_ddp_dedup(
         is_graph=is_graph,
         node_aligned_output_keys=node_aligned_output_keys,
     ).wrap()
+
+
+def validate_eval_loader_batch_counts(
+    loader: DataLoader,
+    *,
+    stage: str,
+    loader_name: Optional[str],
+    distributed: bool,
+) -> None:
+    """Fail before forward when DDP eval ranks would execute different steps."""
+    try:
+        local_count = len(loader)
+    except Exception as error:
+        display_name = loader_name if loader_name is not None else "<default>"
+        raise TypeError(
+            "DDP evaluation loader is not safely observable: "
+            f"stage={stage}, loader={display_name}. len(loader) must be available."
+        ) from error
+    gathered_counts = _all_gather_object(local_count) if distributed else [local_count]
+    if len(set(gathered_counts)) == 1:
+        return
+
+    counts = {rank: count for rank, count in enumerate(gathered_counts)}
+    display_name = loader_name if loader_name is not None else "<default>"
+    raise RuntimeError(
+        "DDP evaluation loader batch-count mismatch: "
+        f"stage={stage}, loader={display_name}, world_size={len(gathered_counts)}, "
+        f"counts={counts}. "
+        "All ranks must execute the same number of eval batches. "
+        "Pad the sampler plan or use drop_last=True."
+    )
+
+
+def resolve_loader_is_graph(loader: DataLoader) -> bool:
+    """Resolve graph mode from the loader, then its dataset."""
+    loader_value = getattr(loader, "is_graph", None)
+    if loader_value is not None:
+        return bool(loader_value)
+    return bool(getattr(getattr(loader, "dataset", None), "is_graph", False))
+
+
+def prepare_eval_loader_for_ddp(
+    loader: DataLoader,
+    *,
+    enabled: bool,
+    stage: str,
+    loader_name: Optional[str],
+    distributed: bool,
+    should_validate_batch_counts: bool = True,
+    node_aligned_output_keys: Optional[Sequence[str]] = None,
+) -> DataLoader:
+    """Validate and optionally wrap one pass-local DDP evaluation loader."""
+    if not distributed:
+        return loader
+
+    if should_validate_batch_counts:
+        validate_eval_loader_batch_counts(
+            loader,
+            stage=stage,
+            loader_name=loader_name,
+            distributed=True,
+        )
+    if not enabled:
+        return loader
+    return wrap_eval_dataloader_for_ddp_dedup(
+        loader,
+        enabled=True,
+        is_graph=resolve_loader_is_graph(loader),
+        node_aligned_output_keys=node_aligned_output_keys,
+    )

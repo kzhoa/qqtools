@@ -607,6 +607,7 @@ def train_runner(
         device=device,
         checkpoint=checkpoint_config,
         early_stop=early_stop_config,
+        ddp_eval_dedup=bool(_getattr_or_default(runner_config, "ddp_eval_dedup", True)),
     )
     scheduler_target = _qconfig_get(
         _qconfig_get(getattr(args, "optim", None), "scheduler_params", None), "target", "val_metric"

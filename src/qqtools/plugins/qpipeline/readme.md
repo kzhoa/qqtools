@@ -45,7 +45,7 @@ python train.py \
 
 ## DDP eval dedup
 
-`task.eval.ddp_dedup` is only meant for DDP eval/infer cases where the sampler pads repeated
+`runner.ddp_eval_dedup` is only meant for DDP eval/infer cases where the sampler pads repeated
 logical samples to keep per-rank step counts aligned.
 
 It is not a general-purpose dedup mechanism. If a sampler intentionally repeats the same logical

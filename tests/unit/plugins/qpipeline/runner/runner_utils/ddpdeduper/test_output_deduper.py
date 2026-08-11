@@ -7,7 +7,10 @@ from torch.utils.data import DataLoader, Dataset
 from qqtools.torch.ddp import BalancedDistributedSampler
 from qqtools.plugins.qpipeline.runner.runner_utils.avgbank import AvgBank
 from qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.eval_contract import EvalBatch, EvalDedupRuntime
-from qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper import DDPOutputDeduper
+from qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper import (
+    DDPOutputDeduper,
+    prepare_eval_loader_for_ddp,
+)
 from qqtools.plugins.qpipeline.runner.runner_utils.tensorbank import TensorBank
 
 
@@ -39,6 +42,23 @@ def _collate_as_list(batch):
 
 def _to_batches(indices, batch_size):
     return [indices[start : start + batch_size] for start in range(0, len(indices), batch_size)]
+
+
+def test_prepare_eval_loader_rejects_unequal_rank_batch_counts(monkeypatch):
+    loader = DataLoader(DictDataset([0, 1, 2]), batch_size=2, shuffle=False, collate_fn=lambda batch: batch)
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper._all_gather_object",
+        lambda value: [value, value - 1],
+    )
+
+    with pytest.raises(RuntimeError, match=r"stage=val.*counts=\{0: 2, 1: 1\}"):
+        prepare_eval_loader_for_ddp(
+            loader,
+            enabled=False,
+            stage="val",
+            loader_name="val_id",
+            distributed=True,
+        )
 
 
 def _mock_gather(monkeypatch, gathered_batches, gathered_real_ids):

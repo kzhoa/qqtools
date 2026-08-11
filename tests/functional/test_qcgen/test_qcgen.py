@@ -24,6 +24,15 @@ def _load_optim_schema():
         return json.load(f)
 
 
+def _load_qconfig_schema():
+    schema_path = (
+        Path(__file__).resolve().parents[3]
+        / "src/qqtools/plugins/qConfigGen/schemas/qConfigSchema.json"
+    )
+    with open(schema_path, "r") as f:
+        return json.load(f)
+
+
 def test_qcgen_import():
     """Test that qcgen CLI module can be imported"""
     from qqtools.cli import qcgen
@@ -200,6 +209,27 @@ def test_runner_schema_supports_accum_grad():
     assert accum_grad_schema["type"] == ["integer", "null"]
     assert accum_grad_schema["minimum"] == 1
     assert accum_grad_schema["default"] is None
+
+
+def test_runner_schema_supports_ddp_eval_dedup_default():
+    schema = _load_runner_schema()
+
+    dedup_schema = schema["properties"]["ddp_eval_dedup"]
+
+    assert dedup_schema == {
+        "type": "boolean",
+        "default": True,
+        "description": "Remove DDP sampler-padding occurrences from eval/infer aggregation.",
+    }
+
+
+def test_qconfig_schema_rejects_legacy_task_eval_surface():
+    schema = _load_qconfig_schema()
+    task_properties = schema["properties"]["task"]["properties"]
+
+    assert "eval" not in task_properties
+    assert "node_aligned_output_keys" in task_properties
+    assert schema["properties"]["task"]["not"] == {"required": ["eval"]}
 
 
 def test_runner_schema_requires_mode_specific_boundaries():

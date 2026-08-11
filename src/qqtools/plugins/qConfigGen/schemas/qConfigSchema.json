@@ -33,33 +33,21 @@
                     "type": "string",
                     "description": "Target predict label"
                 },
-                "eval": {
-                    "type": "object",
-                    "properties": {
-                        "ddp_dedup": {
-                            "type": "object",
-                            "properties": {
-                                "enabled": {
-                                    "type": "boolean"
-                                },
-                                "is_graph": {
-                                    "type": "boolean"
-                                },
-                                "node_aligned_output_keys": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                }
-                            },
-                            "additionalProperties": false
-                        }
+                "node_aligned_output_keys": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
                     },
-                    "additionalProperties": false
+                    "default": []
                 },
                 "dataloader": {
                     "$ref": "./definitions/dataloader.json"
                 }
+            },
+            "not": {
+                "required": [
+                    "eval"
+                ]
             }
         },
         "model": {

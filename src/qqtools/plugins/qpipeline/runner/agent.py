@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -57,6 +58,11 @@ from .runner_utils.evaluation import (
 from .runner_utils.hook_binding import bind_post_metrics_to_value
 from .runner_utils.tensorbank import TensorBank
 from .runner_utils.types import LoopSignal, RunConfig, RunMode, RunningState
+from .runner_utils.ddpdeduper import (
+    EvalDedupRuntime,
+    prepare_eval_loader_for_ddp,
+    unwrap_eval_batch,
+)
 
 
 def _get_scalar_metrics(batch_metrics: Dict[str, Any]) -> Dict[str, float]:
@@ -110,6 +116,7 @@ class RunningAgent:
             min_delta=self.config.checkpoint.get("min_delta", 0.0),
         )
         self._ad_hoc_signal = LoopSignal()
+        self._eval_counts_pending = self.config.distributed
 
         self.train_loader = task.train_loader
         self.train_avg_bank = avg_bank or AvgBank()
@@ -260,6 +267,58 @@ class RunningAgent:
             resolve_loader_group(self.task.test_loader, group_name="test"),
         )
 
+    def _node_aligned_output_keys(self) -> tuple[str, ...]:
+        task_config = getattr(getattr(self.task, "args", None), "task", None)
+        keys = getattr(self.task, "node_aligned_output_keys", None)
+        if keys is None:
+            keys = getattr(task_config, "node_aligned_output_keys", ())
+        return tuple(keys or ())
+
+    def _prepare_evaluation_loader_snapshot(
+        self,
+        val_loaders: list[tuple[Optional[str], DataLoader]],
+        test_loaders: list[tuple[Optional[str], DataLoader]],
+    ) -> tuple[list[tuple[Optional[str], DataLoader]], list[tuple[Optional[str], DataLoader]]]:
+        """Resolve one synchronized, pass-local evaluation loader snapshot."""
+        groups = ((Stage.VAL, val_loaders), (Stage.TEST, test_loaders))
+        manifest = [
+            (stage.value, loader_name)
+            for stage, loaders in groups
+            for loader_name, _ in loaders
+        ]
+        if self.config.distributed and dist.is_available() and dist.is_initialized():
+            gathered_manifests = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(gathered_manifests, manifest)
+            if any(item != gathered_manifests[0] for item in gathered_manifests[1:]):
+                raise RuntimeError(
+                    "DDP evaluation loader manifest mismatch across ranks: "
+                    f"manifests={gathered_manifests}. Resolve the same val/test loader topology on every rank."
+                )
+
+        node_aligned_keys = self._node_aligned_output_keys()
+        should_validate_batch_counts = self._eval_counts_pending
+        prepared_groups = []
+        for stage, loaders in groups:
+            prepared = [
+                (
+                    loader_name,
+                    prepare_eval_loader_for_ddp(
+                        data_loader,
+                        enabled=self.config.ddp_eval_dedup,
+                        stage=stage.value,
+                        loader_name=loader_name,
+                        distributed=self.config.distributed,
+                        should_validate_batch_counts=should_validate_batch_counts,
+                        node_aligned_output_keys=node_aligned_keys,
+                    ),
+                )
+                for loader_name, data_loader in loaders
+            ]
+            prepared_groups.append(prepared)
+        if should_validate_batch_counts and any(loaders for _, loaders in groups):
+            self._eval_counts_pending = False
+        return prepared_groups[0], prepared_groups[1]
+
     def _evaluate_loader_group(
         self,
         model: nn.Module,
@@ -303,6 +362,9 @@ class RunningAgent:
     def evaluate(self, model: nn.Module = None, use_ema: bool = False) -> EvaluationResult:
         base_model = model or self.model
         val_loaders, test_loaders = self._resolve_evaluation_loaders()
+        val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(
+            val_loaders, test_loaders
+        )
         with self._ema_offload_ctx(model=base_model, use_ema=use_ema) as eval_model:
             model_result = self._evaluate_model(
                 eval_model,
@@ -319,6 +381,9 @@ class RunningAgent:
     ) -> EvaluationResult:
         if val_loaders is None or test_loaders is None:
             val_loaders, test_loaders = self._resolve_evaluation_loaders()
+            val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(
+                val_loaders, test_loaders
+            )
 
         with self._ema_offload_ctx(model=self.model, use_ema=False) as eval_model:
             standard_result = self._evaluate_model(
@@ -342,10 +407,19 @@ class RunningAgent:
         loader_name: Optional[str] = None,
     ) -> EvaluationResult:
         base_model = model or self.model
+        prepared_loader = prepare_eval_loader_for_ddp(
+            data_loader,
+            enabled=self.config.ddp_eval_dedup,
+            stage=stage.value,
+            loader_name=loader_name,
+            distributed=self.config.distributed,
+            should_validate_batch_counts=True,
+            node_aligned_output_keys=self._node_aligned_output_keys(),
+        )
 
         with self._ema_offload_ctx(model=base_model, use_ema=use_ema) as eval_model:
             stage_result = self._evaluate_loader_group(
-                eval_model, [(loader_name, data_loader)], stage
+                eval_model, [(loader_name, prepared_loader)], stage
             )
             assert stage_result is not None
             return EvaluationResult(
@@ -367,6 +441,9 @@ class RunningAgent:
         has_epoch_metric = self.task.has_implemented("epoch_metric")
         use_tensor_bank_for_eval = has_batch_cache and has_epoch_metric
         eval_tensor_bank = TensorBank(logger=self.logger) if use_tensor_bank_for_eval else None
+        eval_runtime = getattr(data_loader, "dedup_runtime", None) or EvalDedupRuntime(
+            enabled=False
+        )
 
         has_progress_tick = self._has_listener("on_progress_tick")
         should_calc_avg = has_progress_tick
@@ -374,16 +451,28 @@ class RunningAgent:
         try:
             with torch.no_grad():
                 for batch_idx, batch_data in enumerate(data_loader):
+                    batch_data, control = unwrap_eval_batch(batch_data)
                     batch_data = self._prepare_batch(batch_data)
                     out, batch_data = self._forward_batch(model, batch_data)
 
-                    raw_batch_metrics = self.task.batch_metric(out, batch_data)
-                    eval_avg_bank.update_from_dict(raw_batch_metrics)
-                    if eval_tensor_bank:
-                        eval_tensor_bank.add(self.task.batch_cache(out, batch_data))
+                    raw_batch_metrics = (
+                        {}
+                        if control.all_duplicate
+                        else self.task.batch_metric(out, batch_data)
+                    )
+                    if not control.all_duplicate:
+                        eval_avg_bank.update_from_dict(raw_batch_metrics)
+                        if eval_tensor_bank:
+                            eval_tensor_bank.add(self.task.batch_cache(out, batch_data))
 
                     scalar_batch_metrics = _get_scalar_metrics(raw_batch_metrics)
-                    avg_metrics = eval_avg_bank.to_dict(self.config.distributed) if should_calc_avg else None
+                    avg_metrics = (
+                        eval_runtime.gather_avg_bank(
+                            eval_avg_bank, self.config.distributed, self.device
+                        )
+                        if should_calc_avg
+                        else None
+                    )
 
                     emit_batch_end(
                         self.dispatcher,
@@ -412,9 +501,13 @@ class RunningAgent:
                             max_steps=self.config.max_steps,
                         )
 
-            avg_metrics = eval_avg_bank.gather_average(self.config.distributed)
+            avg_metrics = eval_runtime.gather_avg_bank(
+                eval_avg_bank, self.config.distributed, self.device
+            )
             if use_tensor_bank_for_eval and eval_tensor_bank:
-                gathered_cache = eval_tensor_bank.gather(self.config.distributed, self.device)
+                gathered_cache = eval_runtime.gather_tensor_bank(
+                    eval_tensor_bank, self.config.distributed, self.device
+                )
                 task_epoch_metrics = self.task.epoch_metric(gathered_cache)
                 if task_epoch_metrics:
                     avg_metrics.update(task_epoch_metrics)
@@ -465,6 +558,9 @@ class RunningAgent:
 
     def _run_evaluation_and_update(self, signal: LoopSignal) -> None:
         val_loaders, test_loaders = self._resolve_evaluation_loaders()
+        val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(
+            val_loaders, test_loaders
+        )
         total_eval_batches = sum(len(loader) for _, loader in (*val_loaders, *test_loaders))
 
         emit_eval_start(

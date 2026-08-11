@@ -155,7 +155,7 @@ class EvalDedupRuntime:
                 raise ValueError(
                     f"Graph eval output '{key}' is undeclared but has leading dimension {value.shape[0]}, "
                     f"expected sample-aligned leading dimension {expected_count}. "
-                    "Declare node-aligned outputs explicitly in task.eval.ddp_dedup.node_aligned_output_keys."
+                    "Declare node-aligned outputs explicitly in task.node_aligned_output_keys."
                 )
 
 

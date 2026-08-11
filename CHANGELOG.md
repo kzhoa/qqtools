@@ -1,5 +1,12 @@
 # History
 
+## Unreleased
+
+- breaking: replace `task.eval.ddp_dedup` with `runner.ddp_eval_dedup` and flatten graph output
+  declarations to `task.node_aligned_output_keys`.
+- fix: validate DDP evaluation loader topology and per-rank batch counts before batch-level
+  collectives, and apply sampler-padding dedup to training-period validation/test evaluation.
+
 ## v1.3.3
 
 - fix: collect qpipeline DDP eval/infer dedup audit IDs in the main-process loader iterator so

@@ -30,6 +30,7 @@ def test_qdictdataloader_default_collate_non_graph():
     )
 
     loader = qDictDataloader(dataset=dataset, batch_size=2, is_graph=False)
+    assert loader.is_graph is False
     batch = next(iter(loader))
 
     assert batch["x"].shape == (2, 2)
@@ -43,6 +44,7 @@ def test_qdictdataloader_custom_collate_takes_priority():
         return {"size": len(batch_list)}
 
     loader = qDictDataloader(dataset=dataset, batch_size=2, is_graph=True, collate_fn=custom_collate)
+    assert loader.is_graph is True
     batch = next(iter(loader))
     assert batch == {"size": 2}
 
