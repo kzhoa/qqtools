@@ -4,6 +4,10 @@
 
 - fix: collect qpipeline DDP eval/infer dedup audit IDs in the main-process loader iterator so
   natural-completion assertions work with multi-worker DataLoaders
+- feat: expose `qLmdbDatasetBase.get_raw_blob(idx)` for reading stored LMDB values without
+  training-sample parsing or field conversion
+- breaking: change the qLmdbDataset balance hook to `get_sample_cost(idx)`; implementations that
+  previously accepted a parsed sample must load it explicitly with `self.get(idx)`
 
 ## v1.3.2
 

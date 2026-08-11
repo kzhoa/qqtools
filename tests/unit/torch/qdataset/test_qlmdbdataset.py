@@ -13,6 +13,7 @@ import torch
 from qqtools import qLmdbDataset
 from qqtools.data.qbalance import compute_global_even_sort_order
 from qqtools.torch import qLmdbDataset as TorchQLmdbDataset
+from qqtools.torch import qLmdbDatasetBase
 from qqtools.torch.ddp import BalancedBatchSampler
 
 lmdb = pytest.importorskip("lmdb")
@@ -50,9 +51,31 @@ class _PlainDataset(qLmdbDataset):
 
 
 class _BalancedDataset(_PlainDataset):
+    def get_sample_cost(self, idx: int):
+        return self.get(idx)["cost"]
+
+
+class _RawCostDataset(_PlainDataset):
     @staticmethod
-    def get_sample_cost(sample):
-        return sample["cost"]
+    def parse_value(blob: bytes):
+        raise AssertionError("balance metadata must not parse training samples")
+
+    def get_sample_cost(self, idx: int):
+        return pickle.loads(self.get_raw_blob(idx))["cost"]
+
+
+class _FailingRawCostDataset(_RawCostDataset):
+    def __init__(self, root: Path, files: list[str], **kwargs) -> None:
+        self.close_calls = 0
+        super().__init__(root, files, **kwargs)
+
+    def get_sample_cost(self, idx: int):
+        self.get_raw_blob(idx)
+        raise RuntimeError("cost extraction failed")
+
+    def close(self) -> None:
+        self.close_calls += 1
+        super().close()
 
 
 class _JsonDataset(_PlainDataset):
@@ -78,6 +101,54 @@ def _collate_ids(batch: list[dict]) -> list[int]:
 
 def test_public_exports_resolve_to_new_dataset_class():
     assert qLmdbDataset is TorchQLmdbDataset
+    assert issubclass(TorchQLmdbDataset, qLmdbDatasetBase)
+
+
+def test_get_raw_blob_returns_exact_bytes_without_parsing(tmp_path: Path):
+    root = tmp_path / "dataset"
+    blobs = [b'{"id": 3}', b'{"id": 7}']
+    _write_lmdb(
+        root / "raw" / "data.lmdb",
+        blobs,
+        serializer=lambda blob: blob,
+    )
+    dataset = _JsonDataset(root, ["raw/data.lmdb"])
+
+    assert dataset.get_raw_blob(0) == blobs[0]
+    assert dataset.get_raw_blob(-1) == blobs[-1]
+    assert dataset[1] == {"id": 7}
+
+
+def test_get_raw_blob_uses_global_multishard_indices_and_reports_errors(tmp_path: Path):
+    root = tmp_path / "dataset"
+    first_samples = [{"id": 0}, {"id": 1}]
+    second_samples = [{"id": 2}, {"id": 3}]
+    _write_lmdb(root / "raw" / "0.lmdb", first_samples)
+    second_path = root / "raw" / "1.lmdb"
+    _write_lmdb(second_path, second_samples)
+    dataset = _PlainDataset(root, ["raw/0.lmdb", "raw/1.lmdb"])
+
+    assert pickle.loads(dataset.get_raw_blob(1)) == first_samples[1]
+    assert pickle.loads(dataset.get_raw_blob(2)) == second_samples[0]
+    assert pickle.loads(dataset.get_raw_blob(-1)) == second_samples[1]
+
+    subset = dataset[[3, 0]]
+    assert pickle.loads(subset.get_raw_blob(0)) == first_samples[0]
+    with pytest.raises(IndexError, match="out of range"):
+        dataset.get_raw_blob(4)
+    with pytest.raises(IndexError, match="out of range"):
+        dataset.get_raw_blob(-5)
+
+    dataset.close()
+    environment = lmdb.open(str(second_path), subdir=False, map_size=1 << 26)
+    try:
+        with environment.begin(write=True) as transaction:
+            transaction.delete(b"1")
+    finally:
+        environment.close()
+
+    with pytest.raises(IndexError, match=r"Missing LMDB sample key.*local index 1.*1\.lmdb"):
+        dataset.get_raw_blob(3)
 
 
 def test_plain_multishard_reading_is_sorted_and_runtime_storage_is_lazy(tmp_path: Path):
@@ -208,6 +279,39 @@ def test_balance_assets_are_deterministic_and_used_by_loader(tmp_path: Path):
     assert len(observed_ids) == 6
 
 
+def test_balance_can_compute_costs_from_raw_blobs_without_parsing(tmp_path: Path):
+    root = tmp_path / "dataset"
+    costs = np.asarray([4.0, 1.0, 7.0], dtype=np.float64)
+    _write_lmdb(root / "raw" / "data.lmdb", _samples(costs.tolist()))
+
+    dataset = _RawCostDataset(
+        root,
+        ["raw/data.lmdb"],
+        enable_balance=True,
+    )
+
+    assert np.array_equal(dataset.sample_costs, costs)
+    assert dataset._transactions is None
+    assert dataset._environments is None
+
+
+def test_balance_closes_raw_storage_when_cost_extraction_fails(tmp_path: Path):
+    root = tmp_path / "dataset"
+    _write_lmdb(root / "raw" / "data.lmdb", _samples([1.0]))
+    dataset = _FailingRawCostDataset.__new__(_FailingRawCostDataset)
+
+    with pytest.raises(RuntimeError, match="cost extraction failed"):
+        dataset.__init__(
+            root,
+            ["raw/data.lmdb"],
+            enable_balance=True,
+        )
+
+    assert dataset.close_calls >= 1
+    assert dataset._transactions is None
+    assert dataset._environments is None
+
+
 def test_balanced_subset_uses_local_cost_and_order_coordinates(tmp_path: Path):
     root = tmp_path / "dataset"
     costs = np.asarray([9.0, 1.0, 8.0, 2.0, 7.0], dtype=np.float64)
@@ -246,7 +350,22 @@ def test_rewrite_preserves_source_order_asset_and_aligns_effective_costs(tmp_pat
     root = tmp_path / "dataset"
     costs = np.asarray([9.0, 1.0, 8.0, 2.0, 7.0], dtype=np.float64)
     samples = _samples(costs.tolist())
-    _write_lmdb(root / "raw" / "data.lmdb", samples)
+    source_path = root / "raw" / "data.lmdb"
+    _write_lmdb(source_path, samples)
+    source_environment = lmdb.open(
+        str(source_path),
+        subdir=False,
+        readonly=True,
+        lock=False,
+    )
+    try:
+        with source_environment.begin(write=False) as transaction:
+            source_blobs = [
+                transaction.get(str(idx).encode("ascii"))
+                for idx in range(len(samples))
+            ]
+    finally:
+        source_environment.close()
 
     dataset = _BalancedDataset(
         root,
@@ -272,6 +391,7 @@ def test_rewrite_preserves_source_order_asset_and_aligns_effective_costs(tmp_pat
         with environment.begin(write=False) as transaction:
             assert pickle.loads(transaction.get(b"length")) == len(samples)
             assert pickle.loads(transaction.get(b"0"))["id"] == int(stored_order[0])
+            assert transaction.get(b"0") == source_blobs[int(stored_order[0])]
     finally:
         environment.close()
 

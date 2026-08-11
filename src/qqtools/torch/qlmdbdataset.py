@@ -129,7 +129,31 @@ class qLmdbDatasetBase(qDictDataset):
 
     def get(self, idx: int) -> Any:
         """Read and decode one dataset sample."""
-        return self.parse_value(self._load_raw_blob(idx))
+        return self.parse_value(self.get_raw_blob(idx))
+
+    def get_raw_blob(self, idx: int) -> bytes:
+        """Return one serialized LMDB value without parsing or field conversion.
+
+        Args:
+            idx: Global sample index in the active LMDB shard set. Negative indices follow
+                normal Python sequence semantics.
+
+        Returns:
+            The stored LMDB value as bytes.
+
+        Raises:
+            IndexError: If the index is out of range or the resolved sample key is missing.
+        """
+        shard_idx, local_idx = self._resolve_true_idx(idx)
+        self._ensure_storage_open()
+        key = str(local_idx).encode("ascii")
+        blob = self._transactions[shard_idx].get(key)
+        if blob is None:
+            path = self._lmdb_paths[shard_idx]
+            raise IndexError(
+                f"Missing LMDB sample key {key!r} at local index {local_idx} in {path}"
+            )
+        return blob
 
     def len(self) -> int:
         """Return the total number of samples across all shards."""
@@ -284,18 +308,6 @@ class qLmdbDatasetBase(qDictDataset):
         shard_start = 0 if shard_idx == 0 else self._cumulative_sizes[shard_idx - 1]
         return shard_idx, idx - shard_start
 
-    def _load_raw_blob(self, idx: int) -> bytes:
-        shard_idx, local_idx = self._resolve_true_idx(idx)
-        self._ensure_storage_open()
-        key = str(local_idx).encode("ascii")
-        blob = self._transactions[shard_idx].get(key)
-        if blob is None:
-            path = self._lmdb_paths[shard_idx]
-            raise IndexError(
-                f"Missing LMDB sample key {key!r} at local index {local_idx} in {path}"
-            )
-        return blob
-
     def _set_lmdb_paths(self, paths: tuple[Path, ...]) -> None:
         self.close()
         self._lmdb_paths = paths
@@ -307,7 +319,7 @@ class qLmdbDataset(qLmdbDatasetBase):
     """LMDB dataset with optional balance assets and rewritten materialization.
 
     Implement :attr:`lmdb_files` for plain reading. When balance or rewrite is enabled, also
-    implement ``get_sample_cost(sample)`` on the subclass.
+    implement ``get_sample_cost(idx)`` on the subclass.
     """
 
     rewrite_file_name = "balance_rewrite.lmdb"
@@ -552,7 +564,7 @@ class qLmdbDataset(qLmdbDatasetBase):
             for new_idx, source_idx in progress:
                 transaction.put(
                     str(new_idx).encode("ascii"),
-                    self._load_raw_blob(int(source_idx)),
+                    self.get_raw_blob(int(source_idx)),
                 )
                 if (new_idx + 1) % 1000 == 0:
                     transaction.commit()
