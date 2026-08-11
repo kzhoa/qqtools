@@ -113,6 +113,7 @@ class RunnerConfig:
     clip_grad: Optional[float] = None
     accum_grad: Optional[int] = None
     checkpoint: Optional[CheckpointConfig] = None
+    ddp_eval_dedup: bool = True
 
     def __post_init__(self) -> None:
         if self.accum_grad is not None:
@@ -133,29 +134,13 @@ class DataLoaderConfig:
 
 
 @dataclass
-class EvalDDPDedupConfig:
-    """DDP eval/infer output dedup configuration."""
-
-    enabled: bool = True
-    is_graph: bool = False
-    node_aligned_output_keys: List[str] = field(default_factory=list)
-
-
-@dataclass
-class EvalConfig:
-    """Evaluation-specific runtime configuration."""
-
-    ddp_dedup: EvalDDPDedupConfig = field(default_factory=EvalDDPDedupConfig)
-
-
-@dataclass
 class TaskConfig:
     """Task configuration including dataset and data loading."""
 
     dataset: str
     dataloader: DataLoaderConfig
     target: Optional[str] = None
-    eval: EvalConfig = field(default_factory=EvalConfig)
+    node_aligned_output_keys: List[str] = field(default_factory=list)
 
 
 @dataclass

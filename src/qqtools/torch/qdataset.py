@@ -1108,10 +1108,11 @@ class qDictDataloader(torch.utils.data.DataLoader):
             - Handle both node-level and edge-level attributes appropriately
         """
 
+        self.is_graph = bool(is_graph)
         _collate_fn_to_use = collate_fn
 
         if collate_fn is None:
-            if is_graph:
+            if self.is_graph:
                 _collate_fn_to_use = _StatefulGraphCollator()
                 print("qDictDataloader: is_graph=True. Using stateful graph collator.")
             else:

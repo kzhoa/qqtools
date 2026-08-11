@@ -14,8 +14,18 @@ from ..task.qtask import qTaskBase
 from ..types import Stage
 from .runner_utils.avgbank import AvgBank
 from .runner_utils.common import _getattr_or_default, move_batch_to_device
-from .runner_utils.ddpdeduper import EvalDedupRuntime, unwrap_eval_batch, wrap_eval_dataloader_for_ddp_dedup
-from .runner_utils.evaluation import EvaluationResult, LoaderEvaluation, ModelEvaluation, StageEvaluation
+from .runner_utils.ddpdeduper import (
+    EvalDedupRuntime,
+    prepare_eval_loader_for_ddp,
+    resolve_loader_is_graph,
+    unwrap_eval_batch,
+)
+from .runner_utils.evaluation import (
+    EvaluationResult,
+    LoaderEvaluation,
+    ModelEvaluation,
+    StageEvaluation,
+)
 from .runner_utils.hook_binding import bind_post_metrics_to_value
 from .runner_utils.tensorbank import TensorBank
 
@@ -38,26 +48,28 @@ def extract_auxiliary_output_fields(batch_data: Any) -> Dict[str, Any]:
     return {"labels": labels} if labels is not None else {}
 
 
-def _resolve_eval_dedup_meta(args: Any) -> tuple[bool, bool, tuple[str, ...]]:
+def _resolve_eval_dedup_meta(
+    args: Any, dataloader: DataLoader
+) -> tuple[bool, bool, tuple[str, ...]]:
+    runner_cfg = _getattr_or_default(args, "runner")
     task_cfg = _getattr_or_default(args, "task")
-    eval_cfg = _getattr_or_default(task_cfg, "eval")
-    dedup_cfg = _getattr_or_default(eval_cfg, "ddp_dedup")
-
-    enabled = bool(_getattr_or_default(dedup_cfg, "enabled", True))
-    is_graph = bool(_getattr_or_default(dedup_cfg, "is_graph", False))
-    node_aligned_output_keys = tuple(_getattr_or_default(dedup_cfg, "node_aligned_output_keys", tuple()))
+    enabled = bool(_getattr_or_default(runner_cfg, "ddp_eval_dedup", True))
+    is_graph = resolve_loader_is_graph(dataloader)
+    node_aligned_output_keys = tuple(
+        _getattr_or_default(task_cfg, "node_aligned_output_keys", tuple())
+    )
     return enabled, is_graph, node_aligned_output_keys
 
 
 def _prepare_eval_loader(dataloader: DataLoader, args: Any):
     distributed = bool(_getattr_or_default(args, "distributed", False))
-    enabled, is_graph, node_aligned_output_keys = _resolve_eval_dedup_meta(args)
-    if not distributed:
-        return dataloader
-    return wrap_eval_dataloader_for_ddp_dedup(
+    enabled, _, node_aligned_output_keys = _resolve_eval_dedup_meta(args, dataloader)
+    return prepare_eval_loader_for_ddp(
         dataloader,
         enabled=enabled,
-        is_graph=is_graph,
+        stage="eval",
+        loader_name=None,
+        distributed=distributed,
         node_aligned_output_keys=node_aligned_output_keys,
     )
 

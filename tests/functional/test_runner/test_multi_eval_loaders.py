@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from qqtools.plugins.qpipeline import Stage
+from qqtools.plugins.qpipeline.runner import agent as agent_module
 from qqtools.plugins.qpipeline.runner.agent import RunningAgent
 from qqtools.plugins.qpipeline.runner.runner_utils.evaluation import (
     EvaluationResult,
@@ -19,21 +20,21 @@ from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, Runni
 from .conftest import SimpleModel, SimpleTask
 
 
-def _make_agent(task):
+def _make_agent(task, *, distributed=False):
     model = SimpleModel(input_dim=10)
     return RunningAgent(
         model=model,
         task=task,
         loss_fn=nn.MSELoss(),
         optimizer=torch.optim.Adam(model.parameters(), lr=1.0e-3),
-        config=RunConfig(device=torch.device("cpu")),
+        config=RunConfig(device=torch.device("cpu"), distributed=distributed),
         device=torch.device("cpu"),
     )
 
 
 def test_multi_loader_evaluation_preserves_order_and_uses_stage_score():
     task = SimpleTask(num_samples=40)
-    task.val_loader = {"b1": task.val_loader, "b2": task.test_loader}
+    task.val_loader = {"b2": task.test_loader, "b1": task.val_loader}
     task.test_loader = {"holdout": task.test_loader}
 
     def post_metrics_to_value(result, *, stage):
@@ -48,7 +49,7 @@ def test_multi_loader_evaluation_preserves_order_and_uses_stage_score():
     standard = evaluation.models[0]
 
     assert [stage.stage for stage in standard.stages] == [Stage.VAL, Stage.TEST]
-    assert [loader.name for loader in standard.stages[0].loaders] == ["b1", "b2"]
+    assert [loader.name for loader in standard.stages[0].loaders] == ["b2", "b1"]
     assert standard.stages[0].score is not None
     assert standard.stages[1].score is None
     assert evaluation.target_value("val_metric") == standard.stages[0].score
@@ -66,6 +67,28 @@ def test_loader_groups_are_reread_between_evaluation_boundaries():
 
     evaluation = agent.evaluate_all_models()
     assert evaluation.models[0].stages[0].loaders[0].name == "later"
+
+
+def test_training_eval_checks_batch_counts_only_for_first_nonempty_snapshot(monkeypatch):
+    task = SimpleTask(num_samples=8)
+    agent = _make_agent(task, distributed=True)
+    validate_flags = []
+
+    def prepare(loader, **kwargs):
+        validate_flags.append(kwargs["should_validate_batch_counts"])
+        return loader
+
+    monkeypatch.setattr(agent_module, "prepare_eval_loader_for_ddp", prepare)
+
+    agent._prepare_evaluation_loader_snapshot([], [])
+    assert agent._eval_counts_pending is True
+
+    val_loaders = [(None, task.val_loader)]
+    agent._prepare_evaluation_loader_snapshot(val_loaders, [])
+    agent._prepare_evaluation_loader_snapshot(val_loaders, [])
+
+    assert validate_flags == [True, False]
+    assert agent._eval_counts_pending is False
 
 
 @pytest.mark.parametrize(

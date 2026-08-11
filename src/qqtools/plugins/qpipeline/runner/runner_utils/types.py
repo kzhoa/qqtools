@@ -97,6 +97,7 @@ class RunConfig:
 
     # early stop
     checkpoint: Dict[str, Any] = field(default_factory=dict)
+    ddp_eval_dedup: bool = True
     early_stop: Dict[str, Any] = field(
         default_factory=lambda: {"target": "val_metric", "patience": 10, "mode": "min", "min_delta": 0.0}
     )

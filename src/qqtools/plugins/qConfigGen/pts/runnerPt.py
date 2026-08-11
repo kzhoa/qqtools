@@ -48,6 +48,7 @@ def prompt_runner_params():
     print_formatted_text("=" * 60)
 
     params = {}
+    params["ddp_eval_dedup"] = True
 
     # Step 1: Select run mode
     mode_completer = WordCompleter(["epoch", "step"])
