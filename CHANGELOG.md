@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.4
+
 - breaking: replace `task.eval.ddp_dedup` with `runner.ddp_eval_dedup` and flatten graph output
   declarations to `task.node_aligned_output_keys`.
 - fix: validate DDP evaluation loader topology and per-rank batch counts before batch-level
