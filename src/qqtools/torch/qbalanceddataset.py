@@ -3,7 +3,6 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
@@ -28,7 +27,7 @@ class _BalancedDatasetProvider:
         is_graph: bool,
         balance_seed: int,
         balance_strategy: str,
-        get_sample_cost: Callable[[Any], int | float] | None = None,
+        get_sample_cost: Callable[[int], int | float] | None = None,
     ) -> None:
         if not isinstance(host, qDictDataset):
             raise TypeError(
@@ -91,8 +90,8 @@ class _BalancedDatasetProvider:
 
     def _resolve_get_sample_cost(
         self,
-        get_sample_cost: Callable[[Any], int | float] | None,
-    ) -> Callable[[Any], int | float] | None:
+        get_sample_cost: Callable[[int], int | float] | None,
+    ) -> Callable[[int], int | float] | None:
         if not self.enabled:
             return None
         if get_sample_cost is not None:
@@ -101,7 +100,7 @@ class _BalancedDatasetProvider:
         if host_hook is None or not callable(host_hook):
             raise RuntimeError(
                 "Balance is enabled but `get_sample_cost` is unavailable. "
-                "Implement `get_sample_cost(sample)` on the dataset subclass."
+                "Implement `get_sample_cost(idx)` on the dataset subclass."
             )
         return host_hook
 
@@ -125,7 +124,7 @@ class _BalancedDatasetProvider:
             )
             for idx in indices:
                 costs[idx] = self._normalize_cost(
-                    self._get_sample_cost(self.host.get(idx)),
+                    self._get_sample_cost(idx),
                     idx,
                 )
         finally:

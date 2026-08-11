@@ -14,9 +14,8 @@ class _RewriteDataset(qLmdbDataset):
     def lmdb_files(self):
         return ["raw/data.lmdb"]
 
-    @staticmethod
-    def get_sample_cost(sample):
-        return sample["cost"]
+    def get_sample_cost(self, idx):
+        return self.get(idx)["cost"]
 
     def _write_processed_artifacts(self) -> None:
         writer_log_path = Path(self.root) / "rewrite_writers.log"
