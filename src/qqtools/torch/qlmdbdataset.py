@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import bisect
 import copy
+import hashlib
 import multiprocessing
 import os
 import pickle
+import shutil
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from multiprocessing.context import BaseContext
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import numpy as np
 import torch
@@ -88,6 +91,7 @@ class qLmdbDatasetBase(qDictDataset):
         self._environments: list[Any] | None = None
         self._transactions: list[Any] | None = None
         self._storage_pid: int | None = None
+        self._prefetched_raw_blob: tuple[int, int, bytes] | None = None
         super().__init__(root=self.root)
 
     @property
@@ -145,6 +149,10 @@ class qLmdbDatasetBase(qDictDataset):
             IndexError: If the index is out of range or the resolved sample key is missing.
         """
         shard_idx, local_idx = self._resolve_true_idx(idx)
+        prefetched = self._prefetched_raw_blob
+        if prefetched is not None and prefetched[:2] == (shard_idx, local_idx):
+            return prefetched[2]
+
         self._ensure_storage_open()
         key = str(local_idx).encode("ascii")
         blob = self._transactions[shard_idx].get(key)
@@ -185,12 +193,16 @@ class qLmdbDatasetBase(qDictDataset):
         dataset._environments = None
         dataset._transactions = None
         dataset._storage_pid = None
+        dataset._prefetched_raw_blob = None
         if hasattr(self, "_balance"):
             dataset._balance = copy.copy(self._balance)
             dataset._balance.host = dataset
             hook = dataset._balance._get_sample_cost
             if getattr(hook, "__self__", None) is self:
                 dataset._balance._get_sample_cost = getattr(dataset, hook.__name__)
+            iterator = dataset._balance._iter_sample_costs
+            if getattr(iterator, "__self__", None) is self:
+                dataset._balance._iter_sample_costs = getattr(dataset, iterator.__name__)
         if hasattr(self, "_effective_costs_cache"):
             dataset._effective_costs_cache = None
             dataset._effective_order_cache = None
@@ -201,6 +213,7 @@ class qLmdbDatasetBase(qDictDataset):
         state["_environments"] = None
         state["_transactions"] = None
         state["_storage_pid"] = None
+        state["_prefetched_raw_blob"] = None
         return state
 
     def __del__(self) -> None:
@@ -252,7 +265,11 @@ class qLmdbDatasetBase(qDictDataset):
                         )
                     length = int(decoded_length)
                 else:
-                    length = sum(1 for key, _ in transaction.cursor() if key.isdigit())
+                    length = sum(
+                        1
+                        for key in transaction.cursor().iternext(keys=True, values=False)
+                        if key.isdigit()
+                    )
         finally:
             environment.close()
 
@@ -308,6 +325,17 @@ class qLmdbDatasetBase(qDictDataset):
         shard_start = 0 if shard_idx == 0 else self._cumulative_sizes[shard_idx - 1]
         return shard_idx, idx - shard_start
 
+    @contextmanager
+    def _use_prefetched_raw_blob(self, idx: int, blob: bytes) -> Iterator[None]:
+        """Expose one already-read blob through the standard indexed read path."""
+        shard_idx, local_idx = self._resolve_true_idx(idx)
+        previous = self._prefetched_raw_blob
+        self._prefetched_raw_blob = (shard_idx, local_idx, blob)
+        try:
+            yield
+        finally:
+            self._prefetched_raw_blob = previous
+
     def _set_lmdb_paths(self, paths: tuple[Path, ...]) -> None:
         self.close()
         self._lmdb_paths = paths
@@ -316,10 +344,33 @@ class qLmdbDatasetBase(qDictDataset):
 
 
 class qLmdbDataset(qLmdbDatasetBase):
-    """LMDB dataset with optional balance assets and rewritten materialization.
+    """Read, balance, and optionally materialize one or more LMDB shards.
 
-    Implement :attr:`lmdb_files` for plain reading. When balance or rewrite is enabled, also
-    implement ``get_sample_cost(idx)`` on the subclass.
+    Subclasses define :attr:`lmdb_files` and, when balance or rewrite is enabled, implement the
+    single cost hook ``get_sample_cost(idx)``. Implement the hook through ``self.get(idx)`` or
+    ``self.get_raw_blob(idx)`` so sequential staged rewrites can reuse the blob already obtained
+    by the source cursor without changing the public hook.
+
+    Example::
+
+        class AtomDataset(qLmdbDataset):
+            @property
+            def lmdb_files(self):
+                return ["raw/shard-0.lmdb", "raw/shard-1.lmdb"]
+
+            def get_sample_cost(self, idx: int) -> float:
+                return float(self.get(idx)["natoms"])
+
+        dataset = AtomDataset(
+            root="/data/atoms",
+            balance_mode="rewrite",
+            rewrite_staging_dir="/local-scratch/atoms",
+        )
+
+    The default ``parse_value()`` decodes pickle payloads; override it for another serialization
+    format. ``balance_mode="rewrite"`` uses direct rewrite by default. Providing a staging
+    directory selects sequential staged rewrite, which requires source shards with canonical
+    contiguous ASCII decimal sample keys.
     """
 
     rewrite_file_name = "balance_rewrite.lmdb"
@@ -329,35 +380,53 @@ class qLmdbDataset(qLmdbDatasetBase):
         root: str | Path | None = None,
         *,
         is_graph: bool = False,
-        enable_balance: bool = False,
-        enable_rewrite: bool = False,
+        balance_mode: Literal["none", "runtime", "rewrite"] = "none",
         balance_seed: int = 0,
         balance_strategy: str = "v3",
         sort_lmdb_files: bool = True,
+        rewrite_staging_dir: str | Path | None = None,
     ) -> None:
         self.root = Path(root).expanduser() if root is not None else None
         self.is_graph = bool(is_graph)
-        self.enable_balance = bool(enable_balance)
-        self.enable_rewrite = bool(enable_rewrite)
+        self.balance_mode = str(balance_mode)
+        if self.balance_mode not in {"none", "runtime", "rewrite"}:
+            raise ValueError(
+                "balance_mode must be 'none', 'runtime', or 'rewrite', "
+                f"got {balance_mode!r}"
+            )
+        self._has_balance = self.balance_mode != "none"
+        self._has_rewrite = self.balance_mode == "rewrite"
         self.balance_seed = int(balance_seed)
         self.balance_strategy = str(balance_strategy)
+        if not self._has_rewrite and rewrite_staging_dir is not None:
+            raise ValueError("rewrite_staging_dir requires balance_mode='rewrite'")
+        if rewrite_staging_dir is not None:
+            rewrite_staging_dir = Path(rewrite_staging_dir).expanduser().absolute()
+        self.rewrite_staging_dir = rewrite_staging_dir
+        self._uses_staged_rewrite = self._has_rewrite and rewrite_staging_dir is not None
         self._effective_costs_cache: np.ndarray | None = None
         self._effective_order_cache: np.ndarray | None = None
+        iter_sample_costs = (
+            self._iter_sample_costs_sequential
+            if self._uses_staged_rewrite
+            else None
+        )
         self._balance = _BalancedDatasetProvider(
             host=self,
-            enabled=(self.enable_balance or self.enable_rewrite),
+            enabled=self._has_balance,
             is_graph=self.is_graph,
             balance_seed=self.balance_seed,
             balance_strategy=self.balance_strategy,
+            iter_sample_costs=iter_sample_costs,
         )
         super().__init__(root=self.root, sort_lmdb_files=sort_lmdb_files)
-        if self.enable_rewrite and self.rewrite_path.exists():
+        if self._has_rewrite and self.rewrite_path.exists():
             self._activate_rewrite()
 
     @property
     def processed_file_names(self) -> list[str]:
         names = list(self._balance.processed_file_names())
-        if self.enable_rewrite:
+        if self._has_rewrite:
             names.append(self.rewrite_file_name)
         return names
 
@@ -417,8 +486,71 @@ class qLmdbDataset(qLmdbDatasetBase):
 
     def _write_processed_artifacts(self) -> None:
         self._balance.process()
-        if self.enable_rewrite:
+        if self._has_rewrite:
             self._materialize_rewrite_if_needed()
+
+    @staticmethod
+    def _open_sequential_environment(path: Path):
+        return lmdb.open(
+            str(path),
+            subdir=path.is_dir(),
+            readonly=True,
+            lock=False,
+            readahead=True,
+            meminit=False,
+            max_readers=128,
+        )
+
+    def _iter_source_blobs_sequential(self) -> Iterator[tuple[int, bytes]]:
+        """Yield source blobs in cursor order while validating shard keys."""
+        self._ensure_layout_loaded()
+        shard_lengths = self._shard_lengths or ()
+        source_start = 0
+        for shard_idx, (path, shard_length) in enumerate(
+            zip(self._source_lmdb_paths, shard_lengths, strict=True)
+        ):
+            environment = self._open_sequential_environment(path)
+            sample_count = 0
+            try:
+                with environment.begin(write=False) as transaction:
+                    for key, blob in transaction.cursor().iternext(
+                        keys=True,
+                        values=True,
+                    ):
+                        if not key.isdigit():
+                            continue
+                        local_idx = int(key)
+                        canonical_key = str(local_idx).encode("ascii")
+                        if key != canonical_key:
+                            raise RuntimeError(
+                                "Sequential rewrite requires canonical ASCII sample keys; "
+                                f"found {key!r} in {path}"
+                            )
+                        if local_idx < 0 or local_idx >= shard_length:
+                            raise RuntimeError(
+                                f"Sample key {key!r} is outside shard {shard_idx} range "
+                                f"[0, {shard_length}) in {path}"
+                            )
+                        sample_count += 1
+                        yield source_start + local_idx, bytes(blob)
+            finally:
+                environment.close()
+            if sample_count != shard_length:
+                raise RuntimeError(
+                    f"Shard {path} contains {sample_count} canonical samples, "
+                    f"expected {shard_length}"
+                )
+            source_start += shard_length
+
+    def _iter_sample_costs_sequential(self) -> Iterator[tuple[int, int | float]]:
+        """Yield costs while exposing each cursor blob through indexed reads."""
+        self._ensure_layout_loaded()
+        if not self._cumulative_sizes or self._cumulative_sizes[-1] == 0:
+            return
+        for idx, blob in self._iter_source_blobs_sequential():
+            with self._use_prefetched_raw_blob(idx, blob):
+                cost = self.get_sample_cost(idx)
+            yield idx, cost
 
     def to_dataloader(
         self,
@@ -525,7 +657,7 @@ class qLmdbDataset(qLmdbDatasetBase):
 
     @property
     def _is_rewrite_active(self) -> bool:
-        return self.enable_rewrite and self._lmdb_paths == (self.rewrite_path,)
+        return self._has_rewrite and self._lmdb_paths == (self.rewrite_path,)
 
     def _materialize_rewrite_if_needed(self) -> None:
         if self.rewrite_path.exists():
@@ -533,6 +665,10 @@ class qLmdbDataset(qLmdbDatasetBase):
             return
 
         order = self._balance.sample_order()
+        if self._uses_staged_rewrite:
+            self._materialize_rewrite_sequential_staged(order)
+            return
+
         target_path = self.rewrite_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = target_path.with_name(
@@ -591,6 +727,357 @@ class qLmdbDataset(qLmdbDatasetBase):
             temporary_path.unlink(missing_ok=True)
             temporary_lock_path.unlink(missing_ok=True)
 
+        self._activate_rewrite()
+
+    @property
+    def _staged_workspace(self) -> Path:
+        """Return the isolated temporary workspace for this rewrite target."""
+        if self.rewrite_staging_dir is None:
+            raise RuntimeError("staged rewrite requires rewrite_staging_dir")
+        target = str(self.rewrite_path.absolute()).encode("utf-8")
+        digest = hashlib.sha256(target).hexdigest()[:20]
+        return self.rewrite_staging_dir / f"qlmdbdataset-{digest}"
+
+    @staticmethod
+    def _remove_path(path: Path) -> None:
+        """Remove a controlled temporary file or directory if it exists."""
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
+    def _prepare_staged_workspace(self) -> None:
+        """Create and clean the staged workspace before any payload is moved."""
+        workspace = self._staged_workspace
+        workspace.mkdir(parents=True, exist_ok=True)
+        residuals: list[Path] = []
+
+        for path in workspace.iterdir():
+            if path.name.startswith(("staging-", "inverse-")):
+                try:
+                    self._remove_path(path)
+                except Exception:
+                    residuals.append(path)
+
+        target_dir = self.rewrite_path.parent
+        digest = workspace.name.removeprefix("qlmdbdataset-")
+        final_prefix = f".{self.rewrite_path.name}.{digest}."
+        for path in target_dir.glob(f"{final_prefix}*"):
+            try:
+                self._remove_path(path)
+            except Exception:
+                residuals.append(path)
+
+        if residuals:
+            formatted = ", ".join(str(path) for path in residuals)
+            raise RuntimeError(
+                "Unable to clean stale staged rewrite assets before building: "
+                f"{formatted}"
+            )
+        self._ensure_layout_loaded()
+        if not self._cumulative_sizes or self._cumulative_sizes[-1] == 0:
+            return
+        self._check_staged_space()
+
+    def _check_staged_space(self) -> None:
+        """Perform a conservative free-space check for staged and final LMDBs."""
+        if self.rewrite_staging_dir is None:
+            raise RuntimeError("staged rewrite requires rewrite_staging_dir")
+        staging_dir = self.rewrite_staging_dir
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        processed_dir = self.rewrite_path.parent
+        processed_dir.mkdir(parents=True, exist_ok=True)
+
+        map_size = self._estimate_rewrite_map_size()
+        self._ensure_layout_loaded()
+        total = int(self._cumulative_sizes[-1] if self._cumulative_sizes else 0)
+        inverse_bytes = total * np.dtype(np.int64).itemsize
+        overhead = 64 << 20
+        staging_required = map_size + inverse_bytes + overhead
+        final_required = map_size + overhead
+
+        checks = [(staging_dir, staging_required), (processed_dir, final_required)]
+        try:
+            staging_device = staging_dir.stat().st_dev
+            processed_device = processed_dir.stat().st_dev
+        except OSError:
+            staging_device = processed_device = None
+        if staging_device is not None and staging_device == processed_device:
+            checks = [(staging_dir, staging_required + final_required)]
+
+        for directory, required in checks:
+            free = shutil.disk_usage(directory).free
+            if free < required:
+                raise OSError(
+                    "Insufficient free space for staged rewrite at "
+                    f"{directory}: requires at least {required} bytes, has {free}"
+                )
+
+    def _create_inverse_map(self, order: np.ndarray) -> tuple[Path, np.memmap | None]:
+        """Create a source-indexed inverse permutation in a temporary memmap."""
+        total = int(order.shape[0])
+        if total >= 2**64:
+            raise ValueError("Staged rewrite supports fewer than 2**64 samples")
+        if total == 0:
+            return self._staged_workspace / "inverse-empty.mmap", None
+        if order.ndim != 1:
+            raise RuntimeError(f"Balance order must be 1D, got {order.shape}")
+        if order.min(initial=0) != 0 or order.max(initial=-1) != total - 1:
+            raise RuntimeError("Balance order does not cover the source index range")
+        inverse_path = self._staged_workspace / f"inverse-{os.getpid()}-{uuid.uuid4().hex}.mmap"
+        inverse = None
+        try:
+            inverse = np.memmap(inverse_path, dtype=np.int64, mode="w+", shape=(total,))
+            inverse[np.asarray(order, dtype=np.int64)] = np.arange(total, dtype=np.int64)
+            inverse.flush()
+            return inverse_path, inverse
+        except Exception:
+            if inverse is not None:
+                try:
+                    inverse._mmap.close()
+                except Exception:
+                    pass
+            inverse_path.unlink(missing_ok=True)
+            raise
+
+    def _stage_source_blobs(self, inverse: np.memmap, total: int) -> tuple[Path, int]:
+        """Scan source shards once and write blobs keyed by target index."""
+        if total >= 2**64:
+            raise ValueError("Staged rewrite supports fewer than 2**64 samples")
+        workspace = self._staged_workspace
+        staging_path = workspace / f"staging-{os.getpid()}-{uuid.uuid4().hex}.lmdb"
+        map_size = self._estimate_rewrite_map_size()
+        environment = None
+        transaction = None
+        staged_count = 0
+        batch_count = 0
+        batch_bytes = 0
+        succeeded = False
+        try:
+            environment = lmdb.open(
+                str(staging_path),
+                subdir=False,
+                map_size=map_size,
+                readonly=False,
+                lock=True,
+                readahead=False,
+                meminit=False,
+                max_readers=1,
+            )
+            transaction = environment.begin(write=True)
+            for source_idx, blob in self._iter_source_blobs_sequential():
+                if source_idx < 0 or source_idx >= total:
+                    raise RuntimeError(f"Source index {source_idx} is outside [0, {total})")
+                target_idx = int(inverse[source_idx])
+                if target_idx < 0 or target_idx >= total:
+                    raise RuntimeError(f"Invalid target index {target_idx} for source {source_idx}")
+                stage_key = target_idx.to_bytes(8, "big")
+                if not transaction.put(stage_key, bytes(blob), overwrite=False):
+                    raise RuntimeError(f"Duplicate staging key for target index {target_idx}")
+                staged_count += 1
+                batch_count += 1
+                batch_bytes += len(blob)
+                if batch_count >= 1000 or batch_bytes >= (64 << 20):
+                    transaction.commit()
+                    transaction = environment.begin(write=True)
+                    batch_count = 0
+                    batch_bytes = 0
+            if transaction is not None:
+                transaction.commit()
+                transaction = None
+            if staged_count != total:
+                raise RuntimeError(
+                    f"Staging contains {staged_count} samples, expected {total}"
+                )
+            environment.sync()
+            environment.close()
+            environment = None
+            succeeded = True
+            return staging_path, staged_count
+        except Exception as exc:
+            if exc.__class__.__name__ == "MapFullError":
+                raise RuntimeError(
+                    f"Staging LMDB map is full (estimated map_size={map_size})"
+                ) from exc
+            raise
+        finally:
+            if transaction is not None:
+                transaction.abort()
+            if environment is not None:
+                environment.close()
+            if not succeeded:
+                self._remove_path(staging_path)
+                self._remove_path(Path(f"{staging_path}-lock"))
+
+    def _write_final_from_staging(self, staging_path: Path, total: int) -> Path:
+        """Validate staging continuity and stream it into the public LMDB format."""
+        target_path = self.rewrite_path
+        digest = self._staged_workspace.name.removeprefix("qlmdbdataset-")
+        temporary_path = target_path.with_name(
+            f".{target_path.name}.{digest}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        temporary_lock_path = Path(f"{temporary_path}-lock")
+        source_environment = None
+        final_environment = None
+        transaction = None
+        expected_idx = 0
+        final_map_size = self._estimate_rewrite_map_size()
+        try:
+            source_environment = self._open_sequential_environment(staging_path)
+            final_environment = lmdb.open(
+                str(temporary_path),
+                subdir=False,
+                map_size=final_map_size,
+                readonly=False,
+                lock=True,
+                readahead=False,
+                meminit=False,
+                max_readers=1,
+            )
+            transaction = final_environment.begin(write=True)
+            with source_environment.begin(write=False) as source_transaction:
+                for key, blob in source_transaction.cursor().iternext(keys=True, values=True):
+                    if key == b"length":
+                        raise RuntimeError("Staging contains reserved key b'length'")
+                    if len(key) != 8:
+                        raise RuntimeError(f"Invalid staging key {key!r}")
+                    actual_idx = int.from_bytes(key, "big")
+                    if actual_idx != expected_idx:
+                        raise RuntimeError(
+                            f"Staging key continuity violation: expected {expected_idx}, "
+                            f"found {actual_idx}"
+                        )
+                    transaction.put(str(expected_idx).encode("ascii"), bytes(blob))
+                    expected_idx += 1
+                    if expected_idx % 1000 == 0:
+                        transaction.commit()
+                        transaction = final_environment.begin(write=True)
+            if expected_idx != total:
+                raise RuntimeError(
+                    f"Staging contains {expected_idx} samples, expected {total}"
+                )
+            transaction.put(b"length", pickle.dumps(total))
+            transaction.commit()
+            transaction = None
+            final_environment.sync()
+            final_environment.close()
+            final_environment = None
+            source_environment.close()
+            source_environment = None
+            if target_path.exists():
+                raise FileExistsError(f"LMDB rewrite already exists: {target_path}")
+            temporary_path.replace(target_path)
+            return temporary_path
+        except Exception as exc:
+            if exc.__class__.__name__ == "MapFullError":
+                raise RuntimeError(
+                    "Final rewrite LMDB map is full "
+                    f"(estimated map_size={final_map_size})"
+                ) from exc
+            raise
+        finally:
+            if transaction is not None:
+                transaction.abort()
+            if source_environment is not None:
+                source_environment.close()
+            if final_environment is not None:
+                final_environment.close()
+            temporary_path.unlink(missing_ok=True)
+            temporary_lock_path.unlink(missing_ok=True)
+
+    def _materialize_empty_rewrite(self) -> None:
+        """Publish an empty rewrite without creating inverse or staging assets."""
+        target_path = self.rewrite_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        digest = self._staged_workspace.name.removeprefix("qlmdbdataset-")
+        temporary_path = target_path.with_name(
+            f".{target_path.name}.{digest}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        environment = None
+        transaction = None
+        try:
+            environment = lmdb.open(
+                str(temporary_path),
+                subdir=False,
+                map_size=1 << 20,
+                readonly=False,
+                lock=True,
+                readahead=False,
+                meminit=False,
+                max_readers=1,
+            )
+            transaction = environment.begin(write=True)
+            transaction.put(b"length", pickle.dumps(0))
+            transaction.commit()
+            transaction = None
+            environment.sync()
+            environment.close()
+            environment = None
+            if target_path.exists():
+                raise FileExistsError(f"LMDB rewrite already exists: {target_path}")
+            temporary_path.replace(target_path)
+        finally:
+            if transaction is not None:
+                transaction.abort()
+            if environment is not None:
+                environment.close()
+            temporary_path.unlink(missing_ok=True)
+            Path(f"{temporary_path}-lock").unlink(missing_ok=True)
+
+    def _materialize_rewrite_sequential_staged(self, order: np.ndarray) -> None:
+        """Materialize rewrite using sequential source scans and one staging LMDB."""
+        self._prepare_staged_workspace()
+        total = int(order.shape[0])
+        if total == 0:
+            self._materialize_empty_rewrite()
+            self._activate_rewrite()
+            return
+
+        inverse_path = self._staged_workspace / "inverse-uncreated.mmap"
+        inverse: np.memmap | None = None
+        staging_path: Path | None = None
+        build_error: RuntimeError | None = None
+        try:
+            inverse_path, inverse = self._create_inverse_map(order)
+            assert inverse is not None
+            staging_path, staged_count = self._stage_source_blobs(inverse, total)
+            if staged_count != total:
+                raise RuntimeError(f"Staging count {staged_count} != expected {total}")
+            self._write_final_from_staging(staging_path, total)
+        except Exception as exc:
+            build_error = RuntimeError(
+                f"Failed to materialize staged rewritten LMDB at {self.rewrite_path}"
+            )
+            build_error.__cause__ = exc
+        finally:
+            cleanup_errors: list[str] = []
+            if inverse is not None:
+                try:
+                    inverse.flush()
+                    inverse._mmap.close()
+                except Exception as exc:
+                    cleanup_errors.append(f"{inverse_path}: {exc}")
+            for path in (
+                (staging_path if staging_path is not None else None),
+                (Path(f"{staging_path}-lock") if staging_path is not None else None),
+                inverse_path,
+            ):
+                if path is None:
+                    continue
+                try:
+                    self._remove_path(path)
+                except Exception as exc:
+                    cleanup_errors.append(f"{path}: {exc}")
+            if cleanup_errors:
+                message = "Staged rewrite cleanup left residual assets: " + "; ".join(
+                    cleanup_errors
+                )
+                if build_error is None:
+                    build_error = RuntimeError(message)
+                else:
+                    build_error.add_note(message)
+        if build_error is not None:
+            raise build_error
         self._activate_rewrite()
 
     def _estimate_rewrite_map_size(self) -> int:

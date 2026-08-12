@@ -1,3 +1,4 @@
+import copy
 import json
 import multiprocessing
 import os
@@ -82,6 +83,21 @@ class _JsonDataset(_PlainDataset):
     @staticmethod
     def parse_value(blob: bytes):
         return json.loads(blob.decode("utf-8"))
+
+
+class _PrefetchedCostDataset(_PlainDataset):
+    def __init__(self, root: Path, files: list[str], **kwargs) -> None:
+        self.cost_calls: list[int] = []
+        self.storage_open_calls = 0
+        super().__init__(root, files, **kwargs)
+
+    def get_sample_cost(self, idx: int):
+        self.cost_calls.append(idx)
+        return self.get(idx)["cost"]
+
+    def _ensure_storage_open(self) -> None:
+        self.storage_open_calls += 1
+        super()._ensure_storage_open()
 
 
 def _samples(costs: list[float]) -> list[dict]:
@@ -248,7 +264,7 @@ def test_missing_inputs_and_balance_hook_fail_early(tmp_path: Path):
 
     _write_lmdb(root / "raw" / "data.lmdb", _samples([1.0]))
     with pytest.raises(RuntimeError, match="get_sample_cost"):
-        _PlainDataset(root, ["raw/data.lmdb"], enable_balance=True)
+        _PlainDataset(root, ["raw/data.lmdb"], balance_mode="runtime")
 
 
 def test_balance_assets_are_deterministic_and_used_by_loader(tmp_path: Path):
@@ -259,7 +275,7 @@ def test_balance_assets_are_deterministic_and_used_by_loader(tmp_path: Path):
     dataset = _BalancedDataset(
         root,
         ["raw/data.lmdb"],
-        enable_balance=True,
+        balance_mode="runtime",
         balance_seed=7,
         balance_strategy="v3",
     )
@@ -287,7 +303,7 @@ def test_balance_can_compute_costs_from_raw_blobs_without_parsing(tmp_path: Path
     dataset = _RawCostDataset(
         root,
         ["raw/data.lmdb"],
-        enable_balance=True,
+        balance_mode="runtime",
     )
 
     assert np.array_equal(dataset.sample_costs, costs)
@@ -304,7 +320,7 @@ def test_balance_closes_raw_storage_when_cost_extraction_fails(tmp_path: Path):
         dataset.__init__(
             root,
             ["raw/data.lmdb"],
-            enable_balance=True,
+            balance_mode="runtime",
         )
 
     assert dataset.close_calls >= 1
@@ -319,7 +335,7 @@ def test_balanced_subset_uses_local_cost_and_order_coordinates(tmp_path: Path):
     dataset = _BalancedDataset(
         root,
         ["raw/data.lmdb"],
-        enable_balance=True,
+        balance_mode="runtime",
         balance_seed=7,
     )
 
@@ -343,7 +359,7 @@ def test_balance_rejects_invalid_sample_costs(tmp_path: Path, invalid_cost):
     _write_lmdb(root / "raw" / "data.lmdb", [{"id": 0, "cost": invalid_cost}])
 
     with pytest.raises((TypeError, ValueError), match="Sample cost"):
-        _BalancedDataset(root, ["raw/data.lmdb"], enable_balance=True)
+        _BalancedDataset(root, ["raw/data.lmdb"], balance_mode="runtime")
 
 
 def test_rewrite_preserves_source_order_asset_and_aligns_effective_costs(tmp_path: Path):
@@ -370,7 +386,7 @@ def test_rewrite_preserves_source_order_asset_and_aligns_effective_costs(tmp_pat
     dataset = _BalancedDataset(
         root,
         ["raw/data.lmdb"],
-        enable_rewrite=True,
+        balance_mode="rewrite",
         balance_seed=11,
         balance_strategy="v1",
     )
@@ -398,12 +414,298 @@ def test_rewrite_preserves_source_order_asset_and_aligns_effective_costs(tmp_pat
     reloaded = _BalancedDataset(
         root,
         ["raw/data.lmdb"],
-        enable_rewrite=True,
+        balance_mode="rewrite",
         balance_seed=11,
         balance_strategy="v1",
     )
     assert np.array_equal(reloaded.sample_costs, costs[stored_order])
     assert np.array_equal(reloaded.sample_order, np.arange(len(reloaded)))
+
+
+def test_sequential_staged_rewrite_matches_direct_across_shards(tmp_path: Path):
+    direct_root = tmp_path / "direct"
+    staged_root = tmp_path / "staged"
+    costs = [9.0, 1.0, 8.0, 2.0, 7.0, 3.0]
+    for root in (direct_root, staged_root):
+        _write_lmdb(
+            root / "raw" / "b.lmdb",
+            [{"id": idx, "cost": cost} for idx, cost in enumerate(costs[3:])],
+        )
+        _write_lmdb(
+            root / "raw" / "a.lmdb",
+            [{"id": idx, "cost": cost} for idx, cost in enumerate(costs[:3])],
+        )
+
+    direct = _BalancedDataset(
+        direct_root,
+        ["raw/b.lmdb", "raw/a.lmdb"],
+        balance_mode="rewrite",
+        balance_seed=17,
+    )
+    staged = _BalancedDataset(
+        staged_root,
+        ["raw/b.lmdb", "raw/a.lmdb"],
+        balance_mode="rewrite",
+        rewrite_staging_dir=staged_root / "scratch",
+        balance_seed=17,
+    )
+
+    assert [direct.get_raw_blob(i) for i in range(len(direct))] == [
+        staged.get_raw_blob(i) for i in range(len(staged))
+    ]
+    assert pickle.loads(staged.get_raw_blob(-1))
+    assert staged.rewrite_path.exists()
+    assert list((staged_root / "scratch").glob("**/staging-*.lmdb")) == []
+
+
+def test_sequential_staged_reuses_cursor_blob_through_single_cost_hook(tmp_path: Path):
+    root = tmp_path / "dataset"
+    _write_lmdb(root / "raw" / "data.lmdb", _samples([4.0, 1.0, 7.0]))
+    dataset = _PrefetchedCostDataset(
+        root,
+        ["raw/data.lmdb"],
+        balance_mode="rewrite",
+        rewrite_staging_dir=root / "scratch",
+    )
+
+    assert dataset.cost_calls == [0, 1, 2]
+    assert dataset.storage_open_calls == 0
+    assert dataset._transactions is None
+    assert dataset._prefetched_raw_blob is None
+    assert np.array_equal(dataset.sample_costs, np.asarray([4.0, 1.0, 7.0]))
+
+
+def test_prefetched_blob_scope_does_not_leak_through_copy_or_pickle(tmp_path: Path):
+    root = tmp_path / "dataset"
+    _write_lmdb(root / "raw" / "data.lmdb", [{"id": 0}])
+    dataset = _PlainDataset(root, ["raw/data.lmdb"])
+    prefetched = pickle.dumps({"id": "prefetched"})
+
+    with dataset._use_prefetched_raw_blob(0, prefetched):
+        assert dataset.get_raw_blob(0) == prefetched
+        copied = copy.copy(dataset)
+        restored = pickle.loads(pickle.dumps(dataset))
+
+    assert dataset._prefetched_raw_blob is None
+    assert copied._prefetched_raw_blob is None
+    assert restored._prefetched_raw_blob is None
+    assert pickle.loads(copied.get_raw_blob(0)) == {"id": 0}
+    assert pickle.loads(restored.get_raw_blob(0)) == {"id": 0}
+
+
+def test_sequential_staged_rejects_noncanonical_keys_but_direct_keeps_compatibility(
+    tmp_path: Path,
+):
+    direct_root = tmp_path / "direct"
+    staged_root = tmp_path / "staged"
+    for root in (direct_root, staged_root):
+        path = root / "raw" / "data.lmdb"
+        _write_lmdb(path, [{"id": 0, "cost": 1.0}, {"id": 1, "cost": 2.0}])
+        environment = lmdb.open(str(path), subdir=False, map_size=1 << 26)
+        try:
+            with environment.begin(write=True) as transaction:
+                transaction.put(b"01", pickle.dumps({"id": 1, "cost": 2.0}))
+        finally:
+            environment.close()
+
+    direct = _PrefetchedCostDataset(
+        direct_root,
+        ["raw/data.lmdb"],
+        balance_mode="rewrite",
+    )
+    assert len(direct) == 2
+    assert direct.cost_calls == [0, 1]
+    with pytest.raises(RuntimeError, match="canonical ASCII sample keys"):
+        _PrefetchedCostDataset(
+            staged_root,
+            ["raw/data.lmdb"],
+            balance_mode="rewrite",
+            rewrite_staging_dir=staged_root / "scratch",
+        )
+    assert not (staged_root / "processed" / "balance_rewrite.lmdb").exists()
+
+
+def test_rewrite_artifact_is_reused_when_staging_path_is_added(tmp_path: Path):
+    root = tmp_path / "dataset"
+    path = root / "raw" / "data.lmdb"
+    _write_lmdb(path, [{"id": 0, "cost": 1.0}, {"id": 1, "cost": 2.0}])
+    environment = lmdb.open(str(path), subdir=False, map_size=1 << 26)
+    try:
+        with environment.begin(write=True) as transaction:
+            transaction.put(b"01", pickle.dumps({"id": 1, "cost": 2.0}))
+    finally:
+        environment.close()
+
+    direct = _PrefetchedCostDataset(root, ["raw/data.lmdb"], balance_mode="rewrite")
+    direct_blobs = [direct.get_raw_blob(idx) for idx in range(len(direct))]
+    direct.close()
+
+    reused = _PrefetchedCostDataset(
+        root,
+        ["raw/data.lmdb"],
+        balance_mode="rewrite",
+        rewrite_staging_dir=root / "scratch",
+    )
+
+    assert [reused.get_raw_blob(idx) for idx in range(len(reused))] == direct_blobs
+    assert not (root / "scratch").exists()
+
+
+def test_balance_only_keeps_direct_key_compatibility_without_rewrite(tmp_path: Path):
+    root = tmp_path / "dataset"
+    path = root / "raw" / "data.lmdb"
+    _write_lmdb(path, [{"id": 0, "cost": 1.0}, {"id": 1, "cost": 2.0}])
+    environment = lmdb.open(str(path), subdir=False, map_size=1 << 26)
+    try:
+        with environment.begin(write=True) as transaction:
+            transaction.put(b"01", pickle.dumps({"id": 1, "cost": 2.0}))
+    finally:
+        environment.close()
+
+    dataset = _PrefetchedCostDataset(
+        root,
+        ["raw/data.lmdb"],
+        balance_mode="runtime",
+    )
+
+    assert dataset.cost_calls == [0, 1]
+    assert dataset._transactions is None
+    assert (root / "processed" / "balance_meta.npz").exists()
+    assert (root / "processed" / "balance_order.npy").exists()
+    assert not dataset.rewrite_path.exists()
+
+
+def test_sequential_staged_scan_failure_cleans_unreturned_staging_lmdb(
+    tmp_path: Path,
+    monkeypatch,
+):
+    root = tmp_path / "dataset"
+    _write_lmdb(root / "raw" / "data.lmdb", _samples([1.0]))
+    original_scan = _BalancedDataset._iter_source_blobs_sequential
+    scan_calls = 0
+
+    def fail_source_scan(self):
+        nonlocal scan_calls
+        scan_calls += 1
+        if scan_calls == 2:
+            raise RuntimeError("injected source scan failure")
+        yield from original_scan(self)
+
+    monkeypatch.setattr(
+        _BalancedDataset,
+        "_iter_source_blobs_sequential",
+        fail_source_scan,
+    )
+    with pytest.raises(RuntimeError, match="Failed to materialize staged"):
+        _BalancedDataset(
+            root,
+            ["raw/data.lmdb"],
+            balance_mode="rewrite",
+            rewrite_staging_dir=root / "scratch",
+        )
+
+    workspace = next((root / "scratch").iterdir())
+    assert not list(workspace.glob("staging-*.lmdb"))
+    assert not list(workspace.glob("staging-*.lmdb-lock"))
+    assert not list(workspace.glob("inverse-*.mmap"))
+
+
+def test_sequential_staged_clears_prefetched_blob_when_cost_extraction_fails(
+    tmp_path: Path,
+):
+    root = tmp_path / "dataset"
+    _write_lmdb(root / "raw" / "data.lmdb", _samples([1.0]))
+    dataset = object.__new__(_FailingRawCostDataset)
+
+    with pytest.raises(RuntimeError, match="cost extraction failed"):
+        dataset.__init__(
+            root,
+            ["raw/data.lmdb"],
+            balance_mode="rewrite",
+            rewrite_staging_dir=root / "scratch",
+        )
+
+    assert dataset._prefetched_raw_blob is None
+
+
+def test_empty_staged_dataset_skips_large_space_preflight(tmp_path: Path, monkeypatch):
+    root = tmp_path / "dataset"
+    _write_lmdb(root / "raw" / "data.lmdb", [])
+    monkeypatch.setattr(
+        "qqtools.torch.qlmdbdataset.shutil.disk_usage",
+        lambda path: type("Usage", (), {"free": 0})(),
+    )
+
+    dataset = _PrefetchedCostDataset(
+        root,
+        ["raw/data.lmdb"],
+        balance_mode="rewrite",
+        rewrite_staging_dir=root / "scratch",
+    )
+    assert len(dataset) == 0
+    assert dataset.rewrite_path.exists()
+
+
+def test_sequential_staged_empty_dataset_publishes_length_zero_without_staging_scan(
+    tmp_path: Path,
+):
+    root = tmp_path / "dataset"
+    _write_lmdb(root / "raw" / "data.lmdb", [])
+    dataset = _PrefetchedCostDataset(
+        root,
+        ["raw/data.lmdb"],
+        balance_mode="rewrite",
+        rewrite_staging_dir=root / "scratch",
+    )
+
+    assert len(dataset) == 0
+    assert dataset.cost_calls == []
+    environment = lmdb.open(str(dataset.rewrite_path), subdir=False, readonly=True, lock=False)
+    try:
+        with environment.begin(write=False) as transaction:
+            assert pickle.loads(transaction.get(b"length")) == 0
+    finally:
+        environment.close()
+    workspace = next((root / "scratch").iterdir())
+    assert not list(workspace.glob("inverse-*.mmap"))
+    assert not list(workspace.glob("staging-*.lmdb"))
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"balance_mode": "unknown"}, "balance_mode"),
+        ({"rewrite_staging_dir": "scratch"}, "balance_mode='rewrite'"),
+        (
+            {
+                "balance_mode": "runtime",
+                "rewrite_staging_dir": "scratch",
+            },
+            "balance_mode='rewrite'",
+        ),
+    ],
+)
+def test_balance_mode_configuration_is_validated(tmp_path: Path, kwargs, message):
+    root = tmp_path / "dataset"
+    _write_lmdb(root / "raw" / "data.lmdb", _samples([1.0]))
+    with pytest.raises(ValueError, match=message):
+        _BalancedDataset(root, ["raw/data.lmdb"], **kwargs)
+
+
+@pytest.mark.parametrize(
+    "legacy_kwargs",
+    [
+        {"enable_balance": True},
+        {"enable_rewrite": True},
+        {"rewrite_io_strategy": "sequential_staged"},
+    ],
+)
+def test_legacy_balance_configuration_arguments_are_removed(tmp_path: Path, legacy_kwargs):
+    root = tmp_path / "dataset"
+    _write_lmdb(root / "raw" / "data.lmdb", _samples([1.0]))
+
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        _BalancedDataset(root, ["raw/data.lmdb"], **legacy_kwargs)
 
 
 @pytest.mark.parametrize("start_method", ["spawn", "forkserver"])
@@ -496,7 +798,7 @@ def test_balanced_dataloader_rejects_unpickleable_collate_before_worker_start(
     dataset = _BalancedDataset(
         root,
         ["raw/data.lmdb"],
-        enable_balance=True,
+        balance_mode="runtime",
     )
 
     with pytest.raises(TypeError, match="module-level function"):

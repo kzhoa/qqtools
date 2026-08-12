@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- breaking: replace `qLmdbDataset` `enable_balance`, `enable_rewrite`, and
+  `rewrite_io_strategy` with `balance_mode={"none", "runtime", "rewrite"}`. In rewrite mode,
+  an optional `rewrite_staging_dir` selects sequential staged materialization; without it,
+  direct materialization remains the default.
+- feat: add sequential staged LMDB rewrite with cursor metadata/payload scans, scoped reuse of
+  cursor-read blobs through `get_sample_cost(idx)`, bounded staging transactions, continuity
+  validation, and atomic final LMDB publication. Staged scans reject non-canonical numeric sample
+  keys such as `b"01"`.
+
 ## v1.3.4
 
 - breaking: replace `task.eval.ddp_dedup` with `runner.ddp_eval_dedup` and flatten graph output
