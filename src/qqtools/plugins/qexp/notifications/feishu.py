@@ -32,14 +32,20 @@ class FeishuNotifier:
     def send(self, event: Any, *, webhook: str, secret: str | None,
              timeout_seconds: float) -> dict[str, Any]:
         timestamp = str(int(self._clock()))
-        payload_text = (f"qexp task {event.phase}\n"
-                        f"task: {event.task_id}\n"
-                        f"attempt: {event.attempt_id}\n"
-                        f"reason: {event.reason}\n"
-                        f"exit_code: {'null' if event.exit_code is None else event.exit_code}\n"
-                        f"execution_machine: {event.execution_machine_name}\n"
-                        f"dispatching_machine: {event.dispatching_machine_name}")
-        payload: dict[str, Any] = {"msg_type": "text", "content": {"text": payload_text}}
+        payload: dict[str, Any] = {
+            "msg_type": "interactive",
+            "card": {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "template": _phase_template(event.phase),
+                    "title": {
+                        "tag": "plain_text",
+                        "content": f"qexp 任务{_phase_label(event.phase)}",
+                    },
+                },
+                "elements": [{"tag": "markdown", "content": _card_markdown(event)}],
+            },
+        }
         if secret is not None:
             string_to_sign = timestamp + "\n" + secret
             digest = hmac.new(string_to_sign.encode("utf-8"), b"", hashlib.sha256).digest()
@@ -81,3 +87,30 @@ class FeishuNotifier:
                                              business_code=str(present[0]),
                                              error_type="business_error")
         return {"http_status": status, "business_code": "0"}
+
+
+def _phase_label(phase: Any) -> str:
+    return {"succeeded": "成功", "failed": "失败", "cancelled": "已取消"}.get(
+        phase, str(phase)
+    )
+
+
+def _phase_template(phase: Any) -> str:
+    return {"succeeded": "green", "failed": "red", "cancelled": "orange"}.get(phase, "grey")
+
+
+def _card_markdown(event: Any) -> str:
+    exit_code = "null" if event.exit_code is None else event.exit_code
+    return "\n".join((
+        f"- **Task ID**: `{_markdown_code(event.task_id)}`",
+        f"- **Attempt ID**: `{_markdown_code(event.attempt_id)}`",
+        f"- **原因**: `{_markdown_code(event.reason)}`",
+        f"- **退出码**: `{_markdown_code(exit_code)}`",
+        f"- **执行机器**: `{_markdown_code(event.execution_machine_name)}`",
+        f"- **通知机器**: `{_markdown_code(event.dispatching_machine_name)}`",
+        f"- **机器完成时间**: `{_markdown_code(event.finished_at)}`",
+    ))
+
+
+def _markdown_code(value: Any) -> str:
+    return str(value).replace("\\", "\\\\").replace("`", "\\`")

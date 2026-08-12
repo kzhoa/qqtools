@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -81,8 +82,52 @@ def test_feishu_payload_and_business_success():
         _event(), webhook="https://example.invalid/hook", secret="secret", timeout_seconds=5
     )
     assert result == {"http_status": 200, "business_code": "0"}
-    assert b"qexp task failed" in seen["data"]
+    payload = json.loads(seen["data"])
+    assert payload["msg_type"] == "interactive"
+    assert payload["card"]["header"] == {
+        "template": "red",
+        "title": {"tag": "plain_text", "content": "qexp 任务失败"},
+    }
+    assert payload["card"]["elements"] == [{
+        "tag": "markdown",
+        "content": "\n".join((
+            "- **Task ID**: `task-a`",
+            "- **Attempt ID**: `attempt-a`",
+            "- **原因**: `nonzero_exit`",
+            "- **退出码**: `null`",
+            "- **执行机器**: `gpu-a`",
+            "- **通知机器**: `gpu-b`",
+            "- **机器完成时间**: `2026-08-07T00:00:00Z`",
+        )),
+    }]
     assert b"secret" not in seen["data"]
+
+
+@pytest.mark.parametrize(("phase", "template", "title"), [
+    ("succeeded", "green", "qexp 任务成功"),
+    ("cancelled", "orange", "qexp 任务已取消"),
+])
+def test_feishu_card_uses_phase_status_colours(phase, template, title):
+    seen = {}
+
+    class Response:
+        status = 200
+
+        def read(self):
+            return b'{"code": 0}'
+
+    def urlopen(request, timeout):
+        seen["payload"] = json.loads(request.data)
+        return Response()
+
+    FeishuNotifier(urlopen=urlopen).send(
+        _event(phase=phase), webhook="https://example.invalid/hook", secret=None, timeout_seconds=5
+    )
+
+    assert seen["payload"]["card"]["header"] == {
+        "template": template,
+        "title": {"tag": "plain_text", "content": title},
+    }
 
 
 def test_feishu_rejects_boolean_business_code():
