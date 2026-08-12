@@ -100,17 +100,25 @@ def _phase_template(phase: Any) -> str:
 
 
 def _card_markdown(event: Any) -> str:
-    exit_code = "null" if event.exit_code is None else event.exit_code
     return "\n".join((
         f"- **Task ID**: `{_markdown_code(event.task_id)}`",
         f"- **Attempt ID**: `{_markdown_code(event.attempt_id)}`",
         f"- **原因**: `{_markdown_code(event.reason)}`",
-        f"- **退出码**: `{_markdown_code(exit_code)}`",
+        f"- **退出码**: `{_markdown_code(event.exit_code)}`",
         f"- **执行机器**: `{_markdown_code(event.execution_machine_name)}`",
         f"- **通知机器**: `{_markdown_code(event.dispatching_machine_name)}`",
-        f"- **机器完成时间**: `{_markdown_code(event.finished_at)}`",
+        f"- **通知机器时间**: `{_markdown_code(event.finished_at)}`",
     ))
 
 
 def _markdown_code(value: Any) -> str:
-    return str(value).replace("\\", "\\\\").replace("`", "\\`")
+    if value is None:
+        return "（未记录）"
+    text = str(value)
+    if not text.strip():
+        return "（未记录）"
+    return (text.replace("\\", "\\\\")
+            .replace("`", "\\`")
+            .replace("\r", "\\r")
+            .replace("\n", "\\n")
+            .replace("\t", "\\t"))

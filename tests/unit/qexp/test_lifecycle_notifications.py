@@ -94,10 +94,10 @@ def test_feishu_payload_and_business_success():
             "- **Task ID**: `task-a`",
             "- **Attempt ID**: `attempt-a`",
             "- **原因**: `nonzero_exit`",
-            "- **退出码**: `null`",
+            "- **退出码**: `（未记录）`",
             "- **执行机器**: `gpu-a`",
             "- **通知机器**: `gpu-b`",
-            "- **机器完成时间**: `2026-08-07T00:00:00Z`",
+            "- **通知机器时间**: `2026-08-07T00:00:00Z`",
         )),
     }]
     assert b"secret" not in seen["data"]
@@ -128,6 +128,35 @@ def test_feishu_card_uses_phase_status_colours(phase, template, title):
         "template": template,
         "title": {"tag": "plain_text", "content": title},
     }
+
+
+@pytest.mark.parametrize(("machine_name", "expected"), [
+    (None, "（未记录）"),
+    (" \t ", "（未记录）"),
+    ("gpu`a\\b\nnext\rrow\tcell", "gpu\\`a\\\\b\\nnext\\rrow\\tcell"),
+])
+def test_feishu_card_safely_displays_machine_name(machine_name, expected):
+    seen = {}
+
+    class Response:
+        status = 200
+
+        def read(self):
+            return b'{"code": 0}'
+
+    def urlopen(request, timeout):
+        seen["payload"] = json.loads(request.data)
+        return Response()
+
+    FeishuNotifier(urlopen=urlopen).send(
+        _event(execution_machine_name=machine_name),
+        webhook="https://example.invalid/hook",
+        secret=None,
+        timeout_seconds=5,
+    )
+
+    markdown = seen["payload"]["card"]["elements"][0]["content"]
+    assert f"- **执行机器**: `{expected}`" in markdown
 
 
 def test_feishu_rejects_boolean_business_code():
