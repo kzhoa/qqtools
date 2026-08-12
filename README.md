@@ -222,6 +222,10 @@ variable value changes require restarting that agent; restarting the agent does 
 running task process. Delivery is synchronous and no-throw with at-most-one send attempt: crashes
 or network ambiguity can permanently lose a notification, and qexp does not retry it.
 
+Feishu notifications are sent as interactive cards with status colour, Markdown field labels, and
+terminal Task metadata. The card's `机器完成时间` field is the event's `finished_at` value from the
+machine clock; qexp does not query an external time source or convert it to the recipient's timezone.
+
 `batch-submit` manifests may set Group workers and nested placement defaults, with per-Task
 overrides:
 
