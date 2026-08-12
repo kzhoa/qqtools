@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +28,7 @@ class _BalancedDatasetProvider:
         balance_seed: int,
         balance_strategy: str,
         get_sample_cost: Callable[[int], int | float] | None = None,
+        iter_sample_costs: Callable[[], Iterable[tuple[int, int | float]]] | None = None,
     ) -> None:
         if not isinstance(host, qDictDataset):
             raise TypeError(
@@ -39,6 +40,7 @@ class _BalancedDatasetProvider:
         self.is_graph = bool(is_graph)
         self.balance_seed = int(balance_seed)
         self.balance_strategy = validate_balance_strategy(str(balance_strategy))
+        self._iter_sample_costs = iter_sample_costs
         self._get_sample_cost = self._resolve_get_sample_cost(get_sample_cost)
         self._meta_cache: np.ndarray | None = None
         self._order_cache: np.ndarray | None = None
@@ -107,26 +109,29 @@ class _BalancedDatasetProvider:
     def _require_enabled(self) -> None:
         if not self.enabled:
             raise RuntimeError(
-                "Balance assets are disabled. Set `enable_balance=True` or "
-                "`enable_rewrite=True` when constructing the dataset."
+                "Balance assets are disabled. Set `balance_mode='runtime'` or "
+                "`balance_mode='rewrite'` when constructing the dataset."
             )
 
     def _build_meta(self) -> None:
         total = self.host.len()
         costs = np.empty(total, dtype=np.float64)
         try:
-            indices = tqdm(
-                range(total),
-                total=total,
-                desc="Build balance metadata",
-                unit="sample",
-                disable=None,
-            )
-            for idx in indices:
-                costs[idx] = self._normalize_cost(
-                    self._get_sample_cost(idx),
-                    idx,
+            if self._iter_sample_costs is not None:
+                self._build_meta_from_iterator(costs, total)
+            else:
+                indices = tqdm(
+                    range(total),
+                    total=total,
+                    desc="Build balance metadata",
+                    unit="sample",
+                    disable=None,
                 )
+                for idx in indices:
+                    costs[idx] = self._normalize_cost(
+                        self._get_sample_cost(idx),
+                        idx,
+                    )
         finally:
             close = getattr(self.host, "close", None)
             if callable(close):
@@ -142,6 +147,32 @@ class _BalancedDatasetProvider:
         costs.setflags(write=False)
         self._meta_cache = costs
         self._order_cache = None
+
+    def _build_meta_from_iterator(self, costs: np.ndarray, total: int) -> None:
+        seen = np.zeros(total, dtype=np.bool_)
+        iterator = tqdm(
+            self._iter_sample_costs(),
+            total=total,
+            desc="Build balance metadata",
+            unit="sample",
+            disable=None,
+        )
+        for idx, value in iterator:
+            if isinstance(idx, (bool, np.bool_)) or not isinstance(idx, (int, np.integer)):
+                raise TypeError(f"Sample cost index must be an integer, got {idx!r}")
+            idx = int(idx)
+            if idx < 0 or idx >= total:
+                raise RuntimeError(
+                    f"Sample cost iterator returned out-of-range index {idx} for total {total}"
+                )
+            if seen[idx]:
+                raise RuntimeError(f"Sample cost iterator returned duplicate index {idx}")
+            costs[idx] = self._normalize_cost(value, idx)
+            seen[idx] = True
+
+        if not np.all(seen):
+            missing = int(np.flatnonzero(~seen)[0])
+            raise RuntimeError(f"Sample cost iterator did not cover index {missing}")
 
     def _build_order(self) -> None:
         costs = self.sample_costs()

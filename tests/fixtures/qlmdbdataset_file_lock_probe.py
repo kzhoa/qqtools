@@ -43,7 +43,7 @@ def _write_artifact(root: str, barrier) -> None:
     guard.ensure(writer)
     barrier.wait()
 
-    dataset = _RewriteDataset(root=root_path, enable_rewrite=True)
+    dataset = _RewriteDataset(root=root_path, balance_mode="rewrite")
     assert sorted(dataset[idx]["id"] for idx in range(len(dataset))) == [0, 1]
     dataset.close()
 
