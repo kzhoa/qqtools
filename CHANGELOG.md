@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.5
+
 - breaking: replace `qLmdbDataset` `enable_balance`, `enable_rewrite`, and
   `rewrite_io_strategy` with `balance_mode={"none", "runtime", "rewrite"}`. In rewrite mode,
   an optional `rewrite_staging_dir` selects sequential staged materialization; without it,
@@ -10,6 +12,8 @@
   cursor-read blobs through `get_sample_cost(idx)`, bounded staging transactions, continuity
   validation, and atomic final LMDB publication. Staged scans reject non-canonical numeric sample
   keys such as `b"01"`.
+- feat: render qexp Feishu terminal notifications as status-coloured interactive cards with
+  Markdown task metadata.
 
 ## v1.3.4
 
