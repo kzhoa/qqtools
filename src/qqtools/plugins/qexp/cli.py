@@ -88,6 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
         action.add_argument("--gpus", type=int, default=1); action.add_argument("--cwd")
         action.add_argument("--sharing", choices=["private", "spillover"], default="private")
         action.add_argument("--offer-after-seconds", type=int); action.add_argument("--idempotency-key")
+        action.add_argument("--no-activate", action="store_true",
+                            help="Submit without activating the local agent.")
         action.add_argument("argv", nargs=argparse.REMAINDER)
     bulk = commands.add_parser("batch-submit")
     bulk.add_argument("--file", required=True, dest="manifest_file"); bulk.add_argument("--group")
@@ -287,7 +289,8 @@ def main(argv: list[str] | None = None) -> int:
             task_value = task_commands.submit(cfg, _command(args.argv), requested_gpus=args.gpus, task_id=args.task_id, name=args.name,
                                               group=args.group, working_dir=args.cwd, sharing_mode=args.sharing,
                                               offer_after_seconds=args.offer_after_seconds, idempotency_key=args.idempotency_key)
-            ensure_local_agent_active(cfg, reason="submit")
+            if not args.no_activate:
+                ensure_local_agent_active(cfg, reason="submit")
             print(task_value.task_id); return 0
         if args.command == "batch-submit":
             def print_prepared(operation_id: str, idempotency_key: str) -> None:

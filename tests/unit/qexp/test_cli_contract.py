@@ -176,6 +176,31 @@ def test_submit_requests_local_agent_activation(tmp_path: Path, monkeypatch):
     assert reasons == ["submit"]
 
 
+def test_submit_without_activation_persists_task_and_skips_local_agent(
+        tmp_path: Path, monkeypatch, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    reasons: list[str] = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        lambda cfg, *, reason: reasons.append(reason) or True,
+    )
+
+    assert main([*_base_args(cfg), "submit", "--no-activate", "--", "echo", "ok"]) == 0
+    task_id = capsys.readouterr().out.strip()
+
+    assert reasons == []
+    assert load_task(cfg, task_id).state["projection"] == "queued"
+
+
+def test_submit_without_activation_does_not_start_local_agent(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+
+    assert get_agent_status(cfg)["is_running"] is False
+    assert main([*_base_args(cfg), "submit", "--no-activate", "--", "echo", "ok"]) == 0
+    assert get_agent_status(cfg)["is_running"] is False
+    assert not runtime_pid_path(cfg).exists()
+
+
 def test_batch_submit_requests_local_agent_activation(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     manifest = tmp_path / "runs.yaml"

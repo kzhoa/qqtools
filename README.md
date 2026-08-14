@@ -128,9 +128,11 @@ qexp submit --name demo3 -- python train.py -c config3.yaml
 After `init`, `qexp` saves the current `shared_root` and `machine` as CLI context, so you usually do not need to repeat them on every command.
 
 Agent lifecycle is configured separately from how it is launched. `on_demand` (the default)
-automatically starts for local submissions and exits after true idleness. `daemon` stays active
-until stopped. `qexp agent start` always launches in the background, while `qexp agent run` is
-the foreground debugging command.
+automatically starts for local submissions and exits after true idleness. To record a Task without
+requesting local activation from that invocation, use `qexp submit --no-activate -- <cmd>`; an
+already-running eligible agent may still claim the Task. `daemon` stays active until stopped.
+`qexp agent start` always launches in the background, while `qexp agent run` is the foreground
+debugging command.
 
 ```bash
 qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a --agent-mode daemon
