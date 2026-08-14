@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.6
+
 - breaking: replace qpipeline's public mutable runner-events API with frozen typed extension
   contracts: task lifecycle reactions, committed observers, and single-owner runner hook slots.
   The legacy `runner.events` package, mutable `LoopSignal`, generic command dispatch, and
