@@ -30,7 +30,6 @@ from .events import (
     EventName,
     emit_batch_end,
     emit_batch_start,
-    emit_checkpoint_request,
     emit_early_stop,
     emit_epoch_end,
     emit_epoch_start,
@@ -42,6 +41,9 @@ from .events import (
     emit_table_update,
     emit_train_batch_end,
     emit_validation_end,
+    CheckpointSaveCommandContext,
+    CheckpointSavedEventContext,
+    CommandName,
 )
 from .runner_utils.avgbank import AvgBank
 from .runner_utils.best_model import BestModelTracker
@@ -140,8 +142,8 @@ class RunningAgent:
         self.listeners = self.dispatcher.listeners
         if listeners:
             for event, callbacks in listeners.items():
-                event_name = self._validate_event_name(event)
-                self.listeners[event_name].extend(list(callbacks))
+                for callback in callbacks:
+                    self.dispatcher.add_listener(event, callback)
 
         self._ema_offload_ctx = EMAOffloadContext(
             main_model=self.model,
@@ -635,29 +637,46 @@ class RunningAgent:
         target_signal = signal or self._ad_hoc_signal
         while target_signal.pending_checkpoint_types:
             checkpoint_type = target_signal.pending_checkpoint_types.pop(0)
-            target_signal.begin_checkpoint_request()
-            dispatch_error = None
-
-            try:
-                emit_checkpoint_request(
-                    self.dispatcher,
-                    state=self.state,
-                    checkpoint_type=checkpoint_type,
-                    signal=target_signal,
-                    max_epochs=self.config.max_epochs,
-                    max_steps=self.config.max_steps,
-                )
-            except Exception as error:
-                dispatch_error = (type(error).__name__, str(error))
-
-            target_signal.synchronize_checkpoint_outcome(
-                self.config.distributed,
-                dispatch_error=dispatch_error,
+            checkpoint_path = self.dispatcher.invoke(
+                CommandName.SAVE_CHECKPOINT,
+                CheckpointSaveCommandContext(state=self.state, checkpoint_type=checkpoint_type),
             )
-            checkpoint_path = target_signal.consume_checkpoint_outcome()
+            if not isinstance(checkpoint_path, str) or not checkpoint_path:
+                raise RuntimeError("SAVE_CHECKPOINT handler must return a non-empty checkpoint path.")
 
             if checkpoint_type == "best":
                 self.state.best_ckp_file = Path(checkpoint_path).name
+
+            notification_error = None
+            try:
+                self.dispatcher._dispatch_internal_context(
+                    EventName.ON_CHECKPOINT_SAVED,
+                    CheckpointSavedEventContext(
+                        checkpoint_type=checkpoint_type,
+                        checkpoint_path=checkpoint_path,
+                        epoch=self.state.epoch,
+                        global_step=self.state.global_step,
+                    ),
+                )
+            except Exception as error:
+                notification_error = (type(error).__name__, str(error))
+            self._synchronize_checkpoint_notification_error(notification_error)
+
+    def _synchronize_checkpoint_notification_error(
+        self,
+        notification_error: Optional[tuple[str, str]],
+    ) -> None:
+        if self.config.distributed:
+            gathered_errors = [None for _ in range(qt.qdist.get_world_size())]
+            dist.all_gather_object(gathered_errors, notification_error)
+        else:
+            gathered_errors = [notification_error]
+
+        for rank, error in enumerate(gathered_errors):
+            if error is not None:
+                raise RuntimeError(
+                    f"Checkpoint saved notification failed on rank {rank}: {error[0]}: {error[1]}"
+                )
 
     def _execute_boundary_actions(
         self,

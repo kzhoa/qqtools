@@ -9,13 +9,14 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
+from qqtools.plugins.qpipeline.runner.events import CommandName
 from qqtools.plugins.qpipeline.runner.runner import RunningAgent
 from qqtools.plugins.qpipeline.runner.runner_utils.types import LoopSignal, RunConfig, RunMode, RunningState
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
 
 
-def _record_checkpoint_outcome(context) -> None:
-    context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+def _handle_checkpoint_command(context) -> str:
+    return "test-checkpoint.pt"
 
 
 # Re-using SimpleModel and SimpleTask from conftest or redefining for clarity
@@ -173,7 +174,7 @@ class TestEvaluationTiming:
 
         agent.add_listener("on_eval_start", capture_eval_start)
         agent.add_listener("on_eval_end", logger.on_eval_end)
-        agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
 
         agent.run()
 
@@ -226,7 +227,7 @@ class TestEvaluationTiming:
 
         agent.add_listener("on_eval_start", capture_eval_start)
         agent.add_listener("on_eval_end", logger.on_eval_end)
-        agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
 
         agent.run()
 
@@ -281,10 +282,10 @@ class TestEvaluationTiming:
         )
         checkpoint_types = []
         agent.add_listener("on_eval_start", logger.on_eval_start)
-        agent.add_listener("on_checkpoint_request", lambda context: (
-            checkpoint_types.append(context.checkpoint_type),
-            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt"),
-        ))
+        agent.dispatcher.set_handler(
+            CommandName.SAVE_CHECKPOINT,
+            lambda context: (checkpoint_types.append(context.checkpoint_type), "test-checkpoint.pt")[1],
+        )
 
         agent.run()
 
@@ -311,10 +312,10 @@ class TestEvaluationTiming:
         )
         checkpoint_types = []
         agent.add_listener("on_eval_start", logger.on_eval_start)
-        agent.add_listener("on_checkpoint_request", lambda context: (
-            checkpoint_types.append(context.checkpoint_type),
-            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt"),
-        ))
+        agent.dispatcher.set_handler(
+            CommandName.SAVE_CHECKPOINT,
+            lambda context: (checkpoint_types.append(context.checkpoint_type), "test-checkpoint.pt")[1],
+        )
 
         agent.run()
 
@@ -346,13 +347,13 @@ class TestEvaluationTiming:
             checkpoint_cursors.append(
                 (
                     context.checkpoint_type,
-                    context.runner.run_state.epoch,
-                    context.runner.run_state.batch_idx_in_epoch,
+                    context.state.epoch,
+                    context.state.batch_idx_in_epoch,
                 )
             )
-            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+            return "test-checkpoint.pt"
 
-        agent.add_listener("on_checkpoint_request", capture_checkpoint)
+        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, capture_checkpoint)
         agent.run()
 
         assert logger.on_eval_start.call_count == 1
@@ -384,10 +385,10 @@ class TestEvaluationTiming:
 
         def capture_checkpoint(context):
             checkpoint_types.append(context.checkpoint_type)
-            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+            return "test-checkpoint.pt"
 
         agent.add_listener("on_validation_end", request_stop)
-        agent.add_listener("on_checkpoint_request", capture_checkpoint)
+        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, capture_checkpoint)
         assert agent.run() == "early_stop"
         assert checkpoint_types == ["best", "regular"]
 
@@ -410,7 +411,7 @@ class TestEvaluationTiming:
             logger=logger,
         )
         agent.add_listener("on_eval_start", logger.on_eval_start)
-        agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
 
         assert agent.run() is None
         logger.on_eval_start.assert_not_called()
@@ -473,7 +474,7 @@ class TestEvaluationTiming:
             "on_validation_end",
             lambda context: context.signal.request_stop("completion_eval", "requested stop"),
         )
-        agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
         agent.add_listener("on_early_stop", early_stop_listener)
 
         assert agent.run() == "run_limit"
@@ -496,8 +497,8 @@ class TestEvaluationTiming:
             completion_signals["evaluation"] = context.signal
 
         def capture_checkpoint_signal(context):
-            completion_signals[context.checkpoint_type] = context.signal
-            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+            completion_signals[context.checkpoint_type] = context
+            return "test-checkpoint.pt"
 
         monkeypatch.setattr(LoopSignal, "synchronize_stop", capture_stop_synchronization)
         agent = RunningAgent(
@@ -517,13 +518,13 @@ class TestEvaluationTiming:
             logger=logger,
         )
         agent.add_listener("on_eval_start", capture_validation_signal)
-        agent.add_listener("on_checkpoint_request", capture_checkpoint_signal)
+        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, capture_checkpoint_signal)
 
         assert agent.run() == "run_limit"
 
         completion_signal = completion_signals["evaluation"]
-        assert completion_signal is completion_signals["best"]
-        assert completion_signal is completion_signals["regular"]
+        assert completion_signals["best"].state is agent.state
+        assert completion_signals["regular"].state is agent.state
         assert len(synchronized_signals) == 1
         assert completion_signal is not synchronized_signals[0]
 
@@ -544,10 +545,8 @@ class TestEvaluationTiming:
             context.signal.request_stop("periodic_eval", "requested stop")
 
         def capture_checkpoint(context):
-            checkpoint_signals[context.checkpoint_type] = context.signal
-            if context.checkpoint_type == "regular":
-                context.signal.request_stop("completion_save", "must not affect terminal reason")
-            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+            checkpoint_signals[context.checkpoint_type] = context
+            return "test-checkpoint.pt"
 
         monkeypatch.setattr(LoopSignal, "synchronize_stop", capture_stop_synchronization)
         agent = RunningAgent(
@@ -567,14 +566,14 @@ class TestEvaluationTiming:
             logger=logger,
         )
         agent.add_listener("on_validation_end", request_periodic_stop)
-        agent.add_listener("on_checkpoint_request", capture_checkpoint)
+        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, capture_checkpoint)
         agent.add_listener("on_early_stop", lambda context: early_stop_signals.append(context.signal))
 
         assert agent.run() == "early_stop"
         assert len(synchronized_signals) == 1
         assert len(early_stop_signals) == 1
-        assert early_stop_signals[0] is checkpoint_signals["best"]
-        assert early_stop_signals[0] is not checkpoint_signals["regular"]
+        assert checkpoint_signals["best"].state is agent.state
+        assert checkpoint_signals["regular"].state is agent.state
         assert [reason.source for reason in early_stop_signals[0].stop_reasons] == ["periodic_eval"]
 
     def test_run_limit_wins_over_periodic_stop_and_defers_epoch_save(self, common_setup, monkeypatch):
@@ -593,11 +592,11 @@ class TestEvaluationTiming:
             checkpoint_cursors.append(
                 (
                     context.checkpoint_type,
-                    context.runner.run_state.epoch,
-                    context.runner.run_state.batch_idx_in_epoch,
+                    context.state.epoch,
+                    context.state.batch_idx_in_epoch,
                 )
             )
-            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+            return "test-checkpoint.pt"
 
         monkeypatch.setattr(LoopSignal, "synchronize_stop", capture_stop_synchronization)
         agent = RunningAgent(
@@ -617,7 +616,7 @@ class TestEvaluationTiming:
             logger=logger,
         )
         agent.add_listener("on_validation_end", request_periodic_stop)
-        agent.add_listener("on_checkpoint_request", capture_checkpoint)
+        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, capture_checkpoint)
         agent.add_listener("on_early_stop", early_stop_listener)
 
         assert agent.run() == "run_limit"

@@ -116,6 +116,30 @@ class TestCheckpointManager:
         assert state.best_monitored_metric is None
         assert state.best_model_metrics_snapshot == {}
 
+    def test_best_checkpoint_records_its_own_filename_without_mutating_input_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CheckpointManager(save_dir=tmpdir)
+            self.state.best_ckp_file = "best_epoch4_step80.pt"
+            previous_path = Path(tmpdir) / self.state.best_ckp_file
+            previous_path.touch()
+
+            checkpoint_path = manager.save(
+                self.state,
+                self.model,
+                self.task,
+                self.optimizer,
+                self.scheduler,
+                self.ema_model,
+                self.early_stopper,
+                self.best_model_manager,
+                is_best=True,
+            )
+
+            checkpoint = torch.load(checkpoint_path)
+            assert self.state.best_ckp_file == "best_epoch4_step80.pt"
+            assert checkpoint["state"]["best_ckp_file"] == Path(checkpoint_path).name
+            assert not previous_path.exists()
+
     def test_keep_only_latest_regular_deletes_previous_regular_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = CheckpointManager(save_dir=tmpdir, keep_only_latest_regular=True)

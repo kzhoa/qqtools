@@ -7,13 +7,21 @@
 - feat: add `runner.completion.eval` and `runner.completion.save` so successful qpipeline
   terminal boundaries can run a final normal evaluation and/or persist one complete regular
   checkpoint when periodic intervals did not select that work.
-- breaking: require `CheckpointListener` to receive a `CheckpointManager`; a missing manager now
-  fails at construction instead of silently discarding checkpoint requests.
+- breaking: replace qpipeline's public `on_checkpoint_request` listener with the internally
+  registered, single-handler `SAVE_CHECKPOINT` command. The post-commit
+  `ON_CHECKPOINT_SAVED` notification is also internal; task and external listeners can no longer
+  register checkpoint writers or observers through the lifecycle listener API.
+- breaking: require the `SAVE_CHECKPOINT` `CheckpointCommandHandler` to receive a
+  `CheckpointManager`; a missing manager now fails at construction instead of silently discarding
+  checkpoint requests.
 - fix: finalize every completed qpipeline training boundary in one ordered path, committing a
   completed epoch before resolving simultaneous run-limit and early-stop outcomes.
-- fix: synchronize qpipeline checkpoint request listener-dispatch and persistence failures across
-  DDP ranks through the existing request outcome collective, preventing ranks from waiting after a
-  peer has already failed.
+- fix: commit the best-checkpoint path to every qpipeline rank immediately after persistence and
+  before post-commit notifications. A notification failure therefore no longer leaves ranks with
+  divergent `best_ckp_file` state, while the checkpoint's saved state points to the new best file.
+- fix: synchronize qpipeline checkpoint persistence failures and post-commit notification errors
+  through their separate distributed protocol stages, without using `LoopSignal` as a checkpoint
+  result side channel.
 
 ## v1.3.5
 

@@ -3,11 +3,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from ...entry_utils.qema import qEMA
 from ...task.qtask import qTaskBase
-from ..events import CheckpointRequestEventContext
+from ..events import CheckpointSaveCommandContext, CheckpointSavedEventContext
 from .types import RunningState
 
 
@@ -48,42 +49,66 @@ class CheckpointManager:
         best_model_manager: Optional[Any] = None,
         is_best: bool = False,
     ) -> str:
-        """Save checkpoint to file"""
-        if self.rank != 0:  # Only save in main process
-            return ""
+        """Save on the owner and return its path on every participating rank."""
+        is_distributed = dist.is_available() and dist.is_initialized()
+        outcome = {"path": None, "error_type": None, "error_message": None}
+        owner_error: Optional[BaseException] = None
 
-        if best_model_tracker is None:
-            best_model_tracker = best_model_manager
+        if self.rank == 0:
+            try:
+                if best_model_tracker is None:
+                    best_model_tracker = best_model_manager
+                previous_best_ckp_file = state.best_ckp_file
+                state_for_save = copy.copy(state)
+                filename = generate_checkpoint_filename(
+                    state_for_save.epoch,
+                    state_for_save.global_step,
+                    is_best,
+                )
+                if is_best:
+                    state_for_save.best_ckp_file = filename
+                checkpoint = self._create_checkpoint_dict(
+                    state_for_save,
+                    model,
+                    task,
+                    optimizer,
+                    scheduler,
+                    ema_model,
+                    early_stopper,
+                    best_model_tracker,
+                    filename=filename,
+                    is_best=is_best,
+                )
+                save_path = self.save_dir / filename
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(checkpoint, str(save_path))
+                if is_best:
+                    self._rotate_checkpoint(previous_best_ckp_file, save_path)
+                elif self.keep_only_latest_regular:
+                    self._rotate_checkpoint(self.latest_regular_ckp_file, save_path)
+                    self.latest_regular_ckp_file = filename
+                outcome["path"] = str(save_path)
+            except Exception as error:
+                owner_error = error
+                outcome["error_type"] = type(error).__name__
+                outcome["error_message"] = str(error)
 
-        filename = generate_checkpoint_filename(state.epoch, state.global_step, is_best)
-        checkpoint = self._create_checkpoint_dict(
-            state,
-            model,
-            task,
-            optimizer,
-            scheduler,
-            ema_model,
-            early_stopper,
-            best_model_tracker,
-            filename=filename,
-            is_best=is_best,
-        )
+        if is_distributed:
+            outcome_box = [outcome]
+            dist.broadcast_object_list(outcome_box, src=0)
+            outcome = outcome_box[0]
 
-        # Save the checkpoint to a file
-        save_path = self.save_dir / filename
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(checkpoint, str(save_path))
-
-        # Manage checkpoint rotation to keep only the latest one if configured
-        if is_best:
-            self._rotate_checkpoint(state.best_ckp_file, save_path)
-            # Store only the filename (relative path) in state for portability
-            state.best_ckp_file = filename
-        elif self.keep_only_latest_regular:
-            self._rotate_checkpoint(self.latest_regular_ckp_file, save_path)
-            self.latest_regular_ckp_file = filename
-
-        return str(save_path)
+        if outcome["error_type"] is not None:
+            if owner_error is not None:
+                raise owner_error
+            raise RuntimeError(
+                "Checkpoint persistence failed on owner: "
+                f"{outcome['error_type']}: {outcome['error_message']}"
+            )
+        checkpoint_path = outcome["path"]
+        if not isinstance(checkpoint_path, str) or not checkpoint_path:
+            raise RuntimeError("Checkpoint persistence completed without an owner checkpoint path.")
+        return checkpoint_path
 
     def _rotate_checkpoint(self, old_ckp_file_or_path: Optional[str], new_ckp_path: Path):
         """Delete the old checkpoint file."""
@@ -203,8 +228,8 @@ class CheckpointManager:
         return checkpoint
 
 
-class CheckpointListener:
-    """Listener that persists checkpoints when requested by the agent."""
+class CheckpointCommandHandler:
+    """Command handler that persists checkpoints when requested by the agent."""
 
     def __init__(
         self,
@@ -216,8 +241,6 @@ class CheckpointListener:
         ema_model: Optional[qEMA] = None,
         early_stopper: Optional[Any] = None,
         best_model_tracker: Optional[Any] = None,
-        logger: Optional[Any] = None,
-        event_logger: Optional[Any] = None,
     ) -> None:
         if checkpoint_manager is None:
             raise ValueError("checkpoint_manager is required")
@@ -229,44 +252,47 @@ class CheckpointListener:
         self.ema_model = ema_model
         self.early_stopper = early_stopper
         self.best_model_tracker = best_model_tracker
+
+    def handle(self, context: CheckpointSaveCommandContext) -> str:
+        return self.checkpoint_manager.save(
+            context.state,
+            self.model,
+            self.task,
+            self.optimizer,
+            self.scheduler,
+            self.ema_model,
+            self.early_stopper,
+            self.best_model_tracker,
+            is_best=(context.checkpoint_type == "best"),
+        )
+
+
+class CheckpointSavedListener:
+    """Owner-only post-commit checkpoint logging adapter."""
+
+    def __init__(
+        self,
+        rank: int,
+        logger: Optional[Any] = None,
+        event_logger: Optional[Any] = None,
+    ) -> None:
+        self.rank = rank
         self.logger = logger
         self.event_logger = event_logger
 
-    def _clone_state_for_save(self, context: CheckpointRequestEventContext):
-        state = context.runner.run_state
-        if hasattr(state, "to_running_state"):
-            return state.to_running_state()
-        return copy.copy(state)
-
-    def on_checkpoint_request(self, context: CheckpointRequestEventContext) -> None:
-        checkpoint_type = context.checkpoint_type or "regular"
-        state_for_save = self._clone_state_for_save(context)
-        try:
-            ckp_path = self.checkpoint_manager.save(
-                state_for_save,
-                self.model,
-                self.task,
-                self.optimizer,
-                self.scheduler,
-                self.ema_model,
-                self.early_stopper,
-                self.best_model_tracker,
-                is_best=(checkpoint_type == "best"),
-            )
-        except Exception as error:
-            context.signal.record_checkpoint_outcome(error=error)
+    def on_checkpoint_saved(self, context: CheckpointSavedEventContext) -> None:
+        if self.rank != 0:
             return
-        if ckp_path:
-            context.signal.record_checkpoint_outcome(path=ckp_path)
-        if ckp_path and self.logger is not None:
-            self.logger.info(f"[Checkpoint Saved] type={checkpoint_type} path={Path(ckp_path).resolve()}")
-        if ckp_path and self.event_logger is not None:
+        checkpoint_path = str(Path(context.checkpoint_path).resolve())
+        if self.logger is not None:
+            self.logger.info(f"[Checkpoint Saved] type={context.checkpoint_type} path={checkpoint_path}")
+        if self.event_logger is not None:
             self.event_logger.write(
                 {
                     "event": "checkpoint_saved",
-                    "epoch": context.runner.run_state.epoch,
-                    "global_step": context.runner.run_state.global_step,
-                    "type": checkpoint_type,
-                    "path": str(Path(ckp_path).resolve()),
+                    "epoch": context.epoch,
+                    "global_step": context.global_step,
+                    "type": context.checkpoint_type,
+                    "path": checkpoint_path,
                 }
             )
