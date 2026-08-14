@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from qqtools.plugins.qpipeline.entry_utils.scheduler import qWarmupScheduler
 from qqtools.plugins.qpipeline.entry_utils.type_qconfig import EarlyStopConfig, RunnerConfig
+from qqtools.plugins.qpipeline.runner.events import CommandName
 from qqtools.plugins.qpipeline.runner.agent import RunningAgent
 from qqtools.plugins.qpipeline.runner.runner import train_runner
 from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMode
@@ -110,8 +111,8 @@ class DummyScheduler:
         self.step_warmup()
 
 
-def _record_checkpoint_outcome(context) -> None:
-    context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+def _handle_checkpoint_command(context) -> str:
+    return "test-checkpoint.pt"
 
 
 @pytest.mark.parametrize("invalid_value", [0, -1, 1.5, True])
@@ -186,7 +187,7 @@ def test_accum_grad_delays_optimizer_steps(monkeypatch):
         config=RunConfig(run_mode=RunMode.STEP, max_steps=2, eval_interval=10, accum_grad=2),
         device=torch.device("cpu"),
     )
-    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
 
     agent.run()
 
@@ -248,7 +249,7 @@ def test_partial_accum_window_is_flushed_at_epoch_end(monkeypatch):
         config=RunConfig(run_mode=RunMode.EPOCH, max_epochs=1, eval_interval=1, accum_grad=2),
         device=torch.device("cpu"),
     )
-    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
 
     agent.run()
 
@@ -274,7 +275,7 @@ def test_step_mode_eval_interval_counts_optimizer_steps_under_accumulation():
     )
     eval_steps = []
     agent.add_listener("on_eval_start", lambda ctx: eval_steps.append(ctx.runner.run_state.global_step))
-    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
 
     agent.run()
 
@@ -292,11 +293,12 @@ def test_step_mode_save_interval_counts_optimizer_steps_under_accumulation():
     def capture_checkpoint_request(context):
         checkpoint_events.append(
             {
-                "step": context.runner.run_state.global_step,
-                "batch_idx_in_epoch": context.runner.run_state.batch_idx_in_epoch,
+                "step": context.state.global_step,
+                "batch_idx_in_epoch": context.state.batch_idx_in_epoch,
                 "checkpoint_type": context.checkpoint_type,
             }
         )
+        return "test-checkpoint.pt"
 
     agent = RunningAgent(
         model=model,
@@ -306,8 +308,7 @@ def test_step_mode_save_interval_counts_optimizer_steps_under_accumulation():
         config=RunConfig(run_mode=RunMode.STEP, max_steps=4, eval_interval=99, save_interval=2, accum_grad=2),
         device=torch.device("cpu"),
     )
-    agent.add_listener("on_checkpoint_request", capture_checkpoint_request)
-    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, capture_checkpoint_request)
 
     agent.run()
 
@@ -350,7 +351,7 @@ def test_step_mode_early_stop_halts_after_first_optimizer_step_under_accumulatio
     )
     agent.add_listener("on_validation_end", stop_on_first_validation)
     agent.add_listener("on_batch_end", capture_batch_end)
-    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
 
     early_stop = agent.run()
 
@@ -478,7 +479,7 @@ def test_train_batch_events_do_not_report_early_lr_change_for_valid_end_schedule
         "on_batch_end",
         lambda context: batch_end_lrs.append(context.lr) if context.runner.stage == "train" else None,
     )
-    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
 
     agent.run()
 

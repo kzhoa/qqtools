@@ -26,8 +26,8 @@ from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import TASK_LIFECYCLE_HOOKS, qTaskBase
 from ..types import Stage
 from .agent import NaNDetectedError, RunningAgent
-from .events import ValidationEndEventContext
-from .runner_utils.ckp_manager import CheckpointListener, CheckpointManager
+from .events import CommandName, EventName, ValidationEndEventContext
+from .runner_utils.ckp_manager import CheckpointCommandHandler, CheckpointManager, CheckpointSavedListener
 from .runner_utils.common import _getattr_or_default, _is_periodic_trigger, move_batch_to_device
 from .runner_utils.earlystop import EarlyStopListener, EarlyStopper
 from .runner_utils.epoch_suffix import standardize_epoch_suffixes
@@ -240,7 +240,8 @@ def _prepare_training_session(
     early_stopper: EarlyStopper,
     eval_summary_listener: EvalSummaryListener,
     early_stop_listener: EarlyStopListener,
-    checkpoint_listener: CheckpointListener,
+    checkpoint_command_handler: CheckpointCommandHandler,
+    checkpoint_saved_listener: CheckpointSavedListener,
     effective_scheduler: Optional[qWarmupScheduler],
     scheduler_target: str = "val_metric",
     device: torch.device,
@@ -294,7 +295,11 @@ def _prepare_training_session(
     agent.add_listener("on_validation_end", _on_validation_end_step_scheduler)
     agent.add_listener("on_validation_end", eval_summary_listener.on_validation_end)
     agent.add_listener("on_validation_end", early_stop_listener.on_validation_end)
-    agent.add_listener("on_checkpoint_request", checkpoint_listener.on_checkpoint_request)
+    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, checkpoint_command_handler.handle)
+    agent.dispatcher._add_internal_listener(
+        EventName.ON_CHECKPOINT_SAVED,
+        checkpoint_saved_listener.on_checkpoint_saved,
+    )
 
     progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type, rank=config.rank)
     agent.add_listener("on_epoch_start_internal", progress_tracker.on_epoch_start)
@@ -688,7 +693,7 @@ def train_runner(
         logger=logger,
     )
 
-    checkpoint_listener = CheckpointListener(
+    checkpoint_command_handler = CheckpointCommandHandler(
         checkpoint_manager=checkpoint_manager,
         model=model,
         task=task,
@@ -697,6 +702,9 @@ def train_runner(
         ema_model=ema_model,
         early_stopper=early_stopper,
         best_model_tracker=agent.best_model_tracker,
+    )
+    checkpoint_saved_listener = CheckpointSavedListener(
+        rank=config.rank if config.distributed else 0,
         logger=logger,
         event_logger=metrics_logger,
     )
@@ -728,7 +736,8 @@ def train_runner(
             early_stopper=early_stopper,
             eval_summary_listener=eval_summary_listener,
             early_stop_listener=early_stop_listener,
-            checkpoint_listener=checkpoint_listener,
+            checkpoint_command_handler=checkpoint_command_handler,
+            checkpoint_saved_listener=checkpoint_saved_listener,
             effective_scheduler=effective_scheduler,
             scheduler_target=scheduler_target,
             device=device,

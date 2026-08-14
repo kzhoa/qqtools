@@ -2,7 +2,6 @@ from .dispatcher import EventDispatcher
 from .hooks import (
     emit_batch_end,
     emit_batch_start,
-    emit_checkpoint_request,
     emit_early_stop,
     emit_epoch_end,
     emit_epoch_start,
@@ -17,7 +16,9 @@ from .hooks import (
 )
 from .types import (
     BaseEventContext,
-    CheckpointRequestEventContext,
+    CheckpointSaveCommandContext,
+    CheckpointSavedEventContext,
+    CommandName,
     EventName,
     EventSpec,
     LossComputedEventContext,
@@ -35,7 +36,9 @@ from ..runner_utils.evaluation import (
 
 __all__ = [
     "BaseEventContext",
-    "CheckpointRequestEventContext",
+    "CheckpointSaveCommandContext",
+    "CheckpointSavedEventContext",
+    "CommandName",
     "EventDispatcher",
     "EventName",
     "EventSpec",
@@ -50,7 +53,6 @@ __all__ = [
     "ValidationEndEventContext",
     "emit_batch_end",
     "emit_batch_start",
-    "emit_checkpoint_request",
     "emit_early_stop",
     "emit_epoch_end",
     "emit_epoch_start",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, Literal, Optional, Type
 
 from ...types import Stage
 from ..runner_utils.evaluation import EvaluationResult
@@ -21,9 +21,13 @@ class EventName(Enum):
     ON_EVAL_START = "on_eval_start"
     ON_EVAL_END = "on_eval_end"
     ON_VALIDATION_END = "on_validation_end"
-    ON_CHECKPOINT_REQUEST = "on_checkpoint_request"
+    ON_CHECKPOINT_SAVED = "on_checkpoint_saved"
     ON_EARLY_STOP = "on_early_stop"
     ON_LOSS_COMPUTED = "on_loss_computed"
+
+
+class CommandName(Enum):
+    SAVE_CHECKPOINT = "save_checkpoint"
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -59,10 +63,18 @@ class ValidationEndEventContext(BaseEventContext):
     signal: LoopSignal
 
 
-@dataclass(kw_only=True)
-class CheckpointRequestEventContext(BaseEventContext):
-    checkpoint_type: str
-    signal: LoopSignal
+@dataclass(kw_only=True, frozen=True)
+class CheckpointSaveCommandContext:
+    state: RunningState
+    checkpoint_type: Literal["best", "regular"]
+
+
+@dataclass(kw_only=True, frozen=True)
+class CheckpointSavedEventContext:
+    checkpoint_type: Literal["best", "regular"]
+    checkpoint_path: str
+    epoch: int
+    global_step: int
 
 
 @dataclass(kw_only=True)
@@ -105,7 +117,7 @@ class _EvalEndInternalContext(BaseEventContext):
 @dataclass(frozen=True)
 class EventSpec:
     name: EventName
-    context_type: Type[BaseEventContext]
+    context_type: Type[Any]
     # Default contract: run_state is passed through directly as the current
     # RunningState object. The framework does not enforce immutability for
     # event consumers; behavioral constraints are documented rather than
@@ -160,9 +172,9 @@ EVENT_SPECS: Dict[str, EventSpec] = {
         name=EventName.ON_VALIDATION_END,
         context_type=ValidationEndEventContext,
     ),
-    EventName.ON_CHECKPOINT_REQUEST.value: EventSpec(
-        name=EventName.ON_CHECKPOINT_REQUEST,
-        context_type=CheckpointRequestEventContext,
+    EventName.ON_CHECKPOINT_SAVED.value: EventSpec(
+        name=EventName.ON_CHECKPOINT_SAVED,
+        context_type=CheckpointSavedEventContext,
     ),
     EventName.ON_EARLY_STOP.value: EventSpec(
         name=EventName.ON_EARLY_STOP,

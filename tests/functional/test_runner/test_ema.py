@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from qqtools.plugins.qpipeline.entry_utils.qema import qEMA
 from qqtools.plugins.qpipeline.runner import runner as runner_module
+from qqtools.plugins.qpipeline.runner.events import CommandName
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
 
 RunningAgent = runner_module.RunningAgent
@@ -132,10 +133,7 @@ def setup_agent_with_ema(request):
         ema_model=ema_model,
         logger=MagicMock(),  # Mock logger
     )
-    agent.add_listener(
-        "on_checkpoint_request",
-        lambda context: context.signal.record_checkpoint_outcome(path="test-checkpoint.pt"),
-    )
+    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, lambda context: "test-checkpoint.pt")
     return agent, model, ema_model, device
 
 

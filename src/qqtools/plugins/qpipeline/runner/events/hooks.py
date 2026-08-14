@@ -263,27 +263,6 @@ def emit_validation_end(
     )
 
 
-def emit_checkpoint_request(
-    dispatcher: EventDispatcher,
-    *,
-    state: RunningState,
-    checkpoint_type: str,
-    signal: LoopSignal,
-    max_epochs: Optional[int],
-    max_steps: Optional[int],
-) -> None:
-    _dispatch_context(
-        dispatcher,
-        "on_checkpoint_request",
-        state=state,
-        stage=None,
-        checkpoint_type=checkpoint_type,
-        signal=signal,
-        max_epochs=max_epochs,
-        max_steps=max_steps,
-    )
-
-
 def emit_early_stop(
     dispatcher: EventDispatcher,
     *,
