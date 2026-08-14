@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-06
+updated_at: 2026-08-14
 archived_at:
 ---
 
@@ -902,6 +902,8 @@ Rules:
 - Group is optional for ad hoc Tasks
 - duplicate `task_id` fails by default
 - submission never creates a public Batch
+- `--no-activate` persists the Task without requesting local agent activation from that command
+  invocation; an already-running eligible agent may still claim the Task
 
 ### 12.2 `batch-submit`
 
@@ -1101,7 +1103,8 @@ Hostname is descriptive metadata, not the primary identity.
 
 Default behavior:
 
-- local work submission automatically starts the current machine's agent when needed
+- local work submission automatically starts the current machine's agent when needed, unless the
+  submit invocation uses `--no-activate`
 - `on_demand` agents exit after true idleness; `daemon` agents remain active
 - qexp does not remotely wake other machines
 

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- feat: add `qexp submit --no-activate` to persist a Task without requesting local agent
+  activation from that invocation
 - feat: add `runner.completion.eval` and `runner.completion.save` so successful qpipeline
   terminal boundaries can run a final normal evaluation and/or persist one complete regular
   checkpoint when periodic intervals did not select that work.
