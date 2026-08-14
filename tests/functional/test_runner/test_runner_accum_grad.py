@@ -9,8 +9,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from qqtools.plugins.qpipeline.entry_utils.scheduler import qWarmupScheduler
 from qqtools.plugins.qpipeline.entry_utils.type_qconfig import EarlyStopConfig, RunnerConfig
-from qqtools.plugins.qpipeline.runner.events import CommandName
 from qqtools.plugins.qpipeline.runner.agent import RunningAgent
+from qqtools.plugins.qpipeline.runner.contracts import EarlyStopDecision, EventListenerBindings, ObserverBindings
+from qqtools.plugins.qpipeline.runner.hooks import RunnerHooks
+from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointPlugin, CheckpointPolicy
 from qqtools.plugins.qpipeline.runner.runner import train_runner
 from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMode
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
@@ -111,8 +113,21 @@ class DummyScheduler:
         self.step_warmup()
 
 
-def _handle_checkpoint_command(context) -> str:
-    return "test-checkpoint.pt"
+def _install_checkpoint_plugin(
+    agent: RunningAgent, checkpoint_manager: MagicMock, *, save_interval: int = 1
+) -> CheckpointPlugin:
+    checkpoint_manager.rank = 0
+    plugin = CheckpointPlugin(
+        checkpoint_manager=checkpoint_manager,
+        model=agent.model,
+        task=agent.task,
+        state=agent.state,
+        policy=CheckpointPolicy(save_interval, None, False, False),
+        optimizer=agent.optimizer,
+    )
+    plugin.register(agent.hooks)
+    agent.hooks.freeze()
+    return plugin
 
 
 @pytest.mark.parametrize("invalid_value", [0, -1, 1.5, True])
@@ -127,15 +142,15 @@ def test_run_config_rejects_invalid_accum_grad(invalid_value):
         RunConfig(accum_grad=invalid_value)
 
 
-@pytest.mark.parametrize("completion", [{"eval": 1}, {"save": "false"}, {"unknown": True}])
-def test_run_config_rejects_invalid_completion_policy(completion):
+@pytest.mark.parametrize("completion_eval", [1, "false", None])
+def test_run_config_rejects_invalid_completion_eval(completion_eval):
     with pytest.raises(ValueError):
-        RunConfig(completion=completion)
+        RunConfig(completion_eval=completion_eval)
 
 
-def test_completion_policy_defaults_and_accepts_partial_config():
-    assert RunConfig().completion == {"eval": False, "save": False}
-    assert RunConfig(completion={"eval": True}).completion == {"eval": True, "save": False}
+def test_completion_eval_defaults_and_accepts_boolean_config():
+    assert RunConfig().completion_eval is False
+    assert RunConfig(completion_eval=True).completion_eval is True
 
 
 @pytest.mark.parametrize("invalid_value", [0, -1, 1.5, True])
@@ -187,8 +202,6 @@ def test_accum_grad_delays_optimizer_steps(monkeypatch):
         config=RunConfig(run_mode=RunMode.STEP, max_steps=2, eval_interval=10, accum_grad=2),
         device=torch.device("cpu"),
     )
-    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
-
     agent.run()
 
     assert len(step_calls) == 2
@@ -249,8 +262,6 @@ def test_partial_accum_window_is_flushed_at_epoch_end(monkeypatch):
         config=RunConfig(run_mode=RunMode.EPOCH, max_epochs=1, eval_interval=1, accum_grad=2),
         device=torch.device("cpu"),
     )
-    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
-
     agent.run()
 
     assert len(step_calls) == 3
@@ -263,7 +274,10 @@ def test_step_mode_eval_interval_counts_optimizer_steps_under_accumulation():
     model = TinyModel()
     optimizer = optim.SGD(model.parameters(), lr=0.1)
     loss_fn = nn.MSELoss()
-    listener = MagicMock()
+    observers = ObserverBindings()
+    eval_steps = []
+    observers.bind("evaluation_started", lambda fact: eval_steps.append(fact.global_step))
+    observers.freeze()
 
     agent = RunningAgent(
         model=model,
@@ -272,11 +286,8 @@ def test_step_mode_eval_interval_counts_optimizer_steps_under_accumulation():
         optimizer=optimizer,
         config=RunConfig(run_mode=RunMode.STEP, max_steps=4, eval_interval=2, accum_grad=2),
         device=torch.device("cpu"),
+        observers=observers,
     )
-    eval_steps = []
-    agent.add_listener("on_eval_start", lambda ctx: eval_steps.append(ctx.runner.run_state.global_step))
-    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
-
     agent.run()
 
     assert eval_steps == [2, 4]
@@ -290,12 +301,14 @@ def test_step_mode_save_interval_counts_optimizer_steps_under_accumulation():
     loss_fn = nn.MSELoss()
     checkpoint_events = []
 
-    def capture_checkpoint_request(context):
+    checkpoint_manager = MagicMock()
+
+    def capture_checkpoint_request(*args, **kwargs):
         checkpoint_events.append(
             {
-                "step": context.state.global_step,
-                "batch_idx_in_epoch": context.state.batch_idx_in_epoch,
-                "checkpoint_type": context.checkpoint_type,
+                "step": agent.state.global_step,
+                "batch_idx_in_epoch": agent.state.batch_idx_in_epoch,
+                "checkpoint_type": "best" if kwargs["is_best"] else "regular",
             }
         )
         return "test-checkpoint.pt"
@@ -305,10 +318,12 @@ def test_step_mode_save_interval_counts_optimizer_steps_under_accumulation():
         task=task,
         loss_fn=loss_fn,
         optimizer=optimizer,
-        config=RunConfig(run_mode=RunMode.STEP, max_steps=4, eval_interval=99, save_interval=2, accum_grad=2),
+        config=RunConfig(run_mode=RunMode.STEP, max_steps=4, eval_interval=99, accum_grad=2),
         device=torch.device("cpu"),
+        hooks=RunnerHooks(),
     )
-    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, capture_checkpoint_request)
+    checkpoint_manager.save.side_effect = capture_checkpoint_request
+    _install_checkpoint_plugin(agent, checkpoint_manager, save_interval=2)
 
     agent.run()
 
@@ -332,12 +347,17 @@ def test_step_mode_early_stop_halts_after_first_optimizer_step_under_accumulatio
         step_calls.append("step")
         return original_step(*args, **kwargs)
 
-    def stop_on_first_validation(context):
-        context.signal.request_stop("test", "stop after first accumulated validation")
+    class StopOnFirstValidation:
+        def decide(self, context, *, distributed):  # noqa: ARG002
+            return EarlyStopDecision(
+                should_stop=True,
+                source="test",
+                message="stop after first accumulated validation",
+            )
 
-    def capture_batch_end(context):
-        if context.runner.stage == "train":
-            processed_batches.append(context.batch_idx)
+    observers = ObserverBindings()
+    observers.bind("train_boundary", lambda fact: processed_batches.append(fact.batch_index))
+    observers.freeze()
 
     monkeypatch.setattr(optimizer, "step", counted_step)
 
@@ -348,11 +368,9 @@ def test_step_mode_early_stop_halts_after_first_optimizer_step_under_accumulatio
         optimizer=optimizer,
         config=RunConfig(run_mode=RunMode.STEP, max_steps=8, eval_interval=1, accum_grad=2),
         device=torch.device("cpu"),
+        observers=observers,
+        early_stop_controller=StopOnFirstValidation(),
     )
-    agent.add_listener("on_validation_end", stop_on_first_validation)
-    agent.add_listener("on_batch_end", capture_batch_end)
-    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
-
     early_stop = agent.run()
 
     assert early_stop == "early_stop"
@@ -397,6 +415,10 @@ def test_train_batch_events_report_post_step_lr_for_optimizer_step_scheduler():
     )
     batch_end_lrs = []
     progress_lrs = []
+    observers = ObserverBindings()
+    observers.bind("train_boundary", lambda fact: batch_end_lrs.append(fact.lr))
+    observers.bind("progress_tick", lambda fact: progress_lrs.append(fact.lr))
+    observers.freeze()
 
     agent = RunningAgent(
         model=model,
@@ -406,9 +428,8 @@ def test_train_batch_events_report_post_step_lr_for_optimizer_step_scheduler():
         scheduler=scheduler,
         config=RunConfig(run_mode=RunMode.STEP, max_steps=3, eval_interval=10, accum_grad=1, print_freq=1),
         device=torch.device("cpu"),
+        observers=observers,
     )
-    agent.add_listener("on_batch_end", lambda context: batch_end_lrs.append(context.lr))
-    agent.add_listener("on_progress_tick", lambda context: progress_lrs.append(context.lr))
 
     agent.run()
 
@@ -429,6 +450,10 @@ def test_train_batch_events_mix_pre_and_post_step_lr_under_accumulation():
     )
     batch_end_lrs = []
     progress_lrs = []
+    observers = ObserverBindings()
+    observers.bind("train_boundary", lambda fact: batch_end_lrs.append(fact.lr))
+    observers.bind("progress_tick", lambda fact: progress_lrs.append(fact.lr))
+    observers.freeze()
 
     agent = RunningAgent(
         model=model,
@@ -438,9 +463,8 @@ def test_train_batch_events_mix_pre_and_post_step_lr_under_accumulation():
         scheduler=scheduler,
         config=RunConfig(run_mode=RunMode.STEP, max_steps=2, eval_interval=10, accum_grad=2, print_freq=1),
         device=torch.device("cpu"),
+        observers=observers,
     )
-    agent.add_listener("on_batch_end", lambda context: batch_end_lrs.append(context.lr))
-    agent.add_listener("on_progress_tick", lambda context: progress_lrs.append(context.lr))
 
     agent.run()
 
@@ -461,6 +485,15 @@ def test_train_batch_events_do_not_report_early_lr_change_for_valid_end_schedule
         step_on="valid_end",
     )
     batch_end_lrs = []
+    observers = ObserverBindings()
+    observers.bind("train_boundary", lambda fact: batch_end_lrs.append(fact.lr))
+    observers.freeze()
+    listeners = EventListenerBindings()
+    listeners.bind(
+        "validation",
+        lambda context: scheduler.step_main(metrics=context.evaluation.target_value("val_metric")),
+    )
+    listeners.freeze()
 
     agent = RunningAgent(
         model=model,
@@ -470,17 +503,9 @@ def test_train_batch_events_do_not_report_early_lr_change_for_valid_end_schedule
         scheduler=scheduler,
         config=RunConfig(run_mode=RunMode.STEP, max_steps=4, eval_interval=2, accum_grad=1, print_freq=1),
         device=torch.device("cpu"),
+        event_listeners=listeners,
+        observers=observers,
     )
-    agent.add_listener(
-        "on_validation_end",
-        lambda context: scheduler.step_main(metrics=context.evaluation.target_value("val_metric")),
-    )
-    agent.add_listener(
-        "on_batch_end",
-        lambda context: batch_end_lrs.append(context.lr) if context.runner.stage == "train" else None,
-    )
-    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, _handle_checkpoint_command)
-
     agent.run()
 
     assert batch_end_lrs == pytest.approx([0.1, 0.1, 0.05, 0.05])

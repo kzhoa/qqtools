@@ -6,8 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Union
 
-from ..events import ProgressEventContext
-from ..events.types import _EvalEndInternalContext
+from ..contracts import EvaluationCommittedFact, TrainBoundaryCommittedFact
 from .common import _is_periodic_trigger
 from .types import RunConfig
 
@@ -50,8 +49,8 @@ def _scalar_metrics(metrics: Mapping[str, Any]) -> Dict[str, Any]:
     return result
 
 
-class MetricsJsonlListener:
-    """Write qpipeline batch and evaluation events as machine-readable JSON Lines."""
+class MetricsJsonlObserver:
+    """Write committed qpipeline facts as machine-readable JSON Lines."""
 
     def __init__(
         self,
@@ -63,34 +62,32 @@ class MetricsJsonlListener:
         self.config = run_config
         self.log_granularity = log_granularity
 
-    def on_eval_end(self, context: _EvalEndInternalContext) -> None:
-        state = context.runner.run_state
+    def on_evaluation_committed(self, context: EvaluationCommittedFact) -> None:
         self.logger.write(
             {
                 "event": "evaluation",
-                "epoch": state.epoch,
-                "global_step": state.global_step,
+                "epoch": context.epoch,
+                "global_step": context.global_step,
                 "evaluation": context.evaluation.to_dict(),
             }
         )
 
-    def on_train_batch_end(self, context: ProgressEventContext) -> None:
+    def on_train_boundary(self, context: TrainBoundaryCommittedFact) -> None:
         if "eval" in self.log_granularity:
-            is_epoch_end = context.batch_idx == context.total_batches - 1
+            is_epoch_end = context.batch_index == context.total_batches - 1
             if _is_periodic_trigger(
                 run_mode=self.config.run_mode,
                 interval=self.config.eval_interval,
-                global_step=context.runner.run_state.global_step,
-                epoch=context.runner.run_state.epoch,
+                global_step=context.global_step,
+                epoch=context.epoch,
                 is_epoch_end=is_epoch_end,
             ):
                 return
-        state = context.runner.run_state
         self.logger.write(
             {
                 "event": "train_batch",
-                "epoch": state.epoch,
-                "global_step": state.global_step,
+                "epoch": context.epoch,
+                "global_step": context.global_step,
                 "metrics": _scalar_metrics(context.batch_metrics),
             }
         )

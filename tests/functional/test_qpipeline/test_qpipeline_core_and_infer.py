@@ -13,7 +13,7 @@ import qqtools.plugins.qpipeline.runner.runner_utils.progress as progress_module
 from qqtools.plugins.qpipeline.entry import create_pipeline_class
 from qqtools.plugins.qpipeline.qpipeline import prepare_logdir, qPipeline
 from qqtools.plugins.qpipeline.runner.eval_runner import evaluate_runner, infer_runner
-from qqtools.plugins.qpipeline.task.qtask import OPTIONAL_METHODS, TASK_LIFECYCLE_HOOKS, qTaskBase
+from qqtools.plugins.qpipeline.task.qtask import OPTIONAL_METHODS, TASK_LIFECYCLE_HOOKS
 
 
 def test_prepare_logdir_writes_config_yaml(tmp_path):
@@ -63,71 +63,7 @@ def test_task_lifecycle_hooks_match_optional_methods_contract():
     assert lifecycle_hooks_in_optional_methods == set(TASK_LIFECYCLE_HOOKS)
 
 
-def test_prepare_training_session_registers_exact_task_lifecycle_hooks(monkeypatch, tmp_path):
-    class LifecycleTask(qTaskBase):
-        def __init__(self):
-            super().__init__()
-            self.train_loader = []
-            self.val_loader = []
-            self.test_loader = []
-            self.meta = {}
-
-        def batch_forward(self, model, batch_data):
-            return {}
-
-        def batch_loss(self, out, batch_data):
-            return {"loss": (torch.tensor(0.0), 1)}
-
-        def batch_metric(self, out, batch_data):
-            return {"metric": (torch.tensor(0.0), 1)}
-
-        def post_metrics_to_value(self, result):
-            return 0.0
-
-        def on_epoch_start(self, context):
-            return None
-
-        def on_epoch_end(self, context):
-            return None
-
-        def on_train_batch_end(self, context):
-            return None
-
-        def on_validation_end(self, context):
-            return None
-
-        def on_early_stop(self, context):
-            return None
-
-    class DummyProgressTracker:
-        def __init__(self, logger, print_freq, render_type=None, rank=0):
-            self.logger = logger
-            self.print_freq = print_freq
-            self.render_type = render_type
-            self.rank = rank
-
-        def on_epoch_start(self, context):
-            return None
-
-        def on_progress_tick(self, context):
-            return None
-
-        def on_table_update(self, context):
-            return None
-
-        def on_epoch_end(self, context):
-            return None
-
-        def on_eval_start(self, context):
-            return None
-
-        def on_eval_end(self, context):
-            return None
-
-    monkeypatch.setattr(runner_module, "ProgressTracker", DummyProgressTracker)
-
-    task = LifecycleTask()
-    agent = Mock()
+def test_prepare_training_session_delegates_restore_to_checkpoint_plugin(tmp_path):
     config = qt.qDict(
         {
             "ckp_file": None,
@@ -138,31 +74,19 @@ def test_prepare_training_session_registers_exact_task_lifecycle_hooks(monkeypat
         }
     )
 
-    runner_module._prepare_training_session(
+    checkpoint_plugin = Mock()
+    progress_tracker, profiler = runner_module._prepare_training_session(
         config=config,
         save_dir=str(tmp_path),
         logger=Mock(),
-        metrics_logger=None,
-        checkpoint_manager=Mock(),
-        agent=agent,
-        early_stopper=Mock(),
-        eval_summary_listener=Mock(on_validation_end=Mock()),
-        early_stop_listener=Mock(on_validation_end=Mock()),
-        checkpoint_command_handler=Mock(handle=Mock()),
-        checkpoint_saved_listener=Mock(on_checkpoint_saved=Mock()),
-        effective_scheduler=None,
+        checkpoint_plugin=checkpoint_plugin,
         device=torch.device("cpu"),
-        model=Mock(),
-        task=task,
-        optimizer=Mock(),
-        ema_model=None,
-        log_granularity=None,
+        progress_tracker=Mock(),
     )
 
-    registered_task_lifecycle_hooks = {
-        call.args[0] for call in agent.add_listener.call_args_list if getattr(call.args[1], "__self__", None) is task
-    }
-    assert registered_task_lifecycle_hooks == set(TASK_LIFECYCLE_HOOKS)
+    assert progress_tracker is not None
+    assert profiler is None
+    checkpoint_plugin.restore_if_requested.assert_called_once_with(torch.device("cpu"))
 
 
 def test_infer_runner_without_checkpoint(base_args, tiny_task, tiny_model):
@@ -555,9 +479,9 @@ def test_train_runner_progress_tick_contains_batch_time(monkeypatch, base_args, 
     assert isinstance(first_context.batch_metrics["batch_time"], float)
     assert first_context.batch_metrics["batch_time"] >= 0.0
 
-    assert first_context.avg_bank is not None
-    assert "batch_time" in first_context.avg_bank
-    assert isinstance(first_context.avg_bank["batch_time"], (int, float))
+    assert first_context.average_metrics is not None
+    assert "batch_time" in first_context.average_metrics
+    assert isinstance(first_context.average_metrics["batch_time"], (int, float))
 
 
 def test_eval_emits_progress_tick_for_val_and_test_stages(tiny_task, tiny_model, tiny_optimizer):
@@ -570,6 +494,12 @@ def test_eval_emits_progress_tick_for_val_and_test_stages(tiny_task, tiny_model,
         device=torch.device("cpu"),
     )
 
+    from qqtools.plugins.qpipeline.runner.contracts import ObserverBindings
+
+    observers = ObserverBindings()
+    captured_stages = []
+    observers.bind("progress_tick", lambda fact: captured_stages.append(fact.stage.value))
+    observers.freeze()
     agent = runner_module.RunningAgent(
         model=tiny_model,
         task=tiny_task,
@@ -578,14 +508,8 @@ def test_eval_emits_progress_tick_for_val_and_test_stages(tiny_task, tiny_model,
         config=config,
         device=torch.device("cpu"),
         logger=Mock(),
+        observers=observers,
     )
-
-    captured_stages = []
-
-    def _capture_progress_tick(context):
-        captured_stages.append(context.runner.stage)
-
-    agent.add_listener("on_progress_tick", _capture_progress_tick)
 
     agent._evaluate_loader(tiny_model, tiny_task.val_loader, stage="val")
     agent._evaluate_loader(tiny_model, tiny_task.test_loader, stage="test")

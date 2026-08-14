@@ -91,13 +91,11 @@ def test_bound_resolver_does_not_reinspect_or_retry_user_type_error(monkeypatch)
     assert calls == 1
 
 
-def test_stage_is_shared_by_task_runner_events_and_root_export():
+def test_stage_is_shared_by_task_runner_and_root_export():
     from qqtools.plugins.qpipeline import Stage as exported_stage
     from qqtools.plugins.qpipeline.runner.agent import Stage as agent_stage
-    from qqtools.plugins.qpipeline.runner.events.types import Stage as event_stage
     from qqtools.plugins.qpipeline.task.qtask import Stage as task_stage
 
     assert exported_stage is Stage
     assert task_stage is Stage
     assert agent_stage is Stage
-    assert event_stage is Stage

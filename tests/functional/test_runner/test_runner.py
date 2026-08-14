@@ -18,33 +18,26 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from qqtools.plugins.qpipeline.qlogger import qLogger
-from qqtools.plugins.qpipeline.runner import agent as agent_module
 from qqtools.plugins.qpipeline.runner import runner as runner_module
 from qqtools.plugins.qpipeline.entry_utils.scheduler import qWarmupScheduler
-from qqtools.plugins.qpipeline.runner.events import (
-    BaseEventContext,
-    CommandName,
-    EventDispatcher,
-    EventName,
-    LossComputedEventContext,
-    ProgressEventContext,
-    RunnerRuntimeView,
-    ValidationEndEventContext,
-    emit_batch_end,
-    emit_validation_end,
+from qqtools.plugins.qpipeline.runner.contracts import (
+    EventListenerBindings,
+    ObserverBindings,
+    ProgressTickFact,
+    TrainBoundaryCommittedFact,
 )
 from qqtools.plugins.qpipeline.runner.runner import (
     RunningAgent,
-    MetricsJsonlListener,
+    MetricsJsonlObserver,
     _is_periodic_trigger,
     _resolve_step_mode_max_steps,
     _resolve_train_runner_policy,
     train_runner,
 )
-from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointCommandHandler
+from qqtools.plugins.qpipeline.runner.hooks import RunnerHooks
+from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointPlugin, CheckpointPolicy
 from qqtools.plugins.qpipeline.runner.runner_utils.evaluation import EvaluationResult, ModelEvaluation, StageEvaluation
 from qqtools.plugins.qpipeline.runner.runner_utils.types import (
-    LoopSignal,
     RunConfig,
     RunMode,
     RunningState,
@@ -58,7 +51,6 @@ TERMINAL_LINE_PREFIXES = (
     "Training stopped:",
     "Training failed:",
 )
-from qqtools.torch import qdist
 
 
 class DeterministicEarlyStopTask(SimpleTask):
@@ -167,18 +159,8 @@ class TestRunConfig:
         assert config.max_steps is None
         assert config.eval_interval == 1
 
-    def test_run_config_with_early_stop(self):
-        """Test RunConfig with early stop configuration"""
-        config = RunConfig(
-            early_stop={
-                "target": "val_metric",
-                "patience": 5,
-                "mode": "min",
-                "min_delta": 1e-4,
-            }
-        )
-        assert config.early_stop is not None
-        assert config.early_stop["patience"] == 5
+    def test_run_config_excludes_composed_early_stop_policy(self):
+        assert not hasattr(RunConfig(), "early_stop")
 
 
 class TestQLogger:
@@ -201,40 +183,12 @@ class TestQLogger:
 
 
 class TestEventContracts:
-    def test_runner_runtime_view_contains_only_macro_fields(self):
-        state = RunningState(epoch=2, global_step=7)
-        view = RunnerRuntimeView(run_state=state, stage="train", max_epochs=5, max_steps=99)
+    def test_observer_bindings_freeze_registration(self):
+        bindings = ObserverBindings()
+        bindings.freeze()
 
-        assert vars(view) == {
-            "run_state": state,
-            "stage": "train",
-            "max_epochs": 5,
-            "max_steps": 99,
-        }
-
-    def test_epoch_start_public_context_hides_total_batches_but_internal_keeps_it(self):
-        task = SimpleTask(num_samples=16, num_features=10)
-        model = SimpleModel(input_dim=10)
-        loss_fn = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-        agent = RunningAgent(model=model, task=task, loss_fn=loss_fn, optimizer=optimizer, config=RunConfig())
-
-        received = {}
-
-        def _capture_public(context: BaseEventContext):
-            received["public"] = context
-
-        def _capture_internal(context):
-            received["internal"] = context
-
-        agent.add_listener("on_epoch_start", _capture_public)
-        agent.add_listener("on_epoch_start_internal", _capture_internal)
-
-        agent._start_new_epoch()
-
-        assert hasattr(received["internal"], "total_batches")
-        assert received["internal"].total_batches == len(task.train_loader)
-        assert not hasattr(received["public"], "total_batches")
+        with pytest.raises(RuntimeError, match="frozen"):
+            bindings.bind("progress_tick", lambda fact: None)
 
     def test_epoch_start_advances_custom_batch_sampler_without_distributed(self):
         batch_sampler = BalancedBatchSampler(
@@ -302,38 +256,6 @@ class TestEventContracts:
 
         assert recorder.epochs == [3]
 
-    def test_loss_computed_emits_before_backward(self):
-        task = SimpleTask(num_samples=16, num_features=10)
-        model = SimpleModel(input_dim=10)
-        loss_fn = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-        agent = RunningAgent(
-            model=model,
-            task=task,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            config=RunConfig(max_steps=1, print_freq=1),
-            device=torch.device("cpu"),
-        )
-        captured = {}
-
-        def _capture_loss(context: LossComputedEventContext):
-            captured["context"] = context
-            assert all(param.grad is None for param in model.parameters())
-
-        agent.add_listener("on_loss_computed", _capture_loss)
-        agent.state.batch_idx_in_epoch = 1
-
-        batch = next(iter(task.train_loader))
-        agent._train_one_batch(batch, emit_events=False)
-
-        context = captured["context"]
-        assert context.runner.stage == "train"
-        assert context.loss_tensor is not None
-        assert context.model_output is not None
-        assert context.batch_replay_ref is None
-        assert context.batch_idx == 0
-        assert context.total_batches == len(task.train_loader)
 
 
 # ============================================================================
@@ -451,378 +373,22 @@ class TestTrainingAgent:
         assert results.target_value("test_metric") is not None
         assert "mse" in results.models[0].stages[0].loaders[0].metrics
 
-    def test_trigger_passes_live_state_and_mutable_signal(self):
-        loss_fn = nn.MSELoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            config=RunConfig(),
-            device=self.device,
-        )
-
-        def _listener(context: ValidationEndEventContext):
-            context.runner.run_state.epoch = 999
-            context.signal.request_stop("test", "stop now")
-
-        signal = LoopSignal()
-        agent.add_listener("on_validation_end", _listener)
-        emit_validation_end(
-            agent.dispatcher,
-            state=agent.state,
-            signal=signal,
-            evaluation=EvaluationResult(
-                models=(ModelEvaluation("standard", (StageEvaluation("val", (), 1.0),)),)
-            ),
-            lr=None,
-            previous_best=None,
-            is_best=False,
-            best_model_tracker=None,
-            max_epochs=agent.config.max_epochs,
-            max_steps=agent.config.max_steps,
-        )
-
-        assert agent.state.epoch == 999
-        assert signal.should_stop is True
-        assert signal.stop_reasons[0].source == "test"
-        assert signal.stop_reasons[0].message == "stop now"
-
-    def test_add_listener_rejects_unknown_event(self):
-        loss_fn = nn.MSELoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            config=RunConfig(),
-            device=self.device,
-        )
-
-        with pytest.raises(ValueError, match="Unknown event: on_custom_event"):
-            agent.add_listener("on_custom_event", lambda context: None)
-
-    def test_add_listener_rejects_removed_checkpoint_save_event(self):
-        loss_fn = nn.MSELoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            config=RunConfig(),
-            device=self.device,
-        )
-
-        with pytest.raises(ValueError, match="Unknown event: on_checkpoint_save"):
-            agent.add_listener("on_checkpoint_save", lambda context: None)
-
-    def test_constructor_rejects_unknown_listener_event(self):
-        loss_fn = nn.MSELoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-
-        with pytest.raises(ValueError, match="Unknown event: on_custom_event"):
-            RunningAgent(
-                model=self.model,
-                task=self.task,
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-                config=RunConfig(),
-                device=self.device,
-                listeners={"on_custom_event": [lambda context: None]},
-            )
-
-    def test_constructor_rejects_internal_checkpoint_saved_listener_event(self):
-        loss_fn = nn.MSELoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-
-        with pytest.raises(ValueError, match="internal"):
-            RunningAgent(
-                model=self.model,
-                task=self.task,
-                loss_fn=loss_fn,
-                optimizer=optimizer,
-                config=RunConfig(),
-                device=self.device,
-                listeners={EventName.ON_CHECKPOINT_SAVED: [lambda context: None]},
-            )
-
-    def test_checkpoint_command_handler_requires_checkpoint_manager(self):
+    def test_checkpoint_plugin_requires_checkpoint_manager(self):
         with pytest.raises(ValueError, match="checkpoint_manager is required"):
-            CheckpointCommandHandler(
+            CheckpointPlugin(
                 checkpoint_manager=None,
                 model=self.model,
                 task=self.task,
+                state=RunningState(),
+                policy=CheckpointPolicy(1, None, False, False),
             )
 
-    def test_event_type_registers_on_table_update(self):
-        assert EventName.ON_TABLE_UPDATE.value == "on_table_update"
+    def test_checkpoint_hook_slots_reject_duplicate_plugins(self):
+        hooks = RunnerHooks()
+        hooks.set_after_validation_hook(lambda context: None, provider_id="first")
 
-    def test_public_listener_api_rejects_internal_checkpoint_saved_event(self):
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=nn.MSELoss(),
-            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
-            config=RunConfig(),
-            device=self.device,
-        )
-
-        with pytest.raises(ValueError, match="internal"):
-            agent.add_listener(EventName.ON_CHECKPOINT_SAVED, lambda context: None)
-
-    def test_command_and_event_registration_are_isolated(self):
-        dispatcher = EventDispatcher()
-        marker = object()
-        handler = Mock(return_value=marker)
-
-        with pytest.raises(ValueError, match="CommandName"):
-            dispatcher.set_handler(EventName.ON_EPOCH_START, handler)
-        with pytest.raises(ValueError, match="Unknown event"):
-            dispatcher.add_listener(CommandName.SAVE_CHECKPOINT, handler)
-        with pytest.raises(RuntimeError, match="No handler registered"):
-            dispatcher.invoke(CommandName.SAVE_CHECKPOINT, object())
-
-        context = object()
-        dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, handler)
-        assert dispatcher.invoke(CommandName.SAVE_CHECKPOINT, context) is marker
-        handler.assert_called_once_with(context)
-        with pytest.raises(RuntimeError, match="already registered"):
-            dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, Mock())
-
-    def test_save_regular_checkpoint_calls_manager_with_regular_flag(self):
-        loss_fn = nn.MSELoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        checkpoint_manager = Mock()
-        checkpoint_manager.save.return_value = "regular.pt"
-        logger = Mock()
-
-        checkpoint_command_handler = CheckpointCommandHandler(
-            checkpoint_manager=checkpoint_manager,
-            model=self.model,
-            task=self.task,
-            optimizer=optimizer,
-        )
-
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            config=RunConfig(),
-            device=self.device,
-            logger=logger,
-        )
-        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, checkpoint_command_handler.handle)
-
-        agent._request_checkpoint("regular")
-        agent._flush_checkpoint_requests()
-
-        save_kwargs = checkpoint_manager.save.call_args.kwargs
-        assert save_kwargs["is_best"] is False
-        assert checkpoint_manager.save.call_count == 1
-        assert agent.state.best_ckp_file is None
-
-    def test_save_best_checkpoint_calls_manager_with_best_flag(self):
-        loss_fn = nn.MSELoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        checkpoint_manager = Mock()
-        checkpoint_manager.save.return_value = "best.pt"
-        logger = Mock()
-
-        checkpoint_command_handler = CheckpointCommandHandler(
-            checkpoint_manager=checkpoint_manager,
-            model=self.model,
-            task=self.task,
-            optimizer=optimizer,
-        )
-
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            config=RunConfig(),
-            device=self.device,
-            logger=logger,
-        )
-        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, checkpoint_command_handler.handle)
-
-        agent._request_checkpoint("best")
-        agent._flush_checkpoint_requests()
-
-        save_kwargs = checkpoint_manager.save.call_args.kwargs
-        assert save_kwargs["is_best"] is True
-        assert checkpoint_manager.save.call_count == 1
-        assert agent.state.best_ckp_file == "best.pt"
-
-    def test_boundary_finalizer_raises_nan_before_eval_and_regular_checkpoint(self, monkeypatch):
-        loss_fn = nn.MSELoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        logger = Mock()
-
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            config=RunConfig(run_mode="epoch", eval_interval=1, save_interval=1),
-            device=self.device,
-            logger=logger,
-        )
-        agent.state.epoch = 1
-        agent.state.global_step = 5
-        agent._latest_train_loss = float("nan")
-
-        eval_mock = Mock()
-        checkpoint_mock = Mock()
-        monkeypatch.setattr(agent, "_run_evaluation_and_update", eval_mock)
-        monkeypatch.setattr(agent, "_request_checkpoint", checkpoint_mock)
-
-        with pytest.raises(agent_module.NaNDetectedError, match="NaN detected before periodic"):
-            agent._finalize_training_boundary(did_optimizer_step=True, is_epoch_end=True)
-
-        eval_mock.assert_not_called()
-        checkpoint_mock.assert_not_called()
-        logger.error.assert_called_once()
-        assert (
-            logger.error.call_args.args[0]
-            == "NaN detected before evaluation and regular checkpoint on ranks=[0] at epoch=1, step=5."
-        )
-
-    def test_loop_signal_synchronize_nan_failure_collects_source_ranks(self, monkeypatch):
-        signal = LoopSignal(nan_failure=True)
-
-        monkeypatch.setattr(qdist, "get_world_size", lambda: 4)
-
-        def _fake_all_gather(gathered_tensors, local_tensor):
-            values = [0, 1, 0, 1]
-            for target_tensor, value in zip(gathered_tensors, values):
-                target_tensor.copy_(torch.tensor([value], dtype=local_tensor.dtype, device=local_tensor.device))
-
-        monkeypatch.setattr("qqtools.plugins.qpipeline.runner.runner_utils.types.dist.all_gather", _fake_all_gather)
-
-        signal.synchronize_nan_failure(device=torch.device("cpu"), distributed=True)
-
-        assert signal.nan_failure is True
-        assert signal.nan_failure_source_ranks == [1, 3]
-
-    def test_boundary_finalizer_commits_epoch_before_early_stop(self, monkeypatch):
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=nn.MSELoss(),
-            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
-            config=RunConfig(run_mode=RunMode.EPOCH, max_epochs=2, eval_interval=99),
-            device=self.device,
-        )
-        early_stop_events = []
-
-        def request_stop(*, signal, evaluate, save_regular):
-            signal.request_stop("test", "stop at completed epoch")
-
-        monkeypatch.setattr(agent, "_execute_boundary_actions", request_stop)
-        agent.add_listener("on_early_stop", lambda context: early_stop_events.append(context))
-
-        boundary_stop = agent._finalize_training_boundary(
-            did_optimizer_step=True,
-            is_epoch_end=True,
-        )
-
-        assert boundary_stop == "early_stop"
-        assert agent.state.epoch == 1
-        assert len(early_stop_events) == 1
-
-    def test_boundary_finalizer_prefers_limit_after_epoch_commit(self, monkeypatch):
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=nn.MSELoss(),
-            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
-            config=RunConfig(run_mode=RunMode.EPOCH, max_epochs=1, eval_interval=99),
-            device=self.device,
-        )
-        early_stop_events = []
-
-        def request_stop(*, signal, evaluate, save_regular):
-            signal.request_stop("test", "stop at completed epoch")
-
-        monkeypatch.setattr(agent, "_execute_boundary_actions", request_stop)
-        agent.add_listener("on_early_stop", lambda context: early_stop_events.append(context))
-
-        boundary_stop = agent._finalize_training_boundary(
-            did_optimizer_step=True,
-            is_epoch_end=True,
-        )
-
-        assert boundary_stop == "run_limit"
-        assert agent.state.epoch == 1
-        assert early_stop_events == []
-
-    def test_checkpoint_command_requires_handler(self):
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=nn.MSELoss(),
-            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
-            config=RunConfig(),
-            device=self.device,
-        )
-        agent._request_checkpoint("regular")
-        with pytest.raises(RuntimeError, match="No handler registered"):
-            agent._flush_checkpoint_requests()
-
-    def test_checkpoint_command_handler_is_single_assignment(self):
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=nn.MSELoss(),
-            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
-            config=RunConfig(),
-            device=self.device,
-        )
-        first_handler = Mock(return_value="first.pt")
-        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, first_handler)
-        with pytest.raises(RuntimeError, match="already registered"):
-            agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, lambda context: "second.pt")
-
-        agent._request_checkpoint("regular")
-        agent._flush_checkpoint_requests()
-
-        first_handler.assert_called_once()
-
-    def test_best_checkpoint_state_is_committed_before_notification_error(self, monkeypatch):
-        agent = RunningAgent(
-            model=self.model,
-            task=self.task,
-            loss_fn=nn.MSELoss(),
-            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
-            config=RunConfig(distributed=True),
-            device=self.device,
-        )
-        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, lambda context: "best_owner.pt")
-        agent.dispatcher._add_internal_listener(
-            EventName.ON_CHECKPOINT_SAVED,
-            lambda context: (_ for _ in ()).throw(OSError("logger unavailable")),
-        )
-        monkeypatch.setattr(qdist, "get_world_size", lambda: 2)
-        gathered_errors = []
-
-        def gather(gathered, local_error):
-            gathered_errors.append(local_error)
-            gathered[:] = [local_error, None]
-
-        monkeypatch.setattr("qqtools.plugins.qpipeline.runner.agent.dist.all_gather_object", gather)
-
-        agent._request_checkpoint("best")
-        with pytest.raises(RuntimeError, match="Checkpoint saved notification failed on rank 0"):
-            agent._flush_checkpoint_requests()
-
-        assert gathered_errors == [("OSError", "logger unavailable")]
-        assert agent.state.best_ckp_file == "best_owner.pt"
+        with pytest.raises(RuntimeError, match="already owned"):
+            hooks.set_after_validation_hook(lambda context: None, provider_id="second")
 
 # ============================================================================
 # Integration Tests for train_runner
@@ -904,6 +470,7 @@ class TestTrainRunner:
             )
 
             assert result["final_epoch"] == 2
+
             assert result["best_monitored_key"] == "val_metric"
             assert result["best_monitored_metric"] is not None
             assert result["best_model_metrics_snapshot"]["models"][0]["stages"][0]["score"] is not None
@@ -922,6 +489,22 @@ class TestTrainRunner:
             assert "[DEBUG] Reached max_epochs=2" in log_text
             assert "[DEBUG] Training loop stopping at epoch 2" in log_text
             assert "Training completed:" not in log_text
+
+    def test_train_runner_rejects_non_boolean_regular_checkpoint_retention(self):
+        task, model, loss_fn, optimizer = self._create_training_components()
+        self.args.runner.checkpoint = {"regular_latest_only": "false"}
+
+        with pytest.raises(ValueError, match="regular_latest_only must be a boolean"):
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=1,
+                eval_interval=1,
+                run_mode="epoch",
+            )
 
     def test_train_runner_step_mode(self):
         """Test train_runner in step mode"""
@@ -1229,7 +812,7 @@ class TestTrainRunner:
 
             log_text = self._read_debug_log(tmpdir)
             self._assert_single_terminal_line(log_text, "Training failed: reason=nan_detected")
-            assert "NaN detected before evaluation and regular checkpoint on ranks=[0]" in log_text
+            assert "NaN detected before evaluation on ranks=[0]" in log_text
 
     def test_train_runner_emits_nan_detected_terminal_event_in_step_mode(self, monkeypatch):
         captured_terminal_event = {}
@@ -1281,7 +864,7 @@ class TestTrainRunner:
 
             log_text = self._read_debug_log(tmpdir)
             self._assert_single_terminal_line(log_text, "Training failed: reason=nan_detected")
-            assert "NaN detected before evaluation and regular checkpoint on ranks=[0]" in log_text
+            assert "NaN detected before evaluation on ranks=[0]" in log_text
 
     def test_train_runner_auto_offload_default_is_false(self, monkeypatch):
         captured = {}
@@ -1291,10 +874,6 @@ class TestTrainRunner:
                 captured["auto_offload"] = auto_offload
                 self.state = RunningState()
                 self.best_model_tracker = Mock()
-                self.dispatcher = Mock()
-
-            def add_listener(self, *args, **kwargs):  # noqa: ARG002
-                return None
 
             def run(self):
                 self.state.epoch = 1
@@ -1326,10 +905,6 @@ class TestTrainRunner:
                 captured["auto_offload"] = auto_offload
                 self.state = RunningState()
                 self.best_model_tracker = Mock()
-                self.dispatcher = Mock()
-
-            def add_listener(self, *args, **kwargs):  # noqa: ARG002
-                return None
 
             def run(self):
                 self.state.epoch = 1
@@ -1673,6 +1248,24 @@ class TestTrainRunner:
                     save_dir=tmpdir,
                 )
 
+    def test_train_runner_rejects_non_boolean_ddp_eval_dedup(self):
+        self.args.runner.ddp_eval_dedup = "false"
+        task, model, loss_fn, optimizer = self._create_training_components()
+
+        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(
+            ValueError, match="runner.ddp_eval_dedup must be a boolean"
+        ):
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=1,
+                eval_interval=1,
+                save_dir=tmpdir,
+            )
+
 
 # ============================================================================
 # Tests for Config and RunMode
@@ -1877,28 +1470,25 @@ class TestPeriodicTrigger:
             == expected
         )
 
-    def test_metrics_jsonl_listener_uses_completed_step_trigger_semantics(self):
+    def test_metrics_jsonl_observer_uses_completed_step_trigger_semantics(self):
         metrics_logger = Mock()
         run_config = RunConfig(run_mode=RunMode.STEP, eval_interval=2, max_steps=4)
-        listener = MetricsJsonlListener(
+        observer = MetricsJsonlObserver(
             logger=metrics_logger,
             run_config=run_config,
             log_granularity=["eval", "batch"],
         )
 
-        state = RunningState(global_step=2, epoch=0)
-        context = ProgressEventContext(
-            runner=RunnerRuntimeView(
-                run_state=state,
-                stage="train",
-                max_epochs=run_config.max_epochs,
-                max_steps=run_config.max_steps,
-            ),
-            batch_idx=0,
+        context = TrainBoundaryCommittedFact(
+            epoch=0,
+            global_step=2,
+            batch_index=0,
             total_batches=2,
             batch_metrics={"loss": 1.0},
+            did_optimizer_step=True,
+            lr=None,
         )
-        listener.on_train_batch_end(context)
+        observer.on_train_boundary(context)
 
         metrics_logger.write.assert_not_called()
 
@@ -1916,7 +1506,6 @@ class TestRunningAgentPerformanceOptimizations:
             run_mode=RunMode.STEP,
             max_steps=max_steps,
             eval_interval=10_000,
-            save_interval=10_000,
             print_freq=10_000,
         )
         return RunningAgent(
@@ -1928,29 +1517,8 @@ class TestRunningAgentPerformanceOptimizations:
             device=self.device,
         )
 
-    def test_trigger_does_not_return_context(self):
+    def test_eval_loop_skips_progress_fact_when_no_observer(self):
         agent = self._build_agent(max_steps=1)
-        returned_context = emit_batch_end(
-            agent.dispatcher,
-            state=agent.state,
-            stage="train",
-            batch_idx=0,
-            total_batches=1,
-            batch_metrics={},
-            avg_bank=None,
-            lr=None,
-            max_epochs=agent.config.max_epochs,
-            max_steps=agent.config.max_steps,
-        )
-        assert returned_context is None
-
-    def test_eval_loop_skips_context_build_when_no_target_listener(self, monkeypatch):
-        agent = self._build_agent(max_steps=1)
-
-        def _emitter_should_not_run(*args, **kwargs):  # noqa: ARG001
-            raise AssertionError("Emitter should not run for disabled event paths")
-
-        monkeypatch.setitem(agent.dispatcher.emitters, "on_progress_tick", _emitter_should_not_run)
         results = agent._evaluate_loader(
             agent.model,
             self.task.val_loader,
@@ -1959,13 +1527,19 @@ class TestRunningAgentPerformanceOptimizations:
         assert "mse" in results
 
     def test_eval_loop_emits_scalar_progress_metrics_when_listener_registered(self):
-        agent = self._build_agent(max_steps=1)
         captured_progress_metrics = []
-
-        def _capture_progress(context: ProgressEventContext):
-            captured_progress_metrics.append(context.batch_metrics)
-
-        agent.add_listener("on_progress_tick", _capture_progress)
+        observers = ObserverBindings()
+        observers.bind("progress_tick", lambda fact: captured_progress_metrics.append(fact.batch_metrics))
+        observers.freeze()
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=self.loss_fn,
+            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
+            config=RunConfig(max_steps=1, print_freq=10_000),
+            device=self.device,
+            observers=observers,
+        )
         results = agent._evaluate_loader(
             agent.model,
             self.task.val_loader,
@@ -1978,7 +1552,7 @@ class TestRunningAgentPerformanceOptimizations:
             assert progress_metrics is not None
             assert all(isinstance(metric_value, float) for metric_value in progress_metrics.values())
 
-    def test_eval_loop_works_with_and_without_progress_listener(self):
+    def test_eval_loop_works_with_and_without_progress_observer(self):
         agent_fast = self._build_agent(max_steps=1)
         fast_results = agent_fast._evaluate_loader(
             agent_fast.model,
@@ -1986,8 +1560,18 @@ class TestRunningAgentPerformanceOptimizations:
             stage="val",
         )
 
-        agent_slow = self._build_agent(max_steps=1)
-        agent_slow.add_listener("on_progress_tick", lambda context: None)
+        observers = ObserverBindings()
+        observers.bind("progress_tick", lambda fact: None)
+        observers.freeze()
+        agent_slow = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=self.loss_fn,
+            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
+            config=RunConfig(max_steps=1, print_freq=10_000),
+            device=self.device,
+            observers=observers,
+        )
         slow_results = agent_slow._evaluate_loader(
             agent_slow.model,
             self.task.val_loader,
@@ -2019,7 +1603,6 @@ class TestWarmupAvgBankReset:
             run_mode=RunMode.STEP,
             max_steps=100,
             eval_interval=10_000,
-            save_interval=10_000,
             print_freq=10_000,
         )
         return RunningAgent(
@@ -2032,17 +1615,16 @@ class TestWarmupAvgBankReset:
             device=self.device,
         )
 
-    def test_warmup_listener_registered_when_warmup_enabled(self):
+    def test_warmup_reset_guard_is_enabled_when_warmup_enabled(self):
         agent = self._build_agent_with_warmup(warmup_steps=5)
-        assert agent._has_listener("on_train_batch_end")
+        assert agent._should_reset_avg_after_warmup is True
 
-    def test_warmup_listener_not_registered_when_no_scheduler(self):
+    def test_warmup_reset_guard_is_disabled_when_no_scheduler(self):
         optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         config = RunConfig(
             run_mode=RunMode.STEP,
             max_steps=100,
             eval_interval=10_000,
-            save_interval=10_000,
             print_freq=10_000,
         )
         agent = RunningAgent(
@@ -2053,9 +1635,9 @@ class TestWarmupAvgBankReset:
             config=config,
             device=self.device,
         )
-        assert not agent._has_listener("on_train_batch_end")
+        assert agent._should_reset_avg_after_warmup is False
 
-    def test_warmup_listener_self_removes_after_warmup_ends(self):
+    def test_warmup_reset_guard_disables_after_warmup_ends(self):
         agent = self._build_agent_with_warmup(warmup_steps=3)
 
         # Simulate warmup steps by advancing scheduler
@@ -2064,26 +1646,10 @@ class TestWarmupAvgBankReset:
 
         assert agent.scheduler.current_step >= agent.scheduler.warmup_steps
 
-        # Fire the event — listener should detect warmup ended, reset bank, and remove itself
-        from qqtools.plugins.qpipeline.runner.events import emit_train_batch_end
+        agent._reset_avg_after_warmup()
+        assert agent._should_reset_avg_after_warmup is False
 
-        emit_train_batch_end(
-            agent.dispatcher,
-            state=agent.state,
-            stage="train",
-            batch_idx=0,
-            total_batches=1,
-            batch_metrics={},
-            avg_bank=None,
-            lr=None,
-            max_epochs=agent.config.max_epochs,
-            max_steps=agent.config.max_steps,
-        )
-
-        # Listener should have removed itself
-        assert not agent._has_listener("on_train_batch_end")
-
-    def test_warmup_listener_resets_avg_bank_on_warmup_end(self):
+    def test_warmup_reset_guard_resets_avg_bank_on_warmup_end(self):
         agent = self._build_agent_with_warmup(warmup_steps=2)
 
         # Accumulate some data in avg_bank
@@ -2095,25 +1661,12 @@ class TestWarmupAvgBankReset:
         for _ in range(2):
             agent.scheduler.step_after_optimizer_update()
 
-        from qqtools.plugins.qpipeline.runner.events import emit_train_batch_end
-
-        emit_train_batch_end(
-            agent.dispatcher,
-            state=agent.state,
-            stage="train",
-            batch_idx=0,
-            total_batches=1,
-            batch_metrics={},
-            avg_bank=None,
-            lr=None,
-            max_epochs=agent.config.max_epochs,
-            max_steps=agent.config.max_steps,
-        )
+        agent._reset_avg_after_warmup()
 
         # avg_bank should have been reset
         assert not agent.train_avg_bank.avgMeters
 
-    def test_warmup_listener_stays_during_warmup(self):
+    def test_warmup_reset_guard_stays_enabled_during_warmup(self):
         agent = self._build_agent_with_warmup(warmup_steps=5)
 
         # Only advance 2 steps — still in warmup
@@ -2122,23 +1675,10 @@ class TestWarmupAvgBankReset:
 
         agent.train_avg_bank.add("loss", 1.0, 1.0)
 
-        from qqtools.plugins.qpipeline.runner.events import emit_train_batch_end
+        agent._reset_avg_after_warmup()
 
-        emit_train_batch_end(
-            agent.dispatcher,
-            state=agent.state,
-            stage="train",
-            batch_idx=0,
-            total_batches=1,
-            batch_metrics={},
-            avg_bank=None,
-            lr=None,
-            max_epochs=agent.config.max_epochs,
-            max_steps=agent.config.max_steps,
-        )
-
-        # Still in warmup — listener should NOT have reset or removed itself
-        assert agent._has_listener("on_train_batch_end")
+        # Still in warmup — the guard must not reset the metrics.
+        assert agent._should_reset_avg_after_warmup is True
         assert agent.train_avg_bank.avgMeters
 
 

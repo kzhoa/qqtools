@@ -4,7 +4,9 @@ from collections import OrderedDict
 from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from ..events import ValidationEndEventContext
+import torch.distributed as dist
+
+from ..contracts import EarlyStopDecision, TaskValidationContext
 
 
 class EarlyStopper:
@@ -227,8 +229,8 @@ def singleTargetEarlyStopper(
     )
 
 
-class EarlyStopListener:
-    """Listener that writes early-stop intent into loop signal."""
+class EarlyStopController:
+    """Validation control operation with rank-consistent stop decisions."""
 
     def __init__(
         self,
@@ -240,27 +242,58 @@ class EarlyStopListener:
         self.target = target
         self.logger = logger
 
-    def on_validation_end(self, context: ValidationEndEventContext) -> None:
-        if self.early_stopper is None:
-            return
+    def decide(self, context: TaskValidationContext, *, distributed: bool) -> EarlyStopDecision:
+        local_error: Optional[BaseException] = None
+        local_decision = EarlyStopDecision()
+        try:
+            if self.early_stopper is not None:
+                current_metric = context.evaluation.target_value(self.target)
+                if current_metric is None:
+                    if self.logger is not None:
+                        self.logger.debug(
+                            "EarlyStopper skipped: target=%r default=skip_patience_update epoch=%s step=%s.",
+                            self.target,
+                            context.epoch,
+                            context.global_step,
+                        )
+                else:
+                    should_stop, stop_msg, debug_msg = self.early_stopper({self.target: current_metric})
+                    if debug_msg is not None and self.logger is not None:
+                        self.logger.info(debug_msg)
+                    if should_stop:
+                        local_decision = EarlyStopDecision(
+                            should_stop=True,
+                            source="early_stop",
+                            message=stop_msg,
+                        )
+        except BaseException as error:
+            local_error = error
 
-        current_metric = context.evaluation.target_value(self.target)
-        if current_metric is None:
-            if self.logger is not None:
-                state = context.runner.run_state
-                self.logger.debug(
-                    "EarlyStopper skipped: target=%r default=skip_patience_update epoch=%s step=%s.",
-                    self.target,
-                    state.epoch,
-                    state.global_step,
-                )
-            return
-        metrics_for_early_stop = {self.target: current_metric}
+        if not distributed:
+            if local_error is not None:
+                raise local_error
+            return local_decision
 
-        should_stop, stop_msg, debug_msg = self.early_stopper(metrics_for_early_stop)
-
-        if debug_msg is not None and self.logger is not None:
-            self.logger.info(debug_msg)
-
-        if should_stop and context.signal is not None:
-            context.signal.request_stop("early_stop", stop_msg)
+        rank = dist.get_rank()
+        local_wire = {
+            "rank": rank,
+            "error_type": type(local_error).__name__ if local_error is not None else None,
+            "error_message": str(local_error) if local_error is not None else None,
+            "decision": local_decision,
+        }
+        gathered = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered, local_wire)
+        errors = [item for item in gathered if item["error_type"] is not None]
+        if errors:
+            first = min(errors, key=lambda item: item["rank"])
+            message = (
+                f"early-stop control failed on rank {first['rank']}: "
+                f"{first['error_type']}: {first['error_message']}"
+            )
+            if local_error is not None:
+                raise RuntimeError(message) from local_error
+            raise RuntimeError(message)
+        decisions = [item["decision"] for item in gathered if item["decision"].should_stop]
+        if not decisions:
+            return EarlyStopDecision()
+        return min(decisions, key=lambda decision: (decision.source or "", decision.message or ""))

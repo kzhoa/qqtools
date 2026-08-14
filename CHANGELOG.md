@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- breaking: replace qpipeline's public mutable runner-events API with frozen typed extension
+  contracts: task lifecycle reactions, committed observers, and single-owner runner hook slots.
+  The legacy `runner.events` package, mutable `LoopSignal`, generic command dispatch, and
+  listener registration on `RunningAgent` are removed.
+- breaking: move checkpoint restore, persistence scheduling, completion saving, and regular
+  retention policy into `CheckpointPlugin`. `train_runner` now resolves qConfig once and passes
+  narrow runtime and checkpoint-policy values to their actual consumers.
+- fix: strictly validate qpipeline boolean configuration at the runner boundary, including
+  `runner.ddp_eval_dedup`; evaluation summaries again show the current `Best` value on a new
+  best result; remove obsolete progress/event migration state.
 - feat: add `qexp submit --no-activate` to persist a Task without requesting local agent
   activation from that invocation
 - feat: add `runner.completion.eval` and `runner.completion.save` so successful qpipeline

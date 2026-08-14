@@ -35,6 +35,7 @@ def _make_args(tmp_path):
 def _run_and_capture_config(monkeypatch, tmp_path, *, run_mode, eval_interval, save_interval):
     captured = {}
     original_agent = runner_module.RunningAgent
+    original_checkpoint_plugin = runner_module.CheckpointPlugin
 
     class CapturingAgent(original_agent):
         def __init__(self, *args, **kwargs):
@@ -42,6 +43,13 @@ def _run_and_capture_config(monkeypatch, tmp_path, *, run_mode, eval_interval, s
             super().__init__(*args, **kwargs)
 
     monkeypatch.setattr(runner_module, "RunningAgent", CapturingAgent)
+
+    class CapturingCheckpointPlugin(original_checkpoint_plugin):
+        def __init__(self, *args, **kwargs):
+            captured["checkpoint_policy"] = kwargs["policy"]
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "CheckpointPlugin", CapturingCheckpointPlugin)
     args = _make_args(tmp_path)
     model = TinyModel()
     result = train_runner(
@@ -58,7 +66,7 @@ def _run_and_capture_config(monkeypatch, tmp_path, *, run_mode, eval_interval, s
         save_dir=args.log_dir,
         print_freq=1,
     )
-    return args, captured["config"], result
+    return args, captured["config"], captured["checkpoint_policy"], result
 
 
 @pytest.mark.parametrize(
@@ -77,7 +85,7 @@ def test_train_runner_standardizes_effective_interval_inputs(
     expected_eval,
     expected_save,
 ):
-    args, config, result = _run_and_capture_config(
+    args, config, checkpoint_policy, result = _run_and_capture_config(
         monkeypatch,
         tmp_path,
         run_mode="step",
@@ -87,7 +95,7 @@ def test_train_runner_standardizes_effective_interval_inputs(
 
     assert result["final_step"] == 1
     assert config.eval_interval == expected_eval
-    assert config.save_interval == expected_save
+    assert checkpoint_policy.save_interval == expected_save
     assert args.runner.eval_interval == "99epoch"
     assert args.runner.save_interval == "99epoch"
 

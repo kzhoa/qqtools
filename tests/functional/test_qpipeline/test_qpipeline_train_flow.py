@@ -562,7 +562,7 @@ def test_train_runner_bridges_task_lifecycle_hooks(base_args, tiny_model):
 
         def on_epoch_end(self, context):
             received["on_epoch_end"] = context
-            received["on_epoch_end_epoch"] = context.runner.run_state.epoch
+            received["on_epoch_end_epoch"] = context.completed_epoch
 
         def on_train_batch_end(self, context):
             received.setdefault("on_train_batch_end", []).append(context)
@@ -589,20 +589,19 @@ def test_train_runner_bridges_task_lifecycle_hooks(base_args, tiny_model):
     )
 
     assert result["final_epoch"] == 1
-    assert received["on_epoch_start"].runner.stage == "train"
-    assert not hasattr(received["on_epoch_start"], "total_batches")
+    assert received["on_epoch_start"].epoch == 0
+    assert received["on_epoch_start"].total_batches == len(task.train_loader)
     assert received["on_epoch_end_epoch"] == 0
-    assert received["on_epoch_end"].runner.run_state.epoch == 1
+    assert received["on_epoch_end"].completed_epoch == 0
     assert received["on_train_batch_end"]
     first_train_batch = received["on_train_batch_end"][0]
-    assert first_train_batch.runner.stage == "train"
+    assert first_train_batch.epoch == 0
     assert "loss" in first_train_batch.batch_metrics
     assert first_train_batch.lr is not None
     validation_context = received["on_validation_end"]
-    assert validation_context.runner.stage is None
     assert validation_context.evaluation is not None
     assert validation_context.evaluation.target_value("val_metric") is not None
-    assert validation_context.signal is not None
+    assert not hasattr(validation_context, "signal")
 
 
 def test_train_runner_does_not_bridge_legacy_task_lifecycle_names(base_args, tiny_model):
@@ -646,19 +645,22 @@ def test_train_runner_bridges_task_on_early_stop(base_args, tiny_model, monkeypa
         def on_early_stop(self, context):
             received["on_early_stop"] = context
 
-    class ImmediateEarlyStopListener:
+    class ImmediateEarlyStopController:
         def __init__(self, early_stopper, target="val_metric", logger=None):
             self.early_stopper = early_stopper
             self.target = target
             self.logger = logger
 
-        def on_validation_end(self, context):
-            if context.signal is not None:
-                context.signal.request_stop("test", "forced stop for lifecycle hook test")
+        def decide(self, context, *, distributed):  # noqa: ARG002
+            from qqtools.plugins.qpipeline.runner.contracts import EarlyStopDecision
+
+            return EarlyStopDecision(
+                should_stop=True, source="test", message="forced stop for lifecycle hook test"
+            )
 
     args = base_args.copy()
     args.runner.early_stop.patience = 999
-    monkeypatch.setattr(runner_module, "EarlyStopListener", ImmediateEarlyStopListener)
+    monkeypatch.setattr(runner_module, "EarlyStopController", ImmediateEarlyStopController)
 
     train_runner(
         model=tiny_model,
@@ -673,5 +675,4 @@ def test_train_runner_bridges_task_on_early_stop(base_args, tiny_model, monkeypa
         print_freq=1,
     )
 
-    assert received["on_early_stop"].signal is not None
-    assert received["on_early_stop"].signal.should_stop is True
+    assert received["on_early_stop"].source == "test"

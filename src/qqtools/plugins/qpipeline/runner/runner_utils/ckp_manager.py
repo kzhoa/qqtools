@@ -1,4 +1,6 @@
 import copy
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -8,8 +10,31 @@ import torch.nn as nn
 
 from ...entry_utils.qema import qEMA
 from ...task.qtask import qTaskBase
-from ..events import CheckpointSaveCommandContext, CheckpointSavedEventContext
+from ..hooks import RunnerBoundaryContext, RunnerHooks, ValidationHookContext
+from .common import _is_periodic_trigger
 from .types import RunningState
+
+
+@dataclass(frozen=True)
+class CheckpointPolicy:
+    """Resolved checkpoint settings owned by the checkpoint capability."""
+
+    save_interval: int
+    restore_path: Optional[str]
+    completion_save: bool
+    keep_only_latest_regular: bool
+
+    def __post_init__(self) -> None:
+        if isinstance(self.save_interval, bool) or not isinstance(self.save_interval, int):
+            raise ValueError("checkpoint save_interval must be an integer")
+        if self.save_interval < 1:
+            raise ValueError("checkpoint save_interval must be a positive integer")
+        if self.restore_path is not None and not isinstance(self.restore_path, str):
+            raise ValueError("checkpoint restore_path must be a string or None")
+        if not isinstance(self.completion_save, bool):
+            raise ValueError("checkpoint completion_save must be a boolean")
+        if not isinstance(self.keep_only_latest_regular, bool):
+            raise ValueError("checkpoint keep_only_latest_regular must be a boolean")
 
 
 def generate_checkpoint_filename(epoch: int, global_step: int, is_best: bool = False) -> str:
@@ -228,34 +253,118 @@ class CheckpointManager:
         return checkpoint
 
 
-class CheckpointCommandHandler:
-    """Command handler that persists checkpoints when requested by the agent."""
+class CheckpointPlugin:
+    """Runner-composed checkpoint capability.
+
+    The plugin owns checkpoint policy, persistence invocation, live checkpoint state and its
+    projection.  The Agent only invokes lifecycle slots and never receives a checkpoint path.
+    """
 
     def __init__(
         self,
         checkpoint_manager: CheckpointManager,
         model: nn.Module,
         task: qTaskBase,
+        state: RunningState,
+        policy: CheckpointPolicy,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[Any] = None,
         ema_model: Optional[qEMA] = None,
         early_stopper: Optional[Any] = None,
         best_model_tracker: Optional[Any] = None,
+        logger: Optional[Any] = None,
+        event_logger: Optional[Any] = None,
     ) -> None:
         if checkpoint_manager is None:
             raise ValueError("checkpoint_manager is required")
         self.checkpoint_manager = checkpoint_manager
         self.model = model
         self.task = task
+        self.state = state
+        self.policy = policy
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.ema_model = ema_model
         self.early_stopper = early_stopper
         self.best_model_tracker = best_model_tracker
+        self.logger = logger
+        self.event_logger = event_logger
 
-    def handle(self, context: CheckpointSaveCommandContext) -> str:
-        return self.checkpoint_manager.save(
-            context.state,
+    def register(self, hooks: RunnerHooks) -> None:
+        hooks.set_hook_bundle(
+            (
+                ("after_validation", self.after_validation),
+                ("boundary_cursor", self.at_boundary_cursor),
+                ("after_epoch_commit", self.after_epoch_commit),
+            ),
+            provider_id="checkpoint.v1",
+        )
+
+    def restore_if_requested(self, device: torch.device) -> bool:
+        """Restore the composed checkpoint when its configured file is available."""
+        checkpoint_file = self.policy.restore_path
+        if not checkpoint_file or not Path(checkpoint_file).exists():
+            return False
+
+        self.checkpoint_manager.load(
+            checkpoint_file,
+            device,
+            self.model,
+            self.task,
+            self.optimizer,
+            self.scheduler,
+            self.ema_model,
+            self.state,
+            self.early_stopper,
+            self.best_model_tracker,
+        )
+        if self.logger is not None:
+            self.logger.info(f"Loaded checkpoint from {checkpoint_file}")
+        return True
+
+    def after_validation(self, context: ValidationHookContext) -> None:
+        if context.is_best:
+            self._guard_save_nan(self.state.current_train_loss)
+            self._save("best")
+
+    def at_boundary_cursor(self, context: RunnerBoundaryContext) -> None:
+        is_due = _is_periodic_trigger(
+            run_mode=context.run_mode,
+            interval=self.policy.save_interval,
+            global_step=context.global_step,
+            epoch=context.epoch,
+            is_epoch_end=context.is_epoch_end,
+        )
+        completion_save = context.terminal_candidate and self.policy.completion_save
+        if not (is_due or completion_save):
+            return
+        if context.is_epoch_end and context.terminal_candidate and completion_save:
+            return
+        self._guard_save_nan(context.latest_train_loss)
+        self._save("regular")
+
+    def after_epoch_commit(self, context: RunnerBoundaryContext) -> None:
+        if context.terminal_candidate and self.policy.completion_save:
+            self._guard_save_nan(context.latest_train_loss)
+            self._save("regular")
+
+    def _guard_save_nan(self, latest_train_loss: Optional[float]) -> None:
+        """Fail every rank before checkpoint persistence when the boundary has a NaN loss."""
+        local_nan = latest_train_loss is not None and math.isnan(latest_train_loss)
+        if dist.is_available() and dist.is_initialized():
+            gathered = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(gathered, local_nan)
+            source_ranks = [rank for rank, value in enumerate(gathered) if value]
+        else:
+            source_ranks = [0] if local_nan else []
+        if source_ranks:
+            raise RuntimeError(
+                f"NaN detected before checkpoint persistence on ranks={source_ranks}."
+            )
+
+    def _save(self, checkpoint_type: str) -> None:
+        checkpoint_path = self.checkpoint_manager.save(
+            self.state,
             self.model,
             self.task,
             self.optimizer,
@@ -263,36 +372,36 @@ class CheckpointCommandHandler:
             self.ema_model,
             self.early_stopper,
             self.best_model_tracker,
-            is_best=(context.checkpoint_type == "best"),
+            is_best=(checkpoint_type == "best"),
         )
+        if checkpoint_type == "best":
+            self.state.best_ckp_file = Path(checkpoint_path).name
+        self._write_checkpoint_record(checkpoint_type, checkpoint_path)
 
-
-class CheckpointSavedListener:
-    """Owner-only post-commit checkpoint logging adapter."""
-
-    def __init__(
-        self,
-        rank: int,
-        logger: Optional[Any] = None,
-        event_logger: Optional[Any] = None,
-    ) -> None:
-        self.rank = rank
-        self.logger = logger
-        self.event_logger = event_logger
-
-    def on_checkpoint_saved(self, context: CheckpointSavedEventContext) -> None:
-        if self.rank != 0:
-            return
-        checkpoint_path = str(Path(context.checkpoint_path).resolve())
-        if self.logger is not None:
-            self.logger.info(f"[Checkpoint Saved] type={context.checkpoint_type} path={checkpoint_path}")
-        if self.event_logger is not None:
-            self.event_logger.write(
-                {
-                    "event": "checkpoint_saved",
-                    "epoch": context.epoch,
-                    "global_step": context.global_step,
-                    "type": context.checkpoint_type,
-                    "path": checkpoint_path,
-                }
-            )
+    def _write_checkpoint_record(self, checkpoint_type: str, checkpoint_path: str) -> None:
+        local_error = None
+        if self.checkpoint_manager.rank == 0:
+            try:
+                path = str(Path(checkpoint_path).resolve())
+                if self.logger is not None:
+                    self.logger.info(f"[Checkpoint Saved] type={checkpoint_type} path={path}")
+                if self.event_logger is not None:
+                    self.event_logger.write(
+                        {
+                            "event": "checkpoint_saved",
+                            "epoch": self.state.epoch,
+                            "global_step": self.state.global_step,
+                            "type": checkpoint_type,
+                            "path": path,
+                        }
+                    )
+            except Exception as error:
+                local_error = (type(error).__name__, str(error))
+        if dist.is_available() and dist.is_initialized():
+            gathered = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(gathered, local_error)
+        else:
+            gathered = [local_error]
+        for rank, error in enumerate(gathered):
+            if error is not None:
+                raise RuntimeError(f"Checkpoint logging failed on rank {rank}: {error[0]}: {error[1]}")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Union
 
 from torch.utils.data import DataLoader
@@ -31,6 +32,11 @@ class LoaderEvaluation:
     name: Optional[str]
     metrics: Mapping[str, Any]
     outputs: Optional[Mapping[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
+        if self.outputs is not None:
+            object.__setattr__(self, "outputs", MappingProxyType(dict(self.outputs)))
 
     def to_dict(self) -> Dict[str, Any]:
         result = {"name": self.name, "metrics": dict(self.metrics)}
@@ -75,6 +81,9 @@ class TrainingResult:
 
     metrics: Mapping[str, Any]
     score: Optional[float]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
 
     def to_dict(self) -> Dict[str, Any]:
         return {"metrics": dict(self.metrics), "score": self.score}

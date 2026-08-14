@@ -13,7 +13,13 @@ from ..types import Stage
 __all__ = ["qTaskBase", "PotentialTaskBase"]
 
 if TYPE_CHECKING:
-    from ..runner.events import BaseEventContext, ProgressEventContext, ValidationEndEventContext
+    from ..runner.contracts import (
+        StopCommittedFact,
+        TaskEpochEndContext,
+        TaskEpochStartContext,
+        TaskTrainBoundaryContext,
+        TaskValidationContext,
+    )
 
 TASK_LIFECYCLE_HOOKS: Tuple[str, ...] = (
     "on_epoch_start",
@@ -195,19 +201,19 @@ class qTaskBase(ABC):
     def on_better_model(self, epoch_agent, current_state) -> None:
         raise NotImplementedError
 
-    def on_epoch_start(self, context: "BaseEventContext") -> None:
+    def on_epoch_start(self, context: "TaskEpochStartContext") -> None:
         raise NotImplementedError
 
-    def on_epoch_end(self, context: "BaseEventContext") -> None:
+    def on_epoch_end(self, context: "TaskEpochEndContext") -> None:
         raise NotImplementedError
 
-    def on_train_batch_end(self, context: "ProgressEventContext") -> None:
+    def on_train_batch_end(self, context: "TaskTrainBoundaryContext") -> None:
         raise NotImplementedError
 
-    def on_validation_end(self, context: "ValidationEndEventContext") -> None:
+    def on_validation_end(self, context: "TaskValidationContext") -> None:
         raise NotImplementedError
 
-    def on_early_stop(self, context: "BaseEventContext") -> None:
+    def on_early_stop(self, context: "StopCommittedFact") -> None:
         raise NotImplementedError
 
     def to(self, device) -> None:

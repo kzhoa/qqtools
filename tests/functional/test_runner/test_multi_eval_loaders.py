@@ -1,10 +1,13 @@
 import pytest
 import torch
 import torch.nn as nn
+from unittest.mock import Mock
 
 from qqtools.plugins.qpipeline import Stage
 from qqtools.plugins.qpipeline.runner import agent as agent_module
 from qqtools.plugins.qpipeline.runner.agent import RunningAgent
+from qqtools.plugins.qpipeline.runner.contracts import EvaluationCommittedFact
+from qqtools.plugins.qpipeline.runner.runner_utils.best_model import BestMetricSnapshot
 from qqtools.plugins.qpipeline.runner.runner_utils.evaluation import (
     EvaluationResult,
     LoaderEvaluation,
@@ -14,7 +17,7 @@ from qqtools.plugins.qpipeline.runner.runner_utils.evaluation import (
     TrainingResult,
     resolve_loader_group,
 )
-from qqtools.plugins.qpipeline.runner.runner_utils.eval_formatter import EvalFormatter
+from qqtools.plugins.qpipeline.runner.runner_utils.eval_formatter import EvalFormatter, EvalSummaryObserver
 from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunningState
 
 from .conftest import SimpleModel, SimpleTask
@@ -168,7 +171,7 @@ def test_structured_formatter_uses_stage_and_loader_records():
         target_key="val_metric",
         is_best=True,
         previous_best={"metric": 0.2, "epoch": 0, "step": 1},
-        best_model_tracker=type("Tracker", (), {"mode": "min", "best_metric": 0.1, "best_epoch": 1, "best_step": 2})(),
+        best=BestMetricSnapshot(metric=0.1, epoch=1, step=2),
         lr=None,
         color_new_best=False,
     )
@@ -177,3 +180,29 @@ def test_structured_formatter_uses_stage_and_loader_records():
     assert any("NewBest" in line for line in summary_lines)
     assert any("train:interval" in line for line in table_lines)
     assert any("val:b1" in line for line in table_lines)
+
+
+def test_eval_summary_observer_logs_current_best_on_new_best():
+    logger = Mock()
+    observer = EvalSummaryObserver(logger, color_new_best=False)
+    evaluation = EvaluationResult(
+        models=(
+            ModelEvaluation(
+                variant="standard",
+                stages=(StageEvaluation(stage=Stage.VAL, loaders=(), score=0.1),),
+            ),
+        ),
+    )
+
+    observer.on_evaluation_committed(
+        EvaluationCommittedFact(
+            epoch=1,
+            global_step=2,
+            evaluation=evaluation,
+            is_best=True,
+            previous_best=BestMetricSnapshot(metric=0.2, epoch=0, step=1),
+            lr=None,
+        )
+    )
+
+    assert "Best: val_metric = 0.100000 @ epoch 1, step 2" in logger.info.call_args_list[0].args[0]

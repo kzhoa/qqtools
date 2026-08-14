@@ -9,17 +9,45 @@ import torch.optim as optim
 from unittest.mock import MagicMock
 
 from qqtools.plugins.qpipeline.runner.runner import RunningAgent
-from qqtools.plugins.qpipeline.runner.events import CommandName, EventName
 from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMode
-from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointManager
+from qqtools.plugins.qpipeline.runner.hooks import RunnerBoundaryContext, RunnerHooks
 from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import (
-    CheckpointCommandHandler,
-    CheckpointSavedListener,
+    CheckpointManager,
+    CheckpointPlugin,
+    CheckpointPolicy,
 )
 from qqtools.plugins.qpipeline.runner.runner_utils.metrics_jsonl import MetricsJsonlLogger
 
 # Re-using components from conftest for consistency
 from .conftest import SimpleModel, SimpleTask
+
+
+def _install_checkpoint_plugin(
+    agent: RunningAgent,
+    checkpoint_manager: CheckpointManager,
+    *,
+    event_logger=None,
+    save_interval: int = 1,
+) -> CheckpointPlugin:
+    """Install the production checkpoint capability through runner hook composition."""
+    plugin = CheckpointPlugin(
+        checkpoint_manager=checkpoint_manager,
+        model=agent.model,
+        task=agent.task,
+        state=agent.state,
+        policy=CheckpointPolicy(
+            save_interval=save_interval,
+            restore_path=None,
+            completion_save=False,
+            keep_only_latest_regular=checkpoint_manager.keep_only_latest_regular,
+        ),
+        optimizer=agent.optimizer,
+        logger=agent.logger,
+        event_logger=event_logger,
+    )
+    plugin.register(agent.hooks)
+    agent.hooks.freeze()
+    return plugin
 
 
 class TestCheckpointTriggerTiming:
@@ -64,7 +92,6 @@ class TestCheckpointTriggerTiming:
 
         config_params = {
             "run_mode": run_mode,
-            "save_interval": save_interval,
             "eval_interval": max_val + 1,  # Disable evaluation to isolate checkpointing
             "device": device,
         }
@@ -74,15 +101,11 @@ class TestCheckpointTriggerTiming:
             config_params["max_steps"] = max_val
 
         config = RunConfig(**config_params)
-        agent = RunningAgent(model, task, loss_fn, optimizer, config=config, device=device, logger=logger)
-
-        checkpoint_command_handler = CheckpointCommandHandler(
-            checkpoint_manager=ckp_manager,
-            model=model,
-            task=task,
-            optimizer=optimizer,
+        agent = RunningAgent(
+            model, task, loss_fn, optimizer, config=config, device=device, logger=logger, hooks=RunnerHooks()
         )
-        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, checkpoint_command_handler.handle)
+
+        _install_checkpoint_plugin(agent, ckp_manager, save_interval=save_interval)
 
         # Clone initial model state before training
         initial_weights = {k: v.clone() for k, v in model.state_dict().items()}
@@ -131,21 +154,17 @@ class TestCheckpointTriggerTiming:
             run_mode=RunMode.EPOCH,
             max_epochs=3,
             eval_interval=10,
-            save_interval=1,
             device=device,
         )
-        agent = RunningAgent(model, task, loss_fn, optimizer, config=config, device=device, logger=logger)
-
-        checkpoint_command_handler = CheckpointCommandHandler(
-            checkpoint_manager=CheckpointManager(
-                save_dir=save_dir,
-                keep_only_latest_regular=True,
-            ),
-            model=model,
-            task=task,
-            optimizer=optimizer,
+        agent = RunningAgent(
+            model, task, loss_fn, optimizer, config=config, device=device, logger=logger, hooks=RunnerHooks()
         )
-        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, checkpoint_command_handler.handle)
+
+        _install_checkpoint_plugin(
+            agent,
+            CheckpointManager(save_dir=save_dir, keep_only_latest_regular=True),
+            save_interval=1,
+        )
 
         agent.run()
 
@@ -154,36 +173,35 @@ class TestCheckpointTriggerTiming:
         checkpoint = torch.load(saved_files[0])
         assert checkpoint["state"]["epoch"] == 2
 
-    def test_checkpoint_saved_listener_logs_absolute_path_after_successful_save(self, common_setup):
+    def test_checkpoint_plugin_logs_absolute_path_after_successful_save(self, common_setup):
         task, model, optimizer, loss_fn, device, logger, checkpoint_manager, save_dir = common_setup
         agent = RunningAgent(
             model,
             task,
             loss_fn,
             optimizer,
-            config=RunConfig(device=device),
+            config=RunConfig(run_mode=RunMode.STEP, max_steps=1, device=device),
             device=device,
             logger=logger,
+            hooks=RunnerHooks(),
         )
-        checkpoint_command_handler = CheckpointCommandHandler(
-            checkpoint_manager=checkpoint_manager,
-            model=model,
-            task=task,
-            optimizer=optimizer,
+        plugin = _install_checkpoint_plugin(agent, checkpoint_manager, save_interval=1)
+        plugin.at_boundary_cursor(
+            RunnerBoundaryContext(
+                epoch=0,
+                global_step=1,
+                run_mode=RunMode.STEP,
+                did_optimizer_step=True,
+                is_epoch_end=False,
+                terminal_candidate=False,
+                latest_train_loss=0.1,
+            )
         )
-        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, checkpoint_command_handler.handle)
-        agent.dispatcher._add_internal_listener(
-            EventName.ON_CHECKPOINT_SAVED,
-            CheckpointSavedListener(rank=0, logger=logger).on_checkpoint_saved,
-        )
-
-        agent._request_checkpoint("regular")
-        agent._flush_checkpoint_requests()
 
         checkpoint_path = next(save_dir.glob("*.pt")).resolve()
         logger.info.assert_any_call(f"[Checkpoint Saved] type=regular path={checkpoint_path}")
 
-    def test_checkpoint_saved_listener_writes_jsonl_event_after_successful_save(self, common_setup):
+    def test_checkpoint_plugin_writes_jsonl_event_after_successful_save(self, common_setup):
         task, model, optimizer, loss_fn, device, logger, checkpoint_manager, save_dir = common_setup
         event_logger = MetricsJsonlLogger(save_dir / "metrics.jsonl")
         agent = RunningAgent(
@@ -191,28 +209,28 @@ class TestCheckpointTriggerTiming:
             task,
             loss_fn,
             optimizer,
-            config=RunConfig(device=device),
+            config=RunConfig(run_mode=RunMode.STEP, max_steps=1, device=device),
             device=device,
             logger=logger,
+            hooks=RunnerHooks(),
         )
-        checkpoint_command_handler = CheckpointCommandHandler(
-            checkpoint_manager=checkpoint_manager,
-            model=model,
-            task=task,
-            optimizer=optimizer,
+        plugin = _install_checkpoint_plugin(
+            agent,
+            checkpoint_manager,
+            event_logger=event_logger,
+            save_interval=1,
         )
-        agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, checkpoint_command_handler.handle)
-        agent.dispatcher._add_internal_listener(
-            EventName.ON_CHECKPOINT_SAVED,
-            CheckpointSavedListener(
-                rank=0,
-                logger=logger,
-                event_logger=event_logger,
-            ).on_checkpoint_saved,
+        plugin.at_boundary_cursor(
+            RunnerBoundaryContext(
+                epoch=0,
+                global_step=1,
+                run_mode=RunMode.STEP,
+                did_optimizer_step=True,
+                is_epoch_end=False,
+                terminal_candidate=False,
+                latest_train_loss=0.1,
+            )
         )
-
-        agent._request_checkpoint("regular")
-        agent._flush_checkpoint_requests()
         event_logger.close()
 
         event = json.loads((save_dir / "metrics.jsonl").read_text().strip())

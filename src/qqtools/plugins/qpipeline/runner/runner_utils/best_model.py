@@ -1,6 +1,16 @@
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-__all__ = ["BestModelTracker"]
+__all__ = ["BestMetricSnapshot", "BestModelTracker"]
+
+
+@dataclass(frozen=True, slots=True)
+class BestMetricSnapshot:
+    """Immutable best-metric state exposed at a validation boundary."""
+
+    metric: Optional[float]
+    epoch: int
+    step: int
 
 
 class BestModelTracker:
