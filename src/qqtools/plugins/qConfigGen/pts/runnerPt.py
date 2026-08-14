@@ -227,7 +227,21 @@ def prompt_runner_params():
             break
         print_formatted_text("❌ Invalid input. Please enter 'y' or 'n'.")
 
-    # Step 7: Early stopping configuration
+    # Step 7: Completion actions
+    params["completion"] = {"eval": False, "save": False}
+    for action_name, action_key in (("evaluation", "eval"), ("regular checkpoint", "save")):
+        while True:
+            ans = prompt(
+                f"Run {action_name} at successful training completion? [y/n] (default: n): "
+            ).strip().lower()
+            if not ans or ans in ("n", "no"):
+                break
+            if ans in ("y", "yes"):
+                params["completion"][action_key] = True
+                break
+            print_formatted_text("❌ Invalid input. Please enter 'y' or 'n'.")
+
+    # Step 8: Early stopping configuration
     early_stop_config = prompt_early_stop()
     if early_stop_config:
         params["early_stop"] = early_stop_config

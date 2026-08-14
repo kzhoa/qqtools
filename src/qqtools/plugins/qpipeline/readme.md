@@ -62,6 +62,23 @@ When logging is enabled, qpipeline writes `metrics.jsonl`. Every line is an inde
 model → stage → loader hierarchy and each stage's task-derived score, so multi-loader metrics do
 not rely on ambiguous flattened column names.
 
+## Training completion actions
+
+`runner.completion` can request normal final-boundary work when a successful training conclusion
+does not match the periodic intervals:
+
+```yaml
+runner:
+  completion:
+    eval: true
+    save: true
+```
+
+Both values default to `false`. `eval` performs the normal evaluation flow (including validation
+listeners and best-model tracking); `save` writes a normal regular checkpoint, not a weights-only
+or best-checkpoint export. Actions run only after a processed boundary that finishes through a
+limit or early stop, and do not run after interruption, NaN detection, or an exception.
+
 
 
 ## pipeline init

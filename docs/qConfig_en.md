@@ -587,6 +587,8 @@ In `run_mode: step`, the following values are measured in completed optimizer st
 | `max_steps`       | ⚠️        | Integer | ≥ 1        | null    | Effective in step mode; in step mode, at least one of `max_steps` or `max_epochs` must be provided; ignored in epoch mode |
 | `eval_interval`   | ❌        | Integer or epoch-suffix string | Integer ≥ 1; suffix coefficient > 0 | 1 | Evaluation interval |
 | `save_interval`   | ❌        | Integer, epoch-suffix string, or null | Integer ≥ 1; suffix coefficient > 0 | null | Regular save interval (units follow run_mode) |
+| `completion.eval` | ❌        | Boolean | true/false | false | Run normal evaluation at a successful final boundary when needed |
+| `completion.save` | ❌        | Boolean | true/false | false | Write a normal regular checkpoint at a successful final boundary when needed |
 | `checkpoint.regular_latest_only` | ❌        | Boolean | true/false | true    | Keep only latest regular ckp  |
 | `clip_grad`       | ❌        | Float   | ≥ 0.1      | null    | Gradient clipping threshold   |
 | `accum_grad`      | ❌        | Integer | ≥ 1        | null    | Gradient accumulation factor  |

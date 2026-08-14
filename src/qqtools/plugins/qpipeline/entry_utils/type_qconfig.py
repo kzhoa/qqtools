@@ -101,6 +101,18 @@ class CheckpointConfig:
 
 
 @dataclass
+class CompletionConfig:
+    """Actions requested after a successfully completed training boundary."""
+
+    eval: bool = False
+    save: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.eval, bool) or not isinstance(self.save, bool):
+            raise ValueError("runner.completion.eval and runner.completion.save must be booleans")
+
+
+@dataclass
 class RunnerConfig:
     """Training runner configuration."""
 
@@ -110,6 +122,7 @@ class RunnerConfig:
     max_steps: Optional[int] = None
     eval_interval: int = 1
     save_interval: Optional[int] = None
+    completion: CompletionConfig = field(default_factory=CompletionConfig)
     clip_grad: Optional[float] = None
     accum_grad: Optional[int] = None
     checkpoint: Optional[CheckpointConfig] = None

@@ -126,6 +126,17 @@ def test_run_config_rejects_invalid_accum_grad(invalid_value):
         RunConfig(accum_grad=invalid_value)
 
 
+@pytest.mark.parametrize("completion", [{"eval": 1}, {"save": "false"}, {"unknown": True}])
+def test_run_config_rejects_invalid_completion_policy(completion):
+    with pytest.raises(ValueError):
+        RunConfig(completion=completion)
+
+
+def test_completion_policy_defaults_and_accepts_partial_config():
+    assert RunConfig().completion == {"eval": False, "save": False}
+    assert RunConfig(completion={"eval": True}).completion == {"eval": True, "save": False}
+
+
 @pytest.mark.parametrize("invalid_value", [0, -1, 1.5, True])
 def test_train_runner_rejects_invalid_accum_grad(invalid_value):
     model = TinyModel()

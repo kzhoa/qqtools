@@ -41,6 +41,27 @@
             "default": null,
             "description": "Regular checkpoint saving interval. null follows eval_interval, and explicit integer values use the same units as run_mode."
         },
+        "completion": {
+            "type": "object",
+            "properties": {
+                "eval": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Run one normal evaluation at a successful final training boundary when periodic evaluation did not already run there."
+                },
+                "save": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Write one normal regular checkpoint at a successful final training boundary when periodic saving did not already satisfy it."
+                }
+            },
+            "additionalProperties": false,
+            "default": {
+                "eval": false,
+                "save": false
+            },
+            "description": "Optional final-boundary actions. Both settings default to false."
+        },
         "clip_grad": {
             "type": [
                 "number",

@@ -10,7 +10,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
 from qqtools.plugins.qpipeline.runner.runner import RunningAgent
-from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMode, RunningState
+from qqtools.plugins.qpipeline.runner.runner_utils.types import LoopSignal, RunConfig, RunMode, RunningState
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
 
 
@@ -260,3 +260,368 @@ class TestEvaluationTiming:
 
         assert agent.state.epoch == 1
         assert agent.state.global_step == num_batches_in_epoch
+
+    def test_completion_actions_run_once_when_final_step_misses_periodic_intervals(self, common_setup):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(
+                run_mode=RunMode.STEP,
+                eval_interval=10,
+                save_interval=10,
+                max_steps=2,
+                completion={"eval": True, "save": True},
+                device=device,
+            ),
+            device=device,
+            logger=logger,
+        )
+        checkpoint_types = []
+        agent.add_listener("on_eval_start", logger.on_eval_start)
+        agent.add_listener("on_checkpoint_request", lambda context: (
+            checkpoint_types.append(context.checkpoint_type),
+            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt"),
+        ))
+
+        agent.run()
+
+        assert logger.on_eval_start.call_count == 1
+        assert checkpoint_types == ["best", "regular"]
+
+    def test_completion_save_is_independent_from_periodic_evaluation(self, common_setup):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(
+                run_mode=RunMode.STEP,
+                eval_interval=2,
+                save_interval=10,
+                max_steps=2,
+                completion={"eval": True, "save": True},
+                device=device,
+            ),
+            device=device,
+            logger=logger,
+        )
+        checkpoint_types = []
+        agent.add_listener("on_eval_start", logger.on_eval_start)
+        agent.add_listener("on_checkpoint_request", lambda context: (
+            checkpoint_types.append(context.checkpoint_type),
+            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt"),
+        ))
+
+        agent.run()
+
+        assert logger.on_eval_start.call_count == 1
+        assert checkpoint_types == ["best", "regular"]
+
+    def test_terminal_epoch_completion_save_uses_committed_cursor(self, common_setup):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(
+                run_mode=RunMode.EPOCH,
+                eval_interval=2,
+                save_interval=2,
+                max_epochs=1,
+                completion={"eval": True, "save": True},
+                device=device,
+            ),
+            device=device,
+            logger=logger,
+        )
+        checkpoint_cursors = []
+        agent.add_listener("on_eval_start", logger.on_eval_start)
+
+        def capture_checkpoint(context):
+            checkpoint_cursors.append(
+                (
+                    context.checkpoint_type,
+                    context.runner.run_state.epoch,
+                    context.runner.run_state.batch_idx_in_epoch,
+                )
+            )
+            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+
+        agent.add_listener("on_checkpoint_request", capture_checkpoint)
+        agent.run()
+
+        assert logger.on_eval_start.call_count == 1
+        assert agent.state.epoch_result_val_metric_source == "current_eval"
+        assert checkpoint_cursors[-1] == ("regular", 1, 0)
+
+    def test_early_stop_runs_requested_completion_save(self, common_setup):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(
+                run_mode=RunMode.STEP,
+                eval_interval=1,
+                save_interval=10,
+                max_steps=99,
+                completion={"save": True},
+                device=device,
+            ),
+            device=device,
+            logger=logger,
+        )
+        checkpoint_types = []
+
+        def request_stop(context):
+            context.signal.request_stop("test", "requested stop")
+
+        def capture_checkpoint(context):
+            checkpoint_types.append(context.checkpoint_type)
+            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+
+        agent.add_listener("on_validation_end", request_stop)
+        agent.add_listener("on_checkpoint_request", capture_checkpoint)
+        assert agent.run() == "early_stop"
+        assert checkpoint_types == ["best", "regular"]
+
+    def test_restored_state_at_limit_does_not_run_completion_actions(self, common_setup):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(
+                run_mode=RunMode.STEP,
+                eval_interval=10,
+                max_steps=1,
+                completion={"eval": True, "save": True},
+                device=device,
+            ),
+            state=RunningState(global_step=1),
+            device=device,
+            logger=logger,
+        )
+        agent.add_listener("on_eval_start", logger.on_eval_start)
+        agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+
+        assert agent.run() is None
+        logger.on_eval_start.assert_not_called()
+
+    def test_each_periodic_boundary_synchronizes_stop_once(self, common_setup, monkeypatch):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        synchronized_signals = []
+
+        def capture_stop_synchronization(signal, device, distributed):
+            synchronized_signals.append(signal)
+
+        monkeypatch.setattr(LoopSignal, "synchronize_stop", capture_stop_synchronization)
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(
+                run_mode=RunMode.STEP,
+                eval_interval=10,
+                max_steps=2,
+                device=device,
+            ),
+            device=device,
+            logger=logger,
+        )
+
+        assert agent.run() == "run_limit"
+        assert len(synchronized_signals) == 2
+
+    def test_completion_evaluation_stop_does_not_change_terminal_reason_or_sync(
+        self,
+        common_setup,
+        monkeypatch,
+    ):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        synchronized_signals = []
+        early_stop_listener = MagicMock()
+
+        def capture_stop_synchronization(signal, device, distributed):
+            synchronized_signals.append(signal)
+
+        monkeypatch.setattr(LoopSignal, "synchronize_stop", capture_stop_synchronization)
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(
+                run_mode=RunMode.STEP,
+                eval_interval=10,
+                max_steps=1,
+                completion={"eval": True},
+                device=device,
+            ),
+            device=device,
+            logger=logger,
+        )
+        agent.add_listener(
+            "on_validation_end",
+            lambda context: context.signal.request_stop("completion_eval", "requested stop"),
+        )
+        agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
+        agent.add_listener("on_early_stop", early_stop_listener)
+
+        assert agent.run() == "run_limit"
+        assert len(synchronized_signals) == 1
+        early_stop_listener.assert_not_called()
+
+    def test_completion_actions_share_one_signal_without_stop_synchronization(
+        self,
+        common_setup,
+        monkeypatch,
+    ):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        synchronized_signals = []
+        completion_signals = {}
+
+        def capture_stop_synchronization(signal, device, distributed):
+            synchronized_signals.append(signal)
+
+        def capture_validation_signal(context):
+            completion_signals["evaluation"] = context.signal
+
+        def capture_checkpoint_signal(context):
+            completion_signals[context.checkpoint_type] = context.signal
+            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+
+        monkeypatch.setattr(LoopSignal, "synchronize_stop", capture_stop_synchronization)
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(
+                run_mode=RunMode.STEP,
+                eval_interval=10,
+                save_interval=10,
+                max_steps=1,
+                completion={"eval": True, "save": True},
+                device=device,
+            ),
+            device=device,
+            logger=logger,
+        )
+        agent.add_listener("on_eval_start", capture_validation_signal)
+        agent.add_listener("on_checkpoint_request", capture_checkpoint_signal)
+
+        assert agent.run() == "run_limit"
+
+        completion_signal = completion_signals["evaluation"]
+        assert completion_signal is completion_signals["best"]
+        assert completion_signal is completion_signals["regular"]
+        assert len(synchronized_signals) == 1
+        assert completion_signal is not synchronized_signals[0]
+
+    def test_periodic_early_stop_preserves_reasons_and_isolated_completion_stop(
+        self,
+        common_setup,
+        monkeypatch,
+    ):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        synchronized_signals = []
+        early_stop_signals = []
+        checkpoint_signals = {}
+
+        def capture_stop_synchronization(signal, device, distributed):
+            synchronized_signals.append(signal)
+
+        def request_periodic_stop(context):
+            context.signal.request_stop("periodic_eval", "requested stop")
+
+        def capture_checkpoint(context):
+            checkpoint_signals[context.checkpoint_type] = context.signal
+            if context.checkpoint_type == "regular":
+                context.signal.request_stop("completion_save", "must not affect terminal reason")
+            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+
+        monkeypatch.setattr(LoopSignal, "synchronize_stop", capture_stop_synchronization)
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(
+                run_mode=RunMode.STEP,
+                eval_interval=1,
+                save_interval=10,
+                max_steps=99,
+                completion={"save": True},
+                device=device,
+            ),
+            device=device,
+            logger=logger,
+        )
+        agent.add_listener("on_validation_end", request_periodic_stop)
+        agent.add_listener("on_checkpoint_request", capture_checkpoint)
+        agent.add_listener("on_early_stop", lambda context: early_stop_signals.append(context.signal))
+
+        assert agent.run() == "early_stop"
+        assert len(synchronized_signals) == 1
+        assert len(early_stop_signals) == 1
+        assert early_stop_signals[0] is checkpoint_signals["best"]
+        assert early_stop_signals[0] is not checkpoint_signals["regular"]
+        assert [reason.source for reason in early_stop_signals[0].stop_reasons] == ["periodic_eval"]
+
+    def test_run_limit_wins_over_periodic_stop_and_defers_epoch_save(self, common_setup, monkeypatch):
+        task, model, optimizer, loss_fn, device, logger = common_setup
+        synchronized_signals = []
+        checkpoint_cursors = []
+        early_stop_listener = MagicMock()
+
+        def capture_stop_synchronization(signal, device, distributed):
+            synchronized_signals.append(signal)
+
+        def request_periodic_stop(context):
+            context.signal.request_stop("periodic_eval", "requested stop")
+
+        def capture_checkpoint(context):
+            checkpoint_cursors.append(
+                (
+                    context.checkpoint_type,
+                    context.runner.run_state.epoch,
+                    context.runner.run_state.batch_idx_in_epoch,
+                )
+            )
+            context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+
+        monkeypatch.setattr(LoopSignal, "synchronize_stop", capture_stop_synchronization)
+        agent = RunningAgent(
+            model,
+            task,
+            loss_fn,
+            optimizer,
+            config=RunConfig(
+                run_mode=RunMode.EPOCH,
+                eval_interval=1,
+                save_interval=1,
+                max_epochs=1,
+                completion={"save": True},
+                device=device,
+            ),
+            device=device,
+            logger=logger,
+        )
+        agent.add_listener("on_validation_end", request_periodic_stop)
+        agent.add_listener("on_checkpoint_request", capture_checkpoint)
+        agent.add_listener("on_early_stop", early_stop_listener)
+
+        assert agent.run() == "run_limit"
+        assert len(synchronized_signals) == 1
+        assert early_stop_listener.call_count == 0
+        assert [item[0] for item in checkpoint_cursors].count("regular") == 1
+        assert checkpoint_cursors[-1] == ("regular", 1, 0)
