@@ -533,6 +533,14 @@ class TestTrainingAgent:
                 listeners={"on_custom_event": [lambda context: None]},
             )
 
+    def test_checkpoint_listener_requires_checkpoint_manager(self):
+        with pytest.raises(ValueError, match="checkpoint_manager is required"):
+            CheckpointListener(
+                checkpoint_manager=None,
+                model=self.model,
+                task=self.task,
+            )
+
     def test_event_type_registers_on_table_update(self):
         assert EventName.ON_TABLE_UPDATE.value == "on_table_update"
 
@@ -602,7 +610,7 @@ class TestTrainingAgent:
         assert checkpoint_manager.save.call_count == 1
         assert agent.state.best_ckp_file == "best.pt"
 
-    def test_handle_periodic_events_raises_nan_before_eval_and_regular_checkpoint(self, monkeypatch):
+    def test_boundary_finalizer_raises_nan_before_eval_and_regular_checkpoint(self, monkeypatch):
         loss_fn = nn.MSELoss()
         optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         logger = Mock()
@@ -626,7 +634,7 @@ class TestTrainingAgent:
         monkeypatch.setattr(agent, "_request_checkpoint", checkpoint_mock)
 
         with pytest.raises(agent_module.NaNDetectedError, match="NaN detected before periodic"):
-            agent._handle_periodic_events(is_epoch_end=True)
+            agent._finalize_training_boundary(did_optimizer_step=True, is_epoch_end=True)
 
         eval_mock.assert_not_called()
         checkpoint_mock.assert_not_called()
@@ -652,6 +660,194 @@ class TestTrainingAgent:
 
         assert signal.nan_failure is True
         assert signal.nan_failure_source_ranks == [1, 3]
+
+    def test_boundary_finalizer_commits_epoch_before_early_stop(self, monkeypatch):
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=nn.MSELoss(),
+            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
+            config=RunConfig(run_mode=RunMode.EPOCH, max_epochs=2, eval_interval=99),
+            device=self.device,
+        )
+        early_stop_events = []
+
+        def request_stop(*, signal, evaluate, save_regular):
+            signal.request_stop("test", "stop at completed epoch")
+
+        monkeypatch.setattr(agent, "_execute_boundary_actions", request_stop)
+        agent.add_listener("on_early_stop", lambda context: early_stop_events.append(context))
+
+        boundary_stop = agent._finalize_training_boundary(
+            did_optimizer_step=True,
+            is_epoch_end=True,
+        )
+
+        assert boundary_stop == "early_stop"
+        assert agent.state.epoch == 1
+        assert len(early_stop_events) == 1
+
+    def test_boundary_finalizer_prefers_limit_after_epoch_commit(self, monkeypatch):
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=nn.MSELoss(),
+            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
+            config=RunConfig(run_mode=RunMode.EPOCH, max_epochs=1, eval_interval=99),
+            device=self.device,
+        )
+        early_stop_events = []
+
+        def request_stop(*, signal, evaluate, save_regular):
+            signal.request_stop("test", "stop at completed epoch")
+
+        monkeypatch.setattr(agent, "_execute_boundary_actions", request_stop)
+        agent.add_listener("on_early_stop", lambda context: early_stop_events.append(context))
+
+        boundary_stop = agent._finalize_training_boundary(
+            did_optimizer_step=True,
+            is_epoch_end=True,
+        )
+
+        assert boundary_stop == "run_limit"
+        assert agent.state.epoch == 1
+        assert early_stop_events == []
+
+    def test_loop_signal_checkpoint_outcome_synchronizes_owner_path(self, monkeypatch):
+        signal = LoopSignal()
+        signal.begin_checkpoint_request()
+        signal.record_checkpoint_outcome(path="owner.pt")
+        monkeypatch.setattr(qdist, "get_world_size", lambda: 2)
+
+        def gather(gathered_request_results, local_request_result):
+            gathered_request_results[:] = [local_request_result, (None, None)]
+
+        monkeypatch.setattr(
+            "qqtools.plugins.qpipeline.runner.runner_utils.types.dist.all_gather_object",
+            gather,
+        )
+
+        signal.synchronize_checkpoint_outcome(distributed=True)
+
+        assert signal.consume_checkpoint_outcome() == "owner.pt"
+
+    def test_loop_signal_checkpoint_outcome_rejects_missing_or_duplicate_writer(self):
+        signal = LoopSignal()
+        signal.begin_checkpoint_request()
+        with pytest.raises(RuntimeError, match="exactly one successful"):
+            signal.synchronize_checkpoint_outcome(distributed=False)
+
+        signal.begin_checkpoint_request()
+        signal.record_checkpoint_outcome(path="first.pt")
+        with pytest.raises(RuntimeError, match="more than one writer"):
+            signal.record_checkpoint_outcome(path="second.pt")
+
+    def test_loop_signal_checkpoint_outcome_propagates_owner_failure(self, monkeypatch):
+        signal = LoopSignal()
+        signal.begin_checkpoint_request()
+        monkeypatch.setattr(qdist, "get_world_size", lambda: 2)
+
+        def gather(gathered_request_results, local_request_result):
+            gathered_request_results[:] = [
+                local_request_result,
+                (("failure", "OSError", "disk full"), None),
+            ]
+
+        monkeypatch.setattr(
+            "qqtools.plugins.qpipeline.runner.runner_utils.types.dist.all_gather_object",
+            gather,
+        )
+
+        with pytest.raises(RuntimeError, match="Checkpoint persistence failed on rank 1"):
+            signal.synchronize_checkpoint_outcome(distributed=True)
+
+    def test_checkpoint_dispatch_error_is_synchronized_before_outcome_failure(self, monkeypatch):
+        checkpoint_manager = Mock()
+        checkpoint_manager.save.return_value = "owner.pt"
+        checkpoint_logger = Mock()
+        checkpoint_logger.info.side_effect = OSError("logger unavailable")
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=nn.MSELoss(),
+            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
+            config=RunConfig(distributed=True),
+            device=self.device,
+        )
+        agent.add_listener(
+            "on_checkpoint_request",
+            CheckpointListener(
+                checkpoint_manager=checkpoint_manager,
+                model=self.model,
+                task=self.task,
+                optimizer=agent.optimizer,
+                logger=checkpoint_logger,
+            ).on_checkpoint_request,
+        )
+        monkeypatch.setattr(qdist, "get_world_size", lambda: 2)
+        gathered_request_results = []
+
+        def gather(gathered, local_request_result):
+            gathered_request_results.append(local_request_result)
+            gathered[:] = [local_request_result, (None, None)]
+
+        monkeypatch.setattr(
+            "qqtools.plugins.qpipeline.runner.runner_utils.types.dist.all_gather_object",
+            gather,
+        )
+
+        agent._request_checkpoint("regular")
+
+        with pytest.raises(
+            RuntimeError,
+            match="Checkpoint request listener failed on rank 0: OSError: logger unavailable",
+        ):
+            agent._flush_checkpoint_requests()
+
+        assert len(gathered_request_results) == 1
+        assert gathered_request_results[0][0] == ("success", "owner.pt", None)
+        assert gathered_request_results[0][1] == ("OSError", "logger unavailable")
+
+    def test_checkpoint_duplicate_writer_is_synchronized_as_dispatch_error(self, monkeypatch):
+        agent = RunningAgent(
+            model=self.model,
+            task=self.task,
+            loss_fn=nn.MSELoss(),
+            optimizer=optim.Adam(self.model.parameters(), lr=0.001),
+            config=RunConfig(distributed=True),
+            device=self.device,
+        )
+        agent.add_listener(
+            "on_checkpoint_request",
+            lambda context: context.signal.record_checkpoint_outcome(path="first.pt"),
+        )
+        agent.add_listener(
+            "on_checkpoint_request",
+            lambda context: context.signal.record_checkpoint_outcome(path="second.pt"),
+        )
+        monkeypatch.setattr(qdist, "get_world_size", lambda: 2)
+        gathered_request_results = []
+
+        def gather(gathered, local_request_result):
+            gathered_request_results.append(local_request_result)
+            gathered[:] = [local_request_result, (None, None)]
+
+        monkeypatch.setattr(
+            "qqtools.plugins.qpipeline.runner.runner_utils.types.dist.all_gather_object",
+            gather,
+        )
+
+        agent._request_checkpoint("regular")
+
+        with pytest.raises(
+            RuntimeError,
+            match="Checkpoint request listener failed on rank 0: RuntimeError",
+        ):
+            agent._flush_checkpoint_requests()
+
+        assert len(gathered_request_results) == 1
+        assert gathered_request_results[0][0] == ("success", "first.pt", None)
+        assert gathered_request_results[0][1][0] == "RuntimeError"
 
 # ============================================================================
 # Integration Tests for train_runner

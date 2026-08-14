@@ -110,6 +110,10 @@ class DummyScheduler:
         self.step_warmup()
 
 
+def _record_checkpoint_outcome(context) -> None:
+    context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+
+
 @pytest.mark.parametrize("invalid_value", [0, -1, 1.5, True])
 def test_schema_runner_config_rejects_invalid_accum_grad(invalid_value):
     with pytest.raises(ValueError):
@@ -171,6 +175,7 @@ def test_accum_grad_delays_optimizer_steps(monkeypatch):
         config=RunConfig(run_mode=RunMode.STEP, max_steps=2, eval_interval=10, accum_grad=2),
         device=torch.device("cpu"),
     )
+    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
 
     agent.run()
 
@@ -232,6 +237,7 @@ def test_partial_accum_window_is_flushed_at_epoch_end(monkeypatch):
         config=RunConfig(run_mode=RunMode.EPOCH, max_epochs=1, eval_interval=1, accum_grad=2),
         device=torch.device("cpu"),
     )
+    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
 
     agent.run()
 
@@ -257,6 +263,7 @@ def test_step_mode_eval_interval_counts_optimizer_steps_under_accumulation():
     )
     eval_steps = []
     agent.add_listener("on_eval_start", lambda ctx: eval_steps.append(ctx.runner.run_state.global_step))
+    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
 
     agent.run()
 
@@ -289,6 +296,7 @@ def test_step_mode_save_interval_counts_optimizer_steps_under_accumulation():
         device=torch.device("cpu"),
     )
     agent.add_listener("on_checkpoint_request", capture_checkpoint_request)
+    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
 
     agent.run()
 
@@ -331,10 +339,11 @@ def test_step_mode_early_stop_halts_after_first_optimizer_step_under_accumulatio
     )
     agent.add_listener("on_validation_end", stop_on_first_validation)
     agent.add_listener("on_batch_end", capture_batch_end)
+    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
 
-    early_stopped = agent.run()
+    early_stop = agent.run()
 
-    assert early_stopped is True
+    assert early_stop == "early_stop"
     assert len(step_calls) == 1
     assert processed_batches == [0, 1]
     assert agent.state.batch_idx_in_epoch == 2
@@ -458,6 +467,7 @@ def test_train_batch_events_do_not_report_early_lr_change_for_valid_end_schedule
         "on_batch_end",
         lambda context: batch_end_lrs.append(context.lr) if context.runner.stage == "train" else None,
     )
+    agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
 
     agent.run()
 

@@ -132,6 +132,10 @@ def setup_agent_with_ema(request):
         ema_model=ema_model,
         logger=MagicMock(),  # Mock logger
     )
+    agent.add_listener(
+        "on_checkpoint_request",
+        lambda context: context.signal.record_checkpoint_outcome(path="test-checkpoint.pt"),
+    )
     return agent, model, ema_model, device
 
 
