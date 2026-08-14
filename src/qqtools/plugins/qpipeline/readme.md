@@ -354,8 +354,11 @@ context 读取约定：
 - 宏观运行信息统一走 `context.runner.*`
 - `context.runner.run_state` 默认直接暴露当前 `RunningState`
 - `batch_idx` / `total_batches` 只在 batch/progress 相关事件上可用
-- `signal` 是默认唯一允许 listener 回写主流程的通道
+- `signal` 是 listener 回写主流程的唯一通道，但具体事件是否允许回写、允许回写哪些状态，
+  由该事件的契约决定
 - `signal` 不是普遍可用字段；仅 `on_validation_end` / `on_early_stop` / `on_checkpoint_request` 等控制型事件保证存在
+- `on_checkpoint_request` 的 checkpoint outcome 是 runner 内部状态，只能由标准
+  `CheckpointListener` 写入；其他 listener 不得调用 `signal.record_checkpoint_outcome(...)`
 - `run_state` 与其它 payload 一样都不做机制上的只读防护；如果用户确实要修改，本框架保留这种自由度，但默认语义仍建议将其视为事件输入数据
 - `on_epoch_start` 的 public context 不承诺 `total_batches`
 
@@ -393,6 +396,14 @@ logger类本质上是实现了一系列监听接口，注册在 run agent 的生
 - on_validation_end
 - on_checkpoint_request
 - on_early_stop
+
+`on_checkpoint_request` 是 runner 发出的内部保存命令，不是自定义 checkpoint writer 扩展点。
+标准 `CheckpointListener` 是唯一 checkpoint writer，负责持久化并向 runner 回写请求结果；
+同一事件上的其他 listener 只能观察，不得声明保存成功或失败。一次请求没有标准 writer、
+产生多个 writer outcome，或 writer 持久化失败时，runner 都会将该请求判定为失败。
+
+需要替换 checkpoint 持久化实现时，应在 checkpoint manager/storage 边界扩展，不应通过注册
+第二个 `on_checkpoint_request` writer 改写请求结果。
 
 
 

@@ -225,7 +225,7 @@ class LoopSignal:
     nan_failure: bool = False
     nan_failure_source_ranks: List[int] = field(default_factory=list)
     pending_checkpoint_types: List[Literal["best", "regular"]] = field(default_factory=list)
-    checkpoint_path: Optional[str] = None
+    _checkpoint_outcome: Optional[tuple[str, str, Optional[str]]] = None
 
     def request_stop(self, source: str, message: str) -> None:
         self.should_stop = True
@@ -235,6 +235,84 @@ class LoopSignal:
         if checkpoint_type not in ("best", "regular"):
             raise ValueError(f"Unsupported checkpoint type: {checkpoint_type}")
         self.pending_checkpoint_types.append(checkpoint_type)
+
+    def begin_checkpoint_request(self) -> None:
+        """Clear request-local checkpoint outcome state before listener dispatch."""
+        self._checkpoint_outcome = None
+
+    def record_checkpoint_outcome(
+        self,
+        *,
+        path: Optional[str] = None,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Record the standard checkpoint writer's result for the current request."""
+        if self._checkpoint_outcome is not None:
+            raise RuntimeError("Checkpoint request received more than one writer outcome.")
+        if (path is None) == (error is None):
+            raise ValueError("Checkpoint outcome must contain exactly one of path or error.")
+        if path is not None:
+            if not path:
+                raise ValueError("Checkpoint success outcome requires a non-empty path.")
+            self._checkpoint_outcome = ("success", path, None)
+            return
+        self._checkpoint_outcome = ("failure", type(error).__name__, str(error))
+
+    def synchronize_checkpoint_outcome(
+        self,
+        distributed: bool,
+        *,
+        dispatch_error: Optional[tuple[str, str]] = None,
+    ) -> None:
+        """Make one checkpoint-owner outcome visible to every participating rank."""
+        local_request_result = (self._checkpoint_outcome, dispatch_error)
+        if distributed:
+            gathered_request_results = [None for _ in range(qdist.get_world_size())]
+            dist.all_gather_object(gathered_request_results, local_request_result)
+        else:
+            gathered_request_results = [local_request_result]
+
+        dispatch_errors = [
+            (rank, result[1])
+            for rank, result in enumerate(gathered_request_results)
+            if result[1] is not None
+        ]
+        if dispatch_errors:
+            rank, error = dispatch_errors[0]
+            raise RuntimeError(
+                f"Checkpoint request listener failed on rank {rank}: {error[0]}: {error[1]}"
+            )
+
+        gathered_outcomes = [result[0] for result in gathered_request_results]
+
+        failures = [
+            (rank, outcome)
+            for rank, outcome in enumerate(gathered_outcomes)
+            if outcome is not None and outcome[0] == "failure"
+        ]
+        if failures:
+            rank, outcome = failures[0]
+            raise RuntimeError(
+                f"Checkpoint persistence failed on rank {rank}: {outcome[1]}: {outcome[2]}"
+            )
+
+        successes = [
+            outcome for outcome in gathered_outcomes if outcome is not None and outcome[0] == "success"
+        ]
+        if len(successes) != 1:
+            raise RuntimeError(
+                "Checkpoint request requires exactly one successful writer outcome; "
+                f"received {len(successes)}."
+            )
+        self._checkpoint_outcome = successes[0]
+
+    def consume_checkpoint_outcome(self) -> str:
+        """Return one synchronized checkpoint path and clear request-local state."""
+        outcome = self._checkpoint_outcome
+        self._checkpoint_outcome = None
+        if outcome is None or outcome[0] != "success" or not outcome[1]:
+            raise RuntimeError("Checkpoint request completed without a synchronized success outcome.")
+        return outcome[1]
 
     def synchronize_stop(self, device: torch.device, distributed: bool) -> None:
         """Synchronize the stop signal across all DDP ranks."""

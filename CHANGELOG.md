@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- breaking: require `CheckpointListener` to receive a `CheckpointManager`; a missing manager now
+  fails at construction instead of silently discarding checkpoint requests.
+- fix: finalize every completed qpipeline training boundary in one ordered path, committing a
+  completed epoch before resolving simultaneous run-limit and early-stop outcomes.
+- fix: synchronize qpipeline checkpoint request listener-dispatch and persistence failures across
+  DDP ranks through the existing request outcome collective, preventing ranks from waiting after a
+  peer has already failed.
+
 ## v1.3.5
 
 - breaking: replace `qLmdbDataset` `enable_balance`, `enable_rewrite`, and

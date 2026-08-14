@@ -208,7 +208,7 @@ class CheckpointListener:
 
     def __init__(
         self,
-        checkpoint_manager: Optional[CheckpointManager],
+        checkpoint_manager: CheckpointManager,
         model: nn.Module,
         task: qTaskBase,
         optimizer: Optional[torch.optim.Optimizer] = None,
@@ -219,6 +219,8 @@ class CheckpointListener:
         logger: Optional[Any] = None,
         event_logger: Optional[Any] = None,
     ) -> None:
+        if checkpoint_manager is None:
+            raise ValueError("checkpoint_manager is required")
         self.checkpoint_manager = checkpoint_manager
         self.model = model
         self.task = task
@@ -237,24 +239,25 @@ class CheckpointListener:
         return copy.copy(state)
 
     def on_checkpoint_request(self, context: CheckpointRequestEventContext) -> None:
-        if self.checkpoint_manager is None:
-            return
-
         checkpoint_type = context.checkpoint_type or "regular"
         state_for_save = self._clone_state_for_save(context)
-        ckp_path = self.checkpoint_manager.save(
-            state_for_save,
-            self.model,
-            self.task,
-            self.optimizer,
-            self.scheduler,
-            self.ema_model,
-            self.early_stopper,
-            self.best_model_tracker,
-            is_best=(checkpoint_type == "best"),
-        )
-        if context.signal:
-            context.signal.checkpoint_path = ckp_path
+        try:
+            ckp_path = self.checkpoint_manager.save(
+                state_for_save,
+                self.model,
+                self.task,
+                self.optimizer,
+                self.scheduler,
+                self.ema_model,
+                self.early_stopper,
+                self.best_model_tracker,
+                is_best=(checkpoint_type == "best"),
+            )
+        except Exception as error:
+            context.signal.record_checkpoint_outcome(error=error)
+            return
+        if ckp_path:
+            context.signal.record_checkpoint_outcome(path=ckp_path)
         if ckp_path and self.logger is not None:
             self.logger.info(f"[Checkpoint Saved] type={checkpoint_type} path={Path(ckp_path).resolve()}")
         if ckp_path and self.event_logger is not None:

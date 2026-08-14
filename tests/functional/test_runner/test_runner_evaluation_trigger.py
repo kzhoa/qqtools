@@ -14,6 +14,10 @@ from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMo
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
 
 
+def _record_checkpoint_outcome(context) -> None:
+    context.signal.record_checkpoint_outcome(path="test-checkpoint.pt")
+
+
 # Re-using SimpleModel and SimpleTask from conftest or redefining for clarity
 class SimpleModel(nn.Module):
     def __init__(self, input_dim=10):
@@ -169,6 +173,7 @@ class TestEvaluationTiming:
 
         agent.add_listener("on_eval_start", capture_eval_start)
         agent.add_listener("on_eval_end", logger.on_eval_end)
+        agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
 
         agent.run()
 
@@ -221,6 +226,7 @@ class TestEvaluationTiming:
 
         agent.add_listener("on_eval_start", capture_eval_start)
         agent.add_listener("on_eval_end", logger.on_eval_end)
+        agent.add_listener("on_checkpoint_request", _record_checkpoint_outcome)
 
         agent.run()
 

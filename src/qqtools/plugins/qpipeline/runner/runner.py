@@ -662,7 +662,7 @@ def train_runner(
     # Create managers and callback listeners
     checkpoint_manager = CheckpointManager(
         config.save_dir,
-        config.rank,
+        config.rank if config.distributed else 0,
         keep_only_latest_regular=_qconfig_get(config.checkpoint, "regular_latest_only", True),
     )
     early_stopper = EarlyStopper.from_config(config.early_stop)
@@ -731,8 +731,8 @@ def train_runner(
             ema_model=ema_model,
             log_granularity=log_granularity,
         )
-        loop_stopped_by_early_stop = agent.run()
-        terminal_cause = "early_stop" if loop_stopped_by_early_stop else "normal_finish"
+        agent_stop = agent.run()
+        terminal_cause = "early_stop" if agent_stop == "early_stop" else "normal_finish"
 
     except KeyboardInterrupt:
         terminal_cause = "user_interrupt"

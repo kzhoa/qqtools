@@ -78,6 +78,9 @@ class NaNDetectedError(RuntimeError):
     """Raised when a periodic boundary detects that training loss became NaN."""
 
 
+BoundaryStop = Literal["run_limit", "early_stop"]
+
+
 class RunningAgent:
     def __init__(
         self,
@@ -632,75 +635,111 @@ class RunningAgent:
         target_signal = signal or self._ad_hoc_signal
         while target_signal.pending_checkpoint_types:
             checkpoint_type = target_signal.pending_checkpoint_types.pop(0)
+            target_signal.begin_checkpoint_request()
+            dispatch_error = None
 
-            emit_checkpoint_request(
-                self.dispatcher,
-                state=self.state,
-                checkpoint_type=checkpoint_type,
-                signal=target_signal,
-                max_epochs=self.config.max_epochs,
-                max_steps=self.config.max_steps,
+            try:
+                emit_checkpoint_request(
+                    self.dispatcher,
+                    state=self.state,
+                    checkpoint_type=checkpoint_type,
+                    signal=target_signal,
+                    max_epochs=self.config.max_epochs,
+                    max_steps=self.config.max_steps,
+                )
+            except Exception as error:
+                dispatch_error = (type(error).__name__, str(error))
+
+            target_signal.synchronize_checkpoint_outcome(
+                self.config.distributed,
+                dispatch_error=dispatch_error,
             )
-
-            checkpoint_path = target_signal.checkpoint_path
-            if checkpoint_path is None:
-                continue
+            checkpoint_path = target_signal.consume_checkpoint_outcome()
 
             if checkpoint_type == "best":
                 self.state.best_ckp_file = Path(checkpoint_path).name
 
-            # Reset checkpoint_path for the next listener to use
-            target_signal.checkpoint_path = None
-
-    def _handle_periodic_events(self, is_epoch_end: bool) -> bool:
-        signal = LoopSignal()
-
-        is_eval_trigger = self._check_run_period(self.config.eval_interval, is_epoch_end)
-        if is_epoch_end:
-            self.state.mark_epoch_end_eval_trigger(eval_triggered=is_eval_trigger)
-
-        if is_eval_trigger:
-            self.logger.debug(
-                f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
-                f"\n eval_interval={self.config.eval_interval} save_interval={self.config.save_interval}"
-            )
-        is_save_trigger = self._check_run_period(self.config.save_interval, is_epoch_end)
-
-        if is_eval_trigger or is_save_trigger:
-            signal.nan_failure = self._latest_train_loss is not None and math.isnan(self._latest_train_loss)
-            signal.synchronize_nan_failure(self.device, self.config.distributed)
-
-        if signal.nan_failure:
-            parts = (is_eval_trigger * ["evaluation"]) + (is_save_trigger * ["regular checkpoint"])
-            boundary_text = " and ".join(parts) or "periodic boundary"
-            self.logger.error(
-                f"NaN detected before {boundary_text} on ranks={signal.nan_failure_source_ranks} "
-                f"at epoch={self.state.epoch}, step={self.state.global_step}."
-            )
-            raise NaNDetectedError("NaN detected before periodic evaluation/checkpoint boundary.")
-
-        if is_eval_trigger:
+    def _execute_boundary_actions(
+        self,
+        *,
+        signal: LoopSignal,
+        evaluate: bool,
+        save_regular: bool,
+    ) -> None:
+        """Execute selected boundary actions using the caller-owned listener signal."""
+        if evaluate:
             self._run_evaluation_and_update(signal)
-
-        if is_save_trigger:
+        if save_regular:
             self._request_checkpoint("regular", signal=signal)
+        if signal.pending_checkpoint_types:
+            self._flush_checkpoint_requests(signal)
 
-        self._flush_checkpoint_requests(signal)
-        signal.synchronize_stop(self.device, self.config.distributed)
+    def _finalize_training_boundary(
+        self,
+        *,
+        did_optimizer_step: bool,
+        is_epoch_end: bool,
+    ) -> Optional[BoundaryStop]:
+        """Finalize one processed training boundary in temporal order."""
+        periodic_boundary = (
+            is_epoch_end if self.config.run_mode == RunMode.EPOCH else did_optimizer_step
+        )
+        periodic_signal = LoopSignal()
+        periodic_early_stop = False
 
-        if signal.should_stop:
-            reason_text = "; ".join(f"[{r.source}] {r.message}" for r in signal.stop_reasons)
+        if periodic_boundary:
+            periodic_eval = self._check_run_period(self.config.eval_interval, is_epoch_end)
+            periodic_save = self._check_run_period(self.config.save_interval, is_epoch_end)
+            if is_epoch_end:
+                self.state.mark_epoch_end_eval_trigger(eval_triggered=periodic_eval)
+            if periodic_eval:
+                self.logger.debug(
+                    f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
+                    f"\n eval_interval={self.config.eval_interval} save_interval={self.config.save_interval}"
+                )
+            if periodic_eval or periodic_save:
+                periodic_signal.nan_failure = (
+                    self._latest_train_loss is not None and math.isnan(self._latest_train_loss)
+                )
+                periodic_signal.synchronize_nan_failure(self.device, self.config.distributed)
+            if periodic_signal.nan_failure:
+                parts = (periodic_eval * ["evaluation"]) + (periodic_save * ["regular checkpoint"])
+                boundary_text = " and ".join(parts) or "periodic boundary"
+                self.logger.error(
+                    f"NaN detected before {boundary_text} on ranks={periodic_signal.nan_failure_source_ranks} "
+                    f"at epoch={self.state.epoch}, step={self.state.global_step}."
+                )
+                raise NaNDetectedError("NaN detected before periodic evaluation/checkpoint boundary.")
+
+            self._execute_boundary_actions(
+                signal=periodic_signal,
+                evaluate=periodic_eval,
+                save_regular=periodic_save,
+            )
+            periodic_signal.synchronize_stop(self.device, self.config.distributed)
+            periodic_early_stop = periodic_signal.should_stop
+
+        if is_epoch_end:
+            self._handle_epoch_end()
+
+        if self._reached_run_limits():
+            return "run_limit"
+
+        if periodic_early_stop:
+            reason_text = "; ".join(
+                f"[{reason.source}] {reason.message}" for reason in periodic_signal.stop_reasons
+            )
             self.logger.debug(reason_text or "Early stopping triggered.")
             emit_early_stop(
                 self.dispatcher,
                 state=self.state,
-                signal=signal,
+                signal=periodic_signal,
                 max_epochs=self.config.max_epochs,
                 max_steps=self.config.max_steps,
             )
-            return True
+            return "early_stop"
 
-        return False
+        return None
 
     def _reached_run_limits(self) -> bool:
         max_steps_limit = self.config.max_steps if self.config.max_steps is not None else float("inf")
@@ -954,10 +993,10 @@ class RunningAgent:
 
         return batch_metrics, did_optimizer_step
 
-    def _training_loop(self) -> bool:
+    def _training_loop(self) -> Optional[BoundaryStop]:
         while True:
             if self._reached_run_limits():
-                return False
+                return None
 
             self._start_new_epoch()
             total_batches = len(self.train_loader)
@@ -971,24 +1010,15 @@ class RunningAgent:
                 _, did_optimizer_step = self._train_one_batch(batch_data, emit_events=True)
 
                 is_epoch_end = self.state.batch_idx_in_epoch >= total_batches
-                should_handle_periodic = False
-                if self.config.run_mode == RunMode.EPOCH:
-                    should_handle_periodic = is_epoch_end
-                else:
-                    should_handle_periodic = did_optimizer_step
+                if did_optimizer_step or is_epoch_end:
+                    boundary_stop = self._finalize_training_boundary(
+                        did_optimizer_step=did_optimizer_step,
+                        is_epoch_end=is_epoch_end,
+                    )
+                    if boundary_stop is not None:
+                        return boundary_stop
 
-                if should_handle_periodic:
-                    should_stop_mid_epoch = self._handle_periodic_events(is_epoch_end=is_epoch_end)
-                    if should_stop_mid_epoch:
-                        return True
-
-                if did_optimizer_step:
-                    if self._reached_run_limits():
-                        return False
-
-            self._handle_epoch_end()
-
-    def run(self) -> bool:
+    def run(self) -> Optional[BoundaryStop]:
         if self.loss_fn is None:
             raise ValueError("RunningAgent.run() requires a non-null loss_fn for training mode")
         if self.optimizer is None:
@@ -1005,12 +1035,12 @@ class RunningAgent:
             f"max_steps={max_steps_limit})"
         )
 
-        loop_stopped_by_early_stop = self._training_loop()
+        boundary_stop = self._training_loop()
 
-        if not loop_stopped_by_early_stop:
+        if boundary_stop != "early_stop":
             if self.state.global_step >= max_steps_limit:
                 self.logger.debug(f"Reached max_steps={max_steps_limit}")
             elif self.state.epoch >= max_epochs_limit:
                 self.logger.debug(f"Reached max_epochs={max_epochs_limit}")
 
-        return loop_stopped_by_early_stop
+        return boundary_stop
