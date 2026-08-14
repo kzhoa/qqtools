@@ -9,8 +9,7 @@ Design Philosophy:
 import gc
 import math
 import time
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Literal, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -25,30 +24,35 @@ from ..entry_utils.scheduler import qWarmupScheduler
 from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import qTaskBase
 from ..types import Stage
-from .events import (
-    EventDispatcher,
-    EventName,
-    emit_batch_end,
-    emit_batch_start,
-    emit_early_stop,
-    emit_epoch_end,
-    emit_epoch_start,
-    emit_epoch_start_internal,
-    emit_eval_end,
-    emit_eval_start,
-    emit_loss_computed,
-    emit_progress_tick,
-    emit_table_update,
-    emit_train_batch_end,
-    emit_validation_end,
-    CheckpointSaveCommandContext,
-    CheckpointSavedEventContext,
-    CommandName,
+from .contracts import (
+    EarlyStopDecision,
+    EpochCommittedFact,
+    EpochStartedFact,
+    EvaluationCommittedFact,
+    EvaluationStartedFact,
+    EventListenerBindings,
+    ObserverBindings,
+    ProgressTickFact,
+    StopCommittedFact,
+    TaskEpochEndContext,
+    TaskEpochStartContext,
+    TaskTrainBoundaryContext,
+    TaskValidationContext,
+    TrainBoundaryCommittedFact,
+    dispatch_protected_boundary,
+    freeze_scalar_metrics,
+)
+from .hooks import (
+    OptimizerStepEndContext,
+    RunnerBoundaryContext,
+    RunnerHooks,
+    ValidationHookContext,
 )
 from .runner_utils.avgbank import AvgBank
-from .runner_utils.best_model import BestModelTracker
+from .runner_utils.best_model import BestMetricSnapshot, BestModelTracker
 from .runner_utils.common import _is_periodic_trigger, move_batch_to_device
 from .runner_utils.ema_context import EMAOffloadContext
+from .runner_utils.earlystop import EarlyStopController
 from .runner_utils.evaluation import (
     EvaluationResult,
     LoaderEvaluation,
@@ -59,7 +63,7 @@ from .runner_utils.evaluation import (
 )
 from .runner_utils.hook_binding import bind_post_metrics_to_value
 from .runner_utils.tensorbank import TensorBank
-from .runner_utils.types import LoopSignal, RunConfig, RunMode, RunningState
+from .runner_utils.types import RunConfig, RunMode, RunningState
 from .runner_utils.ddpdeduper import (
     EvalDedupRuntime,
     prepare_eval_loader_for_ddp,
@@ -96,10 +100,15 @@ class RunningAgent:
         ema_model: Optional[qEMA] = None,
         auto_offload: bool = True,
         logger: Optional[qLogger] = None,
-        listeners: Optional[Dict[str, List[Callable]]] = None,
         state: Optional[RunningState] = None,
         avg_bank: Optional[AvgBank] = None,
         best_model_tracker: Optional[BestModelTracker] = None,
+        hooks: Optional[RunnerHooks] = None,
+        event_listeners: Optional[EventListenerBindings] = None,
+        observers: Optional[ObserverBindings] = None,
+        early_stop_controller: Optional[EarlyStopController] = None,
+        validation_scheduler_step: Optional[Callable[[TaskValidationContext], None]] = None,
+        node_aligned_output_keys: Optional[Tuple[str, ...]] = None,
     ):
         self.model = model
         self.task = task
@@ -115,12 +124,19 @@ class RunningAgent:
         self.logger = logger or ConsoleLogger()
 
         self.state = state or RunningState()
-        self.best_model_tracker = best_model_tracker or BestModelTracker(
-            target=self.config.checkpoint.get("target", "val_metric"),
-            mode=self.config.checkpoint.get("mode", "min"),
-            min_delta=self.config.checkpoint.get("min_delta", 0.0),
-        )
-        self._ad_hoc_signal = LoopSignal()
+        self.best_model_tracker = best_model_tracker or BestModelTracker()
+        self.hooks = hooks or RunnerHooks()
+        if hooks is None:
+            self.hooks.freeze()
+        self.event_listeners = event_listeners or EventListenerBindings()
+        self.observers = observers or ObserverBindings(logger=self.logger)
+        if event_listeners is None:
+            self.event_listeners.freeze()
+        if observers is None:
+            self.observers.freeze()
+        self.early_stop_controller = early_stop_controller
+        self._validation_scheduler_step = validation_scheduler_step
+        self._node_aligned_output_key_names = node_aligned_output_keys
         self._eval_counts_pending = self.config.distributed
 
         self.train_loader = task.train_loader
@@ -138,13 +154,6 @@ class RunningAgent:
 
         self.interval_avg_bank = AvgBank()
 
-        self.dispatcher = EventDispatcher()
-        self.listeners = self.dispatcher.listeners
-        if listeners:
-            for event, callbacks in listeners.items():
-                for callback in callbacks:
-                    self.dispatcher.add_listener(event, callback)
-
         self._ema_offload_ctx = EMAOffloadContext(
             main_model=self.model,
             ema_model=self.ema_model,
@@ -161,25 +170,17 @@ class RunningAgent:
         self._current_accum_loss_count = 0.0
         self._latest_train_loss: Optional[float] = None
 
-        if self.scheduler is not None and getattr(self.scheduler, "warmup_steps", 0) > 0:
-            self.add_listener("on_train_batch_end", self._reset_avg_after_warmup)
+        self._should_reset_avg_after_warmup = (
+            self.scheduler is not None and getattr(self.scheduler, "warmup_steps", 0) > 0
+        )
 
-    def _reset_avg_after_warmup(self, context) -> None:
+    def _reset_avg_after_warmup(self) -> None:
         if self.scheduler.current_step >= self.scheduler.warmup_steps:
             self.train_avg_bank.reset()
             self.logger.info(
                 f"Warmup completed at step {self.scheduler.warmup_steps}. " f"Training metrics have been reset."
             )
-            self.remove_listener("on_train_batch_end", self._reset_avg_after_warmup)
-
-    def _validate_event_name(self, event: Union[str, EventName]) -> str:
-        return self.dispatcher._validate_event_name(event)
-
-    def add_listener(self, event: Union[str, EventName], listener: Callable):
-        self.dispatcher.add_listener(event, listener)
-
-    def remove_listener(self, event: Union[str, EventName], listener: Callable):
-        self.dispatcher.remove_listener(event, listener)
+            self._should_reset_avg_after_warmup = False
 
     def _check_run_period(self, interval: Optional[int], is_epoch_end: bool) -> bool:
         return _is_periodic_trigger(
@@ -189,9 +190,6 @@ class RunningAgent:
             epoch=self.state.epoch,
             is_epoch_end=is_epoch_end,
         )
-
-    def _has_listener(self, event: str) -> bool:
-        return self.dispatcher.has_listeners(event)
 
     def _prepare_batch(self, batch_data):
         batch_data = move_batch_to_device(batch_data, self.device)
@@ -219,23 +217,24 @@ class RunningAgent:
 
         self.state.mark_epoch_end_eval_trigger(eval_triggered=False)
         total_batches = len(self.train_loader)
-        emit_epoch_start_internal(
-            self.dispatcher,
-            state=self.state,
-            stage=Stage.TRAIN,
-            total_batches=total_batches,
-            max_epochs=self.config.max_epochs,
-            max_steps=self.config.max_steps,
+        self.event_listeners.dispatch(
+            "epoch_start",
+            TaskEpochStartContext(
+                epoch=self.state.epoch,
+                global_step=self.state.global_step,
+                total_batches=total_batches,
+            ),
         )
-        emit_epoch_start(
-            self.dispatcher,
-            state=self.state,
-            stage=Stage.TRAIN,
-            max_epochs=self.config.max_epochs,
-            max_steps=self.config.max_steps,
+        self.observers.dispatch(
+            "epoch_started",
+            EpochStartedFact(
+                epoch=self.state.epoch,
+                global_step=self.state.global_step,
+                total_batches=total_batches,
+            ),
         )
 
-    def _handle_epoch_end(self):
+    def _handle_epoch_end(self) -> EpochCommittedFact:
         raw_epoch_metrics = self.train_avg_bank.gather_average(self.config.distributed)
         if self.use_tensor_bank and self.train_tensor_bank:
             gathered_cache = self.train_tensor_bank.gather(self.config.distributed, self.device)
@@ -248,21 +247,39 @@ class RunningAgent:
                 result=raw_epoch_metrics,
                 stage=Stage.TRAIN,
             )
+        self.state.update_current_metrics(epoch_results)
+        self.state.refresh_epoch_result_metric_sources()
+        completed_epoch = self.state.epoch
+        task_metrics = freeze_scalar_metrics(epoch_results)
+        self.event_listeners.dispatch(
+            "epoch_end",
+            TaskEpochEndContext(
+                completed_epoch=completed_epoch,
+                global_step=self.state.global_step,
+                epoch_metrics=task_metrics,
+            ),
+        )
         self.train_avg_bank.reset()
         if self.train_tensor_bank:
             self.train_tensor_bank.reset()
-
-        self.state.update_current_metrics(epoch_results)
-        self.state.refresh_epoch_result_metric_sources()
-        emit_epoch_end(
-            self.dispatcher,
-            state=self.state,
-            stage=Stage.TRAIN,
-            max_epochs=self.config.max_epochs,
-            max_steps=self.config.max_steps,
-        )
         self.state.epoch += 1
         self.state.batch_idx_in_epoch = 0
+        observer_metrics = freeze_scalar_metrics(
+            {
+                **epoch_results,
+                "train_loss": self._latest_train_loss,
+                "val_metric": self.state.current_val_metric,
+                "test_metric": self.state.current_test_metric,
+                "val_metric_source": self.state.epoch_result_val_metric_source,
+                "test_metric_source": self.state.epoch_result_test_metric_source,
+            }
+        )
+        return EpochCommittedFact(
+            completed_epoch=completed_epoch,
+            next_epoch=self.state.epoch,
+            global_step=self.state.global_step,
+            epoch_metrics=observer_metrics,
+        )
 
     def _resolve_evaluation_loaders(
         self,
@@ -273,10 +290,9 @@ class RunningAgent:
         )
 
     def _node_aligned_output_keys(self) -> tuple[str, ...]:
-        task_config = getattr(getattr(self.task, "args", None), "task", None)
         keys = getattr(self.task, "node_aligned_output_keys", None)
         if keys is None:
-            keys = getattr(task_config, "node_aligned_output_keys", ())
+            keys = self._node_aligned_output_key_names
         return tuple(keys or ())
 
     def _prepare_evaluation_loader_snapshot(
@@ -450,7 +466,7 @@ class RunningAgent:
             enabled=False
         )
 
-        has_progress_tick = self._has_listener("on_progress_tick")
+        has_progress_tick = self.observers.has("progress_tick")
         should_calc_avg = has_progress_tick
 
         try:
@@ -479,31 +495,19 @@ class RunningAgent:
                         else None
                     )
 
-                    emit_batch_end(
-                        self.dispatcher,
-                        state=self.state,
-                        stage=stage,
-                        batch_idx=batch_idx,
-                        total_batches=total_batches,
-                        batch_metrics=raw_batch_metrics,
-                        avg_bank=avg_metrics,
-                        lr=None,
-                        max_epochs=self.config.max_epochs,
-                        max_steps=self.config.max_steps,
-                    )
-
                     if has_progress_tick:
-                        emit_progress_tick(
-                            self.dispatcher,
-                            state=self.state,
-                            stage=stage,
-                            batch_idx=batch_idx,
-                            total_batches=total_batches,
-                            batch_metrics=scalar_batch_metrics,
-                            avg_bank=avg_metrics,
-                            lr=None,
-                            max_epochs=self.config.max_epochs,
-                            max_steps=self.config.max_steps,
+                        self.observers.dispatch(
+                            "progress_tick",
+                            ProgressTickFact(
+                                stage=stage if isinstance(stage, Stage) else Stage(stage),
+                                epoch=self.state.epoch,
+                                global_step=self.state.global_step,
+                                batch_index=batch_idx,
+                                total_batches=total_batches,
+                                batch_metrics=freeze_scalar_metrics(scalar_batch_metrics),
+                                average_metrics=freeze_scalar_metrics(avg_metrics or {}),
+                                lr=None,
+                            ),
                         )
 
             avg_metrics = eval_runtime.gather_avg_bank(
@@ -529,11 +533,11 @@ class RunningAgent:
         if not tracker:
             return False, None
 
-        previous_best = {
-            "metric": getattr(tracker, "best_metric", None),
-            "epoch": getattr(tracker, "best_epoch", 0),
-            "step": getattr(tracker, "best_step", 0),
-        }
+        previous_best = BestMetricSnapshot(
+            metric=getattr(tracker, "best_metric", None),
+            epoch=getattr(tracker, "best_epoch", 0),
+            step=getattr(tracker, "best_step", 0),
+        )
 
         target_key = getattr(tracker, "target", None)
         if not target_key:
@@ -561,20 +565,20 @@ class RunningAgent:
         self.state.best_model_metrics_snapshot = evaluation.to_dict()
         return True, previous_best
 
-    def _run_evaluation_and_update(self, signal: LoopSignal) -> None:
+    def _run_evaluation_and_update(self) -> EarlyStopDecision:
         val_loaders, test_loaders = self._resolve_evaluation_loaders()
         val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(
             val_loaders, test_loaders
         )
         total_eval_batches = sum(len(loader) for _, loader in (*val_loaders, *test_loaders))
 
-        emit_eval_start(
-            self.dispatcher,
-            state=self.state,
-            total_batches=total_eval_batches,
-            signal=signal,
-            max_epochs=self.config.max_epochs,
-            max_steps=self.config.max_steps,
+        self.observers.dispatch(
+            "evaluation_started",
+            EvaluationStartedFact(
+                epoch=self.state.epoch,
+                global_step=self.state.global_step,
+                total_batches=total_eval_batches,
+            ),
         )
 
         interval_metrics = self.interval_avg_bank.gather_average(self.config.distributed)
@@ -599,99 +603,52 @@ class RunningAgent:
                 state_metrics[key] = value
         self.state.update_current_metrics(state_metrics, is_evaluation_boundary=True)
 
-        emit_eval_end(
-            self.dispatcher,
-            state=self.state,
-            evaluation=evaluation,
-            signal=signal,
-            max_epochs=self.config.max_epochs,
-            max_steps=self.config.max_steps,
-        )
-
         is_best, previous_best = self._update_best_model_state(evaluation)
-        if is_best:
-            self._request_checkpoint("best", signal=signal)
-
-        emit_validation_end(
-            self.dispatcher,
-            state=self.state,
+        context = TaskValidationContext(
+            epoch=self.state.epoch,
+            global_step=self.state.global_step,
             evaluation=evaluation,
-            lr=self._get_current_lr(),
-            previous_best=previous_best,
             is_best=is_best,
-            best_model_tracker=self.best_model_tracker,
-            signal=signal,
-            max_epochs=self.config.max_epochs,
-            max_steps=self.config.max_steps,
+            previous_best=previous_best,
+            lr=self._get_current_lr(),
         )
 
-    def _request_checkpoint(
-        self,
-        checkpoint_type: Literal["best", "regular"],
-        signal: Optional[LoopSignal] = None,
-    ) -> None:
-        target_signal = signal or self._ad_hoc_signal
-        target_signal.request_checkpoint(checkpoint_type)
+        def _run_pre_control_phase() -> None:
+            self.event_listeners.dispatch("validation", context)
+            if self._validation_scheduler_step is not None:
+                self._validation_scheduler_step(context)
 
-    def _flush_checkpoint_requests(self, signal: Optional[LoopSignal] = None) -> None:
-        target_signal = signal or self._ad_hoc_signal
-        while target_signal.pending_checkpoint_types:
-            checkpoint_type = target_signal.pending_checkpoint_types.pop(0)
-            checkpoint_path = self.dispatcher.invoke(
-                CommandName.SAVE_CHECKPOINT,
-                CheckpointSaveCommandContext(state=self.state, checkpoint_type=checkpoint_type),
+        requires_settlement = self.early_stop_controller is not None or self.hooks.has_collective_capable_validation_hook
+        dispatch_protected_boundary(
+            _run_pre_control_phase,
+            distributed=self.config.distributed,
+            requires_settlement=requires_settlement,
+            boundary_name="validation listener/scheduler dispatch",
+        )
+        decision = EarlyStopDecision()
+        if self.early_stop_controller is not None:
+            decision = self.early_stop_controller.decide(context, distributed=self.config.distributed)
+        self.hooks.dispatch_after_validation(
+            ValidationHookContext(
+                epoch=self.state.epoch,
+                global_step=self.state.global_step,
+                evaluation=evaluation,
+                is_best=is_best,
+                previous_best=previous_best,
             )
-            if not isinstance(checkpoint_path, str) or not checkpoint_path:
-                raise RuntimeError("SAVE_CHECKPOINT handler must return a non-empty checkpoint path.")
-
-            if checkpoint_type == "best":
-                self.state.best_ckp_file = Path(checkpoint_path).name
-
-            notification_error = None
-            try:
-                self.dispatcher._dispatch_internal_context(
-                    EventName.ON_CHECKPOINT_SAVED,
-                    CheckpointSavedEventContext(
-                        checkpoint_type=checkpoint_type,
-                        checkpoint_path=checkpoint_path,
-                        epoch=self.state.epoch,
-                        global_step=self.state.global_step,
-                    ),
-                )
-            except Exception as error:
-                notification_error = (type(error).__name__, str(error))
-            self._synchronize_checkpoint_notification_error(notification_error)
-
-    def _synchronize_checkpoint_notification_error(
-        self,
-        notification_error: Optional[tuple[str, str]],
-    ) -> None:
-        if self.config.distributed:
-            gathered_errors = [None for _ in range(qt.qdist.get_world_size())]
-            dist.all_gather_object(gathered_errors, notification_error)
-        else:
-            gathered_errors = [notification_error]
-
-        for rank, error in enumerate(gathered_errors):
-            if error is not None:
-                raise RuntimeError(
-                    f"Checkpoint saved notification failed on rank {rank}: {error[0]}: {error[1]}"
-                )
-
-    def _execute_boundary_actions(
-        self,
-        *,
-        signal: LoopSignal,
-        evaluate: bool,
-        save_regular: bool,
-    ) -> None:
-        """Execute selected boundary actions using the caller-owned listener signal."""
-        if evaluate:
-            self._run_evaluation_and_update(signal)
-        if save_regular:
-            self._request_checkpoint("regular", signal=signal)
-        if signal.pending_checkpoint_types:
-            self._flush_checkpoint_requests(signal)
+        )
+        self.observers.dispatch(
+            "evaluation_committed",
+            EvaluationCommittedFact(
+                epoch=self.state.epoch,
+                global_step=self.state.global_step,
+                evaluation=evaluation,
+                is_best=is_best,
+                previous_best=previous_best,
+                lr=self._get_current_lr(),
+            ),
+        )
+        return decision
 
     def _finalize_training_boundary(
         self,
@@ -703,14 +660,9 @@ class RunningAgent:
         periodic_boundary = (
             is_epoch_end if self.config.run_mode == RunMode.EPOCH else did_optimizer_step
         )
-        periodic_signal = LoopSignal()
-        nan_signal = LoopSignal()
-
         periodic_eval = False
-        periodic_save = False
         if periodic_boundary:
             periodic_eval = self._check_run_period(self.config.eval_interval, is_epoch_end)
-            periodic_save = self._check_run_period(self.config.save_interval, is_epoch_end)
 
         reached_max_steps = (
             self.config.max_steps is not None and self.state.global_step >= self.config.max_steps
@@ -723,30 +675,35 @@ class RunningAgent:
         hard_limit_reached = reached_max_steps or reaches_max_epochs
 
         completion_eval_requested = (
-            hard_limit_reached and self.config.completion.get("eval", False) and not periodic_eval
+            hard_limit_reached and self.config.completion_eval and not periodic_eval
         )
-        completion_save_requested = hard_limit_reached and self.config.completion.get("save", False)
         has_selected_action = (
             periodic_eval
-            or periodic_save
             or completion_eval_requested
-            or completion_save_requested
         )
 
         if has_selected_action:
-            nan_signal.nan_failure = (
+            has_nan_failure = (
                 self._latest_train_loss is not None and math.isnan(self._latest_train_loss)
             )
-            nan_signal.synchronize_nan_failure(self.device, self.config.distributed)
-        if nan_signal.nan_failure:
+            if self.config.distributed:
+                local_nan = torch.tensor([int(has_nan_failure)], dtype=torch.int64, device=self.device)
+                gathered_nan = [torch.empty_like(local_nan) for _ in range(dist.get_world_size())]
+                dist.all_gather(gathered_nan, local_nan)
+                nan_source_ranks = [rank for rank, flag in enumerate(gathered_nan) if int(flag.item())]
+                has_nan_failure = bool(nan_source_ranks)
+            else:
+                nan_source_ranks = [0] if has_nan_failure else []
+        else:
+            has_nan_failure = False
+            nan_source_ranks = []
+        if has_nan_failure:
             action_names = []
             if periodic_eval or completion_eval_requested:
                 action_names.append("evaluation")
-            if periodic_save or completion_save_requested:
-                action_names.append("regular checkpoint")
             boundary_text = " and ".join(action_names) or "completion boundary"
             self.logger.error(
-                f"NaN detected before {boundary_text} on ranks={nan_signal.nan_failure_source_ranks} "
+                f"NaN detected before {boundary_text} on ranks={nan_source_ranks} "
                 f"at epoch={self.state.epoch}, step={self.state.global_step}."
             )
             raise NaNDetectedError("NaN detected before periodic evaluation/checkpoint boundary.")
@@ -757,72 +714,60 @@ class RunningAgent:
             if periodic_eval:
                 self.logger.debug(
                     f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
-                    f"\n eval_interval={self.config.eval_interval} save_interval={self.config.save_interval}"
+                    f"\n eval_interval={self.config.eval_interval}"
                 )
-            self._execute_boundary_actions(
-                signal=periodic_signal,
-                evaluate=periodic_eval,
-                save_regular=False,
+            periodic_decision = (
+                self._run_evaluation_and_update() if periodic_eval else EarlyStopDecision()
             )
-            periodic_signal.synchronize_stop(self.device, self.config.distributed)
+        else:
+            periodic_decision = EarlyStopDecision()
 
-        periodic_early_stop = periodic_signal.should_stop
+        periodic_early_stop = periodic_decision.should_stop
         terminal_candidate = hard_limit_reached or periodic_early_stop
-        completion_signal = LoopSignal()
         completion_eval_requested = (
             terminal_candidate
-            and self.config.completion.get("eval", False)
+            and self.config.completion_eval
             and not periodic_eval
-        )
-        completion_save_requested = terminal_candidate and self.config.completion.get("save", False)
-        defer_regular_save = is_epoch_end and terminal_candidate and completion_save_requested
-        save_after_epoch_commit = (
-            (periodic_save or completion_save_requested) and defer_regular_save
-        )
-        save_at_current_cursor = (
-            (periodic_save or completion_save_requested) and not save_after_epoch_commit
         )
 
         if completion_eval_requested:
             if is_epoch_end:
                 self.state.mark_epoch_end_eval_trigger(eval_triggered=True)
-            self._execute_boundary_actions(
-                signal=completion_signal,
-                evaluate=True,
-                save_regular=False,
-            )
+            completion_decision = self._run_evaluation_and_update()
+            periodic_decision = completion_decision if completion_decision.should_stop else periodic_decision
+            periodic_early_stop = periodic_decision.should_stop
 
-        if save_at_current_cursor:
-            self._execute_boundary_actions(
-                signal=completion_signal,
-                evaluate=False,
-                save_regular=True,
-            )
+        boundary_context = RunnerBoundaryContext(
+            epoch=self.state.epoch,
+            global_step=self.state.global_step,
+            run_mode=self.config.run_mode,
+            did_optimizer_step=did_optimizer_step,
+            is_epoch_end=is_epoch_end,
+            terminal_candidate=terminal_candidate,
+            latest_train_loss=self._latest_train_loss,
+        )
+        self.hooks.dispatch_at_boundary_cursor(boundary_context)
 
         if is_epoch_end:
-            self._handle_epoch_end()
-
-        if save_after_epoch_commit:
-            self._execute_boundary_actions(
-                signal=completion_signal,
-                evaluate=False,
-                save_regular=True,
-            )
+            epoch_fact = self._handle_epoch_end()
+            self.hooks.dispatch_after_epoch_commit(boundary_context)
+            self.observers.dispatch("epoch_committed", epoch_fact)
 
         if self._reached_run_limits():
             return "run_limit"
 
         if periodic_early_stop:
-            reason_text = "; ".join(
-                f"[{reason.source}] {reason.message}" for reason in periodic_signal.stop_reasons
-            )
-            self.logger.debug(reason_text or "Early stopping triggered.")
-            emit_early_stop(
-                self.dispatcher,
-                state=self.state,
-                signal=periodic_signal,
-                max_epochs=self.config.max_epochs,
-                max_steps=self.config.max_steps,
+            source = periodic_decision.source or "early_stop"
+            message = periodic_decision.message or "Early stopping triggered."
+            self.logger.debug("[%s] %s", source, message)
+            self.observers.dispatch_terminal(
+                StopCommittedFact(
+                    source=source,
+                    message=message,
+                    epoch=self.state.epoch,
+                    global_step=self.state.global_step,
+                ),
+                distributed=self.config.distributed,
             )
             return "early_stop"
 
@@ -960,17 +905,6 @@ class RunningAgent:
         batch_idx = state.batch_idx_in_epoch - 1
         batch_start_time = time.time()
 
-        if emit_events:
-            emit_batch_start(
-                self.dispatcher,
-                state=self.state,
-                stage=Stage.TRAIN,
-                batch_idx=batch_idx,
-                total_batches=total_batches,
-                max_epochs=self.config.max_epochs,
-                max_steps=self.config.max_steps,
-            )
-
         batch_data = self._prepare_batch(batch_data)
         out, batch_data = self._forward_batch(self.model, batch_data)
 
@@ -981,23 +915,9 @@ class RunningAgent:
 
         losses = self.task.batch_loss(out, batch_data, self.loss_fn)
         loss_tensor, loss_count = self._extract_training_loss(losses)
-        if self._has_listener(EventName.ON_LOSS_COMPUTED.value):
-            emit_loss_computed(
-                self.dispatcher,
-                state=self.state,
-                stage=Stage.TRAIN,
-                batch_idx=batch_idx,
-                total_batches=total_batches,
-                batch_data=batch_data,
-                loss_tensor=loss_tensor,
-                model_output=out,
-                batch_replay_ref=None,
-                lr=self._get_current_lr(),
-                max_epochs=self.config.max_epochs,
-                max_steps=self.config.max_steps,
-            )
         did_optimizer_step = self._apply_train_step_impl(loss_tensor, loss_count, batch_metrics, total_batches)
         self._latest_train_loss = batch_metrics["loss"]
+        self.state.current_train_loss = self._latest_train_loss
 
         if not emit_events:
             return batch_metrics, did_optimizer_step
@@ -1019,64 +939,65 @@ class RunningAgent:
         is_update_tick = state.batch_idx_in_epoch % self.config.print_freq == 0
         is_update_tick = is_update_tick or state.batch_idx_in_epoch == total_batches
 
-        emit_batch_end(
-            self.dispatcher,
-            state=self.state,
-            stage=Stage.TRAIN,
-            batch_idx=batch_idx,
+        task_context = TaskTrainBoundaryContext(
+            epoch=self.state.epoch,
+            global_step=self.state.global_step,
+            batch_index=batch_idx,
             total_batches=total_batches,
-            batch_metrics=batch_metrics,
-            avg_bank=None,
+            did_optimizer_step=did_optimizer_step,
             lr=current_lr,
-            max_epochs=self.config.max_epochs,
-            max_steps=self.config.max_steps,
+            batch_metrics=freeze_scalar_metrics(batch_metrics),
         )
+        self.event_listeners.dispatch("train_boundary", task_context)
 
-        has_progress_tick = self._has_listener("on_progress_tick")
-        has_table_update = is_update_tick and self._has_listener("on_table_update")
+        self.observers.dispatch(
+            "train_boundary",
+            TrainBoundaryCommittedFact(
+                epoch=self.state.epoch,
+                global_step=self.state.global_step,
+                batch_index=batch_idx,
+                total_batches=total_batches,
+                did_optimizer_step=did_optimizer_step,
+                batch_metrics=freeze_scalar_metrics(batch_metrics),
+                lr=current_lr,
+            ),
+        )
+        has_progress_tick = self.observers.has("progress_tick")
+        has_table_update = is_update_tick and self.observers.has("table_update")
         progress_avg_metrics = None
         should_need_progress_avg = has_progress_tick or has_table_update
         if should_need_progress_avg:
             progress_avg_metrics = self.train_avg_bank.to_dict(self.config.distributed)
             if has_progress_tick:
-                emit_progress_tick(
-                    self.dispatcher,
-                    state=self.state,
-                    stage=Stage.TRAIN,
-                    batch_idx=batch_idx,
-                    total_batches=total_batches,
-                    batch_metrics=batch_metrics,
-                    avg_bank=progress_avg_metrics,
-                    lr=current_lr,
-                    max_epochs=self.config.max_epochs,
-                    max_steps=self.config.max_steps,
+                self.observers.dispatch(
+                    "progress_tick",
+                    ProgressTickFact(
+                        stage=Stage.TRAIN,
+                        epoch=self.state.epoch,
+                        global_step=self.state.global_step,
+                        batch_index=batch_idx,
+                        total_batches=total_batches,
+                        batch_metrics=freeze_scalar_metrics(batch_metrics),
+                        average_metrics=freeze_scalar_metrics(progress_avg_metrics),
+                        lr=current_lr,
+                    ),
                 )
             if has_table_update:
-                emit_table_update(
-                    self.dispatcher,
-                    state=self.state,
-                    stage=Stage.TRAIN,
-                    batch_idx=batch_idx,
-                    total_batches=total_batches,
-                    batch_metrics=batch_metrics,
-                    avg_bank=progress_avg_metrics,
-                    lr=current_lr,
-                    max_epochs=self.config.max_epochs,
-                    max_steps=self.config.max_steps,
+                self.observers.dispatch(
+                    "table_update",
+                    ProgressTickFact(
+                        stage=Stage.TRAIN,
+                        epoch=self.state.epoch,
+                        global_step=self.state.global_step,
+                        batch_index=batch_idx,
+                        total_batches=total_batches,
+                        batch_metrics=freeze_scalar_metrics(batch_metrics),
+                        average_metrics=freeze_scalar_metrics(progress_avg_metrics),
+                        lr=current_lr,
+                    ),
                 )
-
-        emit_train_batch_end(
-            self.dispatcher,
-            state=self.state,
-            stage=Stage.TRAIN,
-            batch_idx=batch_idx,
-            total_batches=total_batches,
-            batch_metrics=batch_metrics,
-            avg_bank=progress_avg_metrics,
-            lr=current_lr,
-            max_epochs=self.config.max_epochs,
-            max_steps=self.config.max_steps,
-        )
+        if self._should_reset_avg_after_warmup:
+            self._reset_avg_after_warmup()
 
         return batch_metrics, did_optimizer_step
 
@@ -1096,7 +1017,18 @@ class RunningAgent:
                 self.state.batch_idx_in_epoch = batch_idx + 1
                 _, did_optimizer_step = self._train_one_batch(batch_data, emit_events=True)
 
-                is_epoch_end = self.state.batch_idx_in_epoch >= total_batches
+                is_natural_epoch_end = self.state.batch_idx_in_epoch >= total_batches
+                end_epoch_requested = False
+                if did_optimizer_step and self.hooks.has_optimizer_step_end_hook:
+                    directive = self.hooks.dispatch_optimizer_step_end(
+                        OptimizerStepEndContext(
+                            epoch=self.state.epoch,
+                            global_step=self.state.global_step,
+                            is_natural_epoch_end=is_natural_epoch_end,
+                        )
+                    )
+                    end_epoch_requested = directive.end_epoch
+                is_epoch_end = is_natural_epoch_end or end_epoch_requested
                 if did_optimizer_step or is_epoch_end:
                     boundary_stop = self._finalize_training_boundary(
                         did_optimizer_step=did_optimizer_step,
@@ -1116,7 +1048,6 @@ class RunningAgent:
         self.logger.info(
             f"Starting training (mode={self.config.run_mode.value}, "
             f"eval_interval={self.config.eval_interval}, "
-            f"save_interval={self.config.save_interval}, "
             f"accum_grad={self.config.accum_grad}, "
             f"max_epochs={max_epochs_limit}, "
             f"max_steps={max_steps_limit})"

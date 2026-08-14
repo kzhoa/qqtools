@@ -2,12 +2,9 @@ import copy
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
+from typing import Any, Dict, Literal, NotRequired, Optional, TypedDict, Union
 
 import torch
-import torch.distributed as dist
-
-from qqtools.torch import qdist
 
 TerminalReason = Literal[
     "max_steps", "max_epochs", "early_stop", "user_interrupt", "oom", "exception",
@@ -19,8 +16,6 @@ __all__ = [
     "RunMode",
     "RunConfig",
     "RunningState",
-    "LoopSignal",
-    "StopReason",
     "FrozenRunningState",
     "TerminalReason",
     "EpochResultMetricSource",
@@ -62,8 +57,7 @@ class RunConfig:
     # main loop
     run_mode: RunMode = RunMode.EPOCH
     eval_interval: int = 1  # depending on run_mode, this is either epoch interval or step interval
-    save_interval: Optional[int] = None  # depending on run_mode, this is either epoch interval or step interval
-    completion: Dict[str, bool] = field(default_factory=lambda: {"eval": False, "save": False})
+    completion_eval: bool = False
 
     # boundary
     # When not specified, max_epochs should be unlimited by default so that
@@ -84,10 +78,6 @@ class RunConfig:
     print_freq: int = 10
     gc_freq: int = 1000  # Frequency of garbage collection and CUDA cache clearing
 
-    # recover
-    ckp_file: Optional[str] = None
-    init_file: Optional[str] = None
-
     device: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     # special features
@@ -96,12 +86,7 @@ class RunConfig:
     render_type: str = "auto"  # Options: "auto", "plain", "tqdm", "rich"; auto will fallback to rich->tqdm->plain
     ema_decay: float = 0.999
 
-    # early stop
-    checkpoint: Dict[str, Any] = field(default_factory=dict)
     ddp_eval_dedup: bool = True
-    early_stop: Dict[str, Any] = field(
-        default_factory=lambda: {"target": "val_metric", "patience": 10, "mode": "min", "min_delta": 0.0}
-    )
 
     def __post_init__(self):
         if isinstance(self.run_mode, str):
@@ -114,18 +99,8 @@ class RunConfig:
         # Validate eval_interval
         if not isinstance(self.eval_interval, int) or self.eval_interval < 1:
             raise ValueError("eval_interval must be a positive integer (>=1)")
-        if not isinstance(self.completion, dict):
-            raise ValueError("completion must be a mapping")
-        unexpected_completion_keys = set(self.completion) - {"eval", "save"}
-        if unexpected_completion_keys:
-            raise ValueError(
-                f"completion contains unsupported keys: {sorted(unexpected_completion_keys)}"
-            )
-        completion = {"eval": False, "save": False}
-        completion.update(self.completion)
-        if not all(isinstance(value, bool) for value in completion.values()):
-            raise ValueError("completion.eval and completion.save must be booleans")
-        object.__setattr__(self, "completion", completion)
+        if not isinstance(self.completion_eval, bool):
+            raise ValueError("completion_eval must be a boolean")
         if self.accum_grad is not None:
             if isinstance(self.accum_grad, bool) or not isinstance(self.accum_grad, int):
                 raise ValueError("accum_grad must be an integer when specified")
@@ -219,67 +194,6 @@ class RunningState:
         for key, value in state_dict.items():
             if hasattr(self, key):
                 setattr(self, key, value)
-
-
-@dataclass
-class StopReason:
-    """Structured record of a single stop-triggering event."""
-
-    source: str
-    message: str
-
-
-@dataclass
-class LoopSignal:
-    """Mutable signal box consumed by the loop after listeners finish."""
-
-    should_stop: bool = False
-    stop_reasons: List[StopReason] = field(default_factory=list)
-    nan_failure: bool = False
-    nan_failure_source_ranks: List[int] = field(default_factory=list)
-    pending_checkpoint_types: List[Literal["best", "regular"]] = field(default_factory=list)
-
-    def request_stop(self, source: str, message: str) -> None:
-        self.should_stop = True
-        self.stop_reasons.append(StopReason(source=source, message=message))
-
-    def request_checkpoint(self, checkpoint_type: Literal["best", "regular"]) -> None:
-        if checkpoint_type not in ("best", "regular"):
-            raise ValueError(f"Unsupported checkpoint type: {checkpoint_type}")
-        self.pending_checkpoint_types.append(checkpoint_type)
-
-    def synchronize_stop(self, device: torch.device, distributed: bool) -> None:
-        """Synchronize the stop signal across all DDP ranks."""
-        if not distributed:
-            return
-
-        # Local decision
-        local_flag = 1 if self.should_stop else 0
-        # Reduce MAX: if anyone wants to stop, everyone stops
-        reduced_flag = qdist.all_reduce(local_flag, device=device, reduceOp="max")
-
-        if reduced_flag > 0:
-            if not self.should_stop:
-                self.request_stop("ddp_sync", "Stopping triggered by another rank.")
-            self.should_stop = True
-
-    def synchronize_nan_failure(self, device: torch.device, distributed: bool) -> None:
-        """Synchronize NaN failure signals across all DDP ranks."""
-        local_nan_flag = 1 if self.nan_failure else 0
-
-        if not distributed:
-            if local_nan_flag > 0 and not self.nan_failure_source_ranks:
-                self.nan_failure_source_ranks = [0]
-            return
-
-        local_flag_tensor = torch.tensor([local_nan_flag], dtype=torch.int64, device=device)
-        gathered_flag_tensors = [torch.empty_like(local_flag_tensor) for _ in range(qdist.get_world_size())]
-        dist.all_gather(gathered_flag_tensors, local_flag_tensor)
-        source_ranks = [rank for rank, flag in enumerate(gathered_flag_tensors) if int(flag.item()) > 0]
-
-        if source_ranks:
-            self.nan_failure = True
-            self.nan_failure_source_ranks = source_ranks
 
 
 def _deep_freeze(value: Any) -> Any:

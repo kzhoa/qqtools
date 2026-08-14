@@ -1,11 +1,11 @@
 """Console formatting for structured qpipeline evaluation results."""
 
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import qqtools as qt
 
-from ..events import ValidationEndEventContext
+from ..contracts import EvaluationCommittedFact
+from .best_model import BestMetricSnapshot
 from .evaluation import EvaluationResult
 
 
@@ -74,17 +74,16 @@ class EvalFormatter:
         step: int,
         target_key: str,
         is_best: bool = False,
-        previous_best: Optional[Dict[str, Any]] = None,
-        best_model_tracker: Optional[Any] = None,
+        previous_best: Optional[Any] = None,
+        best: Optional[BestMetricSnapshot] = None,
         lr: Optional[float] = None,
         color_new_best: bool = True,
     ) -> Tuple[List[str], bool, List[str], bool]:
         """Render control state and raw loader measurements without flat metric keys."""
         target_val = evaluation.target_value(target_key)
-        tracker = best_model_tracker
-        best_metric = cls._to_scalar_if_possible(getattr(tracker, "best_metric", None))
-        best_epoch = getattr(tracker, "best_epoch", None)
-        best_step = getattr(tracker, "best_step", None)
+        best_metric = cls._to_scalar_if_possible(best.metric) if best is not None else None
+        best_epoch = best.epoch if best is not None else None
+        best_step = best.step if best is not None else None
         lines = [f"\n[Evaluation] Epoch: {epoch} | Step: {step} | LR: {cls._format_learning_rate(lr)}"]
         if target_val is None:
             lines.append(f"  Target: {target_key} not produced; best state unchanged")
@@ -96,7 +95,11 @@ class EvalFormatter:
                 f"@ epoch {best_epoch}, step {best_step}"
             )
         if is_best:
-            previous = previous_best.get("metric") if previous_best else None
+            previous = (
+                getattr(previous_best, "metric", None)
+                if previous_best is not None
+                else None
+            )
             delta = None
             if cls._is_numeric(target_val) and cls._is_numeric(previous):
                 delta = float(target_val) - float(previous)
@@ -134,8 +137,8 @@ class EvalFormatter:
         return lines, is_best and color_new_best, table_lines, False
 
 
-class EvalSummaryListener:
-    """Listener that logs formatted evaluation summary on validation end."""
+class EvalSummaryObserver:
+    """Observer that logs a committed evaluation summary."""
 
     def __init__(
         self,
@@ -147,21 +150,22 @@ class EvalSummaryListener:
         self.target_key = target_key
         self.color_new_best = color_new_best
 
-    def on_validation_end(self, context: ValidationEndEventContext) -> None:
-        state = context.runner.run_state
-        tracker = context.best_model_tracker or SimpleNamespace(
-            best_metric=getattr(state, "best_monitored_metric", None),
-            best_epoch=getattr(state, "best_epoch", None),
-            best_step=getattr(state, "best_step", None),
-        )
+    def on_evaluation_committed(self, context: "EvaluationCommittedFact") -> None:
+        best = context.previous_best
+        if context.is_best:
+            best = BestMetricSnapshot(
+                metric=context.evaluation.target_value(self.target_key),
+                epoch=context.epoch,
+                step=context.global_step,
+            )
         summary_lines, summary_has_markup, table_lines, table_has_markup = EvalFormatter.format_evaluation(
             evaluation=context.evaluation,
-            epoch=getattr(state, "epoch", 0),
-            step=getattr(state, "global_step", 0),
+            epoch=context.epoch,
+            step=context.global_step,
             target_key=self.target_key,
-            is_best=bool(context.is_best),
+            is_best=context.is_best,
             previous_best=context.previous_best,
-            best_model_tracker=tracker,
+            best=best,
             lr=context.lr,
             color_new_best=self.color_new_best,
         )

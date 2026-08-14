@@ -26,15 +26,17 @@ from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import TASK_LIFECYCLE_HOOKS, qTaskBase
 from ..types import Stage
 from .agent import NaNDetectedError, RunningAgent
-from .events import CommandName, EventName, ValidationEndEventContext
-from .runner_utils.ckp_manager import CheckpointCommandHandler, CheckpointManager, CheckpointSavedListener
+from .contracts import EventListenerBindings, ObserverBindings, TaskValidationContext
+from .hooks import RunnerHooks
+from .runner_utils.best_model import BestModelTracker
+from .runner_utils.ckp_manager import CheckpointManager, CheckpointPlugin, CheckpointPolicy
 from .runner_utils.common import _getattr_or_default, _is_periodic_trigger, move_batch_to_device
-from .runner_utils.earlystop import EarlyStopListener, EarlyStopper
+from .runner_utils.earlystop import EarlyStopController, EarlyStopper
 from .runner_utils.epoch_suffix import standardize_epoch_suffixes
 from .runner_utils.evaluation import EvaluationResult
-from .runner_utils.eval_formatter import EvalSummaryListener
+from .runner_utils.eval_formatter import EvalSummaryObserver
 from .runner_utils.progress import ProgressTracker
-from .runner_utils.metrics_jsonl import MetricsJsonlListener, MetricsJsonlLogger
+from .runner_utils.metrics_jsonl import MetricsJsonlLogger, MetricsJsonlObserver
 from .runner_utils.types import (
     RunConfig,
     RunMode,
@@ -44,7 +46,7 @@ from .runner_utils.types import (
     TrainRunnerResult,
 )
 
-__all__ = ["train_runner", "MetricsJsonlListener"]
+__all__ = ["train_runner", "MetricsJsonlObserver"]
 
 TerminalCause = Literal[
     "normal_finish", "early_stop", "user_interrupt", "exception", "nan_detected", "logger_failure",
@@ -234,91 +236,13 @@ def _prepare_training_session(
     config: RunConfig,
     save_dir: str,
     logger: qLogger,
-    metrics_logger: Optional[MetricsJsonlLogger],
-    checkpoint_manager: CheckpointManager,
-    agent: RunningAgent,
-    early_stopper: EarlyStopper,
-    eval_summary_listener: EvalSummaryListener,
-    early_stop_listener: EarlyStopListener,
-    checkpoint_command_handler: CheckpointCommandHandler,
-    checkpoint_saved_listener: CheckpointSavedListener,
-    effective_scheduler: Optional[qWarmupScheduler],
-    scheduler_target: str = "val_metric",
+    checkpoint_plugin: CheckpointPlugin,
     device: torch.device,
-    model: nn.Module,
-    task: qTaskBase,
-    optimizer: torch.optim.Optimizer,
-    ema_model: Optional[qEMA],
-    log_granularity: Optional[List[Literal["eval", "batch"]]],
+    progress_tracker: Optional[ProgressTracker],
 ) -> Tuple[Optional[ProgressTracker], Optional[profile]]:
-    progress_tracker: Optional[ProgressTracker] = None
     profiler: Optional[profile] = None
 
-    if config.ckp_file and Path(config.ckp_file).exists():
-        checkpoint_manager.load(
-            config.ckp_file,
-            device,
-            model,
-            task,
-            optimizer,
-            effective_scheduler,
-            ema_model,
-            agent.state,
-            early_stopper,
-            agent.best_model_tracker,
-        )
-        logger.info(f"Loaded checkpoint from {config.ckp_file}")
-
-    for hook_name in TASK_LIFECYCLE_HOOKS:
-        if task.has_implemented(hook_name):
-            agent.add_listener(hook_name, getattr(task, hook_name))
-
-    def _on_validation_end_step_scheduler(context: ValidationEndEventContext) -> None:
-        if effective_scheduler is None:
-            return
-
-        if effective_scheduler.step_on != SCHEDULER_STEP_ON_VALID_END:
-            return
-
-        metric = context.evaluation.target_value(scheduler_target)
-        if metric is None:
-            state = context.runner.run_state
-            logger.debug(
-                "Plateau scheduler skipped: target=%r default=skip_metric_step epoch=%s step=%s.",
-                scheduler_target,
-                state.epoch,
-                state.global_step,
-            )
-            return
-        effective_scheduler.step_main(metrics=metric)
-
-    agent.add_listener("on_validation_end", _on_validation_end_step_scheduler)
-    agent.add_listener("on_validation_end", eval_summary_listener.on_validation_end)
-    agent.add_listener("on_validation_end", early_stop_listener.on_validation_end)
-    agent.dispatcher.set_handler(CommandName.SAVE_CHECKPOINT, checkpoint_command_handler.handle)
-    agent.dispatcher._add_internal_listener(
-        EventName.ON_CHECKPOINT_SAVED,
-        checkpoint_saved_listener.on_checkpoint_saved,
-    )
-
-    progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type, rank=config.rank)
-    agent.add_listener("on_epoch_start_internal", progress_tracker.on_epoch_start)
-    agent.add_listener("on_progress_tick", progress_tracker.on_progress_tick)
-    agent.add_listener("on_table_update", progress_tracker.on_table_update)
-    agent.add_listener("on_epoch_end", progress_tracker.on_epoch_end)
-    agent.add_listener("on_eval_start", progress_tracker.on_eval_start)
-    agent.add_listener("on_eval_end", progress_tracker.on_eval_end)
-
-    if log_granularity and metrics_logger is not None:
-        metrics_listener = MetricsJsonlListener(
-            logger=metrics_logger,
-            run_config=config,
-            log_granularity=log_granularity,
-        )
-        if "eval" in log_granularity:
-            agent.add_listener("on_eval_end", metrics_listener.on_eval_end)
-        if "batch" in log_granularity:
-            agent.add_listener("on_train_batch_end", metrics_listener.on_train_batch_end)
+    checkpoint_plugin.restore_if_requested(device)
 
     if config.use_profiler:
         profiler = profile(
@@ -536,8 +460,8 @@ def train_runner(
     checkpoint_config: CheckpointConfig = _getattr_or_default(runner_config, "checkpoint", dict)
     early_stop_config: EarlyStopConfig = _getattr_or_default(runner_config, "early_stop", dict)
     completion_config = _getattr_or_default(runner_config, "completion", dict)
+    task_config = _getattr_or_default(args, "task", dict)
     ckp_file = _getattr_or_default(args, "ckp_file")
-    init_file = _getattr_or_default(args, "init_file")
     render_type = _getattr_or_default(args, "render_type", "auto")
 
     if checkpoint_config is None:
@@ -595,10 +519,34 @@ def train_runner(
         early_stop_config["mode"] = "min"
 
     # Create run configuration
+    completion_eval = _qconfig_get(completion_config, "eval", False)
+    completion_save = _qconfig_get(completion_config, "save", False)
+    if not isinstance(completion_eval, bool) or not isinstance(completion_save, bool):
+        raise ValueError("runner.completion.eval and runner.completion.save must be booleans")
+
+    checkpoint_target = _qconfig_get(checkpoint_config, "target", "val_metric")
+    checkpoint_mode = _qconfig_get(checkpoint_config, "mode", "min")
+    checkpoint_min_delta = _qconfig_get(checkpoint_config, "min_delta", 0.0)
+    checkpoint_keep_only_latest_regular = _qconfig_get(
+        checkpoint_config, "regular_latest_only", True
+    )
+    if not isinstance(checkpoint_keep_only_latest_regular, bool):
+        raise ValueError("runner.checkpoint.regular_latest_only must be a boolean")
+    checkpoint_policy = CheckpointPolicy(
+        save_interval=effective_save_interval,
+        restore_path=ckp_file,
+        completion_save=completion_save,
+        keep_only_latest_regular=checkpoint_keep_only_latest_regular,
+    )
+    node_aligned_output_keys = tuple(_qconfig_get(task_config, "node_aligned_output_keys", ()) or ())
+    ddp_eval_dedup = _qconfig_get(runner_config, "ddp_eval_dedup", True)
+    if not isinstance(ddp_eval_dedup, bool):
+        raise ValueError("runner.ddp_eval_dedup must be a boolean")
+
     config = RunConfig(
         run_mode=resolved_run_mode,
         eval_interval=effective_eval_interval,
-        save_interval=effective_save_interval,
+        completion_eval=completion_eval,
         max_epochs=effective_max_epochs,
         max_steps=effective_max_steps,
         clip_grad=clip_grad,
@@ -610,23 +558,15 @@ def train_runner(
         use_profiler=use_profiler,
         use_ema=ema_model is not None,
         render_type=render_type,
-        ckp_file=ckp_file,
-        init_file=init_file,
         device=device,
-        checkpoint=checkpoint_config,
-        early_stop=early_stop_config,
-        completion={
-            "eval": _qconfig_get(completion_config, "eval", False),
-            "save": _qconfig_get(completion_config, "save", False),
-        },
-        ddp_eval_dedup=bool(_getattr_or_default(runner_config, "ddp_eval_dedup", True)),
+        ddp_eval_dedup=ddp_eval_dedup,
     )
     scheduler_target = _qconfig_get(
         _qconfig_get(getattr(args, "optim", None), "scheduler_params", None), "target", "val_metric"
     ) or "val_metric"
     targets = (
-        config.checkpoint.get("target", "val_metric"),
-        config.early_stop.get("target", "val_metric"),
+        checkpoint_target,
+        _qconfig_get(early_stop_config, "target", "val_metric"),
         scheduler_target,
     )
     for target in targets:
@@ -675,9 +615,78 @@ def train_runner(
     checkpoint_manager = CheckpointManager(
         config.save_dir,
         config.rank if config.distributed else 0,
-        keep_only_latest_regular=_qconfig_get(config.checkpoint, "regular_latest_only", True),
+        keep_only_latest_regular=checkpoint_policy.keep_only_latest_regular,
     )
-    early_stopper = EarlyStopper.from_config(config.early_stop)
+    early_stopper = EarlyStopper.from_config(early_stop_config)
+
+    hooks = RunnerHooks()
+    event_listeners = EventListenerBindings()
+    observers = ObserverBindings(logger=logger)
+    best_model_tracker = BestModelTracker(
+        target=checkpoint_target,
+        mode=checkpoint_mode,
+        min_delta=checkpoint_min_delta,
+    )
+
+    for hook_name, binding_name in (
+        ("on_epoch_start", "epoch_start"),
+        ("on_train_batch_end", "train_boundary"),
+        ("on_validation_end", "validation"),
+        ("on_epoch_end", "epoch_end"),
+    ):
+        if task.has_implemented(hook_name):
+            event_listeners.bind(binding_name, getattr(task, hook_name))
+
+    if task.has_implemented("on_early_stop"):
+        observers.bind("early_stop", task.on_early_stop, policy="settled_fatal")
+
+    progress_tracker = ProgressTracker(
+        logger, config.print_freq, render_type=config.render_type, rank=config.rank
+    )
+    observers.bind("epoch_started", progress_tracker.on_epoch_start)
+    observers.bind("progress_tick", progress_tracker.on_progress_tick)
+    observers.bind("table_update", progress_tracker.on_table_update)
+    observers.bind("epoch_committed", progress_tracker.on_epoch_end)
+    observers.bind("evaluation_started", progress_tracker.on_eval_start)
+    observers.bind("evaluation_committed", progress_tracker.on_eval_end)
+
+    eval_summary_observer = EvalSummaryObserver(
+        logger=logger,
+        target_key=checkpoint_target,
+    )
+    observers.bind("evaluation_committed", eval_summary_observer.on_evaluation_committed)
+    if log_granularity and metrics_logger is not None:
+        metrics_observer = MetricsJsonlObserver(
+            logger=metrics_logger,
+            run_config=config,
+            log_granularity=log_granularity,
+        )
+        if "eval" in log_granularity:
+            observers.bind("evaluation_committed", metrics_observer.on_evaluation_committed)
+        if "batch" in log_granularity:
+            observers.bind("train_boundary", metrics_observer.on_train_boundary)
+
+    def _step_validation_scheduler(context: TaskValidationContext) -> None:
+        if effective_scheduler is None or effective_scheduler.step_on != SCHEDULER_STEP_ON_VALID_END:
+            return
+        metric = context.evaluation.target_value(scheduler_target)
+        if metric is None:
+            logger.debug(
+                "Plateau scheduler skipped: target=%r default=skip_metric_step epoch=%s step=%s.",
+                scheduler_target,
+                context.epoch,
+                context.global_step,
+            )
+            return
+        effective_scheduler.step_main(metrics=metric)
+
+    early_stop_controller = EarlyStopController(
+        early_stopper=early_stopper,
+        target=_qconfig_get(early_stop_config, "target", "val_metric"),
+        logger=logger,
+    )
+    event_listeners.freeze()
+    observers.freeze()
 
     # Create training agent
     agent = RunningAgent(
@@ -691,34 +700,32 @@ def train_runner(
         ema_model=ema_model,
         auto_offload=auto_offload,
         logger=logger,
+        best_model_tracker=best_model_tracker,
+        hooks=hooks,
+        event_listeners=event_listeners,
+        observers=observers,
+        early_stop_controller=early_stop_controller,
+        validation_scheduler_step=_step_validation_scheduler,
+        node_aligned_output_keys=node_aligned_output_keys,
     )
 
-    checkpoint_command_handler = CheckpointCommandHandler(
+    checkpoint_plugin = CheckpointPlugin(
         checkpoint_manager=checkpoint_manager,
         model=model,
         task=task,
+        state=agent.state,
+        policy=checkpoint_policy,
         optimizer=optimizer,
         scheduler=effective_scheduler,
         ema_model=ema_model,
         early_stopper=early_stopper,
         best_model_tracker=agent.best_model_tracker,
-    )
-    checkpoint_saved_listener = CheckpointSavedListener(
-        rank=config.rank if config.distributed else 0,
         logger=logger,
         event_logger=metrics_logger,
     )
-    early_stop_listener = EarlyStopListener(
-        early_stopper=early_stopper,
-        target=config.early_stop.get("target", "val_metric"),
-        logger=logger,
-    )
-    eval_summary_listener = EvalSummaryListener(
-        logger=logger,
-        target_key=_qconfig_get(config.checkpoint, "target", "val_metric"),
-    )
-
-    progress_tracker = None
+    checkpoint_plugin.register(hooks)
+    hooks.freeze()
+    hooks.validate_distributed_plan(config.distributed)
     profiler = None
     terminal_event: Optional[TerminalEvent] = None
     terminal_cause: Optional[TerminalCause] = None
@@ -730,22 +737,9 @@ def train_runner(
             config=config,
             save_dir=save_dir,
             logger=logger,
-            metrics_logger=metrics_logger,
-            checkpoint_manager=checkpoint_manager,
-            agent=agent,
-            early_stopper=early_stopper,
-            eval_summary_listener=eval_summary_listener,
-            early_stop_listener=early_stop_listener,
-            checkpoint_command_handler=checkpoint_command_handler,
-            checkpoint_saved_listener=checkpoint_saved_listener,
-            effective_scheduler=effective_scheduler,
-            scheduler_target=scheduler_target,
+            checkpoint_plugin=checkpoint_plugin,
             device=device,
-            model=model,
-            task=task,
-            optimizer=optimizer,
-            ema_model=ema_model,
-            log_granularity=log_granularity,
+            progress_tracker=progress_tracker,
         )
         agent_stop = agent.run()
         terminal_cause = "early_stop" if agent_stop == "early_stop" else "normal_finish"

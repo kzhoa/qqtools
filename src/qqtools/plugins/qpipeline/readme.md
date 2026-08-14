@@ -349,11 +349,11 @@ task 为了适应不同的模型，
 - 必须声明在 `qTaskBase`
 - 必须列在 `OPTIONAL_METHODS`
 - 必须使用固定 typed context 签名：
-  - `on_epoch_start(self, context: BaseEventContext) -> None`
-  - `on_epoch_end(self, context: BaseEventContext) -> None`
-  - `on_train_batch_end(self, context: ProgressEventContext) -> None`
-  - `on_validation_end(self, context: ValidationEndEventContext) -> None`
-  - `on_early_stop(self, context: BaseEventContext) -> None`
+  - `on_epoch_start(self, context: TaskEpochStartContext) -> None`
+  - `on_train_batch_end(self, context: TaskTrainBoundaryContext) -> None`
+  - `on_validation_end(self, context: TaskValidationContext) -> None`
+  - `on_epoch_end(self, context: TaskEpochEndContext) -> None`
+  - `on_early_stop(self, context: StopCommittedFact) -> None`
 
 目前支持的 task 生命周期 hook:
 
@@ -363,20 +363,23 @@ task 为了适应不同的模型，
 - `on_validation_end`
 - `on_early_stop`
 
-这些 hook 会由 runner 自动桥接到内部 listener 事件系统。
+这些 hook 会在 runner 的对应生命周期边界同步调用。
 未列入 `qTaskBase` / `OPTIONAL_METHODS` 的生命周期方法，不属于官方支持面。
 
 context 读取约定：
 
-- 宏观运行信息统一走 `context.runner.*`
-- `context.runner.run_state` 默认直接暴露当前 `RunningState`
-- `batch_idx` / `total_batches` 只在 batch/progress 相关事件上可用
-- `signal` 是 listener 回写主流程的唯一通道，但具体事件是否允许回写、允许回写哪些状态，
-  由该事件的契约决定
-- `signal` 不是普遍可用字段；仅 `on_validation_end` / `on_early_stop` 等控制型事件保证存在
-- checkpoint 保存通过内部 `SAVE_CHECKPOINT` command 执行；其结果不会写回 `signal`
-- `run_state` 与其它 payload 一样都不做机制上的只读防护；如果用户确实要修改，本框架保留这种自由度，但默认语义仍建议将其视为事件输入数据
-- `on_epoch_start` 的 public context 不承诺 `total_batches`
+- context 是冻结的 typed snapshot，只提供该 hook 声明的字段；不暴露 `runner`、
+  `RunningState` 或通用 `signal`。
+- `on_epoch_start` 接收 `epoch`、`global_step`、`total_batches`。
+- `on_train_batch_end` 接收 `epoch`、`global_step`、`batch_index`、`total_batches`、
+  `did_optimizer_step`、`lr` 和只读的 `batch_metrics`。
+- `on_validation_end` 接收 `epoch`、`global_step`、`evaluation`、`is_best`、
+  `previous_best` 和 `lr`。
+- `on_epoch_end` 接收 `completed_epoch`、`global_step` 和只读的 `epoch_metrics`。
+- `on_early_stop` 在停止决定已提交后接收 `source`、`message`、`epoch` 和 `global_step`。
+- task 生命周期 hook 只能观察这些上下文或执行 task 自身的边界操作，不能回写主循环、
+  请求 checkpoint 或注册动态事件。checkpoint 及其他 runner 扩展能力必须在 runner
+  组合期通过对应的显式 hook contract 配置。
 
 # qstd Args
 
@@ -393,31 +396,14 @@ context 读取约定：
 
 # RunAgent 与 logger类
 
-logger类本质上是实现了一系列监听接口，注册在 run agent 的生命周期钩子里。
+runner 扩展分为三个不能混用的契约：任务生命周期 listener 在未提交边界内反应但不能控制训练；observer
+只消费已提交事实；`RunnerHooks` 是 runner 组装阶段冻结的单槽生命周期能力。运行期间不能注册、删除或替换
+这些扩展点。
 
-其中需要区分：
-
-- 公共生命周期 hook: 面向 task / 外部 listener 的稳定接口
-- 内部 listener hook: 面向 runner 内建组件的内部事件，不属于 task 官方支持面
-
-- on_batch_end
-- on_train_batch_end
-- on_epoch_start_internal
-- on_epoch_end
-
-此外还有：
-
-- on_eval_start
-- on_eval_end
-- on_validation_end
-- on_early_stop
-
-checkpoint 保存不是公共 listener。runner 在组装时为内部 `SAVE_CHECKPOINT` command 注册唯一
-`CheckpointCommandHandler`；该 handler 直接返回同步后的路径。保存成功后，runner 通过受控的内部
-`ON_CHECKPOINT_SAVED` notification 调用 owner-only 的 `CheckpointSavedListener`，仅写入日志和 JSONL。
-该 listener 是已提交事实的 observer，不代表其他 lifecycle listener；后者可按各自事件契约介入训练流程。
-checkpoint command 和 saved notification 均不支持 task 或外部 listener 注册；需要替换持久化实现时，应在
-checkpoint manager/storage 边界扩展。
+checkpoint 是标准 `CheckpointPlugin`，在组合时占用 `after_validation`、`boundary_cursor` 与
+`after_epoch_commit` 三个 hook。插件自行调用 `CheckpointManager`、写入 `best_ckp_file` 并投影 checkpoint
+日志/JSONL；`RunningAgent` 不接收 checkpoint 路径，也没有 command handler 或 checkpoint-saved notification。
+DDP 运行会在训练开始前验证所有 rank 的冻结 hook 计划一致。
 
 
 
