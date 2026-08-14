@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- feat: add `runner.completion.eval` and `runner.completion.save` so successful qpipeline
+  terminal boundaries can run a final normal evaluation and/or persist one complete regular
+  checkpoint when periodic intervals did not select that work.
 - breaking: require `CheckpointListener` to receive a `CheckpointManager`; a missing manager now
   fails at construction instead of silently discarding checkpoint requests.
 - fix: finalize every completed qpipeline training boundary in one ordered path, committing a

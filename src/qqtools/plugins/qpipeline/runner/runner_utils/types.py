@@ -63,6 +63,7 @@ class RunConfig:
     run_mode: RunMode = RunMode.EPOCH
     eval_interval: int = 1  # depending on run_mode, this is either epoch interval or step interval
     save_interval: Optional[int] = None  # depending on run_mode, this is either epoch interval or step interval
+    completion: Dict[str, bool] = field(default_factory=lambda: {"eval": False, "save": False})
 
     # boundary
     # When not specified, max_epochs should be unlimited by default so that
@@ -113,6 +114,18 @@ class RunConfig:
         # Validate eval_interval
         if not isinstance(self.eval_interval, int) or self.eval_interval < 1:
             raise ValueError("eval_interval must be a positive integer (>=1)")
+        if not isinstance(self.completion, dict):
+            raise ValueError("completion must be a mapping")
+        unexpected_completion_keys = set(self.completion) - {"eval", "save"}
+        if unexpected_completion_keys:
+            raise ValueError(
+                f"completion contains unsupported keys: {sorted(unexpected_completion_keys)}"
+            )
+        completion = {"eval": False, "save": False}
+        completion.update(self.completion)
+        if not all(isinstance(value, bool) for value in completion.values()):
+            raise ValueError("completion.eval and completion.save must be booleans")
+        object.__setattr__(self, "completion", completion)
         if self.accum_grad is not None:
             if isinstance(self.accum_grad, bool) or not isinstance(self.accum_grad, int):
                 raise ValueError("accum_grad must be an integer when specified")

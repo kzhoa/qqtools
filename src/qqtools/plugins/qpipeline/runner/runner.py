@@ -530,6 +530,7 @@ def train_runner(
 
     checkpoint_config: CheckpointConfig = _getattr_or_default(runner_config, "checkpoint", dict)
     early_stop_config: EarlyStopConfig = _getattr_or_default(runner_config, "early_stop", dict)
+    completion_config = _getattr_or_default(runner_config, "completion", dict)
     ckp_file = _getattr_or_default(args, "ckp_file")
     init_file = _getattr_or_default(args, "init_file")
     render_type = _getattr_or_default(args, "render_type", "auto")
@@ -538,6 +539,8 @@ def train_runner(
         checkpoint_config = {}
     if early_stop_config is None:
         early_stop_config = {}
+    if completion_config is None:
+        completion_config = {}
 
     eval_interval, save_interval, epoch_suffix_logs = standardize_epoch_suffixes(
         args=args,
@@ -607,6 +610,10 @@ def train_runner(
         device=device,
         checkpoint=checkpoint_config,
         early_stop=early_stop_config,
+        completion={
+            "eval": _qconfig_get(completion_config, "eval", False),
+            "save": _qconfig_get(completion_config, "save", False),
+        },
         ddp_eval_dedup=bool(_getattr_or_default(runner_config, "ddp_eval_dedup", True)),
     )
     scheduler_target = _qconfig_get(

@@ -685,11 +685,54 @@ class RunningAgent:
             is_epoch_end if self.config.run_mode == RunMode.EPOCH else did_optimizer_step
         )
         periodic_signal = LoopSignal()
-        periodic_early_stop = False
+        nan_signal = LoopSignal()
 
+        periodic_eval = False
+        periodic_save = False
         if periodic_boundary:
             periodic_eval = self._check_run_period(self.config.eval_interval, is_epoch_end)
             periodic_save = self._check_run_period(self.config.save_interval, is_epoch_end)
+
+        reached_max_steps = (
+            self.config.max_steps is not None and self.state.global_step >= self.config.max_steps
+        )
+        reaches_max_epochs = (
+            is_epoch_end
+            and self.config.max_epochs is not None
+            and self.state.epoch + 1 >= self.config.max_epochs
+        )
+        hard_limit_reached = reached_max_steps or reaches_max_epochs
+
+        completion_eval_requested = (
+            hard_limit_reached and self.config.completion.get("eval", False) and not periodic_eval
+        )
+        completion_save_requested = hard_limit_reached and self.config.completion.get("save", False)
+        has_selected_action = (
+            periodic_eval
+            or periodic_save
+            or completion_eval_requested
+            or completion_save_requested
+        )
+
+        if has_selected_action:
+            nan_signal.nan_failure = (
+                self._latest_train_loss is not None and math.isnan(self._latest_train_loss)
+            )
+            nan_signal.synchronize_nan_failure(self.device, self.config.distributed)
+        if nan_signal.nan_failure:
+            action_names = []
+            if periodic_eval or completion_eval_requested:
+                action_names.append("evaluation")
+            if periodic_save or completion_save_requested:
+                action_names.append("regular checkpoint")
+            boundary_text = " and ".join(action_names) or "completion boundary"
+            self.logger.error(
+                f"NaN detected before {boundary_text} on ranks={nan_signal.nan_failure_source_ranks} "
+                f"at epoch={self.state.epoch}, step={self.state.global_step}."
+            )
+            raise NaNDetectedError("NaN detected before periodic evaluation/checkpoint boundary.")
+
+        if periodic_boundary:
             if is_epoch_end:
                 self.state.mark_epoch_end_eval_trigger(eval_triggered=periodic_eval)
             if periodic_eval:
@@ -697,30 +740,55 @@ class RunningAgent:
                     f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
                     f"\n eval_interval={self.config.eval_interval} save_interval={self.config.save_interval}"
                 )
-            if periodic_eval or periodic_save:
-                periodic_signal.nan_failure = (
-                    self._latest_train_loss is not None and math.isnan(self._latest_train_loss)
-                )
-                periodic_signal.synchronize_nan_failure(self.device, self.config.distributed)
-            if periodic_signal.nan_failure:
-                parts = (periodic_eval * ["evaluation"]) + (periodic_save * ["regular checkpoint"])
-                boundary_text = " and ".join(parts) or "periodic boundary"
-                self.logger.error(
-                    f"NaN detected before {boundary_text} on ranks={periodic_signal.nan_failure_source_ranks} "
-                    f"at epoch={self.state.epoch}, step={self.state.global_step}."
-                )
-                raise NaNDetectedError("NaN detected before periodic evaluation/checkpoint boundary.")
-
             self._execute_boundary_actions(
                 signal=periodic_signal,
                 evaluate=periodic_eval,
-                save_regular=periodic_save,
+                save_regular=False,
             )
             periodic_signal.synchronize_stop(self.device, self.config.distributed)
-            periodic_early_stop = periodic_signal.should_stop
+
+        periodic_early_stop = periodic_signal.should_stop
+        terminal_candidate = hard_limit_reached or periodic_early_stop
+        completion_signal = LoopSignal()
+        completion_eval_requested = (
+            terminal_candidate
+            and self.config.completion.get("eval", False)
+            and not periodic_eval
+        )
+        completion_save_requested = terminal_candidate and self.config.completion.get("save", False)
+        defer_regular_save = is_epoch_end and terminal_candidate and completion_save_requested
+        save_after_epoch_commit = (
+            (periodic_save or completion_save_requested) and defer_regular_save
+        )
+        save_at_current_cursor = (
+            (periodic_save or completion_save_requested) and not save_after_epoch_commit
+        )
+
+        if completion_eval_requested:
+            if is_epoch_end:
+                self.state.mark_epoch_end_eval_trigger(eval_triggered=True)
+            self._execute_boundary_actions(
+                signal=completion_signal,
+                evaluate=True,
+                save_regular=False,
+            )
+
+        if save_at_current_cursor:
+            self._execute_boundary_actions(
+                signal=completion_signal,
+                evaluate=False,
+                save_regular=True,
+            )
 
         if is_epoch_end:
             self._handle_epoch_end()
+
+        if save_after_epoch_commit:
+            self._execute_boundary_actions(
+                signal=completion_signal,
+                evaluate=False,
+                save_regular=True,
+            )
 
         if self._reached_run_limits():
             return "run_limit"
