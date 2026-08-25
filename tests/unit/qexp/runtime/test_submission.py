@@ -14,6 +14,11 @@ def test_bulk_submission_has_one_operation_and_no_batch_identity(tmp_path: Path)
     tasks = batch_submit(cfg, manifest, group="exp")
     assert len(tasks) == 2
     assert all(task.group_name == "exp" for task in tasks)
+    assert tasks.operation_id
+    assert tasks.idempotency_key
+    assert tasks.target_group == "exp"
+    assert tasks.state == "committed"
+    assert tasks.to_dict()["task_ids"] == [task.task_id for task in tasks]
     assert not list((cfg.shared_root / "groups").glob("*.batch.json"))
 
 

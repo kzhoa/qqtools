@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- breaking: make finite structured qexp command results human-readable by default; machine
+  consumers must now request `--format=json`, and the legacy `--format=text` value is rejected.
+- fix: recover a qexp launch authorization interrupted between Task and Attempt writes with the
+  original Attempt and fencing token; launch generations and local intent evidence prevent stale
+  or cancelled starts from spawning training processes.
+- docs: archive the completed qexp command-output-format pitch.
+
 ## v1.3.6
 
 - breaking: replace qpipeline's public mutable runner-events API with frozen typed extension

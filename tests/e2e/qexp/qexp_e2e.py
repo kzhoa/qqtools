@@ -65,7 +65,7 @@ def run(
 
 
 def jrun(args: list[str], *, env: dict[str, str]) -> object:
-    result = run(args, env=env)
+    result = run([*args, "--format=json"], env=env)
     text = result.stdout.strip()
     return json.loads(text) if text else None
 

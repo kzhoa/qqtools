@@ -168,7 +168,7 @@ def test_failed_availability_operation_does_not_make_doctor_unhealthy(tmp_path: 
     assert verify_integrity(cfg)["healthy"] is True
 
 
-def test_cli_availability_json_and_text_outputs(tmp_path: Path, monkeypatch, capsys):
+def test_cli_availability_json_and_human_outputs(tmp_path: Path, monkeypatch, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"], group="exp")
     monkeypatch.setattr(
@@ -176,7 +176,7 @@ def test_cli_availability_json_and_text_outputs(tmp_path: Path, monkeypatch, cap
         lambda cfg, *, reason: True,
     )
 
-    assert main([*_base_args(cfg), "task", "share", task.task_id, "--format", "json"]) == 0
+    assert main([*_base_args(cfg), "task", "share", task.task_id, "--format=json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["action"] == "share_now"
     assert payload["task_id"] == task.task_id

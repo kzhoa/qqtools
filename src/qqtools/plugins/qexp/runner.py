@@ -1,4 +1,5 @@
 """Passive local process wrapper for one already-authorized Attempt."""
+
 from __future__ import annotations
 
 import argparse
@@ -15,7 +16,7 @@ from .runtime.paths import local_paths
 from .runtime.records import AttemptRecord, utc_now
 from .runtime.store import atomic_replace, create_if_absent, read_json
 from .runtime.tasks import load_task
-from .scheduler import _process_start_time_ticks
+from .scheduler import _process_start_time_ticks, authority_locks
 
 LOCAL_PROCESS_PROTOCOL_VERSION = 1
 
@@ -45,19 +46,25 @@ def _publish_launch_intent(cfg: RootConfig, attempt: AttemptRecord, task: object
     path = launch_intent_path(cfg, attempt.attempt_id)
     if path.exists():
         raise RuntimeError(f"launch intent already exists for {attempt.attempt_id!r}.")
-    create_if_absent(path, {"launch_intent": {
-        "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
-        "attempt_id": attempt.attempt_id,
-        "task_id": attempt.task_id,
-        "fencing_token": attempt.current_fencing_token,
-        "wrapper_pid": os.getpid(),
-        "wrapper_start_time_ticks": _process_start_time_ticks(os.getpid()),
-        "gpu_ids": attempt.assigned_gpus,
-        "command": task.spec.command,
-        "working_directory": task.spec.working_directory,
-        "lease_expires_at": (task.claim_control.get("active_claim") or {}).get("lease_expires_at"),
-        "created_at": utc_now(),
-    }})
+    create_if_absent(
+        path,
+        {
+            "launch_intent": {
+                "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
+                "attempt_id": attempt.attempt_id,
+                "task_id": attempt.task_id,
+                "fencing_token": attempt.current_fencing_token,
+                "launch_id": attempt.authorization.get("launch_id"),
+                "wrapper_pid": os.getpid(),
+                "wrapper_start_time_ticks": _process_start_time_ticks(os.getpid()),
+                "gpu_ids": attempt.assigned_gpus,
+                "command": task.spec.command,
+                "working_directory": task.spec.working_directory,
+                "lease_expires_at": (task.claim_control.get("active_claim") or {}).get("lease_expires_at"),
+                "created_at": utc_now(),
+            }
+        },
+    )
     return path
 
 
@@ -100,54 +107,99 @@ def _publish_registration(cfg: RootConfig, attempt: AttemptRecord, task: object,
     if path.exists():
         raise RuntimeError(f"process registration already exists for {attempt.attempt_id!r}.")
     claim = task.claim_control.get("active_claim") or {}
-    create_if_absent(path, {"process_registration": {
-        "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
-        "attempt_id": attempt.attempt_id,
-        "task_id": attempt.task_id,
-        "fencing_token": attempt.current_fencing_token,
-        "machine_name": cfg.machine_name,
-        "authority_mode": attempt.authority_mode,
-        "clock_error_bound_seconds": claim.get("clock_error_bound_seconds"),
-        "wrapper_pid": os.getpid(),
-        "wrapper_start_time_ticks": _process_start_time_ticks(os.getpid()),
-        "process_group_id": child.pid,
-        "process_group_start_time_ticks": _process_start_time_ticks(child.pid),
-        "gpu_ids": attempt.assigned_gpus,
-        "command": task.spec.command,
-        "working_directory": task.spec.working_directory,
-        "lease_expires_at": claim.get("lease_expires_at"),
-        "created_at": utc_now(),
-    }})
+    created_at = utc_now()
+    create_if_absent(
+        path,
+        {
+            "process_registration": {
+                "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
+                "attempt_id": attempt.attempt_id,
+                "task_id": attempt.task_id,
+                "fencing_token": attempt.current_fencing_token,
+                "machine_name": cfg.machine_name,
+                "authority_mode": attempt.authority_mode,
+                "clock_error_bound_seconds": claim.get("clock_error_bound_seconds"),
+                "wrapper_pid": os.getpid(),
+                "wrapper_start_time_ticks": _process_start_time_ticks(os.getpid()),
+                "process_group_id": child.pid,
+                "process_group_start_time_ticks": _process_start_time_ticks(child.pid),
+                "gpu_ids": attempt.assigned_gpus,
+                "command": task.spec.command,
+                "working_directory": task.spec.working_directory,
+                "lease_expires_at": claim.get("lease_expires_at"),
+                "process_created_at": created_at,
+                "created_at": created_at,
+            }
+        },
+    )
     return path
 
 
 def _publish_exit_observation(cfg: RootConfig, attempt_id: str, return_code: int) -> None:
-    atomic_replace(observation_path(cfg, attempt_id), {"exit_observation": {
-        "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
-        "attempt_id": attempt_id,
-        "observed_exit_code": return_code,
-        "observed_at": utc_now(),
-    }})
+    atomic_replace(
+        observation_path(cfg, attempt_id),
+        {
+            "exit_observation": {
+                "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
+                "attempt_id": attempt_id,
+                "observed_exit_code": return_code,
+                "observed_at": utc_now(),
+            }
+        },
+    )
 
 
-def run_attempt(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int,
-                popen_factory=subprocess.Popen, poll_interval: float = 0.5) -> int:
+def run_attempt(
+    cfg: RootConfig,
+    task_id: str,
+    attempt_id: str,
+    fencing_token: int,
+    launch_id: str,
+    popen_factory=subprocess.Popen,
+    poll_interval: float = 0.5,
+) -> int:
     """Start and observe a process without participating in execution authority."""
     del poll_interval
     task = load_task(cfg, task_id)
-    attempt = _load_attempt(cfg, task_id, attempt_id)
-    if attempt.current_fencing_token != fencing_token:
-        raise RuntimeError("stale fencing token cannot launch Attempt.")
+    with authority_locks(cfg, task):
+        task = load_task(cfg, task_id)
+        attempt = _load_attempt(cfg, task_id, attempt_id)
+        claim = task.claim_control.get("active_claim") or {}
+        if (
+            attempt.current_fencing_token != fencing_token
+            or attempt.phase != "starting"
+            or attempt.authorization.get("launch_id") != launch_id
+            or claim.get("attempt_id") != attempt_id
+            or claim.get("fencing_token") != fencing_token
+            or claim.get("launch_id") != launch_id
+            or claim.get("machine_name") != cfg.machine_name
+            or claim.get("launch_state") != "starting"
+        ):
+            raise RuntimeError("Attempt is not authorized to launch.")
+        _publish_launch_intent(cfg, attempt, task)
     environment = os.environ.copy()
     if attempt.assigned_gpus:
         environment["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, attempt.assigned_gpus))
     log_path = shared_attempt_log_path(cfg, task_id, attempt_id)
-    _publish_launch_intent(cfg, attempt, task)
     with log_path.open("ab") as log:
-        guardian_command = [sys.executable, "-m", "qqtools.plugins.qexp.runner", "--guardian",
-                            "--parent-pid", str(os.getpid()), "--", *task.spec.command]
-        child = popen_factory(guardian_command, cwd=task.spec.working_directory, env=environment,
-                              stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        guardian_command = [
+            sys.executable,
+            "-m",
+            "qqtools.plugins.qexp.runner",
+            "--guardian",
+            "--parent-pid",
+            str(os.getpid()),
+            "--",
+            *task.spec.command,
+        ]
+        child = popen_factory(
+            guardian_command,
+            cwd=task.spec.working_directory,
+            env=environment,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         _publish_registration(cfg, attempt, task, child)
         return_code = child.wait()
     _publish_exit_observation(cfg, attempt_id, return_code)
@@ -175,10 +227,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--fencing-token", required=True, type=int)
+    parser.add_argument("--launch-id", required=True)
     parser.add_argument("--runtime-root")
     args = parser.parse_args(argv)
     cfg = load_root_config(args.shared_root, args.machine, args.runtime_root, require_initialized=True)
-    return run_attempt(cfg, args.task_id, args.attempt_id, args.fencing_token)
+    return run_attempt(cfg, args.task_id, args.attempt_id, args.fencing_token, args.launch_id)
 
 
 if __name__ == "__main__":

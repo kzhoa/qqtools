@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .locks import group_lock, schema_lock
 from .paths import group_path, idempotency_path, shared_paths, submission_path, task_path
@@ -26,6 +26,42 @@ from ..lease import clock_capability, new_timed_offer_proof, persist_clock_obser
 
 class IdempotencyConflict(ValueError):
     pass
+
+
+class SubmissionResult(list[TaskRecord]):
+    def __init__(
+        self,
+        tasks: Iterable[TaskRecord],
+        *,
+        operation_id: str,
+        idempotency_key: str,
+        target_group: str | None,
+        state: str,
+    ) -> None:
+        super().__init__(tasks)
+        self.operation_id = operation_id
+        self.idempotency_key = idempotency_key
+        self.target_group = target_group
+        self.state = state
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "operation_id": self.operation_id,
+            "idempotency_key": self.idempotency_key,
+            "target_group": self.target_group,
+            "task_ids": [task.task_id for task in self],
+            "state": self.state,
+        }
+
+
+def _submission_result(tasks: Iterable[TaskRecord], submission: dict[str, Any]) -> SubmissionResult:
+    return SubmissionResult(
+        tasks,
+        operation_id=submission["operation_id"],
+        idempotency_key=submission["idempotency_key"],
+        target_group=submission["target_group"],
+        state=submission["state"],
+    )
 
 
 def semantic_digest(request: dict[str, Any]) -> str:
@@ -199,7 +235,7 @@ def submit_specs(
     kind: str = "single",
     worker_set: list[str] | None = None,
     on_prepared: Callable[[str, str], None] | None = None,
-) -> list[TaskRecord]:
+) -> SubmissionResult:
     if not specs:
         raise ValueError("submission must contain at least one task.")
     worker_additions = _worker_additions(worker_set)
@@ -217,10 +253,13 @@ def submit_specs(
                 raise IdempotencyConflict("idempotency key was already used with different semantic input.")
             if submission["state"] == "committed":
                 try:
-                    return [
-                        TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id)))
-                        for task_id in submission["resolved_context"]["task_ids"]
-                    ]
+                    return _submission_result(
+                        [
+                            TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id)))
+                            for task_id in submission["resolved_context"]["task_ids"]
+                        ],
+                        submission,
+                    )
                 except FileNotFoundError as exc:
                     raise RuntimeError("committed submission has missing Task truth; run qexp doctor repair.") from exc
             if submission["state"] == "aborted":
@@ -387,7 +426,7 @@ def submit_specs(
             operation["submission"]["state"] = "committed"
             operation["submission"]["committed_at"] = utc_now()
             atomic_replace(submission_path(cfg.shared_root, operation_id), operation)
-            return staged
+            return _submission_result(staged, operation["submission"])
         except Exception as exc:
             operation["submission"]["state"] = "aborted"
             operation["submission"]["failure_reason"] = str(exc)
@@ -397,9 +436,9 @@ def submit_specs(
                     group_file = group_path(cfg.shared_root, group_name)
                     if group_file.exists():
                         group = read_json(group_file)
-                        has_pending_commit = (
-                            group["group"].get("pending_submission_commit") or {}
-                        ).get("operation_id") == operation_id
+                        has_pending_commit = (group["group"].get("pending_submission_commit") or {}).get(
+                            "operation_id"
+                        ) == operation_id
                         removed_worker = _remove_operation_added_workers(group, operation)
                         if has_pending_commit or removed_worker:
                             group["group"]["pending_submission_commit"] = None

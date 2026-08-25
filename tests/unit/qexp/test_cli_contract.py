@@ -23,7 +23,7 @@ def test_task_cancel_reports_pending_acknowledgement(tmp_path: Path, capsys):
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert main([*_base_args(cfg), "task", "cancel", task.task_id]) == 0
+    assert main([*_base_args(cfg), "task", "cancel", task.task_id, "--format=json"]) == 0
     output = json.loads(capsys.readouterr().out)
     assert output["owning_machine"] == "gpu-1"
     assert output["operation_state"] == "waiting_ack"
@@ -35,7 +35,7 @@ def test_prelaunch_cancel_reports_completed_without_pending_acknowledgement(tmp_
     task = submit(cfg, ["echo", "ok"])
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
-    assert main([*_base_args(cfg), "task", "cancel", task.task_id]) == 0
+    assert main([*_base_args(cfg), "task", "cancel", task.task_id, "--format=json"]) == 0
     output = json.loads(capsys.readouterr().out)
     assert output["task_state"] == "cancelled"
     assert output["operation_state"] == "completed"
@@ -63,7 +63,7 @@ def test_clean_cli_reports_dry_run_candidates(tmp_path: Path, capsys):
     assert fail_attempt(
         cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure"
     )
-    assert main([*_base_args(cfg), "clean", "--task-id", task.task_id, "--dry-run"]) == 0
+    assert main([*_base_args(cfg), "clean", "--task-id", task.task_id, "--dry-run", "--format=json"]) == 0
     output = json.loads(capsys.readouterr().out)
     assert output["candidates"] == [task.task_id]
     assert output["removed"] == []
@@ -121,7 +121,7 @@ def test_agent_start_records_parent_visible_pid(tmp_path: Path, monkeypatch, cap
 
     monkeypatch.setattr("qqtools.plugins.qexp.activation.spawn_agent_process", spawn)
 
-    assert main([*_base_args(cfg), "agent", "start"]) == 0
+    assert main([*_base_args(cfg), "agent", "start", "--format=json"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "started"
     assert runtime_pid_path(cfg).read_text(encoding="utf-8").strip() == "4321"
 
@@ -153,7 +153,7 @@ def test_agent_run_reports_foreground_start(tmp_path: Path, monkeypatch, capsys)
 
     monkeypatch.setattr("qqtools.plugins.qexp.cli.run_local_agent_foreground", run_foreground)
 
-    assert main([*_base_args(cfg), "agent", "run"]) == 0
+    assert main([*_base_args(cfg), "agent", "run", "--format=json"]) == 0
     assert received == ["manual_run"]
     assert json.loads(capsys.readouterr().out)["action"] == "running"
 
@@ -288,7 +288,7 @@ def test_agent_stop_returns_structured_status(tmp_path: Path, monkeypatch, capsy
         lambda cfg: ("already_stopped", {"machine_name": cfg.machine_name, "agent_state": "stopped", "pid": None, "is_running": False}),
     )
 
-    assert main([*_base_args(cfg), "agent", "stop"]) == 0
+    assert main([*_base_args(cfg), "agent", "stop", "--format=json"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "already_stopped"
 
 
@@ -299,5 +299,5 @@ def test_agent_restart_returns_structured_status(tmp_path: Path, monkeypatch, ca
         lambda cfg: ("restarted", {"machine_name": cfg.machine_name, "agent_state": "active", "pid": 987, "is_running": True, "previous_pid": 432}),
     )
 
-    assert main([*_base_args(cfg), "agent", "restart"]) == 0
+    assert main([*_base_args(cfg), "agent", "restart", "--format=json"]) == 0
     assert json.loads(capsys.readouterr().out)["previous_pid"] == 432
