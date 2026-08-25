@@ -140,7 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_format(share)
     share.add_argument("task_id")
     share.add_argument("--after")
-    share.add_argument("--with", dest="helper_machines", action="append")
+    share.add_argument(
+        "--with",
+        dest="helper_machines",
+        action="append",
+        help="Helper machine; repeat the option or use comma-separated machine names.",
+    )
     keep_local = task_sub.add_parser("keep-local")
     _add_output_format(keep_local)
     keep_local.add_argument("task_id")
@@ -233,6 +238,15 @@ def _duration_seconds(value: str) -> int:
         raise ValueError("duration must use an explicit s, m, or h unit, for example 10m.")
     amount = int(matched.group(1))
     return amount * {"s": 1, "m": 60, "h": 3600}[matched.group(2)]
+
+
+def _split_machine_list(values: list[str] | None) -> list[str] | None:
+    if values is None:
+        return None
+    machines = [machine.strip() for value in values for machine in value.split(",")]
+    if not all(machines):
+        raise ValueError("--with machine names must be comma-separated non-empty values.")
+    return machines
 
 
 def _try_save_context(shared_root: str, machine: str, runtime_root: str | None) -> None:
@@ -461,7 +475,10 @@ def main(argv: list[str] | None = None) -> int:
             elif args.task_action == "share":
                 after_seconds = _duration_seconds(args.after) if args.after is not None else None
                 result = task_commands.share(
-                    cfg, args.task_id, after_seconds=after_seconds, helper_machines=args.helper_machines
+                    cfg,
+                    args.task_id,
+                    after_seconds=after_seconds,
+                    helper_machines=_split_machine_list(args.helper_machines),
                 )
                 ensure_local_agent_active(cfg, reason="task-share")
                 _emit("availability", result.to_dict(), args.format)

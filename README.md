@@ -169,7 +169,7 @@ doctor verify` and `qexp agent status` expose the provider, authority mode, and 
 
 ```bash
 qexp task share TASK_ID
-qexp task share TASK_ID --after 10m --with gpu-b --with gpu-c
+qexp task share TASK_ID --after 10m --with gpu-b,gpu-c
 qexp task keep-local TASK_ID
 qexp task offer TASK_ID --format=json
 ```

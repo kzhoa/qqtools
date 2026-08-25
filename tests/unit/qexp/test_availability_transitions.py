@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.cli import _split_machine_list, main
 from qqtools.plugins.qexp.commands.group import change_worker
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
@@ -184,6 +184,28 @@ def test_cli_availability_json_and_human_outputs(tmp_path: Path, monkeypatch, ca
 
     assert main([*_base_args(cfg), "task", "keep-local", task.task_id]) == 0
     assert "restricted to its home machine" in capsys.readouterr().out
+
+
+def test_cli_share_accepts_comma_separated_helper_machines(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    change_worker(cfg, "exp", "g2", "add")
+    change_worker(cfg, "exp", "g3", "add")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        lambda cfg, *, reason: True,
+    )
+
+    assert main([
+        *_base_args(cfg), "task", "share", task.task_id, "--with", "g2,g3",
+    ]) == 0
+
+    assert load_task(cfg, task.task_id).placement_policy["fallback_constraint"] == ["g2", "g3"]
+
+
+def test_cli_share_rejects_empty_comma_separated_helper_machine():
+    with pytest.raises(ValueError, match="non-empty"):
+        _split_machine_list(["g2,,g3"])
 
 
 def test_rebuild_deadline_indexes_removes_stale_index(tmp_path: Path):
