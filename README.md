@@ -171,14 +171,14 @@ doctor verify` and `qexp agent status` expose the provider, authority mode, and 
 qexp task share TASK_ID
 qexp task share TASK_ID --after 10m --with gpu-b --with gpu-c
 qexp task keep-local TASK_ID
-qexp task offer TASK_ID --format json
+qexp task offer TASK_ID --format=json
 ```
 
 `share` is the user-facing control for letting eligible Group workers help while the home
 machine remains eligible. `share --after` records a bounded deadline; `keep-local` clears the
 shared policy and returns the Task to the home queue. `task offer` is retained for Tasks that
 were already submitted with spillover policy and only moves that existing policy into the shared
-queue.
+queue. Scripts and other machine consumers must request structured command output explicitly with `--format=json`.
 
 For normal task and cleanup workflows:
 

@@ -1,20 +1,22 @@
 """Task command workflows for qexp."""
+
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Callable
 
 from ..config_types import RootConfig
-from ..layout import (ensure_machine_layout, ensure_shared_layout,
-                      validate_root_contract)
+from ..layout import ensure_machine_layout, ensure_shared_layout, validate_root_contract
 from ..manifest import parse_batch_manifest
-from ..runtime.availability import (AvailabilityTransitionRequest,
-                                    AvailabilityTransitionResult,
-                                    apply_availability_transition)
+from ..runtime.availability import (
+    AvailabilityTransitionRequest,
+    AvailabilityTransitionResult,
+    apply_availability_transition,
+)
 from ..runtime.paths import attempt_path, shared_paths
 from ..runtime.records import AttemptRecord, TaskRecord, utc_now, validate_group_name
 from ..runtime.store import read_json
-from ..runtime.submission import submit_specs
+from ..runtime.submission import SubmissionResult, submit_specs
 from ..runtime.tasks import load_task, save_task
 
 
@@ -31,40 +33,69 @@ def reject_cleanup_blocked(cfg: RootConfig, task: TaskRecord, action: str) -> No
         raise ValueError(f"Task {task.task_id!r} is being cleaned and cannot be {action}.")
 
 
-def submit(cfg: RootConfig, command: list[str], requested_gpus: int = 1, task_id: str | None = None,
-           name: str | None = None, group: str | None = None, working_dir: str | Path | None = None,
-           sharing_mode: str = "private", fallback_machines: str | list[str] = "group",
-           offer_after_seconds: int | None = None, idempotency_key: str | None = None) -> TaskRecord:
+def submit(
+    cfg: RootConfig,
+    command: list[str],
+    requested_gpus: int = 1,
+    task_id: str | None = None,
+    name: str | None = None,
+    group: str | None = None,
+    working_dir: str | Path | None = None,
+    sharing_mode: str = "private",
+    fallback_machines: str | list[str] = "group",
+    offer_after_seconds: int | None = None,
+    idempotency_key: str | None = None,
+) -> TaskRecord:
     validate_root_contract(cfg)
     ensure_shared_layout(cfg)
     ensure_machine_layout(cfg)
-    items = [{"task_id": task_id, "name": name, "command": list(command),
-              "requested_gpus": requested_gpus, "working_directory": str(Path(working_dir or Path.cwd()).resolve()),
-              "sharing_mode": sharing_mode, "fallback_machines": fallback_machines,
-              "offer_after_seconds": offer_after_seconds}]
+    items = [
+        {
+            "task_id": task_id,
+            "name": name,
+            "command": list(command),
+            "requested_gpus": requested_gpus,
+            "working_directory": str(Path(working_dir or Path.cwd()).resolve()),
+            "sharing_mode": sharing_mode,
+            "fallback_machines": fallback_machines,
+            "offer_after_seconds": offer_after_seconds,
+        }
+    ]
     return submit_specs(cfg, items, group_name=validate_group_name(group), idempotency_key=idempotency_key)[0]
 
 
-def batch_submit(cfg: RootConfig, manifest_path: Path, *, group: str | None = None,
-                 idempotency_key: str | None = None,
-                 on_prepared: Callable[[str, str], None] | None = None) -> list[TaskRecord]:
+def batch_submit(
+    cfg: RootConfig,
+    manifest_path: Path,
+    *,
+    group: str | None = None,
+    idempotency_key: str | None = None,
+    on_prepared: Callable[[str, str], None] | None = None,
+) -> SubmissionResult:
     validate_root_contract(cfg)
     group_name = validate_group_name(group)
     normalized, workers = parse_batch_manifest(Path(manifest_path), group_name=group_name)
-    return submit_specs(cfg, normalized, group_name=group_name,
-                        idempotency_key=idempotency_key, kind="bulk",
-                        worker_set=workers, on_prepared=on_prepared)
+    return submit_specs(
+        cfg,
+        normalized,
+        group_name=group_name,
+        idempotency_key=idempotency_key,
+        kind="bulk",
+        worker_set=workers,
+        on_prepared=on_prepared,
+    )
 
 
 def cancel(cfg: RootConfig, task_id: str, *, terminate_running: bool = True) -> TaskRecord:
     from ..scheduler import cancel_task
+
     return cancel_task(cfg, task_id, terminate_running=terminate_running)
 
 
-def retry(
-        cfg: RootConfig, task_id: str, *, acknowledge_duplicate_risk: bool = False) -> TaskRecord:
+def retry(cfg: RootConfig, task_id: str, *, acknowledge_duplicate_risk: bool = False) -> TaskRecord:
     """Queue the next Attempt, optionally accepting unresolved orphan duplication risk."""
     from ..scheduler import authority_locks
+
     initial = load_task(cfg, task_id)
     with authority_locks(cfg, initial):
         task = load_task(cfg, task_id)
@@ -79,35 +110,53 @@ def retry(
         if acknowledge_duplicate_risk:
             if task.state["projection"] != "blocked" or current.phase != "orphaned":
                 raise ValueError(
-                    "--acknowledge-duplicate-risk requires a blocked Task with an "
-                    "orphaned current Attempt."
+                    "--acknowledge-duplicate-risk requires a blocked Task with an " "orphaned current Attempt."
                 )
             acknowledged_at = utc_now()
             from ..events import write_event
+
             write_event(
                 cfg,
                 "duplicate_risk_acknowledged",
                 task_id=task_id,
-                details={"attempt_id": current.attempt_id,
-                         "fencing_token": current.current_fencing_token,
-                         "reason": "operator_acknowledged_duplicate_risk"},
+                details={
+                    "attempt_id": current.attempt_id,
+                    "fencing_token": current.current_fencing_token,
+                    "reason": "operator_acknowledged_duplicate_risk",
+                },
             )
             task.claim_control["fencing_epoch"] += 1
-            task.control.update({"duplicate_risk_acknowledged_at": acknowledged_at,
-                                 "duplicate_risk_acknowledged_by": cfg.machine_name,
-                                 "duplicate_risk_attempt_id": current.attempt_id})
+            task.control.update(
+                {
+                    "duplicate_risk_acknowledged_at": acknowledged_at,
+                    "duplicate_risk_acknowledged_by": cfg.machine_name,
+                    "duplicate_risk_attempt_id": current.attempt_id,
+                }
+            )
             task.state = {"projection": "queued", "reason": "duplicate_risk_acknowledged"}
         else:
             if task.state["projection"] != "failed" or current.phase != "failed":
-                raise ValueError(
-                    "only a failed Task with a failed current Attempt can be retried."
-                )
+                raise ValueError("only a failed Task with a failed current Attempt can be retried.")
             task.state = {"projection": "queued", "reason": None}
-        task.control.update({"cancellation_requested_at": None, "cancellation_operation_id": None,
-                             "terminate_running": False, "requested_by": None,
-                             "termination_acknowledged_at": None, "termination_result": None})
-        task.placement_runtime.update({"queue_scope": "home", "queued_home_at": utc_now(), "offered_at": None,
-                                       "offer_reason": None, "offered_by": None})
+        task.control.update(
+            {
+                "cancellation_requested_at": None,
+                "cancellation_operation_id": None,
+                "terminate_running": False,
+                "requested_by": None,
+                "termination_acknowledged_at": None,
+                "termination_result": None,
+            }
+        )
+        task.placement_runtime.update(
+            {
+                "queue_scope": "home",
+                "queued_home_at": utc_now(),
+                "offered_at": None,
+                "offer_reason": None,
+                "offered_by": None,
+            }
+        )
         task.attempt_control["current_attempt_id"] = None
         task.meta["revision"] += 1
         task.meta["updated_at"] = utc_now()
@@ -115,16 +164,20 @@ def retry(
         return task
 
 
-def share(cfg: RootConfig, task_id: str, *, after_seconds: int | None = None,
-          helper_machines: list[str] | None = None) -> AvailabilityTransitionResult:
+def share(
+    cfg: RootConfig, task_id: str, *, after_seconds: int | None = None, helper_machines: list[str] | None = None
+) -> AvailabilityTransitionResult:
     if after_seconds is not None and after_seconds < 0:
         raise ValueError("share --after must be non-negative.")
     action = "share_after" if after_seconds is not None else "share_now"
     return apply_availability_transition(
         cfg,
         AvailabilityTransitionRequest(
-            action=action, task_id=task_id, helper_machines=helper_machines,
-            after_seconds=after_seconds, reason="manual",
+            action=action,
+            task_id=task_id,
+            helper_machines=helper_machines,
+            after_seconds=after_seconds,
+            reason="manual",
         ),
     )
 

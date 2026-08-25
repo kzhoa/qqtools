@@ -4,6 +4,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from .config_types import RootConfig
 from .lifecycle import (TerminalTransition, commit_terminal_transition_locked,
                          dispatch_task_lifecycle_hooks_noexcept)
@@ -114,6 +115,56 @@ class AuthoritySupervisor:
         else:
             self._set_authority_state(process, "suspect")
 
+    def _publish_running(self, registration: dict[str, object], manifest: Path) -> None:
+        task_id = registration.get("task_id")
+        attempt_id = registration.get("attempt_id")
+        token = registration.get("fencing_token")
+        if not isinstance(task_id, str) or not isinstance(attempt_id, str) or not isinstance(token, int):
+            return
+        with attempt_control_lock(self.cfg, attempt_id):
+            task = load_task(self.cfg, task_id)
+            with authority_locks(self.cfg, task):
+                task = load_task(self.cfg, task_id)
+                claim = task.claim_control.get("active_claim") or {}
+                number = task.attempt_control.get("current_attempt_number")
+                if not isinstance(number, int):
+                    return
+                try:
+                    attempt = AttemptRecord.from_dict(read_json(attempt_path(self.cfg.shared_root, task_id, number)))
+                except (FileNotFoundError, KeyError, ValueError):
+                    return
+                if (claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != token
+                        or claim.get("machine_name") != self.cfg.machine_name
+                        or attempt.attempt_id != attempt_id or attempt.current_fencing_token != token
+                        or attempt.machine_name != self.cfg.machine_name):
+                    return
+                if claim.get("launch_state") not in {"starting", "running"} or attempt.phase not in {"starting", "running"}:
+                    return
+                for key in ("wrapper_pid", "wrapper_start_time_ticks", "process_group_id", "process_group_start_time_ticks"):
+                    value = registration.get(key)
+                    if value is not None:
+                        existing = attempt.process.get(key)
+                        if existing is not None and existing != value:
+                            return
+                        attempt.process[key] = value
+                attempt.process["local_process_manifest"] = str(manifest)
+                created_at = registration.get("process_created_at")
+                if not isinstance(created_at, str):
+                    return
+                existing_created = attempt.timestamps.get("process_created_at")
+                if existing_created is not None and existing_created != created_at:
+                    return
+                attempt.timestamps["process_created_at"] = created_at
+                if attempt.timestamps.get("running_at") is None:
+                    attempt.timestamps["running_at"] = utc_now()
+                attempt.phase = "running"
+                atomic_replace(attempt_path(self.cfg.shared_root, task_id, number), attempt.to_dict())
+                if claim.get("launch_state") != "running":
+                    claim["launch_state"] = "running"
+                    task.meta["revision"] += 1
+                    task.meta["updated_at"] = utc_now()
+                    save_task(self.cfg, task)
+
     def _materialize_registrations(self) -> None:
         self._materialize_unverified_intents()
         for path in iter_json(local_paths(self.cfg.runtime_root)["registrations"]):
@@ -124,12 +175,12 @@ class AuthoritySupervisor:
             if not isinstance(attempt_id, str):
                 continue
             manifest = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
-            if manifest.exists():
-                continue
-            value = dict(registration)
-            value.update({"observed_state": "running", "supervisor": "agent",
-                          "authority_state": "healthy", "created_by": "agent"})
-            atomic_replace(manifest, {"process": value})
+            if not manifest.exists():
+                value = dict(registration)
+                value.update({"observed_state": "running", "supervisor": "agent",
+                              "authority_state": "healthy", "created_by": "agent"})
+                atomic_replace(manifest, {"process": value})
+            self._publish_running(registration, manifest)
 
     def _materialize_unverified_intents(self) -> None:
         for path in iter_json(local_paths(self.cfg.runtime_root)["launch_intents"]):

@@ -558,7 +558,10 @@ Attempt rules:
 - Attempt is materialized idempotently when a claim allocates its attempt number
 - `claimed` is pre-launch and revocable
 - `starting` means the shared launch gate committed
-- `running` means local process creation was recorded
+- `running` means the owning Agent fenced and published immutable local process-creation evidence into shared Attempt truth
+- `launch_authorized_at` is written once by the Scheduler when the shared launch gate commits
+- `process_created_at` is written once by the passive Runner immediately after guardian process creation, in its immutable local registration
+- `running_at` is written once by the owning Agent when it accepts that registration and commits shared `running` truth
 - a terminal Attempt never returns to an active phase
 - `orphaned` records ambiguous process ownership after lease expiry
 - a recovery CAS may issue a new token for the same orphaned Attempt
@@ -1184,15 +1187,19 @@ validates:
 - no applicable cancellation barrier won
 - machine remains an active Worker Set member
 
-The winning fenced Task transition changes:
+The winning fenced transition uses one authorization timestamp and changes:
 
 ```text
 active_claim.launch_state: claimed -> starting
 active_claim.launch_authorized_at: null -> timestamp
+Attempt.phase: claimed -> starting
+Attempt.timestamps.launch_authorized_at: null -> same timestamp
 ```
 
-It records the current Group dispatch epoch and Worker Set epoch. Attempt truth is then
-reconciled to `starting` under the same token.
+The Task write is the launch gate linearization point. If a crash leaves the matching Attempt in
+`claimed`, a later fenced authorization replay may only reconcile it to `starting` using the
+persisted Task timestamp; it must not authorize a second Runner. It records the current Group
+dispatch epoch and Worker Set epoch.
 
 This transition is the linearization point:
 
@@ -1209,9 +1216,13 @@ After launch authorization, the agent starts a passive runner. The runner writes
 launch intent, creates the guardian-owned training process under the assigned GPUs, writes one
 immutable local process registration, and later writes a separate exit observation. The agent
 materializes the mutable local process manifest from that registration and exclusively owns all
-authority transitions. It then renews the lease and reconciles process state; only the agent may
-publish shared running or terminal truth, perform Recovery, release the reservation, or issue a
-qexp signal.
+authority transitions. The Runner records `process_created_at` in its registration immediately
+after guardian creation. The Agent validates the registration's Attempt ID, machine, fencing token
+and process identity, then writes the registration identity and `process_created_at` to Attempt,
+sets `Attempt.phase` and claim `launch_state` to `running`, and writes `running_at` once. Replayed
+materialization may only complete a matching partial transition; it must never refresh these
+first-write timestamps. Only the Agent may publish shared running or terminal truth, perform
+Recovery, release the reservation, or issue a qexp signal.
 
 If local process creation fails, the Attempt becomes failed and claim and reservation are
 released idempotently.

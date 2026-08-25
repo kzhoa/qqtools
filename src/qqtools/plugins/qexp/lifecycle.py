@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal, Protocol
 
 from .config_types import RootConfig
@@ -27,6 +28,19 @@ class TaskLifecycleEvent:
     dispatching_machine_name: str
     finished_at: str
     task_revision: int
+    execution_started_at: str | None = None
+    duration_ms: int | None = None
+
+
+def _duration_ms(started_at: str | None, finished_at: str) -> int | None:
+    if started_at is None:
+        return None
+    try:
+        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        finish = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0, int((finish - start).total_seconds() * 1000))
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,12 +145,16 @@ def commit_terminal_transition_locked(
     task.meta["revision"] += 1
     task.meta["updated_at"] = finished_at
     save_task(cfg, task)
+    execution_started_at = (attempt.timestamps.get("process_created_at")
+                            or attempt.timestamps.get("running_at"))
     event = TaskLifecycleEvent(
         event_type="task_terminal", task_id=task.task_id, attempt_id=attempt.attempt_id,
         attempt_number=attempt.attempt_number, previous_task_phase=previous_phase,
         phase=transition.phase, reason=transition.reason, exit_code=transition.exit_code,
         execution_machine_name=attempt.machine_name, dispatching_machine_name=cfg.machine_name,
         finished_at=finished_at, task_revision=task.meta["revision"],
+        execution_started_at=execution_started_at,
+        duration_ms=_duration_ms(execution_started_at, finished_at),
     )
     return TerminalCommitResult("committed", event, reservation_id, reservation_machine)
 

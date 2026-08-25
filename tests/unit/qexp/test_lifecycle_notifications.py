@@ -16,7 +16,8 @@ def _event(**overrides):
     values = {"phase": "failed", "task_id": "task-a", "attempt_id": "attempt-a",
               "reason": "nonzero_exit", "exit_code": None,
               "execution_machine_name": "gpu-a", "dispatching_machine_name": "gpu-b",
-              "finished_at": "2026-08-07T00:00:00Z"}
+              "finished_at": "2026-08-07T00:00:00Z", "execution_started_at": None,
+              "duration_ms": None}
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -97,6 +98,8 @@ def test_feishu_payload_and_business_success():
             "- **退出码**: `（未记录）`",
             "- **执行机器**: `gpu-a`",
             "- **通知机器**: `gpu-b`",
+            "- **开始时间**: `（未记录）`",
+            "- **执行时长**: `（未记录）`",
             "- **通知机器时间**: `2026-08-07T00:00:00Z`",
         )),
     }]

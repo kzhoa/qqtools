@@ -107,8 +107,16 @@ def _card_markdown(event: Any) -> str:
         f"- **退出码**: `{_markdown_code(event.exit_code)}`",
         f"- **执行机器**: `{_markdown_code(event.execution_machine_name)}`",
         f"- **通知机器**: `{_markdown_code(event.dispatching_machine_name)}`",
+        f"- **开始时间**: `{_markdown_code(getattr(event, 'execution_started_at', None))}`",
+        f"- **执行时长**: `{_markdown_code(_duration_text(getattr(event, 'duration_ms', None)))}`",
         f"- **通知机器时间**: `{_markdown_code(event.finished_at)}`",
     ))
+
+
+def _duration_text(duration_ms: Any) -> str | None:
+    if not isinstance(duration_ms, int):
+        return None
+    return f"{duration_ms / 1000:.3f}s"
 
 
 def _markdown_code(value: Any) -> str:

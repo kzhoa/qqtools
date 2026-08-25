@@ -23,6 +23,12 @@ def _disable_process_group_guardian(monkeypatch):
     monkeypatch.setattr("qqtools.plugins.qexp.runner._configure_process_group_guardian", lambda: None)
 
 
+def _launch_id(cfg, attempt):
+    return read_json(attempt_path(cfg.shared_root, attempt.task_id, attempt.attempt_number))["attempt"][
+        "authorization"
+    ]["launch_id"]
+
+
 class FakeChild:
     pid = 4321
     returncode = 0
@@ -39,8 +45,8 @@ def test_runner_publishes_registration_and_exit_observation_only(tmp_path: Path,
     task = submit(cfg, ["echo", "ok"])
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
-    monkeypatch.setattr("qqtools.plugins.qexp.runner._process_start_time_ticks",
-                        lambda pid: pid + 100)
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    monkeypatch.setattr("qqtools.plugins.qexp.runner._process_start_time_ticks", lambda pid: pid + 100)
     launched: dict[str, object] = {}
 
     def popen_factory(*args, **kwargs):
@@ -48,8 +54,14 @@ def test_runner_publishes_registration_and_exit_observation_only(tmp_path: Path,
         launched.update(kwargs)
         return FakeChild()
 
-    result = run_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token,
-                         popen_factory=popen_factory)
+    result = run_attempt(
+        cfg,
+        task.task_id,
+        attempt.attempt_id,
+        attempt.current_fencing_token,
+        _launch_id(cfg, attempt),
+        popen_factory=popen_factory,
+    )
     assert result == 0
     assert launched["start_new_session"] is True
     assert launched["command"][-3:] == ["--", "echo", "ok"]
@@ -68,19 +80,27 @@ def test_read_logs_uses_attempt_log_written_by_runner(tmp_path: Path, monkeypatc
     task = submit(cfg, ["echo", "ok"])
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
-    monkeypatch.setattr("qqtools.plugins.qexp.runner._process_start_time_ticks",
-                        lambda pid: pid + 100)
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    monkeypatch.setattr("qqtools.plugins.qexp.runner._process_start_time_ticks", lambda pid: pid + 100)
 
     def popen_factory(*args, **kwargs):
         kwargs["stdout"].write(b"attempt output\n")
         kwargs["stdout"].flush()
         return FakeChild()
 
-    assert run_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token,
-                       popen_factory=popen_factory) == 0
+    assert (
+        run_attempt(
+            cfg,
+            task.task_id,
+            attempt.attempt_id,
+            attempt.current_fencing_token,
+            _launch_id(cfg, attempt),
+            popen_factory=popen_factory,
+        )
+        == 0
+    )
 
-    remote_cfg = load_root_config(cfg.shared_root, "gpu-2", tmp_path / "remote-runtime",
-                                  require_initialized=True)
+    remote_cfg = load_root_config(cfg.shared_root, "gpu-2", tmp_path / "remote-runtime", require_initialized=True)
     log_path = cfg.shared_root / "logs" / task.task_id / f"{attempt.attempt_id}.log"
     assert log_path.exists()
     assert read_logs(cfg, task.task_id) == "attempt output\n"
@@ -120,8 +140,17 @@ def test_observed_exit_after_cancel_acknowledges_already_exited(tmp_path: Path, 
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     monkeypatch.setattr("qqtools.plugins.qexp.runner._process_start_time_ticks", lambda pid: pid + 100)
-    assert run_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token,
-                       popen_factory=lambda *args, **kwargs: FakeChild()) == 0
+    assert (
+        run_attempt(
+            cfg,
+            task.task_id,
+            attempt.attempt_id,
+            attempt.current_fencing_token,
+            _launch_id(cfg, attempt),
+            popen_factory=lambda *args, **kwargs: FakeChild(),
+        )
+        == 0
+    )
     cancel_task(cfg, task.task_id, terminate_running=True)
 
     AuthoritySupervisor(cfg).tick()
@@ -145,9 +174,9 @@ def test_missing_registration_after_dead_wrapper_is_isolated_without_releasing_g
     AuthoritySupervisor(cfg).tick()
 
     manifest = read_json(local_paths(cfg.runtime_root)["processes"] / f"{attempt.attempt_id}.json")["process"]
-    diagnostic = read_json(
-        local_paths(cfg.runtime_root)["authority_diagnostics"] / f"{attempt.attempt_id}.json"
-    )["authority_diagnostic"]
+    diagnostic = read_json(local_paths(cfg.runtime_root)["authority_diagnostics"] / f"{attempt.attempt_id}.json")[
+        "authority_diagnostic"
+    ]
     assert manifest["observed_state"] == "launch_unverifiable"
     assert manifest["authority_state"] == "isolated"
     assert diagnostic["reason"] == "launch_unverifiable"
@@ -160,23 +189,30 @@ def test_unavailable_shared_policy_isolated_by_cached_deadline(tmp_path: Path, m
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     expiry = (datetime.now(timezone.utc) - timedelta(seconds=1)).replace(microsecond=0)
-    atomic_replace(local_paths(cfg.runtime_root)["processes"] / f"{attempt.attempt_id}.json", {"process": {
-        "protocol_version": 1,
-        "task_id": task.task_id,
-        "attempt_id": attempt.attempt_id,
-        "fencing_token": attempt.current_fencing_token,
-        "lease_expires_at": expiry.isoformat().replace("+00:00", "Z"),
-    }})
+    atomic_replace(
+        local_paths(cfg.runtime_root)["processes"] / f"{attempt.attempt_id}.json",
+        {
+            "process": {
+                "protocol_version": 1,
+                "task_id": task.task_id,
+                "attempt_id": attempt.attempt_id,
+                "fencing_token": attempt.current_fencing_token,
+                "lease_expires_at": expiry.isoformat().replace("+00:00", "Z"),
+            }
+        },
+    )
     supervisor = AuthoritySupervisor(cfg)
-    monkeypatch.setattr("qqtools.plugins.qexp.authority.load_lease_policy",
-                        lambda _cfg: (_ for _ in ()).throw(OSError("shared root down")))
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.authority.load_lease_policy",
+        lambda _cfg: (_ for _ in ()).throw(OSError("shared root down")),
+    )
 
     supervisor.tick()
 
     manifest = read_json(local_paths(cfg.runtime_root)["processes"] / f"{attempt.attempt_id}.json")["process"]
-    diagnostic = read_json(
-        local_paths(cfg.runtime_root)["authority_diagnostics"] / f"{attempt.attempt_id}.json"
-    )["authority_diagnostic"]
+    diagnostic = read_json(local_paths(cfg.runtime_root)["authority_diagnostics"] / f"{attempt.attempt_id}.json")[
+        "authority_diagnostic"
+    ]
     assert manifest["authority_state"] == "suspect"
     assert diagnostic["reason"] == "lease_policy_unavailable"
 
@@ -208,9 +244,17 @@ import time
 subprocess.Popen([sys.executable, "-c", sys.argv[1], sys.argv[2], sys.argv[3]])
 time.sleep(60)
 """
-    launcher = subprocess.Popen([
-        sys.executable, "-c", launcher_code, guardian_code, child_code, str(pid_file),
-    ], env=environment)
+    launcher = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            launcher_code,
+            guardian_code,
+            child_code,
+            str(pid_file),
+        ],
+        env=environment,
+    )
     try:
         deadline = time.monotonic() + 5
         while not pid_file.exists() and time.monotonic() < deadline:

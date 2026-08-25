@@ -440,6 +440,17 @@ transition. For a pre-launch Attempt in `claimed`, exactly one outcome wins:
 perform this fenced transition immediately before process creation. It must not implement
 the launch gate as an unfenced read followed by a local launch.
 
+Attempt timing distinguishes authorization, local creation and shared confirmation:
+
+- `launch_authorized_at` records the successful fenced launch gate;
+- `process_created_at` records successful guardian creation by the passive Runner;
+- `running_at` records the owning Agent accepting the fenced registration into shared running truth.
+
+Human-facing execution duration is measured from `process_created_at` to `finished_at`. If that
+creation time is unavailable, it may use `running_at`; it must never use `claimed_at`, which also
+includes reservation and launch delay. Historical or unverified Attempts without either start
+record display an unavailable duration.
+
 ## 9. Home-First Placement Protocol
 
 ### 9.1 Submission Policy
@@ -581,7 +592,7 @@ Supported controls:
   private Task into spillover.
 
 Successful placement controls return a human-readable result by default and a stable JSON
-envelope with `--format json`. The envelope contains action, Task, Group, home machine, eligible
+envelope with `--format=json`. The envelope contains action, Task, Group, home machine, eligible
 helpers, effective time, resulting queue state, idempotency, operation id, and message.
 
 These are the only first-release triggers. The first-release manifest does not accept or
@@ -1028,13 +1039,11 @@ Everyday observation should remain Task-first and Group-aware:
 qexp task list
 qexp task list --group stage-c1
 qexp task show task_xxx
-qexp task show task_xxx --json
+qexp task show task_xxx --format=json
 qexp group list
 qexp group show stage-c1
-qexp group show stage-c1 --json
+qexp group show stage-c1 --format=json
 qexp top
-qexp top --all
-qexp top --group stage-c1
 qexp machines
 ```
 
@@ -1051,11 +1060,7 @@ Group output should show:
 - Worker Set state
 - home and fallback machine distribution
 
-`top` scope must be internally consistent:
-
-- default counts and details refer to the selected machine
-- `--all` counts and details refer to the project
-- `--group` counts and details refer to the Group
+`top` currently reports project-wide counts, Tasks, and machine views. It does not define `--all` or `--group` filters.
 
 GPU terminology must use:
 
