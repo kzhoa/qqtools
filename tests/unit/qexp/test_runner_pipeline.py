@@ -133,7 +133,7 @@ def test_read_logs_prefers_persisted_attempt_log_reference(tmp_path: Path):
     assert read_logs(cfg, task.task_id) == "persisted reference\n"
 
 
-def test_observed_exit_after_cancel_acknowledges_already_exited(tmp_path: Path, monkeypatch):
+def test_observed_success_after_cancel_remains_succeeded(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     attempt = claim_task(cfg, task.task_id, [0])
@@ -157,7 +157,9 @@ def test_observed_exit_after_cancel_acknowledges_already_exited(tmp_path: Path, 
 
     stored_task = read_json(cfg.shared_root / "tasks" / f"{task.task_id}.json")["task"]
     stored_attempt = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"]
-    assert stored_task["state"] == {"projection": "cancelled", "reason": "termination_process_already_exited"}
+    assert stored_task["state"] == {"projection": "succeeded", "reason": "completed"}
+    assert stored_attempt["result"]["exit_code"] == 0
+    assert stored_attempt["result"]["reason"] == "completed"
     assert stored_task["control"]["termination_result"] == "already_exited"
     assert stored_task["control"]["termination_acknowledged_at"] is not None
     assert stored_attempt["termination"]["result"] == "already_exited"

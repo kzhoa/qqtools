@@ -195,12 +195,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_format(doctor)
     doctor.add_argument("action", choices=["verify", "repair"], default="verify", nargs="?")
     doctor.add_argument("--strict", action="store_true")
-    clean = commands.add_parser("clean")
+    clean = commands.add_parser(
+        "clean",
+        help="Remove terminal qexp metadata while preserving experiment work directories.",
+        description="Remove terminal qexp metadata while preserving experiment work directories.",
+    )
     _add_output_format(clean)
-    clean.add_argument("--task-id")
-    clean.add_argument("--older-than-days", type=int, default=30)
-    clean.add_argument("--limit", type=int, default=100)
-    clean.add_argument("--dry-run", action="store_true")
+    clean_scope = clean.add_mutually_exclusive_group()
+    clean_scope.add_argument("--task-id", help="Clean one terminal task, regardless of its age.")
+    clean_scope.add_argument("--group", help="Clean terminal tasks in one group subject to retention and limit.")
+    clean.add_argument("--older-than-days", type=int, default=30,
+                       help="Minimum task age for bulk cleanup (default: 30).")
+    clean.add_argument("--limit", type=int, default=100,
+                       help="Maximum number of bulk-cleanup candidates (default: 100).")
+    clean.add_argument("--dry-run", action="store_true", help="Show candidates without cleaning them.")
     use = commands.add_parser("use")
     use.add_argument("--shared-root", dest="use_shared_root")
     use.add_argument("--machine", dest="use_machine")
@@ -566,7 +574,8 @@ def main(argv: list[str] | None = None) -> int:
             return resolve_verify_exit_code(result, strict=args.strict)
         if args.command == "clean":
             result = cleanup.clean(
-                cfg, task_id=args.task_id, older_than_days=args.older_than_days, limit=args.limit, dry_run=args.dry_run
+                cfg, task_id=args.task_id, group=args.group, older_than_days=args.older_than_days,
+                limit=args.limit, dry_run=args.dry_run
             )
             _emit("clean", result, args.format)
             return 0

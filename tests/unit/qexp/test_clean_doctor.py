@@ -52,8 +52,8 @@ def _recv_cleanup_reconcile_result(process, parent_connection, *, timeout: float
     raise AssertionError("cleanup reconciliation subprocess did not report before timeout")
 
 
-def _failed_task(cfg, command: str = "failed"):
-    task = submit(cfg, ["echo", command])
+def _failed_task(cfg, command: str = "failed", group: str | None = None):
+    task = submit(cfg, ["echo", command], group=group)
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert fail_attempt(
@@ -137,6 +137,22 @@ def test_clean_bulk_is_bounded_by_retention_and_limit(tmp_path: Path):
     preview = clean(cfg, older_than_days=30, limit=1, dry_run=True)
     assert len(preview["candidates"]) == 1
     assert preview["removed"] == []
+
+
+def test_clean_bulk_filters_candidates_by_group(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    selected = _failed_task(cfg, "selected", group="selected-group")
+    selected_data = read_json(task_path(cfg.shared_root, selected.task_id))
+    selected_data["meta"]["updated_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(task_path(cfg.shared_root, selected.task_id), selected_data)
+    excluded = _failed_task(cfg, "excluded", group="other-group")
+    excluded_data = read_json(task_path(cfg.shared_root, excluded.task_id))
+    excluded_data["meta"]["updated_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(task_path(cfg.shared_root, excluded.task_id), excluded_data)
+
+    preview = clean(cfg, group="selected-group", older_than_days=30, dry_run=True)
+
+    assert preview["candidates"] == [selected.task_id]
 
 
 def test_clean_releases_proven_local_reservation_before_deleting_truth(tmp_path: Path):
