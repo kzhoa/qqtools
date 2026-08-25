@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.7
+
 - fix: accept comma-separated machine names in `qexp task share --with` alongside repeated flags
 - fix: keep a qexp task that exits successfully as `succeeded` when a cancellation request
   races with completion but no termination signal was sent; the cancellation acknowledgement
