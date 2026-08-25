@@ -13,6 +13,7 @@ logs/
 .github/agents
 .codex
 .claude
+memory/
 tmp*
 .tmp*
 
