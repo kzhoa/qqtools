@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- fix: keep a qexp task that exits successfully as `succeeded` when a cancellation request
+  races with completion but no termination signal was sent; the cancellation acknowledgement
+  now records that the process had already exited.
+- feat: add `qexp clean --group <group>` for retention- and limit-bounded cleanup of terminal
+  qexp metadata in one group, while preserving experiment work directories.
 - breaking: make finite structured qexp command results human-readable by default; machine
   consumers must now request `--format=json`, and the legacy `--format=text` value is rejected.
 - fix: recover a qexp launch authorization interrupted between Task and Attempt writes with the

@@ -229,7 +229,17 @@ class AuthoritySupervisor:
                 with attempt_control_lock(self.cfg, attempt_id):
                     result = send_signals(self.cfg, attempt_id, decision["decision_id"])
                 if result.get("state") == "confirmed":
-                    self._finalize(task_id, attempt_id, token, None, was_terminated=True)
+                    observation = local_paths(self.cfg.runtime_root)["observations"] / f"{attempt_id}.json"
+                    exit_code = None
+                    if observation.exists():
+                        exit_code = read_json(observation).get("exit_observation", {}).get("observed_exit_code")
+                    self._finalize(
+                        task_id,
+                        attempt_id,
+                        token,
+                        exit_code,
+                        was_terminated=bool(result.get("signal_attempts")),
+                    )
                 return
         observation = local_paths(self.cfg.runtime_root)["observations"] / f"{attempt_id}.json"
         if observation.exists():
@@ -311,16 +321,16 @@ class AuthoritySupervisor:
                 return
             code = exit_code if isinstance(exit_code, int) else None
             was_cancel_requested = bool(task.control.get("terminate_running"))
-            was_terminated = was_terminated or was_cancel_requested
             phase = "cancelled" if was_terminated else ("succeeded" if code == 0 else "failed")
-            reason = ("termination_process_already_exited" if was_cancel_requested else
-                      ("terminated_by_agent" if was_terminated else
-                       ("completed" if code == 0 else "nonzero_exit")))
+            reason = ("terminated_by_agent" if was_terminated else
+                      ("completed" if code == 0 else "nonzero_exit"))
+            termination_result = ("terminated" if was_terminated else
+                                  ("already_exited" if was_cancel_requested else None))
             result = commit_terminal_transition_locked(
                 self.cfg, task, TerminalTransition(task_id, attempt_id, number, token, phase, reason,
                     code, frozenset({"running", "starting", "claimed"}),
                     frozenset({"claimed", "starting", "running"}), "active",
-                    "already_exited" if was_cancel_requested else ("terminated" if was_terminated else None)))
+                    termination_result))
         if result.outcome != "committed":
             return
         if result.reservation_id and result.reservation_machine_name == self.cfg.machine_name:

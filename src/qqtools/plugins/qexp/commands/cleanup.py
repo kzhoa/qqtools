@@ -263,9 +263,11 @@ def reconcile_cleanup_operations(cfg: RootConfig) -> list[dict[str, Any]]:
     return results
 
 
-def clean(cfg: RootConfig, *, task_id: str | None = None, older_than_days: int = 30,
-          limit: int = 100, dry_run: bool = False) -> dict[str, Any]:
+def clean(cfg: RootConfig, *, task_id: str | None = None, group: str | None = None,
+          older_than_days: int = 30, limit: int = 100, dry_run: bool = False) -> dict[str, Any]:
     """Remove terminal Task truth exactly or under a bounded retention policy."""
+    if task_id and group:
+        raise ValueError("task_id and group cannot be used together.")
     if older_than_days < 0:
         raise ValueError("older_than_days must be non-negative.")
     if limit <= 0:
@@ -277,6 +279,8 @@ def clean(cfg: RootConfig, *, task_id: str | None = None, older_than_days: int =
         candidates = []
         for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
             task = TaskRecord.from_dict(read_json(path))
+            if group and task.group_name != group:
+                continue
             updated_at = datetime.fromisoformat(task.meta["updated_at"].replace("Z", "+00:00"))
             if (task.state["projection"] in {"succeeded", "failed", "cancelled"}
                     and updated_at <= cutoff):

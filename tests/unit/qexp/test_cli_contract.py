@@ -69,6 +69,16 @@ def test_clean_cli_reports_dry_run_candidates(tmp_path: Path, capsys):
     assert output["removed"] == []
 
 
+def test_clean_help_documents_group_scope_and_work_directory_boundary(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["clean", "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--group GROUP" in output
+    assert "preserving experiment work directories" in output
+
+
 def test_init_succeeds_when_context_save_fails(tmp_path: Path, monkeypatch, capsys):
     root = tmp_path / ".qexp"
     runtime_root = tmp_path / "rt"
