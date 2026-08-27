@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-14
+updated_at: 2026-08-27
 archived_at:
 ---
 
@@ -154,7 +154,8 @@ Typical users have:
 - about 10 GPU servers, sometimes more
 - one project directory mounted at the same absolute path on all machines
 - one shared project `.qexp` control root
-- one registered qexp machine identity per server
+- one or more registered qexp machine identities per physical server, with one identity for
+  each independently scheduled GPU resource pool
 - one local agent per registered machine
 - machine-local GPU, PID, local launch backend state, and runtime state
 - experiment sets containing tens or hundreds of independent commands
@@ -334,7 +335,19 @@ fencing data do not exist before claim.
 
 ### 6.4 Machine
 
-A Machine is one registered execution resource with a local agent.
+A Machine is one registered, independently scheduled GPU resource pool with a local agent
+and local runtime. It is a qexp scheduling boundary, not a physical server identity or other
+physical machine entity.
+
+One physical server may expose multiple qexp Machines. For example, a server with eight GPUs
+may expose two Machines with four GPUs each. Each Machine owns only the GPUs visible and
+permitted to that Machine; qexp does not infer the physical server topology, discover GPUs
+assigned to other Machines, or coordinate reservations outside the current Machine boundary.
+
+Concurrently active Machines must not expose overlapping underlying GPU resources unless an
+external isolation layer guarantees exclusive access. Separate machine identities and local
+runtime directories do not by themselves prevent physical GPU oversubscription across
+overlapping resource pools.
 
 It owns:
 
@@ -344,7 +357,9 @@ It owns:
 - local process namespace and optional tmux-managed interactive sessions
 - machine heartbeat and snapshots
 
-A Machine may be a Task's home machine, a fallback worker, or both.
+A Machine may be the home machine for one Task and a fallback worker for another Task. For a
+single Task, its home machine remains eligible by definition and must not also be listed as a
+helper.
 
 ### 6.5 Submission Operation
 
@@ -1102,7 +1117,9 @@ Shared mode requires an explicit machine name:
 qexp init --shared-root /path/to/project/.qexp --machine gpu2a
 ```
 
-Hostname is descriptive metadata, not the primary identity.
+The machine name identifies the qexp GPU resource pool; it does not identify a physical server.
+Multiple Machines on one physical server must use distinct machine names and independent local
+runtime roots.
 
 ### 15.3 On-Demand Agent by Default
 
@@ -1212,6 +1229,8 @@ The target CLI also does not promise aliases for the old flat `list`, `inspect`,
 ## 17. Acceptance Checklist
 
 - [ ] Shared mode requires explicit machine identity.
+- [ ] A machine is defined as an independently scheduled GPU resource pool, not a physical
+      server entity; one physical server may expose multiple non-overlapping machines.
 - [ ] One project uses one shared `.qexp` control plane.
 - [ ] Single Task submission remains YAML-free.
 - [ ] New submissions create no public Batch identity.
