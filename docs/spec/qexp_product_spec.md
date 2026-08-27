@@ -986,20 +986,27 @@ Retry rules:
 - Task ID remains stable
 - Task totals do not increase
 - historical Attempts remain auditable
-- retry is allowed only when both the Task projection and current Attempt are failed
+- retry is allowed when no active claim exists and either the Task projection and current
+  Attempt are both failed, or the Task is blocked and its current Attempt is orphaned
 - retry reserves the next attempt number; claim materializes the concrete Attempt record
 - stale historical failures are not retried after a newer Attempt exists
 
-Blocked orphaned work is not an ordinary failed retry. If cleanup cannot be proven, the
-only override is explicit:
+For blocked orphaned work, the ordinary manual retry command is itself the explicit operator
+decision:
 
 ```bash
-qexp task retry <task-id> --acknowledge-duplicate-risk
+qexp task retry <task-id>
 ```
 
-This preserves the orphaned Attempt, records the acknowledgement, and queues the next
-Attempt without claiming that the old process stopped. Group retry-failed never applies
-this override.
+Under the Task lock, retry verifies that no active claim exists, increments the fencing epoch,
+records an `orphan_superseded_by_retry` audit event, preserves the orphaned Attempt as historical
+truth, clears the current Attempt reference, and queues the same Task. The next claim creates a
+new Attempt with a higher fencing token.
+
+Retry supersedes the old Attempt's qexp execution authority. It does not inspect the old machine,
+claim that the old process stopped, or undo external side effects. No additional duplicate-risk
+acknowledgement flag is required. `qexp group retry-failed` remains limited to failed Tasks and
+never selects blocked or orphaned work.
 
 Task cancellation semantics:
 

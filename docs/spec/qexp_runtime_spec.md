@@ -1391,12 +1391,15 @@ an obsolete process.
 
 ## 16. Retry Protocol
 
-`qexp task retry <task-id>` is accepted only when the Task's current Attempt is failed.
+`qexp task retry <task-id>` is accepted only when no active claim exists and either:
 
-Under the Task lock it:
+- the Task projection and current Attempt are both `failed`; or
+- the Task projection is `blocked` and the current Attempt is `orphaned`.
+
+For a failed Task, under the Task lock it:
 
 1. validates no active claim exists
-2. validates Task is not blocked, queued, running, succeeded, or cancelled
+2. validates the Task projection and current Attempt are both `failed`
 3. changes Task projection to queued
 4. preserves command, Group, home, sharing, and fallback policy
 5. restores queue scope according to the preserved placement runtime contract
@@ -1410,20 +1413,28 @@ revision, then applies the same Task retry transition only to Tasks whose curren
 projection and current Attempt are failed. A historical failure behind a newer Attempt is
 never selected.
 
-Blocked or orphaned work requires recovery, not ordinary retry. A duplicate-risk override
-must be explicit.
+For a blocked Task whose current Attempt is orphaned, the same manual retry command is the
+explicit operator decision. Under the Task lock it atomically:
 
-`qexp task retry <task-id> --acknowledge-duplicate-risk` may override an unresolved
-orphan only when the Task is blocked and the current Attempt is orphaned. Under the Task
-lock it:
+1. validates no active claim exists
+2. validates the Task projection is `blocked` and the current Attempt is `orphaned`
+3. increments the Task fencing epoch
+4. records an `orphan_superseded_by_retry` audit event containing the old Attempt ID, old
+   fencing token, operator, and timestamp
+5. clears `current_attempt_id` while preserving the old Attempt number, record, and expired
+   token history
+6. restores queue scope according to the preserved placement runtime contract and changes
+   the Task projection to `queued`
 
-1. records the operator acknowledgement and reason in an audit event
-2. preserves the orphaned Attempt and expired token history
-3. increments the Task fencing epoch so the next claim receives newer authority
-4. queues the same Task for its next Attempt
+The next winning claim creates a new Attempt with a higher fencing token. The old Attempt
+remains `orphaned`, and every late write carrying its obsolete authority is rejected.
 
-This override does not stop the old process or undo external side effects. It is never
-used by automatic retry or Group retry-failed.
+Retry supersedes the old Attempt's qexp execution authority. It does not inspect the old
+machine, assert physical process termination, or undo external side effects. The manual retry
+command requires no additional duplicate-risk acknowledgement flag. During one compatibility
+cycle, an existing `--acknowledge-duplicate-risk` argument may be accepted only as a deprecated
+no-op and must not change the transition. Automatic retry and `qexp group retry-failed` never
+select blocked or orphaned work.
 
 ## 17. Agent Lifecycle
 
@@ -1580,7 +1591,8 @@ The runtime implementation is not releasable until tests demonstrate:
 - recovery CAS issues a new token only for the same orphaned Attempt
 - grouped recovery obeys Group-then-Task lock order, Worker Set state, and termination
   barriers while allowing pause semantics
-- duplicate-risk retry requires explicit acknowledgement and is excluded from Group retry
+- manual retry can supersede an unclaimed blocked/orphaned Attempt without an additional risk
+  flag, issues a higher fencing epoch, and remains excluded from Group retry
 - Group cancellation progress and pending acknowledgements survive process restart
 - on-demand idle exit does not abandon processes, reservations, or repair work
 - daemon background startup preserves daemon mode
