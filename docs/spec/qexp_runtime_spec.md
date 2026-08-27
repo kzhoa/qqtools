@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-07
+updated_at: 2026-08-27
 archived_at:
 ---
 
@@ -694,7 +694,6 @@ machines/<machine-name>/machine.json
 Required fields include:
 
 - stable `machine_name`
-- hostname as descriptive metadata
 - project and shared-root identity
 - local runtime root
 - agent mode
@@ -706,8 +705,6 @@ In shared mode, machine identity is explicit:
 ```bash
 qexp init --shared-root /path/to/project/.qexp --machine gpu2a
 ```
-
-Hostname is never the primary machine key.
 
 ### 8.8 Agent and Snapshot Truth
 

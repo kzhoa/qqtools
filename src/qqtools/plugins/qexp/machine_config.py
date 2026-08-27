@@ -1,7 +1,6 @@
 """Machine metadata lifecycle, including compatibility normalization."""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from .config_types import MachinePolicy, RootConfig
@@ -17,7 +16,6 @@ def save_machine_config(cfg: RootConfig, *, agent_mode: str | None) -> None:
         current = load_machine_record(cfg) or {}
         current["machine"] = {
             "machine_name": cfg.machine_name,
-            "hostname": os.uname().nodename,
             "project_id": project_id(cfg.shared_root),
             "shared_root": str(cfg.shared_root),
             "runtime_root": str(cfg.runtime_root),
