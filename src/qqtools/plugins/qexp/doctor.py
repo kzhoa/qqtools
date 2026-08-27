@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .commands.cleanup import reconcile_cleanup_operations
@@ -56,7 +57,29 @@ def _records_by_stem(directory: Any, key: str, issues: list[dict[str, Any]],
     return records
 
 
-def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
+def verify_integrity(
+    cfg: RootConfig,
+    *,
+    reservation_runtime_root: Path | None = None,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Verify shared truth and the selected project's local execution evidence.
+
+    Args:
+        cfg: Project configuration using the authoritative local runtime root.
+        reservation_runtime_root: Reservation store to verify.
+        project_id: Project filter for a machine-wide reservation store.
+
+    Returns:
+        Integrity summary and discovered issues.
+    """
+    if reservation_runtime_root is None:
+        from .machine_runtime import resolve_execution_context
+
+        context = resolve_execution_context(cfg)
+        cfg = context.local_cfg
+        reservation_runtime_root = context.reservation_root
+        project_id = context.project_id
     validate_root_contract(cfg)
     issues: list[dict[str, Any]] = []
     paths = shared_paths(cfg.shared_root)
@@ -212,11 +235,13 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
             _issue(issues, "availability_operation_incomplete", operation_path, "high")
         if not task_path(cfg.shared_root, task_id).exists() and task_id not in cleaned:
             _issue(issues, "availability_operation_task_missing", operation_path, "high")
-    for reservation_path in iter_json(local_paths(cfg.runtime_root)["active"]):
+    for reservation_path in iter_json(local_paths(reservation_runtime_root)["active"]):
         try:
             reservation = read_json(reservation_path)["reservation"]
         except (KeyError, OSError, ValueError) as exc:
             _issue(issues, "reservation_invalid", reservation_path, "high", str(exc))
+            continue
+        if project_id is not None and reservation.get("project_id") != project_id:
             continue
         task_file = task_path(cfg.shared_root, reservation["task_id"])
         if not task_file.exists():
@@ -306,7 +331,15 @@ def verify_integrity(cfg: RootConfig) -> dict[str, Any]:
                                  "scheduling_capability": "full" if capability.is_healthy else "local-safe"}}
 
 
-def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
+def repair_metadata(
+    cfg: RootConfig, *, reservation_runtime_root: Path | None = None
+) -> dict[str, Any]:
+    if reservation_runtime_root is None:
+        from .machine_runtime import resolve_execution_context
+
+        context = resolve_execution_context(cfg)
+        cfg = context.local_cfg
+        reservation_runtime_root = context.reservation_root
     repaired: list[str] = []
     blocked: list[str] = []
     operations = shared_paths(cfg.shared_root)["submissions"]
@@ -330,7 +363,9 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
             repaired.append(operation["operation_id"])
         else:
             blocked.append(operation["operation_id"])
-    for result in reconcile_cleanup_operations(cfg):
+    for result in reconcile_cleanup_operations(
+            cfg, reservation_runtime_root=reservation_runtime_root
+    ):
         if result["state"] == "completed":
             repaired.append(result["operation_id"])
         else:
@@ -392,7 +427,7 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
         for result in post_commit_results:
             if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
                 from .runtime.reservations import release
-                release(cfg.runtime_root, result.reservation_id, "group_cancelled_before_launch")
+                release(reservation_runtime_root or cfg.runtime_root, result.reservation_id, "group_cancelled_before_launch")
             if result.event:
                 dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
         pending: dict[str, list[str]] = {}
@@ -428,7 +463,7 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
     for control in reconcile_group_cancel_operations(cfg):
         if control["operation_id"] not in repaired:
             repaired.append(control["operation_id"])
-    orphan_result = repair_orphans(cfg)
+    orphan_result = repair_orphans(cfg, reservation_runtime_root=reservation_runtime_root)
     repaired.extend(task_id for task_id in orphan_result["repaired"] if task_id not in repaired)
     blocked.extend(item["task_id"] for item in orphan_result["blocked"]
                    if item["task_id"] not in blocked)
@@ -436,7 +471,9 @@ def repair_metadata(cfg: RootConfig) -> dict[str, Any]:
             "message": "Submission and Group control operations reconciled."}
 
 
-def repair_orphans(cfg: RootConfig) -> dict[str, Any]:
+def repair_orphans(
+    cfg: RootConfig, *, reservation_runtime_root: Path | None = None
+) -> dict[str, Any]:
     from .runtime.recovery import recover_running_attempt
     from .scheduler import (_process_evidence_state, finalize_orphaned_attempt)
     repaired: list[str] = []
@@ -471,6 +508,7 @@ def repair_orphans(cfg: RootConfig) -> dict[str, Any]:
             token = recover_running_attempt(
                 cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token,
                 manifest=process,
+                reservation_runtime_root=reservation_runtime_root,
             )
             if token is not None:
                 repaired.append(task.task_id)
@@ -480,7 +518,10 @@ def repair_orphans(cfg: RootConfig) -> dict[str, Any]:
             is_terminated = bool(task.control.get("terminate_running"))
             if finalize_orphaned_attempt(
                     cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token,
-                    exit_code=process.get("exit_code"), was_terminated=is_terminated):
+                    exit_code=process.get("exit_code"),
+                    was_terminated=is_terminated,
+                    reservation_runtime_root=reservation_runtime_root,
+            ):
                 process["observed_state"] = "exited"
                 process["reconciled_at"] = utc_now()
                 atomic_replace(manifest_path, {"process": process})

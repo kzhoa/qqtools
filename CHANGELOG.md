@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- breaking: replace qexp's per-project standalone agent runtime with one machine-global
+  `qexp agent` that owns scheduling, GPU reservations, and local process supervision across all
+  registered projects. New projects now require an explicit `qexp agent add-project`; agent start
+  and automatic activation no longer register the current project implicitly.
+- feat: add qexp machine-agent project lifecycle commands for listing, disabling, and safely
+  removing registered projects. Disabled projects drain existing local supervision before removal,
+  while enabled projects share deterministic fair scheduling.
+- feat: add the explicit, recoverable `qexp agent migrate-project` handoff for projects created by
+  older qqtools releases. Migration verifies and stops only the matching legacy agent, preserves
+  running training processes and reservations, drains late runner evidence, and resumes safely
+  after interruption.
+- fix: serialize machine-agent start, stop, restart, and automatic activation through one lifecycle
+  lock, preventing concurrent commands from spawning competing agent processes or failing after
+  another invocation wins startup.
+- fix: make machine-agent restart wait for the previous process identity to exit before starting
+  its replacement, preventing an early identity cleanup from racing scheduler-authority release.
+- fix: prevent a project from creating new claims in a machine-agent cycle when legacy-evidence
+  draining, durable maintenance, or authority supervision failed earlier in that cycle.
+- fix: preserve per-project authority supervision and agent lifecycle timestamps across dispatch
+  cycles so lease-renewal throttling, failure state, uptime, and continuous idle duration remain
+  accurate.
+
 ## v1.3.7
 
 - fix: accept comma-separated machine names in `qexp task share --with` alongside repeated flags

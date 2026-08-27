@@ -21,7 +21,8 @@ def _is_expired(value: dict[str, Any]) -> bool:
 
 
 def reserve(runtime_root: Path, task_id: str, gpu_ids: list[int], *, attempt_id: str | None = None,
-            fencing_token: int | None = None) -> dict[str, Any]:
+            fencing_token: int | None = None, project_id: str | None = None,
+            shared_root: str | None = None, machine_name: str | None = None) -> dict[str, Any]:
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
         for path in iter_json(paths["provisional"]):
@@ -37,6 +38,7 @@ def reserve(runtime_root: Path, task_id: str, gpu_ids: list[int], *, attempt_id:
             raise ValueError("requested GPU is already reserved by qexp.")
         reservation_id = new_id()
         value = {"reservation": {"reservation_id": reservation_id, "acquisition_id": new_id(),
+            "project_id": project_id, "shared_root": shared_root, "machine_name": machine_name,
             "task_id": task_id, "attempt_id": attempt_id, "fencing_token": fencing_token,
             "gpu_ids": list(gpu_ids), "state": "provisional", "created_at": utc_now(),
             "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=PROVISIONAL_TTL_SECONDS)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -95,8 +97,13 @@ def release(runtime_root: Path, reservation_id: str, reason: str = "completed") 
 def reserved_gpu_ids(runtime_root: Path) -> set[int]:
     paths = local_paths(runtime_root)
     active = {gpu for path in iter_json(paths["active"]) for gpu in read_json(path)["reservation"]["gpu_ids"]}
-    provisional = {gpu for path in iter_json(paths["provisional"])
-                   for gpu in read_json(path)["reservation"]["gpu_ids"] if not _is_expired(read_json(path))}
+    provisional = {
+        gpu
+        for path in iter_json(paths["provisional"])
+        for value in [read_json(path)]
+        if not _is_expired(value)
+        for gpu in value["reservation"]["gpu_ids"]
+    }
     return active | provisional
 
 

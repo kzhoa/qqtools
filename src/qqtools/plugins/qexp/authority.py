@@ -1,6 +1,7 @@
 """Agent-owned runtime authority for locally registered qexp processes."""
 from __future__ import annotations
 
+import shutil
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -25,8 +26,9 @@ from .scheduler import (authority_locks, commit_shared_termination, renew_attemp
 class AuthoritySupervisor:
     """The sole local writer of live-process authority, termination, and terminal truth."""
 
-    def __init__(self, cfg: RootConfig) -> None:
+    def __init__(self, cfg: RootConfig, *, reservation_runtime_root: Path | None = None) -> None:
         self.cfg = cfg
+        self.reservation_runtime_root = reservation_runtime_root or cfg.runtime_root
         self._last_renewal: dict[str, float] = {}
         self._failures: dict[str, int] = {}
         self._states: dict[str, str] = {}
@@ -46,6 +48,7 @@ class AuthoritySupervisor:
                             send_signals(self.cfg, value["attempt_id"], value["decision_id"])
 
     def tick(self) -> None:
+        self._remove_terminal_evidence()
         self._materialize_registrations()
         for path in iter_json(local_paths(self.cfg.runtime_root)["processes"]):
             process = read_json(path).get("process", {})
@@ -220,6 +223,9 @@ class AuthoritySupervisor:
         token = process.get("fencing_token")
         if not isinstance(task_id, str) or not isinstance(attempt_id, str) or not isinstance(token, int):
             return
+        if self._has_terminal_attempt(task_id, attempt_id):
+            self._remove_attempt_evidence(attempt_id)
+            return
         if process.get("observed_state") == "launch_unverifiable":
             self._record_diagnostic(process, "launch_unverifiable")
             return
@@ -247,6 +253,79 @@ class AuthoritySupervisor:
             self._finalize(task_id, attempt_id, token, exit_code, was_terminated=False)
             return
         self._renew_or_isolate(task_id, attempt_id, token, process)
+
+    def _has_terminal_attempt(self, task_id: str, attempt_id: str) -> bool:
+        for path in iter_json(self.cfg.shared_root / "attempts" / task_id):
+            try:
+                attempt = AttemptRecord.from_dict(read_json(path))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if attempt.attempt_id == attempt_id:
+                return attempt.phase in {"succeeded", "failed", "cancelled"}
+        return False
+
+    def _task_id_for_attempt(self, attempt_id: str) -> str | None:
+        attempts_root = self.cfg.shared_root / "attempts"
+        if not attempts_root.is_dir():
+            return None
+        for task_directory in sorted(attempts_root.iterdir()):
+            if not task_directory.is_dir():
+                continue
+            for path in iter_json(task_directory):
+                try:
+                    attempt = AttemptRecord.from_dict(read_json(path))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if attempt.attempt_id == attempt_id:
+                    return attempt.task_id
+        return None
+
+    def _remove_attempt_evidence(self, attempt_id: str) -> None:
+        paths = local_paths(self.cfg.runtime_root)
+        for name in (
+            "processes",
+            "registrations",
+            "observations",
+            "launch_intents",
+            "wrappers",
+            "authority_diagnostics",
+        ):
+            (paths[name] / f"{attempt_id}.json").unlink(missing_ok=True)
+        shutil.rmtree(paths["termination_decisions"] / attempt_id, ignore_errors=True)
+
+    def _remove_terminal_evidence(self) -> None:
+        paths = local_paths(self.cfg.runtime_root)
+        attempt_ids: set[str] = set()
+        for name in (
+            "processes",
+            "registrations",
+            "observations",
+            "launch_intents",
+            "wrappers",
+            "authority_diagnostics",
+        ):
+            attempt_ids.update(path.stem for path in iter_json(paths[name]))
+        if paths["termination_decisions"].is_dir():
+            attempt_ids.update(
+                path.name for path in paths["termination_decisions"].iterdir() if path.is_dir()
+            )
+        for attempt_id in attempt_ids:
+            task_id = None
+            for name, record_key in (
+                ("processes", "process"),
+                ("registrations", "process_registration"),
+                ("launch_intents", "launch_intent"),
+            ):
+                path = paths[name] / f"{attempt_id}.json"
+                if not path.exists():
+                    continue
+                value = read_json(path).get(record_key, {}).get("task_id")
+                if isinstance(value, str):
+                    task_id = value
+                    break
+            task_id = task_id or self._task_id_for_attempt(attempt_id)
+            if task_id is not None and self._has_terminal_attempt(task_id, attempt_id):
+                self._remove_attempt_evidence(attempt_id)
 
     def _renew_or_isolate(self, task_id: str, attempt_id: str, token: int, process: dict[str, object]) -> None:
         now = datetime.now(timezone.utc).timestamp()
@@ -282,7 +361,14 @@ class AuthoritySupervisor:
             else:
                 self._set_authority_state(process, "suspect")
             return
-        resolution = resolve_execution_authority(self.cfg, task_id, attempt_id, token, uuid.uuid4().hex)
+        resolution = resolve_execution_authority(
+            self.cfg,
+            task_id,
+            attempt_id,
+            token,
+            uuid.uuid4().hex,
+            reservation_runtime_root=self.reservation_runtime_root,
+        )
         if resolution.outcome in {AuthorityResolutionOutcome.RENEWED, AuthorityResolutionOutcome.RECOVERED}:
             self._set_authority_state(process, "healthy")
             return
@@ -334,7 +420,7 @@ class AuthoritySupervisor:
         if result.outcome != "committed":
             return
         if result.reservation_id and result.reservation_machine_name == self.cfg.machine_name:
-            release(self.cfg.runtime_root, result.reservation_id, reason)
+            release(self.reservation_runtime_root, result.reservation_id, reason)
         manifest_path = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
         process = read_json(manifest_path).get("process", {})
         if (process.get("task_id") == task_id and process.get("attempt_id") == attempt_id
@@ -344,3 +430,4 @@ class AuthoritySupervisor:
             atomic_replace(manifest_path, {"process": process})
         if result.event:
             dispatch_task_lifecycle_hooks_noexcept(self.cfg, result.event)
+        self._remove_attempt_evidence(attempt_id)

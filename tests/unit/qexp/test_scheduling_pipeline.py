@@ -7,7 +7,7 @@ from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands.task import cancel, retry
 from qqtools.plugins.qexp.executor import Executor
 from qqtools.plugins.qexp.runtime.reservations import reserved_gpu_ids
-from qqtools.plugins.qexp.runtime.paths import attempt_path
+from qqtools.plugins.qexp.runtime.paths import attempt_path, shared_paths
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -98,23 +98,32 @@ def test_cancel_running_task_persists_termination_intent_by_default(tmp_path: Pa
     assert cancelled.control["terminate_running"] is True
 
 
-def test_blocked_orphan_retry_requires_duplicate_risk_acknowledgement(tmp_path: Path):
+def test_blocked_orphan_retry_supersedes_orphan_and_records_audit_event(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    with pytest.raises(ValueError, match="failed Task"):
-        retry(cfg, task.task_id)
-    queued = retry(cfg, task.task_id, acknowledge_duplicate_risk=True)
+
+    queued = retry(cfg, task.task_id)
+
     current = AttemptRecord.from_dict(read_json(attempt_path(
         cfg.shared_root, task.task_id, attempt.attempt_number
     )))
-    assert queued.state["projection"] == "queued"
-    assert current.phase == "orphaned"
+    events = [read_json(path) for path in shared_paths(cfg.shared_root)["events"].glob("*/*.json")]
+    audit_event = next(event for event in events if event["event_type"] == "orphan_superseded_by_retry")
+    assert queued.state == {"projection": "queued", "reason": "orphan_superseded_by_retry"}
+    assert queued.claim_control["active_claim"] is None
     assert queued.claim_control["fencing_epoch"] == attempt.current_fencing_token + 1
-    assert queued.control["duplicate_risk_attempt_id"] == attempt.attempt_id
+    assert queued.attempt_control["current_attempt_id"] is None
+    assert queued.attempt_control["current_attempt_number"] == attempt.attempt_number
+    assert current.phase == "orphaned"
+    assert audit_event["task_id"] == task.task_id
+    assert audit_event["details"]["attempt_id"] == attempt.attempt_id
+    assert audit_event["details"]["fencing_token"] == attempt.current_fencing_token
+    assert audit_event["details"]["operator"] == cfg.machine_name
+    assert isinstance(audit_event["details"]["timestamp"], str)
 
 
 def test_agent_does_not_acknowledge_unconfirmed_termination(tmp_path: Path, monkeypatch):

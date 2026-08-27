@@ -10,7 +10,7 @@ from qqtools.plugins.qexp.cli import _split_machine_list, main
 from qqtools.plugins.qexp.commands.group import change_worker
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
-from qqtools.plugins.qexp.agent import _offer_due_tasks
+from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
 from qqtools.plugins.qexp.runtime import availability as availability_runtime
 from qqtools.plugins.qexp.runtime.availability import rebuild_deadline_indexes
 from qqtools.plugins.qexp.runtime.paths import shared_paths
@@ -224,7 +224,7 @@ def test_agent_removes_stale_deadline_index_without_skipping_remaining_work(tmp_
     task = submit(cfg, ["echo", "ok"], group="exp")
     task_commands.share(cfg, task.task_id, after_seconds=0)
 
-    _offer_due_tasks(cfg)
+    offer_due_tasks(cfg)
 
     assert not stale.exists()
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"

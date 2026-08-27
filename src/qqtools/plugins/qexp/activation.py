@@ -1,124 +1,132 @@
-"""Local qexp agent lifecycle control plane."""
+"""Global qexp agent lifecycle helpers."""
 from __future__ import annotations
 
 import os
-import signal
-import time
 from collections.abc import Callable
 
-from .agent import get_agent_status
-from .agent_process import spawn_agent_process
 from .config_types import RootConfig
 from .events import write_event
-from .layout import runtime_pid_path
-from .machine_config import load_machine_policy
-from .runtime.locks import exclusive
-from .scheduler import has_eligible_local_work
+from .machine_agent import (
+    ensure_machine_agent_started,
+    get_machine_agent_status,
+    restart_machine_agent,
+    run_machine_agent_loop,
+    stop_machine_agent,
+)
+from .machine_config import is_legacy_agent_project
+from .machine_runtime import MachineRuntime, ProjectBinding
 
 
-def ensure_local_agent_active(cfg: RootConfig, *, reason: str) -> bool:
-    action, _ = start_local_agent(cfg, reason=reason, require_eligible_work=True)
-    return action == "started"
+def managed_project_agent_status(
+    cfg: RootConfig, *, machine_runtime: MachineRuntime | None = None
+) -> tuple[MachineRuntime, ProjectBinding, dict[str, object]] | None:
+    """Return global-agent ownership details for a registered project."""
+    runtime = machine_runtime or MachineRuntime()
+    binding = runtime.matching_binding(cfg)
+    if binding is None:
+        return None
+    status = get_machine_agent_status(runtime)
+    return runtime, binding, {
+        **status,
+        "managed_by_machine": True,
+        "project_id": binding.project_id,
+        "project_state": runtime.binding_state(binding),
+    }
+
+
+def _registration_error(cfg: RootConfig) -> RuntimeError:
+    if is_legacy_agent_project(cfg):
+        return RuntimeError("legacy project metadata detected; run 'qexp agent migrate-project'.")
+    return RuntimeError("project is not registered; run 'qexp agent add-project'.")
+
+
+def _ensure_machine_agent_started(
+    runtime: MachineRuntime,
+) -> tuple[bool, dict[str, object]]:
+    """Start the machine agent once through the shared lifecycle lock."""
+    process, status = ensure_machine_agent_started(runtime)
+    return process is not None, status
+
+
+def ensure_managed_project_agent_active(
+    cfg: RootConfig, *, machine_runtime: MachineRuntime | None = None
+) -> tuple[str, dict[str, object]] | None:
+    managed = managed_project_agent_status(cfg, machine_runtime=machine_runtime)
+    if managed is None:
+        return None
+    runtime, _binding, status = managed
+    if status["is_running"]:
+        return "already_running", status
+    is_started, status = _ensure_machine_agent_started(runtime)
+    return ("started" if is_started else "already_running"), status
+
+
+def ensure_local_agent_active(
+    cfg: RootConfig, *, reason: str, machine_runtime: MachineRuntime | None = None
+) -> bool:
+    """Ensure the current project is served by the sole machine agent."""
+    del reason
+    runtime = machine_runtime or MachineRuntime()
+    if runtime.matching_binding(cfg) is None:
+        raise _registration_error(cfg)
+    is_started, _status = _ensure_machine_agent_started(runtime)
+    return is_started
 
 
 def start_local_agent(
-        cfg: RootConfig, *, reason: str, require_eligible_work: bool) -> tuple[str, dict[str, object]]:
-    """Start a detached local agent unless one is already active."""
-    policy = load_machine_policy(cfg)
+    cfg: RootConfig, *, reason: str, require_eligible_work: bool,
+    machine_runtime: MachineRuntime | None = None,
+) -> tuple[str, dict[str, object]]:
+    """Compatibility wrapper that starts the unique machine agent."""
+    del require_eligible_work
+    runtime = machine_runtime or MachineRuntime()
+    if runtime.matching_binding(cfg) is None:
+        raise _registration_error(cfg)
+    is_started, status = _ensure_machine_agent_started(runtime)
+    if not is_started:
+        return "already_running", status
     write_event(
         cfg,
-        "agent_activation_requested",
-        details={"reason": reason, "agent_mode": policy.agent_mode},
+        "agent_activation_started",
+        details={"reason": reason, "agent_mode": "machine", "pid": status["pid"]},
     )
-    if get_agent_status(cfg).get("is_running"):
-        return "already_running", get_agent_status(cfg)
-    if require_eligible_work and not has_eligible_local_work(cfg):
-        return "no_eligible_work", get_agent_status(cfg)
-
-    activation_lock = cfg.runtime_root / "locks" / "activation.lock"
-    with exclusive(activation_lock, blocking=False) as acquired:
-        if not acquired:
-            return "already_running", get_agent_status(cfg)
-        status = get_agent_status(cfg)
-        if status.get("is_running"):
-            return "already_running", status
-        if require_eligible_work and not has_eligible_local_work(cfg):
-            return "no_eligible_work", get_agent_status(cfg)
-        process = spawn_agent_process(cfg)
-        write_event(
-            cfg,
-            "agent_activation_started",
-            details={"reason": reason, "agent_mode": policy.agent_mode, "pid": process.pid},
-        )
-        return "started", _active_status(cfg, process.pid)
+    return "started", status
 
 
 def run_local_agent_foreground(
-        cfg: RootConfig, *, reason: str, on_started: Callable[[dict[str, object]], None]) -> None:
-    """Run one agent in the current process after claiming lifecycle ownership."""
-    policy = load_machine_policy(cfg)
-    activation_lock = cfg.runtime_root / "locks" / "activation.lock"
-    with exclusive(activation_lock, blocking=False) as acquired:
-        if not acquired:
-            raise RuntimeError("qexp agent startup is already in progress.")
-        if get_agent_status(cfg).get("is_running"):
-            raise RuntimeError("qexp agent is already running; use 'qexp agent status'.")
-        write_event(
-            cfg,
-            "agent_activation_started",
-            details={"reason": reason, "agent_mode": policy.agent_mode, "pid": os.getpid()},
-        )
-        on_started(_active_status(cfg, os.getpid()))
-        from .agent import run_agent_loop
-        run_agent_loop(cfg, exit_when_idle=policy.exit_when_idle)
+    cfg: RootConfig, *, reason: str, on_started: Callable[[dict[str, object]], None],
+    machine_runtime: MachineRuntime | None = None,
+) -> None:
+    """Run the unique machine agent in the foreground."""
+    runtime = machine_runtime or MachineRuntime()
+    if runtime.matching_binding(cfg) is None:
+        raise _registration_error(cfg)
+    if get_machine_agent_status(runtime)["is_running"]:
+        raise RuntimeError("machine agent is already running; use 'qexp agent status'.")
+    write_event(
+        cfg,
+        "agent_activation_started",
+        details={"reason": reason, "agent_mode": "machine", "pid": os.getpid()},
+    )
+    on_started({"agent_state": "starting", "is_running": False, "machine_runtime_root": str(runtime.root)})
+    run_machine_agent_loop(runtime)
 
 
 def stop_local_agent(
-        cfg: RootConfig, *, timeout_seconds: float = 2.0) -> tuple[str, dict[str, object]]:
-    """Stop the local coordination process without terminating task processes."""
-    status = get_agent_status(cfg)
-    pid_path = runtime_pid_path(cfg)
-    if not status.get("is_running"):
-        pid_path.unlink(missing_ok=True)
-        return "already_stopped", _stopped_status(cfg)
-    pid = status["pid"]
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pid_path.unlink(missing_ok=True)
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline and get_agent_status(cfg).get("is_running"):
-        time.sleep(0.05)
-    if get_agent_status(cfg).get("is_running"):
-        raise RuntimeError(f"qexp agent pid {pid} did not stop within {timeout_seconds:g} seconds.")
-    pid_path.unlink(missing_ok=True)
-    return "stopped", _stopped_status(cfg)
+    cfg: RootConfig, *, timeout_seconds: float = 10.0, machine_runtime: MachineRuntime | None = None
+) -> tuple[str, dict[str, object]]:
+    """Stop the unique machine agent without terminating task processes."""
+    del cfg
+    runtime = machine_runtime or MachineRuntime()
+    stopped = stop_machine_agent(runtime, timeout=timeout_seconds)
+    return ("stopped" if stopped else "already_stopped"), get_machine_agent_status(runtime)
 
 
-def restart_local_agent(cfg: RootConfig) -> tuple[str, dict[str, object]]:
-    """Stop the current agent, then start one detached replacement."""
-    previous_pid = get_agent_status(cfg).get("pid")
-    stop_local_agent(cfg)
-    action, status = start_local_agent(cfg, reason="restart", require_eligible_work=False)
-    if action != "started":
-        raise RuntimeError("qexp agent restart could not start a replacement process.")
-    status["previous_pid"] = previous_pid
-    return "restarted", status
-
-
-def _active_status(cfg: RootConfig, pid: int) -> dict[str, object]:
-    return {
-        "machine_name": cfg.machine_name,
-        "agent_state": "active",
-        "pid": pid,
-        "is_running": True,
-    }
-
-
-def _stopped_status(cfg: RootConfig) -> dict[str, object]:
-    return {
-        "machine_name": cfg.machine_name,
-        "agent_state": "stopped",
-        "pid": None,
-        "is_running": False,
-    }
+def restart_local_agent(
+    cfg: RootConfig, *, machine_runtime: MachineRuntime | None = None
+) -> tuple[str, dict[str, object]]:
+    """Restart the unique machine agent."""
+    del cfg
+    runtime = machine_runtime or MachineRuntime()
+    process = restart_machine_agent(runtime)
+    return "restarted", {**get_machine_agent_status(runtime), "pid": process.pid}

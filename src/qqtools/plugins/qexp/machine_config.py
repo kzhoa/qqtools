@@ -9,6 +9,8 @@ from .layout import (initialize_shared_root, load_machine_record, project_id,
 from .policy import normalize_agent_mode, resolve_machine_policy
 from .runtime.locks import machine_lock
 
+MACHINE_AGENT_RUNTIME = "machine"
+
 
 def save_machine_config(cfg: RootConfig, *, agent_mode: str | None) -> None:
     """Normalize and persist the current machine's metadata record."""
@@ -20,6 +22,7 @@ def save_machine_config(cfg: RootConfig, *, agent_mode: str | None) -> None:
             "shared_root": str(cfg.shared_root),
             "runtime_root": str(cfg.runtime_root),
             "agent_mode": normalize_agent_mode(agent_mode),
+            "agent_runtime": MACHINE_AGENT_RUNTIME,
         }
         save_machine_record(cfg, current)
 
@@ -29,6 +32,12 @@ def load_machine_policy(cfg: RootConfig) -> MachinePolicy:
     record = load_machine_record(cfg)
     raw_mode = record.get("machine", {}).get("agent_mode") if record else None
     return resolve_machine_policy(raw_mode)
+
+
+def is_legacy_agent_project(cfg: RootConfig) -> bool:
+    """Return whether this machine record predates the global-agent runtime."""
+    record = load_machine_record(cfg) or {}
+    return record.get("machine", {}).get("agent_runtime") != MACHINE_AGENT_RUNTIME
 
 
 def init_shared_root(shared_root: Path, machine_name: str, *, agent_mode: str = "on_demand",

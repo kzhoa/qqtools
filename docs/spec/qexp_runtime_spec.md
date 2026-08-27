@@ -132,24 +132,48 @@ guarantee equal observability, ergonomics, or performance for that non-`tmux` pa
 qexp does not snapshot source code. A Task executes the files visible on its execution
 machine at launch time.
 
-### 3.3 Machine-Local Runtime Root
+### 3.3 Project-Local Runtime Root
 
-Each machine has a private runtime root, recommended as:
+Standalone operation retains its existing project-local `RootConfig.runtime_root` for its agent
+PID, reservations, process manifests, wrapper controls, and recovery evidence. It remains local
+and never becomes shared project authority.
+
+### 3.4 MachineRuntime Root and Project Registry
+
+Machine-agent operation adds one disposable, user-local `MachineRuntime` per qexp Machine. Its
+root is `QEXP_MACHINE_RUNTIME_ROOT` when set, otherwise:
 
 ```text
-~/.qqtools/qexp-runtime/<project-id>/<machine-name>/
+~/.qqtools/qexp-machine/
 ```
 
-It contains:
+The resolver canonicalizes the path without creating it. It rejects an existing non-directory or
+a project `.qexp` root. Scheduling and registry mutations create the layout and fail before their
+first write if it is not writable. Read-only project commands do not initialize this runtime.
+Deployment must provide user-local rather than shared control storage. It has no fallback to a
+project's runtime root.
+Every qexp agent process uses this resolver to acquire the same lifetime-held machine scheduler
+lock.
 
-- agent PID and local lifecycle state
-- provisional and active GPU reservations
-- local Attempt process manifests
-- wrapper control files
-- optional tmux references
-- machine-local recovery evidence
+`MachineRuntime` owns the registry, scheduler and registry locks, one unified GPU reservation
+set, global-agent PID/status, round-robin cursor, and project-ID-partitioned local process,
+launch, observation, termination, and recovery records. It does not own or duplicate Task,
+Group, Attempt, claim, lease, log, or terminal truth.
 
-Local runtime files are never global scheduling authority.
+A registry binding contains `project_id`, canonical `shared_root`, project-local `machine_name`,
+and `enabled`. `project_id` is the stable value in the project's `project/identity.json`; paths
+are only location and diagnostic data. Registry changes are serialized and revisioned. Duplicate
+stable IDs and duplicate canonical roots are rejected. Runtime state is derived as `enabled`,
+`draining` (disabled with local blockers), or `disabled` (disabled with no blockers). A binding
+may be removed only when disabled and all associated reservations, process/launch/observation
+records, termination decisions, and pending local convergence evidence are absent.
+After shared terminal truth commits, the agent consumes the corresponding process,
+registration, observation, launch-intent, and completed termination records. Successful removal
+deletes the binding's disposable project runtime partition before removing the registry entry.
+New-generation projects register explicitly with `qexp agent add-project` and may be added while
+the global agent is running. A project whose machine metadata predates the global runtime must use
+`qexp agent migrate-project`; the migration creates a disabled binding, stops only a verified old
+agent, imports local reservations and evidence, then enables the binding after the durable handoff.
 
 ## 4. Runtime Invariants
 
@@ -860,6 +884,52 @@ Reconciliation distinguishes three outcomes:
 - matching historical identity with a confirmed absent process permits recovery-finalize
 - mismatched or unverifiable identity remains blocked and retains its reservation
 
+### 9.4 Machine-Managed Local Identity and Authority
+
+For a machine-managed binding, the reservation and every local execution artifact are namespaced
+by stable project ID. Its authoritative local association is the composite
+`(project_id, task_id, attempt_id)` and also records canonical shared root and project-local
+machine name for validation and diagnostics. Project-local `task_id` or `attempt_id` alone must
+never identify a machine-managed reservation, process manifest, launch intent, registration,
+observation, wrapper, termination decision, tmux reference, or recovery operation.
+
+The machine scheduler lock is independent of project ID and is held continuously from local
+recovery through claim scanning, supervision, and final resource writes. Lock contention fails
+before a second agent reserves a GPU or creates a process.
+
+Disable commits only `enabled = false` under the registry lock. Subsequent global-agent cycles
+exclude that binding from new candidate scans. Disabled bindings continue reconciliation and
+terminal publication while blockers exist; removal remains rejected until those blockers are gone.
+
+Before dispatching an enabled or draining binding, the machine agent performs that project's
+durable maintenance: event and claim-archive convergence, cleanup and availability-operation
+reconciliation, elapsed-offer evaluation, and reservation reconciliation. Because reservations
+are machine-wide, reservation reconciliation filters by the binding's stable project ID before
+reading project Task or Attempt truth; it must never release another registered project's
+reservation.
+
+Machine runtime state is disposable. Loss of its registry, cursor, PID, reservation, or process
+records neither changes project truth nor proves an old process stopped. A replacement runtime
+requires explicit re-registration and may schedule queued work, but it does not recover or write
+a terminal outcome for executions evidenced only by the lost runtime. Project lease expiry and
+fencing retain the existing post-authorization safety outcome: orphaned Attempt, blocked Task,
+and no automatic replacement.
+
+### 9.5 Explicit Legacy Project Migration
+
+An existing Project without the global-agent machine-record marker is migrated only by explicit
+`qexp agent migrate-project`. The operation verifies the old PID through Linux process identity
+and its configured project arguments before signalling it. Process exit is checked against the
+same PID start identity so PID reuse cannot delay the handoff. Reservation transfer holds both the
+legacy and unified reservation locks while it re-reads, validates, writes, and removes records.
+After the old agent stops, its local evidence is moved once into the machine runtime. The machine
+agent subsequently drains only immutable registration, observation, and launch-intent records
+that a previously launched runner may still write, deleting each legacy source after the target
+write is durable. It enables the binding before recording the final `active` migration state.
+Migration progress and the operator-controlled binding state are independent: retrying an
+`active` migration never re-enables a disabled binding. The operation never automatically
+discovers, stops, or registers sibling projects.
+
 ## 10. Submission Protocol
 
 ### 10.1 Common Submission Pipeline
@@ -1129,7 +1199,27 @@ overload and heartbeat-based early offering require separate future contracts.
 
 ## 13. Claim and Launch Protocol
 
-### 13.1 Eligibility
+### 13.1 Machine-Agent Cross-Project Selection
+
+A machine agent scans only enabled registry bindings. For each binding it builds a project-local
+`RootConfig` and applies the existing project eligibility, lock, claim, lease, and fencing
+protocol without changing their semantics. Candidate selection is advisory; only the winning
+project-root claim authorizes execution.
+
+Enabled bindings are sorted lexically by stable project ID. The persisted cursor identifies the
+next starting binding. One cycle visits each binding at most once in that rotation. Missing or
+unknown cursor state starts at the first sorted binding. The agent continues after a project has
+no candidate, lacks capacity in the machine-wide reservation set, has an inaccessible working
+directory, or loses its project claim. After a successful claim it persists the successor of
+that binding; after a full round with no successful claim it persists the successor of the
+starting binding. This is deterministic, unweighted round-robin; it does not implement
+priorities, quotas, preemption, or project capacity reservations.
+
+The candidate working directory must be locally readable and searchable before claim. Failure
+is a per-project diagnostic and does not prevent other bindings from dispatching. A later launch
+failure follows the normal fenced terminal-compensation path.
+
+### 13.2 Eligibility
 
 Before reserving capacity, an agent verifies advisory eligibility. Before claiming, it
 must revalidate under authoritative locks:
@@ -1142,7 +1232,7 @@ must revalidate under authoritative locks:
 - shared queue claimant is allowed by Worker Set and fallback constraint
 - Task requires no more locally reservable qexp GPUs than available
 
-### 13.2 Provisional Reservation
+### 13.3 Provisional Reservation
 
 The agent creates a TTL-bound local provisional reservation keyed by an acquisition ID.
 It must not reserve more Tasks than it can promptly launch.
@@ -1150,7 +1240,7 @@ It must not reserve more Tasks than it can promptly launch.
 If shared-lock acquisition is delayed beyond the provisional TTL, the agent releases and
 restarts acquisition rather than extending capacity indefinitely without ownership.
 
-### 13.3 Global Claim
+### 13.4 Global Claim
 
 For a grouped Task, the agent acquires Group then Task lock. It validates eligibility and
 updates Task truth in one revision:
@@ -1172,7 +1262,7 @@ Attempt when storage permits, then releases the claim and reservation through th
 token. An allocated attempt number is never reused. No process may launch while Attempt
 truth is missing.
 
-### 13.4 Final Launch Gate
+### 13.5 Final Launch Gate
 
 Immediately before local process creation, the agent acquires Group then Task lock and
 validates:
@@ -1207,7 +1297,7 @@ This transition is the linearization point:
 
 A plain read followed by process creation is invalid.
 
-### 13.5 Process Creation
+### 13.6 Process Creation
 
 After launch authorization, the agent starts a passive runner. The runner writes its immutable
 launch intent, creates the guardian-owned training process under the assigned GPUs, writes one

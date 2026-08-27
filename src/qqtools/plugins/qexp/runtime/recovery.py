@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from ..config_types import RootConfig
 from ..lease import clock_capability, lease_expiry, load_lease_policy, persist_clock_observation
@@ -15,8 +16,10 @@ from .termination import attempt_control_lock, is_recovery_blocked
 
 
 def recover_running_attempt(cfg: RootConfig, task_id: str, attempt_id: str, expired_token: int,
-                            manifest: dict[str, object] | None = None) -> int | None:
+                            manifest: dict[str, object] | None = None,
+                            reservation_runtime_root: Path | None = None) -> int | None:
     """Restore authority only for a locally verified live orphaned process."""
+    reservation_root = reservation_runtime_root or cfg.runtime_root
     policy = load_lease_policy(cfg)
     capability = clock_capability(cfg, policy)
     if not capability.is_healthy or capability.observation is None:
@@ -72,7 +75,7 @@ def recover_running_attempt(cfg: RootConfig, task_id: str, attempt_id: str, expi
                 "provider": capability.observation.provider,
                 "observation_id": capability.observation.observation_id,
             }
-            if not retag(cfg.runtime_root, attempt.reservation_id, attempt_id, token):
+            if not retag(reservation_root, attempt.reservation_id, attempt_id, token):
                 return None
             task.claim_control.update({"fencing_epoch": token, "active_claim": {
             "claim_id": attempt_id, "attempt_id": attempt_id, "attempt_number": number,

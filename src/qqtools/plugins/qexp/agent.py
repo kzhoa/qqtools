@@ -1,47 +1,14 @@
-"""Local qexp agent lifecycle and scheduling loop."""
+"""Legacy-agent inspection helpers and GPU discovery."""
 from __future__ import annotations
 
 import os
-import signal
 import shutil
 import subprocess
-import time
-import uuid
 from typing import Any
 
-from .executor import Executor
-from .events import flush_local_events
 from .config_types import RootConfig
 from .layout import runtime_pid_path
-from .machine_config import load_machine_policy
-from .machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
-from .runtime.reservations import active_reservations, release, release_expired_provisionals, reserved_gpu_ids, retag
-from .runtime.claims import reconcile_claim_archives
-from .commands.cleanup import reconcile_cleanup_operations
-from .commands.group import reconcile_group_cancel_operations
-from .commands.task import offer
-from .runtime.availability import (elapsed_offer_is_proven, reconcile_availability_operations,
-                                   remove_deadline_index, sync_deadline_index)
-from .runtime.paths import attempt_path, shared_paths
-from .runtime.records import AttemptRecord, utc_now
-from .runtime.store import read_json
-from .runtime.placement import offer_due
-from .runtime.store import iter_json
-from .runtime.tasks import load_task
-from .scheduler import reconcile_running_tasks, run_dispatch_cycle
-from .authority import AuthoritySupervisor
 from .lease import clock_capability
-
-
-def _runtime_pid_value(pid_path) -> int:
-    if pid_path.exists():
-        try:
-            existing = int(pid_path.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            existing = 0
-        if existing > 0 and _pid_alive(existing):
-            return existing
-    return os.getpid()
 
 
 def get_agent_status(cfg: RootConfig, probe_local_pid: bool = True) -> dict[str, Any]:
@@ -83,153 +50,12 @@ def _visible_gpus(cfg: RootConfig) -> list[int]:
         return []
 
 
-def run_agent_loop(cfg: RootConfig, *, exit_when_idle: bool = True, loop_interval: float = 5.0,
-                   idle_timeout: int = 600, available_gpus: list[int] | None = None,
-                   executor: Executor | None = None) -> None:
-    cfg.runtime_root.mkdir(parents=True, exist_ok=True)
-    pid_path = runtime_pid_path(cfg)
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid = _runtime_pid_value(pid_path)
-    pid_path.write_text(str(pid), encoding="utf-8")
-    executor = executor or Executor()
-    authority = AuthoritySupervisor(cfg)
-    authority.recover_startup()
-    idle_since = time.monotonic()
-    idle_since_at = utc_now()
-    started_at = utc_now()
-    instance_id = uuid.uuid4().hex
-    policy = load_machine_policy(cfg)
-    stop_reason = "stopped"
-    visible_gpu_ids: list[int] = []
-    reserved_gpu_ids_value: set[int] = set()
-    try:
-        publish_machine_snapshots(
-            cfg, instance_id=instance_id, pid=pid, agent_mode=policy.agent_mode,
-            observed_state="active", active_attempt_ids=[], visible_gpu_ids=[], reserved_gpu_ids=[],
-            heartbeat_interval_seconds=loop_interval, started_at=started_at, idle_since_at=idle_since_at,
-        )
-    except OSError:
-        pass
-    previous_sigterm_handler = None
+def run_agent_loop(*_args: object, **_kwargs: object) -> None:
+    """Reject the removed standalone agent runtime."""
+    raise RuntimeError(
+        "standalone agent runtime was removed; use 'qexp agent add-project' then 'qexp agent start'."
+    )
 
-    def handle_sigterm(_signal_number: int, _frame: object) -> None:
-        nonlocal stop_reason
-        stop_reason = "stopped_by_signal"
-        raise SystemExit
-
-    try:
-        previous_sigterm_handler = signal.signal(signal.SIGTERM, handle_sigterm)
-    except ValueError:
-        pass
-    try:
-        while True:
-            authority.tick()
-            try:
-                flush_local_events(cfg)
-                reconcile_claim_archives(cfg)
-                release_expired_provisionals(cfg.runtime_root)
-                _reconcile_reservations(cfg)
-                reconcile_group_cancel_operations(cfg)
-                reconcile_cleanup_operations(cfg)
-                reconcile_availability_operations(cfg)
-                _offer_due_tasks(cfg)
-                visible_gpu_ids = available_gpus if available_gpus is not None else _visible_gpus(cfg)
-                reserved_before_dispatch = reserved_gpu_ids(cfg.runtime_root)
-                free = [gpu for gpu in visible_gpu_ids if gpu not in reserved_before_dispatch]
-                launched = run_dispatch_cycle(cfg, available_gpus=free, executor=executor)
-                reservations = active_reservations(cfg.runtime_root)
-                reserved_gpu_ids_value = {
-                    gpu_id for reservation in reservations for gpu_id in reservation.get("gpu_ids", [])
-                }
-                attempts = [reservation.get("attempt_id") for reservation in reservations]
-                active_attempt_ids = [attempt_id for attempt_id in attempts if isinstance(attempt_id, str)]
-                observed_state = "active" if reserved_gpu_ids_value else "idle"
-                if observed_state == "active":
-                    idle_since_at = None
-                elif idle_since_at is None:
-                    idle_since_at = utc_now()
-                publish_machine_snapshots(
-                    cfg, instance_id=instance_id, pid=pid, agent_mode=policy.agent_mode,
-                    observed_state=observed_state, active_attempt_ids=active_attempt_ids,
-                    visible_gpu_ids=visible_gpu_ids, reserved_gpu_ids=reserved_gpu_ids_value,
-                    heartbeat_interval_seconds=loop_interval, started_at=started_at,
-                    idle_since_at=idle_since_at,
-                )
-            except OSError:
-                time.sleep(loop_interval)
-                continue
-            if launched or reserved_before_dispatch:
-                idle_since = time.monotonic()
-            elif exit_when_idle and time.monotonic() - idle_since >= idle_timeout:
-                stop_reason = "idle_timeout"
-                break
-            time.sleep(loop_interval)
-    finally:
-        try:
-            publish_machine_stop_snapshot(
-                cfg, instance_id=instance_id, pid=None, agent_mode=policy.agent_mode,
-                visible_gpu_ids=visible_gpu_ids,
-                reserved_gpu_ids=reserved_gpu_ids_value,
-                heartbeat_interval_seconds=loop_interval, started_at=started_at, idle_since_at=idle_since_at,
-                stop_reason=stop_reason,
-            )
-        except OSError:
-            pass
-        pid_path.unlink(missing_ok=True)
-        if previous_sigterm_handler is not None:
-            signal.signal(signal.SIGTERM, previous_sigterm_handler)
-
-
-def _reconcile_reservations(cfg: RootConfig) -> None:
-    for reservation in active_reservations(cfg.runtime_root):
-        try:
-            task = load_task(cfg, reservation["task_id"])
-        except FileNotFoundError:
-            release(cfg.runtime_root, reservation["reservation_id"], "task_missing")
-            continue
-        claim = task.claim_control.get("active_claim") or {}
-        if (claim.get("reservation_id") != reservation["reservation_id"] or
-                claim.get("fencing_token") != reservation.get("fencing_token")):
-            if task.state["projection"] == "blocked":
-                continue
-            number = task.attempt_control.get("current_attempt_number")
-            if number is not None:
-                attempt_file = attempt_path(cfg.shared_root, task.task_id, number)
-                if attempt_file.exists():
-                    attempt = AttemptRecord.from_dict(read_json(attempt_file))
-                    if (claim.get("attempt_id") == attempt.attempt_id
-                            and claim.get("fencing_token") == attempt.current_fencing_token
-                            and retag(cfg.runtime_root, reservation["reservation_id"], attempt.attempt_id,
-                                      attempt.current_fencing_token)):
-                        continue
-            release(cfg.runtime_root, reservation["reservation_id"], "claim_missing")
-
-
-def _offer_due_tasks(cfg: RootConfig) -> None:
-    seen: set[str] = set()
-    candidate_paths = list(iter_json(shared_paths(cfg.shared_root)["offer_deadlines"]))
-    candidate_paths.extend(iter_json(shared_paths(cfg.shared_root)["tasks"]))
-    for path in candidate_paths:
-        task_id = path.stem
-        if task_id in seen:
-            continue
-        seen.add(task_id)
-        try:
-            task = load_task(cfg, task_id)
-        except FileNotFoundError:
-            if path.parent == shared_paths(cfg.shared_root)["offer_deadlines"]:
-                remove_deadline_index(cfg, task_id)
-            continue
-        sync_deadline_index(cfg, task)
-        if task.placement_policy["home_machine"] != cfg.machine_name or not offer_due(task):
-            continue
-        if not elapsed_offer_is_proven(cfg, task):
-            continue
-        try:
-            offer(cfg, task.task_id, reason="elapsed")
-        except (ValueError, FileNotFoundError):
-            continue
-
-
-def start_agent(cfg: RootConfig, *, exit_when_idle: bool = True, idle_timeout: int = 600) -> None:
-    run_agent_loop(cfg, exit_when_idle=exit_when_idle, idle_timeout=idle_timeout)
+def start_agent(*_args: object, **_kwargs: object) -> None:
+    """Reject the removed standalone agent runtime."""
+    run_agent_loop()

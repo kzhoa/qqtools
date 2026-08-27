@@ -86,14 +86,27 @@ def batch_submit(
     )
 
 
-def cancel(cfg: RootConfig, task_id: str, *, terminate_running: bool = True) -> TaskRecord:
+def cancel(
+    cfg: RootConfig,
+    task_id: str,
+    *,
+    terminate_running: bool = True,
+    reservation_runtime_root: Path | None = None,
+) -> TaskRecord:
+    from ..machine_runtime import resolve_execution_context
     from ..scheduler import cancel_task
 
-    return cancel_task(cfg, task_id, terminate_running=terminate_running)
+    reservation_runtime_root = reservation_runtime_root or resolve_execution_context(cfg).reservation_root
+    return cancel_task(
+        cfg,
+        task_id,
+        terminate_running=terminate_running,
+        reservation_runtime_root=reservation_runtime_root,
+    )
 
 
 def retry(cfg: RootConfig, task_id: str, *, acknowledge_duplicate_risk: bool = False) -> TaskRecord:
-    """Queue the next Attempt, optionally accepting unresolved orphan duplication risk."""
+    """Queue the next Attempt after a failed or orphaned current Attempt."""
     from ..scheduler import authority_locks
 
     initial = load_task(cfg, task_id)
@@ -107,37 +120,27 @@ def retry(cfg: RootConfig, task_id: str, *, acknowledge_duplicate_risk: bool = F
             raise ValueError("Task has no current Attempt to retry.")
         current_path = attempt_path(cfg.shared_root, task_id, number)
         current = AttemptRecord.from_dict(read_json(current_path))
-        if acknowledge_duplicate_risk:
-            if task.state["projection"] != "blocked" or current.phase != "orphaned":
-                raise ValueError(
-                    "--acknowledge-duplicate-risk requires a blocked Task with an " "orphaned current Attempt."
-                )
-            acknowledged_at = utc_now()
+        if task.state["projection"] == "failed" and current.phase == "failed":
+            task.state = {"projection": "queued", "reason": None}
+        elif task.state["projection"] == "blocked" and current.phase == "orphaned":
+            superseded_at = utc_now()
+            task.claim_control["fencing_epoch"] += 1
             from ..events import write_event
 
             write_event(
                 cfg,
-                "duplicate_risk_acknowledged",
+                "orphan_superseded_by_retry",
                 task_id=task_id,
                 details={
                     "attempt_id": current.attempt_id,
                     "fencing_token": current.current_fencing_token,
-                    "reason": "operator_acknowledged_duplicate_risk",
+                    "operator": cfg.machine_name,
+                    "timestamp": superseded_at,
                 },
             )
-            task.claim_control["fencing_epoch"] += 1
-            task.control.update(
-                {
-                    "duplicate_risk_acknowledged_at": acknowledged_at,
-                    "duplicate_risk_acknowledged_by": cfg.machine_name,
-                    "duplicate_risk_attempt_id": current.attempt_id,
-                }
-            )
-            task.state = {"projection": "queued", "reason": "duplicate_risk_acknowledged"}
+            task.state = {"projection": "queued", "reason": "orphan_superseded_by_retry"}
         else:
-            if task.state["projection"] != "failed" or current.phase != "failed":
-                raise ValueError("only a failed Task with a failed current Attempt can be retried.")
-            task.state = {"projection": "queued", "reason": None}
+            raise ValueError("only a failed Task or a blocked Task with an orphaned current Attempt can be retried.")
         task.control.update(
             {
                 "cancellation_requested_at": None,

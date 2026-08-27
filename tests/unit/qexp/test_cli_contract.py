@@ -42,17 +42,41 @@ def test_prelaunch_cancel_reports_completed_without_pending_acknowledgement(tmp_
     assert output["pending_acknowledgement"] is False
 
 
-def test_task_retry_accepts_explicit_duplicate_risk_acknowledgement(tmp_path: Path, capsys):
+def test_task_retry_accepts_blocked_orphan_without_acknowledgement(tmp_path: Path, monkeypatch, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert main([*_base_args(cfg), "task", "retry", task.task_id,
-                 "--acknowledge-duplicate-risk"]) == 0
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active", lambda *_args, **_kwargs: False
+    )
+
+    assert main([*_base_args(cfg), "task", "retry", task.task_id]) == 0
+
     assert capsys.readouterr().out.strip() == task.task_id
     assert load_task(cfg, task.task_id).state["projection"] == "queued"
+
+
+def test_task_retry_accepts_deprecated_duplicate_risk_flag_as_noop(tmp_path: Path, monkeypatch, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active", lambda *_args, **_kwargs: False
+    )
+
+    assert main([*_base_args(cfg), "task", "retry", task.task_id,
+                 "--acknowledge-duplicate-risk"]) == 0
+
+    assert capsys.readouterr().out.strip() == task.task_id
+    stored = load_task(cfg, task.task_id)
+    assert stored.state["projection"] == "queued"
+    assert "duplicate_risk_attempt_id" not in stored.control
 
 
 def test_clean_cli_reports_dry_run_candidates(tmp_path: Path, capsys):
@@ -112,7 +136,7 @@ def test_use_still_fails_when_context_save_fails(tmp_path: Path, monkeypatch):
         ])
 
 
-def test_agent_start_records_parent_visible_pid(tmp_path: Path, monkeypatch, capsys):
+def test_agent_start_starts_the_registered_global_agent(tmp_path: Path, monkeypatch, capsys):
     cfg = init_shared_root(
         tmp_path / ".qexp",
         "gpu-1",
@@ -120,31 +144,27 @@ def test_agent_start_records_parent_visible_pid(tmp_path: Path, monkeypatch, cap
         runtime_root=tmp_path / "rt",
     )
 
-    class FakeProcess:
-        pid = 4321
+    from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 
-    def spawn(cfg):
-        pid_path = runtime_pid_path(cfg)
-        pid_path.parent.mkdir(parents=True, exist_ok=True)
-        pid_path.write_text(str(FakeProcess.pid), encoding="utf-8")
-        return FakeProcess()
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.start_local_agent",
+        lambda *_args, **_kwargs: ("started", {"agent_state": "active", "pid": 4321}),
+    )
 
-    monkeypatch.setattr("qqtools.plugins.qexp.activation.spawn_agent_process", spawn)
-
-    assert main([*_base_args(cfg), "agent", "start", "--format=json"]) == 0
+    assert main([*_base_args(cfg), "--machine-runtime-root", str(runtime.root), "agent", "start", "--format=json"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "started"
-    assert runtime_pid_path(cfg).read_text(encoding="utf-8").strip() == "4321"
 
 
-def test_submit_tolerates_a_malformed_runtime_pid_file(tmp_path: Path, capsys):
+def test_submit_requires_explicit_project_registration(tmp_path: Path, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     pid_path = runtime_pid_path(cfg)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text("not-a-pid", encoding="utf-8")
 
-    assert get_agent_status(cfg)["is_running"] is False
-    assert main([*_base_args(cfg), "submit", "--", "echo", "ok"]) == 0
-    assert capsys.readouterr().out.strip()
+    assert main([*_base_args(cfg), "submit", "--", "echo", "ok"]) == 2
+    assert "qexp agent add-project" in capsys.readouterr().err
 
 
 def test_agent_start_rejects_removed_background_flag(tmp_path: Path):
@@ -155,15 +175,20 @@ def test_agent_start_rejects_removed_background_flag(tmp_path: Path):
 
 def test_agent_run_reports_foreground_start(tmp_path: Path, monkeypatch, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
     received = []
 
-    def run_foreground(cfg, *, reason, on_started):
+    def run_foreground(cfg, *, reason, on_started, machine_runtime=None):
+        assert machine_runtime.root == runtime.root
         received.append(reason)
         on_started({"machine_name": cfg.machine_name, "agent_state": "active", "pid": 123, "is_running": True})
 
     monkeypatch.setattr("qqtools.plugins.qexp.cli.run_local_agent_foreground", run_foreground)
 
-    assert main([*_base_args(cfg), "agent", "run", "--format=json"]) == 0
+    assert main([*_base_args(cfg), "--machine-runtime-root", str(runtime.root), "agent", "run", "--format=json"]) == 0
     assert received == ["manual_run"]
     assert json.loads(capsys.readouterr().out)["action"] == "running"
 
@@ -273,13 +298,22 @@ def test_group_resume_requests_local_agent_activation(tmp_path: Path, monkeypatc
     assert reasons == ["group-resume"]
 
 
-def test_group_retry_failed_requests_local_agent_activation(tmp_path: Path, monkeypatch):
+def test_group_retry_failed_skips_blocked_orphans_and_requests_activation(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
-    task = submit(cfg, ["echo", "ok"], group="demo")
-    attempt = claim_task(cfg, task.task_id, [0])
-    assert attempt is not None
+    failed_task = submit(cfg, ["echo", "failed"], group="demo")
+    failed_attempt = claim_task(cfg, failed_task.task_id, [0])
+    assert failed_attempt is not None
     assert fail_attempt(
-        cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure"
+        cfg, failed_task.task_id, failed_attempt.attempt_id, failed_attempt.current_fencing_token, "test_failure"
+    )
+    blocked_task = submit(cfg, ["echo", "blocked"], group="demo")
+    orphaned_attempt = claim_task(cfg, blocked_task.task_id, [0])
+    assert orphaned_attempt is not None
+    assert authorize_launch(
+        cfg, blocked_task.task_id, orphaned_attempt.attempt_id, orphaned_attempt.current_fencing_token
+    )
+    assert expire_claim(
+        cfg, blocked_task.task_id, orphaned_attempt.attempt_id, orphaned_attempt.current_fencing_token
     )
     reasons: list[str] = []
     monkeypatch.setattr(
@@ -289,25 +323,187 @@ def test_group_retry_failed_requests_local_agent_activation(tmp_path: Path, monk
 
     assert main([*_base_args(cfg), "group", "retry-failed", "demo"]) == 0
     assert reasons == ["group-retry-failed"]
+    assert load_task(cfg, failed_task.task_id).state["projection"] == "queued"
+    assert load_task(cfg, blocked_task.task_id).state["projection"] == "blocked"
 
 
 def test_agent_stop_returns_structured_status(tmp_path: Path, monkeypatch, capsys):
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    runtime_root = tmp_path / "machine-runtime"
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.stop_local_agent",
-        lambda cfg: ("already_stopped", {"machine_name": cfg.machine_name, "agent_state": "stopped", "pid": None, "is_running": False}),
+        "qqtools.plugins.qexp.cli.stop_machine_agent", lambda _runtime: False,
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.get_machine_agent_status",
+        lambda _runtime: {"agent_state": "stopped", "pid": None, "is_running": False, "projects": []},
     )
 
-    assert main([*_base_args(cfg), "agent", "stop", "--format=json"]) == 0
+    assert main(["--machine-runtime-root", str(runtime_root), "agent", "stop", "--format=json"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "already_stopped"
 
 
 def test_agent_restart_returns_structured_status(tmp_path: Path, monkeypatch, capsys):
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    runtime_root = tmp_path / "machine-runtime"
+    class FakeProcess:
+        pid = 987
+
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.restart_local_agent",
-        lambda cfg: ("restarted", {"machine_name": cfg.machine_name, "agent_state": "active", "pid": 987, "is_running": True, "previous_pid": 432}),
+        "qqtools.plugins.qexp.cli.restart_machine_agent", lambda _runtime: FakeProcess(),
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.get_machine_agent_status",
+        lambda _runtime: {"agent_state": "active", "pid": 432, "is_running": True, "projects": []},
     )
 
-    assert main([*_base_args(cfg), "agent", "restart", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out)["previous_pid"] == 432
+    assert main(["--machine-runtime-root", str(runtime_root), "agent", "restart", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out)["pid"] == 987
+
+
+def test_agent_add_project_is_explicit_and_machine_agent_prefix_is_not_public(tmp_path: Path, capsys) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime_root = tmp_path / "machine-runtime"
+    args = [
+        "--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,
+        "--runtime-root", str(cfg.runtime_root), "--machine-runtime-root", str(runtime_root),
+    ]
+
+    assert main([*args, "agent", "add-project", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "project_added"
+    with pytest.raises(SystemExit):
+        main(["machine-agent", "status"])
+
+
+def test_machine_agent_status_branches_before_project_configuration(tmp_path: Path, capsys) -> None:
+    runtime_root = tmp_path / "machine-runtime"
+
+    assert main([
+        "--machine-runtime-root", str(runtime_root), "agent", "status", "--format=json"
+    ]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["machine_runtime_root"] == str(runtime_root.resolve())
+    assert output["projects"] == []
+
+
+def test_agent_project_registry_commands(tmp_path: Path, capsys) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime_root = tmp_path / "machine-runtime"
+    base = [*_base_args(cfg), "--machine-runtime-root", str(runtime_root), "agent"]
+
+    assert main([*base, "add-project", "--format=json"]) == 0
+    added = json.loads(capsys.readouterr().out)
+    assert added["project_id"]
+
+    assert main(["--machine-runtime-root", str(runtime_root), "agent", "list-projects", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out)["projects"][0]["state"] == "enabled"
+
+    assert main(["--machine-runtime-root", str(runtime_root), "agent", "disable-project", added["project_id"], "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out)["enabled"] is False
+
+    assert main(["--machine-runtime-root", str(runtime_root), "agent", "remove-project", added["project_id"], "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "project_removed"
+
+
+def test_agent_project_add_can_register_while_scheduler_is_running(
+        tmp_path: Path, capsys) -> None:
+    from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+
+    cfg = init_shared_root(
+        tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
+    )
+    runtime_root = tmp_path / "machine-runtime"
+    runtime = MachineRuntime(runtime_root)
+
+    with runtime.scheduler_authority(blocking=True):
+        result = main([
+            *_base_args(cfg), "--machine-runtime-root", str(runtime_root), "agent", "add-project",
+        ])
+
+    assert result == 0
+    assert runtime.load_registry()[1]
+
+
+def test_read_only_task_list_does_not_initialize_machine_runtime(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    from qqtools.plugins.qexp.machine_runtime import MACHINE_RUNTIME_ENV
+
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    machine_runtime_root = tmp_path / "unused-machine-runtime"
+    monkeypatch.setenv(MACHINE_RUNTIME_ENV, str(machine_runtime_root))
+
+    assert main([*_base_args(cfg), "task", "list", "--format=json"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == []
+    assert not machine_runtime_root.exists()
+
+
+def test_legacy_project_requires_explicit_migration(tmp_path: Path, capsys) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime_root = tmp_path / "machine-runtime"
+    record_path = cfg.shared_root / "machines" / cfg.machine_name / "machine.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["machine"].pop("agent_runtime")
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    base = [*_base_args(cfg), "--machine-runtime-root", str(runtime_root), "agent"]
+
+    assert main([*base, "start"]) == 2
+    assert "qexp agent migrate-project" in capsys.readouterr().err
+
+
+def test_global_agent_status_and_stop_do_not_require_project_context(
+        tmp_path: Path, monkeypatch, capsys) -> None:
+    runtime_root = tmp_path / "machine-runtime"
+    machine_status = {"agent_state": "active", "is_running": True, "pid": 4321, "projects": []}
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.get_machine_agent_status", lambda _runtime: machine_status)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.stop_machine_agent", lambda _runtime: True)
+
+    assert main(["--machine-runtime-root", str(runtime_root), "agent", "status", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out)["agent_state"] == "active"
+
+    assert main(["--machine-runtime-root", str(runtime_root), "agent", "stop", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "stopped"
+
+
+def test_explicit_machine_runtime_root_submits_through_global_activation(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        lambda _cfg, *, reason, machine_runtime: machine_runtime.root == runtime.root and reason == "submit",
+    )
+
+    assert main([
+        "--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,
+        "--runtime-root", str(cfg.runtime_root),
+        "--machine-runtime-root", str(runtime.root), "submit", "--", "echo", "ok",
+    ]) == 0
+    assert capsys.readouterr().out.strip()
+
+
+def test_managed_doctor_reads_project_local_process_evidence(
+        tmp_path: Path, capsys) -> None:
+    from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+    from qqtools.plugins.qexp.runtime.store import atomic_replace
+
+    cfg = init_shared_root(
+        tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
+    )
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    process_path = runtime.project_paths(binding.project_id)["processes"] / "missing.json"
+    atomic_replace(process_path, {"process": {"task_id": "missing-task"}})
+
+    result = main([
+        *_base_args(cfg),
+        "--machine-runtime-root", str(runtime.root),
+        "doctor", "verify", "--format=json",
+    ])
+
+    output = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert any(
+        issue["code"] == "process_manifest_task_missing" for issue in output["issues"]
+    )

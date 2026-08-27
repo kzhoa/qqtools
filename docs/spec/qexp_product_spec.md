@@ -94,7 +94,7 @@ machines.
 It is local-first:
 
 - a Task defaults to the machine from which it is submitted
-- each machine runs its own lightweight agent
+- each machine has at most one active global `qexp agent`, serving explicitly registered projects
 - process, PID, local launch backend, and GPU reservation remain machine-local; qexp-captured
   Attempt stdout/stderr logs are shared for cross-machine inspection
 
@@ -377,6 +377,44 @@ It persists both:
 - an immutable resolved-context digest covering the original submitting machine, resolved
   Task specifications and IDs, target Group, placement constraints, and Worker Set change
   plan
+
+### 6.6 MachineRuntime and Machine Agent
+
+`MachineRuntime` is the disposable, machine-local resource authority for one qexp Machine.
+It owns the unified visible GPU reservation set, process and tmux supervision, local recovery
+evidence, machine scheduler lock, project registry, and cross-project scheduling cursor. It is
+not a project control plane: each bound project's `.qexp` remains authoritative for its Tasks,
+Groups, Attempts, claims, leases, fencing tokens, logs, and terminal transitions.
+
+A machine agent binds explicitly registered projects to that one resource authority. A project
+binding contains the stable project ID from `project/identity.json`, canonical shared root, the
+project-local machine name, and persistent `enabled` state. The registry has no Task copies,
+commands, environments, credentials, or project lifecycle truth. Its observable state is:
+
+- `enabled`: the binding may supply new candidates;
+- `draining`: the binding is disabled but local Attempts, reservations, process evidence, or
+  pending terminal writes still require supervision;
+- `disabled`: the binding is disabled and has no such local blockers.
+
+Disable excludes the binding from subsequent global-agent scheduling cycles while preserving
+supervision and convergence. Removal requires `disabled` and no local blockers; it never
+force-removes a project with active evidence. After terminal truth converges, machine-local
+execution evidence is consumed rather than retained as history; successful removal deletes the
+binding's disposable local runtime partition.
+
+The default machine runtime root is `~/.qqtools/qexp-machine/`. Every global-agent path resolves
+the same root from `QEXP_MACHINE_RUNTIME_ROOT` when set, otherwise that default. Path resolution
+is read-only; scheduling and registry mutations create and validate
+the writable layout on demand. The resolver rejects a project `.qexp` root; deployment must not
+place it on a shared control filesystem. The shared scheduler lock is held for the agent lifetime,
+so no second qexp agent can acquire local GPU scheduling authority.
+
+Machine-local execution records use `(stable_project_id, task_id, attempt_id)` as their identity;
+project-local IDs alone are insufficient. The machine agent uses deterministic unweighted
+round-robin over enabled bindings sorted by stable project ID. It resumes from a persisted cursor;
+a missing cursor starts at the first sorted binding. A project with no eligible candidate, no
+fitting capacity, or a failed project-level claim does not block the remainder of the round.
+Project-level eligibility and fenced claim protocols remain the final authority.
 
 ## 7. No Public Batch Entity
 
@@ -661,10 +699,12 @@ Every failure path must compensate idempotently:
 - local process creation failure marks the Attempt failed and releases both resources
 - terminal process reconciliation closes the claim and releases the reservation
 
-The local agent and `doctor` reconcile reservations against current claims, Attempt state,
-and local process identity. They may delete an expired unattached reservation only after
-proving no matching process exists. Ambiguous process ownership becomes blocked recovery
-work instead of being treated as free capacity.
+The global agent and `doctor` reconcile
+reservations against current claims, Attempt state, and local process identity. A machine agent
+does this separately for each supervised project and may reconcile only reservations carrying
+that project's stable ID. They may delete an expired unattached reservation only after proving
+no matching process exists. Ambiguous process ownership becomes blocked recovery work instead of
+being treated as free capacity.
 
 ## 10. Group Worker Set and Runtime Elasticity
 
@@ -871,13 +911,11 @@ Attempt: running -> orphaned
 Task: running -> blocked
 ```
 
-qexp must not automatically start a replacement. Retry requires:
-
-- confirmation that the old process stopped
-- successful machine-local repair
-- or explicit acknowledgement of duplicate-execution risk
-
-`orphaned` is a recoverable uncertainty state, not proof that the process terminated.
+qexp must not automatically start a replacement. An ordinary `qexp task retry <task-id>`
+is the explicit operator decision for an unclaimed `blocked` Task whose current Attempt is
+`orphaned`; it supersedes qexp authority for the old Attempt without confirming that its process
+stopped or requiring an additional duplicate-risk flag. `orphaned` remains a recoverable
+uncertainty state, not proof that the process terminated.
 
 When the old machine returns, its agent must reconcile local processes against current
 fencing tokens before taking new work. Lease expiry archives the old claim, so a returning
@@ -1165,7 +1203,39 @@ non-`tmux` deployments.
 Cross-machine commands write shared intent and wait for acknowledgements. They do not
 directly operate remote PIDs.
 
-### 15.5 Scheduling Logs Only
+### 15.5 Machine-Agent Operation and Migration
+
+Global-agent deployment is explicit and local to the qexp Machine:
+
+```bash
+qexp agent add-project
+qexp agent list-projects
+qexp agent disable-project <project-id-or-root>
+qexp agent remove-project <project-id-or-root>
+qexp agent start
+qexp agent status
+```
+
+Project registration is explicit and may occur while the global agent is running. A new Project
+uses `qexp agent add-project`; ordinary `qexp agent start` never registers the current directory.
+An existing Project without the global-agent machine-record marker must use the one-time
+`qexp agent migrate-project` command. It stops only a verified old agent process, imports local
+execution evidence, registers the Project, and then starts or wakes the global agent without
+terminating already running training processes. Late immutable runner evidence is drained from
+the legacy runtime instead of permanently mirrored. Repeating a completed migration preserves
+the binding's current operator-controlled enabled or disabled state.
+
+`start`, `run`, `stop`, `restart`, and `status` are global-agent commands. They operate on the
+machine authority and therefore affect every registered Project. Activation-triggering commands
+require their Project to be registered; `submit --no-activate` may still persist work without
+starting the agent.
+
+Machine runtime loss is not project loss. A replacement machine agent starts from explicitly
+registered bindings and does not infer, supervise, or declare the terminal state of processes
+from a discarded runtime. Shared lease and fencing rules leave an unreachable previously running
+Attempt `orphaned` and its Task `blocked`; no automatic retry follows.
+
+### 15.6 Scheduling Logs Only
 
 qexp records:
 
@@ -1219,13 +1289,16 @@ are exposed through Task/Group JSON, events, and `doctor` only.
 - `qexp group machines drain`
 - `qexp group machines remove`
 
-### 16.4 Low-Frequency Commands
+### 16.4 Agent Commands
 
 - `qexp agent start`
 - `qexp agent run`
 - `qexp agent restart`
 - `qexp agent stop`
 - `qexp agent status`
+- `qexp agent add-project | list-projects`
+- `qexp agent disable-project | remove-project <project-id-or-root>`
+- `qexp agent migrate-project`
 - `qexp doctor`
 - `qexp clean`
 
@@ -1239,6 +1312,19 @@ The target CLI also does not promise aliases for the old flat `list`, `inspect`,
 - [ ] A machine is defined as an independently scheduled GPU resource pool, not a physical
       server entity; one physical server may expose multiple non-overlapping machines.
 - [ ] One project uses one shared `.qexp` control plane.
+- [ ] MachineRuntime owns only machine-local resources; every project retains authority for its
+      own queue and execution truth.
+- [ ] Machine-agent project bindings use stable project identity, canonical roots, and explicit
+      enabled/draining/disabled lifecycle semantics.
+- [ ] The default and environment-overridden machine runtime root produce one global scheduler
+      lock for every registered Project.
+- [ ] Machine-managed local execution records use stable project-ID composite identity and one
+      unified reservation set.
+- [ ] Cross-project dispatch is deterministic stable-ID round-robin and a blocked project does
+      not prevent scanning later bindings.
+- [ ] Explicit project migration verifies old PID identity, keeps training processes alive, and
+      leaves one global agent process responsible for the migrated Project.
+- [ ] Machine runtime loss cannot assert process termination or cause automatic retry.
 - [ ] Single Task submission remains YAML-free.
 - [ ] New submissions create no public Batch identity.
 - [ ] Unsupported old schema fails fast and is not read, migrated, or partially imported.
