@@ -87,5 +87,32 @@ def attempt_control_lock_path(root: Path, attempt_id: str) -> Path:
     return local_paths(root)["locks"] / "attempt-control" / f"{attempt_id}.lock"
 
 
+def machine_runtime_paths(root: Path) -> dict[str, Path]:
+    root = Path(root).expanduser().resolve()
+    return {
+        "root": root,
+        "locks": root / "locks",
+        "scheduler_lock": root / "locks" / "scheduler.lock",
+        "registry_lock": root / "locks" / "registry.lock",
+        "reservation_lock": root / "locks" / "gpu-reservations.lock",
+        "registry": root / "registry.json",
+        "cursor": root / "scheduler" / "cursor.json",
+        "agent": root / "agent",
+        "pid": root / "agent" / "machine-agent.pid",
+        "provisional": root / "reservations" / "provisional",
+        "active": root / "reservations" / "active",
+        "released": root / "reservations" / "released",
+        "projects": root / "projects",
+        "diagnostics": root / "diagnostics",
+    }
+
+
+def machine_project_paths(root: Path, project_id: str) -> dict[str, Path]:
+    if not project_id or "/" in project_id or "\\" in project_id or ".." in project_id:
+        raise ValueError("project_id is invalid.")
+    project_root = machine_runtime_paths(root)["projects"] / project_id
+    return {"root": project_root, **local_paths(project_root)}
+
+
 def shared_log_path(root: Path, task_id: str, attempt_id: str) -> Path:
     return shared_paths(root)["logs"] / task_id / f"{attempt_id}.log"

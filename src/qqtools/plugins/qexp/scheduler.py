@@ -9,7 +9,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, ContextManager, Iterator
 
 from .events import write_diagnostic_event, write_event
 from .lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
@@ -31,7 +31,7 @@ from .config_types import RootConfig
 from .runtime.locks import group_lock, task_lock
 from .runtime.claims import archive_claim
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, submission_path
-from .runtime.records import AttemptRecord, TaskRecord, utc_now
+from .runtime.records import AttemptRecord, TaskRecord, TaskSpec, utc_now
 from .runtime.reservations import attach, release, reserve
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.tasks import load_task, save_task
@@ -39,6 +39,10 @@ from .runtime.tasks import load_task, save_task
 LEASE_SECONDS = 120
 TERMINATION_GRACE_SECONDS = 5.0
 TERMINATION_POLL_SECONDS = 0.05
+
+
+def _reservation_root(cfg: RootConfig, value: Path | None = None) -> Path:
+    return value if value is not None else cfg.runtime_root
 
 
 def _is_process_group_alive(process_group_id: int | None) -> bool:
@@ -193,6 +197,7 @@ def _claim(
     lease_seconds: int,
     authority_mode: str,
     clock_evidence: dict[str, Any] | None,
+    reservation_runtime_root: Path,
 ) -> AttemptRecord | None:
     task = load_task(cfg, task_id)
     if not _eligible(cfg, task):
@@ -257,14 +262,24 @@ def _claim(
         save_task(cfg, task)
         try:
             atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
-            attach(cfg.runtime_root, attempt.reservation_id, attempt.attempt_id, token)
+            attach(reservation_runtime_root, attempt.reservation_id, attempt.attempt_id, token)
         except Exception:
-            _release_claim_locked(cfg, task, token, "attempt_materialization_failed")
+            _release_claim_locked(
+                cfg, task, token, "attempt_materialization_failed",
+                reservation_runtime_root=reservation_runtime_root,
+            )
             raise
         return attempt
 
 
-def _release_claim_locked(cfg: RootConfig, task: TaskRecord, token: int, reason: str) -> None:
+def _release_claim_locked(
+    cfg: RootConfig,
+    task: TaskRecord,
+    token: int,
+    reason: str,
+    *,
+    reservation_runtime_root: Path | None = None,
+) -> None:
     claim = task.claim_control.get("active_claim") or {}
     if claim.get("fencing_token") != token:
         return
@@ -275,11 +290,17 @@ def _release_claim_locked(cfg: RootConfig, task: TaskRecord, token: int, reason:
     task.meta["revision"] += 1
     task.meta["updated_at"] = utc_now()
     save_task(cfg, task)
-    release(cfg.runtime_root, claim["reservation_id"], reason)
+    release(reservation_runtime_root or cfg.runtime_root, claim["reservation_id"], reason)
 
 
 def claim_task(
-    cfg: RootConfig, task_id: str, assigned_gpus: list[int], *, lease_seconds: int | None = None
+    cfg: RootConfig,
+    task_id: str,
+    assigned_gpus: list[int],
+    *,
+    lease_seconds: int | None = None,
+    reservation_runtime_root: Path | None = None,
+    project_id: str | None = None,
 ) -> AttemptRecord | None:
     policy = load_lease_policy(cfg)
     capability = clock_capability(cfg, policy)
@@ -288,9 +309,17 @@ def claim_task(
     if capability.observation:
         persist_clock_observation(cfg, capability.observation)
         evidence = _clock_evidence(capability.observation)
+    reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     if lease_seconds is None:
         lease_seconds = policy.ttl_seconds
-    reservation = reserve(cfg.runtime_root, task_id, assigned_gpus)
+    reservation = reserve(
+        reservation_runtime_root,
+        task_id,
+        assigned_gpus,
+        project_id=project_id,
+        shared_root=str(cfg.shared_root),
+        machine_name=cfg.machine_name,
+    )
     try:
         attempt = _claim(
             cfg,
@@ -299,12 +328,13 @@ def claim_task(
             lease_seconds=lease_seconds,
             authority_mode=authority_mode,
             clock_evidence=evidence,
+            reservation_runtime_root=reservation_runtime_root,
         )
     except Exception:
-        release(cfg.runtime_root, reservation["reservation"]["reservation_id"], "claim_failed")
+        release(reservation_runtime_root, reservation["reservation"]["reservation_id"], "claim_failed")
         raise
     if attempt is None:
-        release(cfg.runtime_root, reservation["reservation"]["reservation_id"], "claim_lost")
+        release(reservation_runtime_root, reservation["reservation"]["reservation_id"], "claim_lost")
     return attempt
 
 
@@ -316,7 +346,10 @@ def _has_local_launch_evidence(cfg: RootConfig, attempt_id: str) -> bool:
     )
 
 
-def resume_starting_attempt(cfg: RootConfig, task_id: str) -> AttemptRecord | None:
+def resume_starting_attempt(
+    cfg: RootConfig, task_id: str, *, reservation_runtime_root: Path | None = None
+) -> AttemptRecord | None:
+    reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
     cancel_result = None
     with authority_locks(cfg, task):
@@ -373,13 +406,21 @@ def resume_starting_attempt(cfg: RootConfig, task_id: str) -> AttemptRecord | No
             return attempt
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
-            release(cfg.runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled_before_launch")
+            release(reservation_runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled_before_launch")
         if cancel_result.event:
             dispatch_task_lifecycle_hooks_noexcept(cfg, cancel_result.event)
     return None
 
 
-def authorize_launch(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int) -> bool:
+def authorize_launch(
+    cfg: RootConfig,
+    task_id: str,
+    attempt_id: str,
+    fencing_token: int,
+    *,
+    reservation_runtime_root: Path | None = None,
+) -> bool:
+    reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
     cancel_result = None
     with authority_locks(cfg, task):
@@ -440,7 +481,7 @@ def authorize_launch(cfg: RootConfig, task_id: str, attempt_id: str, fencing_tok
             atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
-            release(cfg.runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled")
+            release(reservation_runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled")
         if cancel_result.event:
             dispatch_task_lifecycle_hooks_noexcept(cfg, cancel_result.event)
         return False
@@ -471,7 +512,14 @@ def _cancel_prelaunch_locked(cfg: RootConfig, task: TaskRecord, reason: str, att
     )
 
 
-def cancel_task(cfg: RootConfig, task_id: str, *, terminate_running: bool = True) -> TaskRecord:
+def cancel_task(
+    cfg: RootConfig,
+    task_id: str,
+    *,
+    terminate_running: bool = True,
+    reservation_runtime_root: Path | None = None,
+) -> TaskRecord:
+    reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
     cancel_result = None
     with authority_locks(cfg, task):
@@ -507,7 +555,7 @@ def cancel_task(cfg: RootConfig, task_id: str, *, terminate_running: bool = True
             save_task(cfg, task)
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
-            release(cfg.runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled_before_launch")
+            release(reservation_runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled_before_launch")
         if cancel_result.event:
             dispatch_task_lifecycle_hooks_noexcept(cfg, cancel_result.event)
         return load_task(cfg, task_id)
@@ -525,36 +573,91 @@ def _load_current_attempt(cfg: RootConfig, task: TaskRecord) -> AttemptRecord | 
 
 
 def run_dispatch_cycle(
-    cfg: RootConfig, *, available_gpus: list[int] | None = None, executor: Executor | None = None
+    cfg: RootConfig,
+    *,
+    available_gpus: list[int] | None = None,
+    executor: Executor | None = None,
+    reservation_runtime_root: Path | None = None,
+    project_id: str | None = None,
+    preflight: Callable[[TaskSpec], bool] | None = None,
+    preflight_rejected: Callable[[TaskRecord], None] | None = None,
+    before_claim: Callable[[], bool] | None = None,
+    claim_guard: Callable[[], ContextManager[bool]] | None = None,
+    max_new_claims: int | None = None,
+    on_claim: Callable[[str], None] | None = None,
 ) -> list[str]:
+    reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     available = list(available_gpus or [])
     executor = executor or Executor()
     launched: list[str] = []
+    new_claims = 0
     for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
         task = load_task(cfg, path.stem)
-        attempt = resume_starting_attempt(cfg, task.task_id)
+        attempt = resume_starting_attempt(
+            cfg, task.task_id, reservation_runtime_root=reservation_runtime_root
+        )
         if attempt is None:
             continue
         try:
             executor.launch_attempt(cfg, task.task_id, attempt)
             launched.append(task.task_id)
         except Exception:
-            fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "executor_launch_failed")
+            fail_attempt(
+                cfg,
+                task.task_id,
+                attempt.attempt_id,
+                attempt.current_fencing_token,
+                "executor_launch_failed",
+                reservation_runtime_root=reservation_runtime_root,
+            )
     for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
+        if max_new_claims is not None and new_claims >= max_new_claims:
+            break
         task = load_task(cfg, path.stem)
-        if not _eligible(cfg, task) or len(available) < task.spec.requested_gpus:
+        if not _eligible(cfg, task):
+            continue
+        if preflight is not None and not preflight(task.spec):
+            if preflight_rejected is not None:
+                preflight_rejected(task)
+            continue
+        if len(available) < task.spec.requested_gpus:
             continue
         gpus, available = available[: task.spec.requested_gpus], available[task.spec.requested_gpus :]
         try:
-            attempt = claim_task(cfg, task.task_id, gpus)
+            if claim_guard is not None:
+                with claim_guard() as is_permitted:
+                    if not is_permitted:
+                        available = gpus + available
+                        break
+                    attempt = claim_task(
+                        cfg, task.task_id, gpus,
+                        reservation_runtime_root=reservation_runtime_root, project_id=project_id,
+                    )
+            else:
+                if before_claim is not None and not before_claim():
+                    available = gpus + available
+                    break
+                attempt = claim_task(
+                    cfg, task.task_id, gpus,
+                    reservation_runtime_root=reservation_runtime_root, project_id=project_id,
+                )
         except ValueError:
             available = gpus + available
             continue
         if attempt is None:
             available = gpus + available
             continue
+        new_claims += 1
+        if on_claim is not None:
+            on_claim(task.task_id)
         try:
-            if not authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token):
+            if not authorize_launch(
+                cfg,
+                task.task_id,
+                attempt.attempt_id,
+                attempt.current_fencing_token,
+                reservation_runtime_root=reservation_runtime_root,
+            ):
                 available = gpus + available
                 continue
             authorized = _load_current_attempt(cfg, load_task(cfg, task.task_id))
@@ -564,7 +667,14 @@ def run_dispatch_cycle(
             executor.launch_attempt(cfg, task.task_id, authorized)
             launched.append(task.task_id)
         except Exception:
-            fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "executor_launch_failed")
+            fail_attempt(
+                cfg,
+                task.task_id,
+                attempt.attempt_id,
+                attempt.current_fencing_token,
+                "executor_launch_failed",
+                reservation_runtime_root=reservation_runtime_root,
+            )
     return launched
 
 
@@ -655,7 +765,8 @@ def renew_attempt_lease(
 
 
 def resolve_execution_authority(
-    cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int, decision_id: str
+    cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int, decision_id: str,
+    *, reservation_runtime_root: Path | None = None,
 ) -> AuthorityResolution:
     """Perform the final authoritative renewal/recovery decision for a live process."""
     try:
@@ -680,7 +791,13 @@ def resolve_execution_authority(
     if result.outcome is LeaseRenewalOutcome.ORPHANED_RECOVERY_REQUIRED:
         from .runtime.recovery import recover_running_attempt
 
-        token = recover_running_attempt(cfg, task_id, attempt_id, fencing_token)
+        token = recover_running_attempt(
+            cfg,
+            task_id,
+            attempt_id,
+            fencing_token,
+            reservation_runtime_root=reservation_runtime_root,
+        )
         if token is not None:
             return AuthorityResolution(
                 AuthorityResolutionOutcome.RECOVERED, decision_id, attempt_id, fencing_token, token
@@ -766,8 +883,16 @@ def _continue_committed_termination(cfg: RootConfig, task_id: str, attempt_id: s
     return True
 
 
-def expire_claim(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int) -> bool:
+def expire_claim(
+    cfg: RootConfig,
+    task_id: str,
+    attempt_id: str,
+    fencing_token: int,
+    *,
+    reservation_runtime_root: Path | None = None,
+) -> bool:
     """Converge an expired claim without creating replacement execution authority."""
+    reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     policy = load_lease_policy(cfg)
     capability = clock_capability(cfg, policy)
     if not capability.is_healthy or capability.observation is None:
@@ -794,7 +919,7 @@ def expire_claim(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: 
         if claim.get("launch_state") == "claimed":
             attempt.phase = "cancelled"
             attempt.result["reason"] = "lease_expired_before_launch"
-            release(cfg.runtime_root, claim["reservation_id"], "lease_expired_before_launch")
+            release(reservation_runtime_root, claim["reservation_id"], "lease_expired_before_launch")
             task.state.update({"projection": "queued", "reason": "lease_expired_before_launch"})
         else:
             attempt.phase = "orphaned"
@@ -832,7 +957,16 @@ def expire_claim(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: 
         return True
 
 
-def fail_attempt(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int, reason: str) -> bool:
+def fail_attempt(
+    cfg: RootConfig,
+    task_id: str,
+    attempt_id: str,
+    fencing_token: int,
+    reason: str,
+    *,
+    reservation_runtime_root: Path | None = None,
+) -> bool:
+    reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
     result = None
     with authority_locks(cfg, task):
@@ -859,16 +993,23 @@ def fail_attempt(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: 
     if result.outcome != "committed":
         return False
     if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
-        release(cfg.runtime_root, result.reservation_id, reason)
+        release(reservation_runtime_root, result.reservation_id, reason)
     if result.event:
         dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
     return True
 
 
 def finalize_agent_supervised_attempt(
-    cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int, *, was_terminated: bool
+    cfg: RootConfig,
+    task_id: str,
+    attempt_id: str,
+    fencing_token: int,
+    *,
+    was_terminated: bool,
+    reservation_runtime_root: Path | None = None,
 ) -> bool:
     """Publish terminal truth after the agent confirms a recovered process is absent."""
+    reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
     result = None
     with authority_locks(cfg, task):
@@ -901,16 +1042,24 @@ def finalize_agent_supervised_attempt(
     if result.outcome != "committed":
         return False
     if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
-        release(cfg.runtime_root, result.reservation_id, reason)
+        release(reservation_runtime_root, result.reservation_id, reason)
     if result.event:
         dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
     return True
 
 
 def finalize_orphaned_attempt(
-    cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int, *, exit_code: int | None, was_terminated: bool
+    cfg: RootConfig,
+    task_id: str,
+    attempt_id: str,
+    fencing_token: int,
+    *,
+    exit_code: int | None,
+    was_terminated: bool,
+    reservation_runtime_root: Path | None = None,
 ) -> bool:
     """Resolve a blocked orphan after local evidence confirms its process is absent."""
+    reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
     result = None
     with authority_locks(cfg, task):
@@ -964,14 +1113,17 @@ def finalize_orphaned_attempt(
     if result.outcome != "committed":
         return False
     if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
-        release(cfg.runtime_root, result.reservation_id, reason)
+        release(reservation_runtime_root, result.reservation_id, reason)
     if result.event:
         dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
     return True
 
 
-def reconcile_running_tasks(cfg: RootConfig, *, executor: Executor | None = None) -> list[str]:
+def reconcile_running_tasks(
+    cfg: RootConfig, *, executor: Executor | None = None, reservation_runtime_root: Path | None = None
+) -> list[str]:
     """Reconcile local manifests and persistent cancellation intents."""
+    reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     reconciled: list[str] = []
     process_dir = cfg.runtime_root / "processes"
     for manifest in iter_json(process_dir):
@@ -996,7 +1148,14 @@ def reconcile_running_tasks(cfg: RootConfig, *, executor: Executor | None = None
             if task.state["projection"] == "blocked" and evidence_state == "alive":
                 from .runtime.recovery import recover_running_attempt
 
-                recovered = recover_running_attempt(cfg, task_id, attempt_id, token, manifest=data)
+                recovered = recover_running_attempt(
+                    cfg,
+                    task_id,
+                    attempt_id,
+                    token,
+                    manifest=data,
+                    reservation_runtime_root=reservation_runtime_root,
+                )
             elif task.state["projection"] == "blocked" and attempt is not None and evidence_state == "absent":
                 was_terminated = bool(task.control.get("terminate_running"))
                 if finalize_orphaned_attempt(
@@ -1006,6 +1165,7 @@ def reconcile_running_tasks(cfg: RootConfig, *, executor: Executor | None = None
                     attempt.current_fencing_token,
                     exit_code=data.get("exit_code"),
                     was_terminated=was_terminated,
+                    reservation_runtime_root=reservation_runtime_root,
                 ):
                     data.update(
                         {
@@ -1053,7 +1213,14 @@ def reconcile_running_tasks(cfg: RootConfig, *, executor: Executor | None = None
         if is_process_alive and was_terminated:
             is_process_alive = not _terminate_process_group(pid)
         if not is_process_alive:
-            if finalize_agent_supervised_attempt(cfg, task_id, attempt_id, token, was_terminated=was_terminated):
+            if finalize_agent_supervised_attempt(
+                    cfg,
+                    task_id,
+                    attempt_id,
+                    token,
+                    was_terminated=was_terminated,
+                    reservation_runtime_root=reservation_runtime_root,
+            ):
                 data.update(
                     {
                         "observed_state": "exited",
@@ -1084,6 +1251,12 @@ def reconcile_running_tasks(cfg: RootConfig, *, executor: Executor | None = None
         if claim.get("authority_mode") == "bounded_lease" and datetime.fromisoformat(
             expires.replace("Z", "+00:00")
         ) <= datetime.now(timezone.utc):
-            if expire_claim(cfg, task.task_id, claim["attempt_id"], claim["fencing_token"]):
+            if expire_claim(
+                    cfg,
+                    task.task_id,
+                    claim["attempt_id"],
+                    claim["fencing_token"],
+                    reservation_runtime_root=reservation_runtime_root,
+            ):
                 reconciled.append(task.task_id)
     return reconciled

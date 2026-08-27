@@ -17,7 +17,28 @@ from ..runtime.tasks import load_task, save_task
 from ..runtime.availability import remove_deadline_index
 
 
-def _clean_blockers(cfg: RootConfig, task: TaskRecord) -> list[str]:
+def _machine_project_id(cfg: RootConfig, reservation_runtime_root: Path) -> str | None:
+    if reservation_runtime_root == cfg.runtime_root:
+        return None
+    identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
+    if not identity_path.exists():
+        return None
+    value = read_json(identity_path).get("project", {}).get("project_id")
+    return value if isinstance(value, str) else None
+
+
+def _reservation_matches_task(
+    reservation: dict[str, Any], task_id: str, machine_project_id: str | None
+) -> bool:
+    return (reservation.get("task_id") == task_id
+            and (machine_project_id is None or reservation.get("project_id") == machine_project_id))
+
+
+def _clean_blockers(
+    cfg: RootConfig, task: TaskRecord, *, reservation_runtime_root: Path | None = None
+) -> list[str]:
+    reservation_runtime_root = reservation_runtime_root or cfg.runtime_root
+    machine_project_id = _machine_project_id(cfg, reservation_runtime_root)
     blockers: list[str] = []
     if task.state["projection"] not in {"succeeded", "failed", "cancelled"}:
         blockers.append(f"task_state:{task.state['projection']}")
@@ -47,9 +68,9 @@ def _clean_blockers(cfg: RootConfig, task: TaskRecord) -> list[str]:
         if process.get("observed_state") not in {"exited", "missing", "quarantined"}:
             blockers.append(f"local_process:{process.get('attempt_id')}")
     for state in ("active", "provisional"):
-        for reservation_path in iter_json(local_paths(cfg.runtime_root)[state]):
+        for reservation_path in iter_json(local_paths(reservation_runtime_root)[state]):
             reservation = read_json(reservation_path).get("reservation", {})
-            if reservation.get("task_id") == task.task_id:
+            if _reservation_matches_task(reservation, task.task_id, machine_project_id):
                 blockers.append(f"local_{state}_reservation:{reservation.get('reservation_id')}")
     return blockers
 
@@ -100,14 +121,31 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
     return operation
 
 
-def _cleanup_local_resources(cfg: RootConfig, task_id: str) -> tuple[list[str], list[str]]:
+def _cleanup_local_resources(
+    cfg: RootConfig, task_id: str, *, reservation_runtime_root: Path | None = None
+) -> tuple[list[str], list[str]]:
+    from ..machine_runtime import resolve_execution_context
     from ..runtime.reservations import release
+
+    reservation_runtime_root = (
+        reservation_runtime_root or resolve_execution_context(cfg).reservation_root
+    )
+    machine_project_id = _machine_project_id(cfg, reservation_runtime_root)
     removed: list[str] = []
     blockers: list[str] = []
+    attempt_ids: set[str] = set()
+    for path in iter_json(shared_paths(cfg.shared_root)["attempts"] / task_id):
+        try:
+            attempt_ids.add(AttemptRecord.from_dict(read_json(path)).attempt_id)
+        except (KeyError, TypeError, ValueError):
+            continue
     for manifest_path in iter_json(cfg.runtime_root / "processes"):
         process = read_json(manifest_path).get("process", {})
         if process.get("task_id") != task_id:
             continue
+        attempt_id = process.get("attempt_id")
+        if isinstance(attempt_id, str):
+            attempt_ids.add(attempt_id)
         if process.get("observed_state") not in {"exited", "missing", "quarantined"}:
             blockers.append(f"local_process:{process.get('attempt_id')}")
             continue
@@ -115,13 +153,45 @@ def _cleanup_local_resources(cfg: RootConfig, task_id: str) -> tuple[list[str], 
         removed.append(str(manifest_path))
     if blockers:
         return removed, blockers
-    paths = local_paths(cfg.runtime_root)
+    local = local_paths(cfg.runtime_root)
+    for name, record_key in (
+        ("registrations", "process_registration"),
+        ("launch_intents", "launch_intent"),
+    ):
+        for path in iter_json(local[name]):
+            record = read_json(path).get(record_key, {})
+            if record.get("task_id") != task_id:
+                continue
+            attempt_id = record.get("attempt_id")
+            if isinstance(attempt_id, str):
+                attempt_ids.add(attempt_id)
+            path.unlink(missing_ok=True)
+            removed.append(str(path))
+    for path in iter_json(local["observations"]):
+        attempt_id = read_json(path).get("exit_observation", {}).get("attempt_id")
+        if attempt_id not in attempt_ids:
+            continue
+        path.unlink(missing_ok=True)
+        removed.append(str(path))
+    for path in sorted(local["termination_decisions"].rglob("*.json")):
+        decision = read_json(path).get("termination_decision", {})
+        if decision.get("task_id") != task_id and decision.get("attempt_id") not in attempt_ids:
+            continue
+        path.unlink(missing_ok=True)
+        removed.append(str(path))
+    for path in iter_json(local["authority_diagnostics"]):
+        attempt_id = read_json(path).get("authority_diagnostic", {}).get("attempt_id")
+        if attempt_id not in attempt_ids:
+            continue
+        path.unlink(missing_ok=True)
+        removed.append(str(path))
+    paths = local_paths(reservation_runtime_root)
     for state in ("active", "provisional"):
         for reservation_path in list(iter_json(paths[state])):
             reservation = read_json(reservation_path).get("reservation", {})
-            if reservation.get("task_id") != task_id:
+            if not _reservation_matches_task(reservation, task_id, machine_project_id):
                 continue
-            release(cfg.runtime_root, reservation["reservation_id"], "task_cleanup")
+            release(reservation_runtime_root, reservation["reservation_id"], "task_cleanup")
             removed.append(str(reservation_path))
     for log_path in sorted((cfg.runtime_root / "logs").glob(f"{task_id}-*.log")):
         log_path.unlink(missing_ok=True)
@@ -204,7 +274,9 @@ def _finalize_cleanup_if_ready(cfg: RootConfig, operation_path: Path) -> list[st
             return finalize_under_task_lock()
 
 
-def reconcile_cleanup_operations(cfg: RootConfig) -> list[dict[str, Any]]:
+def reconcile_cleanup_operations(
+    cfg: RootConfig, *, reservation_runtime_root: Path | None = None
+) -> list[dict[str, Any]]:
     """Clean machine-local resources and finalize fully acknowledged cleanup operations."""
     results: list[dict[str, Any]] = []
     for operation_path in iter_json(shared_paths(cfg.shared_root)["cleanup"]):
@@ -233,7 +305,9 @@ def reconcile_cleanup_operations(cfg: RootConfig) -> list[dict[str, Any]]:
             removed: list[str] = []
             blockers: list[str] = []
             if cfg.machine_name in required and cfg.machine_name not in acknowledgements:
-                removed, blockers = _cleanup_local_resources(cfg, task_id)
+                removed, blockers = _cleanup_local_resources(
+                    cfg, task_id, reservation_runtime_root=reservation_runtime_root
+                )
                 if not blockers:
                     acknowledgements[cfg.machine_name] = {"acknowledged_at": utc_now(),
                                                           "removed": removed}
@@ -263,9 +337,23 @@ def reconcile_cleanup_operations(cfg: RootConfig) -> list[dict[str, Any]]:
     return results
 
 
-def clean(cfg: RootConfig, *, task_id: str | None = None, group: str | None = None,
-          older_than_days: int = 30, limit: int = 100, dry_run: bool = False) -> dict[str, Any]:
+def clean(
+    cfg: RootConfig,
+    *,
+    task_id: str | None = None,
+    group: str | None = None,
+    older_than_days: int = 30,
+    limit: int = 100,
+    dry_run: bool = False,
+    reservation_runtime_root: Path | None = None,
+) -> dict[str, Any]:
     """Remove terminal Task truth exactly or under a bounded retention policy."""
+    if reservation_runtime_root is None:
+        from ..machine_runtime import resolve_execution_context
+
+        context = resolve_execution_context(cfg)
+        cfg = context.local_cfg
+        reservation_runtime_root = context.reservation_root
     if task_id and group:
         raise ValueError("task_id and group cannot be used together.")
     if older_than_days < 0:
@@ -295,7 +383,9 @@ def clean(cfg: RootConfig, *, task_id: str | None = None, group: str | None = No
         with schema_lock(cfg.shared_root):
             with authority_locks(cfg, candidate):
                 task = load_task(cfg, candidate.task_id)
-                blockers = _clean_blockers(cfg, task)
+                blockers = _clean_blockers(
+                    cfg, task, reservation_runtime_root=reservation_runtime_root
+                )
                 unsafe_blockers = [item for item in blockers if not item.startswith(
                     ("local_active_reservation:", "local_provisional_reservation:"))]
                 if unsafe_blockers:
@@ -305,7 +395,9 @@ def clean(cfg: RootConfig, *, task_id: str | None = None, group: str | None = No
                     operation = _start_cleanup_operation(cfg, task)
                     result.setdefault("operations", {})[task.task_id] = operation["cleanup"]
     if not dry_run:
-        for reconciliation in reconcile_cleanup_operations(cfg):
+        for reconciliation in reconcile_cleanup_operations(
+                cfg, reservation_runtime_root=reservation_runtime_root
+        ):
             if reconciliation["task_id"] in result["candidates"]:
                 result["removed"].extend(reconciliation["removed"])
                 result.setdefault("operations", {})[reconciliation["task_id"]] = reconciliation

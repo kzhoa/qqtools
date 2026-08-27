@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.agent import _offer_due_tasks, _reconcile_reservations
+from qqtools.plugins.qexp.project_maintenance import offer_due_tasks, reconcile_project_reservations
 from qqtools.plugins.qexp.authority import AuthoritySupervisor
 from qqtools.plugins.qexp.commands.group import (
     change_worker,
@@ -196,7 +196,7 @@ def test_recovery_cas_issues_new_fencing_token(tmp_path: Path):
     assert recovered.timestamps["recovered_at"] is not None
     assert recovered.timestamps["finished_at"] is None
     assert recovered.result["reason"] is None
-    _reconcile_reservations(cfg)
+    reconcile_project_reservations(cfg)
     assert reserved_gpu_ids(cfg.runtime_root) == {0}
 
 
@@ -334,7 +334,7 @@ def test_agent_supervises_recovered_child_without_runner(tmp_path: Path, monkeyp
 def test_elapsed_offer_is_applied_by_home_agent(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover", offer_after_seconds=0)
-    _offer_due_tasks(cfg)
+    offer_due_tasks(cfg)
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
 
 

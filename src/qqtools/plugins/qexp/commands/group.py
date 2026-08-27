@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 from ..config_types import RootConfig
@@ -17,7 +18,17 @@ from ..runtime.tasks import load_task, save_task
 from .task import has_cleanup_operation, is_cleanup_blocked, retry
 
 
-def group_control(cfg: RootConfig, name: str, action: str, *, terminate_running: bool = False) -> dict[str, Any]:
+def group_control(
+    cfg: RootConfig,
+    name: str,
+    action: str,
+    *,
+    terminate_running: bool = False,
+    reservation_runtime_root: Path | None = None,
+) -> dict[str, Any]:
+    from ..machine_runtime import resolve_execution_context
+
+    reservation_runtime_root = reservation_runtime_root or resolve_execution_context(cfg).reservation_root
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
     post_commit_results = []
     with group_lock(cfg.shared_root, name):
@@ -129,7 +140,7 @@ def group_control(cfg: RootConfig, name: str, action: str, *, terminate_running:
     for result in post_commit_results:
         if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
             from ..runtime.reservations import release
-            release(cfg.runtime_root, result.reservation_id, "group_cancelled_before_launch")
+            release(reservation_runtime_root, result.reservation_id, "group_cancelled_before_launch")
         if result.event:
             dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
     return result_data

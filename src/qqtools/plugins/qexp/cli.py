@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .activation import (
     ensure_local_agent_active,
+    managed_project_agent_status,
     restart_local_agent,
     run_local_agent_foreground,
     start_local_agent,
@@ -26,7 +27,18 @@ from .config_types import RootConfig
 from .lease import LeasePolicy, load_lease_policy, save_lease_policy
 from .runtime.paths import shared_paths
 from .runtime.store import iter_json, read_json
+from .machine_agent import (
+    ensure_machine_agent_started,
+    get_machine_agent_status,
+    migrate_project,
+    register_project,
+    restart_machine_agent,
+    set_project_enabled,
+    stop_machine_agent,
+    unregister_project,
+)
 from .machine_config import init_shared_root, load_machine_policy
+from .machine_runtime import ExecutionContext, MachineRuntime, resolve_execution_context
 from .notification_config import (
     DEFAULT_WEBHOOK_ENV,
     load_notifications,
@@ -66,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shared-root")
     parser.add_argument("--machine")
     parser.add_argument("--runtime-root")
+    parser.add_argument("--machine-runtime-root")
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init")
     init.add_argument("--agent-mode", choices=["on_demand", "daemon"], default="on_demand")
@@ -132,7 +145,11 @@ def build_parser() -> argparse.ArgumentParser:
     cancel.add_argument("task_id")
     retry = task_sub.add_parser("retry")
     retry.add_argument("task_id")
-    retry.add_argument("--acknowledge-duplicate-risk", action="store_true")
+    retry.add_argument(
+        "--acknowledge-duplicate-risk",
+        action="store_true",
+        help="Deprecated compatibility option; retained as a no-op.",
+    )
     offer = task_sub.add_parser("offer")
     _add_output_format(offer)
     offer.add_argument("task_id")
@@ -187,9 +204,14 @@ def build_parser() -> argparse.ArgumentParser:
             action.add_argument("--terminate-running", action="store_true")
     agent = commands.add_parser("agent")
     agent_sub = agent.add_subparsers(dest="agent_action", required=True)
-    for name in ("start", "run", "restart", "status", "stop"):
+    for name in (
+        "start", "run", "restart", "status", "stop", "add-project", "list-projects",
+        "disable-project", "remove-project", "migrate-project",
+    ):
         action = agent_sub.add_parser(name)
         _add_output_format(action)
+    for name in ("disable-project", "remove-project"):
+        agent_sub.choices[name].add_argument("project")
     top = commands.add_parser("top")
     _add_output_format(top)
     machine_list = commands.add_parser("machines")
@@ -298,7 +320,41 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("use requires --shared-root and --machine.")
             save_context(args.use_shared_root, args.use_machine, args.use_runtime_root)
             return 0
+        if args.command == "agent" and args.agent_action in {
+            "status", "list-projects", "disable-project", "remove-project", "stop", "restart"
+        }:
+            runtime = MachineRuntime(args.machine_runtime_root)
+            if args.agent_action == "status":
+                _emit("agent", {"action": "status", **get_machine_agent_status(runtime)}, args.format)
+            elif args.agent_action == "list-projects":
+                _emit("agent", {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]}, args.format)
+            elif args.agent_action == "disable-project":
+                binding = set_project_enabled(runtime, args.project, False)
+                _emit("agent", {"action": "project_disabled", **binding.to_dict()}, args.format)
+            elif args.agent_action == "remove-project":
+                binding = unregister_project(runtime, args.project)
+                _emit("agent", {"action": "project_removed", **binding.to_dict()}, args.format)
+            elif args.agent_action == "stop":
+                stopped = stop_machine_agent(runtime)
+                _emit("agent", {"action": "stopped" if stopped else "already_stopped", **get_machine_agent_status(runtime)}, args.format)
+            else:
+                process = restart_machine_agent(runtime)
+                _emit("agent", {"action": "restarted", **get_machine_agent_status(runtime), "pid": process.pid}, args.format)
+            return 0
         cfg = _resolve_cfg(args)
+        execution_context: ExecutionContext | None = None
+
+        def get_execution_context() -> ExecutionContext:
+            nonlocal execution_context
+            if execution_context is None:
+                execution_context = resolve_execution_context(cfg, args.machine_runtime_root)
+            return execution_context
+
+        def get_lifecycle_kwargs() -> dict[str, MachineRuntime]:
+            if args.machine_runtime_root is None:
+                return {}
+            return {"machine_runtime": get_execution_context().machine_runtime}
+
         if args.command == "config":
             if args.config_action != "notifications":
                 raise ValueError("unknown config action")
@@ -404,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
             _emit("lease-policy", {"lease_policy": values}, args.format)
             return 0
         if args.command == "submit":
+            if not args.no_activate:
+                ensure_local_agent_active(cfg, reason="submit", **get_lifecycle_kwargs())
             task_value = task_commands.submit(
                 cfg,
                 _command(args.argv),
@@ -416,11 +474,11 @@ def main(argv: list[str] | None = None) -> int:
                 offer_after_seconds=args.offer_after_seconds,
                 idempotency_key=args.idempotency_key,
             )
-            if not args.no_activate:
-                ensure_local_agent_active(cfg, reason="submit")
             print(task_value.task_id)
             return 0
         if args.command == "batch-submit":
+
+            ensure_local_agent_active(cfg, reason="batch-submit", **get_lifecycle_kwargs())
 
             def print_prepared(operation_id: str, idempotency_key: str) -> None:
                 print(
@@ -436,12 +494,14 @@ def main(argv: list[str] | None = None) -> int:
                 idempotency_key=args.idempotency_key,
                 on_prepared=print_prepared,
             )
-            ensure_local_agent_active(cfg, reason="batch-submit")
             _emit("batch-submit", values.to_dict(), args.format)
             return 0
         if args.command == "task":
             if args.task_action == "cancel":
-                task_value = task_commands.cancel(cfg, args.task_id)
+                context = get_execution_context()
+                task_value = task_commands.cancel(
+                    cfg, args.task_id, reservation_runtime_root=context.reservation_root
+                )
                 claim = task_value.claim_control.get("active_claim") or {}
                 is_pending = bool(
                     task_value.state["projection"] == "running"
@@ -461,30 +521,38 @@ def main(argv: list[str] | None = None) -> int:
                     args.format,
                 )
             elif args.task_action == "retry":
+                ensure_local_agent_active(
+                    cfg, reason="task-retry", **get_lifecycle_kwargs()
+                )
                 task_value = task_commands.retry(
                     cfg,
                     args.task_id,
                     acknowledge_duplicate_risk=args.acknowledge_duplicate_risk,
                 )
-                ensure_local_agent_active(cfg, reason="task-retry")
                 print(task_value.task_id)
             elif args.task_action == "offer":
+                ensure_local_agent_active(
+                    cfg, reason="task-offer", **get_lifecycle_kwargs()
+                )
                 result = task_commands.offer(cfg, args.task_id)
-                ensure_local_agent_active(cfg, reason="task-offer")
                 _emit("availability", result.to_dict(), args.format)
             elif args.task_action == "share":
                 after_seconds = _duration_seconds(args.after) if args.after is not None else None
+                ensure_local_agent_active(
+                    cfg, reason="task-share", **get_lifecycle_kwargs()
+                )
                 result = task_commands.share(
                     cfg,
                     args.task_id,
                     after_seconds=after_seconds,
                     helper_machines=_split_machine_list(args.helper_machines),
                 )
-                ensure_local_agent_active(cfg, reason="task-share")
                 _emit("availability", result.to_dict(), args.format)
             elif args.task_action == "keep-local":
+                ensure_local_agent_active(
+                    cfg, reason="task-keep-local", **get_lifecycle_kwargs()
+                )
                 result = task_commands.keep_local(cfg, args.task_id)
-                ensure_local_agent_active(cfg, reason="task-keep-local")
                 _emit("availability", result.to_dict(), args.format)
             elif args.task_action == "list":
                 _emit(
@@ -510,10 +578,12 @@ def main(argv: list[str] | None = None) -> int:
                 result = group_commands.show_group(cfg, args.name)
                 kind = "group-show"
             elif args.group_action == "retry-failed":
+                ensure_local_agent_active(
+                    cfg, reason="group-retry-failed", **get_lifecycle_kwargs()
+                )
                 result = {
                     "task_ids": [task_value.task_id for task_value in group_commands.group_retry_failed(cfg, args.name)]
                 }
-                ensure_local_agent_active(cfg, reason="group-retry-failed")
                 kind = "group-operation"
                 presentation = {**result, "action": "retry-failed", "name": args.name, "status": "completed"}
             elif args.group_action == "machines":
@@ -531,11 +601,18 @@ def main(argv: list[str] | None = None) -> int:
                     "worker_machine": args.worker_machine,
                 }
             else:
-                result = group_commands.group_control(
-                    cfg, args.name, args.group_action, terminate_running=getattr(args, "terminate_running", False)
-                )
+                context = get_execution_context()
                 if args.group_action == "resume":
-                    ensure_local_agent_active(cfg, reason="group-resume")
+                    ensure_local_agent_active(
+                        cfg, reason="group-resume", **get_lifecycle_kwargs()
+                    )
+                result = group_commands.group_control(
+                    cfg,
+                    args.name,
+                    args.group_action,
+                    terminate_running=getattr(args, "terminate_running", False),
+                    reservation_runtime_root=context.reservation_root,
+                )
                 kind = "group-operation"
                 presentation = {**result, "action": args.group_action}
             task_views = observer.list_tasks(cfg, limit=10**9) if args.format == "human" else None
@@ -547,31 +624,55 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "agent":
-            policy = load_machine_policy(cfg)
-            if args.agent_action == "status":
+            runtime = MachineRuntime(args.machine_runtime_root)
+            if args.agent_action == "add-project":
+                binding = register_project(runtime, cfg.shared_root, cfg.machine_name)
+                _emit("agent", {"action": "project_added", **binding.to_dict()}, args.format)
+                return 0
+            if args.agent_action == "migrate-project":
+                binding = migrate_project(runtime, cfg)
+                _process, status = ensure_machine_agent_started(runtime)
+                siblings = [
+                    str(path)
+                    for path in sorted(cfg.shared_root.parent.parent.glob("*/.qexp"))
+                    if path.resolve() != cfg.shared_root
+                ]
                 _emit(
-                    "agent", {"action": "status", "agent_mode": policy.agent_mode, **get_agent_status(cfg)}, args.format
+                    "agent",
+                    {"action": "project_migrated", **binding.to_dict(), **status, "migration_candidates": siblings},
+                    args.format,
                 )
-            elif args.agent_action == "start":
-                action, status = start_local_agent(cfg, reason="manual_start", require_eligible_work=False)
-                _emit("agent", {"action": action, "agent_mode": policy.agent_mode, **status}, args.format)
+                return 0
+            if args.agent_action == "list-projects":
+                _emit("agent", {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]}, args.format)
+                return 0
+            if args.agent_action == "disable-project":
+                binding = set_project_enabled(runtime, args.project, False)
+                _emit("agent", {"action": "project_disabled", **binding.to_dict()}, args.format)
+                return 0
+            if args.agent_action == "remove-project":
+                binding = unregister_project(runtime, args.project)
+                _emit("agent", {"action": "project_removed", **binding.to_dict()}, args.format)
+                return 0
+            if args.agent_action == "status":
+                _emit("agent", {"action": "status", **get_machine_agent_status(runtime)}, args.format)
+                return 0
+            if args.agent_action == "start":
+                action, status = start_local_agent(cfg, reason="manual_start", require_eligible_work=False, machine_runtime=runtime)
+                _emit("agent", {"action": action, **status}, args.format)
             elif args.agent_action == "run":
                 run_local_agent_foreground(
                     cfg,
                     reason="manual_run",
-                    on_started=lambda status: _emit(
-                        "agent",
-                        {"action": "running", "agent_mode": policy.agent_mode, **status},
-                        args.format,
-                        flush=True,
-                    ),
+                    on_started=lambda status: _emit("agent", {"action": "running", **status}, args.format, flush=True),
+                    machine_runtime=runtime,
                 )
             elif args.agent_action == "restart":
-                action, status = restart_local_agent(cfg)
-                _emit("agent", {"action": action, "agent_mode": policy.agent_mode, **status}, args.format)
+                action, status = restart_local_agent(cfg, machine_runtime=runtime)
+                _emit("agent", {"action": action, **status}, args.format)
             elif args.agent_action == "stop":
-                action, status = stop_local_agent(cfg)
-                _emit("agent", {"action": action, "agent_mode": policy.agent_mode, **status}, args.format)
+                action, status = stop_local_agent(cfg, machine_runtime=runtime)
+                _emit("agent", {"action": action, **status}, args.format)
             return 0
         if args.command == "top":
             result = observer.top_view(cfg, all_machines=True)
@@ -586,13 +687,31 @@ def main(argv: list[str] | None = None) -> int:
             print(log_commands.read_logs(cfg, args.task_id), end="")
             return 0
         if args.command == "doctor":
-            result = verify_integrity(cfg) if args.action == "verify" else repair_metadata(cfg)
+            context = get_execution_context()
+            result = (
+                verify_integrity(
+                    context.local_cfg,
+                    reservation_runtime_root=context.reservation_root,
+                    project_id=context.project_id,
+                )
+                if args.action == "verify"
+                else repair_metadata(
+                    context.local_cfg,
+                    reservation_runtime_root=context.reservation_root,
+                )
+            )
             _emit("doctor", result, args.format)
             return resolve_verify_exit_code(result, strict=args.strict)
         if args.command == "clean":
+            context = get_execution_context()
             result = cleanup.clean(
-                cfg, task_id=args.task_id, group=args.group, older_than_days=args.older_than_days,
-                limit=args.limit, dry_run=args.dry_run
+                context.local_cfg,
+                task_id=args.task_id,
+                group=args.group,
+                older_than_days=args.older_than_days,
+                limit=args.limit,
+                dry_run=args.dry_run,
+                reservation_runtime_root=context.reservation_root,
             )
             _emit("clean", result, args.format)
             return 0
