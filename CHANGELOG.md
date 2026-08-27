@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.8
+
 - breaking: replace qexp's per-project standalone agent runtime with one machine-global
   `qexp agent` that owns scheduling, GPU reservations, and local process supervision across all
   registered projects. New projects now require an explicit `qexp agent add-project`; agent start
