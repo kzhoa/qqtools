@@ -4,7 +4,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from threading import Barrier, Thread
+from threading import Barrier, Event, Thread
 
 import pytest
 
@@ -12,6 +12,7 @@ from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.commands.cleanup import clean
 from qqtools.plugins.qexp.commands.task import cancel, submit
 from qqtools.plugins.qexp.machine_agent import (
+    _MachineControlPlane,
     _publish_project_snapshots,
     dispatch_machine_cycle,
     dispatch_machine_cycle_locked,
@@ -904,6 +905,116 @@ def test_machine_agent_loop_rejects_non_main_thread_without_publishing_identity(
     assert "main thread" in str(errors[0])
     assert not runtime.paths["pid"].exists()
     assert not (runtime.paths["agent"] / "status.json").exists()
+
+
+def test_machine_control_heartbeat_is_not_blocked_by_slow_maintenance(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
+    )
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    control_plane = _MachineControlPlane(
+        runtime,
+        instance_id="test-agent",
+        loop_interval=0.02,
+        started_at="2026-01-01T00:00:00Z",
+        available_gpus=[],
+    )
+    heartbeat_path = cfg.shared_root / "machines" / cfg.machine_name / "state" / "agent.json"
+    maintenance_started = Event()
+
+    def slow_maintenance(*_args, **_kwargs) -> None:
+        maintenance_started.set()
+        time.sleep(0.15)
+
+    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.maintain_project", slow_maintenance)
+    control_plane.start()
+    try:
+        assert heartbeat_path.exists()
+        heartbeat_path.unlink()
+        worker = Thread(
+            target=dispatch_machine_cycle_locked,
+            kwargs={
+                "runtime": runtime,
+                "available_gpus": [],
+                "supervise": False,
+                "publish_snapshots": False,
+            },
+        )
+        worker.start()
+        assert maintenance_started.wait(timeout=1.0)
+        deadline = time.monotonic() + 0.1
+        while not heartbeat_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert heartbeat_path.exists()
+    finally:
+        control_plane.stop()
+
+
+def test_machine_control_authority_is_not_blocked_by_slow_project_maintenance(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    first = init_shared_root(
+        tmp_path / "first" / ".qexp", "gpu-1", runtime_root=tmp_path / "first-runtime"
+    )
+    second = init_shared_root(
+        tmp_path / "second" / ".qexp", "gpu-1", runtime_root=tmp_path / "second-runtime"
+    )
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(first.shared_root, first.machine_name)
+    runtime.add_binding(second.shared_root, second.machine_name)
+    second_tick = Event()
+    maintenance_started = Event()
+    class RecordingSupervisor:
+        def __init__(self, cfg, *, reservation_runtime_root) -> None:
+            del reservation_runtime_root
+            self.cfg = cfg
+
+        @property
+        def renewal_interval_seconds(self) -> float:
+            return 0.02
+
+        def recover_startup(self) -> None:
+            return None
+
+        def tick(self) -> None:
+            if self.cfg.shared_root == second.shared_root:
+                second_tick.set()
+
+    def slow_maintenance(*_args, **_kwargs) -> None:
+        maintenance_started.set()
+        time.sleep(0.15)
+
+    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.AuthoritySupervisor", RecordingSupervisor)
+    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.maintain_project", slow_maintenance)
+    control_plane = _MachineControlPlane(
+        runtime,
+        instance_id="test-agent",
+        loop_interval=0.2,
+        started_at="2026-01-01T00:00:00Z",
+        available_gpus=[],
+    )
+    control_plane.start()
+    try:
+        second_tick.clear()
+        worker = Thread(
+            target=dispatch_machine_cycle_locked,
+            kwargs={
+                "runtime": runtime,
+                "available_gpus": [],
+                "supervise": False,
+                "publish_snapshots": False,
+            },
+        )
+        worker.start()
+        assert maintenance_started.wait(timeout=1.0)
+        assert second_tick.wait(timeout=0.3)
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+    finally:
+        control_plane.stop()
 
 
 def test_restart_and_activation_share_one_lifecycle_lock(

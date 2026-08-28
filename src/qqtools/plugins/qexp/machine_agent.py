@@ -162,6 +162,136 @@ def _publish_project_snapshots(
             continue
 
 
+class _MachineControlPlane:
+    """Run deadline-sensitive heartbeats and authority renewal outside dispatch scans."""
+
+    def __init__(
+            self, runtime: MachineRuntime, *, instance_id: str, loop_interval: float,
+            started_at: str, available_gpus: list[int] | None) -> None:
+        self._runtime = runtime
+        self._instance_id = instance_id
+        self._loop_interval = loop_interval
+        self._started_at = started_at
+        self._visible_gpus = list(available_gpus) if available_gpus is not None else None
+        self._stop_event = threading.Event()
+        self._supervisors: dict[str, AuthoritySupervisor] = {}
+        self._authority_thread = threading.Thread(
+            target=self._run_authority_loop,
+            name="qexp-machine-authority",
+            daemon=True,
+        )
+        self._heartbeat_thread = threading.Thread(
+            target=self._run_heartbeat_loop,
+            name="qexp-machine-heartbeat",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        """Publish initial liveness before starting the control loops."""
+        self._refresh_visible_gpus()
+        self._publish_heartbeat()
+        self._authority_thread.start()
+        self._heartbeat_thread.start()
+
+    def stop(self) -> None:
+        """Stop control loops before publishing the terminal machine snapshot."""
+        self._stop_event.set()
+        for thread in (self._authority_thread, self._heartbeat_thread):
+            if thread.is_alive():
+                thread.join()
+
+    def _supervised_bindings(self) -> list[ProjectBinding]:
+        _, registered = self._runtime.load_registry()
+        return [
+            binding
+            for binding in registered
+            if binding.enabled or self._runtime.binding_state(binding) == "draining"
+        ]
+
+    def _run_authority_cycle(self) -> float:
+        authority_interval = self._loop_interval
+        try:
+            bindings = self._supervised_bindings()
+        except (OSError, RuntimeError, ValueError):
+            return authority_interval
+        supervised_ids = {binding.project_id for binding in bindings}
+        for project_id in set(self._supervisors) - supervised_ids:
+            del self._supervisors[project_id]
+        for binding in bindings:
+            try:
+                cfg = _binding_config(self._runtime, binding)
+                supervisor = self._supervisors.get(binding.project_id)
+                if supervisor is None:
+                    supervisor = AuthoritySupervisor(cfg, reservation_runtime_root=self._runtime.root)
+                    supervisor.recover_startup()
+                    self._supervisors[binding.project_id] = supervisor
+                supervisor.tick()
+                authority_interval = min(authority_interval, supervisor.renewal_interval_seconds)
+            except (OSError, RuntimeError, ValueError):
+                continue
+        return authority_interval
+
+    def _refresh_visible_gpus(self) -> None:
+        if self._visible_gpus is not None:
+            return
+        try:
+            bindings = self._supervised_bindings()
+            if bindings:
+                self._visible_gpus = _visible_gpus(_binding_config(self._runtime, bindings[0]))
+        except (OSError, RuntimeError, ValueError):
+            return
+
+    def _publish_heartbeat(self) -> None:
+        self._refresh_visible_gpus()
+        try:
+            bindings = self._supervised_bindings()
+        except (OSError, RuntimeError, ValueError):
+            return
+        readable: dict[str, RootConfig] = {}
+        for binding in bindings:
+            try:
+                readable[binding.project_id] = _binding_config(self._runtime, binding)
+            except (OSError, RuntimeError, ValueError):
+                continue
+        try:
+            _publish_project_snapshots(
+                readable,
+                instance_id=self._instance_id,
+                pid=_read_pid(self._runtime),
+                visible=self._visible_gpus or [],
+                reservations=active_reservations(self._runtime.root),
+                heartbeat_interval_seconds=self._loop_interval,
+                started_at=self._started_at,
+            )
+        except (OSError, RuntimeError, ValueError):
+            return
+
+    def _run_authority_loop(self) -> None:
+        deadline = time.monotonic()
+        while not self._stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining > 0 and self._stop_event.wait(remaining):
+                return
+            deadline = time.monotonic() + self._run_authority_cycle()
+
+    def _run_heartbeat_loop(self) -> None:
+        self._run_deadline_loop(self._publish_heartbeat, initial_delay=self._loop_interval)
+
+    def _run_deadline_loop(self, operation, *, initial_delay: float = 0.0) -> None:
+        """Run an operation on monotonic deadlines without adding execution time to the period."""
+        deadline = time.monotonic() + initial_delay
+        while not self._stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining > 0 and self._stop_event.wait(remaining):
+                return
+            operation()
+            deadline += self._loop_interval
+            now = time.monotonic()
+            if deadline <= now:
+                missed_intervals = int((now - deadline) // self._loop_interval) + 1
+                deadline += missed_intervals * self._loop_interval
+
+
 def dispatch_machine_cycle_locked(
     runtime: MachineRuntime,
     *,
@@ -171,6 +301,8 @@ def dispatch_machine_cycle_locked(
     heartbeat_interval_seconds: float = 5.0,
     started_at: str | None = None,
     supervisors: dict[str, AuthoritySupervisor] | None = None,
+    supervise: bool = True,
+    publish_snapshots: bool = True,
 ) -> list[dict[str, Any]]:
     """Supervise readable bindings and make at most one fair new claim."""
     executor = executor or Executor()
@@ -201,12 +333,13 @@ def dispatch_machine_cycle_locked(
                 reservation_runtime_root=runtime.root,
                 project_id=binding.project_id,
             )
-            supervisor = None if supervisors is None else supervisors.get(binding.project_id)
-            if supervisor is None:
-                supervisor = AuthoritySupervisor(cfg, reservation_runtime_root=runtime.root)
-                if supervisors is not None:
-                    supervisors[binding.project_id] = supervisor
-            supervisor.tick()
+            if supervise:
+                supervisor = None if supervisors is None else supervisors.get(binding.project_id)
+                if supervisor is None:
+                    supervisor = AuthoritySupervisor(cfg, reservation_runtime_root=runtime.root)
+                    if supervisors is not None:
+                        supervisors[binding.project_id] = supervisor
+                supervisor.tick()
             dispatchable[binding.project_id] = cfg
         except (OSError, RuntimeError, ValueError) as exc:
             results.append({"project_id": binding.project_id, "launched": [], "status": "error", "error": str(exc)})
@@ -241,11 +374,12 @@ def dispatch_machine_cycle_locked(
             runtime.save_cursor(ordered_enabled[(index + 1) % len(ordered_enabled)].project_id)
         else:
             runtime.save_cursor(ordered_enabled[(ordered_enabled.index(start) + 1) % len(ordered_enabled)].project_id)
-    reservations = active_reservations(runtime.root)
-    _publish_project_snapshots(
-        readable, instance_id=instance_id, pid=_read_pid(runtime), visible=visible, reservations=reservations,
-        heartbeat_interval_seconds=heartbeat_interval_seconds, started_at=started_at,
-    )
+    if publish_snapshots:
+        reservations = active_reservations(runtime.root)
+        _publish_project_snapshots(
+            readable, instance_id=instance_id, pid=_read_pid(runtime), visible=visible, reservations=reservations,
+            heartbeat_interval_seconds=heartbeat_interval_seconds, started_at=started_at,
+        )
     return results
 
 
@@ -540,7 +674,7 @@ def run_machine_agent_loop(
         raise RuntimeError(f"machine agent is already running with pid {current_identity[0]}.")
     instance_id = uuid.uuid4().hex
     started_at = utc_now()
-    supervisors: dict[str, AuthoritySupervisor] = {}
+    control_plane: _MachineControlPlane | None = None
     stop = False
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -569,19 +703,14 @@ def run_machine_agent_loop(
                 }
             })
             is_status_published = True
-            _, registered = machine_runtime.load_registry()
-            for binding in registered:
-                if not binding.enabled and machine_runtime.binding_state(binding) != "draining":
-                    continue
-                try:
-                    supervisor = AuthoritySupervisor(
-                        _binding_config(machine_runtime, binding),
-                        reservation_runtime_root=machine_runtime.root,
-                    )
-                    supervisors[binding.project_id] = supervisor
-                    supervisor.recover_startup()
-                except (OSError, RuntimeError, ValueError):
-                    continue
+            control_plane = _MachineControlPlane(
+                machine_runtime,
+                instance_id=instance_id,
+                loop_interval=loop_interval,
+                started_at=started_at,
+                available_gpus=available_gpus,
+            )
+            control_plane.start()
             while not stop:
                 with machine_runtime.migration_guard() as is_migration_clear:
                     if is_migration_clear:
@@ -589,10 +718,13 @@ def run_machine_agent_loop(
                             machine_runtime, available_gpus=available_gpus, executor=executor,
                             instance_id=instance_id, heartbeat_interval_seconds=loop_interval,
                             started_at=started_at,
-                            supervisors=supervisors,
+                            supervise=False,
+                            publish_snapshots=False,
                         )
                 time.sleep(loop_interval)
         finally:
+            if control_plane is not None:
+                control_plane.stop()
             try:
                 is_active_identity = _active_machine_identity(machine_runtime) == (
                     os.getpid(), instance_id, start_ticks

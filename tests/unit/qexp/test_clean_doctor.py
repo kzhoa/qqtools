@@ -16,6 +16,7 @@ from qqtools.plugins.qexp.runtime.locks import group_lock, task_lock
 from qqtools.plugins.qexp.runtime.paths import attempt_path, group_path, shared_paths, task_path
 from qqtools.plugins.qexp.runtime.reservations import attach, reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.records import SCHEMA_VERSION, new_id, utc_now
+from qqtools.plugins.qexp.lease import ClockCapability
 from qqtools.plugins.qexp.runtime.claims import reconcile_claim_archives
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -60,6 +61,25 @@ def _failed_task(cfg, command: str = "failed", group: str | None = None):
         cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure"
     )
     return task
+
+
+def test_verify_integrity_accepts_valid_holder_bound_claim(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.clock_capability",
+        lambda *_args: ClockCapability("unavailable", "no_qualified_provider"),
+    )
+
+    attempt = claim_task(cfg, task.task_id, [0])
+
+    assert attempt is not None
+    assert attempt.authority_mode == "holder_bound"
+    result = verify_integrity(cfg)
+    codes = {issue["code"] for issue in result["issues"]}
+    assert result["healthy"] is True
+    assert not {"task_invalid", "claim_lease_invalid", "active_claim_lease_expired"} & codes
 
 
 def test_clean_exact_terminal_task_supports_dry_run_and_audit(tmp_path: Path):

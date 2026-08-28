@@ -60,6 +60,12 @@ class AuthoritySupervisor:
                 self._record_diagnostic(process, "shared_storage_unavailable", exc)
                 self._mark_shared_unavailable(process)
 
+    @property
+    def renewal_interval_seconds(self) -> float:
+        """Return the current policy interval used to schedule the next supervision pass."""
+        policy = self._policy or self._refresh_policy()
+        return policy.renew_interval_seconds if policy is not None else 1.0
+
     def _refresh_policy(self) -> LeasePolicy | None:
         try:
             self._policy = load_lease_policy(self.cfg)
