@@ -204,6 +204,36 @@ def test_slow_ready_reads_shrink_the_process_local_batch(
     assert sizer.batch_size < policy.initial_batch_size
 
 
+def test_ready_dispatch_stops_when_record_operation_cost_exceeds_budget(
+    tmp_path: Path,
+) -> None:
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
+    )
+    task = submit(cfg, ["echo", "ready"], task_id="task-ready")
+    _activate_ready(cfg)
+    budget = SliceBudget(
+        WorkBudgetPolicy(
+            operation_hard_limit=2,
+            soft_deadline_ms=60_000,
+        )
+    )
+
+    launched = run_dispatch_cycle(
+        cfg,
+        available_gpus=[0],
+        should_recover_starting=False,
+        work_budget=budget,
+    )
+
+    assert launched == []
+    assert budget.records_used == 0
+    assert budget.operations_used == 0
+    assert read_json(shared_paths(cfg.shared_root)["tasks"] / f"{task.task_id}.json")[
+        "task"
+    ]["state"]["projection"] == "queued"
+
+
 def test_full_capacity_machine_cycle_reads_no_ready_candidates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

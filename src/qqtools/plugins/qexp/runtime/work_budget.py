@@ -132,16 +132,18 @@ class SliceBudget:
     def __post_init__(self) -> None:
         self._deadline_ns = self.clock_ns() + self.policy.soft_deadline_ms * 1_000_000
 
-    def can_start_record(self) -> bool:
+    def can_start_record(self, *, operations: int = 1) -> bool:
+        if type(operations) is not int or operations <= 0:
+            raise ValueError("record operations must be a positive integer.")
         return (
             self.records_used < self.policy.record_hard_limit
-            and self.operations_used < self.policy.operation_hard_limit
+            and self.operations_used + operations <= self.policy.operation_hard_limit
             and self.clock_ns() < self._deadline_ns
         )
 
     def consume_record(self, *, operations: int = 1) -> None:
-        if operations <= 0:
-            raise ValueError("record operations must be positive.")
+        if type(operations) is not int or operations <= 0:
+            raise ValueError("record operations must be a positive integer.")
         if self.records_used >= self.policy.record_hard_limit:
             raise RuntimeError("scheduler record hard limit exceeded.")
         if self.operations_used + operations > self.policy.operation_hard_limit:
