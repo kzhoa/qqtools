@@ -1,17 +1,12 @@
 # History
 
-## Unreleased
-
-- fix: make `qexp init` automatically register new projects with the machine-global agent, keeping
-  the established `init` then `agent start` or `submit` workflow intact. Legacy project metadata
-  is rejected before it can be overwritten, preserving the explicit migration handoff.
-
 ## v1.3.8
 
 - breaking: replace qexp's per-project standalone agent runtime with one machine-global
   `qexp agent` that owns scheduling, GPU reservations, and local process supervision across all
-  registered projects. New projects now require an explicit `qexp agent add-project`; agent start
-  and automatic activation no longer register the current project implicitly.
+  registered projects. `qexp init` registers new projects automatically; `qexp agent add-project`
+  is reserved for operational recovery, while agent start never registers the current project
+  implicitly.
 - feat: add qexp machine-agent project lifecycle commands for listing, disabling, and safely
   removing registered projects. Disabled projects drain existing local supervision before removal,
   while enabled projects share deterministic fair scheduling.
@@ -29,6 +24,8 @@
 - fix: preserve per-project authority supervision and agent lifecycle timestamps across dispatch
   cycles so lease-renewal throttling, failure state, uptime, and continuous idle duration remain
   accurate.
+- fix: reject legacy project metadata before `qexp init` can overwrite it, preserving the explicit
+  `qexp agent migrate-project` migration handoff.
 
 ## v1.3.7
 
