@@ -12,6 +12,9 @@ from typing import Any, Iterator
 from .config_types import RootConfig
 from .layout import load_machine_record, load_root_config
 from .runtime.locks import exclusive
+from .runtime.filesystem_qualification import (
+    validate_existing_filesystem_qualification,
+)
 from .runtime.paths import local_paths, machine_project_paths, machine_runtime_paths, shared_paths
 from .runtime.records import utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
@@ -223,6 +226,7 @@ class MachineRuntime:
         stable_id = identity.get("project_id")
         if not isinstance(stable_id, str) or not stable_id:
             raise RuntimeError(f"qexp project identity is malformed: {identity_path}")
+        validate_existing_filesystem_qualification(cfg)
         record = load_machine_record(cfg)
         if not record or record.get("machine", {}).get("machine_name") != machine_name:
             raise RuntimeError(f"machine {machine_name!r} is not initialized in {cfg.shared_root}.")

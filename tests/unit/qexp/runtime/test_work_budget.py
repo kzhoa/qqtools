@@ -79,6 +79,28 @@ def test_slice_budget_does_not_prefetch_after_hard_limit() -> None:
     assert records.reads == 4
 
 
+def test_slice_budget_rejects_record_when_required_operations_do_not_fit() -> None:
+    budget = SliceBudget(
+        policy=WorkBudgetPolicy(
+            record_hard_limit=4,
+            operation_hard_limit=2,
+            initial_batch_size=4,
+        )
+    )
+
+    assert budget.can_start_record(operations=3) is False
+    assert budget.records_used == 0
+    assert budget.operations_used == 0
+
+
+@pytest.mark.parametrize("operations", [0, -1, True])
+def test_slice_budget_rejects_invalid_operation_requirements(operations: int) -> None:
+    budget = SliceBudget()
+
+    with pytest.raises(ValueError, match="positive integer"):
+        budget.can_start_record(operations=operations)
+
+
 def test_work_budget_rejects_boolean_limits() -> None:
     with pytest.raises(ValueError, match="must be positive"):
         WorkBudgetPolicy(record_hard_limit=True)

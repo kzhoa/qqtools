@@ -1,7 +1,7 @@
 ---
 doc_type: adr
 status: active
-updated_at: 2026-08-28
+updated_at: 2026-08-29
 archived_at:
 ---
 
@@ -29,6 +29,16 @@ The two participants must have distinct identities and exercise the same mounted
 The probe must prove exclusive-lock contention, whole-value atomic replacement, file and directory
 `fsync` visibility, and safe process-failure cleanup. Missing or failed evidence is not qualified.
 Results describe only that deployment and never tune repository-wide scheduling defaults.
+
+The most recent decision and its evidence are persisted atomically at
+`.qexp/project/filesystem-qualification.json`, bound to the project identity and canonical shared
+root. A failed requalification replaces and revokes an earlier success. Missing, malformed,
+mismatched, or failed evidence is unqualified. Initialization and project
+registration reject an invalid record when one is present. A same-machine claim does not require
+this record; every claim whose execution machine differs from the Task home machine revalidates it
+before reserving local GPUs and again while holding Task authority. Launch authorization and
+`starting` recovery also revalidate it, so failed requalification prevents an unlaunched remote
+Attempt from starting. There is no boolean override for cross-machine dispatch.
 
 ## Consequences
 
