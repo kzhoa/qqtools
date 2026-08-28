@@ -1,5 +1,22 @@
 # History
 
+## v1.3.9
+
+- feat: replace history-sized qexp scheduling scans with a bounded ready index, capacity-first
+  admission, fair multi-project dispatch, resumable activation and repair, and in-memory runtime
+  diagnostics. Scheduling work is now bounded by portable record, operation, and deadline budgets.
+- fix: fail closed before cross-machine claim, launch authorization, or `starting` recovery unless
+  the project has valid deployment-specific shared-filesystem qualification evidence. Failed
+  requalification revokes earlier evidence while preserving same-machine scheduling.
+- fix: isolate machine-agent heartbeat and authority control loops from blocking dispatch work,
+  preserve active-operation recovery, and avoid ordinary ready-candidate reads when local qexp GPU
+  capacity is fully reserved.
+- fix: ignore the offer-deadline layout control record during `qexp doctor verify`, preventing a
+  healthy project from being reported as stale after deadline-index migration.
+- test: separate fast qexp unit checks from release-only integration coverage, add deterministic
+  `qexp-unit`, `qexp-integration`, and `qexp-full` tox environments, and require the complete qexp
+  source suite plus installed-wheel E2E before publishing.
+
 ## v1.3.8
 
 - breaking: replace qexp's per-project standalone agent runtime with one machine-global
