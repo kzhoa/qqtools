@@ -108,6 +108,8 @@ def verify_integrity(
     groups = {name: {"group": group} for name, group in group_records.items()}
     deadline_task_ids: set[str] = set()
     for deadline_path in iter_json(paths["offer_deadlines"]):
+        if deadline_path == paths["offer_deadlines_migration"]:
+            continue
         try:
             deadline = read_json(deadline_path).get("offer_deadline", {})
         except (OSError, ValueError) as exc:

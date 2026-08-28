@@ -13,6 +13,7 @@ from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.doctor import repair_metadata, repair_orphans, verify_integrity
 from qqtools.plugins.qexp.lease import ClockCapability
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
+from qqtools.plugins.qexp.runtime.availability import migrate_legacy_deadline_indexes
 from qqtools.plugins.qexp.runtime.claims import reconcile_claim_archives
 from qqtools.plugins.qexp.runtime.locks import group_lock, task_lock
 from qqtools.plugins.qexp.runtime.paths import attempt_path, group_path, shared_paths, task_path
@@ -85,6 +86,16 @@ def test_verify_integrity_accepts_valid_holder_bound_claim(
     codes = {issue["code"] for issue in result["issues"]}
     assert result["healthy"] is True
     assert not {"task_invalid", "claim_lease_invalid", "active_claim_lease_expired"} & codes
+
+
+def test_verify_integrity_ignores_deadline_layout_marker(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    migrate_legacy_deadline_indexes(cfg)
+
+    result = verify_integrity(cfg)
+
+    assert shared_paths(cfg.shared_root)["offer_deadlines_migration"].exists()
+    assert result["healthy"] is True
 
 
 def test_clean_exact_terminal_task_supports_dry_run_and_audit(tmp_path: Path):
