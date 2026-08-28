@@ -6,6 +6,7 @@ from qqtools.plugins.qexp import batch_submit, init_shared_root, submit
 from qqtools.plugins.qexp.commands.group import group_control
 from qqtools.plugins.qexp.observer import list_groups
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def test_group_membership_sequences_and_workers_are_authoritative(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")

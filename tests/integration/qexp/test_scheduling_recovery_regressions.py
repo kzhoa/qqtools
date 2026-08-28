@@ -3,7 +3,6 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.project_maintenance import offer_due_tasks, reconcile_project_reservations
 from qqtools.plugins.qexp.authority import AuthoritySupervisor
 from qqtools.plugins.qexp.commands.group import (
     change_worker,
@@ -12,10 +11,11 @@ from qqtools.plugins.qexp.commands.group import (
     show_group,
 )
 from qqtools.plugins.qexp.doctor import repair_metadata
+from qqtools.plugins.qexp.project_maintenance import offer_due_tasks, reconcile_project_reservations
 from qqtools.plugins.qexp.runner import run_attempt
-from qqtools.plugins.qexp.runtime.recovery import recover_running_attempt
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
+from qqtools.plugins.qexp.runtime.recovery import recover_running_attempt
 from qqtools.plugins.qexp.runtime.reservations import reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -28,6 +28,7 @@ from qqtools.plugins.qexp.scheduler import (
     run_dispatch_cycle,
 )
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 class RecordingExecutor:
     def __init__(self):

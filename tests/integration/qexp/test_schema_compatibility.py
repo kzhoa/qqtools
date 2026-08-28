@@ -2,12 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp.layout import (load_machine_record, load_root_config,
-                                         validate_root_contract)
+from qqtools.plugins.qexp.layout import load_machine_record, load_root_config, validate_root_contract
 from qqtools.plugins.qexp.machine_config import init_shared_root
 from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.store import atomic_replace
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def test_old_schema_fails_before_mutation(tmp_path: Path):
     root = tmp_path / ".qexp"
@@ -32,7 +32,7 @@ def test_init_rejects_old_schema_before_lock_mutation(tmp_path: Path):
     assert not (root / "locks").exists()
 
 
-def test_init_writes_schema5_layout(tmp_path: Path):
+def test_init_writes_current_schema_layout(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     paths = shared_paths(cfg.shared_root)
     assert paths["groups"].is_dir()

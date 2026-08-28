@@ -11,12 +11,13 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, load_root_config, read_logs, submit
 from qqtools.plugins.qexp.authority import AuthoritySupervisor
+from qqtools.plugins.qexp.runner import _publish_launch_intent, run_attempt
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths
 from qqtools.plugins.qexp.runtime.reservations import active_reservations
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
-from qqtools.plugins.qexp.runner import _publish_launch_intent, run_attempt
 from qqtools.plugins.qexp.scheduler import authorize_launch, cancel_task, claim_task
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 @pytest.fixture(autouse=True)
 def _disable_process_group_guardian(monkeypatch):

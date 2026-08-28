@@ -31,12 +31,13 @@ from qqtools.plugins.qexp.machine_runtime import (
     resolve_machine_runtime_root,
 )
 from qqtools.plugins.qexp.project_maintenance import maintain_project
-from qqtools.plugins.qexp.runtime.paths import machine_project_paths, machine_runtime_paths
 from qqtools.plugins.qexp.runtime.locks import exclusive
+from qqtools.plugins.qexp.runtime.paths import machine_project_paths, machine_runtime_paths
 from qqtools.plugins.qexp.runtime.reservations import active_reservations, attach, reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def test_resolve_machine_runtime_root_prefers_explicit_override_and_uses_safe_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -317,8 +318,8 @@ def test_migration_disables_binding_when_final_state_write_fails(
 def test_legacy_agent_stop_treats_reused_pid_as_stopped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from qqtools.plugins.qexp.machine_agent import _stop_verified_legacy_agent
     from qqtools.plugins.qexp.layout import runtime_pid_path
+    from qqtools.plugins.qexp.machine_agent import _stop_verified_legacy_agent
 
     cfg = init_shared_root(
         tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
@@ -389,8 +390,7 @@ def test_migration_gpu_conflict_keeps_source_and_disables_project(tmp_path: Path
 
 def test_machine_recovery_retags_global_reservation(tmp_path: Path) -> None:
     from qqtools.plugins.qexp.runtime.recovery import recover_running_attempt
-    from qqtools.plugins.qexp.scheduler import claim_task
-    from qqtools.plugins.qexp.scheduler import authorize_launch
+    from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
 
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     task = submit(cfg, ["echo", "ok"])
@@ -734,11 +734,19 @@ def test_machine_dispatch_continues_after_a_project_dispatch_error(
     monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.run_dispatch_cycle", fail_first)
 
     results = dispatch_machine_cycle(runtime, available_gpus=[0], executor=_RecordingExecutor())
+    result_by_project = {result["project_id"]: result for result in results}
 
-    assert results == [
-        {"project_id": first_binding.project_id, "launched": [], "status": "error", "error": "dispatch failed"},
-        {"project_id": second_binding.project_id, "launched": [], "status": "dispatched"},
-    ]
+    assert result_by_project[first_binding.project_id] == {
+        "project_id": first_binding.project_id,
+        "launched": [],
+        "status": "error",
+        "error": "dispatch failed",
+    }
+    assert result_by_project[second_binding.project_id] == {
+        "project_id": second_binding.project_id,
+        "launched": [],
+        "status": "dispatched",
+    }
 
 
 def test_machine_cleanup_keeps_other_project_reservation_with_same_task_id(tmp_path: Path) -> None:

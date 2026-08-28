@@ -6,6 +6,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.cli import main
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _base_args(cfg) -> list[str]:
     return [

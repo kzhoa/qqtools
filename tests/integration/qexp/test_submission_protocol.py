@@ -6,6 +6,7 @@ from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.commands.task import batch_submit, submit
 from qqtools.plugins.qexp.runtime.submission import IdempotencyConflict
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def test_bulk_submission_has_one_operation_and_no_batch_identity(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")

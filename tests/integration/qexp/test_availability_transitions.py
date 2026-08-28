@@ -7,8 +7,8 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.cli import _split_machine_list, main
-from qqtools.plugins.qexp.commands.group import change_worker
 from qqtools.plugins.qexp.commands import task as task_commands
+from qqtools.plugins.qexp.commands.group import change_worker
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
 from qqtools.plugins.qexp.runtime import availability as availability_runtime
@@ -18,6 +18,7 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import claim_task
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _base_args(cfg) -> list[str]:
     return ["--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,

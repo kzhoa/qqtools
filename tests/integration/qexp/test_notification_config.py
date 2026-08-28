@@ -1,9 +1,12 @@
 import io
 
+import pytest
+
 from qqtools.plugins.qexp import cli
 from qqtools.plugins.qexp.machine_config import init_shared_root
 from qqtools.plugins.qexp.notification_config import shared_feishu_webhook_path
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def test_shared_file_webhook_cli_requires_acknowledgement(tmp_path, monkeypatch, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")

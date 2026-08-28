@@ -17,6 +17,7 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 class _RecordingExecutor:
     def __init__(self) -> None:
