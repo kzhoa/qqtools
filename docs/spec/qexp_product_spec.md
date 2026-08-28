@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-27
+updated_at: 2026-08-28
 archived_at:
 ---
 
@@ -59,6 +59,45 @@ Document authority is divided as follows:
 
 Anything marked **Assumption / Unverified** is not a guarantee of the installed version.
 
+## Compatibility policy
+
+Workflows listed under **Protected workflows**, and workflows explicitly marked as stable in
+this specification, are stable public behavior. Experimental workflows are excluded only when
+explicitly labeled experimental.
+
+A change is backward incompatible if an existing documented successful workflow:
+
+- becomes invalid;
+- requires an additional mandatory user step;
+- gains a new prerequisite;
+- changes supported persisted-state interpretation; or
+- implicitly changes project or agent ownership.
+
+Such changes require an explicit compatibility decision recorded in the relevant requirement
+pitch or delivery change description, with explicit approval.
+
+## Protected workflows
+
+- New project activation: `qexp init -> qexp agent start`
+- New project submission: `qexp init -> qexp submit -- <command>`
+- Legacy project migration: `qexp agent migrate-project`
+
+`init` succeeds only after it initializes the project, writes the current machine configuration,
+and registers the current-generation binding; it does not start an agent. `agent start` starts
+the global agent only for an existing binding. It neither initializes nor registers a project and
+must not require `add-project` in the new-project workflow.
+
+Unless `--no-activate` is supplied, `submit` activates the local agent for an existing binding
+and submitted work eventually converges through its normal scheduling lifecycle. `--no-activate`
+is an explicit non-activation exception, not an additional prerequisite for the main workflow.
+
+`migrate-project` handles only a project carrying legacy metadata. It verifies and stops the old
+agent, imports that project's local evidence, and enables its binding. A failed migration must not
+mark the project migrated or release or overwrite resources belonging to another project.
+
+`add-project` is an operations command for restoring a missing or removed current-generation
+binding; it is not part of new-project setup.
+
 Recommended reading order:
 
 - Sections 3-5 explain product position, deployment reality, and goals.
@@ -67,7 +106,7 @@ Recommended reading order:
 - Sections 12-16 define commands, observation, and operating boundaries.
 - Section 17 is the release acceptance gate.
 
-### Breaking Schema Cutover
+## Breaking Schema Cutover
 
 The Group/Task/Attempt model intentionally does not provide backward compatibility for
 Batch-era control data.
@@ -1183,7 +1222,8 @@ qexp agent start
 ```
 
 `agent start` always starts a detached process. Use `qexp agent run` for foreground debugging.
-`init` only records machine configuration; it does not start a long-lived process.
+`init` initializes the project, records machine configuration, and registers its binding; it does
+not start a long-lived process.
 
 ### 15.4 Local Process Ownership
 

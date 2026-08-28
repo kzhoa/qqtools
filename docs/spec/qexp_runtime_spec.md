@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-27
+updated_at: 2026-08-28
 archived_at:
 ---
 
@@ -76,6 +76,29 @@ destructive:
 
 Loss of Batch-era scheduling metadata is a known and accepted product risk. The schema-5 to
 schema-6 migration is a one-way control-root upgrade, not a legacy reader or repair path.
+
+## Compatibility-sensitive runtime invariants
+
+This section protects only runtime semantics whose regression would break a protected workflow or
+misassign process or GPU ownership. It does not promote general implementation details into public
+API.
+
+1. **Legacy classification**: if any project machine record carries legacy metadata, `init`,
+   registration, and agent startup must not implicitly reclassify or overwrite it; only
+   `qexp agent migrate-project` performs that conversion.
+2. **Agent ownership**: one shared `MachineRuntime` root has one global agent and one unified GPU
+   reservation set. Projects join it only through controlled bindings. A logical `--machine` name
+   is not physical-host identity; projects share this arbitration boundary only when they use the
+   same `MachineRuntime`.
+3. **Running task ownership**: initialization, registration, global-agent lifecycle operations,
+   and migration must not take over, terminate, or reinterpret running work outside the target
+   binding. The global agent continues its established supervision only for registered projects.
+4. **GPU reservation ownership**: reservations retain stable project ID and MachineRuntime
+   ownership. Another project or an incomplete migration must not release, overwrite, or treat a
+   valid reservation as available capacity.
+5. **Migration transition**: verified legacy-agent stop, reservation and local-evidence import,
+   and binding enablement are ordered and recoverable. A failure leaves a diagnosable incomplete
+   state.
 
 ## Lifecycle terminal boundary and notifications
 
