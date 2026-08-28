@@ -3,13 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from qqtools.plugins.qexp.machine_config import init_shared_root
-from qqtools.plugins.qexp.notification_config import (shared_feishu_webhook_path,
-                                                       update_notifications,
-                                                       validate_notifications,
-                                                       write_shared_feishu_webhook)
-from qqtools.plugins.qexp.notifications.feishu import FeishuNotifier, NotificationTransportError
+from qqtools.plugins.qexp.notification_config import validate_notifications
 from qqtools.plugins.qexp.notifications import NotificationHook, notification_key
+from qqtools.plugins.qexp.notifications.feishu import FeishuNotifier, NotificationTransportError
 
 
 def _event(**overrides):
@@ -35,35 +31,6 @@ def test_feishu_timeout_validation(timeout, valid):
     else:
         with pytest.raises(ValueError):
             validate_notifications(value)
-
-
-def test_shared_file_credential_source_uses_owner_private_webhook(tmp_path):
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
-    update_notifications(cfg, lambda current: {
-        **current,
-        "enabled": True,
-        "providers": {"feishu": {
-            "enabled": True,
-            "credential_source": "shared_file",
-            "webhook_env": "UNUSED_WEBHOOK_ENV",
-            "secret_env": None,
-            "timeout_seconds": 5,
-        }},
-    })
-    write_shared_feishu_webhook(cfg, "https://example.invalid/shared-webhook")
-    calls = []
-
-    class Notifier:
-        name = "feishu"
-
-        def send(self, event, *, webhook, secret, timeout_seconds):
-            calls.append((webhook, secret, timeout_seconds))
-            return {"http_status": 200, "business_code": "0"}
-
-    NotificationHook(registry={"feishu": Notifier()}).handle(cfg, _event())
-
-    assert calls == [("https://example.invalid/shared-webhook", None, 5)]
-    assert shared_feishu_webhook_path(cfg).exists()
 
 
 def test_feishu_payload_and_business_success():

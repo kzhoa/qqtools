@@ -10,14 +10,19 @@ from qqtools.plugins.qexp.machine_agent import dispatch_machine_cycle_locked
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
-    delete_stale_ready_marker, load_ready_cursor, next_ready_marker,
+    delete_stale_ready_marker,
+    load_ready_cursor,
+    next_ready_marker,
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.work_budget import (
-    AdaptiveBatchSizer, SliceBudget, WorkBudgetPolicy,
+    AdaptiveBatchSizer,
+    SliceBudget,
+    WorkBudgetPolicy,
 )
 from qqtools.plugins.qexp.scheduler import run_dispatch_cycle
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 class _RecordingExecutor:
     def __init__(self) -> None:

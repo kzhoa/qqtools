@@ -5,17 +5,22 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands.task import cancel, retry
-from qqtools.plugins.qexp.executor import Executor
-from qqtools.plugins.qexp.runtime.reservations import reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.paths import attempt_path, shared_paths
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
+from qqtools.plugins.qexp.runtime.reservations import reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
-from qqtools.plugins.qexp.scheduler import (authorize_launch, claim_task, expire_claim,
-                                             reconcile_running_tasks, run_dispatch_cycle,
-                                             _manifest_supervisor,
-                                             _terminate_process_group)
+from qqtools.plugins.qexp.scheduler import (
+    _manifest_supervisor,
+    _terminate_process_group,
+    authorize_launch,
+    claim_task,
+    expire_claim,
+    reconcile_running_tasks,
+    run_dispatch_cycle,
+)
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 class RecordingExecutor:
     def __init__(self):

@@ -97,6 +97,9 @@ jobs:
 
           pathlib.Path("RELEASE_BODY.md").write_text(body + "\n", encoding="utf-8")
           PY
+      - name: Run complete qexp regression suite
+        run: tox run -e qexp-full
+
       - name: Build package
         run: python -m build --sdist --wheel
 

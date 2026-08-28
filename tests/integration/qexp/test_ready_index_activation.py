@@ -6,11 +6,10 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
 from qqtools.plugins.qexp.layout import project_id
 from qqtools.plugins.qexp.machine_state import publish_machine_snapshots
-from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.locks import exclusive, schema_lock
+from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
     READY_WRITER_CAPABILITY,
     advance_ready_index_build,
@@ -23,6 +22,7 @@ from qqtools.plugins.qexp.runtime.records import TaskRecord
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _ready_reference(cfg, task: TaskRecord):
     from qqtools.plugins.qexp.runtime.ready import ReadyMarkerRef
@@ -302,49 +302,6 @@ def test_recent_incompatible_agent_blocks_cutover(tmp_path: Path) -> None:
         reason == "incompatible_active_writers:gpu-1"
         for reason in record["degraded_reasons"]
     )
-
-
-def test_doctor_reports_and_repairs_missing_active_marker(tmp_path: Path) -> None:
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
-    task = submit(cfg, ["echo", "repair"], task_id="repair-task")
-    _finish_build(cfg)
-    reference = _ready_reference(cfg, load_task(cfg, task.task_id))
-    marker = (
-        shared_paths(cfg.shared_root)["ready_home"]
-        / reference.home_machine
-        / reference.partition
-        / reference.marker_name
-    )
-    marker.unlink()
-
-    verification = verify_integrity(cfg, reservation_runtime_root=cfg.runtime_root)
-    repaired = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root)
-    current = load_task(cfg, task.task_id)
-
-    assert any(issue["code"] == "ready_projection_inconsistent" for issue in verification["issues"])
-    assert repaired["ready_index"]["state"] == "active"
-    assert current.ready_generation > task.ready_generation
-    assert classify_ready_marker(cfg, _ready_reference(cfg, current)).classification == "claimable"
-
-
-def test_doctor_rebuilds_corrupt_catalog_from_task_truth(tmp_path: Path) -> None:
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
-    task = submit(cfg, ["echo", "repair"], task_id="catalog-task")
-    _finish_build(cfg)
-    reference = _ready_reference(cfg, load_task(cfg, task.task_id))
-    catalog = (
-        shared_paths(cfg.shared_root)["ready_catalogs"]
-        / f"home.{cfg.machine_name}"
-        / f"{reference.catalog_page:016d}.json"
-    )
-    atomic_replace(catalog, {"corrupt": {}})
-
-    repaired = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root)
-    current = load_task(cfg, task.task_id)
-
-    assert repaired["ready_index"]["state"] == "active"
-    assert current.ready_generation > task.ready_generation
-    assert classify_ready_marker(cfg, _ready_reference(cfg, current)).classification == "claimable"
 
 
 def test_nonqueued_task_needs_no_marker_at_cutover(tmp_path: Path) -> None:

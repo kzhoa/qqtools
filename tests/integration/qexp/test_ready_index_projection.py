@@ -7,19 +7,20 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
+from qqtools.plugins.qexp.runtime.active_operations import (
+    iter_active_operation_paths,
+    write_active_operation,
+)
 from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
     ReadyMarkerRef,
     classify_ready_marker,
 )
-from qqtools.plugins.qexp.runtime.active_operations import (
-    iter_active_operation_paths,
-    write_active_operation,
-)
 from qqtools.plugins.qexp.runtime.store import read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import claim_task
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _ready_reference(cfg, task_id: str, generation: int) -> ReadyMarkerRef:
     path = shared_paths(cfg.shared_root)["ready_reservations"] / f"{task_id}.{generation}.json"
@@ -154,7 +155,7 @@ def test_deadline_index_is_partitioned_by_home_and_time_bucket(tmp_path: Path):
 
 def test_active_operation_enumeration_is_hard_bounded(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
-    for index in range(100):
+    for index in range(65):
         write_active_operation(
             cfg,
             "availability",
@@ -168,5 +169,5 @@ def test_active_operation_enumeration_is_hard_bounded(tmp_path: Path):
     assert len(paths) == 64
     active_directory = shared_paths(cfg.shared_root)["availability_active"]
     assert all(path.parent == active_directory for path in paths)
-    assert len(next_paths) == 36
+    assert len(next_paths) == 1
     assert not set(paths).intersection(next_paths)

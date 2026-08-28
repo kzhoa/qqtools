@@ -33,6 +33,22 @@ tox run -e e2e
 tox run -e release-e2e
 ```
 
+Test placement and execution frequency are separate decisions. An integration test remains an
+integration test even when it is intentionally excluded from the fast pull-request loop.
+
+For qexp, use these stable module entry points:
+
+```bash
+tox run -e qexp-unit
+tox run -e qexp-integration
+tox run -e qexp-full
+```
+
+During development, run `qexp-unit` and the specific integration files that protect the changed
+behavior. `qexp-integration` is the complete integration layer, while `qexp-full` combines all
+qexp unit and integration tests for release validation. Pull-request CI does not run the complete
+qexp integration layer; the publish gate does.
+
 Default pytest collection excludes `tests/e2e/qexp`. `tox run -e release-e2e`
 builds and validates a wheel from the current checkout; use
 `tox run -e release-e2e --installpkg <wheel>` when validating a selected,

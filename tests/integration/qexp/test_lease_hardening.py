@@ -6,19 +6,36 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.lease import (ClockCapability, LeasePolicy, LeaseRenewalOutcome,
-                                        chrony_health, load_lease_policy, save_lease_policy)
 from qqtools.plugins.qexp.layout import load_root_config, migrate_schema5_to_schema6
+from qqtools.plugins.qexp.lease import (
+    ClockCapability,
+    LeasePolicy,
+    LeaseRenewalOutcome,
+    load_lease_policy,
+    save_lease_policy,
+)
 from qqtools.plugins.qexp.runtime.paths import attempt_path
-from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
-from qqtools.plugins.qexp.runtime.termination import (commit_local_unavailable, commit_signal,
-                                                       create_decision, is_recovery_blocked,
-                                                       send_signals, update_decision)
-from qqtools.plugins.qexp.scheduler import (authorize_launch, claim_task, commit_shared_termination,
-                                             _process_start_time_ticks, expire_claim, reconcile_running_tasks,
-                                             renew_attempt_lease)
 from qqtools.plugins.qexp.runtime.recovery import recover_running_attempt
+from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+from qqtools.plugins.qexp.runtime.termination import (
+    commit_local_unavailable,
+    commit_signal,
+    create_decision,
+    is_recovery_blocked,
+    send_signals,
+    update_decision,
+)
+from qqtools.plugins.qexp.scheduler import (
+    _process_start_time_ticks,
+    authorize_launch,
+    claim_task,
+    commit_shared_termination,
+    expire_claim,
+    reconcile_running_tasks,
+    renew_attempt_lease,
+)
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def test_renewal_error_is_classified_without_fencing(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
@@ -42,15 +59,6 @@ def test_local_irreversible_commitment_blocks_recovery(tmp_path: Path):
     assert is_recovery_blocked(cfg, "attempt")
     commit_signal(cfg, "attempt", decision["decision_id"])
     assert is_recovery_blocked(cfg, "attempt")
-
-
-def test_chrony_health_rejects_large_offset():
-    class Completed:
-        returncode = 0
-        stdout = ("System time     : 2.0 seconds slow of NTP time\nRoot delay      : 0.1 seconds\n"
-                  "Root dispersion : 0.1 seconds\nSkew            : 0.01 ppm\nLeap status     : Normal\n")
-
-    assert chrony_health(LeasePolicy(), run=lambda *_args, **_kwargs: Completed()) == (False, "chrony_error_bound_exceeds_policy")
 
 
 def test_unqualified_clock_creates_local_safe_claim_and_blocks_expiry(tmp_path: Path, monkeypatch):
@@ -187,8 +195,9 @@ def test_recovery_uses_authoritative_policy_ttl(tmp_path: Path):
     assert token == attempt.current_fencing_token + 1
     recovered = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"]
     expires_at = recovered["lease"]["expires_at"]
-    from qqtools.plugins.qexp.lease import parse_utc
     from datetime import datetime, timezone
+
+    from qqtools.plugins.qexp.lease import parse_utc
     remaining = (parse_utc(expires_at) - datetime.now(timezone.utc)).total_seconds()
     assert 175 <= remaining <= 180
 

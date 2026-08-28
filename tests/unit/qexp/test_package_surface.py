@@ -1,7 +1,7 @@
 from qqtools.plugins import qexp
 
 
-def test_schema5_public_surface_has_group_task_attempt_without_batch():
+def test_public_surface_has_group_task_attempt_without_batch():
     assert callable(qexp.submit)
     assert callable(qexp.batch_submit)
     assert callable(qexp.list_groups)

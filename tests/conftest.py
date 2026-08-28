@@ -3,7 +3,9 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -16,11 +18,40 @@ RELEASE_E2E_ROOT = PROJECT_ROOT / "tests" / "e2e" / "qexp"
 RELEASE_E2E_PYTEST_INI = PROJECT_ROOT / "tests" / "e2e" / "release_pytest.ini"
 
 
+@pytest.fixture
+def qexp_healthy_clock(monkeypatch):
+    """Provide the bounded-clock deployment prerequisite to qexp tests."""
+    from qqtools.plugins.qexp.lease import ClockCapability, ClockObservation
+
+    observation = ClockObservation(
+        "test-observation",
+        "chrony",
+        "2026-08-06T00:00:00Z",
+        time.monotonic(),
+        "test-boot",
+        -0.001,
+        0.001,
+        0.0,
+        0.0,
+    )
+    capability = ClockCapability("healthy", "healthy", observation, ("chrony",))
+    monkeypatch.setattr("qqtools.plugins.qexp.lease.clock_capability", lambda *_args: capability)
+    monkeypatch.setattr("qqtools.plugins.qexp.scheduler.clock_capability", lambda *_args: capability)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.runtime.recovery.clock_capability",
+        lambda *_args: capability,
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.reclaim_allowed_at",
+        lambda *_args: datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+
+
 def pytest_ignore_collect(collection_path, config):
     """Reserve installed-wheel e2e tests for their isolated pytest config."""
     path = Path(str(collection_path)).resolve()
     if path != RELEASE_E2E_ROOT and RELEASE_E2E_ROOT not in path.parents:
-        return False
+        return None
     return config.inipath is None or Path(config.inipath).resolve() != RELEASE_E2E_PYTEST_INI
 
 

@@ -10,6 +10,7 @@ from qqtools.plugins.qexp.machine_state import (
 )
 from qqtools.plugins.qexp.runtime.store import read_json
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def test_standalone_agent_runtime_is_removed(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")

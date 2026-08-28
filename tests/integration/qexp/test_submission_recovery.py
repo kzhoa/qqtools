@@ -3,12 +3,10 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.commands.task import batch_submit
-from qqtools.plugins.qexp.runtime.store import read_json
-from qqtools.plugins.qexp.runtime.paths import idempotency_path, submission_path
-from qqtools.plugins.qexp.runtime.submission import IdempotencyConflict
+from qqtools.plugins.qexp.runtime.paths import idempotency_path
 from qqtools.plugins.qexp.runtime.submission import semantic_digest
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def test_sealed_group_does_not_poison_idempotency_key(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")

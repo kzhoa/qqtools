@@ -171,6 +171,7 @@ def main() -> int:
     _require_clean_head()
     _check_lazy_export_stubs()
     release_env = _release_env()
+    _run("tox", "run", "-e", "qexp-full", env=release_env)
     with tempfile.TemporaryDirectory(prefix="qqtools-preflight-") as temporary_dir:
         wheel = _build_artifacts(Path(temporary_dir), env=release_env)
         _run(

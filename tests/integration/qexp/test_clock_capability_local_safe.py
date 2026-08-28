@@ -3,14 +3,17 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
-from qqtools.plugins.qexp.runtime import availability as availability_runtime
 from qqtools.plugins.qexp.lease import ClockCapability, ClockObservation, LeasePolicy, clock_capability
+from qqtools.plugins.qexp.runtime import availability as availability_runtime
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _observation(provider: str, lower: float, upper: float) -> ClockObservation:
     return ClockObservation(

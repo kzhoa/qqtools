@@ -4,14 +4,14 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import AGENT_MODE_DAEMON, init_shared_root, submit
-from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.agent import get_agent_status
+from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.layout import load_root_config, runtime_pid_path
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.runtime.tasks import load_task
-from qqtools.plugins.qexp.scheduler import (authorize_launch, claim_task, expire_claim,
-                                             fail_attempt)
+from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, expire_claim, fail_attempt
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _base_args(cfg) -> list[str]:
     return ["--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,

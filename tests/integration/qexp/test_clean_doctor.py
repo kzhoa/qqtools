@@ -5,26 +5,31 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.commands.cleanup import clean, reconcile_cleanup_operations
-from qqtools.plugins.qexp.commands.group import (group_control,
-                                                reconcile_group_cancel_operations)
 from qqtools.plugins.qexp.commands import task as task_commands
+from qqtools.plugins.qexp.commands.cleanup import clean, reconcile_cleanup_operations
+from qqtools.plugins.qexp.commands.group import group_control, reconcile_group_cancel_operations
 from qqtools.plugins.qexp.commands.task import offer, retry
-from qqtools.plugins.qexp.doctor import repair_metadata, repair_orphans, verify_integrity
 from qqtools.plugins.qexp.config_types import RootConfig
+from qqtools.plugins.qexp.doctor import repair_metadata, repair_orphans, verify_integrity
+from qqtools.plugins.qexp.lease import ClockCapability
+from qqtools.plugins.qexp.runtime import submission as submission_runtime
+from qqtools.plugins.qexp.runtime.claims import reconcile_claim_archives
 from qqtools.plugins.qexp.runtime.locks import group_lock, task_lock
 from qqtools.plugins.qexp.runtime.paths import attempt_path, group_path, shared_paths, task_path
-from qqtools.plugins.qexp.runtime.reservations import attach, reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.records import SCHEMA_VERSION, new_id, utc_now
-from qqtools.plugins.qexp.lease import ClockCapability
-from qqtools.plugins.qexp.runtime.claims import reconcile_claim_archives
-from qqtools.plugins.qexp.runtime import submission as submission_runtime
+from qqtools.plugins.qexp.runtime.reservations import attach, reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
-from qqtools.plugins.qexp.scheduler import (authorize_launch, claim_task, expire_claim,
-                                             cancel_task, fail_attempt,
-                                             reconcile_running_tasks)
+from qqtools.plugins.qexp.scheduler import (
+    authorize_launch,
+    cancel_task,
+    claim_task,
+    expire_claim,
+    fail_attempt,
+    reconcile_running_tasks,
+)
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _run_cleanup_reconcile(
         shared_root: str, project_root: str, runtime_root: str, machine_name: str,

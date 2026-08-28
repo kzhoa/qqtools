@@ -11,6 +11,7 @@ from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.paths import group_path, submission_path
 from qqtools.plugins.qexp.runtime.store import read_json
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _manifest(tmp_path: Path, body: str) -> Path:
     path = tmp_path / "runs.yaml"

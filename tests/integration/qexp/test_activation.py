@@ -9,6 +9,7 @@ from qqtools.plugins.qexp.activation import ensure_local_agent_active
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
+pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def test_unregistered_current_project_requires_explicit_add(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
