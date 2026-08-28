@@ -15,8 +15,12 @@ def shared_paths(root: Path) -> dict[str, Path]:
         "attempts": root / "attempts",
         "submissions": root / "operations" / "submissions",
         "availability": root / "operations" / "availability",
+        "availability_active": root / "operations" / "availability" / "active",
         "group_control": root / "operations" / "group-control",
+        "group_control_active": root / "operations" / "group-control" / "active",
         "cleanup": root / "operations" / "cleanup",
+        "cleanup_active": root / "operations" / "cleanup" / "active",
+        "operations_migration": root / "operations" / "active-layout-v1.json",
         "idempotency": root / "idempotency" / "submissions",
         "claim_archive": root / "claims" / "archive",
         "claim_pending": root / "claims" / "pending",
@@ -25,6 +29,16 @@ def shared_paths(root: Path) -> dict[str, Path]:
         "events": root / "events",
         "indexes": root / "indexes",
         "offer_deadlines": root / "indexes" / "offer-deadlines",
+        "offer_deadlines_active": root / "indexes" / "offer-deadlines" / "active",
+        "offer_deadline_cursors": root / "indexes" / "offer-deadlines" / "cursors",
+        "offer_deadlines_migration": root / "indexes" / "offer-deadlines" / "layout-v1.json",
+        "ready": root / "indexes" / "ready",
+        "ready_home": root / "indexes" / "ready" / "home",
+        "ready_shared": root / "indexes" / "ready" / "shared",
+        "ready_catalogs": root / "indexes" / "ready" / "catalogs",
+        "ready_reservations": root / "indexes" / "ready" / "reservations",
+        "ready_cursors": root / "indexes" / "ready" / "cursors",
+        "ready_locks": root / "indexes" / "ready" / "locks",
         "logs": root / "logs",
         "notifications": root / "notifications",
     }
@@ -46,6 +60,7 @@ def local_paths(root: Path) -> dict[str, Path]:
         "clock_health": root / "agent" / "clock-health.json",
         "lease_policy_cache": root / "agent" / "lease-policy.json",
         "termination_decisions": root / "termination-decisions",
+        "maintenance_cursors": root / "maintenance-cursors",
         "locks": root / "locks",
     }
 
@@ -64,6 +79,10 @@ def attempt_path(root: Path, task_id: str, number: int) -> Path:
 
 def submission_path(root: Path, operation_id: str) -> Path:
     return shared_paths(root)["submissions"] / f"{operation_id}.json"
+
+
+def ready_state_path(root: Path) -> Path:
+    return shared_paths(root)["ready"] / "state.json"
 
 
 def idempotency_path(root: Path, digest: str) -> Path:

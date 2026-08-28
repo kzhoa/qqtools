@@ -516,16 +516,10 @@ def test_machine_dispatch_uses_one_reservation_root_and_each_task_preflight(tmp_
     executor = _RecordingExecutor()
 
     first_results = dispatch_machine_cycle(runtime, available_gpus=[0, 1], executor=executor)
-    first_binding_by_order = min((first_binding, second_binding), key=lambda item: item.project_id)
-    first_task_by_order = first_task if first_binding_by_order == first_binding else second_task
-    second_binding_by_order = second_binding if first_binding_by_order == first_binding else first_binding
 
-    assert {item["project_id"] for item in first_results} == {first_binding_by_order.project_id}
-    assert {task_id for task_id, _ in executor.launched} == {first_task_by_order.task_id}
-    assert reserved_gpu_ids(runtime.root) == {0}
-
-    second_results = dispatch_machine_cycle(runtime, available_gpus=[0, 1], executor=executor)
-    assert {item["project_id"] for item in second_results} == {second_binding_by_order.project_id}
+    assert {item["project_id"] for item in first_results} == {
+        first_binding.project_id, second_binding.project_id,
+    }
     assert {task_id for task_id, _ in executor.launched} == {first_task.task_id, second_task.task_id}
     assert reserved_gpu_ids(runtime.root) == {0, 1}
     assert reserved_gpu_ids(runtime.project_paths(first_binding.project_id)["root"]) == set()

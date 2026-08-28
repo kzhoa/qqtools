@@ -15,6 +15,14 @@ from ..runtime.records import AttemptRecord, SCHEMA_VERSION, TaskRecord, new_id,
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.tasks import load_task, save_task
 from ..runtime.availability import remove_deadline_index
+from ..runtime.ready import retire_current_ready_generation
+from ..runtime.active_operations import (
+    active_operation_path,
+    archive_operation,
+    iter_active_operation_paths,
+    locate_operation_path,
+    write_active_operation,
+)
 
 
 def _machine_project_id(cfg: RootConfig, reservation_runtime_root: Path) -> str | None:
@@ -85,7 +93,7 @@ def _cleanup_required_machines(cfg: RootConfig, task: TaskRecord) -> list[str]:
 
 def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any]:
     from ..events import write_event
-    operation_path = shared_paths(cfg.shared_root)["cleanup"] / f"{task.task_id}.json"
+    operation_path = locate_operation_path(cfg, "cleanup", task.task_id)
     if operation_path.exists():
         operation = read_json(operation_path)
         cleanup = operation.get("cleanup", {})
@@ -106,12 +114,14 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
         "terminal_state": task.state["projection"], "created_at": now,
         "required_machines": _cleanup_required_machines(cfg, task), "acknowledgements": {},
         "completed_at": None}}
-    atomic_replace(operation_path, operation)
+    operation_path = active_operation_path(cfg, "cleanup", task.task_id)
+    write_active_operation(cfg, "cleanup", task.task_id, operation)
     task.control["cleanup_operation_id"] = operation["cleanup"]["operation_id"]
     task.control["cleanup_state"] = "preparing"
     task.meta["revision"] += 1
     task.meta["updated_at"] = now
     save_task(cfg, task)
+    retire_current_ready_generation(cfg, task)
     write_event(cfg, "task_cleanup_started", task_id=task.task_id, details={
         "operation_id": operation["cleanup"]["operation_id"],
         "group_name": task.group_name,
@@ -230,7 +240,7 @@ def _finalize_cleanup_operation(cfg: RootConfig, operation: dict[str, Any]) -> l
     cleanup.update({"state": "completed", "completed_at": utc_now()})
     operation["meta"]["revision"] += 1
     operation["meta"]["updated_at"] = utc_now()
-    atomic_replace(shared_paths(cfg.shared_root)["cleanup"] / f"{task_id}.json", operation)
+    archive_operation(cfg, "cleanup", task_id, operation)
     return removed
 
 
@@ -275,11 +285,14 @@ def _finalize_cleanup_if_ready(cfg: RootConfig, operation_path: Path) -> list[st
 
 
 def reconcile_cleanup_operations(
-    cfg: RootConfig, *, reservation_runtime_root: Path | None = None
+    cfg: RootConfig, *, reservation_runtime_root: Path | None = None,
+    include_legacy: bool = True,
 ) -> list[dict[str, Any]]:
     """Clean machine-local resources and finalize fully acknowledged cleanup operations."""
     results: list[dict[str, Any]] = []
-    for operation_path in iter_json(shared_paths(cfg.shared_root)["cleanup"]):
+    for operation_path in iter_active_operation_paths(
+        cfg, "cleanup", include_legacy=include_legacy
+    ):
         operation = read_json(operation_path)
         cleanup = operation.get("cleanup", {})
         if cleanup.get("state") not in {"preparing", "waiting_ack"}:
@@ -330,7 +343,8 @@ def reconcile_cleanup_operations(
                       "removed": removed, "blockers": blockers}
         if not result["pending_machines"]:
             result["removed"].extend(_finalize_cleanup_if_ready(cfg, operation_path))
-            finalized = read_json(operation_path).get("cleanup", {})
+            finalized_path = locate_operation_path(cfg, "cleanup", task_id)
+            finalized = read_json(finalized_path).get("cleanup", {})
             result["state"] = finalized.get("state", result["state"])
             result["pending_machines"] = finalized.get("pending_machines", [])
         results.append(result)

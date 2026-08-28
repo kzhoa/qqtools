@@ -19,6 +19,7 @@ from .runtime.records import AttemptRecord, TaskRecord, utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.termination import list_decisions
 from .runtime.tasks import load_task
+from .runtime.ready import retire_current_ready_generation
 from .lease import clock_capability
 
 
@@ -425,6 +426,8 @@ def repair_metadata(
                         task.meta["revision"] += 1
                         task.meta["updated_at"] = utc_now()
                         atomic_replace(task_path(cfg.shared_root, task.task_id), task.to_dict())
+                    if task.state["projection"] == "cancelled":
+                        retire_current_ready_generation(cfg, task)
         for result in post_commit_results:
             if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
                 from .runtime.reservations import release

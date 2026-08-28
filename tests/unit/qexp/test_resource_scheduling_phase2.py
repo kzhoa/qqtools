@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp.commands import task as task_commands
+from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
+from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
+from qqtools.plugins.qexp.runtime.ready import (
+    ReadyMarkerRef,
+    classify_ready_marker,
+)
+from qqtools.plugins.qexp.runtime.active_operations import (
+    iter_active_operation_paths,
+    write_active_operation,
+)
+from qqtools.plugins.qexp.runtime.store import read_json
+from qqtools.plugins.qexp.runtime.tasks import load_task
+from qqtools.plugins.qexp.scheduler import claim_task
+
+
+def _ready_reference(cfg, task_id: str, generation: int) -> ReadyMarkerRef:
+    path = shared_paths(cfg.shared_root)["ready_reservations"] / f"{task_id}.{generation}.json"
+    record = read_json(path)["ready_reservation"]
+    return ReadyMarkerRef(
+        task_id,
+        generation,
+        record["queue_scope"],
+        record["home_machine"],
+        record["partition"],
+        record["catalog_page"],
+        record["marker_name"],
+    )
+
+
+def test_submission_commits_one_durable_ready_generation(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+
+    task = submit(cfg, ["echo", "ok"])
+
+    stored = load_task(cfg, task.task_id)
+    reference = _ready_reference(cfg, task.task_id, stored.ready_generation)
+    result = classify_ready_marker(cfg, reference)
+    assert stored.ready_generation == 1
+    assert result.classification == "claimable"
+    assert result.task is not None and result.task.task_id == task.task_id
+    assert read_json(ready_state_path(cfg.shared_root))["ready_index"]["state"] == "absent"
+
+
+def test_claim_commits_truth_before_retiring_ready_marker(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    reservation_path = (
+        shared_paths(cfg.shared_root)["ready_reservations"]
+        / f"{task.task_id}.{task.ready_generation}.json"
+    )
+
+    attempt = claim_task(cfg, task.task_id, [0])
+
+    assert attempt is not None
+    assert load_task(cfg, task.task_id).state["projection"] == "running"
+    assert not reservation_path.exists()
+
+
+def test_ready_delete_failure_does_not_roll_back_authoritative_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.runtime.ready.delete_ready_marker",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("shared storage unavailable")),
+    )
+
+    attempt = claim_task(cfg, task.task_id, [0])
+
+    assert attempt is not None
+    active_claim = load_task(cfg, task.task_id).claim_control["active_claim"]
+    assert active_claim["attempt_id"] == attempt.attempt_id
+
+
+def test_scope_change_writes_new_generation_before_retiring_old(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    original = submit(cfg, ["echo", "ok"], group="exp")
+    old_reservation = (
+        shared_paths(cfg.shared_root)["ready_reservations"]
+        / f"{original.task_id}.{original.ready_generation}.json"
+    )
+
+    task_commands.share(cfg, original.task_id)
+
+    shared = load_task(cfg, original.task_id)
+    reference = _ready_reference(cfg, shared.task_id, shared.ready_generation)
+    assert shared.ready_generation == original.ready_generation + 1
+    assert reference.queue_scope == "shared"
+    assert not old_reservation.exists()
+    assert classify_ready_marker(cfg, reference).classification == "claimable"
+
+
+def test_offer_due_tasks_never_enumerates_task_truth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(
+        cfg,
+        ["echo", "ok"],
+        group="exp",
+        sharing_mode="spillover",
+        offer_after_seconds=0,
+    )
+    seen = []
+    from qqtools.plugins.qexp.runtime import availability
+
+    original_scandir = availability.os.scandir
+
+    def record_directory(directory):
+        seen.append(directory)
+        assert directory != shared_paths(cfg.shared_root)["tasks"]
+        return original_scandir(directory)
+
+    monkeypatch.setattr(availability.os, "scandir", record_directory)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.project_maintenance.elapsed_offer_is_proven",
+        lambda *_args: True,
+    )
+
+    offer_due_tasks(cfg)
+
+    assert len(seen) >= 1
+    deadline_home = shared_paths(cfg.shared_root)["offer_deadlines_active"] / "g1"
+    assert deadline_home in map(Path, seen)
+    assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
+
+
+def test_deadline_index_is_partitioned_by_home_and_time_bucket(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(
+        cfg,
+        ["echo", "ok"],
+        group="exp",
+        sharing_mode="spillover",
+        offer_after_seconds=60,
+    )
+
+    stable = shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task.task_id}.json"
+    target = stable.resolve(strict=True)
+
+    assert stable.is_symlink()
+    assert target.parent.parent.name == "g1"
+    assert len(target.parent.name) == 10
+
+
+def test_active_operation_enumeration_is_hard_bounded(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    for index in range(100):
+        write_active_operation(
+            cfg,
+            "availability",
+            f"operation-{index:03d}",
+            {"availability_operation": {"state": "prepared"}},
+        )
+
+    paths = list(iter_active_operation_paths(cfg, "availability", limit=64))
+    next_paths = list(iter_active_operation_paths(cfg, "availability", limit=64))
+
+    assert len(paths) == 64
+    active_directory = shared_paths(cfg.shared_root)["availability_active"]
+    assert all(path.parent == active_directory for path in paths)
+    assert len(next_paths) == 36
+    assert not set(paths).intersection(next_paths)

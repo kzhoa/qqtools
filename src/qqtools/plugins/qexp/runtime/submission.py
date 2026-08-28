@@ -19,6 +19,8 @@ from .records import (
     utc_now,
     validate_identifier,
 )
+from .ready import delete_ready_marker, prepare_ready_transition, retire_previous_ready_generation
+from .active_operations import operation_exists
 from .store import atomic_replace, create_if_absent, read_json
 from .availability import remove_deadline_index, sync_deadline_index
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
@@ -187,9 +189,8 @@ def _validate_group_precondition(group: dict[str, Any], precondition: dict[str, 
 
 
 def _reject_cleanup_tombstones(cfg: Any, resolved: list[dict[str, Any]]) -> None:
-    cleanup_dir = shared_paths(cfg.shared_root)["cleanup"]
     for item in resolved:
-        if (cleanup_dir / f"{item['task_id']}.json").exists():
+        if operation_exists(cfg, "cleanup", item["task_id"]):
             raise ValueError(f"Task {item['task_id']!r} was cleaned and its id cannot be reused.")
 
 
@@ -392,6 +393,14 @@ def submit_specs(
                     current = TaskRecord.from_dict(read_json(path))
                     if not _task_matches_resolved(current, item, operation_id, group_name):
                         raise ValueError(f"Task {item['task_id']!r} already exists with different truth.")
+                    if current.ready_generation == 0:
+                        old_generation, _ = prepare_ready_transition(
+                            cfg, current, "submission_resume"
+                        )
+                        current.meta["revision"] += 1
+                        current.meta["updated_at"] = utc_now()
+                        atomic_replace(path, current.to_dict())
+                        retire_previous_ready_generation(cfg, old_generation, current)
                     sync_deadline_index(cfg, current)
                     staged.append(current)
                     continue
@@ -409,7 +418,14 @@ def submit_specs(
                     operation_id=operation_id,
                 )
                 task.group_membership_sequence = sequence
+                old_generation, _ = prepare_ready_transition(
+                    cfg,
+                    task,
+                    "submission_stage",
+                    target_revision=task.meta["revision"],
+                )
                 atomic_replace(path, task.to_dict())
+                retire_previous_ready_generation(cfg, old_generation, task)
                 sync_deadline_index(cfg, task)
                 staged.append(task)
             if group_name:
@@ -455,5 +471,9 @@ def submit_specs(
                     continue
                 if current.submission_operation_id == operation_id:
                     remove_deadline_index(cfg, task_id)
+                    try:
+                        delete_ready_marker(cfg, task_id, current.ready_generation)
+                    except (OSError, KeyError, TypeError, ValueError):
+                        pass
                     path.unlink(missing_ok=True)
             raise

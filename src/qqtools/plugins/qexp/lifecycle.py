@@ -12,6 +12,7 @@ from .runtime.paths import attempt_path
 from .runtime.records import AttemptRecord, TaskRecord, utc_now
 from .runtime.store import atomic_replace, read_json
 from .runtime.tasks import save_task
+from .runtime.ready import retire_current_ready_generation
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +146,7 @@ def commit_terminal_transition_locked(
     task.meta["revision"] += 1
     task.meta["updated_at"] = finished_at
     save_task(cfg, task)
+    retire_current_ready_generation(cfg, task)
     execution_started_at = (attempt.timestamps.get("process_created_at")
                             or attempt.timestamps.get("running_at"))
     event = TaskLifecycleEvent(
@@ -184,6 +186,7 @@ def _commit_missing_attempt_transition(
     task.meta["revision"] += 1
     task.meta["updated_at"] = finished_at
     save_task(cfg, task)
+    retire_current_ready_generation(cfg, task)
     return TerminalCommitResult("committed", None, reservation_id, reservation_machine)
 
 

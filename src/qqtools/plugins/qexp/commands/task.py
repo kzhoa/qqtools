@@ -18,6 +18,13 @@ from ..runtime.records import AttemptRecord, TaskRecord, utc_now, validate_group
 from ..runtime.store import read_json
 from ..runtime.submission import SubmissionResult, submit_specs
 from ..runtime.tasks import load_task, save_task
+from ..runtime.ready import (
+    discard_ready_generation,
+    prepare_ready_transition,
+    reserve_ready_generation,
+    retire_previous_ready_generation,
+)
+from ..runtime.active_operations import operation_exists
 
 
 def is_cleanup_blocked(task: TaskRecord) -> bool:
@@ -25,7 +32,7 @@ def is_cleanup_blocked(task: TaskRecord) -> bool:
 
 
 def has_cleanup_operation(cfg: RootConfig, task_id: str) -> bool:
-    return (shared_paths(cfg.shared_root)["cleanup"] / f"{task_id}.json").exists()
+    return operation_exists(cfg, "cleanup", task_id)
 
 
 def reject_cleanup_blocked(cfg: RootConfig, task: TaskRecord, action: str) -> None:
@@ -110,61 +117,82 @@ def retry(cfg: RootConfig, task_id: str, *, acknowledge_duplicate_risk: bool = F
     from ..scheduler import authority_locks
 
     initial = load_task(cfg, task_id)
-    with authority_locks(cfg, initial):
-        task = load_task(cfg, task_id)
-        reject_cleanup_blocked(cfg, task, "retried")
-        if task.claim_control.get("active_claim"):
-            raise ValueError("a Task with an active claim cannot be retried.")
-        number = task.attempt_control.get("current_attempt_number")
-        if number is None:
-            raise ValueError("Task has no current Attempt to retry.")
-        current_path = attempt_path(cfg.shared_root, task_id, number)
-        current = AttemptRecord.from_dict(read_json(current_path))
-        if task.state["projection"] == "failed" and current.phase == "failed":
-            task.state = {"projection": "queued", "reason": None}
-        elif task.state["projection"] == "blocked" and current.phase == "orphaned":
-            superseded_at = utc_now()
-            task.claim_control["fencing_epoch"] += 1
-            from ..events import write_event
+    reserved_generation = initial.ready_generation + 1
+    reference = reserve_ready_generation(
+        cfg,
+        task_id,
+        reserved_generation,
+        "home",
+        initial.placement_policy["home_machine"],
+    )
+    is_committed = False
+    try:
+        with authority_locks(cfg, initial):
+            task = load_task(cfg, task_id)
+            reject_cleanup_blocked(cfg, task, "retried")
+            if task.claim_control.get("active_claim"):
+                raise ValueError("a Task with an active claim cannot be retried.")
+            number = task.attempt_control.get("current_attempt_number")
+            if number is None:
+                raise ValueError("Task has no current Attempt to retry.")
+            current_path = attempt_path(cfg.shared_root, task_id, number)
+            current = AttemptRecord.from_dict(read_json(current_path))
+            if task.state["projection"] == "failed" and current.phase == "failed":
+                task.state = {"projection": "queued", "reason": None}
+            elif task.state["projection"] == "blocked" and current.phase == "orphaned":
+                superseded_at = utc_now()
+                task.claim_control["fencing_epoch"] += 1
+                from ..events import write_event
 
-            write_event(
-                cfg,
-                "orphan_superseded_by_retry",
-                task_id=task_id,
-                details={
-                    "attempt_id": current.attempt_id,
-                    "fencing_token": current.current_fencing_token,
-                    "operator": cfg.machine_name,
-                    "timestamp": superseded_at,
-                },
+                write_event(
+                    cfg,
+                    "orphan_superseded_by_retry",
+                    task_id=task_id,
+                    details={
+                        "attempt_id": current.attempt_id,
+                        "fencing_token": current.current_fencing_token,
+                        "operator": cfg.machine_name,
+                        "timestamp": superseded_at,
+                    },
+                )
+                task.state = {"projection": "queued", "reason": "orphan_superseded_by_retry"}
+            else:
+                raise ValueError(
+                    "only a failed Task or a blocked Task with an orphaned current Attempt "
+                    "can be retried."
+                )
+            task.control.update(
+                {
+                    "cancellation_requested_at": None,
+                    "cancellation_operation_id": None,
+                    "terminate_running": False,
+                    "requested_by": None,
+                    "termination_acknowledged_at": None,
+                    "termination_result": None,
+                }
             )
-            task.state = {"projection": "queued", "reason": "orphan_superseded_by_retry"}
-        else:
-            raise ValueError("only a failed Task or a blocked Task with an orphaned current Attempt can be retried.")
-        task.control.update(
-            {
-                "cancellation_requested_at": None,
-                "cancellation_operation_id": None,
-                "terminate_running": False,
-                "requested_by": None,
-                "termination_acknowledged_at": None,
-                "termination_result": None,
-            }
-        )
-        task.placement_runtime.update(
-            {
-                "queue_scope": "home",
-                "queued_home_at": utc_now(),
-                "offered_at": None,
-                "offer_reason": None,
-                "offered_by": None,
-            }
-        )
-        task.attempt_control["current_attempt_id"] = None
-        task.meta["revision"] += 1
-        task.meta["updated_at"] = utc_now()
-        save_task(cfg, task)
-        return task
+            task.placement_runtime.update(
+                {
+                    "queue_scope": "home",
+                    "queued_home_at": utc_now(),
+                    "offered_at": None,
+                    "offer_reason": None,
+                    "offered_by": None,
+                }
+            )
+            task.attempt_control["current_attempt_id"] = None
+            old_generation, _ = prepare_ready_transition(
+                cfg, task, "retry", reference=reference
+            )
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task)
+            is_committed = True
+            retire_previous_ready_generation(cfg, old_generation, task)
+            return task
+    finally:
+        if not is_committed:
+            discard_ready_generation(cfg, task_id, reserved_generation)
 
 
 def share(

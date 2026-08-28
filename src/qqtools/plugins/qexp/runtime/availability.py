@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import heapq
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,10 +15,25 @@ from ..events import write_diagnostic_event
 from ..lease import (ClockObservation, clock_capability, new_timed_offer_proof,
                      persist_clock_observation, timed_offer_deadline_upper)
 from .locks import group_lock, task_lock
+from .locks import schema_lock
 from .paths import group_path, shared_paths, submission_path
 from .records import SCHEMA_VERSION, TaskRecord, new_id, utc_now
+from .ready import (
+    discard_ready_generation,
+    prepare_ready_transition,
+    reserve_ready_generation,
+    retire_previous_ready_generation,
+)
 from .store import atomic_replace, iter_json, read_json
 from .tasks import load_task, save_task
+from .active_operations import (
+    active_operation_path,
+    archive_operation,
+    iter_active_operation_paths,
+    locate_operation_path,
+    operation_exists,
+    write_active_operation,
+)
 
 AvailabilityAction = Literal["share_now", "share_after", "keep_local", "manual_offer", "elapsed_offer"]
 
@@ -53,7 +69,7 @@ class AvailabilityTransitionResult:
 
 
 def _operation_path(cfg: RootConfig, operation_id: str) -> Path:
-    return shared_paths(cfg.shared_root)["availability"] / f"{operation_id}.json"
+    return locate_operation_path(cfg, "availability", operation_id)
 
 
 def _operation_meta(cfg: RootConfig) -> dict[str, Any]:
@@ -78,7 +94,7 @@ def _create_operation(
         "after_seconds": request.after_seconds, "created_at": now, "updated_at": now,
         "completed_at": None, "blocked_reason": None, "task_revision_before": None,
         "task_revision_after": None, "result": None}}
-    atomic_replace(path, operation)
+    write_active_operation(cfg, "availability", operation_id, operation)
     return operation_id, operation
 
 
@@ -102,7 +118,10 @@ def _update_operation(
         control["completed_at"] = control["completed_at"] or utc_now()
     operation["meta"]["revision"] += 1
     operation["meta"]["updated_at"] = utc_now()
-    atomic_replace(_operation_path(cfg, control["operation_id"]), operation)
+    if state == "completed":
+        archive_operation(cfg, "availability", control["operation_id"], operation)
+    else:
+        write_active_operation(cfg, "availability", control["operation_id"], operation)
 
 
 def clock_evidence(cfg: RootConfig) -> tuple[ClockObservation, datetime, float]:
@@ -133,10 +152,9 @@ def elapsed_offer_is_proven(cfg: RootConfig, task: TaskRecord) -> bool:
 
 
 def _cleanup_blocked(cfg: RootConfig, task: TaskRecord) -> bool:
-    cleanup_dir = shared_paths(cfg.shared_root)["cleanup"]
     return bool(task.control.get("cleanup_operation_id")
                 or task.control.get("cleanup_state")
-                or (cleanup_dir / f"{task.task_id}.json").exists())
+                or operation_exists(cfg, "cleanup", task.task_id))
 
 
 def _submission_committed(cfg: RootConfig, task: TaskRecord) -> bool:
@@ -276,8 +294,41 @@ def _deadline_index_path(cfg: RootConfig, task_id: str) -> Path:
     return shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task_id}.json"
 
 
+def _deadline_bucket(value: str) -> str:
+    deadline = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return deadline.astimezone(timezone.utc).strftime("%Y%m%d%H")
+
+
+def _active_deadline_path(cfg: RootConfig, task: TaskRecord) -> Path:
+    bucket = _deadline_bucket(task.placement_runtime["offer_eligible_at"])
+    return (
+        shared_paths(cfg.shared_root)["offer_deadlines_active"]
+        / task.placement_policy["home_machine"]
+        / bucket
+        / f"{task.task_id}.json"
+    )
+
+
 def remove_deadline_index(cfg: RootConfig, task_id: str) -> None:
-    _deadline_index_path(cfg, task_id).unlink(missing_ok=True)
+    stable = _deadline_index_path(cfg, task_id)
+    if stable.exists() or stable.is_symlink():
+        try:
+            target = stable.resolve(strict=True)
+        except FileNotFoundError:
+            target = None
+        stable.unlink(missing_ok=True)
+        if target is not None:
+            target.unlink(missing_ok=True)
+            bucket = target.parent
+            home = bucket.parent
+            try:
+                bucket.rmdir()
+            except OSError:
+                pass
+            try:
+                home.rmdir()
+            except OSError:
+                pass
 
 
 def sync_deadline_index(cfg: RootConfig, task: TaskRecord) -> None:
@@ -286,13 +337,86 @@ def sync_deadline_index(cfg: RootConfig, task: TaskRecord) -> None:
             and task.placement_policy.get("sharing_mode") == "spillover"
             and task.placement_runtime.get("offer_eligible_at")
             and task.placement_runtime.get("offer_clock_evidence")):
-        atomic_replace(path, {"offer_deadline": {"task_id": task.task_id,
+        desired = {"offer_deadline": {"task_id": task.task_id,
             "group_name": task.group_name, "home_machine": task.placement_policy["home_machine"],
             "offer_eligible_at": task.placement_runtime["offer_eligible_at"],
             "operation_id": task.placement_runtime.get("availability_operation_id"),
-            "updated_at": utc_now()}})
+            "updated_at": task.meta["updated_at"]}}
+        active = _active_deadline_path(cfg, task)
+        if path.exists():
+            try:
+                if read_json(path) == desired:
+                    return
+            except (KeyError, TypeError, ValueError):
+                pass
+        remove_deadline_index(cfg, task.task_id)
+        atomic_replace(active, desired)
+        try:
+            path.symlink_to(active.relative_to(path.parent))
+        except FileExistsError:
+            pass
         return
     remove_deadline_index(cfg, task.task_id)
+
+
+def iter_due_deadline_paths(cfg: RootConfig, *, limit: int = 64):
+    """Yield bounded due records for this home machine from time buckets only."""
+    if limit <= 0:
+        raise ValueError("deadline limit must be positive.")
+    home = shared_paths(cfg.shared_root)["offer_deadlines_active"] / cfg.machine_name
+    if not home.exists():
+        return
+    current_bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+    yielded = 0
+    due_buckets = heapq.nsmallest(
+        limit,
+        (
+            Path(entry.path)
+            for entry in os.scandir(home)
+            if entry.is_dir() and entry.name <= current_bucket
+        ),
+        key=lambda path: path.name,
+    )
+    for bucket in due_buckets:
+        with os.scandir(bucket) as entries:
+            for entry in entries:
+                if not entry.is_file() or not entry.name.endswith(".json"):
+                    continue
+                if yielded >= limit:
+                    return
+                yielded += 1
+                yield Path(entry.path)
+
+
+def migrate_legacy_deadline_indexes(cfg: RootConfig) -> None:
+    """Move legacy flat deadline records into home/time buckets once."""
+    marker = shared_paths(cfg.shared_root)["offer_deadlines_migration"]
+    if marker.exists():
+        return
+    with schema_lock(cfg.shared_root):
+        if marker.exists():
+            return
+        root = shared_paths(cfg.shared_root)["offer_deadlines"]
+        for path in root.iterdir():
+            if not path.is_file() or path.is_symlink() or path.name == marker.name:
+                continue
+            try:
+                record = read_json(path)["offer_deadline"]
+                home_machine = record["home_machine"]
+                bucket = _deadline_bucket(record["offer_eligible_at"])
+            except (KeyError, TypeError, ValueError):
+                path.unlink(missing_ok=True)
+                continue
+            active = (
+                shared_paths(cfg.shared_root)["offer_deadlines_active"]
+                / home_machine
+                / bucket
+                / path.name
+            )
+            atomic_replace(active, {"offer_deadline": record})
+            path.unlink(missing_ok=True)
+            path.symlink_to(active.relative_to(path.parent))
+        atomic_replace(marker, {"offer_deadline_layout": {"version": 1}})
 
 
 def _same_delayed_share(task: TaskRecord, fallback: str | list[str],
@@ -312,6 +436,19 @@ def apply_availability_transition(
     operation_id, operation = _create_operation(cfg, request)
     initial = load_task(cfg, request.task_id)
     lock_group = initial.group_name
+    target_scope = (
+        "shared" if request.action in {"share_now", "manual_offer", "elapsed_offer"}
+        else "home"
+    )
+    reserved_generation = initial.ready_generation + 1
+    ready_reference = reserve_ready_generation(
+        cfg,
+        initial.task_id,
+        reserved_generation,
+        target_scope,
+        initial.placement_policy["home_machine"],
+    )
+    is_ready_committed = False
     try:
         with ExitStack() as stack:
             if lock_group:
@@ -393,9 +530,17 @@ def apply_availability_transition(
                         "offered_by": cfg.machine_name,
                         "availability_operation_id": operation_id})
             if not idempotent:
+                old_generation, _ = prepare_ready_transition(
+                    cfg,
+                    task,
+                    f"availability_{request.action}",
+                    reference=ready_reference,
+                )
                 task.meta["revision"] += 1
                 task.meta["updated_at"] = utc_now()
                 save_task(cfg, task)
+                is_ready_committed = True
+                retire_previous_ready_generation(cfg, old_generation, task)
             sync_deadline_index(cfg, task)
             result = _make_result(request.action, task, group, operation_id, idempotent=idempotent)
             _write_audit_event(cfg, result, before, clock_proof)
@@ -419,11 +564,18 @@ def apply_availability_transition(
         except Exception:
             _update_operation(cfg, operation, state="blocked", blocked_reason=str(exc))
         raise
+    finally:
+        if not is_ready_committed:
+            discard_ready_generation(cfg, initial.task_id, reserved_generation)
 
 
-def reconcile_availability_operations(cfg: RootConfig) -> list[dict[str, Any]]:
+def reconcile_availability_operations(
+    cfg: RootConfig, *, include_legacy: bool = True,
+) -> list[dict[str, Any]]:
     reconciled: list[dict[str, Any]] = []
-    for path in iter_json(shared_paths(cfg.shared_root)["availability"]):
+    for path in iter_active_operation_paths(
+        cfg, "availability", include_legacy=include_legacy
+    ):
         operation = read_json(path)
         control = operation.get("availability_operation", {})
         if control.get("state") not in {"prepared", "blocked"}:

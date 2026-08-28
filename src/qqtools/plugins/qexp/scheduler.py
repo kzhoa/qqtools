@@ -32,9 +32,27 @@ from .runtime.locks import group_lock, task_lock
 from .runtime.claims import archive_claim
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, submission_path
 from .runtime.records import AttemptRecord, TaskRecord, TaskSpec, utc_now
-from .runtime.reservations import attach, release, reserve
+from .runtime.ready import (
+    ReadyMarkerRef,
+    classify_ready_marker,
+    delete_stale_ready_marker,
+    mark_ready_index_degraded,
+    next_ready_marker,
+    prepare_ready_transition,
+    read_ready_index_state,
+    retire_current_ready_generation,
+    retire_previous_ready_generation,
+)
+from .runtime.active_operations import operation_exists
+from .runtime.reservations import ReservationIdentity, attach, release, reserve
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.tasks import load_task, save_task
+from .runtime.work_budget import (
+    AdaptiveBatchSizer,
+    SliceBudget,
+    diagnostic_increment,
+    diagnostic_span,
+)
 
 LEASE_SECONDS = 120
 TERMINATION_GRACE_SECONDS = 5.0
@@ -163,7 +181,7 @@ def _eligible(cfg: RootConfig, task: TaskRecord) -> bool:
         return False
     if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
         return False
-    if (shared_paths(cfg.shared_root)["cleanup"] / f"{task.task_id}.json").exists():
+    if operation_exists(cfg, "cleanup", task.task_id):
         return False
     if task.control.get("cancellation_requested_at"):
         return False
@@ -269,6 +287,7 @@ def _claim(
                 reservation_runtime_root=reservation_runtime_root,
             )
             raise
+        retire_current_ready_generation(cfg, task)
         return attempt
 
 
@@ -347,7 +366,11 @@ def _has_local_launch_evidence(cfg: RootConfig, attempt_id: str) -> bool:
 
 
 def resume_starting_attempt(
-    cfg: RootConfig, task_id: str, *, reservation_runtime_root: Path | None = None
+    cfg: RootConfig,
+    task_id: str,
+    *,
+    reservation_runtime_root: Path | None = None,
+    expected_reservation: ReservationIdentity | None = None,
 ) -> AttemptRecord | None:
     reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
@@ -368,6 +391,13 @@ def resume_starting_attempt(
             or _has_local_launch_evidence(cfg, attempt_id)
         ):
             return None
+        if expected_reservation is not None and (
+            expected_reservation.task_id != task_id
+            or expected_reservation.attempt_id != attempt_id
+            or expected_reservation.fencing_token != fencing_token
+            or expected_reservation.reservation_id != claim.get("reservation_id")
+        ):
+            return None
         try:
             attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task_id, attempt_number)))
         except (FileNotFoundError, KeyError, ValueError):
@@ -383,7 +413,7 @@ def resume_starting_attempt(
             cancel_result = _cancel_prelaunch_locked(cfg, task, "cancelled_before_launch", {"claimed", "starting"})
         elif task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
             return None
-        elif (shared_paths(cfg.shared_root)["cleanup"] / f"{task.task_id}.json").exists():
+        elif operation_exists(cfg, "cleanup", task.task_id):
             return None
         elif task.group_name and not _group_allows(
             read_json(group_path(cfg.shared_root, task.group_name)), task, cfg.machine_name
@@ -434,7 +464,7 @@ def authorize_launch(
             return False
         if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
             return False
-        if (shared_paths(cfg.shared_root)["cleanup"] / f"{task.task_id}.json").exists():
+        if operation_exists(cfg, "cleanup", task.task_id):
             return False
         if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
             return False
@@ -527,7 +557,7 @@ def cancel_task(
         if (
             task.control.get("cleanup_operation_id")
             or task.control.get("cleanup_state")
-            or (shared_paths(cfg.shared_root)["cleanup"] / f"{task_id}.json").exists()
+            or operation_exists(cfg, "cleanup", task_id)
         ):
             raise ValueError(f"Task {task_id!r} is being cleaned and cannot be cancelled.")
         if task.state["projection"] in {"succeeded", "failed", "cancelled"}:
@@ -553,6 +583,8 @@ def cancel_task(
             task.meta["revision"] += 1
             task.meta["updated_at"] = utc_now()
             save_task(cfg, task)
+        if task.state["projection"] == "cancelled":
+            retire_current_ready_generation(cfg, task)
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
             release(reservation_runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled_before_launch")
@@ -585,31 +617,209 @@ def run_dispatch_cycle(
     claim_guard: Callable[[], ContextManager[bool]] | None = None,
     max_new_claims: int | None = None,
     on_claim: Callable[[str], None] | None = None,
+    should_recover_starting: bool = True,
+    work_budget: SliceBudget | None = None,
+    batch_sizer: AdaptiveBatchSizer | None = None,
+    inspected_ready: set[tuple[str, str, str]] | None = None,
+) -> list[str]:
+    with diagnostic_span("run_dispatch_cycle"):
+        return _run_dispatch_cycle(
+            cfg,
+            available_gpus=available_gpus,
+            executor=executor,
+            reservation_runtime_root=reservation_runtime_root,
+            project_id=project_id,
+            preflight=preflight,
+            preflight_rejected=preflight_rejected,
+            before_claim=before_claim,
+            claim_guard=claim_guard,
+            max_new_claims=max_new_claims,
+            on_claim=on_claim,
+            should_recover_starting=should_recover_starting,
+            work_budget=work_budget,
+            batch_sizer=batch_sizer,
+            inspected_ready=inspected_ready,
+        )
+
+
+def _run_dispatch_cycle(
+    cfg: RootConfig,
+    *,
+    available_gpus: list[int] | None = None,
+    executor: Executor | None = None,
+    reservation_runtime_root: Path | None = None,
+    project_id: str | None = None,
+    preflight: Callable[[TaskSpec], bool] | None = None,
+    preflight_rejected: Callable[[TaskRecord], None] | None = None,
+    before_claim: Callable[[], bool] | None = None,
+    claim_guard: Callable[[], ContextManager[bool]] | None = None,
+    max_new_claims: int | None = None,
+    on_claim: Callable[[str], None] | None = None,
+    should_recover_starting: bool = True,
+    work_budget: SliceBudget | None = None,
+    batch_sizer: AdaptiveBatchSizer | None = None,
+    inspected_ready: set[tuple[str, str, str]] | None = None,
 ) -> list[str]:
     reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     available = list(available_gpus or [])
     executor = executor or Executor()
     launched: list[str] = []
     new_claims = 0
-    for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
-        task = load_task(cfg, path.stem)
-        attempt = resume_starting_attempt(
-            cfg, task.task_id, reservation_runtime_root=reservation_runtime_root
-        )
-        if attempt is None:
-            continue
-        try:
-            executor.launch_attempt(cfg, task.task_id, attempt)
-            launched.append(task.task_id)
-        except Exception:
-            fail_attempt(
-                cfg,
-                task.task_id,
-                attempt.attempt_id,
-                attempt.current_fencing_token,
-                "executor_launch_failed",
-                reservation_runtime_root=reservation_runtime_root,
+    if should_recover_starting:
+        for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
+            task = load_task(cfg, path.stem)
+            attempt = resume_starting_attempt(
+                cfg, task.task_id, reservation_runtime_root=reservation_runtime_root
             )
+            if attempt is None:
+                continue
+            try:
+                executor.launch_attempt(cfg, task.task_id, attempt)
+                launched.append(task.task_id)
+            except Exception:
+                fail_attempt(
+                    cfg,
+                    task.task_id,
+                    attempt.attempt_id,
+                    attempt.current_fencing_token,
+                    "executor_launch_failed",
+                    reservation_runtime_root=reservation_runtime_root,
+                )
+    ready_state = read_ready_index_state(cfg)
+    if ready_state == "degraded":
+        diagnostic_increment("scheduler.ready.skipped_degraded")
+        return launched
+    if ready_state == "active":
+        budget = work_budget or SliceBudget()
+        sizer = batch_sizer or AdaptiveBatchSizer(budget.policy)
+        inspected = inspected_ready if inspected_ready is not None else set()
+        scopes = ("home", "shared")
+        candidates: list[tuple[ReadyMarkerRef, str]] = []
+        scope_identities: dict[str, set[str]] = {scope: set() for scope in scopes}
+        while len(candidates) < sizer.batch_size and (
+            not candidates or budget.can_start_record()
+        ):
+            made_progress = False
+            for scope in scopes:
+                if len(candidates) >= sizer.batch_size or not budget.can_start_record():
+                    break
+                reference, has_wrapped = next_ready_marker(
+                    cfg,
+                    project_id or "standalone",
+                    scope,
+                    scope_identities[scope],
+                )
+                if has_wrapped:
+                    diagnostic_increment("scheduler.ready.cursor_wraps")
+                if reference is None:
+                    continue
+                identity = (project_id or "standalone", scope, reference.identity)
+                if identity in inspected:
+                    made_progress = True
+                    continue
+                scope_identities[scope].add(reference.identity)
+                candidates.append((reference, scope))
+                made_progress = True
+            if not made_progress:
+                break
+        for reference, _scope in candidates:
+            inspected.add((project_id or "standalone", _scope, reference.identity))
+            started_ns = time.monotonic_ns()
+            budget.consume_record(operations=3)
+            diagnostic_increment("scheduler.ready.markers_inspected")
+            result = classify_ready_marker(cfg, reference)
+            if result.classification == "corrupt":
+                diagnostic_increment("scheduler.ready.corrupt")
+                mark_ready_index_degraded(cfg, f"marker_corrupt:{reference.identity}")
+                break
+            if result.classification == "permanently_stale":
+                diagnostic_increment("scheduler.ready.stale")
+                delete_stale_ready_marker(cfg, reference)
+                sizer.observe(max(1, time.monotonic_ns() - started_ns))
+                continue
+            task = result.task
+            if result.classification == "temporarily_unavailable" or task is None:
+                diagnostic_increment("scheduler.ready.temporarily_unavailable")
+                sizer.observe(max(1, time.monotonic_ns() - started_ns))
+                continue
+            if not _eligible(cfg, task):
+                diagnostic_increment("scheduler.ready.machine_ineligible")
+                sizer.observe(max(1, time.monotonic_ns() - started_ns))
+                continue
+            if preflight is not None and not preflight(task.spec):
+                if preflight_rejected is not None:
+                    preflight_rejected(task)
+                sizer.observe(max(1, time.monotonic_ns() - started_ns))
+                continue
+            if len(available) < task.spec.requested_gpus:
+                diagnostic_increment("scheduler.ready.insufficient_capacity")
+                sizer.observe(max(1, time.monotonic_ns() - started_ns))
+                continue
+            if max_new_claims is not None and new_claims >= max_new_claims:
+                sizer.observe(max(1, time.monotonic_ns() - started_ns))
+                continue
+            gpus, available = (
+                available[: task.spec.requested_gpus],
+                available[task.spec.requested_gpus :],
+            )
+            try:
+                if claim_guard is not None:
+                    with claim_guard() as is_permitted:
+                        if not is_permitted:
+                            available = gpus + available
+                            break
+                        attempt = claim_task(
+                            cfg, task.task_id, gpus,
+                            reservation_runtime_root=reservation_runtime_root,
+                            project_id=project_id,
+                        )
+                else:
+                    if before_claim is not None and not before_claim():
+                        available = gpus + available
+                        break
+                    attempt = claim_task(
+                        cfg, task.task_id, gpus,
+                        reservation_runtime_root=reservation_runtime_root,
+                        project_id=project_id,
+                    )
+            except ValueError:
+                available = gpus + available
+                sizer.observe(max(1, time.monotonic_ns() - started_ns))
+                continue
+            if attempt is None:
+                available = gpus + available
+                diagnostic_increment("scheduler.ready.claim_races")
+                sizer.observe(max(1, time.monotonic_ns() - started_ns))
+                continue
+            new_claims += 1
+            if on_claim is not None:
+                on_claim(task.task_id)
+            try:
+                if authorize_launch(
+                    cfg,
+                    task.task_id,
+                    attempt.attempt_id,
+                    attempt.current_fencing_token,
+                    reservation_runtime_root=reservation_runtime_root,
+                ):
+                    authorized = _load_current_attempt(cfg, load_task(cfg, task.task_id))
+                    if authorized is not None:
+                        executor.launch_attempt(cfg, task.task_id, authorized)
+                        launched.append(task.task_id)
+            except Exception:
+                fail_attempt(
+                    cfg,
+                    task.task_id,
+                    attempt.attempt_id,
+                    attempt.current_fencing_token,
+                    "executor_launch_failed",
+                    reservation_runtime_root=reservation_runtime_root,
+                )
+            sizer.observe(max(1, time.monotonic_ns() - started_ns))
+            if max_new_claims is not None and new_claims >= max_new_claims:
+                break
+        return launched
+
     for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
         if max_new_claims is not None and new_claims >= max_new_claims:
             break
@@ -916,11 +1126,15 @@ def expire_claim(
             return False
         path = attempt_path(cfg.shared_root, task_id, task.attempt_control["current_attempt_number"])
         attempt = AttemptRecord.from_dict(read_json(path))
+        old_ready_generation = None
         if claim.get("launch_state") == "claimed":
+            task.state.update({"projection": "queued", "reason": "lease_expired_before_launch"})
+            old_ready_generation, _ = prepare_ready_transition(
+                cfg, task, "prelaunch_expiry"
+            )
             attempt.phase = "cancelled"
             attempt.result["reason"] = "lease_expired_before_launch"
             release(reservation_runtime_root, claim["reservation_id"], "lease_expired_before_launch")
-            task.state.update({"projection": "queued", "reason": "lease_expired_before_launch"})
         else:
             attempt.phase = "orphaned"
             attempt.result.update({"exit_code": None, "signal": None, "category": None, "reason": None})
@@ -940,6 +1154,8 @@ def expire_claim(
         task.meta["revision"] += 1
         task.meta["updated_at"] = utc_now()
         save_task(cfg, task)
+        if old_ready_generation is not None:
+            retire_previous_ready_generation(cfg, old_ready_generation, task)
         if attempt.phase == "orphaned":
             try:
                 write_event(

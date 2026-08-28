@@ -93,6 +93,7 @@ class TaskRecord:
     group_membership_sequence: int | None
     submission_operation_id: str | None
     name: str | None
+    ready_generation: int
     spec: TaskSpec
     placement_policy: dict[str, Any]
     placement_runtime: dict[str, Any]
@@ -106,6 +107,8 @@ class TaskRecord:
         validate_identifier(self.task_id, "task_id")
         validate_group_name(self.group_name)
         _check_meta(self.meta)
+        if type(self.ready_generation) is not int or self.ready_generation < 0:
+            raise ValueError("task ready_generation must be a non-negative integer.")
         if self.state.get("projection") not in TASK_PHASES:
             raise ValueError("task state projection is invalid.")
         if self.placement_policy.get("sharing_mode") not in SHARING_MODES:
@@ -162,7 +165,7 @@ class TaskRecord:
             raise ValueError("only timed offers may contain clock proof data.")
         return cls(
             task_id=task_id, group_name=group_name, group_membership_sequence=None,
-            submission_operation_id=operation_id, name=name, spec=spec,
+            submission_operation_id=operation_id, name=name, ready_generation=0, spec=spec,
             placement_policy={"home_machine": machine, "sharing_mode": sharing_mode,
                               "fallback_constraint": fallback_machines, "offer_after_seconds": offer_after_seconds},
             placement_runtime={"queue_scope": "home", "queued_home_at": now,
@@ -181,6 +184,7 @@ class TaskRecord:
         return {"meta": self.meta, "task": {"task_id": self.task_id, "group_name": self.group_name,
                 "group_membership_sequence": self.group_membership_sequence,
                 "submission_operation_id": self.submission_operation_id, "name": self.name,
+                "ready_generation": self.ready_generation,
                 "spec": self.spec.to_dict(), "placement_policy": self.placement_policy,
                 "placement_runtime": self.placement_runtime, "state": self.state, "control": self.control,
                 "attempt_control": self.attempt_control, "claim_control": self.claim_control}}
@@ -191,6 +195,7 @@ class TaskRecord:
         return cls(meta=data["meta"], task_id=task["task_id"], group_name=task.get("group_name"),
                    group_membership_sequence=task.get("group_membership_sequence"),
                    submission_operation_id=task.get("submission_operation_id"), name=task.get("name"),
+                   ready_generation=task.get("ready_generation", 0),
                    spec=TaskSpec(**task["spec"]), placement_policy=task["placement_policy"],
                    placement_runtime=task["placement_runtime"], state=task["state"], control=task["control"],
                    attempt_control=task["attempt_control"], claim_control=task["claim_control"])

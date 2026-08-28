@@ -65,11 +65,17 @@ def validate_root_contract(cfg: RootConfig) -> None:
 def ensure_shared_layout(cfg: RootConfig) -> None:
     paths = shared_paths(cfg.shared_root)
     for name, path in paths.items():
-        if name in {"lease_policy", "notifications"}:
+        if name in {
+            "lease_policy", "notifications", "operations_migration",
+            "offer_deadlines_migration",
+        }:
             continue
         path.mkdir(parents=True, exist_ok=True)
     (paths["locks"] / "groups").mkdir(exist_ok=True)
     (paths["locks"] / "tasks").mkdir(exist_ok=True)
+    from .runtime.ready import ensure_ready_layout
+
+    ensure_ready_layout(cfg)
 
 
 def ensure_machine_layout(cfg: RootConfig) -> None:
@@ -172,7 +178,7 @@ def _migration_blockers(cfg: RootConfig) -> list[str]:
             blockers.append(f"submission:{operation_path.stem}:{state}")
     for name in ("group_control", "cleanup", "availability", "claim_pending"):
         directory = shared_paths(cfg.shared_root)[name]
-        if directory.exists() and any(directory.iterdir()):
+        if directory.exists() and any(path.is_file() for path in directory.iterdir()):
             blockers.append(f"shared_runtime_evidence:{directory.name}")
     for name in ("active", "provisional", "processes", "registrations", "launch_intents",
                  "termination_decisions"):
