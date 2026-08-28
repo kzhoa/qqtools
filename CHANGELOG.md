@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- fix: make `qexp init` automatically register new projects with the machine-global agent, keeping
+  the established `init` then `agent start` or `submit` workflow intact. Legacy project metadata
+  is rejected before it can be overwritten, preserving the explicit migration handoff.
+
 ## v1.3.8
 
 - breaking: replace qexp's per-project standalone agent runtime with one machine-global

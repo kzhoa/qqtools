@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
 
 from qexp_e2e import (
     TASK_TERMINAL_TIMEOUT_SECONDS,
     ensure_site_packages_import,
     jrun,
+    is_machine_agent_running,
     make_env,
     make_layout,
     run,
@@ -28,8 +28,6 @@ def test_installed_wheel_agent_completes_task(tmp_path):
         "--runtime-root",
         str(runtime_root),
     ]
-    pid_path = Path(runtime_root) / "agent" / "agent.pid"
-
     try:
         run([*common, "init", "--agent-mode", "daemon"], env=env)
         started = subprocess.run(
@@ -39,7 +37,11 @@ def test_installed_wheel_agent_completes_task(tmp_path):
             capture_output=True,
         )
         assert started.returncode == 0, started.stderr
-        wait_for(pid_path.exists, timeout=10, label="background agent pid file")
+        wait_for(
+            lambda: is_machine_agent_running(common, env=env),
+            timeout=10,
+            label="background machine agent status",
+        )
 
         submit = run(
             [
@@ -68,4 +70,4 @@ def test_installed_wheel_agent_completes_task(tmp_path):
         assert task["task"]["state"]["projection"] == "succeeded"
         assert "agent ok" in logs
     finally:
-        stop_agent(common, env=env, pid_path=pid_path)
+        stop_agent(common, env=env)

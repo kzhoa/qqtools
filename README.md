@@ -127,18 +127,24 @@ qexp submit --name demo3 -- python train.py -c config3.yaml
 
 After `init`, `qexp` saves the current `shared_root` and `machine` as CLI context, so you usually do not need to repeat them on every command.
 
-Each qexp Machine has one global `qexp agent` process. Projects join it explicitly; a normal new
-project first uses `qexp agent add-project`, while a project created by an older qexp release uses
-the one-time `qexp agent migrate-project`. `qexp agent start` only starts the global agent for an
-already registered project. `qexp agent run` is the foreground debugging command.
+Each qexp Machine has one global `qexp agent` process. `qexp init` registers a normal new project
+with it; a project created by an older qexp release uses the one-time `qexp agent migrate-project`.
+`qexp agent start` only starts the global agent for an already registered project. `qexp agent run`
+is the foreground debugging command.
 
 ```bash
 qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
-qexp agent add-project
 qexp agent start
 qexp agent status
 qexp agent stop
 ```
+
+`qexp init` automatically registers a new project with the machine agent. `qexp agent add-project`
+is an operations command for restoring a removed or lost current-generation registration; it is not
+part of normal setup. Older per-project-agent metadata must use `qexp agent migrate-project`.
+
+`--machine` is a project-local logical worker name. Projects on the same host may use different
+names while sharing one global agent and GPU reservation pool.
 
 ### Schema 6 operation
 

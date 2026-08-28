@@ -170,8 +170,9 @@ records, termination decisions, and pending local convergence evidence are absen
 After shared terminal truth commits, the agent consumes the corresponding process,
 registration, observation, launch-intent, and completed termination records. Successful removal
 deletes the binding's disposable project runtime partition before removing the registry entry.
-New-generation projects register explicitly with `qexp agent add-project` and may be added while
-the global agent is running. A project whose machine metadata predates the global runtime must use
+`qexp init` registers new-generation projects with the global agent before reporting success.
+`qexp agent add-project` may restore an absent current-generation binding while the global agent is
+running. A project whose machine metadata predates the global runtime must use
 `qexp agent migrate-project`; the migration creates a disabled binding, stops only a verified old
 agent, imports local reservations and evidence, then enables the binding after the durable handoff.
 

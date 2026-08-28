@@ -79,6 +79,15 @@ def wait_for(predicate, *, timeout: float, label: str) -> None:
     raise TimeoutError(f"timed out waiting for {label}")
 
 
-def stop_agent(common: list[str], *, env: dict[str, str], pid_path: Path) -> None:
+def is_machine_agent_running(common: list[str], *, env: dict[str, str]) -> bool:
+    status = jrun([*common, "agent", "status"], env=env)
+    return bool(status["is_running"])
+
+
+def stop_agent(common: list[str], *, env: dict[str, str]) -> None:
     run([*common, "agent", "stop"], env=env, check=False)
-    wait_for(lambda: not pid_path.exists(), timeout=10, label="background agent pid cleanup")
+    wait_for(
+        lambda: not is_machine_agent_running(common, env=env),
+        timeout=10,
+        label="background machine agent cleanup",
+    )
