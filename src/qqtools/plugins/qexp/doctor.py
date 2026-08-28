@@ -173,14 +173,15 @@ def verify_integrity(
                             _issue(issues, "claim_attempt_token_mismatch", attempt_file, "critical")
                         if mode == "holder_bound" and attempt.machine_name != claim.get("machine_name"):
                             _issue(issues, "holder_bound_machine_mismatch", attempt_file, "critical")
-                try:
-                    expires_at = datetime.fromisoformat(
-                        claim["lease_expires_at"].replace("Z", "+00:00")
-                    )
-                    if expires_at <= datetime.now(timezone.utc):
-                        _issue(issues, "active_claim_lease_expired", path, "high")
-                except (KeyError, TypeError, ValueError):
-                    _issue(issues, "claim_lease_invalid", path, "high")
+                if mode == "bounded_lease":
+                    try:
+                        expires_at = datetime.fromisoformat(
+                            claim["lease_expires_at"].replace("Z", "+00:00")
+                        )
+                        if expires_at <= datetime.now(timezone.utc):
+                            _issue(issues, "active_claim_lease_expired", path, "high")
+                    except (KeyError, TypeError, ValueError):
+                        _issue(issues, "claim_lease_invalid", path, "high")
                 if task.group_name and task.group_name in groups:
                     workers = groups[task.group_name]["group"].get("worker_set", {})
                     if claim.get("machine_name") not in workers:
