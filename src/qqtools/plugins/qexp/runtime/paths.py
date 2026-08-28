@@ -38,6 +38,7 @@ def shared_paths(root: Path) -> dict[str, Path]:
         "ready_catalogs": root / "indexes" / "ready" / "catalogs",
         "ready_reservations": root / "indexes" / "ready" / "reservations",
         "ready_cursors": root / "indexes" / "ready" / "cursors",
+        "ready_builds": root / "indexes" / "ready" / "builds",
         "ready_locks": root / "indexes" / "ready" / "locks",
         "logs": root / "logs",
         "notifications": root / "notifications",

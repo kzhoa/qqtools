@@ -33,6 +33,7 @@ from .runtime.claims import archive_claim
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, submission_path
 from .runtime.records import AttemptRecord, TaskRecord, TaskSpec, utc_now
 from .runtime.ready import (
+    advance_ready_index_build,
     ReadyMarkerRef,
     classify_ready_marker,
     delete_stale_ready_marker,
@@ -686,6 +687,9 @@ def _run_dispatch_cycle(
                     reservation_runtime_root=reservation_runtime_root,
                 )
     ready_state = read_ready_index_state(cfg)
+    if available and project_id is None and ready_state in {"absent", "building"}:
+        advance_ready_index_build(cfg)
+        ready_state = read_ready_index_state(cfg)
     if ready_state == "degraded":
         diagnostic_increment("scheduler.ready.skipped_degraded")
         return launched

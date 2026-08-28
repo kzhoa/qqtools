@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import time
 from typing import Any
 
 from .commands.cleanup import reconcile_cleanup_operations
@@ -11,7 +12,6 @@ from .config_types import RootConfig
 from .lifecycle import (TerminalTransition, commit_terminal_transition_locked,
                         dispatch_task_lifecycle_hooks_noexcept)
 from .runtime.availability import rebuild_deadline_indexes, reconcile_availability_operations
-from .runtime.claims import archive_claim
 from .layout import validate_root_contract
 from .runtime.locks import group_lock, task_lock
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
@@ -19,7 +19,15 @@ from .runtime.records import AttemptRecord, TaskRecord, utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.termination import list_decisions
 from .runtime.tasks import load_task
-from .runtime.ready import retire_current_ready_generation
+from .runtime.ready import (
+    READY_BUILD_PAGE_SIZE,
+    mark_ready_index_degraded,
+    read_ready_index_state,
+    read_ready_index_status,
+    ready_task_projection_issue,
+    repair_ready_index,
+    retire_current_ready_generation,
+)
 from .lease import clock_capability
 
 
@@ -83,6 +91,14 @@ def verify_integrity(
         project_id = context.project_id
     validate_root_contract(cfg)
     issues: list[dict[str, Any]] = []
+    ready_state = read_ready_index_state(cfg)
+    if ready_state == "degraded":
+        _issue(
+            issues,
+            "ready_index_degraded",
+            shared_paths(cfg.shared_root)["ready"] / "state.json",
+            "high",
+        )
     paths = shared_paths(cfg.shared_root)
     cleaned = _cleaned_task_ids(cfg)
     submissions = _records_by_stem(
@@ -123,6 +139,16 @@ def verify_integrity(
         checked += 1
         try:
             task = TaskRecord.from_dict(read_json(path))
+            if ready_state in {"active", "degraded"}:
+                ready_issue = ready_task_projection_issue(cfg, task.task_id)
+                if ready_issue is not None:
+                    _issue(
+                        issues,
+                        "ready_projection_inconsistent",
+                        path,
+                        "high",
+                        ready_issue,
+                    )
             if path.stem != task.task_id:
                 _issue(issues, "task_filename_id_mismatch", path, "high")
             submission = submissions.get(task.submission_operation_id or "")
@@ -327,6 +353,7 @@ def verify_integrity(
         except (OSError, ValueError):
             _issue(issues, "termination_decision_invalid", decision_path, "high")
     return {"schema_version": 6, "tasks_checked": checked, "issues": issues, "healthy": not issues,
+            "ready_index": read_ready_index_status(cfg),
             "clock_capability": {"status": capability.status, "reason": capability.reason,
                                  "provider": capability.observation.provider if capability.observation else None,
                                  "observation_id": capability.observation.observation_id if capability.observation else None,
@@ -344,6 +371,7 @@ def repair_metadata(
         reservation_runtime_root = context.reservation_root
     repaired: list[str] = []
     blocked: list[str] = []
+    initial_ready_state = read_ready_index_state(cfg)
     operations = shared_paths(cfg.shared_root)["submissions"]
     for path in iter_json(operations):
         operation = read_json(path)["submission"]
@@ -425,7 +453,9 @@ def repair_metadata(
                     if not has_saved_task:
                         task.meta["revision"] += 1
                         task.meta["updated_at"] = utc_now()
-                        atomic_replace(task_path(cfg.shared_root, task.task_id), task.to_dict())
+                        from .runtime.tasks import save_task
+
+                        save_task(cfg, task)
                     if task.state["projection"] == "cancelled":
                         retire_current_ready_generation(cfg, task)
         for result in post_commit_results:
@@ -471,8 +501,29 @@ def repair_metadata(
     repaired.extend(task_id for task_id in orphan_result["repaired"] if task_id not in repaired)
     blocked.extend(item["task_id"] for item in orphan_result["blocked"]
                    if item["task_id"] not in blocked)
+    if read_ready_index_state(cfg) == "active":
+        for ready_task_path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
+            issue = ready_task_projection_issue(cfg, ready_task_path.stem)
+            if issue is not None:
+                mark_ready_index_degraded(cfg, f"doctor_repair:{issue}")
+                break
+    ready_record = repair_ready_index(cfg, max_tasks=READY_BUILD_PAGE_SIZE)
+    while ready_record.get("state") == "building":
+        time.sleep(0)
+        ready_record = repair_ready_index(cfg, max_tasks=READY_BUILD_PAGE_SIZE)
+    ready_build = ready_record.get("build") or {}
+    if ready_record.get("state") == "active" and initial_ready_state != "active":
+        repaired.append(
+            f"ready_index:{ready_build.get('repaired', 0)}:"
+            f"{ready_build.get('stale_removed', 0)}"
+        )
+    elif ready_record.get("state") == "degraded":
+        blocked.append("ready_index")
     return {"repaired": repaired, "blocked": blocked,
-            "message": "Submission and Group control operations reconciled."}
+            "ready_index": {"state": ready_record.get("state"),
+                            "build": ready_build,
+                            "degraded_reasons": ready_record.get("degraded_reasons", [])},
+            "message": "Submission, Group control, and ready-index operations reconciled."}
 
 
 def repair_orphans(

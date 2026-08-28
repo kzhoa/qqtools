@@ -28,6 +28,10 @@ class _RecordingExecutor:
 
 
 def _activate_ready(cfg) -> None:
+    schema_path = shared_paths(cfg.shared_root)["schema"] / "version.json"
+    schema = read_json(schema_path)
+    schema["schema"]["writer_capabilities"] = ["ready-v1"]
+    atomic_replace(schema_path, schema)
     value = read_json(ready_state_path(cfg.shared_root))
     value["ready_index"]["state"] = "active"
     value["ready_index"]["writer_capability"] = "ready-v1"

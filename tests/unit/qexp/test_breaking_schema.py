@@ -20,6 +20,18 @@ def test_old_schema_fails_before_mutation(tmp_path: Path):
     assert not (root / "tasks").exists()
 
 
+def test_init_rejects_old_schema_before_lock_mutation(tmp_path: Path):
+    root = tmp_path / ".qexp"
+    root.mkdir()
+    (root / "schema").mkdir()
+    atomic_replace(root / "schema" / "version.json", {"schema": {"version": "4.1"}})
+
+    with pytest.raises(RuntimeError, match="Unsupported qexp schema"):
+        init_shared_root(root, "g1", runtime_root=tmp_path / "rt")
+
+    assert not (root / "locks").exists()
+
+
 def test_init_writes_schema5_layout(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     paths = shared_paths(cfg.shared_root)
