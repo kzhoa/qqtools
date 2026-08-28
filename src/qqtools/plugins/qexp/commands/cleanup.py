@@ -15,7 +15,7 @@ from ..runtime.records import AttemptRecord, SCHEMA_VERSION, TaskRecord, new_id,
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.tasks import load_task, save_task
 from ..runtime.availability import remove_deadline_index
-from ..runtime.ready import retire_current_ready_generation
+from ..runtime.ready import assert_ready_writer_compatible, retire_current_ready_generation
 from ..runtime.active_operations import (
     active_operation_path,
     archive_operation,
@@ -218,6 +218,7 @@ def _finalize_cleanup_operation(cfg: RootConfig, operation: dict[str, Any]) -> l
     removed: list[str] = []
     path = task_path(cfg.shared_root, task_id)
     if path.exists():
+        assert_ready_writer_compatible(cfg)
         path.unlink()
         removed.append(str(path))
     deadline_index = shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task_id}.json"

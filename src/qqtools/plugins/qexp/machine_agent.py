@@ -27,6 +27,7 @@ from .runtime.reservations import (
     active_reservations,
     reconcile_snapshot,
 )
+from .runtime.ready import advance_ready_index_build, read_ready_index_state
 from .runtime.locks import exclusive
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.work_budget import (
@@ -566,6 +567,18 @@ def _dispatch_machine_cycle_locked(
             }
             results.append(item)
             result_by_project[binding.project_id] = item
+    if free:
+        for binding in ordered_enabled:
+            cfg = dispatchable.get(binding.project_id)
+            if cfg is None or read_ready_index_state(cfg) not in {"absent", "building"}:
+                continue
+            try:
+                advance_ready_index_build(cfg)
+            except (OSError, RuntimeError, ValueError) as exc:
+                item = result_by_project[binding.project_id]
+                item["status"] = "error"
+                item["error"] = str(exc)
+                del dispatchable[binding.project_id]
     if not free:
         diagnostic_increment("scheduler.work.skipped_no_capacity", len(ordered_enabled))
     budget = SliceBudget()
@@ -582,6 +595,7 @@ def _dispatch_machine_cycle_locked(
     inspected_ready: set[tuple[str, str, str]] = set()
     round_bindings = list(ordered_enabled)
     last_successful_binding: ProjectBinding | None = None
+    has_retried_empty_round = False
     while free and round_bindings:
         if not budget.can_start_record():
             diagnostic_increment("scheduler.work.immediate_slices")
@@ -629,9 +643,19 @@ def _dispatch_machine_cycle_locked(
                 item = result_by_project[binding.project_id]
                 item["status"] = "error"
                 item["error"] = str(exc)
-        if round_claims == 0 and budget.can_start_record():
-            break
-        if round_claims == 0 and budget.records_used == records_before_round:
+        if (
+            round_claims == 0
+            and not budget.can_start_record()
+            and budget.records_used == records_before_round
+            and not has_retried_empty_round
+        ):
+            diagnostic_increment("scheduler.work.immediate_slices")
+            time.sleep(0)
+            budget = SliceBudget()
+            round_bindings = round_bindings[1:] + round_bindings[:1]
+            has_retried_empty_round = True
+            continue
+        if round_claims == 0:
             break
         diagnostic_increment("scheduler.work.rounds")
         if round_last_success is not None:

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import shutil
 import uuid
@@ -32,8 +31,19 @@ def read_schema_version(cfg: RootConfig) -> int | None:
     version = schema.get("version")
     if version != SCHEMA_VERSION:
         return version
-    if set(schema) != {"name", "version", "minimum_reader_version", "created_at"}:
+    base_fields = {"name", "version", "minimum_reader_version", "created_at"}
+    schema_fields = frozenset(schema)
+    if schema_fields not in {
+        frozenset(base_fields), frozenset({*base_fields, "writer_capabilities"})
+    }:
         raise RuntimeError("qexp schema/version.json is malformed.")
+    capabilities = schema.get("writer_capabilities")
+    if capabilities is not None and (
+        not isinstance(capabilities, list)
+        or not all(isinstance(item, str) for item in capabilities)
+        or "ready-v1" not in capabilities
+    ):
+        raise RuntimeError("qexp schema/version.json has unsupported writer capabilities.")
     return version
 
 
@@ -90,16 +100,29 @@ def ensure_machine_layout(cfg: RootConfig) -> None:
 
 
 def initialize_shared_root(cfg: RootConfig) -> None:
-    existing = read_schema_version(cfg)
-    if existing is not None and existing != SCHEMA_VERSION:
-        raise RuntimeError(f"Unsupported qexp schema {existing!r}; refusing mixed-schema initialization.")
-    if existing == SCHEMA_VERSION:
-        validate_root_contract(cfg)
-    ensure_shared_layout(cfg)
+    observed = read_schema_version(cfg)
+    if observed is not None and observed != SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Unsupported qexp schema {observed!r}; refusing mixed-schema initialization."
+        )
+    with schema_lock(cfg.shared_root):
+        existing = read_schema_version(cfg)
+        if existing is not None and existing != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Unsupported qexp schema {existing!r}; refusing mixed-schema initialization."
+            )
+        if existing == SCHEMA_VERSION:
+            validate_root_contract(cfg)
+        ensure_shared_layout(cfg)
+        if existing is None:
+            schema = {"schema": {
+                "name": "qexp-runtime",
+                "version": SCHEMA_VERSION,
+                "minimum_reader_version": SCHEMA_VERSION,
+                "created_at": utc_now(),
+            }}
+            atomic_replace(_schema_path(cfg), schema)
     ensure_machine_layout(cfg)
-    schema = {"schema": {"name": "qexp-runtime", "version": SCHEMA_VERSION,
-                          "minimum_reader_version": SCHEMA_VERSION, "created_at": utc_now()}}
-    atomic_replace(_schema_path(cfg), schema)
     identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
     if not identity_path.exists():
         atomic_replace(identity_path, {"project": {"project_id": project_id(cfg.shared_root),

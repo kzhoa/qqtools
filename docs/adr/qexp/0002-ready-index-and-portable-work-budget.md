@@ -65,6 +65,21 @@ scheduling only after the writer capability gate is active. An incompatible writ
 mutation. Repair may rebuild projections from truth, but ordinary active scheduling never scans all
 Tasks to compensate for projection loss.
 
+The writer gate is an additive `writer_capabilities: [ready-v1]` field in `schema/version.json`,
+installed with `building` under the schema lock after in-flight Submission writers exit. Older
+schema-6 readers reject the extended envelope, while current
+writers recheck the capability immediately before Task persistence. Machine-agent snapshots publish
+the same capability; a recently active agent without it prevents activation. This does not claim to
+physically fence an arbitrary process that ignores both schema validation and machine registration;
+such evidence keeps the project out of `active`.
+
+The historical watermark is a streamed sequence of immutable pages containing at most 64 Task IDs.
+Streaming bounds memory but performs one complete legacy directory pass. Backfill and final audit
+persist page/offset cursors and process no more than 64 exact Task records per slice. Tasks created
+during capture are covered by the already-active marker-before-Task writer protocol. Repair moves
+damaged advisory structures into a build-specific forensic archive, creates a clean projection, and
+runs the same backfill and audit protocol before restoring `active`.
+
 Work is constrained by environment-independent record, Task-read, Attempt-read, reservation-read,
 operation, and memory hard limits. A 50 ms monotonic soft deadline controls when another independent
 record may start; it cannot interrupt an already-blocking synchronous filesystem operation. An

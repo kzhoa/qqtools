@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .locks import group_lock, schema_lock
-from .paths import group_path, idempotency_path, shared_paths, submission_path, task_path
+from .paths import group_path, idempotency_path, submission_path, task_path
 from .records import (
     TaskRecord,
     TaskSpec,
@@ -19,10 +19,16 @@ from .records import (
     utc_now,
     validate_identifier,
 )
-from .ready import delete_ready_marker, prepare_ready_transition, retire_previous_ready_generation
+from .ready import (
+    assert_ready_writer_compatible,
+    delete_ready_marker,
+    prepare_ready_transition,
+    retire_previous_ready_generation,
+)
 from .active_operations import operation_exists
 from .store import atomic_replace, create_if_absent, read_json
 from .availability import remove_deadline_index, sync_deadline_index
+from .tasks import save_task
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
 
 
@@ -399,7 +405,7 @@ def submit_specs(
                         )
                         current.meta["revision"] += 1
                         current.meta["updated_at"] = utc_now()
-                        atomic_replace(path, current.to_dict())
+                        save_task(cfg, current)
                         retire_previous_ready_generation(cfg, old_generation, current)
                     sync_deadline_index(cfg, current)
                     staged.append(current)
@@ -424,7 +430,7 @@ def submit_specs(
                     "submission_stage",
                     target_revision=task.meta["revision"],
                 )
-                atomic_replace(path, task.to_dict())
+                save_task(cfg, task)
                 retire_previous_ready_generation(cfg, old_generation, task)
                 sync_deadline_index(cfg, task)
                 staged.append(task)
@@ -475,5 +481,6 @@ def submit_specs(
                         delete_ready_marker(cfg, task_id, current.ready_generation)
                     except (OSError, KeyError, TypeError, ValueError):
                         pass
+                    assert_ready_writer_compatible(cfg)
                     path.unlink(missing_ok=True)
             raise

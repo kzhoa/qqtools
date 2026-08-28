@@ -14,4 +14,7 @@ def load_task(cfg: object, task_id: str) -> TaskRecord:
 
 
 def save_task(cfg: object, task: TaskRecord) -> None:
+    from .ready import assert_ready_writer_compatible
+
+    assert_ready_writer_compatible(cfg)
     atomic_replace(task_path(cfg.shared_root, task.task_id), task.to_dict())

@@ -366,7 +366,10 @@ The target layout is:
       home/<machine>/<partition>/<task-id>.<generation>.json
       shared/<partition>/partition.json
       shared/<partition>/<task-id>.<generation>.json
-      cursors/<machine>/<project-id>/<scope>/<partition>.json
+      cursors/<project-id>.<machine>.<scope>.json
+      builds/<build-id>/watermark/<page>.json
+      builds/<build-id>/replaced-projection/
+      locks/state.lock
       locks/<route>.lock
   logs/
     <task-id>/
@@ -430,7 +433,14 @@ schema:
   version: int
   minimum_reader_version: int
   created_at: str
+  writer_capabilities: [ready-v1]  # present after ready-index building starts
 ```
+
+Installing `writer_capabilities` is the ready-index writer gate. Schema-6 readers predating the
+capability field reject the extended schema envelope before entering a protected mutation workflow.
+Current writers also validate `ready-v1` immediately before every Task create, update, or delete.
+The field and the transition to `building` are committed while holding the schema lock, after any
+in-flight Submission writer exits. The field is never removed on activation or repair.
 
 `project/identity.json` contains a stable project ID and canonical shared-root identity.
 Every local runtime root is namespaced by that project ID so two projects using the same
@@ -1327,6 +1337,56 @@ active marker or catalog/partition record degrades the project instead of fallin
 discovery. A temporarily unavailable or machine-ineligible marker remains in the index and still
 advances candidate progress.
 
+The durable index state has one revisioned record:
+
+```yaml
+ready_index:
+  schema_version: 1
+  state: absent | building | active | degraded
+  writer_capability: ready-v1 | null
+  revision: int
+  build:
+    build_id: str
+    phase: inventory | backfill | audit | completed
+    is_repair: bool
+    watermark:
+      page_count: int
+      task_count: int
+      captured_at: str | null
+      is_complete: bool
+    cursor: {page: int, offset: int}
+    audit_cursor: {page: int, offset: int}
+    processed: int
+    repaired: int
+    stale_removed: int
+    started_at: str
+    completed_at: str | null
+  degraded_reasons: [str]
+  updated_at: str
+```
+
+The first current-generation dispatch cycle with free GPU capacity installs the schema writer gate,
+commits `building`, and streams the legacy Task-name watermark into immutable pages of at most 64 IDs.
+The inventory stream has bounded memory but may perform one complete legacy directory pass; this is
+the final history-sized operation and is never used after activation. Each later maintenance slice
+opens at most 64 exact watermark Tasks and commits the resulting page/offset cursor at the slice
+boundary. A crash may repeat at most one bounded slice safely. Writers operating after `building`
+begins publish the new marker before Task truth, so Tasks created during watermark capture need not
+be members of the legacy watermark.
+
+Backfill creates a new generation for every queued Task whose current marker is missing, corrupt,
+or unreachable from its reservation, partition, and catalog. Non-queued Tasks have any current
+marker retired. A second bounded pass audits the same watermark. Activation requires the audit to
+finish, the schema gate to remain installed, and every recently active machine agent to advertise
+`ready-v1`; otherwise the project enters `degraded`. The single `state: active` replacement is the
+cutover point. Ordinary active scheduling never reads build pages or falls back to Task history.
+
+`doctor repair` first audits an active projection. On damage it commits `degraded`, moves the
+advisory home/shared marker trees, catalogs, reservations, allocators, and cursors beneath the new
+build's `replaced-projection/` directory, and rebuilds from Task truth. The move preserves forensic
+evidence and never moves or rewrites Task, Attempt, Submission, claim, or GPU-reservation authority.
+Repair uses the same 64-record cursor slices and restores `active` only after the final audit.
+
 ### 13.1.1 Portable Work Slice Contract
 
 One scheduling work slice has environment-independent hard bounds:
@@ -1809,10 +1869,14 @@ It must distinguish:
 - orphaned Attempt with live, finished, missing, or unknown process
 - unacknowledged Task or Group termination intent
 - stale or corrupt derived index
+- incomplete ready-index build, incompatible active writer, missing marker, and marker unreachable
+  from its reservation, partition, or catalog
 
 Safe automatic repairs include:
 
 - rebuilding indexes and summaries
+- resuming a ready-index cursor, rebuilding its advisory projection from Task truth, and restoring
+  a degraded project only after the final consistency audit
 - completing an idempotent operation whose staged truth exactly matches resolved context
 - rebuilding Group cancellation progress from Task and Attempt truth
 - resuming idempotent cancellation convergence after CLI or agent restart

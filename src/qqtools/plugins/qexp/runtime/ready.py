@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import os
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from .locks import exclusive
+from .locks import exclusive, schema_lock
 from .paths import group_path, ready_state_path, shared_paths, submission_path, task_path
-from .records import SCHEMA_VERSION, TaskRecord, utc_now, validate_identifier
+from .records import TaskRecord, utc_now, validate_identifier
 from .store import atomic_replace, read_json
 
 READY_PROTOCOL_VERSION = 1
+READY_WRITER_CAPABILITY = "ready-v1"
 READY_PARTITION_SLOTS = 64
 READY_CATALOG_PAGE_SIZE = 64
+READY_BUILD_PAGE_SIZE = 64
 ReadyScope = Literal["home", "shared"]
 ReadyClassification = Literal[
     "claimable", "temporarily_unavailable", "permanently_stale", "corrupt"
@@ -59,7 +64,7 @@ def ensure_ready_layout(cfg: object) -> None:
     paths = shared_paths(cfg.shared_root)
     for name in (
         "ready", "ready_home", "ready_shared", "ready_catalogs", "ready_reservations",
-        "ready_cursors", "ready_locks",
+        "ready_cursors", "ready_builds", "ready_locks",
     ):
         paths[name].mkdir(parents=True, exist_ok=True)
     state_path = ready_state_path(cfg.shared_root)
@@ -69,6 +74,8 @@ def ensure_ready_layout(cfg: object) -> None:
                 "schema_version": READY_PROTOCOL_VERSION,
                 "state": "absent",
                 "writer_capability": None,
+                "revision": 0,
+                "build": None,
                 "updated_at": utc_now(),
                 "degraded_reasons": [],
             }
@@ -87,28 +94,264 @@ def read_ready_index_state(cfg: object) -> ReadyIndexState:
             return "degraded"
         if state not in {"absent", "building", "active", "degraded"}:
             return "degraded"
+        if (
+            state in {"building", "active"}
+            and record.get("writer_capability") != READY_WRITER_CAPABILITY
+        ):
+            return "degraded"
         return state
     except (KeyError, TypeError, ValueError):
         return "degraded"
+
+
+def _state_lock_path(cfg: object) -> Path:
+    return shared_paths(cfg.shared_root)["ready_locks"] / "state.lock"
+
+
+def _read_ready_state_record(cfg: object) -> tuple[dict[str, Any], dict[str, Any]]:
+    value = read_json(ready_state_path(cfg.shared_root))
+    record = value["ready_index"]
+    if record.get("schema_version") != READY_PROTOCOL_VERSION:
+        raise ValueError("ready index state schema is unsupported.")
+    if record.get("state") not in {"absent", "building", "active", "degraded"}:
+        raise ValueError("ready index state is invalid.")
+    record.setdefault("writer_capability", None)
+    record.setdefault("revision", 0)
+    record.setdefault("build", None)
+    record.setdefault("degraded_reasons", [])
+    if type(record["revision"]) is not int or record["revision"] < 0:
+        raise ValueError("ready index revision is invalid.")
+    return value, record
+
+
+def read_ready_index_status(cfg: object) -> dict[str, Any]:
+    """Return the durable build, cursor, watermark, and degradation status."""
+    try:
+        _value, record = _read_ready_state_record(cfg)
+        return record
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        return {
+            "schema_version": READY_PROTOCOL_VERSION,
+            "state": "degraded",
+            "writer_capability": None,
+            "revision": 0,
+            "build": None,
+            "degraded_reasons": ["state_invalid"],
+            "updated_at": None,
+        }
+
+
+def _commit_ready_state(path: Path, value: dict[str, Any], record: dict[str, Any]) -> None:
+    record["revision"] += 1
+    record["updated_at"] = utc_now()
+    atomic_replace(path, value)
+
+
+def _schema_capability_path(cfg: object) -> Path:
+    return shared_paths(cfg.shared_root)["schema"] / "version.json"
+
+
+def _install_writer_capability_gate(cfg: object) -> None:
+    """Make pre-ready schema readers reject the root before they can mutate Tasks."""
+    path = _schema_capability_path(cfg)
+    value = read_json(path)
+    schema = value.get("schema")
+    if not isinstance(schema, dict):
+        raise RuntimeError("qexp schema/version.json is malformed.")
+    capabilities = schema.get("writer_capabilities")
+    if capabilities is None:
+        schema["writer_capabilities"] = [READY_WRITER_CAPABILITY]
+    elif (
+        not isinstance(capabilities, list)
+        or not all(isinstance(item, str) for item in capabilities)
+        or READY_WRITER_CAPABILITY not in capabilities
+    ):
+        raise RuntimeError("qexp schema writer capability gate is incompatible.")
+    else:
+        return
+    atomic_replace(path, value)
+
+
+def assert_ready_writer_compatible(
+    cfg: object, writer_capability: str | None = READY_WRITER_CAPABILITY,
+) -> None:
+    """Reject an incompatible writer before authoritative Task mutation."""
+    state = read_ready_index_state(cfg)
+    if state == "absent":
+        return
+    try:
+        _value, record = _read_ready_state_record(cfg)
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("ready index state is invalid; Task mutation is disabled.") from exc
+    required = record.get("writer_capability")
+    if required != READY_WRITER_CAPABILITY or writer_capability != required:
+        raise RuntimeError(
+            f"ready index requires writer capability {required!r}; "
+            f"writer declared {writer_capability!r}."
+        )
+    try:
+        schema = read_json(_schema_capability_path(cfg))["schema"]
+        capabilities = schema["writer_capabilities"]
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("ready writer schema capability gate is missing.") from exc
+    if (
+        not isinstance(capabilities, list)
+        or not all(isinstance(item, str) for item in capabilities)
+        or READY_WRITER_CAPABILITY not in capabilities
+    ):
+        raise RuntimeError("ready writer schema capability gate is incompatible.")
+
+
+def _build_root(cfg: object, build_id: str) -> Path:
+    validate_identifier(build_id, "ready build id")
+    return shared_paths(cfg.shared_root)["ready_builds"] / build_id
+
+
+def _build_page_path(cfg: object, build_id: str, page: int) -> Path:
+    return _build_root(cfg, build_id) / "watermark" / f"{page:016d}.json"
+
+
+def _write_build_page(
+    cfg: object, build_id: str, page: int, task_ids: list[str],
+) -> None:
+    atomic_replace(
+        _build_page_path(cfg, build_id, page),
+        {"ready_build_page": {
+            "schema_version": READY_PROTOCOL_VERSION,
+            "build_id": build_id,
+            "page": page,
+            "task_ids": list(task_ids),
+        }},
+    )
+
+
+def _capture_build_watermark(cfg: object, record: dict[str, Any]) -> None:
+    """Stream one immutable legacy inventory into bounded durable pages."""
+    build = record["build"]
+    build_id = build["build_id"]
+    page = 0
+    task_count = 0
+    task_ids: list[str] = []
+    tasks = shared_paths(cfg.shared_root)["tasks"]
+    with os.scandir(tasks) as entries:
+        for entry in entries:
+            if not entry.is_file() or not entry.name.endswith(".json"):
+                continue
+            task_ids.append(entry.name[:-5])
+            task_count += 1
+            if len(task_ids) == READY_BUILD_PAGE_SIZE:
+                _write_build_page(cfg, build_id, page, task_ids)
+                page += 1
+                task_ids = []
+    if task_ids:
+        _write_build_page(cfg, build_id, page, task_ids)
+        page += 1
+    build["watermark"] = {
+        "page_count": page,
+        "task_count": task_count,
+        "captured_at": utc_now(),
+        "is_complete": True,
+    }
+    build["phase"] = "backfill"
+
+
+def _reset_ready_projection_for_repair(cfg: object, build_id: str) -> None:
+    """Move the damaged advisory projection aside before a truth-based rebuild."""
+    paths = shared_paths(cfg.shared_root)
+    archive = _build_root(cfg, build_id) / "replaced-projection"
+    archive.mkdir(parents=True, exist_ok=True)
+    targets = {
+        "home": paths["ready_home"],
+        "shared": paths["ready_shared"],
+        "catalogs": paths["ready_catalogs"],
+        "reservations": paths["ready_reservations"],
+        "cursors": paths["ready_cursors"],
+        "allocators": paths["ready"] / "allocators",
+    }
+    for name, target in targets.items():
+        archived = archive / name
+        if target.exists():
+            os.replace(target, archived)
+        target.mkdir(parents=True, exist_ok=True)
+
+
+def begin_ready_index_build(cfg: object, *, is_repair: bool = False) -> dict[str, Any]:
+    """Start or resume the single durable ready-index build."""
+    ensure_ready_layout(cfg)
+    state = read_ready_index_state(cfg)
+    if state == "active" or (state == "degraded" and not is_repair):
+        return read_ready_index_status(cfg)
+    if state in {"absent", "degraded"}:
+        with schema_lock(cfg.shared_root):
+            with exclusive(_state_lock_path(cfg)):
+                path = ready_state_path(cfg.shared_root)
+                value, record = _read_ready_state_record(cfg)
+                state = record["state"]
+                if state == "active" or (state == "degraded" and not is_repair):
+                    return record
+                if state in {"absent", "degraded"}:
+                    _install_writer_capability_gate(cfg)
+                    build_id = uuid.uuid4().hex
+                    if state == "degraded" and is_repair:
+                        _reset_ready_projection_for_repair(cfg, build_id)
+                    record["state"] = "building"
+                    record["writer_capability"] = READY_WRITER_CAPABILITY
+                    record["build"] = {
+                        "build_id": build_id,
+                        "phase": "inventory",
+                        "is_repair": is_repair,
+                        "watermark": {
+                            "page_count": 0,
+                            "task_count": 0,
+                            "captured_at": None,
+                            "is_complete": False,
+                        },
+                        "cursor": {"page": 0, "offset": 0},
+                        "audit_cursor": {"page": 0, "offset": 0},
+                        "processed": 0,
+                        "repaired": 0,
+                        "stale_removed": 0,
+                        "started_at": utc_now(),
+                        "completed_at": None,
+                    }
+                    _commit_ready_state(path, value, record)
+    with exclusive(_state_lock_path(cfg)):
+        path = ready_state_path(cfg.shared_root)
+        value, record = _read_ready_state_record(cfg)
+        state = record["state"]
+        if state == "active":
+            return record
+        if state == "degraded" and not is_repair:
+            return record
+        build = record.get("build")
+        if not isinstance(build, dict):
+            raise RuntimeError("ready index build state is missing.")
+        if not build.get("watermark", {}).get("is_complete"):
+            _capture_build_watermark(cfg, record)
+            _commit_ready_state(path, value, record)
+        return record
 
 
 def mark_ready_index_degraded(cfg: object, reason: str) -> None:
     """Fail closed after detecting a corrupt active projection."""
     path = ready_state_path(cfg.shared_root)
     try:
-        value = read_json(path)
-        record = value["ready_index"]
-        reasons = record.get("degraded_reasons", [])
-        if not isinstance(reasons, list):
-            reasons = []
-        if reason not in reasons:
-            reasons.append(reason)
-        record["state"] = "degraded"
-        record["degraded_reasons"] = reasons
-        record["updated_at"] = utc_now()
-        atomic_replace(path, value)
+        with exclusive(_state_lock_path(cfg)):
+            value, record = _read_ready_state_record(cfg)
+            _degrade_ready_record(record, reason)
+            _commit_ready_state(path, value, record)
     except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
         return
+
+
+def _degrade_ready_record(record: dict[str, Any], reason: str) -> None:
+    reasons = record.get("degraded_reasons", [])
+    if not isinstance(reasons, list):
+        reasons = []
+    if reason not in reasons:
+        reasons.append(reason)
+    record["state"] = "degraded"
+    record["degraded_reasons"] = reasons
 
 
 def _route_key(scope: ReadyScope, home_machine: str) -> str:
@@ -305,6 +548,27 @@ def next_ready_marker(
             raise ValueError("ready partition slots are invalid.")
         names = sorted(slots)
     except FileNotFoundError:
+        lock_path = shared_paths(cfg.shared_root)["ready_locks"] / f"{route_key}.lock"
+        with exclusive(lock_path):
+            try:
+                current_catalog = read_json(page_path)["ready_catalog"]
+                current_partitions = current_catalog["partitions"]
+                if (
+                    current_catalog.get("schema_version") != READY_PROTOCOL_VERSION
+                    or current_catalog.get("route") != route_key
+                    or current_catalog.get("page") != page_number
+                    or not isinstance(current_partitions, list)
+                    or not all(isinstance(item, str) for item in current_partitions)
+                ):
+                    raise ValueError("ready catalog is invalid.")
+                is_still_referenced = partition_name in current_partitions
+            except (FileNotFoundError, KeyError, TypeError, ValueError):
+                is_still_referenced = True
+        if is_still_referenced:
+            mark_ready_index_degraded(
+                cfg, f"partition_missing:{route_key}:{partition_name}"
+            )
+            return None, False
         names = []
     except (KeyError, TypeError, ValueError):
         mark_ready_index_degraded(cfg, f"partition_invalid:{route_key}:{partition_name}")
@@ -740,3 +1004,289 @@ def classify_ready_marker(
         if group.get("dispatch_state") != "active":
             return ReadyClassificationResult("temporarily_unavailable", "group_paused", task)
     return ReadyClassificationResult("claimable", "eligible_truth", task)
+
+
+def _reference_for_generation(
+    cfg: object, task_id: str, generation: int,
+) -> ReadyMarkerRef | None:
+    path = _reservation_path(cfg.shared_root, task_id, generation)
+    try:
+        record = read_json(path)["ready_reservation"]
+        reference = ReadyMarkerRef(
+            task_id,
+            generation,
+            record["queue_scope"],
+            record["home_machine"],
+            record["partition"],
+            record["catalog_page"],
+            record["marker_name"],
+        )
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        return None
+    if (
+        record.get("schema_version") != READY_PROTOCOL_VERSION
+        or record.get("task_id") != task_id
+        or record.get("generation") != generation
+        or record.get("queue_scope") not in {"home", "shared"}
+        or not isinstance(record.get("home_machine"), str)
+        or not isinstance(record.get("partition"), str)
+        or type(record.get("catalog_page")) is not int
+        or record["catalog_page"] < 0
+        or record.get("marker_name") != f"{task_id}.{generation}.json"
+    ):
+        return None
+    return reference
+
+
+def _is_ready_reference_indexed(cfg: object, reference: ReadyMarkerRef) -> bool:
+    """Verify the exact reservation is reachable through its partition and catalog."""
+    route_key = _route_key(reference.queue_scope, reference.home_machine)
+    try:
+        partition = read_json(
+            _partition_record_path(
+                cfg.shared_root,
+                reference.queue_scope,
+                reference.home_machine,
+                reference.partition,
+            )
+        )["ready_partition"]
+        catalog = read_json(
+            _catalog_path(cfg.shared_root, route_key, reference.catalog_page)
+        )["ready_catalog"]
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        return False
+    slots = partition.get("slots")
+    partitions = catalog.get("partitions")
+    return (
+        isinstance(slots, list)
+        and all(isinstance(item, str) for item in slots)
+        and isinstance(partitions, list)
+        and all(isinstance(item, str) for item in partitions)
+        and partition.get("schema_version") == READY_PROTOCOL_VERSION
+        and partition.get("route") == route_key
+        and partition.get("partition") == reference.partition
+        and partition.get("catalog_page") == reference.catalog_page
+        and reference.marker_name in slots
+        and catalog.get("schema_version") == READY_PROTOCOL_VERSION
+        and catalog.get("route") == route_key
+        and catalog.get("page") == reference.catalog_page
+        and reference.partition in partitions
+    )
+
+
+def _task_should_have_ready_marker(task: TaskRecord) -> bool:
+    return (
+        task.state.get("projection") == "queued"
+        and not task.claim_control.get("active_claim")
+        and not task.control.get("cleanup_operation_id")
+        and not task.control.get("cleanup_state")
+        and not task.control.get("cancellation_requested_at")
+    )
+
+
+def _repair_task_ready_projection(cfg: object, task_id: str) -> tuple[int, int]:
+    """Repair one Task projection under its authority lock."""
+    from .locks import task_lock
+    from .tasks import load_task, save_task
+
+    repaired = 0
+    stale_removed = 0
+    with task_lock(cfg.shared_root, task_id):
+        try:
+            task = load_task(cfg, task_id)
+        except FileNotFoundError:
+            return repaired, stale_removed
+        reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+        classification = (
+            classify_ready_marker(cfg, reference).classification
+            if reference is not None and _is_ready_reference_indexed(cfg, reference)
+            else None
+        )
+        if _task_should_have_ready_marker(task):
+            if classification in {"claimable", "temporarily_unavailable"}:
+                return repaired, stale_removed
+            old_generation, _new_generation = prepare_ready_transition(
+                cfg, task, "ready_index_rebuild"
+            )
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task)
+            retire_previous_ready_generation(cfg, old_generation, task)
+            return 1, int(old_generation > 0)
+        if reference is not None and delete_ready_marker(
+            cfg, task.task_id, task.ready_generation
+        ):
+            stale_removed += 1
+        return repaired, stale_removed
+
+
+def _load_build_page(cfg: object, build_id: str, page: int) -> list[str]:
+    record = read_json(_build_page_path(cfg, build_id, page))["ready_build_page"]
+    task_ids = record.get("task_ids")
+    if (
+        record.get("schema_version") != READY_PROTOCOL_VERSION
+        or record.get("build_id") != build_id
+        or record.get("page") != page
+        or not isinstance(task_ids, list)
+        or len(task_ids) > READY_BUILD_PAGE_SIZE
+        or not all(isinstance(task_id, str) for task_id in task_ids)
+    ):
+        raise ValueError("ready build watermark page is invalid.")
+    return task_ids
+
+
+def _advance_build_cursor(
+    cursor: dict[str, Any], *, item_count: int, page_count: int,
+) -> bool:
+    cursor["offset"] += 1
+    if cursor["offset"] < item_count:
+        return False
+    cursor["page"] += 1
+    cursor["offset"] = 0
+    return cursor["page"] >= page_count
+
+
+def _active_incompatible_writers(cfg: object) -> list[str]:
+    """Return recently active machine agents that did not advertise ready-v1."""
+    incompatible: list[str] = []
+    machines = shared_paths(cfg.shared_root)["machines"]
+    try:
+        entries = os.scandir(machines)
+    except FileNotFoundError:
+        return incompatible
+    now = datetime.now(timezone.utc)
+    with entries:
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            path = Path(entry.path) / "state" / "agent.json"
+            try:
+                agent = read_json(path)["agent"]
+                heartbeat = datetime.fromisoformat(
+                    agent["heartbeat_at"].replace("Z", "+00:00")
+                )
+                interval = float(agent["heartbeat_interval_seconds"])
+            except (FileNotFoundError, KeyError, TypeError, ValueError):
+                continue
+            if agent.get("observed_state") not in {"active", "idle"}:
+                continue
+            if (now - heartbeat).total_seconds() > max(30.0, interval * 3.0):
+                continue
+            if agent.get("writer_capability") != READY_WRITER_CAPABILITY:
+                incompatible.append(entry.name)
+    return sorted(incompatible)
+
+
+def _audit_task_ready_projection(cfg: object, task_id: str) -> str | None:
+    try:
+        task = TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id)))
+    except FileNotFoundError:
+        return None
+    except (KeyError, TypeError, ValueError):
+        return f"task_invalid:{task_id}"
+    reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+    if _task_should_have_ready_marker(task):
+        if reference is None:
+            return f"marker_missing:{task_id}"
+        if not _is_ready_reference_indexed(cfg, reference):
+            return f"marker_unindexed:{task_id}"
+        result = classify_ready_marker(cfg, reference)
+        if result.classification not in {"claimable", "temporarily_unavailable"}:
+            return f"marker_{result.classification}:{task_id}:{result.reason}"
+    elif reference is not None:
+        return f"marker_stale:{task_id}"
+    return None
+
+
+def ready_task_projection_issue(cfg: object, task_id: str) -> str | None:
+    """Return the ready projection defect for one authoritative Task, if any."""
+    return _audit_task_ready_projection(cfg, task_id)
+
+
+def advance_ready_index_build(
+    cfg: object, *, max_tasks: int = READY_BUILD_PAGE_SIZE,
+) -> dict[str, Any]:
+    """Advance at most ``max_tasks`` durable rebuild or audit records."""
+    if type(max_tasks) is not int or not 1 <= max_tasks <= READY_BUILD_PAGE_SIZE:
+        raise ValueError(
+            f"max_tasks must be between 1 and {READY_BUILD_PAGE_SIZE}."
+        )
+    begin_ready_index_build(cfg)
+    with exclusive(_state_lock_path(cfg)):
+        path = ready_state_path(cfg.shared_root)
+        value, record = _read_ready_state_record(cfg)
+        if record["state"] != "building":
+            return record
+        build = record.get("build")
+        if not isinstance(build, dict):
+            _degrade_ready_record(record, "build_state_missing")
+            _commit_ready_state(path, value, record)
+            return record
+        watermark = build.get("watermark", {})
+        page_count = watermark.get("page_count")
+        if type(page_count) is not int or page_count < 0 or not watermark.get("is_complete"):
+            _degrade_ready_record(record, "build_watermark_invalid")
+            _commit_ready_state(path, value, record)
+            return record
+        phase = build.get("phase")
+        cursor_name = "cursor" if phase == "backfill" else "audit_cursor"
+        if phase not in {"backfill", "audit"}:
+            _degrade_ready_record(record, f"build_phase_invalid:{phase}")
+            _commit_ready_state(path, value, record)
+            return record
+        cursor = build.get(cursor_name)
+        if not isinstance(cursor, dict):
+            _degrade_ready_record(record, f"build_cursor_invalid:{cursor_name}")
+            _commit_ready_state(path, value, record)
+            return record
+        processed_now = 0
+        try:
+            while processed_now < max_tasks and cursor["page"] < page_count:
+                task_ids = _load_build_page(cfg, build["build_id"], cursor["page"])
+                if cursor["offset"] >= len(task_ids):
+                    cursor["page"] += 1
+                    cursor["offset"] = 0
+                    continue
+                task_id = task_ids[cursor["offset"]]
+                if phase == "backfill":
+                    repaired, stale_removed = _repair_task_ready_projection(cfg, task_id)
+                    build["repaired"] += repaired
+                    build["stale_removed"] += stale_removed
+                    build["processed"] += 1
+                else:
+                    issue = _audit_task_ready_projection(cfg, task_id)
+                    if issue is not None:
+                        _degrade_ready_record(record, issue)
+                        break
+                processed_now += 1
+                _advance_build_cursor(
+                    cursor, item_count=len(task_ids), page_count=page_count
+                )
+            if record["state"] == "building" and cursor["page"] >= page_count:
+                if phase == "backfill":
+                    build["phase"] = "audit"
+                else:
+                    assert_ready_writer_compatible(cfg)
+                    incompatible = _active_incompatible_writers(cfg)
+                    if incompatible:
+                        _degrade_ready_record(
+                            record,
+                            "incompatible_active_writers:" + ",".join(incompatible),
+                        )
+                    else:
+                        record["state"] = "active"
+                        record["degraded_reasons"] = []
+                        build["phase"] = "completed"
+                        build["completed_at"] = utc_now()
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            _degrade_ready_record(record, f"build_failed:{type(exc).__name__}:{exc}")
+        _commit_ready_state(path, value, record)
+        return record
+
+
+def repair_ready_index(
+    cfg: object, *, max_tasks: int = READY_BUILD_PAGE_SIZE,
+) -> dict[str, Any]:
+    """Start degraded recovery and advance one bounded repair slice."""
+    begin_ready_index_build(cfg, is_repair=True)
+    return advance_ready_index_build(cfg, max_tasks=max_tasks)
