@@ -8,8 +8,19 @@ from .layout import (initialize_shared_root, load_machine_record, project_id,
                      save_machine_record)
 from .policy import normalize_agent_mode, resolve_machine_policy
 from .runtime.locks import machine_lock
+from .runtime.store import read_json
 
 MACHINE_AGENT_RUNTIME = "machine"
+
+
+def has_legacy_agent_metadata(cfg: RootConfig) -> bool:
+    """Return whether any machine record in this project predates the global agent."""
+    machines_root = cfg.shared_root / "machines"
+    for record_path in machines_root.glob("*/machine.json"):
+        record = read_json(record_path)
+        if record.get("machine", {}).get("agent_runtime") != MACHINE_AGENT_RUNTIME:
+            return True
+    return False
 
 
 def save_machine_config(cfg: RootConfig, *, agent_mode: str | None) -> None:
@@ -47,6 +58,8 @@ def init_shared_root(shared_root: Path, machine_name: str, *, agent_mode: str = 
         Path.home() / ".qqtools" / "qexp-runtime" / project_id(shared_root) / machine_name
     )
     cfg = RootConfig(shared_root, shared_root.parent, machine_name, runtime_root)
+    if has_legacy_agent_metadata(cfg):
+        raise ValueError("legacy project metadata requires 'qexp agent migrate-project'.")
     initialize_shared_root(cfg)
     save_machine_config(cfg, agent_mode=agent_mode)
     return cfg

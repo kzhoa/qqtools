@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 import subprocess
-from pathlib import Path
 
 from qexp_e2e import (
     TASK_TERMINAL_TIMEOUT_SECONDS,
     ensure_site_packages_import,
     jrun,
+    is_machine_agent_running,
     make_env,
     make_layout,
     run,
@@ -29,8 +28,6 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
         "--runtime-root",
         str(runtime_root),
     ]
-    pid_path = Path(runtime_root) / "agent" / "agent.pid"
-
     try:
         run([*common, "init", "--agent-mode", "daemon"], env=env)
         started = subprocess.run(
@@ -40,7 +37,11 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
             capture_output=True,
         )
         assert started.returncode == 0, started.stderr
-        wait_for(pid_path.exists, timeout=10, label="background agent pid file")
+        wait_for(
+            lambda: is_machine_agent_running(common, env=env),
+            timeout=10,
+            label="background machine agent status",
+        )
 
         submit = run(
             [
@@ -64,15 +65,6 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
         wait_for(is_done, timeout=TASK_TERMINAL_TIMEOUT_SECONDS, label="failing task terminal state")
         task = jrun([*common, "task", "show", task_id], env=env)
         logs = run([*common, "logs", task_id], env=env).stdout
-        process_dir = Path(runtime_root) / "processes"
-
-        def has_exited_process() -> bool:
-            return any(
-                json.loads(path.read_text(encoding="utf-8"))["process"].get("observed_state") == "exited"
-                for path in process_dir.glob("*.json")
-            )
-
-        wait_for(has_exited_process, timeout=10, label="agent process-exit reconciliation")
         clean = jrun([*common, "clean", "--task-id", task_id], env=env)
         verify = jrun([*common, "doctor", "verify"], env=env)
 
@@ -83,4 +75,4 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
         assert clean["removed"]
         assert verify["healthy"] is True
     finally:
-        stop_agent(common, env=env, pid_path=pid_path)
+        stop_agent(common, env=env)

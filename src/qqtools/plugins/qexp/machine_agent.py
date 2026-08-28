@@ -6,7 +6,7 @@ import signal
 import threading
 import time
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -287,11 +287,19 @@ def get_machine_agent_status(runtime: MachineRuntime | str | Path | None = None,
     }
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectRegistration:
+    """Result of an idempotent current-generation project registration."""
+
+    binding: ProjectBinding
+    is_added: bool
+
+
 def register_project(
     runtime: MachineRuntime | str | Path | None,
     shared_root: str | Path,
     machine_name: str,
-) -> ProjectBinding:
+) -> ProjectRegistration:
     """Register a current-generation project with the machine agent.
 
     Args:
@@ -300,7 +308,7 @@ def register_project(
         machine_name: Project-local machine name.
 
     Returns:
-        The persisted enabled project binding.
+        The persisted binding and whether this call created it.
 
     Raises:
         ValueError: If the project still requires explicit legacy migration.
@@ -309,7 +317,8 @@ def register_project(
     cfg = load_root_config(shared_root, machine_name, require_initialized=True)
     if is_legacy_agent_project(cfg):
         raise ValueError("legacy project metadata requires 'qexp agent migrate-project'.")
-    return machine_runtime.add_binding(shared_root, machine_name)
+    binding, is_added = machine_runtime.ensure_binding(shared_root, machine_name)
+    return ProjectRegistration(binding, is_added)
 
 
 def _legacy_pid_matches(cfg: RootConfig, pid: int) -> bool:

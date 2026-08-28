@@ -7,6 +7,7 @@ from qqtools.plugins.qexp import AGENT_MODE_DAEMON, init_shared_root, submit
 from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.agent import get_agent_status
 from qqtools.plugins.qexp.layout import load_root_config, runtime_pid_path
+from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import (authorize_launch, claim_task, expire_claim,
                                              fail_attempt)
@@ -121,6 +122,75 @@ def test_init_succeeds_when_context_save_fails(tmp_path: Path, monkeypatch, caps
     assert "initialized successfully, but failed to save CLI context" in captured.err
     cfg = load_root_config(root, "gpu-1", runtime_root, require_initialized=True)
     assert cfg.shared_root == root.resolve()
+
+
+def test_init_registers_project_with_machine_agent(tmp_path: Path, capsys):
+    root = tmp_path / ".qexp"
+    runtime_root = tmp_path / "rt"
+    machine_runtime_root = tmp_path / "machine-runtime"
+    args = [
+        "--shared-root", str(root), "--machine", "gpu-1", "--runtime-root", str(runtime_root),
+        "--machine-runtime-root", str(machine_runtime_root), "init",
+    ]
+
+    assert main(args) == 0
+    assert main(args) == 0
+
+    cfg = load_root_config(root, "gpu-1", runtime_root, require_initialized=True)
+    _, bindings = MachineRuntime(machine_runtime_root).load_registry()
+    assert len(bindings) == 1
+    assert bindings[0].shared_root == cfg.shared_root
+    assert bindings[0].machine_name == "gpu-1"
+
+
+def test_init_rejects_project_legacy_metadata_without_overwriting_it(tmp_path: Path, capsys):
+    root = tmp_path / ".qexp"
+    runtime_root = tmp_path / "legacy-runtime"
+    cfg = init_shared_root(root, "gpu-1", runtime_root=runtime_root)
+    record_path = cfg.shared_root / "machines" / cfg.machine_name / "machine.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["machine"].pop("agent_runtime")
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert main([
+        "--shared-root", str(root), "--machine", "gpu-2", "--runtime-root", str(runtime_root), "init",
+    ]) == 2
+
+    assert "qexp agent migrate-project" in capsys.readouterr().err
+    assert json.loads(record_path.read_text(encoding="utf-8")) == record
+    assert not (cfg.shared_root / "machines" / "gpu-2").exists()
+
+
+def test_init_allows_project_local_machine_names_in_one_runtime(tmp_path: Path):
+    machine_runtime_root = tmp_path / "machine-runtime"
+    for project, machine_name in (("first", "a"), ("second", "b")):
+        assert main([
+            "--shared-root", str(tmp_path / project / ".qexp"), "--machine", machine_name,
+            "--machine-runtime-root", str(machine_runtime_root), "init",
+        ]) == 0
+
+    _, bindings = MachineRuntime(machine_runtime_root).load_registry()
+    assert {(binding.shared_root.parent.name, binding.machine_name) for binding in bindings} == {
+        ("first", "a"), ("second", "b"),
+    }
+
+
+def test_init_reports_recoverable_registration_failure(tmp_path: Path, monkeypatch, capsys):
+    saved_contexts = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.register_project",
+        lambda *_args: (_ for _ in ()).throw(OSError("machine runtime unavailable")),
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli._try_save_context", lambda *args: saved_contexts.append(args),
+    )
+
+    assert main([
+        "--shared-root", str(tmp_path / ".qexp"), "--machine", "gpu-1", "init",
+    ]) == 2
+
+    assert saved_contexts == []
+    assert "initialized but was not registered" in capsys.readouterr().err
 
 
 def test_use_still_fails_when_context_save_fails(tmp_path: Path, monkeypatch):
@@ -368,6 +438,8 @@ def test_agent_add_project_is_explicit_and_machine_agent_prefix_is_not_public(tm
 
     assert main([*args, "agent", "add-project", "--format=json"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "project_added"
+    assert main([*args, "agent", "add-project", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "project_already_registered"
     with pytest.raises(SystemExit):
         main(["machine-agent", "status"])
 

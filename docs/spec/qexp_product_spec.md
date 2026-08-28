@@ -1162,9 +1162,9 @@ Shared mode requires an explicit machine name:
 qexp init --shared-root /path/to/project/.qexp --machine gpu2a
 ```
 
-The machine name identifies the qexp GPU resource pool; it does not identify a physical server.
-Multiple Machines on one physical server must use distinct machine names and independent local
-runtime roots.
+The machine name identifies a project-local logical worker; it does not identify a physical server.
+Projects on one physical server may use different machine names while the one global agent retains
+one shared GPU resource pool.
 
 ### 15.3 On-Demand Agent by Default
 
@@ -1205,7 +1205,7 @@ directly operate remote PIDs.
 
 ### 15.5 Machine-Agent Operation and Migration
 
-Global-agent deployment is explicit and local to the qexp Machine:
+Global-agent operations are local to the qexp Machine:
 
 ```bash
 qexp agent add-project
@@ -1216,9 +1216,11 @@ qexp agent start
 qexp agent status
 ```
 
-Project registration is explicit and may occur while the global agent is running. A new Project
-uses `qexp agent add-project`; ordinary `qexp agent start` never registers the current directory.
-An existing Project without the global-agent machine-record marker must use the one-time
+`qexp init` initializes and registers every new Project before it returns successfully. Ordinary
+`qexp agent start` never initializes or registers the current directory. `qexp agent add-project`
+is an idempotent operations command for restoring a removed or lost current-generation binding and
+may run while the global agent is active. An existing Project without the global-agent machine-record
+marker must use the one-time
 `qexp agent migrate-project` command. It stops only a verified old agent process, imports local
 execution evidence, registers the Project, and then starts or wakes the global agent without
 terminating already running training processes. Late immutable runner evidence is drained from

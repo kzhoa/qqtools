@@ -294,6 +294,13 @@ def main(argv: list[str] | None = None) -> int:
                 agent_mode=args.agent_mode,
                 runtime_root=Path(args.runtime_root) if args.runtime_root else None,
             )
+            try:
+                register_project(MachineRuntime(args.machine_runtime_root), cfg.shared_root, cfg.machine_name)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    "qexp project initialized but was not registered with the machine agent; "
+                    f"resolve the registration error and run 'qexp agent add-project': {exc}"
+                ) from exc
             _try_save_context(str(cfg.shared_root), cfg.machine_name, str(cfg.runtime_root))
             print(cfg.shared_root)
             return 0
@@ -626,8 +633,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "agent":
             runtime = MachineRuntime(args.machine_runtime_root)
             if args.agent_action == "add-project":
-                binding = register_project(runtime, cfg.shared_root, cfg.machine_name)
-                _emit("agent", {"action": "project_added", **binding.to_dict()}, args.format)
+                registration = register_project(runtime, cfg.shared_root, cfg.machine_name)
+                action = "project_added" if registration.is_added else "project_already_registered"
+                _emit("agent", {"action": action, **registration.binding.to_dict()}, args.format)
                 return 0
             if args.agent_action == "migrate-project":
                 binding = migrate_project(runtime, cfg)

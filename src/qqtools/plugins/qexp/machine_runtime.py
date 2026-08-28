@@ -210,7 +210,10 @@ class MachineRuntime:
             },
         )
 
-    def add_binding(self, shared_root: str | Path, machine_name: str, *, enabled: bool = True) -> ProjectBinding:
+    def ensure_binding(
+            self, shared_root: str | Path, machine_name: str, *, enabled: bool = True
+    ) -> tuple[ProjectBinding, bool]:
+        """Persist one binding, returning whether this call created it."""
         cfg = load_root_config(shared_root, machine_name, require_initialized=True)
         identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
         identity = read_json(identity_path).get("project", {}) if identity_path.exists() else {}
@@ -223,11 +226,20 @@ class MachineRuntime:
         binding = ProjectBinding(stable_id, cfg.shared_root, machine_name, enabled)
         with self.registry_guard():
             revision, bindings = self.load_registry()
+            if binding in bindings:
+                return binding, False
             if any(item.project_id == binding.project_id for item in bindings):
                 raise ValueError(f"project {binding.project_id!r} is already registered.")
             if any(item.shared_root == binding.shared_root for item in bindings):
                 raise ValueError(f"project root {binding.shared_root} is already registered.")
             self._save_registry(revision + 1, [*bindings, binding])
+        return binding, True
+
+    def add_binding(self, shared_root: str | Path, machine_name: str, *, enabled: bool = True) -> ProjectBinding:
+        """Add one new binding, rejecting an already registered project."""
+        binding, is_added = self.ensure_binding(shared_root, machine_name, enabled=enabled)
+        if not is_added:
+            raise ValueError(f"project {binding.project_id!r} is already registered.")
         return binding
 
     def _legacy_evidence_roots(
