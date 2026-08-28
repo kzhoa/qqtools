@@ -15,6 +15,13 @@ from ..runtime.records import (AttemptRecord, SCHEMA_VERSION, TaskRecord, new_gr
                                new_worker_member, utc_now, validate_group_name)
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.tasks import load_task, save_task
+from ..runtime.ready import retire_current_ready_generation
+from ..runtime.active_operations import (
+    active_operation_path,
+    archive_operation,
+    iter_active_operation_paths,
+    write_active_operation,
+)
 from .task import has_cleanup_operation, is_cleanup_blocked, retry
 
 
@@ -42,7 +49,9 @@ def group_control(
         if action == "cancel":
             operation_id = new_id()
             high_watermark = group["next_membership_sequence"] - 1
-            operation_path = shared_paths(cfg.shared_root)["group_control"] / f"{operation_id}.json"
+            operation_path = active_operation_path(
+                cfg, "group_control", operation_id
+            )
             operation = {"meta": {"schema_version": SCHEMA_VERSION, "revision": 1, "created_at": utc_now(),
                 "updated_at": utc_now(), "updated_by": {"actor_type": "cli", "machine_name": cfg.machine_name,
                 "process_id": str(os.getpid())}}, "group_control": {"operation_id": operation_id,
@@ -53,7 +62,7 @@ def group_control(
                 "prelaunch_cancelled": 0, "running_allowed": 0, "termination_pending": 0,
                 "termination_acknowledged": 0, "blocked": 0}, "pending_machine_acknowledgements": {},
                 "created_at": utc_now(), "updated_at": utc_now(), "completed_at": None, "blocked_reason": None}}
-            atomic_replace(operation_path, operation)
+            write_active_operation(cfg, "group_control", operation_id, operation)
             group["cancellation_barriers"].append({"operation_id": operation_id,
                 "membership_high_watermark": high_watermark, "terminate_running": terminate_running,
                 "created_at": utc_now()})
@@ -63,7 +72,7 @@ def group_control(
             atomic_replace(path, data)
             operation["group_control"]["state"] = "converging"
             operation["group_control"]["updated_at"] = utc_now()
-            atomic_replace(operation_path, operation)
+            write_active_operation(cfg, "group_control", operation_id, operation)
             for task_file in iter_json(shared_paths(cfg.shared_root)["tasks"]):
                 task = TaskRecord.from_dict(read_json(task_file))
                 if task.group_name != name or (task.group_membership_sequence or 0) > high_watermark:
@@ -113,6 +122,8 @@ def group_control(
                         task.meta["revision"] += 1
                         task.meta["updated_at"] = utc_now()
                         save_task(cfg, task)
+                    if task.state["projection"] == "cancelled":
+                        retire_current_ready_generation(cfg, task)
             progress = operation["group_control"]["progress"]
             if not terminate_running or progress["termination_pending"] == 0:
                 operation["group_control"].update({"state": "completed", "completed_at": utc_now()})
@@ -120,6 +131,10 @@ def group_control(
                 operation["group_control"]["state"] = "waiting_ack"
             operation["group_control"]["updated_at"] = utc_now()
             atomic_replace(operation_path, operation)
+            if operation["group_control"]["state"] == "completed":
+                operation_path = archive_operation(
+                    cfg, "group_control", operation_id, operation
+                )
             data["cancellation_operation"] = operation["group_control"]
         elif action == "seal":
             group["admission_state"] = "sealed"
@@ -147,10 +162,13 @@ def group_control(
 
 
 def reconcile_group_cancel_operations(
-        cfg: RootConfig, group_name: str | None = None) -> list[dict[str, Any]]:
+        cfg: RootConfig, group_name: str | None = None, *,
+        include_legacy: bool = True) -> list[dict[str, Any]]:
     """Rebuild durable Group cancellation operation status from current Task truth."""
     reconciled: list[dict[str, Any]] = []
-    for operation_path in iter_json(shared_paths(cfg.shared_root)["group_control"]):
+    for operation_path in iter_active_operation_paths(
+        cfg, "group_control", include_legacy=include_legacy
+    ):
         operation = read_json(operation_path)
         control = operation.get("group_control", {})
         if control.get("operation_type") != "cancel":
@@ -234,6 +252,10 @@ def reconcile_group_cancel_operations(
             operation["meta"]["revision"] += 1
             operation["meta"]["updated_at"] = utc_now()
             atomic_replace(operation_path, operation)
+            if control["state"] == "completed":
+                archive_operation(
+                    cfg, "group_control", control["operation_id"], operation
+                )
             snapshot = group_data.get("cancellation_operation") or {}
             if snapshot.get("operation_id") == control["operation_id"]:
                 group_data["cancellation_operation"] = control
@@ -286,14 +308,16 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
             data["meta"]["revision"] += 1
             data["meta"]["updated_at"] = utc_now()
             atomic_replace(path, data)
-            operation_path = shared_paths(cfg.shared_root)["group_control"] / f"{operation_id}.json"
+            operation_path = active_operation_path(
+                cfg, "group_control", operation_id
+            )
             operation = {"meta": {"schema_version": SCHEMA_VERSION, "revision": 1, "created_at": utc_now(),
                 "updated_at": utc_now(), "updated_by": {"actor_type": "cli", "machine_name": cfg.machine_name,
                 "process_id": str(os.getpid())}}, "group_control": {"operation_id": operation_id,
                 "operation_type": "worker_remove", "group_name": group_name, "machine_name": machine,
                 "state": "converging", "terminate_running": terminate_running, "blockers": [],
                 "created_at": utc_now(), "updated_at": utc_now(), "completed_at": None}}
-            atomic_replace(operation_path, operation)
+            write_active_operation(cfg, "group_control", operation_id, operation)
             blockers: list[str] = []
             for task_file in iter_json(shared_paths(cfg.shared_root)["tasks"]):
                 task = TaskRecord.from_dict(read_json(task_file))
@@ -325,6 +349,10 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                 operation["group_control"].update({"state": "completed", "completed_at": utc_now()})
             operation["group_control"]["updated_at"] = utc_now()
             atomic_replace(operation_path, operation)
+            if operation["group_control"]["state"] == "completed":
+                archive_operation(
+                    cfg, "group_control", operation_id, operation
+                )
             data["worker_control"] = operation["group_control"]
             data["meta"]["revision"] += 1
             data["meta"]["updated_at"] = utc_now()

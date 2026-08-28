@@ -15,6 +15,7 @@ from .runtime.locks import exclusive
 from .runtime.paths import local_paths, machine_project_paths, machine_runtime_paths, shared_paths
 from .runtime.records import utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
+from .runtime.work_budget import AdaptiveBatchSizer
 
 MACHINE_RUNTIME_ENV = "QEXP_MACHINE_RUNTIME_ROOT"
 REGISTRY_VERSION = 1
@@ -132,6 +133,8 @@ class MachineRuntime:
     def __init__(self, root: str | Path | None = None) -> None:
         self.root = resolve_machine_runtime_root(root)
         self.paths = machine_runtime_paths(self.root)
+        self.last_diagnostic_publish_ns: int | None = None
+        self.ready_batch_sizers: dict[str, AdaptiveBatchSizer] = {}
 
     def ensure_layout(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)

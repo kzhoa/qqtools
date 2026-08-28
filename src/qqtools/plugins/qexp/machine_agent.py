@@ -18,13 +18,27 @@ from .executor import Executor
 from .machine_runtime import MachineRuntime, ProjectBinding
 from .machine_config import is_legacy_agent_project, save_machine_config
 from .layout import load_root_config, machine_state_path, runtime_pid_path
-from .project_maintenance import maintain_project
+from .project_maintenance import maintain_project, reconcile_reservation
 from .runtime.paths import local_paths
 from .runtime.records import TaskSpec, utc_now
-from .runtime.reservations import active_reservations, release_expired_provisionals, reserved_gpu_ids
+from .runtime.reservations import (
+    ReservationIdentity,
+    ReservationSnapshot,
+    active_reservations,
+    reconcile_snapshot,
+)
 from .runtime.locks import exclusive
 from .runtime.store import atomic_replace, iter_json, read_json
-from .scheduler import run_dispatch_cycle
+from .runtime.work_budget import (
+    AdaptiveBatchSizer,
+    DIAGNOSTIC_PUBLISH_INTERVAL_SECONDS,
+    RuntimeDiagnostics,
+    SliceBudget,
+    activate_diagnostics,
+    diagnostic_increment,
+    diagnostic_span,
+)
+from .scheduler import fail_attempt, resume_starting_attempt, run_dispatch_cycle
 
 
 def _pid_alive(pid: int) -> bool:
@@ -162,17 +176,102 @@ def _publish_project_snapshots(
             continue
 
 
+def _reconcile_machine_reservations(
+    runtime: MachineRuntime,
+    readable: dict[str, RootConfig],
+) -> ReservationSnapshot:
+    """Reconcile a machine-wide snapshot without holding its lock during shared I/O."""
+    with diagnostic_span("recovery.reservation_reconciliation"):
+        snapshot = reconcile_snapshot(runtime.root)
+        diagnostic_increment("recovery.reservations.snapshotted", len(snapshot.active))
+        for reservation in snapshot.active:
+            project_id = reservation.get("project_id")
+            cfg = readable.get(project_id) if isinstance(project_id, str) else None
+            if cfg is None:
+                diagnostic_increment("recovery.reservations.isolated")
+                continue
+            try:
+                action = reconcile_reservation(
+                    cfg,
+                    reservation,
+                    reservation_runtime_root=runtime.root,
+                )
+            except (KeyError, OSError, RuntimeError, ValueError):
+                diagnostic_increment("recovery.reservations.errors")
+                diagnostic_increment("recovery.reservations.isolated")
+                continue
+            diagnostic_increment(f"recovery.reservations.{action}")
+        trusted = reconcile_snapshot(runtime.root)
+        diagnostic_increment("recovery.reservations.trusted", len(trusted.active))
+        return trusted
+
+
+def _recover_starting_reservations(
+    runtime: MachineRuntime,
+    readable: dict[str, RootConfig],
+    reservations: tuple[dict[str, Any], ...],
+    executor: Executor,
+) -> dict[str, list[str]]:
+    """Recover starting Attempts from exact active-reservation identities."""
+    launched: dict[str, list[str]] = {}
+    with diagnostic_span("recovery.starting_attempts"):
+        for reservation in reservations:
+            try:
+                identity = ReservationIdentity.from_record(reservation)
+            except ValueError:
+                diagnostic_increment("recovery.starting.invalid_reservation")
+                continue
+            cfg = readable.get(identity.project_id or "")
+            if cfg is None or identity.attempt_id is None or identity.fencing_token is None:
+                diagnostic_increment("recovery.starting.ineligible_reservation")
+                continue
+            diagnostic_increment("recovery.starting.checked")
+            try:
+                attempt = resume_starting_attempt(
+                    cfg,
+                    identity.task_id,
+                    reservation_runtime_root=runtime.root,
+                    expected_reservation=identity,
+                )
+            except (KeyError, OSError, RuntimeError, ValueError):
+                diagnostic_increment("recovery.starting.errors")
+                continue
+            if attempt is None:
+                continue
+            try:
+                executor.launch_attempt(cfg, identity.task_id, attempt)
+                launched.setdefault(identity.project_id or "", []).append(identity.task_id)
+                diagnostic_increment("recovery.starting.launched")
+            except Exception:
+                diagnostic_increment("recovery.starting.launch_failed")
+                try:
+                    fail_attempt(
+                        cfg,
+                        identity.task_id,
+                        attempt.attempt_id,
+                        attempt.current_fencing_token,
+                        "executor_launch_failed",
+                        reservation_runtime_root=runtime.root,
+                    )
+                except (KeyError, OSError, RuntimeError, ValueError):
+                    diagnostic_increment("recovery.starting.compensation_errors")
+    return launched
+
+
 class _MachineControlPlane:
     """Run deadline-sensitive heartbeats and authority renewal outside dispatch scans."""
 
     def __init__(
             self, runtime: MachineRuntime, *, instance_id: str, loop_interval: float,
-            started_at: str, available_gpus: list[int] | None) -> None:
+            started_at: str, available_gpus: list[int] | None,
+            scheduler_wakeup: threading.Event | None = None) -> None:
         self._runtime = runtime
         self._instance_id = instance_id
         self._loop_interval = loop_interval
         self._started_at = started_at
         self._visible_gpus = list(available_gpus) if available_gpus is not None else None
+        self._scheduler_wakeup = scheduler_wakeup
+        self._registry_revision: int | None = None
         self._stop_event = threading.Event()
         self._supervisors: dict[str, AuthoritySupervisor] = {}
         self._authority_thread = threading.Thread(
@@ -201,7 +300,14 @@ class _MachineControlPlane:
                 thread.join()
 
     def _supervised_bindings(self) -> list[ProjectBinding]:
-        _, registered = self._runtime.load_registry()
+        revision, registered = self._runtime.load_registry()
+        if (
+            self._registry_revision is not None
+            and revision != self._registry_revision
+            and self._scheduler_wakeup is not None
+        ):
+            self._scheduler_wakeup.set()
+        self._registry_revision = revision
         return [
             binding
             for binding in registered
@@ -210,6 +316,11 @@ class _MachineControlPlane:
 
     def _run_authority_cycle(self) -> float:
         authority_interval = self._loop_interval
+        reserved_before = {
+            gpu_id
+            for item in active_reservations(self._runtime.root)
+            for gpu_id in item.get("gpu_ids", [])
+        }
         try:
             bindings = self._supervised_bindings()
         except (OSError, RuntimeError, ValueError):
@@ -229,6 +340,16 @@ class _MachineControlPlane:
                 authority_interval = min(authority_interval, supervisor.renewal_interval_seconds)
             except (OSError, RuntimeError, ValueError):
                 continue
+        reserved_after = {
+            gpu_id
+            for item in active_reservations(self._runtime.root)
+            for gpu_id in item.get("gpu_ids", [])
+        }
+        if (
+            reserved_after < reserved_before
+            and self._scheduler_wakeup is not None
+        ):
+            self._scheduler_wakeup.set()
         return authority_interval
 
     def _refresh_visible_gpus(self) -> None:
@@ -304,7 +425,56 @@ def dispatch_machine_cycle_locked(
     supervise: bool = True,
     publish_snapshots: bool = True,
 ) -> list[dict[str, Any]]:
-    """Supervise readable bindings and make at most one fair new claim."""
+    """Supervise bindings and fill capacity in fair one-claim-per-project rounds."""
+    diagnostics = RuntimeDiagnostics()
+    with activate_diagnostics(diagnostics), diagnostic_span("dispatch_machine_cycle"):
+        results = _dispatch_machine_cycle_locked(
+            runtime,
+            available_gpus=available_gpus,
+            executor=executor,
+            instance_id=instance_id,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            started_at=started_at,
+            supervisors=supervisors,
+            supervise=supervise,
+            publish_snapshots=publish_snapshots,
+        )
+    now_ns = time.monotonic_ns()
+    publish_interval_ns = DIAGNOSTIC_PUBLISH_INTERVAL_SECONDS * 1_000_000_000
+    should_publish_diagnostic = (
+        runtime.last_diagnostic_publish_ns is None
+        or now_ns - runtime.last_diagnostic_publish_ns >= publish_interval_ns
+    )
+    if not should_publish_diagnostic:
+        return results
+    try:
+        atomic_replace(
+            runtime.paths["diagnostics"] / "scheduler-cycle.json",
+            {
+                "scheduler_diagnostic": {
+                    "recorded_at": utc_now(),
+                    **diagnostics.snapshot(),
+                }
+            },
+        )
+        runtime.last_diagnostic_publish_ns = now_ns
+    except OSError:
+        pass
+    return results
+
+
+def _dispatch_machine_cycle_locked(
+    runtime: MachineRuntime,
+    *,
+    available_gpus: list[int] | None = None,
+    executor: Executor | None = None,
+    instance_id: str = "machine-agent",
+    heartbeat_interval_seconds: float = 5.0,
+    started_at: str | None = None,
+    supervisors: dict[str, AuthoritySupervisor] | None = None,
+    supervise: bool = True,
+    publish_snapshots: bool = True,
+) -> list[dict[str, Any]]:
     executor = executor or Executor()
     _, registered = runtime.load_registry()
     ordered_enabled = _ordered_bindings(runtime, registered)
@@ -319,20 +489,36 @@ def dispatch_machine_cycle_locked(
             del supervisors[project_id]
     if not supervised:
         return []
-    release_expired_provisionals(runtime.root)
     readable: dict[str, RootConfig] = {}
     dispatchable: dict[str, RootConfig] = {}
     results: list[dict[str, Any]] = []
     for binding in supervised:
         try:
             cfg = _binding_config(runtime, binding)
-            readable[binding.project_id] = cfg
             runtime.drain_legacy_runner_evidence(binding)
-            maintain_project(
-                cfg,
-                reservation_runtime_root=runtime.root,
-                project_id=binding.project_id,
+            readable[binding.project_id] = cfg
+        except (OSError, RuntimeError, ValueError) as exc:
+            results.append(
+                {
+                    "project_id": binding.project_id,
+                    "launched": [],
+                    "status": "error",
+                    "error": str(exc),
+                }
             )
+    snapshot = _reconcile_machine_reservations(runtime, readable)
+    for binding in supervised:
+        cfg = readable.get(binding.project_id)
+        if cfg is None:
+            continue
+        try:
+            with diagnostic_span("maintenance.project"):
+                maintain_project(
+                    cfg,
+                    reservation_runtime_root=runtime.root,
+                    project_id=binding.project_id,
+                    should_reconcile_reservations=False,
+                )
             if supervise:
                 supervisor = None if supervisors is None else supervisors.get(binding.project_id)
                 if supervisor is None:
@@ -342,38 +528,122 @@ def dispatch_machine_cycle_locked(
                 supervisor.tick()
             dispatchable[binding.project_id] = cfg
         except (OSError, RuntimeError, ValueError) as exc:
-            results.append({"project_id": binding.project_id, "launched": [], "status": "error", "error": str(exc)})
-    visible = list(available_gpus) if available_gpus is not None else _visible_gpus(next(iter(readable.values()))) if readable else []
-    successful_binding: ProjectBinding | None = None
-    for binding in ordered_enabled:
-        cfg = dispatchable.get(binding.project_id)
-        if cfg is None:
-            continue
-        claimed = False
-        claimed_task_ids: list[str] = []
-        try:
-            free = [gpu_id for gpu_id in visible if gpu_id not in reserved_gpu_ids(runtime.root)]
-            launched = run_dispatch_cycle(
-                cfg, available_gpus=free, executor=executor, reservation_runtime_root=runtime.root,
-                project_id=binding.project_id, preflight=lambda spec: _working_directory_reason(spec) is None,
-                preflight_rejected=lambda task: _record_bad_task_spec(runtime, binding, task.task_id, task.spec),
-                claim_guard=lambda: runtime.enabled_claim_guard(binding), max_new_claims=1,
-                on_claim=claimed_task_ids.append,
+            results.append(
+                {
+                    "project_id": binding.project_id,
+                    "launched": [],
+                    "status": "error",
+                    "error": str(exc),
+                }
             )
-            claimed = bool(claimed_task_ids)
-            results.append({"project_id": binding.project_id, "launched": launched, "status": "dispatched"})
-        except (OSError, RuntimeError, ValueError) as exc:
-            results.append({"project_id": binding.project_id, "launched": [], "status": "error", "error": str(exc)})
-        if claimed:
-            successful_binding = binding
+    executor = executor or Executor()
+    snapshot = reconcile_snapshot(runtime.root)
+    recovered = _recover_starting_reservations(
+        runtime,
+        dispatchable,
+        snapshot.active,
+        executor,
+    )
+    snapshot = reconcile_snapshot(runtime.root)
+    visible = (
+        list(available_gpus)
+        if available_gpus is not None
+        else _visible_gpus(next(iter(readable.values()))) if readable else []
+    )
+    free = [gpu_id for gpu_id in visible if gpu_id not in snapshot.reserved_gpu_ids]
+    diagnostic_increment("scheduler.capacity.visible_gpus", len(visible))
+    diagnostic_increment("scheduler.capacity.reserved_gpus", len(snapshot.reserved_gpu_ids))
+    diagnostic_increment("scheduler.capacity.free_gpus", len(free))
+    result_by_project = {
+        item["project_id"]: item for item in results if item.get("project_id") is not None
+    }
+    for binding in ordered_enabled:
+        if binding.project_id in dispatchable and binding.project_id not in result_by_project:
+            item = {
+                "project_id": binding.project_id,
+                "launched": list(recovered.get(binding.project_id, [])),
+                "status": "dispatched",
+            }
+            results.append(item)
+            result_by_project[binding.project_id] = item
+    if not free:
+        diagnostic_increment("scheduler.work.skipped_no_capacity", len(ordered_enabled))
+    budget = SliceBudget()
+    batch_sizers: dict[str, AdaptiveBatchSizer] = {}
+    enabled_ids = {binding.project_id for binding in ordered_enabled}
+    for project_id in set(runtime.ready_batch_sizers) - enabled_ids:
+        del runtime.ready_batch_sizers[project_id]
+    for binding in ordered_enabled:
+        sizer = runtime.ready_batch_sizers.get(binding.project_id)
+        if not isinstance(sizer, AdaptiveBatchSizer):
+            sizer = AdaptiveBatchSizer(budget.policy)
+            runtime.ready_batch_sizers[binding.project_id] = sizer
+        batch_sizers[binding.project_id] = sizer
+    inspected_ready: set[tuple[str, str, str]] = set()
+    round_bindings = list(ordered_enabled)
+    last_successful_binding: ProjectBinding | None = None
+    while free and round_bindings:
+        if not budget.can_start_record():
+            diagnostic_increment("scheduler.work.immediate_slices")
+            time.sleep(0)
+            budget = SliceBudget()
+        round_claims = 0
+        records_before_round = budget.records_used
+        round_last_success: ProjectBinding | None = None
+        for binding in round_bindings:
+            cfg = dispatchable.get(binding.project_id)
+            if cfg is None or not free or not budget.can_start_record():
+                continue
+            claimed_task_ids: list[str] = []
+            try:
+                with diagnostic_span("scheduler.work"):
+                    launched = run_dispatch_cycle(
+                        cfg,
+                        available_gpus=free,
+                        executor=executor,
+                        reservation_runtime_root=runtime.root,
+                        project_id=binding.project_id,
+                        preflight=lambda spec: _working_directory_reason(spec) is None,
+                        preflight_rejected=lambda task: _record_bad_task_spec(
+                            runtime, binding, task.task_id, task.spec
+                        ),
+                        claim_guard=lambda: runtime.enabled_claim_guard(binding),
+                        max_new_claims=1,
+                        on_claim=claimed_task_ids.append,
+                        should_recover_starting=False,
+                        work_budget=budget,
+                        batch_sizer=batch_sizers[binding.project_id],
+                        inspected_ready=inspected_ready,
+                    )
+                result_by_project[binding.project_id]["launched"].extend(launched)
+                if claimed_task_ids:
+                    round_claims += 1
+                    round_last_success = binding
+                    last_successful_binding = binding
+                    snapshot = reconcile_snapshot(runtime.root)
+                    free = [
+                        gpu_id for gpu_id in visible
+                        if gpu_id not in snapshot.reserved_gpu_ids
+                    ]
+            except (OSError, RuntimeError, ValueError) as exc:
+                item = result_by_project[binding.project_id]
+                item["status"] = "error"
+                item["error"] = str(exc)
+        if round_claims == 0 and budget.can_start_record():
             break
+        if round_claims == 0 and budget.records_used == records_before_round:
+            break
+        diagnostic_increment("scheduler.work.rounds")
+        if round_last_success is not None:
+            index = round_bindings.index(round_last_success)
+            round_bindings = round_bindings[index + 1 :] + round_bindings[: index + 1]
     if ordered_enabled:
-        start = ordered_enabled[0]
-        if successful_binding is not None:
-            index = ordered_enabled.index(successful_binding)
-            runtime.save_cursor(ordered_enabled[(index + 1) % len(ordered_enabled)].project_id)
+        if last_successful_binding is not None:
+            index = ordered_enabled.index(last_successful_binding)
+            next_binding = ordered_enabled[(index + 1) % len(ordered_enabled)]
         else:
-            runtime.save_cursor(ordered_enabled[(ordered_enabled.index(start) + 1) % len(ordered_enabled)].project_id)
+            next_binding = ordered_enabled[1 % len(ordered_enabled)]
+        runtime.save_cursor(next_binding.project_id)
     if publish_snapshots:
         reservations = active_reservations(runtime.root)
         _publish_project_snapshots(
@@ -675,6 +945,7 @@ def run_machine_agent_loop(
     instance_id = uuid.uuid4().hex
     started_at = utc_now()
     control_plane: _MachineControlPlane | None = None
+    scheduler_wakeup = threading.Event()
     stop = False
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -709,9 +980,11 @@ def run_machine_agent_loop(
                 loop_interval=loop_interval,
                 started_at=started_at,
                 available_gpus=available_gpus,
+                scheduler_wakeup=scheduler_wakeup,
             )
             control_plane.start()
             while not stop:
+                scheduler_wakeup.clear()
                 with machine_runtime.migration_guard() as is_migration_clear:
                     if is_migration_clear:
                         dispatch_machine_cycle_locked(
@@ -721,7 +994,7 @@ def run_machine_agent_loop(
                             supervise=False,
                             publish_snapshots=False,
                         )
-                time.sleep(loop_interval)
+                scheduler_wakeup.wait(loop_interval)
         finally:
             if control_plane is not None:
                 control_plane.stop()

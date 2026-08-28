@@ -251,16 +251,23 @@ lock solely from wall-clock age.
 
 ### 5.2 Filesystem Qualification Gate
 
-**Assumption / Unverified**:
+Cross-machine dispatch is fail-closed until two distinct deployment hosts produce one successful
+qualification result for the same mounted control root. The probe contract requires both hosts
+to participate in each test and records their stable operator-supplied identities. It verifies:
 
-- the target shared filesystem provides a validated cross-host exclusive primitive
-- atomic replacement is visible consistently enough for the documented protocols
-- stale-client, partition, and delayed-visibility behavior is bounded and tested
-- participating machines maintain bounded clock skew through time synchronization
+1. an exclusive lock has exactly one holder while the peer observes contention;
+2. readers observe either the old or complete new payload across atomic replacement, never a
+   partial payload;
+3. a file and its parent-directory replacement become visible to the peer after file and
+   directory `fsync` complete;
+4. process exit releases the lock, while an incomplete temporary write is never interpreted as
+   committed truth.
 
-Cross-machine dispatch remains disabled until a dedicated ADR selects the primitive and
-the target filesystem qualification suite passes. A process-local mock or single-host
-test is not sufficient evidence.
+Missing evidence, identical host identities, timeout, malformed payload, inconsistent observation,
+or any failed property yields `not_qualified` with property-specific reasons. A process-local mock
+or single-host test can verify the judge but cannot qualify a deployment. Probe output is deployment
+evidence only: it never mutates scheduler budgets, partition counts, persisted Task truth, or global
+defaults. Single-host scheduling does not require a fabricated qualification result.
 
 ### 5.3 Lock Order
 
@@ -308,10 +315,13 @@ The target layout is:
     submissions/
       <operation-id>.json
     availability/
+      active/<operation-id>.json
       <operation-id>.json
     group-control/
+      active/<operation-id>.json
       <operation-id>.json
     cleanup/
+      active/<task-id>.json
       <task-id>.json
   idempotency/
     submissions/
@@ -346,6 +356,18 @@ The target layout is:
     tasks-by-state/
     tasks-by-group/
     offer-deadlines/
+      active/<home-machine>/<utc-hour>/<task-id>.json
+    ready/
+      state.json
+      allocators/<route>.json
+      catalogs/<route>/<page>.json
+      reservations/<task-id>.<generation>.json
+      home/<machine>/<partition>/partition.json
+      home/<machine>/<partition>/<task-id>.<generation>.json
+      shared/<partition>/partition.json
+      shared/<partition>/<task-id>.<generation>.json
+      cursors/<machine>/<project-id>/<scope>/<partition>.json
+      locks/<route>.lock
   logs/
     <task-id>/
       <attempt-id>.log
@@ -362,6 +384,12 @@ Layout rules:
 - machine state is writable only by that machine, except repair metadata explicitly
   written by `doctor`
 - indexes and summaries may be deleted and rebuilt without losing truth
+- `ready` is a rebuildable liveness projection; Task and Submission truth remain authoritative
+- unfinished availability, Group control, and cleanup truth lives below its type-specific
+  `active/` directory; completed truth is published at the stable history path before active truth
+  is removed
+- a stable operation or deadline path may be a compatibility symlink while the record is active;
+  the symlink is a locator, not a second authority record
 - captured Attempt stdout/stderr logs are shared observability artifacts; process evidence,
   PIDs, reservations, wrappers, and locks remain machine-local
 
@@ -477,6 +505,7 @@ task:
   group_membership_sequence: int | null
   submission_operation_id: str | null
   name: str | null
+  ready_generation: int
   spec:
     command: list[str]
     working_directory: str
@@ -544,6 +573,8 @@ Task rules:
 - absence of `active_claim` means no machine owns execution authority
 - user-facing Task projection is derived from Task and current Attempt truth
 - Task truth wins over every queue index or machine summary
+- `ready_generation` is non-negative and monotonic; additive schema-6 records without the field
+  read as generation zero until a ready-producing transition or the ready builder assigns one
 
 ### 8.4 Attempt Truth
 
@@ -1159,6 +1190,12 @@ All queued availability changes use the same durable operation path:
 6. update or remove `indexes/offer-deadlines/<task-id>.json`
 7. mark the operation `completed`
 
+Unfinished operation truth is stored in the type-specific `active/` directory. Completion first
+publishes terminal history at the stable operation path and then removes active truth. Regular
+agent maintenance streams at most 64 active availability, Group cancel, and cleanup records of each
+type and never enumerates completed operation history. Existing flat unfinished schema-6 records
+are split once under the project schema lock.
+
 If Task truth is committed but audit or index writing is interrupted, the operation remains
 replayable. Agent startup and `qexp doctor repair` reconcile incomplete availability operations
 and rebuild advisory deadline indexes from Task truth.
@@ -1203,6 +1240,12 @@ queued_home_at
 offer_eligible_at = queued_home_at + after_seconds
 ```
 
+The advisory deadline record lives at
+`indexes/offer-deadlines/active/<home-machine>/<utc-hour>/<task-id>.json`; the flat path remains an
+exact compatibility locator. A home agent consumes only its due UTC-hour buckets, with at most 64
+records per maintenance slice. Removing the final record removes its empty bucket. Synchronization
+compares the complete payload first and does not rewrite or fsync unchanged content.
+
 Any active Group worker may scan due-time indexes, but the index is advisory. Offering
 acquires the Task lock and validates authoritative Task truth:
 
@@ -1231,13 +1274,140 @@ protocol without changing their semantics. Candidate selection is advisory; only
 project-root claim authorizes execution.
 
 Enabled bindings are sorted lexically by stable project ID. The persisted cursor identifies the
-next starting binding. One cycle visits each binding at most once in that rotation. Missing or
-unknown cursor state starts at the first sorted binding. The agent continues after a project has
-no candidate, lacks capacity in the machine-wide reservation set, has an inaccessible working
-directory, or loses its project claim. After a successful claim it persists the successor of
-that binding; after a full round with no successful claim it persists the successor of the
-starting binding. This is deterministic, unweighted round-robin; it does not implement
-priorities, quotas, preemption, or project capacity reservations.
+next starting binding. Missing or unknown cursor state starts at the first sorted binding. One
+round visits each binding at most once and permits at most one successful claim per project. The
+agent continues after a project has no candidate, lacks capacity in the machine-wide reservation
+set, has an inaccessible working directory, or loses its project claim. If capacity and the work
+budget remain after a round, the successor of the last successful binding starts another round.
+After dispatch, the cursor persists that successor; after a full round with no successful claim,
+it persists the successor of the starting binding. This is deterministic, unweighted round-robin;
+it does not implement priorities, quotas, preemption, or project capacity reservations.
+
+After ready-index activation, project selection uses a persistent project cursor and candidate
+selection uses one persistent cursor for each project and queue scope. A marker name is
+`<task-id>.<ready-generation>.json`. Writers allocate markers into monotonically numbered partition
+records with 64 durable slots. Allocation reserves a slot under the ready allocator lock, releases
+that lock, and performs shared Task/Submission I/O afterward; the allocator lock is never held while
+waiting for a shared object lock. A partition is sealed when all slots have been allocated and is
+removed after every marker and reservation has drained. Active partition IDs are stored in linked
+catalog pages of at most 64 IDs. The candidate path reads one catalog page and one partition record,
+then opens marker paths named by that record; it never discovers candidates with an unbounded
+directory glob. The cursor record contains exactly:
+
+```yaml
+cursor:
+  schema_version: 1
+  project_id: str
+  machine_name: str
+  queue_scope: home | shared
+  catalog_page: str | null
+  partition: str | null
+  after_name: str | null
+  revision: int
+```
+
+Catalog pages and partitions rotate from the durable successor links. Within a partition, markers
+sort lexically by full filename and resume strictly after `after_name`; reaching the end clears
+`after_name` and advances the partition. The cursor advances for every inspected marker,
+including stale, corrupt, temporarily ineligible, and claim-race records. This prevents one bad
+candidate from pinning progress. Cursor writes are advisory and may repeat work after a crash;
+authoritative claim fencing prevents duplicate execution.
+
+The project index state gates discovery before any candidate scan:
+
+- `absent` and `building` retain bounded legacy Task discovery so pre-cutover queued work remains
+  live;
+- `active` uses only ready catalog, partition, and marker records for ordinary new claims;
+- `degraded` permits control, recovery, maintenance, terminal convergence, and repair, but rejects
+  new claims for the affected project.
+
+A permanently stale marker is classified against authoritative Task and Submission truth twice:
+once during candidate handling and again immediately before exact-generation deletion. A corrupt
+active marker or catalog/partition record degrades the project instead of falling back to Task
+discovery. A temporarily unavailable or machine-ineligible marker remains in the index and still
+advances candidate progress.
+
+### 13.1.1 Portable Work Slice Contract
+
+One scheduling work slice has environment-independent hard bounds:
+
+- at most 64 candidate, deadline, Attempt, and durable-operation records combined are inspected;
+- at most 64 authoritative Task JSON records and 64 Attempt JSON records are read;
+- at most 256 counted filesystem operations are initiated;
+- at most 256 reservation records are enumerated before the slice yields;
+- at most 256 in-memory candidate descriptors and one scheduler diagnostic snapshot are retained.
+
+The limits apply per slice, not per project, and are never increased by local benchmarks. Capacity
+reconciliation may consume the reservation-record allowance before candidate selection. A full
+machine performs no ordinary ready-candidate Task reads; it may still read exact Task/Attempt truth
+referenced by active reservations and due control operations.
+
+Each slice starts with `deadline = monotonic_ns() + 50_000_000`. Before starting each independent
+record, the scheduler checks both count allowances and `monotonic_ns() < deadline`. It never starts
+another record after either boundary is reached. The deadline cannot interrupt one synchronous I/O
+already in progress. Heartbeat and authority renewal remain on their independent control threads.
+
+The disposable in-process adaptive batch state starts at 4 records, has minimum 1 and maximum 64,
+and is not persisted. For positive record duration `sample`, it maintains:
+
+```text
+estimate[0] = sample
+estimate[n] = max(ceil((3 * estimate[n-1] + sample) / 4), sample)
+target = clamp(floor(50_000_000 / estimate[n]), 1, 64)
+```
+
+If `target` is below the current batch, shrink immediately to no more than both `target` and half
+the current batch. Growth requires three consecutive observations with a larger target and then
+adds exactly one record. Any slowdown resets the growth streak. Delay, error, or corrupt-record
+outcomes still consume the inspected-record allowance and advance the cursor. When due work remains
+after yielding, the agent schedules an immediate continuation after giving control threads an
+execution opportunity; it does not wait a complete agent loop interval.
+
+Diagnostics use monotonic durations and count, at minimum, `maintain_project`, `offer_due_tasks`,
+`run_dispatch_cycle`, reservation enumeration entries, and authoritative Task JSON reads. They are
+machine-local, replaceable observations and never scheduling truth. The latest snapshot is persisted
+at most once per 30 seconds so observation does not add a durable write to every cycle. Wall time is
+diagnostic only; portable regression acceptance is based on operation counts and bounds.
+
+### 13.1.2 Machine-Wide Resource Gate
+
+Before ordinary Task discovery, the machine agent forms a trustworthy capacity snapshot:
+
+1. under the machine reservation lock, expire unattached provisional records and snapshot active
+   reservation identities;
+2. release the machine lock and verify each active record through its stable project binding and
+   exact Task and Attempt identity;
+3. reacquire the machine lock for any retag or release and apply it only when `reservation_id`,
+   `acquisition_id`, `project_id`, `task_id`, `attempt_id`, `fencing_token`, and GPU IDs still match
+   the original snapshot;
+4. form a second lock-consistent snapshot containing both active and unexpired provisional GPU
+   occupancy;
+5. enter ordinary Task discovery only when that final snapshot contains visible free qexp GPUs.
+
+Shared Task or Attempt I/O is never performed while holding the machine reservation lock. A missing
+or unreadable project binding, malformed identity, blocked Task, or otherwise unverifiable ownership
+retains the reservation and is counted as isolated; uncertainty is never converted into free
+capacity.
+
+Machine-agent recovery of `starting` Attempts is driven only by the final active-reservation
+snapshot. It opens the exact project Task and Attempt and requires the reservation ID, Attempt ID,
+fencing token, machine, claim, and launch state to agree before replaying the existing launch gate.
+The machine-agent path does not scan the Task directory to find `starting` Attempts. The standalone
+project scheduler retains its legacy scan while the ready index is `absent` or `building`, switches
+to ready-only discovery at `active`, and fails closed for new claims at `degraded`.
+
+At zero free capacity, heartbeat and authority threads continue independently and project
+maintenance still processes its current durable responsibilities, while `run_dispatch_cycle` is not
+called. Phase diagnostics separate `recovery.reservation_reconciliation`,
+`recovery.starting_attempts`, `maintenance.project`, and `scheduler.work`, and include trustworthy
+reservation and visible/reserved/free GPU counts.
+
+Scheduling runs immediately at machine-agent startup. A cycle observes the current binding
+revision before project selection. Capacity released by recovery, maintenance, or a completed
+claim is reused by the next fair round without waiting for the loop interval; a ready marker written
+by local maintenance is therefore visible to the work plane in that same cycle. If no local event
+continues work, the existing loop interval is the correctness-preserving idle probe for remote
+markers and later binding changes. No filesystem notification facility is required.
 
 The candidate working directory must be locally readable and searchable before claim. Failure
 is a per-project diagnostic and does not prevent other bindings from dispatching. A later launch
