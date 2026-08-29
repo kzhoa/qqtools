@@ -1,5 +1,11 @@
 # History
 
+## v1.3.12
+
+- fix: remove qexp's shared-filesystem qualification-file gate so eligible cross-machine work can
+  be claimed, authorized, and recovered without deployment-specific probe evidence. Legacy
+  qualification records are ignored.
+
 ## v1.3.11
 
 - fix: report the previous machine-agent process id in `qexp agent restart` structured output,
