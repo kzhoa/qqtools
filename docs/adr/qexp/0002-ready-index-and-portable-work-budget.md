@@ -1,7 +1,7 @@
 ---
 doc_type: adr
 status: active
-updated_at: 2026-08-28
+updated_at: 2026-08-29
 archived_at:
 ---
 
@@ -112,9 +112,10 @@ control, authority, recovery, and maintenance paths active. Starting recovery op
 Attempt named by an active reservation; machine-agent recovery never discovers `starting` work by
 scanning the Task directory.
 
-Cross-host use additionally requires the deployment-specific, two-host qualification contract in
-[0001-shared-filesystem-coordination.md](0001-shared-filesystem-coordination.md). Probe evidence cannot
-tune partitions or work budgets.
+At the time of this decision, cross-host use required the deployment-specific, two-host
+qualification contract in [0001-shared-filesystem-coordination.md](0001-shared-filesystem-coordination.md).
+That requirement was superseded by
+[0003-remove-filesystem-qualification-gate.md](0003-remove-filesystem-qualification-gate.md).
 
 ## Consequences
 
