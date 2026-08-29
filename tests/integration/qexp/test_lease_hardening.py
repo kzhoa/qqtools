@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.layout import load_root_config, migrate_schema5_to_schema6
 from qqtools.plugins.qexp.lease import (
     ClockCapability,
@@ -180,6 +181,7 @@ def test_termination_confirmation_uses_real_process_group_identity(tmp_path: Pat
 
 def test_recovery_uses_authoritative_policy_ttl(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
     save_lease_policy(cfg, LeasePolicy(ttl_seconds=180))
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg, task.task_id, [0])

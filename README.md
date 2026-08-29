@@ -143,8 +143,19 @@ qexp agent stop
 is an operations command for restoring a removed or lost current-generation registration; it is not
 part of normal setup. Older per-project-agent metadata must use `qexp agent migrate-project`.
 
-`--machine` is a project-local logical worker name. Projects on the same host may use different
-names while sharing one global agent and GPU reservation pool.
+`--machine` is a project-local logical worker name and, for operational commands, a compatibility
+assertion against the local MachineRuntime binding. It is not the Task target. Use
+`--home-machine` to place a Task independently:
+
+```bash
+# Run on g3; only the registered g4 Project machine may claim this private Task.
+qexp submit --home-machine g4 -- python train.py -c config1.yaml
+```
+
+Omitting `--home-machine` uses the verified local machine. A remote home must have a valid
+current-generation Project machine record, but qexp does not remotely start its agent or transfer
+files. `--no-activate` only suppresses local activation; it does not bypass identity or placement
+validation.
 
 ### Schema 6 operation
 
@@ -252,6 +263,11 @@ tasks:
         mode: private
     command: [python, control.py]
 ```
+
+Group membership is explicit: `group create` defaults to the current machine only when
+`--workers` is omitted, while an explicit list is exact. Submission never implicitly adds its
+origin machine. A single `submit --group NAME` requires an existing Group; a new Group can be
+created atomically by `batch-submit` only when the manifest declares a non-empty `group.workers`.
 
 During a shared-filesystem outage, the owning agent retains the training process and GPU
 reservation in `suspect` and then `isolated` state; it does not create a replacement Attempt

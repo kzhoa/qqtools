@@ -5,10 +5,10 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import batch_submit, init_shared_root
-from qqtools.plugins.qexp.commands.group import change_worker
+from qqtools.plugins.qexp.commands.group import change_worker, create_group, group_control
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
-from qqtools.plugins.qexp.runtime.paths import group_path, submission_path
+from qqtools.plugins.qexp.runtime.paths import group_path, submission_path, task_path
 from qqtools.plugins.qexp.runtime.store import read_json
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -19,8 +19,13 @@ def _manifest(tmp_path: Path, body: str) -> Path:
     return path
 
 
+def _existing_group(cfg: RootConfig, name: str = "exp") -> None:
+    create_group(cfg, name)
+
+
 def test_nested_task_private_overrides_spillover_defaults(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     manifest = _manifest(
         tmp_path,
         """
@@ -50,6 +55,9 @@ tasks:
 
 def test_tasks_can_use_different_nested_placement_in_one_group(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
+    init_shared_root(cfg.shared_root, "g3", runtime_root=tmp_path / "g3-rt")
+    _existing_group(cfg)
     manifest = _manifest(
         tmp_path,
         """
@@ -92,6 +100,7 @@ tasks:
 
 def test_current_home_and_generated_task_ids_are_frozen_for_idempotency(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "g1")
+    _existing_group(cfg)
     manifest = _manifest(
         tmp_path,
         """
@@ -112,6 +121,8 @@ tasks:
 
 def test_group_workers_allow_new_home_and_are_recorded_in_resolved_context(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
+    _existing_group(cfg)
     manifest = _manifest(
         tmp_path,
         """
@@ -134,17 +145,18 @@ tasks:
 
 def test_worker_set_epoch_changes_only_when_a_worker_is_added(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     first = _manifest(tmp_path, "tasks:\n  - command: [echo, one]\n")
 
     batch_submit(cfg, first, group="exp")
     group = read_json(group_path(cfg.shared_root, "exp"))
-    assert group["group"]["worker_set_epoch"] == 1
-    assert group["group"]["worker_set"]["g1"]["state_epoch"] == 1
+    assert group["group"]["worker_set_epoch"] == 0
+    assert group["group"]["worker_set"]["g1"]["state_epoch"] == 0
 
     second = _manifest(tmp_path, "tasks:\n  - command: [echo, two]\n")
     batch_submit(cfg, second, group="exp")
     group = read_json(group_path(cfg.shared_root, "exp"))
-    assert group["group"]["worker_set_epoch"] == 1
+    assert group["group"]["worker_set_epoch"] == 0
 
 
 def test_rejects_unknown_manifest_fields_with_yaml_path(tmp_path: Path):
@@ -182,6 +194,7 @@ def test_manifest_allow_list_and_type_errors(tmp_path: Path, body: str, message:
 
 def test_flat_task_fields_work_with_deprecation_warning(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     manifest = _manifest(
         tmp_path,
         """
@@ -255,15 +268,18 @@ tasks:
         batch_submit(cfg, manifest, group="exp")
 
 
-def test_failed_submission_removes_operation_added_origin_and_workers(tmp_path: Path):
+def test_failed_submission_removes_operation_owned_group(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
     manifest = _manifest(
         tmp_path,
         """
 group:
   workers: [g2]
 tasks:
-  - command: [echo, ok]
+  - placement:
+      home_machine: g2
+    command: [echo, ok]
 """,
     )
 
@@ -273,22 +289,24 @@ tasks:
     with pytest.raises(RuntimeError, match="interrupted"):
         batch_submit(cfg, manifest, group="exp", on_prepared=fail_after_prepare)
 
-    group = read_json(group_path(cfg.shared_root, "exp"))
-    assert group["group"]["worker_set"] == {}
-    assert group["group"]["worker_set_epoch"] == 2
+    assert not group_path(cfg.shared_root, "exp").exists()
+    assert not list((cfg.shared_root / "tasks").glob("*.json"))
 
 
-def test_failed_final_operation_commit_removes_operation_added_workers(
+def test_failed_operation_commit_removes_operation_owned_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
     manifest = _manifest(
         tmp_path,
         """
 group:
   workers: [g2]
 tasks:
-  - command: [echo, ok]
+  - placement:
+      home_machine: g2
+    command: [echo, ok]
 """,
     )
     original_atomic_replace = submission_runtime.atomic_replace
@@ -304,15 +322,105 @@ tasks:
     with pytest.raises(OSError, match="simulated committed operation write failure"):
         batch_submit(cfg, manifest, group="exp")
 
+    assert not group_path(cfg.shared_root, "exp").exists()
+    assert not list((cfg.shared_root / "tasks").glob("*.json"))
+    operation_files = list((cfg.shared_root / "operations" / "submissions").glob("*.json"))
+    assert len(operation_files) == 1
+    assert read_json(operation_files[0])["submission"]["state"] == "aborted"
+
+
+def test_committed_operation_keeps_group_pending_when_finalizer_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
+    manifest = _manifest(
+        tmp_path,
+        """
+group:
+  workers: [g2]
+tasks:
+  - placement:
+      home_machine: g2
+    command: [echo, ok]
+""",
+    )
+    key = "finalizer-retry"
+    original_atomic_replace = submission_runtime.atomic_replace
+
+    def fail_group_finalizer(path: Path, value: dict) -> None:
+        if path == group_path(cfg.shared_root, "exp") and value["group"].get(
+            "pending_submission_commit"
+        ) is None:
+            raise OSError("simulated Group finalizer failure")
+        original_atomic_replace(path, value)
+
+    monkeypatch.setattr(submission_runtime, "atomic_replace", fail_group_finalizer)
+
+    with pytest.raises(OSError, match="simulated Group finalizer failure"):
+        batch_submit(cfg, manifest, group="exp", idempotency_key=key)
+
+    operation_files = list((cfg.shared_root / "operations" / "submissions").glob("*.json"))
+    assert len(operation_files) == 1
+    operation = read_json(operation_files[0])["submission"]
+    assert operation["state"] == "committed"
+    group = read_json(group_path(cfg.shared_root, "exp"))
+    assert group["group"]["pending_submission_commit"]["operation_id"] == operation["operation_id"]
+    assert set(group["group"]["worker_set"]) == {"g2"}
+    assert len(list((cfg.shared_root / "tasks").glob("*.json"))) == 1
+
+    monkeypatch.setattr(submission_runtime, "atomic_replace", original_atomic_replace)
+    retried = batch_submit(cfg, manifest, group="exp", idempotency_key=key)
+    assert retried.state == "committed"
     group = read_json(group_path(cfg.shared_root, "exp"))
     assert group["group"]["pending_submission_commit"] is None
-    assert group["group"]["worker_set"] == {}
-    assert group["group"]["worker_set_epoch"] == 2
-    assert not list((cfg.shared_root / "tasks").glob("*.json"))
+    assert group["group"]["next_membership_sequence"] == 2
+
+
+def test_group_cancel_finalizes_committed_submission_before_watermark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
+    manifest = _manifest(
+        tmp_path,
+        """
+group:
+  workers: [g2]
+tasks:
+  - placement:
+      home_machine: g2
+    command: [echo, ok]
+""",
+    )
+    original_atomic_replace = submission_runtime.atomic_replace
+
+    def fail_group_finalizer(path: Path, value: dict) -> None:
+        if path == group_path(cfg.shared_root, "exp") and value["group"].get(
+            "pending_submission_commit"
+        ) is None:
+            raise OSError("simulated Group finalizer failure")
+        original_atomic_replace(path, value)
+
+    monkeypatch.setattr(submission_runtime, "atomic_replace", fail_group_finalizer)
+    with pytest.raises(OSError, match="simulated Group finalizer failure"):
+        batch_submit(cfg, manifest, group="exp", idempotency_key="cancel-finalizer")
+
+    monkeypatch.setattr(submission_runtime, "atomic_replace", original_atomic_replace)
+    group = group_control(cfg, "exp", "cancel")
+
+    task_id = next(path.stem for path in (cfg.shared_root / "tasks").glob("*.json"))
+    task = read_json(task_path(cfg.shared_root, task_id))["task"]
+    assert task["state"]["projection"] == "cancelled"
+    assert group["group"]["pending_submission_commit"] is None
+    assert group["group"]["next_membership_sequence"] == 2
+    assert group["cancellation_operation"]["membership_high_watermark"] == 1
 
 
 def test_rejects_home_or_fallback_outside_active_planned_workers(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
+    _existing_group(cfg)
     batch_submit(cfg, _manifest(tmp_path, "tasks:\n  - command: [echo, seed]\n"), group="exp")
     change_worker(cfg, "exp", "g2", "add")
     change_worker(cfg, "exp", "g2", "drain")
@@ -330,8 +438,9 @@ tasks:
         batch_submit(cfg, manifest, group="exp")
 
 
-def test_rejects_ungrouped_spillover_and_remote_home(tmp_path: Path):
+def test_allows_ungrouped_private_remote_home_but_rejects_spillover(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
     spillover = _manifest(
         tmp_path,
         """
@@ -354,5 +463,6 @@ tasks:
     command: [echo, ok]
 """,
     )
-    with pytest.raises(ValueError, match="ungrouped tasks must use the submitting machine as home"):
-        batch_submit(cfg, remote_home)
+    task = batch_submit(cfg, remote_home)[0]
+    assert task.placement_policy["home_machine"] == "g2"
+    assert task.placement_policy["sharing_mode"] == "private"

@@ -64,15 +64,20 @@ class ProjectBinding:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ProjectBinding":
+        if not isinstance(value, dict):
+            raise ValueError("project binding must be an object.")
         enabled = value.get("enabled")
         if not isinstance(enabled, bool):
             raise ValueError("project binding enabled must be a bool.")
-        return cls(
-            project_id=value["project_id"],
-            shared_root=Path(value["shared_root"]),
-            machine_name=value["machine_name"],
-            enabled=enabled,
-        )
+        try:
+            return cls(
+                project_id=value["project_id"],
+                shared_root=Path(value["shared_root"]),
+                machine_name=value["machine_name"],
+                enabled=enabled,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("project binding has invalid identity fields.") from exc
 
     def root_config(self) -> RootConfig:
         cfg = load_root_config(self.shared_root, self.machine_name, require_initialized=True)
@@ -198,7 +203,11 @@ class MachineRuntime:
         bindings = registry.get("bindings")
         if not isinstance(revision, int) or revision < 0 or not isinstance(bindings, list):
             raise RuntimeError("machine registry is malformed.")
-        return revision, [ProjectBinding.from_dict(item) for item in bindings]
+        try:
+            parsed = [ProjectBinding.from_dict(item) for item in bindings]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("machine registry contains a malformed project binding.") from exc
+        return revision, parsed
 
     def _save_registry(self, revision: int, bindings: list[ProjectBinding]) -> None:
         atomic_replace(
@@ -381,6 +390,86 @@ class MachineRuntime:
     def execution_context(self, cfg: RootConfig) -> ExecutionContext:
         """Pair project operations with the shared machine reservation backend when registered."""
         return ExecutionContext(cfg, self, self.matching_binding(cfg))
+
+    def resolve_project_binding(self, shared_root: str | Path) -> ProjectBinding:
+        """Resolve and validate the unique local binding for a shared project root."""
+        root = Path(shared_root).expanduser().resolve()
+        identity_path = shared_paths(root)["project"] / "identity.json"
+        if not identity_path.exists():
+            raise ValueError(f"qexp project identity is missing: {identity_path}")
+        identity = read_json(identity_path).get("project")
+        if not isinstance(identity, dict):
+            raise ValueError(f"qexp project identity is malformed: {identity_path}")
+        stable_id = identity.get("project_id")
+        identity_root = identity.get("shared_root")
+        if not isinstance(stable_id, str) or not stable_id:
+            raise ValueError(f"qexp project identity has no stable project ID: {identity_path}")
+        if not isinstance(identity_root, str) or Path(identity_root).expanduser().resolve() != root:
+            raise ValueError("project identity shared_root does not match the canonical shared root.")
+
+        _, bindings = self.load_registry()
+        project_matches = [binding for binding in bindings if binding.project_id == stable_id]
+        root_matches = [binding for binding in bindings if binding.shared_root == root]
+        matches = [
+            binding
+            for binding in project_matches
+            if binding.shared_root == root
+        ]
+        if len(project_matches) > 1 or len(root_matches) > 1:
+            candidates = project_matches or root_matches
+            machines = ", ".join(sorted(binding.machine_name for binding in candidates))
+            raise RuntimeError(f"local project binding is ambiguous for {root}: {machines}.")
+        if project_matches and root_matches and project_matches[0] != root_matches[0]:
+            raise RuntimeError(f"machine registry binding does not match Project truth for {root}.")
+        if not matches:
+            for record_path in sorted(shared_paths(root)["machines"].glob("*/machine.json")):
+                try:
+                    record = read_json(record_path)
+                    machine = record.get("machine") if isinstance(record, dict) else None
+                except (OSError, TypeError, ValueError):
+                    raise ValueError(f"qexp machine record is malformed: {record_path}") from None
+                if not isinstance(machine, dict) or machine.get("agent_runtime") != "machine":
+                    raise ValueError(
+                        "legacy project metadata detected; run 'qexp agent migrate-project'."
+                    )
+            raise ValueError(
+                f"no local project binding exists for {root}; run 'qexp agent add-project'."
+            )
+        if len(matches) > 1:
+            machines = ", ".join(sorted(binding.machine_name for binding in matches))
+            raise RuntimeError(f"local project binding is ambiguous for {root}: {machines}.")
+
+        binding = matches[0]
+        cfg = load_root_config(root, binding.machine_name, require_initialized=True)
+        record = load_machine_record(cfg)
+        machine = record.get("machine", {}) if isinstance(record, dict) else {}
+        if not isinstance(machine, dict):
+            raise ValueError(
+                f"machine record for {binding.machine_name!r} is malformed in {root}."
+            )
+        if (
+            machine.get("machine_name") != binding.machine_name
+            or machine.get("project_id") != binding.project_id
+            or machine.get("shared_root") != str(root)
+        ):
+            raise ValueError(
+                f"local binding for machine {binding.machine_name!r} does not match Project truth."
+            )
+        if machine.get("agent_runtime") != "machine":
+            raise ValueError("legacy project metadata detected; run 'qexp agent migrate-project'.")
+        return binding
+
+    def verified_execution_context(self, shared_root: str | Path) -> ExecutionContext:
+        """Build an operational context from the binding-owned local runtime partition."""
+        binding = self.resolve_project_binding(shared_root)
+        local_root = self.project_paths(binding.project_id)["root"]
+        cfg = load_root_config(
+            binding.shared_root,
+            binding.machine_name,
+            local_root,
+            require_initialized=True,
+        )
+        return ExecutionContext(cfg, self, binding)
 
     def claim_permitted(self, binding: ProjectBinding) -> bool:
         """Revalidate that an unchanged binding remains enabled for a new claim."""

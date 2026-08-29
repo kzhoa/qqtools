@@ -10,9 +10,9 @@ from ..lifecycle import (TerminalTransition, commit_terminal_transition_locked,
                          dispatch_task_lifecycle_hooks_noexcept)
 from ..runtime.claims import archive_claim
 from ..runtime.locks import group_lock, task_lock
-from ..runtime.paths import attempt_path, group_path, shared_paths
+from ..runtime.paths import attempt_path, group_path, shared_paths, submission_path
 from ..runtime.records import (AttemptRecord, SCHEMA_VERSION, TaskRecord, new_group, new_id,
-                               new_worker_member, utc_now, validate_group_name)
+                               new_worker_member, utc_now, validate_group_name, validate_identifier)
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.tasks import load_task, save_task
 from ..runtime.ready import retire_current_ready_generation
@@ -22,7 +22,32 @@ from ..runtime.active_operations import (
     iter_active_operation_paths,
     write_active_operation,
 )
+from ..runtime.submission import finalize_submission_group
 from .task import has_cleanup_operation, is_cleanup_blocked, retry
+
+
+def _finalize_pending_submission_before_group_mutation(
+    cfg: RootConfig, name: str, path: Path
+) -> None:
+    """Finalize a committed submission before taking the Group mutation lock."""
+    with group_lock(cfg.shared_root, name):
+        if not path.exists():
+            return
+        data = read_json(path)
+        pending = data["group"].get("pending_submission_commit") or {}
+        if not pending:
+            return
+        operation_file = submission_path(cfg.shared_root, pending["operation_id"])
+        if not operation_file.exists():
+            raise RuntimeError(
+                f"Group {name!r} has pending submission commit {pending['operation_id']!r}."
+            )
+        operation = read_json(operation_file)["submission"]
+        if operation.get("state") != "committed":
+            raise RuntimeError(
+                f"Group {name!r} has pending submission commit {pending['operation_id']!r}."
+            )
+    finalize_submission_group(cfg, operation)
 
 
 def group_control(
@@ -37,15 +62,24 @@ def group_control(
 
     reservation_runtime_root = reservation_runtime_root or resolve_execution_context(cfg).reservation_root
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
+    _finalize_pending_submission_before_group_mutation(cfg, name, path)
     post_commit_results = []
     with group_lock(cfg.shared_root, name):
         data = read_json(path)
         group = data["group"]
         pending = group.get("pending_submission_commit")
         if pending:
-            operation_path = cfg.shared_root / "operations" / "submissions" / f"{pending['operation_id']}.json"
-            if not operation_path.exists() or read_json(operation_path)["submission"]["state"] != "committed":
-                raise RuntimeError(f"Group {name!r} has pending submission commit {pending['operation_id']!r}.")
+            operation_path = submission_path(cfg.shared_root, pending["operation_id"])
+            if (
+                not operation_path.exists()
+                or read_json(operation_path)["submission"].get("state") != "committed"
+            ):
+                raise RuntimeError(
+                    f"Group {name!r} has pending submission commit {pending['operation_id']!r}."
+                )
+            raise RuntimeError(
+                f"Group {name!r} received a concurrent submission commit; retry the mutation."
+            )
         if action == "cancel":
             operation_id = new_id()
             high_watermark = group["next_membership_sequence"] - 1
@@ -354,7 +388,13 @@ def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -
         if path.exists():
             return read_json(path)
         data = new_group(name, cfg.machine_name)
-        for machine in [cfg.machine_name, *(workers or [])]:
+        initial_workers = [cfg.machine_name] if workers is None else list(workers)
+        seen: set[str] = set()
+        for machine in initial_workers:
+            validate_identifier(machine, "worker_machine")
+            if machine in seen:
+                raise ValueError(f"group workers must not contain duplicate machine {machine!r}.")
+            seen.add(machine)
             data["group"]["worker_set"][machine] = new_worker_member()
         atomic_replace(path, data)
         return data
@@ -369,8 +409,22 @@ def show_group(cfg: RootConfig, name: str) -> dict[str, Any]:
 def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                   *, terminate_running: bool = False) -> dict[str, Any]:
     path = group_path(cfg.shared_root, validate_group_name(group_name) or group_name)
+    _finalize_pending_submission_before_group_mutation(cfg, group_name, path)
     with group_lock(cfg.shared_root, group_name):
         data = read_json(path)
+        pending = data["group"].get("pending_submission_commit")
+        if pending:
+            operation_path = submission_path(cfg.shared_root, pending["operation_id"])
+            if (
+                not operation_path.exists()
+                or read_json(operation_path)["submission"].get("state") != "committed"
+            ):
+                raise RuntimeError(
+                    f"Group {group_name!r} has pending submission commit {pending['operation_id']!r}."
+                )
+            raise RuntimeError(
+                f"Group {group_name!r} received a concurrent submission commit; retry the mutation."
+            )
         workers = data["group"]["worker_set"]
         if action == "add":
             workers.setdefault(machine, new_worker_member())

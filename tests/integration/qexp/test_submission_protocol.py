@@ -3,13 +3,17 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
+from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import batch_submit, submit
+from qqtools.plugins.qexp.runtime.paths import group_path, submission_path
 from qqtools.plugins.qexp.runtime.submission import IdempotencyConflict
+from qqtools.plugins.qexp.runtime.store import read_json
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def test_bulk_submission_has_one_operation_and_no_batch_identity(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
     manifest = tmp_path / "runs.yaml"
     manifest.write_text("tasks:\n  - command: [echo, one]\n  - command: [echo, two]\n", encoding="utf-8")
     tasks = batch_submit(cfg, manifest, group="exp")
@@ -38,6 +42,30 @@ def test_bulk_submission_announces_random_operation_before_task_staging(tmp_path
     assert announced[0][0] == first[0].submission_operation_id
     assert announced[0][1]
     assert first[0].submission_operation_id != second[0].submission_operation_id
+
+
+def test_failed_new_group_batch_removes_operation_owned_group(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    manifest = tmp_path / "runs.yaml"
+    manifest.write_text(
+        "group:\n  workers: [gpu-1]\ntasks:\n  - command: [echo, one]\n",
+        encoding="utf-8",
+    )
+    prepared: list[str] = []
+
+    def fail_after_prepare(operation_id: str, _key: str) -> None:
+        prepared.append(operation_id)
+        raise OSError("task storage unavailable")
+
+    with pytest.raises(OSError, match="task storage unavailable"):
+        batch_submit(cfg, manifest, group="new-group", on_prepared=fail_after_prepare)
+
+    assert prepared
+    assert not group_path(cfg.shared_root, "new-group").exists()
+    operation = read_json(submission_path(cfg.shared_root, prepared[0]))["submission"]
+    assert operation["state"] == "aborted"
+    assert operation["resolved_context"]["create_group"] is True
+    assert not list((cfg.shared_root / "tasks").glob("*.json"))
 
 
 def test_same_idempotency_key_reuses_resolved_task(tmp_path: Path):

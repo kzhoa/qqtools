@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.commands.group import change_worker
+from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import offer
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
@@ -24,6 +24,7 @@ def _offered_task_and_remote_cfg(tmp_path: Path) -> tuple[RootConfig, RootConfig
     cfg = init_shared_root(
         tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "gpu-1"
     )
+    create_group(cfg, "exp")
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     change_worker(cfg, "exp", "gpu-2", "add")
     offer(cfg, task.task_id)

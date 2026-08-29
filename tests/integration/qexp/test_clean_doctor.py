@@ -4,10 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp import batch_submit, init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.cleanup import clean, reconcile_cleanup_operations
-from qqtools.plugins.qexp.commands.group import group_control, reconcile_group_cancel_operations
+from qqtools.plugins.qexp.commands.group import (
+    create_group,
+    group_control,
+    reconcile_group_cancel_operations,
+)
 from qqtools.plugins.qexp.commands.task import offer, retry
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.doctor import repair_metadata, repair_orphans, verify_integrity
@@ -60,6 +64,8 @@ def _recv_cleanup_reconcile_result(process, parent_connection, *, timeout: float
 
 
 def _failed_task(cfg, command: str = "failed", group: str | None = None):
+    if group is not None:
+        create_group(cfg, group)
     task = submit(cfg, ["echo", command], group=group)
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
@@ -120,6 +126,7 @@ def test_clean_exact_terminal_task_supports_dry_run_and_audit(tmp_path: Path):
 
 def test_clean_removes_timed_offer_deadline_index(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
     task = submit(cfg, ["echo", "ok"], group="exp")
     task_commands.share(cfg, task.task_id, after_seconds=3600)
     index_path = shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task.task_id}.json"
@@ -136,8 +143,11 @@ def test_clean_removes_timed_offer_deadline_index(tmp_path: Path):
     assert not index_path.exists()
 
 
-def test_submission_rollback_removes_task_and_deadline_index(tmp_path: Path, monkeypatch):
+def test_submission_finalizer_failure_preserves_task_and_deadline_index(
+    tmp_path: Path, monkeypatch
+):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
     task_id = "rollback-index-task"
     original_atomic_replace = submission_runtime.atomic_replace
     has_failed = False
@@ -158,8 +168,38 @@ def test_submission_rollback_removes_task_and_deadline_index(tmp_path: Path, mon
         submit(cfg, ["echo", "ok"], task_id=task_id, group="exp", sharing_mode="spillover",
                offer_after_seconds=3600)
 
-    assert not task_path(cfg.shared_root, task_id).exists()
-    assert not (shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task_id}.json").exists()
+    assert task_path(cfg.shared_root, task_id).exists()
+    assert (shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task_id}.json").exists()
+    group = read_json(group_path(cfg.shared_root, "exp"))
+    assert group["group"]["pending_submission_commit"]
+
+
+def test_doctor_finalizes_committed_submission_group(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp", workers=["gpu-1"])
+    manifest = tmp_path / "runs.yaml"
+    manifest.write_text(
+        "tasks:\n  - task_id: repair-task\n    command: [echo, ok]\n", encoding="utf-8"
+    )
+    original_atomic_replace = submission_runtime.atomic_replace
+
+    def fail_group_finalizer(path, value):
+        if path == group_path(cfg.shared_root, "exp") and value["group"].get(
+            "pending_submission_commit"
+        ) is None:
+            raise OSError("simulated Group finalizer failure")
+        original_atomic_replace(path, value)
+
+    monkeypatch.setattr(submission_runtime, "atomic_replace", fail_group_finalizer)
+    with pytest.raises(OSError, match="simulated Group finalizer failure"):
+        batch_submit(cfg, manifest, group="exp", idempotency_key="repair-finalizer")
+
+    monkeypatch.setattr(submission_runtime, "atomic_replace", original_atomic_replace)
+    repaired = repair_metadata(cfg)
+    assert repaired["repaired"]
+    group = read_json(group_path(cfg.shared_root, "exp"))
+    assert group["group"]["pending_submission_commit"] is None
+    assert group["group"]["next_membership_sequence"] == 2
 
 
 def test_clean_bulk_is_bounded_by_retention_and_limit(tmp_path: Path):
@@ -256,6 +296,7 @@ def test_cleanup_waiting_ack_blocks_cancel_offer_and_claim_even_if_task_is_queue
     shared_root = tmp_path / ".qexp"
     cfg1 = init_shared_root(shared_root, "gpu-1", runtime_root=tmp_path / "rt-1")
     cfg2 = init_shared_root(shared_root, "gpu-2", runtime_root=tmp_path / "rt-2")
+    create_group(cfg1, "exp")
     task = submit(cfg1, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg1, task.task_id, [0])
     assert attempt is not None
@@ -344,6 +385,7 @@ def test_public_cleanup_finalization_does_not_block_on_group_lock(tmp_path: Path
     shared_root = tmp_path / ".qexp"
     cfg1 = init_shared_root(shared_root, "gpu-1", runtime_root=tmp_path / "rt-1")
     cfg2 = init_shared_root(shared_root, "gpu-2", runtime_root=tmp_path / "rt-2")
+    create_group(cfg1, "exp")
     task = submit(cfg1, ["echo", "ok"], group="exp")
     attempt = claim_task(cfg1, task.task_id, [0])
     assert attempt is not None
@@ -459,6 +501,7 @@ def test_clean_rejects_nonterminal_task(tmp_path: Path):
 
 def test_group_prelaunch_cancellation_archives_claim(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
     task = submit(cfg, ["echo", "ok"], group="exp")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
@@ -502,6 +545,7 @@ def test_claim_archive_io_failure_does_not_block_terminal_task(tmp_path: Path, m
 
 def test_missing_group_barrier_remains_blocked_during_reconciliation(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
     submit(cfg, ["echo", "ok"], group="exp")
     group = group_control(cfg, "exp", "cancel")
     operation_id = group["cancellation_operation"]["operation_id"]

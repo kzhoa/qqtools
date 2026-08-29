@@ -7,6 +7,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
+from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.lease import ClockCapability, ClockObservation, LeasePolicy, clock_capability
 from qqtools.plugins.qexp.runtime import availability as availability_runtime
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
@@ -61,6 +62,7 @@ def test_unqualified_clock_creates_holder_bound_claim(tmp_path: Path, monkeypatc
 
 def test_elapsed_offer_requires_conservative_two_host_proof(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "g")
     task = submit(cfg, ["echo", "ok"], group="g", sharing_mode="private")
     start = datetime(2026, 8, 6, tzinfo=timezone.utc)
     creator = ClockObservation(
@@ -93,6 +95,7 @@ def test_elapsed_offer_requires_conservative_two_host_proof(tmp_path: Path, monk
 
 def test_elapsed_offer_ages_creator_evidence_through_long_delay(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "g")
     task = submit(cfg, ["echo", "ok"], group="g", sharing_mode="private")
     start = datetime(2026, 8, 6, tzinfo=timezone.utc)
     creator = ClockObservation(
@@ -130,6 +133,7 @@ def test_elapsed_offer_ages_creator_evidence_through_long_delay(tmp_path: Path, 
 
 def test_submission_persists_raw_creator_observation_for_timed_offer(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "g")
     observation = _observation("chrony", -0.2, 0.2)
     monkeypatch.setattr(
         submission_runtime,

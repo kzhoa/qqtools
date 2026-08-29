@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-28
+updated_at: 2026-08-30
 archived_at:
 ---
 
@@ -581,13 +581,16 @@ Defaults:
   the initial or additional Worker Set
 - `group.workers` is the only manifest Worker Set input; root `workers` and
   `defaults.placement.workers` are invalid
-- omitted `home_machine` resolves to the submitting machine
+- omitted `home_machine` resolves to the verified submitting machine
 - omitted `sharing.mode` means `private`
 - Task `placement` overlays `defaults.placement` field-by-field rather than replacing the whole
   object
 - no Task is remotely claimable unless the user explicitly permits it
 - an ungrouped Task must remain private because no Group Worker Set exists to bound remote
   execution
+- an ungrouped private Task may use a non-current home machine when that machine has a valid
+  current-generation Project machine record; the Task then remains claimable only by that home
+  machine
 - legacy Task-level `sharing_mode`, `fallback_machines`, and `offer_after_seconds` are accepted
   only as deprecated aliases for the nested fields; declaring both forms for the same semantic
   field is invalid
@@ -754,11 +757,14 @@ Worker Set invariants:
 
 - every grouped Task's home machine must be an active, non-draining Group worker when the
   Task is committed
-- submitting from the current machine to an open Group may atomically add that current
-  machine as an active worker
+- submission never adds the submitting machine to the Worker Set implicitly
+- `group create` defaults to `{current}` when `--workers` is omitted; an explicit `--workers`
+  list is the exact initial Worker Set
+- a single submit may target only an existing Group; a new Group may be atomically created by
+  `batch-submit` only when its manifest declares a non-empty `group.workers` list
 - an explicitly configured non-current home machine must already be an active worker
-- a manifest may initialize or add workers but must not silently remove or replace the
-  existing Worker Set
+- a manifest may add workers explicitly but must not silently remove or replace the existing
+  Worker Set
 - removal and drain occur only through explicit Group machine operations
 - a draining machine cannot claim either home or shared Tasks from that Group
 
@@ -997,12 +1003,20 @@ old process, which is why ambiguous automatic retry remains forbidden.
 
 ```bash
 qexp submit --task-id qm9-seed-1 --group qm9-study -- python train.py --seed 1
+qexp submit --home-machine gpu-b -- python train.py --seed 1
 ```
 
 Rules:
 
 - single-Task submission must not require YAML
 - Group is optional for ad hoc Tasks
+- `--machine` is the verified local identity assertion; `--home-machine` selects Task placement
+  and defaults to the verified current machine
+- a private Task is executable only by its home machine; a non-current private home requires a
+  valid current-generation Project machine record and does not require a Group
+- selecting a remote home never starts or controls that machine's agent
+- a single `--group` submission requires an existing Group; it does not create or modify the
+  Group Worker Set implicitly
 - duplicate `task_id` fails by default
 - submission never creates a public Batch
 - `--no-activate` persists the Task without requesting local agent activation from that command
@@ -1036,8 +1050,8 @@ Rules:
 - a retry loads the existing operation before resolving machine-relative values
 - the same key and canonical raw request reuse the first operation's resolved context and
   converge even when retried from another machine
-- retry never reinterprets `current`, regenerates Task IDs, or recomputes implicit Worker
-  Set additions against newer Group state
+- retry never reinterprets `current`, regenerates Task IDs, or recomputes Worker Set additions
+  against newer Group state
 - the same key with a different canonical raw request fails with an idempotency conflict
 - incompatible later Group changes leave completion recoverably blocked; they do not
   silently rewrite the stored submission plan
@@ -1205,6 +1219,16 @@ The machine name identifies a project-local logical worker; it does not identify
 Projects on one physical server may use different machine names while the one global agent retains
 one shared GPU resource pool.
 
+Operational commands derive the submitting machine from the unique local `MachineRuntime` binding
+for the canonical shared root and stable Project ID. `--machine` and `QEXP_MACHINE` are
+compatibility assertions only; a mismatch fails before project mutation and suggests
+`--home-machine` for placement intent. Saved-context machine/runtime fields and standalone
+`--runtime-root` inputs do not select operational identity or local resource ownership.
+
+`qexp submit --home-machine <name>` selects Task placement independently. `current` and omission
+resolve to the verified local machine. A remote home needs valid current-generation shared Project
+machine metadata, but qexp does not remotely activate its agent or transfer project files.
+
 ### 15.3 On-Demand Agent by Default
 
 Default behavior:
@@ -1371,7 +1395,9 @@ The target CLI also does not promise aliases for the old flat `list`, `inspect`,
 - [ ] New submissions create no public Batch identity.
 - [ ] Unsupported old schema fails fast and is not read, migrated, or partially imported.
 - [ ] Multiple machine-local submissions can populate one Group.
-- [ ] Omitted home machine resolves to the submitting machine.
+- [ ] Omitted home machine resolves to the verified submitting machine.
+- [ ] A private Task may use a non-current home when its current-generation Project machine
+      record is valid, and only that home machine may claim it.
 - [ ] Omitted sharing mode remains private.
 - [ ] A Task is remotely claimable only when the user permits spillover.
 - [ ] Placement authorization and runtime queue scope are separate validated Task domains.
@@ -1380,7 +1406,12 @@ The target CLI also does not promise aliases for the old flat `list`, `inspect`,
 - [ ] First release offers Tasks only through `qexp task offer` or persisted
   `after_seconds`.
 - [ ] `--group` is the sole submission source for Group identity and manifest
-  `group.name` is rejected.
+      `group.name` is rejected.
+- [ ] Submission never implicitly adds its origin machine to a Group Worker Set.
+- [ ] `group create --workers` uses an exact explicit Worker Set and defaults to `{current}` only
+      when the option is omitted.
+- [ ] Single Group submission requires an existing Group; batch creation requires explicit
+      non-empty manifest `group.workers`.
 - [ ] Existing Task and Group operations use resource-first command namespaces and `show`
   is the only ordinary single-resource observation verb.
 - [ ] Attempt and Submission Operation remain diagnostic internals without daily CLI

@@ -10,6 +10,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.commands.cleanup import clean
+from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import cancel, submit
 from qqtools.plugins.qexp.machine_agent import (
     _MachineControlPlane,
@@ -775,6 +776,7 @@ def test_machine_cleanup_keeps_other_project_reservation_with_same_task_id(tmp_p
 
 def test_machine_maintenance_offers_elapsed_work(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    create_group(cfg, "exp")
     task = submit(
         cfg,
         ["echo", "ok"],

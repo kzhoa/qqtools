@@ -6,6 +6,7 @@ from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.authority import AuthoritySupervisor
 from qqtools.plugins.qexp.commands.group import (
     change_worker,
+    create_group,
     group_control,
     reconcile_group_cancel_operations,
     show_group,
@@ -30,6 +31,10 @@ from qqtools.plugins.qexp.scheduler import (
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
+
+
+def _existing_group(cfg) -> None:
+    create_group(cfg, "exp")
 
 class RecordingExecutor:
     def __init__(self):
@@ -171,6 +176,7 @@ def test_expired_provisional_is_reclaimed_before_next_reservation(tmp_path: Path
 
 def test_recovery_cas_issues_new_fencing_token(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
@@ -204,6 +210,7 @@ def test_recovery_cas_issues_new_fencing_token(tmp_path: Path):
 
 def test_blocked_orphan_with_missing_process_finalizes_and_releases_gpu(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
@@ -236,6 +243,7 @@ def test_blocked_orphan_with_missing_process_finalizes_and_releases_gpu(tmp_path
 
 def test_partial_recovery_finalize_preserves_monotonic_fencing_epoch(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
@@ -271,6 +279,7 @@ def test_partial_recovery_finalize_preserves_monotonic_fencing_epoch(tmp_path: P
 
 def test_reconcile_finishes_recovery_when_manifest_write_was_interrupted(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
@@ -305,6 +314,7 @@ def test_reconcile_finishes_recovery_when_manifest_write_was_interrupted(tmp_pat
 
 def test_agent_supervises_recovered_child_without_runner(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
@@ -335,6 +345,7 @@ def test_agent_supervises_recovered_child_without_runner(tmp_path: Path, monkeyp
 
 def test_elapsed_offer_is_applied_by_home_agent(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover", offer_after_seconds=0)
     offer_due_tasks(cfg)
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
@@ -342,6 +353,7 @@ def test_elapsed_offer_is_applied_by_home_agent(tmp_path: Path):
 
 def test_worker_removal_drains_before_reporting_home_queue_blocker(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     submit(cfg, ["echo", "ok"], group="exp")
     group = change_worker(cfg, "exp", "g1", "remove")
     assert group["group"]["worker_set"]["g1"]["state"] == "draining"
@@ -350,6 +362,7 @@ def test_worker_removal_drains_before_reporting_home_queue_blocker(tmp_path: Pat
 
 def test_worker_removal_operation_completes_after_blocker_clears(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp")
     group = change_worker(cfg, "exp", "g1", "remove")
     operation_id = group["worker_control"]["operation_id"]
@@ -372,6 +385,7 @@ def test_worker_removal_operation_completes_after_blocker_clears(tmp_path: Path)
 
 def test_missing_group_barrier_blocked_operation_is_archived(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     submit(cfg, ["echo", "ok"], group="exp")
     operation_id = "missing-barrier"
     active_path = active_operation_path(cfg, "group_control", operation_id)
@@ -403,6 +417,7 @@ def test_missing_group_barrier_blocked_operation_is_archived(tmp_path: Path):
 
 def test_group_cancel_persists_snapshot_operation(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     submit(cfg, ["echo", "ok"], group="exp")
     group = group_control(cfg, "exp", "cancel")
     operation = group["cancellation_operation"]
@@ -413,6 +428,7 @@ def test_group_cancel_persists_snapshot_operation(tmp_path: Path):
 
 def test_default_group_cancel_does_not_block_authorized_attempt_recovery(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
@@ -437,6 +453,7 @@ def test_default_group_cancel_does_not_block_authorized_attempt_recovery(tmp_pat
 
 def test_doctor_restores_terminating_group_cancel_intent(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
@@ -461,6 +478,7 @@ def test_doctor_restores_terminating_group_cancel_intent(tmp_path: Path):
 
 def test_agent_reconciliation_completes_group_cancel_operation(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
@@ -490,6 +508,7 @@ def test_agent_reconciliation_completes_group_cancel_operation(tmp_path: Path, m
 
 def test_group_show_reconciles_waiting_cancel_operation(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
