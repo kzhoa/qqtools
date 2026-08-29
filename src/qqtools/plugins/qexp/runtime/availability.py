@@ -581,6 +581,7 @@ def reconcile_availability_operations(
         if control.get("state") not in {"prepared", "blocked"}:
             continue
         if control.get("state") == "blocked" and control.get("blocked_reason"):
+            archive_operation(cfg, "availability", control["operation_id"], operation)
             continue
         request = AvailabilityTransitionRequest(
             action=control["operation_type"], task_id=control["task_id"],

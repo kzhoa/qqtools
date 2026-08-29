@@ -164,14 +164,20 @@ def group_control(
 def reconcile_group_cancel_operations(
         cfg: RootConfig, group_name: str | None = None, *,
         include_legacy: bool = True) -> list[dict[str, Any]]:
-    """Rebuild durable Group cancellation operation status from current Task truth."""
+    """Rebuild durable Group control operation status from current Task truth."""
     reconciled: list[dict[str, Any]] = []
     for operation_path in iter_active_operation_paths(
         cfg, "group_control", include_legacy=include_legacy
     ):
         operation = read_json(operation_path)
         control = operation.get("group_control", {})
-        if control.get("operation_type") != "cancel":
+        operation_type = control.get("operation_type")
+        if operation_type == "worker_remove":
+            result = _reconcile_worker_remove_operation(cfg, operation_path, operation, group_name)
+            if result is not None:
+                reconciled.append(result)
+            continue
+        if operation_type != "cancel":
             continue
         if control.get("state") not in {"converging", "waiting_ack", "blocked"}:
             continue
@@ -194,6 +200,9 @@ def reconcile_group_cancel_operations(
                 operation["meta"]["revision"] += 1
                 operation["meta"]["updated_at"] = utc_now()
                 atomic_replace(operation_path, operation)
+                archive_operation(
+                    cfg, "group_control", control["operation_id"], operation
+                )
                 snapshot = group_data.get("cancellation_operation") or {}
                 if snapshot.get("operation_id") == control["operation_id"]:
                     group_data["cancellation_operation"] = control
@@ -264,6 +273,79 @@ def reconcile_group_cancel_operations(
                 atomic_replace(group_file, group_data)
             reconciled.append(control)
     return reconciled
+
+
+def _reconcile_worker_remove_operation(
+        cfg: RootConfig, operation_path: Path, operation: dict[str, Any],
+        group_name: str | None) -> dict[str, Any] | None:
+    control = operation.get("group_control", {})
+    if control.get("state") not in {"converging", "waiting_ack"}:
+        return None
+    name = control.get("group_name")
+    machine = control.get("machine_name")
+    if not name or not machine or (group_name is not None and name != group_name):
+        return None
+    with group_lock(cfg.shared_root, name):
+        group_file = group_path(cfg.shared_root, name)
+        if not group_file.exists():
+            return None
+        group_data = read_json(group_file)
+        workers = group_data["group"].get("worker_set", {})
+        worker = workers.get(machine)
+        if worker is None:
+            control.update({"state": "completed", "completed_at": control.get("completed_at") or utc_now(),
+                            "updated_at": utc_now()})
+            operation["meta"]["revision"] += 1
+            operation["meta"]["updated_at"] = utc_now()
+            archive_operation(cfg, "group_control", control["operation_id"], operation)
+            return control
+        blockers: list[str] = []
+        for task_file in iter_json(shared_paths(cfg.shared_root)["tasks"]):
+            task = TaskRecord.from_dict(read_json(task_file))
+            if task.group_name != name:
+                continue
+            claim = task.claim_control.get("active_claim") or {}
+            if claim.get("machine_name") == machine:
+                if control.get("terminate_running"):
+                    with task_lock(cfg.shared_root, task.task_id):
+                        task = load_task(cfg, task.task_id)
+                        current_claim = task.claim_control.get("active_claim") or {}
+                        if current_claim.get("machine_name") == machine:
+                            task.control.update({"cancellation_requested_at": utc_now(), "terminate_running": True,
+                                                 "requested_by": cfg.machine_name,
+                                                 "cancellation_operation_id": control["operation_id"]})
+                            task.meta["revision"] += 1
+                            task.meta["updated_at"] = utc_now()
+                            save_task(cfg, task)
+                blockers.append(task.task_id)
+            if task.state["projection"] == "queued" and task.placement_policy["home_machine"] == machine:
+                blockers.append(task.task_id)
+        control["blockers"] = sorted(set(blockers))
+        if blockers:
+            control.update({"state": "waiting_ack", "completed_at": None,
+                            "updated_at": utc_now()})
+            operation["meta"]["revision"] += 1
+            operation["meta"]["updated_at"] = utc_now()
+            write_active_operation(cfg, "group_control", control["operation_id"], operation)
+        else:
+            if worker.get("state") != "removing":
+                worker["state"] = "removing"
+                worker["state_epoch"] += 1
+                worker["remove_requested_at"] = worker.get("remove_requested_at") or utc_now()
+                group_data["group"]["worker_set_epoch"] += 1
+            control.update({"state": "completed", "completed_at": control.get("completed_at") or utc_now(),
+                            "updated_at": utc_now()})
+            operation["meta"]["revision"] += 1
+            operation["meta"]["updated_at"] = utc_now()
+        snapshot = group_data.get("worker_control") or {}
+        if snapshot.get("operation_id") == control["operation_id"]:
+            group_data["worker_control"] = control
+        group_data["meta"]["revision"] += 1
+        group_data["meta"]["updated_at"] = utc_now()
+        atomic_replace(group_file, group_data)
+        if control["state"] == "completed":
+            archive_operation(cfg, "group_control", control["operation_id"], operation)
+        return control
 
 
 def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -> dict[str, Any]:
