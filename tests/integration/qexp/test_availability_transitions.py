@@ -17,7 +17,7 @@ from qqtools.plugins.qexp.runtime.availability import rebuild_deadline_indexes
 from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
-from qqtools.plugins.qexp.scheduler import claim_task
+from qqtools.plugins.qexp.scheduler import claim_task, fail_attempt
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -256,3 +256,58 @@ def test_agent_removes_stale_deadline_index_without_skipping_remaining_work(tmp_
 
     assert not stale.exists()
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
+
+
+def test_offer_due_tasks_skips_stale_deadline_for_claimed_task(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(
+        cfg,
+        ["echo", "ok"],
+        group="exp",
+        sharing_mode="spillover",
+        offer_after_seconds=0,
+    )
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.project_maintenance.elapsed_offer_is_proven",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.project_maintenance.offer",
+        lambda *_args, **_kwargs: pytest.fail("claimed Tasks must not be offered"),
+    )
+
+    offer_due_tasks(cfg)
+
+    assert load_task(cfg, task.task_id).claim_control["active_claim"]["attempt_id"] == attempt.attempt_id
+    assert not list(shared_paths(cfg.shared_root)["availability_active"].glob("*.json"))
+
+
+def test_offer_due_tasks_skips_stale_deadline_for_terminal_task(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(
+        cfg,
+        ["echo", "ok"],
+        group="exp",
+        sharing_mode="spillover",
+        offer_after_seconds=0,
+    )
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.project_maintenance.elapsed_offer_is_proven",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.project_maintenance.offer",
+        lambda *_args, **_kwargs: pytest.fail("terminal Tasks must not be offered"),
+    )
+
+    offer_due_tasks(cfg)
+
+    assert load_task(cfg, task.task_id).state["projection"] == "failed"
+    assert not list(shared_paths(cfg.shared_root)["availability_active"].glob("*.json"))

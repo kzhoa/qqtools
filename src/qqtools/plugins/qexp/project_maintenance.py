@@ -146,6 +146,8 @@ def offer_due_tasks(cfg: RootConfig) -> None:
                 remove_deadline_index(cfg, task_id)
                 continue
             sync_deadline_index(cfg, task)
+            if task.state["projection"] != "queued" or task.claim_control.get("active_claim"):
+                continue
             if task.placement_policy["home_machine"] != cfg.machine_name or not offer_due(task):
                 continue
             if not elapsed_offer_is_proven(cfg, task):

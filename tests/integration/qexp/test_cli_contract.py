@@ -415,6 +415,7 @@ def test_agent_restart_returns_structured_status(tmp_path: Path, monkeypatch, ca
     runtime_root = tmp_path / "machine-runtime"
     class FakeProcess:
         pid = 987
+        previous_pid = 432
 
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.restart_machine_agent", lambda _runtime: FakeProcess(),
@@ -425,7 +426,9 @@ def test_agent_restart_returns_structured_status(tmp_path: Path, monkeypatch, ca
     )
 
     assert main(["--machine-runtime-root", str(runtime_root), "agent", "restart", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out)["pid"] == 987
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pid"] == 987
+    assert payload["previous_pid"] == 432
 
 
 def test_agent_add_project_is_explicit_and_machine_agent_prefix_is_not_public(tmp_path: Path, capsys) -> None:
