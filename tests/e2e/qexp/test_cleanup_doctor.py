@@ -65,9 +65,33 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
         wait_for(is_done, timeout=TASK_TERMINAL_TIMEOUT_SECONDS, label="failing task terminal state")
         task = jrun([*common, "task", "show", task_id], env=env)
         logs = run([*common, "logs", task_id], env=env).stdout
-        clean = jrun([*common, "clean", "--task-id", task_id], env=env)
+        clean = None
+
+        def clean_after_local_process_exit() -> bool:
+            nonlocal clean
+            try:
+                clean = jrun([*common, "clean", "--task-id", task_id], env=env)
+            except RuntimeError as exc:
+                marker = "cannot be cleaned: "
+                message = str(exc)
+                if marker not in message:
+                    raise
+                blockers = message.rsplit(marker, 1)[1].splitlines()[0].split(", ")
+                if not blockers or any(
+                    not blocker.startswith("local_process:") for blocker in blockers
+                ):
+                    raise
+                return False
+            return True
+
+        wait_for(
+            clean_after_local_process_exit,
+            timeout=TASK_TERMINAL_TIMEOUT_SECONDS,
+            label="local process cleanup eligibility",
+        )
         verify = jrun([*common, "doctor", "verify"], env=env)
 
+        assert clean is not None
         assert "site-packages" in imported_from
         assert task["task"]["state"]["projection"] == "failed"
         assert "fail ok" in logs
