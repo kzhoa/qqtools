@@ -1153,6 +1153,7 @@ with runtime.scheduler_authority(blocking=True):
     try:
         assert time.monotonic() - started_at >= 0.25
         assert old_process.returncode == 0
+        assert new_process.previous_pid == old_process.pid
         assert get_machine_agent_status(runtime)["pid"] == new_process.pid
     finally:
         stop_machine_agent(runtime)

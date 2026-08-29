@@ -1142,7 +1142,11 @@ def restart_machine_agent(
     """Replace a running machine agent without treating it as a cold start."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     with machine_runtime.agent_lifecycle_guard():
+        identity = _active_machine_identity(machine_runtime)
+        previous_pid = identity[0] if identity is not None else None
         _stop_machine_agent_locked(machine_runtime, timeout=10.0)
-        return _start_machine_agent_locked(
+        process = _start_machine_agent_locked(
             machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr
         )
+        process.previous_pid = previous_pid
+        return process

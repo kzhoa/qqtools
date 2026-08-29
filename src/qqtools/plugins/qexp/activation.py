@@ -129,4 +129,8 @@ def restart_local_agent(
     del cfg
     runtime = machine_runtime or MachineRuntime()
     process = restart_machine_agent(runtime)
-    return "restarted", {**get_machine_agent_status(runtime), "pid": process.pid}
+    return "restarted", {
+        **get_machine_agent_status(runtime),
+        "pid": process.pid,
+        "previous_pid": getattr(process, "previous_pid", None),
+    }

@@ -346,7 +346,16 @@ def main(argv: list[str] | None = None) -> int:
                 _emit("agent", {"action": "stopped" if stopped else "already_stopped", **get_machine_agent_status(runtime)}, args.format)
             else:
                 process = restart_machine_agent(runtime)
-                _emit("agent", {"action": "restarted", **get_machine_agent_status(runtime), "pid": process.pid}, args.format)
+                _emit(
+                    "agent",
+                    {
+                        "action": "restarted",
+                        **get_machine_agent_status(runtime),
+                        "pid": process.pid,
+                        "previous_pid": getattr(process, "previous_pid", None),
+                    },
+                    args.format,
+                )
             return 0
         cfg = _resolve_cfg(args)
         execution_context: ExecutionContext | None = None
