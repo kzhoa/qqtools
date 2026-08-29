@@ -15,7 +15,8 @@
   healthy project from being reported as stale after deadline-index migration.
 - test: separate fast qexp unit checks from release-only integration coverage, add deterministic
   `qexp-unit`, `qexp-integration`, and `qexp-full` tox environments, and require the complete qexp
-  source suite plus installed-wheel E2E before publishing.
+  source suite plus installed-wheel E2E before publishing. Cleanup E2E now waits only for the
+  expected local process-evidence convergence window while continuing to fail on other blockers.
 
 ## v1.3.8
 
