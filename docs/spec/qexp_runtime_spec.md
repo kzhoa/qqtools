@@ -249,27 +249,7 @@ or provide a separately fenced recovery protocol. File existence alone must neve
 treated as proof that a lock is still owned, and agents must not delete an apparently old
 lock solely from wall-clock age.
 
-### 5.2 Filesystem Qualification Gate
-
-Cross-machine dispatch is fail-closed until two distinct deployment hosts produce one successful
-qualification result for the same mounted control root. The probe contract requires both hosts
-to participate in each test and records their stable operator-supplied identities. It verifies:
-
-1. an exclusive lock has exactly one holder while the peer observes contention;
-2. readers observe either the old or complete new payload across atomic replacement, never a
-   partial payload;
-3. a file and its parent-directory replacement become visible to the peer after file and
-   directory `fsync` complete;
-4. process exit releases the lock, while an incomplete temporary write is never interpreted as
-   committed truth.
-
-Missing evidence, identical host identities, timeout, malformed payload, inconsistent observation,
-or any failed property yields `not_qualified` with property-specific reasons. A process-local mock
-or single-host test can verify the judge but cannot qualify a deployment. Probe output is deployment
-evidence only: it never mutates scheduler budgets, partition counts, persisted Task truth, or global
-defaults. Single-host scheduling does not require a fabricated qualification result.
-
-### 5.3 Lock Order
+### 5.2 Lock Order
 
 All implementations use this global lock order:
 

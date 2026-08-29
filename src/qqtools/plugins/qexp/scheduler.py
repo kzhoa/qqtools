@@ -30,10 +30,6 @@ from .executor import Executor
 from .config_types import RootConfig
 from .runtime.locks import group_lock, task_lock
 from .runtime.claims import archive_claim
-from .runtime.filesystem_qualification import (
-    load_filesystem_qualification,
-    require_cross_host_filesystem_qualification,
-)
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, submission_path
 from .runtime.records import AttemptRecord, TaskRecord, TaskSpec, utc_now
 from .runtime.ready import (
@@ -204,14 +200,6 @@ def _eligible(cfg: RootConfig, task: TaskRecord) -> bool:
     return group_file.exists() and _group_allows(read_json(group_file), task, cfg.machine_name)
 
 
-def _is_cross_host_filesystem_qualified(cfg: RootConfig, task: TaskRecord) -> bool:
-    """Return whether this claim needs and has deployment qualification."""
-    return (
-        task.placement_policy["home_machine"] == cfg.machine_name
-        or load_filesystem_qualification(cfg).is_qualified
-    )
-
-
 def _clock_evidence(observation: ClockObservation) -> dict[str, Any]:
     return {
         "clock_error_bound_seconds": observation.bound_at(time.monotonic()),
@@ -231,16 +219,12 @@ def _claim(
     reservation_runtime_root: Path,
 ) -> AttemptRecord | None:
     task = load_task(cfg, task_id)
-    if task.placement_policy["home_machine"] != cfg.machine_name:
-        if not _eligible(cfg, task):
-            return None
-        require_cross_host_filesystem_qualification(cfg)
+    if task.placement_policy["home_machine"] != cfg.machine_name and not _eligible(cfg, task):
+        return None
     with authority_locks(cfg, task):
         task = load_task(cfg, task_id)
         if not _eligible(cfg, task):
             return None
-        if task.placement_policy["home_machine"] != cfg.machine_name:
-            require_cross_host_filesystem_qualification(cfg)
         attempt_number = task.attempt_control["next_attempt_number"]
         attempt_id = f"{task.task_id}-attempt-{attempt_number}"
         token = task.claim_control["fencing_epoch"] + 1
@@ -339,10 +323,8 @@ def claim_task(
     project_id: str | None = None,
 ) -> AttemptRecord | None:
     task = load_task(cfg, task_id)
-    if task.placement_policy["home_machine"] != cfg.machine_name:
-        if not _eligible(cfg, task):
-            return None
-        require_cross_host_filesystem_qualification(cfg)
+    if task.placement_policy["home_machine"] != cfg.machine_name and not _eligible(cfg, task):
+        return None
     policy = load_lease_policy(cfg)
     capability = clock_capability(cfg, policy)
     authority_mode = "bounded_lease" if capability.is_healthy else "holder_bound"
@@ -431,14 +413,7 @@ def resume_starting_attempt(
             or attempt.phase not in {"claimed", "starting"}
         ):
             return None
-        if not _is_cross_host_filesystem_qualified(cfg, task):
-            cancel_result = _cancel_prelaunch_locked(
-                cfg,
-                task,
-                "filesystem_unqualified",
-                {"claimed", "starting"},
-            )
-        elif task.control.get("cancellation_requested_at"):
+        if task.control.get("cancellation_requested_at"):
             cancel_result = _cancel_prelaunch_locked(cfg, task, "cancelled_before_launch", {"claimed", "starting"})
         elif task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
             return None
@@ -510,13 +485,7 @@ def authorize_launch(
             or attempt.machine_name != cfg.machine_name
         ):
             return False
-        if not _is_cross_host_filesystem_qualified(cfg, task):
-            cancel_result = _cancel_prelaunch_locked(
-                cfg,
-                task,
-                "filesystem_unqualified",
-            )
-        elif claim.get("launch_state") == "starting":
+        if claim.get("launch_state") == "starting":
             return False
         elif (
             claim.get("launch_state") != "claimed"
