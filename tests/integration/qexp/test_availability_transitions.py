@@ -11,6 +11,7 @@ from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import change_worker
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
+from qqtools.plugins.qexp.runtime.active_operations import active_operation_path, write_active_operation
 from qqtools.plugins.qexp.runtime import availability as availability_runtime
 from qqtools.plugins.qexp.runtime.availability import rebuild_deadline_indexes
 from qqtools.plugins.qexp.runtime.paths import shared_paths
@@ -115,6 +116,32 @@ def test_doctor_replays_prepared_availability_operation(tmp_path: Path):
     assert stored.placement_policy["sharing_mode"] == "spillover"
     assert stored.placement_runtime["queue_scope"] == "shared"
     assert read_json(operation_path)["availability_operation"]["state"] == "completed"
+
+
+def test_doctor_archives_blocked_availability_operation_with_reason(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    operation_id = "blocked-share"
+    operation_path = active_operation_path(cfg, "availability", operation_id)
+    write_active_operation(cfg, "availability", operation_id, {"meta": {"schema_version": 6, "revision": 1,
+        "created_at": "2026-08-06T00:00:00Z", "updated_at": "2026-08-06T00:00:00Z",
+        "updated_by": {"actor_type": "cli", "machine_name": "g1", "process_id": "test"}},
+        "availability_operation": {"operation_id": operation_id, "operation_type": "share_now",
+        "task_id": task.task_id, "state": "blocked", "requested_by": "g1", "reason": "manual",
+        "helper_machines": None, "after_seconds": None, "created_at": "2026-08-06T00:00:00Z",
+        "updated_at": "2026-08-06T00:00:00Z", "completed_at": None,
+        "blocked_reason": "placement can only change while a Task is queued and unclaimed.",
+        "task_revision_before": None, "task_revision_after": None, "result": None}})
+
+    archived_path = shared_paths(cfg.shared_root)["availability"] / f"{operation_id}.json"
+    assert archived_path.is_symlink()
+
+    repair_metadata(cfg)
+
+    assert not operation_path.exists()
+    assert archived_path.exists()
+    assert not archived_path.is_symlink()
+    assert read_json(archived_path)["availability_operation"]["state"] == "blocked"
 
 
 def test_doctor_completes_operation_after_post_task_side_effect_failure(

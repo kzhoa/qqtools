@@ -137,8 +137,7 @@ def iter_active_operation_paths(
                 record = read_json(path)
             except (OSError, KeyError, TypeError, ValueError):
                 continue
-            state = _operation_state(kind, record)
-            if state in _terminal_states(kind):
+            if _operation_is_terminal(kind, record):
                 continue
             yielded += 1
             yield path
@@ -153,6 +152,18 @@ def _terminal_states(kind: ActiveOperationKind) -> frozenset[str]:
     if kind == "availability":
         return frozenset({"completed"})
     return frozenset({"completed"})
+
+
+def _operation_is_terminal(kind: ActiveOperationKind, record: dict) -> bool:
+    state = _operation_state(kind, record)
+    if state in _terminal_states(kind):
+        return True
+    if kind == "availability":
+        return (
+            state == "blocked"
+            and bool(record.get("availability_operation", {}).get("blocked_reason"))
+        )
+    return False
 
 
 def migrate_legacy_active_operations(cfg: object) -> None:
@@ -178,7 +189,7 @@ def migrate_legacy_active_operations(cfg: object) -> None:
                         record = read_json(path)
                     except (OSError, KeyError, TypeError, ValueError):
                         continue
-                    if _operation_state(kind, record) in _terminal_states(kind):
+                    if _operation_is_terminal(kind, record):
                         continue
                     active = active_operation_path(cfg, kind, path.stem)
                     atomic_replace(active, record)

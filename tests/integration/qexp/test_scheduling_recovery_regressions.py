@@ -13,6 +13,7 @@ from qqtools.plugins.qexp.commands.group import (
 from qqtools.plugins.qexp.doctor import repair_metadata
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks, reconcile_project_reservations
 from qqtools.plugins.qexp.runner import run_attempt
+from qqtools.plugins.qexp.runtime.active_operations import active_operation_path, write_active_operation
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
 from qqtools.plugins.qexp.runtime.recovery import recover_running_attempt
@@ -345,6 +346,59 @@ def test_worker_removal_drains_before_reporting_home_queue_blocker(tmp_path: Pat
     group = change_worker(cfg, "exp", "g1", "remove")
     assert group["group"]["worker_set"]["g1"]["state"] == "draining"
     assert group["worker_control"]["state"] == "waiting_ack"
+
+
+def test_worker_removal_operation_completes_after_blocker_clears(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    group = change_worker(cfg, "exp", "g1", "remove")
+    operation_id = group["worker_control"]["operation_id"]
+    active_path = active_operation_path(cfg, "group_control", operation_id)
+    stable_path = cfg.shared_root / "operations" / "group-control" / f"{operation_id}.json"
+    assert active_path.exists()
+    assert stable_path.is_symlink()
+
+    cancel_task(cfg, task.task_id, terminate_running=False)
+    reconciled = reconcile_group_cancel_operations(cfg)
+
+    assert any(item["operation_id"] == operation_id and item["state"] == "completed"
+               for item in reconciled)
+    assert not active_path.exists()
+    assert stable_path.exists()
+    assert not stable_path.is_symlink()
+    assert read_json(stable_path)["group_control"]["state"] == "completed"
+    assert show_group(cfg, "exp")["group"]["worker_set"]["g1"]["state"] == "removing"
+
+
+def test_missing_group_barrier_blocked_operation_is_archived(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    submit(cfg, ["echo", "ok"], group="exp")
+    operation_id = "missing-barrier"
+    active_path = active_operation_path(cfg, "group_control", operation_id)
+    write_active_operation(cfg, "group_control", operation_id, {"meta": {
+        "schema_version": 6, "revision": 1, "created_at": "2026-08-06T00:00:00Z",
+        "updated_at": "2026-08-06T00:00:00Z",
+        "updated_by": {"actor_type": "cli", "machine_name": "g1", "process_id": "test"}},
+        "group_control": {"operation_id": operation_id, "operation_type": "cancel",
+        "group_name": "exp", "state": "converging", "group_revision_at_start": 1,
+        "dispatch_epoch_at_start": 0, "membership_high_watermark": 1,
+        "terminate_running": False, "progress": {"target_tasks": 0,
+        "already_terminal": 0, "queued_cancelled": 0, "prelaunch_cancelled": 0,
+        "running_allowed": 0, "termination_pending": 0, "termination_acknowledged": 0,
+        "blocked": 0}, "pending_machine_acknowledgements": {},
+        "created_at": "2026-08-06T00:00:00Z", "updated_at": "2026-08-06T00:00:00Z",
+        "completed_at": None, "blocked_reason": None}})
+    stable_path = cfg.shared_root / "operations" / "group-control" / f"{operation_id}.json"
+    assert stable_path.is_symlink()
+
+    reconcile_group_cancel_operations(cfg)
+
+    assert not active_path.exists()
+    assert stable_path.exists()
+    assert not stable_path.is_symlink()
+    control = read_json(stable_path)["group_control"]
+    assert control["state"] == "blocked"
+    assert control["blocked_reason"] == "cancellation_barrier_missing"
 
 
 def test_group_cancel_persists_snapshot_operation(tmp_path: Path):
