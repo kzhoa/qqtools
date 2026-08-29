@@ -1,5 +1,11 @@
 # History
 
+## v1.3.10
+
+- fix: archive settled qexp active operations so blocked availability controls and unrecoverable
+  Group-control failures no longer remain in the active operation directory, and worker-removal
+  operations complete once their blockers clear.
+
 ## v1.3.9
 
 - feat: replace history-sized qexp scheduling scans with a bounded ready index, capacity-first
