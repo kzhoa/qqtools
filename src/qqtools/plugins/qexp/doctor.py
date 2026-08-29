@@ -17,6 +17,7 @@ from .runtime.locks import group_lock, task_lock
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
 from .runtime.records import AttemptRecord, TaskRecord, utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
+from .runtime.submission import finalize_submission_group
 from .runtime.termination import list_decisions
 from .runtime.tasks import load_task
 from .runtime.ready import (
@@ -386,6 +387,14 @@ def repair_metadata(
         group_data = read_json(group_file)
         pending = group_data["group"].get("pending_submission_commit") or {}
         if pending.get("operation_id") != operation["operation_id"]:
+            continue
+        if operation["state"] == "committed":
+            try:
+                finalize_submission_group(cfg, operation)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                blocked.append(operation["operation_id"])
+                continue
+            repaired.append(operation["operation_id"])
             continue
         if operation["state"] in {"committed", "aborted", "blocked"}:
             group_data["group"]["pending_submission_commit"] = None

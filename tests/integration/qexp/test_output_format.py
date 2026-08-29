@@ -5,10 +5,13 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _base_args(cfg) -> list[str]:
+    machine_runtime_root = cfg.runtime_root.parent / "machine-runtime"
+    MachineRuntime(machine_runtime_root).ensure_binding(cfg.shared_root, cfg.machine_name)
     return [
         "--shared-root",
         str(cfg.shared_root),
@@ -16,6 +19,8 @@ def _base_args(cfg) -> list[str]:
         cfg.machine_name,
         "--runtime-root",
         str(cfg.runtime_root),
+        "--machine-runtime-root",
+        str(machine_runtime_root),
     ]
 
 

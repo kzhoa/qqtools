@@ -6,6 +6,7 @@ import pytest
 from qqtools.plugins.qexp import AGENT_MODE_DAEMON, init_shared_root, submit
 from qqtools.plugins.qexp.agent import get_agent_status
 from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.layout import load_root_config, runtime_pid_path
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -14,8 +15,11 @@ from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, expire_
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _base_args(cfg) -> list[str]:
+    machine_runtime_root = cfg.runtime_root.parent / "machine-runtime"
+    MachineRuntime(machine_runtime_root).ensure_binding(cfg.shared_root, cfg.machine_name)
     return ["--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,
-            "--runtime-root", str(cfg.runtime_root)]
+            "--runtime-root", str(cfg.runtime_root), "--machine-runtime-root",
+            str(machine_runtime_root)]
 
 
 def test_task_cancel_reports_pending_acknowledgement(tmp_path: Path, capsys):
@@ -233,7 +237,10 @@ def test_submit_requires_explicit_project_registration(tmp_path: Path, capsys):
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text("not-a-pid", encoding="utf-8")
 
-    assert main([*_base_args(cfg), "submit", "--", "echo", "ok"]) == 2
+    args = ["--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,
+            "--runtime-root", str(cfg.runtime_root), "--machine-runtime-root",
+            str(tmp_path / "machine-runtime"), "submit", "--", "echo", "ok"]
+    assert main(args) == 2
     assert "qexp agent add-project" in capsys.readouterr().err
 
 
@@ -274,7 +281,7 @@ def test_submit_requests_local_agent_activation(tmp_path: Path, monkeypatch):
     reasons: list[str] = []
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.ensure_local_agent_active",
-        lambda cfg, *, reason: reasons.append(reason) or True,
+        lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
     assert main([*_base_args(cfg), "submit", "--", "echo", "ok"]) == 0
@@ -287,7 +294,7 @@ def test_submit_without_activation_persists_task_and_skips_local_agent(
     reasons: list[str] = []
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.ensure_local_agent_active",
-        lambda cfg, *, reason: reasons.append(reason) or True,
+        lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
     assert main([*_base_args(cfg), "submit", "--no-activate", "--", "echo", "ok"]) == 0
@@ -308,12 +315,13 @@ def test_submit_without_activation_does_not_start_local_agent(tmp_path: Path):
 
 def test_batch_submit_requests_local_agent_activation(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "demo")
     manifest = tmp_path / "runs.yaml"
     manifest.write_text("tasks:\n  - command: ['echo', 'ok']\n", encoding="utf-8")
     reasons: list[str] = []
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.ensure_local_agent_active",
-        lambda cfg, *, reason: reasons.append(reason) or True,
+        lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
     assert main([*_base_args(cfg), "batch-submit", "--file", str(manifest), "--group", "demo"]) == 0
@@ -334,7 +342,7 @@ def test_retry_requests_local_agent_activation(tmp_path: Path, monkeypatch):
     reasons: list[str] = []
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.ensure_local_agent_active",
-        lambda cfg, *, reason: reasons.append(reason) or True,
+        lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
     assert main([*_base_args(cfg), "task", "retry", task.task_id, "--acknowledge-duplicate-risk"]) == 0
@@ -343,11 +351,12 @@ def test_retry_requests_local_agent_activation(tmp_path: Path, monkeypatch):
 
 def test_offer_requests_local_agent_activation(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "demo")
     task = submit(cfg, ["echo", "ok"], group="demo", sharing_mode="spillover")
     reasons: list[str] = []
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.ensure_local_agent_active",
-        lambda cfg, *, reason: reasons.append(reason) or True,
+        lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
     assert main([*_base_args(cfg), "task", "offer", task.task_id]) == 0
@@ -361,7 +370,7 @@ def test_group_resume_requests_local_agent_activation(tmp_path: Path, monkeypatc
     reasons: list[str] = []
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.ensure_local_agent_active",
-        lambda cfg, *, reason: reasons.append(reason) or True,
+        lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
     assert main([*_base_args(cfg), "group", "resume", "demo"]) == 0
@@ -370,6 +379,7 @@ def test_group_resume_requests_local_agent_activation(tmp_path: Path, monkeypatc
 
 def test_group_retry_failed_skips_blocked_orphans_and_requests_activation(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "demo")
     failed_task = submit(cfg, ["echo", "failed"], group="demo")
     failed_attempt = claim_task(cfg, failed_task.task_id, [0])
     assert failed_attempt is not None
@@ -388,7 +398,7 @@ def test_group_retry_failed_skips_blocked_orphans_and_requests_activation(tmp_pa
     reasons: list[str] = []
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.ensure_local_agent_active",
-        lambda cfg, *, reason: reasons.append(reason) or True,
+        lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
     assert main([*_base_args(cfg), "group", "retry-failed", "demo"]) == 0
@@ -462,7 +472,9 @@ def test_machine_agent_status_branches_before_project_configuration(tmp_path: Pa
 def test_agent_project_registry_commands(tmp_path: Path, capsys) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime_root = tmp_path / "machine-runtime"
-    base = [*_base_args(cfg), "--machine-runtime-root", str(runtime_root), "agent"]
+    base = ["--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,
+            "--runtime-root", str(cfg.runtime_root), "--machine-runtime-root", str(runtime_root),
+            "agent"]
 
     assert main([*base, "add-project", "--format=json"]) == 0
     added = json.loads(capsys.readouterr().out)
@@ -487,10 +499,13 @@ def test_agent_project_add_can_register_while_scheduler_is_running(
     )
     runtime_root = tmp_path / "machine-runtime"
     runtime = MachineRuntime(runtime_root)
+    base = ["--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,
+            "--runtime-root", str(cfg.runtime_root), "--machine-runtime-root", str(runtime_root),
+            "agent"]
 
     with runtime.scheduler_authority(blocking=True):
         result = main([
-            *_base_args(cfg), "--machine-runtime-root", str(runtime_root), "agent", "add-project",
+            *base, "add-project",
         ])
 
     assert result == 0

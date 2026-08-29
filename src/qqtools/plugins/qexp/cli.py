@@ -38,7 +38,7 @@ from .machine_agent import (
     unregister_project,
 )
 from .machine_config import init_shared_root, load_machine_policy
-from .machine_runtime import ExecutionContext, MachineRuntime, resolve_execution_context
+from .machine_runtime import ExecutionContext, MachineRuntime
 from .notification_config import (
     DEFAULT_WEBHOOK_ENV,
     load_notifications,
@@ -59,24 +59,107 @@ def _emit(
     print(render(kind, result, output_format, tasks=tasks or ()), flush=flush)
 
 
-def _resolve_cfg(args: argparse.Namespace):
-    shared = getattr(args, "shared_root", None) or os.environ.get("QEXP_SHARED_ROOT")
-    machine = getattr(args, "machine", None) or os.environ.get("QEXP_MACHINE")
-    runtime = getattr(args, "runtime_root", None) or os.environ.get("QEXP_RUNTIME_ROOT")
-    context = load_context() if not shared or not machine else None
-    if context:
-        shared = shared or context.get("shared_root")
-        machine = machine or context.get("machine")
-        runtime = runtime or context.get("runtime_root")
-    if not shared or not machine:
-        raise ValueError("--shared-root and --machine are required or must be saved with qexp use.")
-    return load_root_config(shared, machine, runtime, require_initialized=True)
+def _machine_assertion(args: argparse.Namespace) -> str | None:
+    """Return the caller's identity assertion after checking duplicate inputs."""
+    flag_value = getattr(args, "machine", None)
+    environment_value = os.environ.get("QEXP_MACHINE")
+    if flag_value is not None and environment_value is not None and flag_value != environment_value:
+        raise ValueError(
+            f"--machine {flag_value!r} conflicts with QEXP_MACHINE {environment_value!r}."
+        )
+    return flag_value if flag_value is not None else environment_value
+
+
+def _shared_root_input(args: argparse.Namespace) -> tuple[str | None, dict | None]:
+    """Resolve only the shared-root locator; saved identity fields are intentionally ignored."""
+    flag_value = getattr(args, "shared_root", None)
+    environment_value = os.environ.get("QEXP_SHARED_ROOT")
+    context = load_context() if flag_value is None and environment_value is None else None
+    shared = flag_value or environment_value or (context or {}).get("shared_root")
+    return shared, context
+
+
+def _requires_verified_binding(args: argparse.Namespace) -> bool:
+    """Classify commands that can create or change project-owned state."""
+    if args.command in {"submit", "batch-submit", "clean"}:
+        return True
+    if args.command == "config":
+        return (
+            getattr(args, "notifications_action", None) == "set"
+            or getattr(args, "provider_action", None) == "set"
+        )
+    if args.command == "lease-policy":
+        return args.lease_policy_action == "set"
+    if args.command == "task":
+        return args.task_action not in {"list", "show", "logs"}
+    if args.command == "group":
+        return args.group_action not in {"list", "show"}
+    if args.command == "agent":
+        return args.agent_action in {"start", "run"}
+    return args.command == "doctor" and args.action == "repair"
+
+
+def _resolve_cfg(
+    args: argparse.Namespace, *, require_binding: bool
+) -> tuple[object, ExecutionContext]:
+    shared, saved_context = _shared_root_input(args)
+    if not shared:
+        raise ValueError("--shared-root is required or must be saved with qexp use.")
+    assertion = _machine_assertion(args)
+    machine_runtime = MachineRuntime(getattr(args, "machine_runtime_root", None))
+
+    if require_binding:
+        execution_context = machine_runtime.verified_execution_context(shared)
+        verified_machine = execution_context.cfg.machine_name
+        if assertion is not None and assertion != verified_machine:
+            raise ValueError(
+                f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}.\n"
+                f"Use '--home-machine {assertion}' to select Task placement."
+            )
+        return execution_context.cfg, execution_context
+
+    # Read-only project commands should use the binding-owned local runtime when one is
+    # available, while remaining usable for observation before local registration.
+    if not (args.command == "agent" and args.agent_action in {"add-project", "migrate-project"}):
+        try:
+            execution_context = machine_runtime.verified_execution_context(shared)
+        except (ValueError, RuntimeError):
+            execution_context = None
+        if execution_context is not None:
+            verified_machine = execution_context.cfg.machine_name
+            if assertion is not None and assertion != verified_machine:
+                raise ValueError(
+                    f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}."
+                )
+            return execution_context.cfg, execution_context
+
+    # Read-only project observation must remain possible without a local binding. The sentinel is
+    # never used as an authority source because this branch is not used for mutations.
+    legacy_machine = assertion
+    if args.command == "agent" and args.agent_action in {"add-project", "migrate-project"}:
+        legacy_machine = legacy_machine or (saved_context or {}).get("machine")
+    machine = legacy_machine or "unbound"
+    runtime = None
+    if args.command == "agent" and args.agent_action == "migrate-project":
+        runtime = getattr(args, "runtime_root", None) or os.environ.get("QEXP_RUNTIME_ROOT")
+        runtime = runtime or (saved_context or {}).get("runtime_root")
+    cfg = load_root_config(shared, machine, runtime, require_initialized=True)
+    return cfg, ExecutionContext(cfg, machine_runtime)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="qexp schema-6 experiment queue")
-    parser.add_argument("--shared-root")
-    parser.add_argument("--machine")
+    parser = argparse.ArgumentParser(
+        description=(
+            "qexp schema-6 experiment queue; --machine is local identity, --home-machine is Task "
+            "placement, and Attempt machine is selected later by claim. qexp does not remotely "
+            "start a target agent."
+        )
+    )
+    parser.add_argument("--shared-root", help="Locate the shared project control root.")
+    parser.add_argument(
+        "--machine",
+        help="Assert the local logical machine identity; this is not the Task target machine.",
+    )
     parser.add_argument("--runtime-root")
     parser.add_argument("--machine-runtime-root")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -121,13 +204,25 @@ def build_parser() -> argparse.ArgumentParser:
     provider_set.add_argument("--secret-env")
     provider_set.add_argument("--unset-secret-env", action="store_true")
     provider_set.add_argument("--timeout-seconds", type=float)
-    submit = commands.add_parser("submit")
+    submit = commands.add_parser(
+        "submit",
+        description=(
+            "Submit one Task using the verified local identity. --home-machine selects placement; "
+            "private Tasks are executable only by that home machine. qexp does not remotely start "
+            "the target agent."
+        ),
+    )
     for action in (submit,):
         action.add_argument("--task-id")
         action.add_argument("--name")
         action.add_argument("--group")
         action.add_argument("--gpus", type=int, default=1)
         action.add_argument("--cwd")
+        action.add_argument(
+            "--home-machine",
+            default="current",
+            help="Task home placement (default: verified current machine); does not activate a remote agent.",
+        )
         action.add_argument("--sharing", choices=["private", "spillover"], default="private")
         action.add_argument("--offer-after-seconds", type=int)
         action.add_argument("--idempotency-key")
@@ -181,7 +276,7 @@ def build_parser() -> argparse.ArgumentParser:
     create = group_sub.add_parser("create")
     _add_output_format(create)
     create.add_argument("name")
-    create.add_argument("--workers", nargs="*", default=[])
+    create.add_argument("--workers", nargs="*", default=None)
     group_list = group_sub.add_parser("list")
     _add_output_format(group_list)
     show_group = group_sub.add_parser("show")
@@ -357,19 +452,15 @@ def main(argv: list[str] | None = None) -> int:
                     args.format,
                 )
             return 0
-        cfg = _resolve_cfg(args)
-        execution_context: ExecutionContext | None = None
+        cfg, execution_context = _resolve_cfg(
+            args, require_binding=_requires_verified_binding(args)
+        )
 
         def get_execution_context() -> ExecutionContext:
-            nonlocal execution_context
-            if execution_context is None:
-                execution_context = resolve_execution_context(cfg, args.machine_runtime_root)
             return execution_context
 
         def get_lifecycle_kwargs() -> dict[str, MachineRuntime]:
-            if args.machine_runtime_root is None:
-                return {}
-            return {"machine_runtime": get_execution_context().machine_runtime}
+            return {"machine_runtime": execution_context.machine_runtime}
 
         if args.command == "config":
             if args.config_action != "notifications":
@@ -486,6 +577,7 @@ def main(argv: list[str] | None = None) -> int:
                 name=args.name,
                 group=args.group,
                 working_dir=args.cwd,
+                home_machine=args.home_machine,
                 sharing_mode=args.sharing,
                 offer_after_seconds=args.offer_after_seconds,
                 idempotency_key=args.idempotency_key,
@@ -640,7 +732,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "agent":
-            runtime = MachineRuntime(args.machine_runtime_root)
+            runtime = get_execution_context().machine_runtime
             if args.agent_action == "add-project":
                 registration = register_project(runtime, cfg.shared_root, cfg.machine_name)
                 action = "project_added" if registration.is_added else "project_already_registered"

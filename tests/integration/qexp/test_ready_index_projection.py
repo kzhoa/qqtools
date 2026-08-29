@@ -6,6 +6,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
+from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
 from qqtools.plugins.qexp.runtime.active_operations import (
     iter_active_operation_paths,
@@ -84,6 +85,7 @@ def test_ready_delete_failure_does_not_roll_back_authoritative_claim(
 
 def test_scope_change_writes_new_generation_before_retiring_old(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
     original = submit(cfg, ["echo", "ok"], group="exp")
     old_reservation = (
         shared_paths(cfg.shared_root)["ready_reservations"]
@@ -104,6 +106,7 @@ def test_offer_due_tasks_never_enumerates_task_truth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
     task = submit(
         cfg,
         ["echo", "ok"],
@@ -137,6 +140,7 @@ def test_offer_due_tasks_never_enumerates_task_truth(
 
 def test_deadline_index_is_partitioned_by_home_and_time_bucket(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
     task = submit(
         cfg,
         ["echo", "ok"],

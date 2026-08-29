@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.machine_agent import dispatch_machine_cycle_locked
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
@@ -82,6 +83,7 @@ def test_ready_cursor_advances_past_temporarily_unavailable_candidate(tmp_path: 
     cfg = init_shared_root(
         tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
     )
+    create_group(cfg, "paused")
     paused = submit(
         cfg, ["echo", "paused"], task_id="task-a", group="paused", working_dir=work
     )

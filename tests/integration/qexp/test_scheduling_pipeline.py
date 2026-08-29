@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import cancel, retry
 from qqtools.plugins.qexp.runtime.paths import attempt_path, shared_paths
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
@@ -41,6 +42,7 @@ def test_dispatch_claims_and_launches_with_reservation(tmp_path: Path):
 
 def test_worker_set_blocks_intruder_claim(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     other = cfg.__class__(cfg.shared_root, cfg.project_root, "intruder", tmp_path / "intruder-rt")
     assert claim_task(other, task.task_id, [0]) is None

@@ -137,6 +137,12 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
         state = task.get("state", {})
         control = task.get("control", {})
         attempts = result.get("attempts", ())
+        submission = result.get("submission", {})
+        execution_machines = [
+            f"#{attempt.get('attempt', {}).get('attempt_number')}:"
+            f"{attempt.get('attempt', {}).get('machine_name')}"
+            for attempt in attempts
+        ]
         return _details(
             (
                 ("Task ID", task.get("task_id")),
@@ -147,7 +153,9 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
             ),
             (
                 ("State", state.get("projection")),
-                ("Placement", placement.get("home_machine")),
+                ("Original submitting machine", submission.get("original_submitting_machine")),
+                ("Home machine", placement.get("home_machine")),
+                ("Execution machines", execution_machines),
                 ("Queue scope", runtime.get("queue_scope")),
                 ("Control", control.get("cancellation_operation_id")),
                 ("Attempts", len(attempts)),

@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-28
+updated_at: 2026-08-30
 archived_at:
 ---
 
@@ -161,6 +161,10 @@ Standalone operation retains its existing project-local `RootConfig.runtime_root
 PID, reservations, process manifests, wrapper controls, and recovery evidence. It remains local
 and never becomes shared project authority.
 
+For a machine-managed operational command, the verified binding instead selects the disposable
+project partition beneath `MachineRuntime`; caller-supplied standalone runtime roots remain
+non-authoritative compatibility inputs.
+
 ### 3.4 MachineRuntime Root and Project Registry
 
 Machine-agent operation adds one disposable, user-local `MachineRuntime` per qexp Machine. Its
@@ -177,6 +181,12 @@ Deployment must provide user-local rather than shared control storage. It has no
 project's runtime root.
 Every qexp agent process uses this resolver to acquire the same lifetime-held machine scheduler
 lock.
+
+Operational project commands resolve a canonical shared root and stable Project ID, then require
+one matching local registry binding before constructing an authoritative execution context. The
+binding supplies the submitting machine and the `MachineRuntime` project-local runtime partition;
+saved-context machine/runtime fields, `--runtime-root`, and identity assertions cannot replace
+those values. Read-only project commands may observe shared truth without a local binding.
 
 `MachineRuntime` owns the registry, scheduler and registry locks, one unified GPU reservation
 set, global-agent PID/status, round-robin cursor, and project-ID-partitioned local process,
@@ -690,12 +700,21 @@ Submission rules:
   submission-affecting CLI arguments
 - YAML formatting, key order, and manifest path are not semantic input
 - `--group` is the sole source of Group identity
+- `--machine` and `QEXP_MACHINE` are identity assertions only; they must match the verified local
+  binding and cannot select Task placement
+- `submit --home-machine` resolves `current` to the verified submitting machine; a non-current
+  home requires a matching current-generation shared Project machine record but does not trigger
+  remote activation or write target-machine local state
+- an ungrouped Task may use a non-current home only with private placement, making that home the
+  complete eligibility set
 - manifest `group.name` is invalid
 - manifest Worker Set changes come only from `group.workers`; root `workers` and
   `defaults.placement.workers` are invalid
 - the first operation resolves `home_machine: current`, generated Task IDs, placement
   defaults, original submitting machine, planned Worker Set, Group revision/worker-set epoch, and
-  Worker Set additions exactly once
+  explicit Worker Set additions exactly once
+- a single submit cannot create a missing Group; a bulk submit may create one only with a non-empty
+  manifest `group.workers` declaration, whose initial Worker Set is exact
 - retries load the existing operation before resolving machine-relative values
 - the same key and raw request reuse the stored resolved context across machines
 - the same key with different raw input fails with an idempotency conflict
@@ -1000,8 +1019,9 @@ Submission executes:
 3. exclusively create or load the idempotency mapping
 4. if existing, validate the raw digest and reuse its stored resolved context
 5. if new, acquire the Group lock when grouped
-6. resolve whether the Group must be created, plus Task IDs, homes, placement, and Worker
-   Set additions against the planned active Worker Set
+6. resolve Task IDs, homes, placement, and explicit Worker Set additions against the planned
+   active Worker Set; a single submission rejects a missing Group, while bulk creation requires
+   a non-empty manifest `group.workers` declaration
 7. persist the Submission Operation in `preparing`
 8. release the Group lock
 
@@ -1024,8 +1044,9 @@ The runtime then:
    `committing`
 9. writes the reserved membership sequence into every staged Task
 10. records Worker Set additions tagged with the operation ID
-11. changes the Submission Operation to `committed`
-12. advances Group `next_membership_sequence` and clears `pending_submission_commit`
+11. writes the Submission Operation as `committed`; this is the durable submission commit point
+12. independently and idempotently advances Group `next_membership_sequence` and clears
+   `pending_submission_commit`
 13. releases the Group lock
 
 An existing Task ID is reusable only when it already belongs to the same Submission
@@ -1049,6 +1070,8 @@ Crash behavior:
 - before operation creation: no durable submission exists
 - after operation creation but before complete staging: no staged Task is claimable
 - after complete staging but before commit: retry or `doctor` may commit idempotently
+- after the Submission Operation commit point but before Group finalization: Tasks and the
+  committed Operation remain durable; retry or `doctor` reruns the Group finalizer
 - during `committing`: the Group pending pointer forces completion or abort before another
   Group mutation can overtake it
 - incompatible later Group changes: operation becomes `blocked` with an explicit reason
@@ -1463,6 +1486,7 @@ must revalidate under authoritative locks:
 - Group dispatch is active, if grouped
 - machine is an active non-draining Group worker
 - home queue is claimed only by home machine
+- an ungrouped private Task is claimable only by its resolved home machine
 - shared queue claimant is allowed by Worker Set and fallback constraint
 - Task requires no more locally reservable qexp GPUs than available
 

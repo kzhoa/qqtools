@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config_types import RootConfig
-from .runtime.paths import group_path, machine_path, shared_paths, task_path
+from .runtime.paths import group_path, machine_path, shared_paths, submission_path, task_path
 from .runtime.records import TaskRecord
 from .runtime.store import iter_json, read_json
 from .runtime.tasks import load_task
@@ -39,6 +39,15 @@ def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
     result = task.to_dict()
     attempts_dir = shared_paths(cfg.shared_root)["attempts"] / task_id
     result["attempts"] = [read_json(path) for path in iter_json(attempts_dir)]
+    operation_id = task.submission_operation_id
+    if operation_id:
+        operation_path = submission_path(cfg.shared_root, operation_id)
+        if operation_path.exists():
+            submission = read_json(operation_path).get("submission", {})
+            result["submission"] = {
+                "operation_id": operation_id,
+                "original_submitting_machine": submission.get("original_submitting_machine"),
+            }
     return result
 
 
