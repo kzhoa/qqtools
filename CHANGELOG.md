@@ -1,5 +1,13 @@
 # History
 
+## v1.3.11
+
+- fix: report the previous machine-agent process id in `qexp agent restart` structured output,
+  including restart paths that clear active identity before the replacement starts.
+- fix: skip stale deadline-index offers for tasks that are no longer queued or already have an
+  active claim, preventing invalid placement attempts from creating blocked availability
+  operations.
+
 ## v1.3.10
 
 - fix: archive settled qexp active operations so blocked availability controls and unrecoverable
