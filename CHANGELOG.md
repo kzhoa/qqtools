@@ -1,5 +1,14 @@
 # History
 
+## v1.3.14
+
+- feat: automatically canonicalize qexp primary/borrow Worker encoding and per-machine GPU limits
+  on agent startup or Group mutation; normal runtime paths now require the canonical representation.
+- breaking: remove deprecated `qexp use` machine/runtime inputs, legacy saved-context recovery
+  fallback, and the qexp Group `--max-gpus` alias.
+- chore: retire the 1.3.14 compatibility boundaries for primary/borrow encoding, CLI context, and
+  Group GPU-limit fields; remove the completed CLI alias registry item.
+
 ## v1.3.13
 
 - test: run installed-wheel E2E only for the exact tagged release artifact; retain its JUnit report

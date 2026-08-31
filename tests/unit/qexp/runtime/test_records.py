@@ -1,3 +1,5 @@
+import pytest
+
 from qqtools.plugins.qexp.runtime.records import TaskRecord, TaskSpec, normalize_group_record
 
 
@@ -33,11 +35,13 @@ def test_legacy_group_worker_defaults_to_primary():
     assert group["group"]["worker_set"]["gpu-1"]["gpu_limit_gpus"] is None
 
 
-def test_legacy_borrow_limit_is_normalized_to_gpu_limit():
-    """QQTOOLS-COMPAT-0004: N reads legacy Group truth into the canonical field."""
+def test_legacy_borrow_limit_is_accepted_only_by_the_n_plus_one_upgrader():
+    """QQTOOLS-COMPAT-0004: N+1 keeps the legacy reader inside the upgrader only."""
     group = {"group": {"worker_set": {"gpu-1": {"borrow_limit_gpus": 2}}}}
 
-    normalize_group_record(group)
+    with pytest.raises(ValueError, match="obsolete borrow_limit_gpus"):
+        normalize_group_record(group)
+    normalize_group_record(group, allow_legacy=True)
 
     worker = group["group"]["worker_set"]["gpu-1"]
     assert worker["gpu_limit_gpus"] == 2

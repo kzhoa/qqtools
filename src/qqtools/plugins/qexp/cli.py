@@ -79,41 +79,6 @@ def _shared_root_input(args: argparse.Namespace) -> tuple[str | None, dict | Non
     return shared, context
 
 
-def _legacy_context_value(context: dict | None, field: str) -> str | None:
-    """Read one N-release recovery input from a legacy local context."""
-    value = (context or {}).get(field)
-    return value if isinstance(value, str) and value else None
-
-
-def _warn_legacy_context_fallback(field: str) -> None:
-    print(
-        "qexp: saved context "
-        f"{field} is deprecated and used only for agent recovery/migration. "
-        "QQTOOLS-COMPAT-0002",
-        file=sys.stderr,
-    )
-
-
-def _warn_deprecated_use_flags(args: argparse.Namespace) -> None:
-    names = [
-        name
-        for value, name in (
-            (args.machine, "--machine"),
-            (args.runtime_root, "--runtime-root"),
-            (args.use_machine, "--machine"),
-            (args.use_runtime_root, "--runtime-root"),
-        )
-        if value is not None
-    ]
-    if names:
-        print(
-            "qexp: "
-            f"{', '.join(dict.fromkeys(names))} is deprecated for 'qexp use' and ignored; "
-            "use only --shared-root. QQTOOLS-COMPAT-0002",
-            file=sys.stderr,
-        )
-
-
 def _requires_verified_binding(args: argparse.Namespace) -> bool:
     """Classify commands that can create or change project-owned state."""
     if args.command in {"submit", "batch-submit", "clean"}:
@@ -137,7 +102,7 @@ def _requires_verified_binding(args: argparse.Namespace) -> bool:
 def _resolve_cfg(
     args: argparse.Namespace, *, require_binding: bool
 ) -> tuple[object, ExecutionContext]:
-    shared, saved_context = _shared_root_input(args)
+    shared, _saved_context = _shared_root_input(args)
     if not shared:
         raise ValueError("--shared-root is required or must be saved with qexp use.")
     assertion = _machine_assertion(args)
@@ -179,20 +144,16 @@ def _resolve_cfg(
 
     # Read-only project observation must remain possible without a local binding. The sentinel is
     # never used as an authority source because this branch is not used for mutations.
-    legacy_machine = assertion
     if args.command == "agent" and args.agent_action in {"add-project", "migrate-project"}:
-        if legacy_machine is None:
-            legacy_machine = _legacy_context_value(saved_context, "machine")
-            if legacy_machine is not None:
-                _warn_legacy_context_fallback("machine")
-    machine = legacy_machine or "unbound"
+        if assertion is None:
+            raise ValueError(
+                "agent add-project and migrate-project require --machine or QEXP_MACHINE "
+                "when no local project binding exists."
+            )
+    machine = assertion or "unbound"
     runtime = None
     if args.command == "agent" and args.agent_action == "migrate-project":
         runtime = getattr(args, "runtime_root", None) or os.environ.get("QEXP_RUNTIME_ROOT")
-        if runtime is None:
-            runtime = _legacy_context_value(saved_context, "runtime_root")
-            if runtime is not None:
-                _warn_legacy_context_fallback("runtime_root")
     cfg = load_root_config(shared, machine, runtime, require_initialized=True)
     return cfg, ExecutionContext(cfg, machine_runtime)
 
@@ -363,12 +324,6 @@ def build_parser() -> argparse.ArgumentParser:
             action.add_argument("--role", choices=("primary", "borrow"))
             gpu_limit = action.add_mutually_exclusive_group()
             gpu_limit.add_argument("--gpu-limit-gpus", type=_gpu_limit_gpus)
-            gpu_limit.add_argument(
-                "--max-gpus",
-                dest="gpu_limit_gpus",
-                type=_gpu_limit_gpus,
-                help="Deprecated compatibility alias for --gpu-limit-gpus. QQTOOLS-COMPAT-0003",
-            )
         if name == "remove":
             action.add_argument("--terminate-running", action="store_true")
     agent = commands.add_parser("agent")
@@ -416,16 +371,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     use.add_argument(
         "--shared-root", dest="use_shared_root", help="Shared project control root to save."
-    )
-    use.add_argument(
-        "--machine",
-        dest="use_machine",
-        help="Deprecated compatibility input; ignored. QQTOOLS-COMPAT-0002",
-    )
-    use.add_argument(
-        "--runtime-root",
-        dest="use_runtime_root",
-        help="Deprecated compatibility input; ignored. QQTOOLS-COMPAT-0002",
     )
     use.add_argument("--show", action="store_true")
     use.add_argument("--clear", action="store_true")
@@ -521,11 +466,9 @@ def main(argv: list[str] | None = None) -> int:
             is_selecting = args.use_shared_root is not None
             if sum((is_selecting, args.show, args.clear)) != 1:
                 raise ValueError("use requires exactly one of --shared-root, --show, or --clear.")
-            if (args.show or args.clear) and any(
-                value is not None
-                for value in (args.machine, args.runtime_root, args.use_machine, args.use_runtime_root)
-            ):
-                raise ValueError("deprecated use flags cannot be combined with --show or --clear.")
+            # QQTOOLS-COMPAT-0002: N+1 rejects the former qexp use identity inputs.
+            if args.machine is not None or args.runtime_root is not None:
+                raise ValueError("qexp use accepts only --shared-root, --show, or --clear.")
             if args.clear:
                 clear_context()
                 return 0
@@ -541,7 +484,6 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--format requires --show.")
             if not args.use_shared_root:
                 raise ValueError("use requires a non-empty --shared-root.")
-            _warn_deprecated_use_flags(args)
             save_context(args.use_shared_root)
             return 0
         if args.command == "agent" and args.agent_action in {
