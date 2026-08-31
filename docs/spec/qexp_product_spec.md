@@ -449,11 +449,11 @@ place it on a shared control filesystem. The shared scheduler lock is held for t
 so no second qexp agent can acquire local GPU scheduling authority.
 
 Machine-local execution records use `(stable_project_id, task_id, attempt_id)` as their identity;
-project-local IDs alone are insufficient. The machine agent uses deterministic unweighted
-round-robin over enabled bindings sorted by stable project ID. It resumes from a persisted cursor;
-a missing cursor starts at the first sorted binding. A project with no eligible candidate, no
-fitting capacity, or a failed project-level claim does not block the remainder of the round.
-Project-level eligibility and fenced claim protocols remain the final authority.
+project-local IDs alone are insufficient. Within each local admission layer, the machine agent uses
+deterministic unweighted round-robin over enabled bindings sorted by stable project ID. The primary
+layer is considered before borrow; a project with no eligible candidate, no fitting capacity, or a
+failed project-level claim does not block the remainder of its layer. Project-level eligibility and
+fenced claim protocols remain the final authority.
 
 ## 7. No Public Batch Entity
 
@@ -753,16 +753,46 @@ being treated as free capacity.
 A Group Worker Set defines which machines may execute Group Tasks. For shared Tasks, it is
 also the maximum fallback-machine scope.
 
+### 10.1 Primary and Borrow Resource Pools
+
+Each active Group Worker has one scheduling role:
+
+- `primary`: normal Group capacity on that machine;
+- `borrow`: capacity that may receive a new claim only when the local machine agent has no
+  primary demand on that machine.
+
+Worker role is a local admission ordering rule after Task placement authorization. It does not
+broaden a private Task, alter a Task's home/fallback policy, reserve capacity, or preempt an
+existing Attempt. A primary demand that is runnable now or waiting only for qexp GPU aggregation
+blocks new borrow admission. Existing borrow Attempts continue after primary demand appears;
+only later borrow claims stop.
+
+`borrow_limit_gpus` is `null` or a positive integer. `null` removes only the Group-level borrow
+quota; visible free qexp GPUs, placement, primary demand, and machine-wide reservations still
+apply. A finite quota is checked by GPU count, not Task count. Lowering a quota below current
+usage reports `over_limit` and blocks later borrow admission without terminating work.
+
+For compatibility, a borrow Worker is persisted as both `scheduling_role: borrow` and
+`state: borrow`. Current agents treat `active` and `borrow` as claimable lifecycle states and
+apply the scheduling role. Agents that only recognize `state: active` skip `state: borrow` and
+therefore fail closed; they must never schedule it as primary capacity. `draining` and `removing`
+remain non-claimable.
+
+An enabled local project binding is required on every target machine. `qexp init` creates the
+normal binding; `qexp agent add-project` restores a missing binding. Submitting on one machine
+does not wake another machine's on-demand agent. A running target agent observes later Group
+truth changes without re-registration.
+
 Worker Set invariants:
 
-- every grouped Task's home machine must be an active, non-draining Group worker when the
+- every grouped Task's home machine must be a claimable, non-draining Group worker when the
   Task is committed
 - submission never adds the submitting machine to the Worker Set implicitly
 - `group create` defaults to `{current}` when `--workers` is omitted; an explicit `--workers`
   list is the exact initial Worker Set
 - a single submit may target only an existing Group; a new Group may be atomically created by
   `batch-submit` only when its manifest declares a non-empty `group.workers` list
-- an explicitly configured non-current home machine must already be an active worker
+- an explicitly configured non-current home machine must already be a claimable worker
 - a manifest may add workers explicitly but must not silently remove or replace the existing
   Worker Set
 - removal and drain occur only through explicit Group machine operations
@@ -771,9 +801,11 @@ Worker Set invariants:
 Required operations:
 
 ```bash
-qexp group machines add <group> g11
+qexp group machines add <group> g11 --role borrow --max-gpus 2
+qexp group machines set <group> g11 --role primary
 qexp group machines drain <group> g5
 qexp group machines remove <group> g5 --terminate-running
+qexp group machines list <group>
 ```
 
 Adding a machine:
@@ -781,6 +813,10 @@ Adding a machine:
 - makes it eligible for compatible queued shared Tasks
 - does not modify running or terminal Attempts
 - does not remotely start the agent
+
+Role and borrow-limit changes are Group-lock-linearized. They affect later claims but do not
+revoke a successfully created claim. Drain, remove, pause, cancellation, lease, and fencing keep
+their existing launch-gate meaning.
 
 Draining a machine:
 
@@ -796,7 +832,7 @@ unclaimable. In particular:
   queued placement policy changed, or be cancelled
 - a `queued_home` spillover Task must be atomically offered, explicitly rehomed, or
   cancelled
-- an already `queued_shared` Task may remain when another active worker is still allowed
+- an already `queued_shared` Task may remain when another claimable worker is still allowed
   by its fallback constraint
 - forced removal does not bypass queued-work safety checks
 
@@ -976,7 +1012,7 @@ A live process may recover the same Attempt only through a recovery CAS requirin
 Grouped recovery also respects current Group control:
 
 - pause allows recovery because the Attempt was already running
-- active workers may recover
+- claimable workers may recover
 - a draining worker may recover only the same Attempt when launch authorization predates
   the drain request
 - removing or removed workers cannot recover execution authority
@@ -1386,8 +1422,8 @@ The target CLI also does not promise aliases for the old flat `list`, `inspect`,
       lock for every registered Project.
 - [ ] Machine-managed local execution records use stable project-ID composite identity and one
       unified reservation set.
-- [ ] Cross-project dispatch is deterministic stable-ID round-robin and a blocked project does
-      not prevent scanning later bindings.
+- [ ] Within each primary/borrow admission layer, cross-project dispatch is deterministic
+      stable-ID round-robin and a blocked project does not prevent scanning later bindings.
 - [ ] Explicit project migration verifies old PID identity, keeps training processes alive, and
       leaves one global agent process responsible for the migrated Project.
 - [ ] Machine runtime loss cannot assert process termination or cause automatic retry.

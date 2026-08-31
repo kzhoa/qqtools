@@ -457,7 +457,9 @@ group:
   pending_submission_commit: null | object
   worker_set:
     <machine-name>:
-      state: active | draining | removing
+      state: active | borrow | draining | removing
+      scheduling_role: primary | borrow
+      borrow_limit_gpus: int | null
       state_epoch: int
       added_at: str
       added_by_operation: str | null
@@ -483,10 +485,23 @@ Group rules:
 - cancellation captures the current membership high watermark
 - Tasks committed later have a higher sequence and are outside that cancellation snapshot
 - pause increments `dispatch_epoch`
-- every Worker Set state change increments `worker_set_epoch` and records the resulting
-  value as that worker's `state_epoch`
+- every Worker Set role, quota, or lifecycle-state change increments `worker_set_epoch` and
+  records the resulting value as that worker's `state_epoch`
 - Worker Set state is authoritative eligibility input, not a display-only summary
 - removed machines remain auditable through events or tombstone history
+
+A Worker member contains `scheduling_role: primary | borrow` and
+`borrow_limit_gpus: positive-int | null`. Its persisted `state` is one of
+`active | borrow | draining | removing`: `active` is a primary claimable Worker, `borrow` is a
+borrow claimable Worker, and `draining`/`removing` are not claimable. `primary` requires a null
+borrow limit. Existing Worker records without these fields read as `state: active`,
+`scheduling_role: primary`, and `borrow_limit_gpus: null`.
+
+`state: borrow` is deliberately a fail-closed compatibility encoding. An agent that predates
+primary/borrow support already excludes any Worker whose state is not `active`, so it skips the
+borrow Worker instead of treating it as ordinary capacity. New agents must accept both claimable
+states and then apply the role policy. No Group-wide agent capability acknowledgement is required
+to write this encoding.
 
 ### 8.3 Task Truth
 
@@ -862,10 +877,18 @@ Required shape:
 reservation:
   reservation_id: str
   acquisition_id: str
+  project_id: str | null
+  group_name: str | null
+  machine_name: str | null
   task_id: str
   attempt_id: str | null
   fencing_token: int | null
   gpu_ids: list[int]
+  admission:
+    worker_scheduling_role: primary | borrow | null
+    borrow_limit_gpus: int | null
+    group_worker_set_epoch: int | null
+    worker_state_epoch: int | null
   state: provisional | active | released
   created_at: str
   expires_at: str
@@ -877,6 +900,8 @@ Rules:
 
 - allocation is serialized by the local GPU reservation lock
 - provisional reservations have a short TTL
+- grouped reservations retain Group identity even when initially admitted as primary, so a later
+  primary-to-borrow role change observes their GPU usage
 - attaching to an authoritative Attempt records Attempt ID and fencing token
 - active reservations remain until terminal process reconciliation or verified cleanup
 - releasing an already released reservation succeeds idempotently
@@ -1020,7 +1045,7 @@ Submission executes:
 4. if existing, validate the raw digest and reuse its stored resolved context
 5. if new, acquire the Group lock when grouped
 6. resolve Task IDs, homes, placement, and explicit Worker Set additions against the planned
-   active Worker Set; a single submission rejects a missing Group, while bulk creation requires
+   claimable Worker Set; a single submission rejects a missing Group, while bulk creation requires
    a non-empty manifest `group.workers` declaration
 7. persist the Submission Operation in `preparing`
 8. release the Group lock
@@ -1187,7 +1212,7 @@ to a remote PID.
 A user-authorized placement change is accepted only while the Task is queued and has no
 active claim. It acquires Group then Task lock and validates:
 
-- the new home is an active non-draining Group worker
+- the new home is a claimable non-draining Group worker
 - fallback scope does not exceed the Group Worker Set
 - changing private to spillover is explicit user intent
 - an agent-initiated transition changes queue scope only and never broadens policy
@@ -1286,15 +1311,30 @@ A machine agent scans only enabled registry bindings. For each binding it builds
 protocol without changing their semantics. Candidate selection is advisory; only the winning
 project-root claim authorizes execution.
 
-Enabled bindings are sorted lexically by stable project ID. The persisted cursor identifies the
-next starting binding. Missing or unknown cursor state starts at the first sorted binding. One
-round visits each binding at most once and permits at most one successful claim per project. The
-agent continues after a project has no candidate, lacks capacity in the machine-wide reservation
-set, has an inaccessible working directory, or loses its project claim. If capacity and the work
-budget remain after a round, the successor of the last successful binding starts another round.
-After dispatch, the cursor persists that successor; after a full round with no successful claim,
-it persists the successor of the starting binding. This is deterministic, unweighted round-robin;
-it does not implement priorities, quotas, preemption, or project capacity reservations.
+Before normal cross-project selection, the agent performs a no-side-effect primary-demand probe
+over every enabled binding. The probe uses an independent advisory cursor; it never advances an
+ordinary dispatch cursor, creates a reservation, or changes Task truth. It reports one of
+`runnable_now`, `waiting_for_aggregation`, `no_primary_demand`, or `unresolved` for the machine.
+The first two results, and `unresolved`, prohibit new borrow admission. `unresolved` covers an
+incomplete budgeted traversal, unreadable required truth, and ready-index mutation while probing.
+Only a complete traversal whose start and end ready-index revisions agree may report
+`no_primary_demand`. Structurally impossible candidates are diagnosed and skipped rather than
+permanently blocking borrow.
+
+When primary demand is absent, eligible primary and borrow candidates use separate deterministic
+fair rounds: the primary layer is always exhausted or blocked before borrow is considered, and
+the borrow layer skips a candidate whose Group usage has reached its finite borrow limit. Role
+selection occurs only after existing Group, Task, and placement authorization. This is not a
+project priority, quota, preemption, or capacity reservation feature.
+
+Within each layer, bindings are sorted lexically by stable project ID. The persisted dispatch
+cursor identifies the next starting binding. Missing or unknown cursor state starts at the first
+sorted binding. One round visits each binding at most once and permits at most one successful
+claim per project. The agent continues after a project has no candidate, lacks capacity in the
+machine-wide reservation set, has an inaccessible working directory, or loses its project claim.
+If capacity and the work budget remain after a round, the successor of the last successful binding
+starts another round. After dispatch, the cursor persists that successor; after a full round with
+no successful claim, it persists the successor of the starting binding.
 
 After ready-index activation, project selection uses a persistent project cursor and candidate
 selection uses one persistent cursor for each project and queue scope. A marker name is
@@ -1452,6 +1492,10 @@ or unreadable project binding, malformed identity, blocked Task, or otherwise un
 retains the reservation and is counted as isolated; uncertainty is never converted into free
 capacity.
 
+A borrow admission linearizes against this trusted capacity snapshot. Primary work submitted or
+offered after the completed probe is observed in the next scheduling decision and does not revoke
+an already-created borrow reservation.
+
 Machine-agent recovery of `starting` Attempts is driven only by the final active-reservation
 snapshot. It opens the exact project Task and Attempt and requires the reservation ID, Attempt ID,
 fencing token, machine, claim, and launch state to agree before replaying the existing launch gate.
@@ -1484,16 +1528,26 @@ must revalidate under authoritative locks:
 - Submission Operation is committed
 - Task is queued and unclaimed
 - Group dispatch is active, if grouped
-- machine is an active non-draining Group worker
+- machine is an `active` or `borrow` claimable Group worker
 - home queue is claimed only by home machine
 - an ungrouped private Task is claimable only by its resolved home machine
 - shared queue claimant is allowed by Worker Set and fallback constraint
 - Task requires no more locally reservable qexp GPUs than available
 
+For a borrow Worker, eligibility additionally requires a `no_primary_demand` probe result and a
+successful atomic borrow-quota reservation. A Task requiring more GPUs than the finite quota is
+ineligible for that Worker but remains eligible elsewhere when placement allows it.
+
 ### 13.3 Provisional Reservation
 
 The agent creates a TTL-bound local provisional reservation keyed by an acquisition ID.
 It must not reserve more Tasks than it can promptly launch.
+
+`reserve_admitted` is the only borrow admission API. While holding the machine reservation lock,
+it expires unattached provisionals, aggregates active and unexpired provisional GPU IDs for the
+same `(project_id, group_name, machine_name)`, checks the finite quota, and writes the provisional
+record atomically. Group and Task truth are re-read under Group -> Task locks before this call;
+the reservation lock performs no shared Group/Task I/O.
 
 If shared-lock acquisition is delayed beyond the provisional TTL, the agent releases and
 restarts acquisition rather than extending capacity indefinitely without ownership.
@@ -1530,7 +1584,7 @@ validates:
 - Attempt exists in `claimed`
 - Group dispatch is active
 - no applicable cancellation barrier won
-- machine remains an active Worker Set member
+- machine remains a claimable Worker Set member, subject to existing drain/remove semantics
 
 The winning fenced transition uses one authorization timestamp and changes:
 
@@ -1541,7 +1595,9 @@ Attempt.phase: claimed -> starting
 Attempt.timestamps.launch_authorized_at: null -> same timestamp
 ```
 
-The Task write is the launch gate linearization point. If a crash leaves the matching Attempt in
+The Task write is the launch gate linearization point. Role or borrow-limit changes after a
+successful claim do not revoke that claim; pause, drain/remove, cancellation, lease, and fencing
+continue to gate launch. If a crash leaves the matching Attempt in
 `claimed`, a later fenced authorization replay may only reconcile it to `starting` using the
 persisted Task timestamp; it must not authorize a second Runner. It records the current Group
 dispatch epoch and Worker Set epoch.

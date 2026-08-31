@@ -17,7 +17,7 @@ from ..lease import (ClockObservation, clock_capability, new_timed_offer_proof,
 from .locks import group_lock, task_lock
 from .locks import schema_lock
 from .paths import group_path, shared_paths, submission_path
-from .records import SCHEMA_VERSION, TaskRecord, new_id, utc_now
+from .records import SCHEMA_VERSION, TaskRecord, new_id, normalize_group_record, utc_now
 from .ready import (
     discard_ready_generation,
     prepare_ready_transition,
@@ -168,7 +168,9 @@ def _submission_committed(cfg: RootConfig, task: TaskRecord) -> bool:
 def _group_data(cfg: RootConfig, task: TaskRecord) -> dict[str, Any] | None:
     if not task.group_name:
         return None
-    return read_json(group_path(cfg.shared_root, task.group_name))
+    group = read_json(group_path(cfg.shared_root, task.group_name))
+    normalize_group_record(group)
+    return group
 
 
 def _group_cancel_blocked(group: dict[str, Any], task: TaskRecord) -> bool:
@@ -196,8 +198,8 @@ def _validate_common(cfg: RootConfig, task: TaskRecord, group: dict[str, Any] | 
         raise ValueError(f"Group {task.group_name!r} is being cancelled.")
     home = task.placement_policy["home_machine"]
     worker = group["group"]["worker_set"].get(home)
-    if not worker or worker.get("state") != "active":
-        raise ValueError(f"Task home machine {home!r} is not an active Group worker.")
+    if not worker or worker.get("state") not in {"active", "borrow"}:
+        raise ValueError(f"Task home machine {home!r} is not a claimable Group worker.")
 
 
 def _normalize_helpers(
@@ -216,8 +218,11 @@ def _normalize_helpers(
             "Submit the work to a Group to let other machines help."
         )
     workers = group["group"]["worker_set"]
-    invalid = [machine for machine in helper_machines
-               if workers.get(machine, {}).get("state") != "active"]
+    invalid = [
+        machine
+        for machine in helper_machines
+        if workers.get(machine, {}).get("state") not in {"active", "borrow"}
+    ]
     if invalid:
         raise ValueError(f"shared helpers are not active Group workers: {invalid}")
     return list(helper_machines) if helper_machines else "group"
@@ -231,9 +236,12 @@ def _eligible_helpers(task: TaskRecord, group: dict[str, Any] | None) -> list[st
     workers = group["group"]["worker_set"]
     if fallback == "group":
         return sorted(machine for machine, worker in workers.items()
-                      if machine != home and worker.get("state") == "active")
-    return sorted(machine for machine in fallback
-                  if machine != home and workers.get(machine, {}).get("state") == "active")
+                      if machine != home and worker.get("state") in {"active", "borrow"})
+    return sorted(
+        machine
+        for machine in fallback
+        if machine != home and workers.get(machine, {}).get("state") in {"active", "borrow"}
+    )
 
 
 def _is_same_immediate_share(

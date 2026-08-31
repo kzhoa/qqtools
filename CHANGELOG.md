@@ -1,5 +1,11 @@
 # History
 
+## Unreleased
+
+- feat: add qexp Group primary/borrow Worker roles, optional per-machine borrow GPU limits, and
+  machine-agent admission that preserves primary demand before launching new borrowed work.
+- docs: archive the completed qexp Group primary/borrow resource-pool pitch.
+
 ## v1.3.12
 
 - fix: remove qexp's shared-filesystem qualification-file gate so eligible cross-machine work can

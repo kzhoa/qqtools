@@ -290,11 +290,15 @@ def build_parser() -> argparse.ArgumentParser:
             action.add_argument("--terminate-running", action="store_true")
     machines = group_sub.add_parser("machines")
     machines_sub = machines.add_subparsers(dest="machine_action", required=True)
-    for name in ("add", "drain", "remove"):
+    for name in ("add", "set", "drain", "remove", "list"):
         action = machines_sub.add_parser(name)
         _add_output_format(action)
         action.add_argument("group_name")
-        action.add_argument("worker_machine")
+        if name != "list":
+            action.add_argument("worker_machine")
+        if name in {"add", "set"}:
+            action.add_argument("--role", choices=("primary", "borrow"))
+            action.add_argument("--max-gpus", type=_max_gpus)
         if name == "remove":
             action.add_argument("--terminate-running", action="store_true")
     agent = commands.add_parser("agent")
@@ -355,6 +359,22 @@ def _duration_seconds(value: str) -> int:
         raise ValueError("duration must use an explicit s, m, or h unit, for example 10m.")
     amount = int(matched.group(1))
     return amount * {"s": 1, "m": 60, "h": 3600}[matched.group(2)]
+
+
+def _max_gpus(value: str) -> int | str:
+    if value == "unlimited":
+        return value
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "max-gpus must be a positive integer or 'unlimited'."
+        ) from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            "max-gpus must be a positive integer or 'unlimited'."
+        )
+    return parsed
 
 
 def _split_machine_list(values: list[str] | None) -> list[str] | None:
@@ -695,12 +715,24 @@ def main(argv: list[str] | None = None) -> int:
                 kind = "group-operation"
                 presentation = {**result, "action": "retry-failed", "name": args.name, "status": "completed"}
             elif args.group_action == "machines":
+                if args.machine_action == "list":
+                    result = observer.list_group_machines(
+                        cfg,
+                        args.group_name,
+                        reservation_runtime_root=execution_context.reservation_root,
+                    )
+                    _emit("group-machines", result, args.format)
+                    return 0
+                max_gpus = getattr(args, "max_gpus", None)
                 result = group_commands.change_worker(
                     cfg,
                     args.group_name,
                     args.worker_machine,
                     args.machine_action,
                     terminate_running=getattr(args, "terminate_running", False),
+                    role=getattr(args, "role", None),
+                    borrow_limit_gpus=None if max_gpus in {None, "unlimited"} else max_gpus,
+                    has_borrow_limit=max_gpus is not None,
                 )
                 kind = "group-operation"
                 presentation = {

@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from .runtime.records import validate_identifier
+from .runtime.records import validate_borrow_limit, validate_identifier
 
 _ROOT_KEYS = {"group", "defaults", "tasks"}
 _GROUP_KEYS = {"workers"}
@@ -107,9 +107,7 @@ def _offer_after(value: Any, path: str) -> int | None:
     return value
 
 
-def _workers(value: Any, path: str) -> list[str]:
-    if value is None:
-        return []
+def _worker_names(value: Any, path: str) -> list[str]:
     if not isinstance(value, list):
         raise ValueError(f"{path} must be a list of machine names.")
     seen: set[str] = set()
@@ -120,6 +118,45 @@ def _workers(value: Any, path: str) -> list[str]:
             raise ValueError(f"{path} must not contain duplicate machine {item!r}.")
         seen.add(item)
         result.append(item)
+    return result
+
+
+def _borrow_workers(value: Any, path: str) -> dict[str, int | None]:
+    if isinstance(value, list):
+        return {machine: None for machine in _worker_names(value, path)}
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} must be a list or mapping of machine names to GPU limits.")
+    result: dict[str, int | None] = {}
+    for machine, limit in value.items():
+        validate_identifier(machine, f"{path}.{machine}")
+        if machine in result:
+            raise ValueError(f"{path} must not contain duplicate machine {machine!r}.")
+        result[machine] = validate_borrow_limit(limit, f"{path}.{machine}")
+    return result
+
+
+def _workers(value: Any, path: str) -> dict[str, dict[str, Any]]:
+    if value is None:
+        return {}
+    if isinstance(value, list):
+        return {
+            machine: {"scheduling_role": "primary", "borrow_limit_gpus": None}
+            for machine in _worker_names(value, path)
+        }
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} must be a list or mapping of Worker pools.")
+    unknown = sorted(set(value) - {"primary", "borrow"})
+    if unknown:
+        raise ValueError(f"{path}.{unknown[0]} is not allowed.")
+    primary = _worker_names(value.get("primary", []), f"{path}.primary")
+    borrow = _borrow_workers(value.get("borrow", []), f"{path}.borrow")
+    result: dict[str, dict[str, Any]] = {}
+    for machine in primary:
+        result[machine] = {"scheduling_role": "primary", "borrow_limit_gpus": None}
+    for machine, limit in borrow.items():
+        if machine in result:
+            raise ValueError(f"{path} declares machine {machine!r} as both primary and borrow.")
+        result[machine] = {"scheduling_role": "borrow", "borrow_limit_gpus": limit}
     return result
 
 
@@ -181,7 +218,9 @@ def _apply_flat_fields(entry: dict[str, Any], placement: dict[str, Any], task_pa
     return result
 
 
-def parse_batch_manifest(path: Path, *, group_name: str | None) -> tuple[list[dict[str, Any]], list[str]]:
+def parse_batch_manifest(
+    path: Path, *, group_name: str | None
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Parse a batch-submit manifest into canonical Task specs and Worker Set additions."""
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     root = _mapping(raw, "root")

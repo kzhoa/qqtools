@@ -20,14 +20,21 @@ from .machine_config import is_legacy_agent_project, save_machine_config
 from .layout import load_root_config, machine_state_path, runtime_pid_path
 from .project_maintenance import maintain_project, reconcile_reservation
 from .runtime.paths import local_paths
-from .runtime.records import TaskSpec, utc_now
+from .runtime.records import TaskSpec, normalize_group_record, utc_now
 from .runtime.reservations import (
     ReservationIdentity,
     ReservationSnapshot,
-    active_reservations,
     reconcile_snapshot,
+    reservation_snapshot,
 )
-from .runtime.ready import advance_ready_index_build, read_ready_index_state
+from .runtime.ready import (
+    ReadyProbeBudgetExhausted,
+    advance_ready_index_build,
+    classify_ready_marker,
+    peek_primary_ready_marker,
+    read_ready_index_state,
+    ready_index_route_revision,
+)
 from .runtime.locks import exclusive
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.work_budget import (
@@ -35,11 +42,247 @@ from .runtime.work_budget import (
     DIAGNOSTIC_PUBLISH_INTERVAL_SECONDS,
     RuntimeDiagnostics,
     SliceBudget,
+    WorkBudgetPolicy,
     activate_diagnostics,
     diagnostic_increment,
     diagnostic_span,
 )
-from .scheduler import fail_attempt, resume_starting_attempt, run_dispatch_cycle
+from .scheduler import (
+    _BorrowAdmissionGrant,
+    _BorrowAdmissionRevision,
+    _eligible,
+    fail_attempt,
+    resume_starting_attempt,
+    run_dispatch_cycle,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PrimaryDemandProbe:
+    state: str
+    diagnostics: tuple[dict[str, str], ...] = ()
+
+
+def _probe_primary_demand(
+    runtime: MachineRuntime,
+    readable: dict[str, RootConfig],
+    dispatchable: dict[str, RootConfig],
+    visible: list[int],
+    free: list[int],
+    budget: SliceBudget,
+) -> PrimaryDemandProbe:
+    """Scan primary candidates through an independent bounded ready cursor."""
+    diagnostics: list[dict[str, str]] = []
+    waiting = False
+    try:
+        _, bindings = runtime.load_registry()
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        return PrimaryDemandProbe("unresolved", ({"reason": f"registry_unreadable:{exc}"},))
+    enabled_ids = {binding.project_id for binding in bindings if binding.enabled}
+    unavailable = sorted(
+        project_id
+        for project_id in enabled_ids
+        if project_id not in readable or project_id not in dispatchable
+    )
+    if unavailable:
+        diagnostics.extend(
+            {
+                "project_id": project_id,
+                "reason": "project_not_probeable",
+            }
+            for project_id in unavailable
+        )
+        return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+    for project_id, cfg in readable.items():
+        if project_id not in dispatchable or project_id not in enabled_ids:
+            continue
+        try:
+            ready_state = read_ready_index_state(cfg)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            diagnostics.append({"project_id": project_id,
+                                "reason": f"ready_index_unreadable:{exc}"})
+            return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+        if ready_state != "active":
+            diagnostics.append({"project_id": project_id, "reason": "ready_index_unresolved"})
+            return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+        for scope in ("shared", "home"):
+            cursor_key = (project_id, scope)
+            cursor = runtime.primary_probe_cursors.get(cursor_key)
+            if runtime.primary_probe_complete.get(cursor_key, False):
+                try:
+                    current_revision = ready_index_route_revision(
+                        cfg, scope, budget, primary_only=True
+                    )
+                except ReadyProbeBudgetExhausted:
+                    diagnostics.append({"project_id": project_id,
+                                        "reason": "probe_budget_exhausted"})
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                    diagnostics.append({"project_id": project_id,
+                                        "reason": f"index_unreadable:{exc}"})
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                if current_revision != runtime.primary_probe_revisions.get(cursor_key):
+                    runtime.primary_probe_cursors[cursor_key] = None
+                    runtime.primary_probe_revisions[cursor_key] = current_revision
+                    runtime.primary_probe_complete[cursor_key] = False
+                    diagnostics.append({"project_id": project_id,
+                                        "reason": "ready_index_changed"})
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                continue
+            previous_revision = runtime.primary_probe_revisions.get(cursor_key)
+            if cursor is None or previous_revision is None:
+                try:
+                    start_revision = ready_index_route_revision(
+                        cfg, scope, budget, primary_only=True
+                    )
+                except ReadyProbeBudgetExhausted:
+                    diagnostics.append({"project_id": project_id,
+                                        "reason": "probe_budget_exhausted"})
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                    diagnostics.append({"project_id": project_id,
+                                        "reason": f"index_unreadable:{exc}"})
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                runtime.primary_probe_revisions[cursor_key] = start_revision
+            else:
+                start_revision = previous_revision
+            runtime.primary_probe_complete[cursor_key] = False
+            while True:
+                cursor_before = cursor
+                try:
+                    peek = peek_primary_ready_marker(cfg, project_id, scope, cursor, budget)
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                    diagnostics.append({"project_id": project_id,
+                                        "reason": f"index_unreadable:{exc}"})
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                if peek.exhausted or peek.unresolved:
+                    diagnostics.append({"project_id": project_id,
+                                        "reason": (
+                                            "probe_budget_exhausted"
+                                            if peek.exhausted else "ready_index_unresolved"
+                                        )})
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                cursor = peek.cursor
+                runtime.primary_probe_cursors[cursor_key] = cursor
+                if peek.reference is None:
+                    runtime.primary_probe_complete[cursor_key] = True
+                    break
+                reference = peek.reference
+                if not budget.can_start_record(operations=3):
+                    runtime.primary_probe_cursors[cursor_key] = cursor_before
+                    diagnostics.append({"project_id": project_id,
+                                        "reason": "probe_budget_exhausted"})
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                budget.consume_record(operations=3)
+                try:
+                    result = classify_ready_marker(cfg, reference)
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                    runtime.primary_probe_cursors[cursor_key] = cursor_before
+                    diagnostics.append({"project_id": project_id, "task_id": reference.task_id,
+                                        "reason": f"marker_unreadable:{exc}"})
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                if result.classification == "corrupt":
+                    diagnostics.append({
+                        "project_id": project_id,
+                        "task_id": reference.task_id,
+                        "reason": result.reason,
+                    })
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                if result.classification != "claimable" or result.task is None:
+                    continue
+                task = result.task
+                try:
+                    is_eligible = _eligible(cfg, task)
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                    runtime.primary_probe_cursors[cursor_key] = cursor_before
+                    diagnostics.append({"project_id": project_id, "task_id": task.task_id,
+                                        "reason": f"task_truth_unreadable:{exc}"})
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                if not is_eligible:
+                    diagnostics.append({
+                        "project_id": project_id,
+                        "task_id": task.task_id,
+                        "reason": "placement_rejected",
+                    })
+                    continue
+                if task.group_name is None:
+                    continue
+                try:
+                    group = read_json(cfg.shared_root / "groups" / f"{task.group_name}.json")
+                    normalize_group_record(group)
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                    runtime.primary_probe_cursors[cursor_key] = cursor_before
+                    diagnostics.append({"project_id": project_id, "task_id": task.task_id,
+                                        "reason": f"group_unreadable:{exc}"})
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                worker = group["group"]["worker_set"].get(cfg.machine_name)
+                if worker is None or worker["scheduling_role"] != "primary":
+                    continue
+                reason = _working_directory_reason(task.spec)
+                if reason is not None:
+                    diagnostics.append({
+                        "project_id": project_id,
+                        "task_id": task.task_id,
+                        "reason": f"working_directory:{reason}",
+                    })
+                    continue
+                requested = task.spec.requested_gpus
+                if requested > len(visible):
+                    diagnostics.append({
+                        "project_id": project_id,
+                        "task_id": task.task_id,
+                        "reason": "exceeds_machine_capacity",
+                    })
+                    continue
+                if requested <= len(free):
+                    return PrimaryDemandProbe("runnable_now", tuple(diagnostics[-32:]))
+                waiting = True
+            try:
+                end_revision = ready_index_route_revision(
+                    cfg, scope, budget, primary_only=True
+                )
+            except ReadyProbeBudgetExhausted:
+                diagnostics.append({"project_id": project_id,
+                                    "reason": "probe_budget_exhausted"})
+                return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                diagnostics.append({"project_id": project_id,
+                                    "reason": f"index_unreadable:{exc}"})
+                return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+            if end_revision != start_revision:
+                runtime.primary_probe_cursors[cursor_key] = None
+                runtime.primary_probe_revisions[cursor_key] = end_revision
+                runtime.primary_probe_complete[cursor_key] = False
+                diagnostics.append({"project_id": project_id,
+                                    "reason": "ready_index_changed"})
+                return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+    state = "waiting_for_aggregation" if waiting else "no_primary_demand"
+    return PrimaryDemandProbe(state, tuple(diagnostics[-32:]))
+
+
+def _build_borrow_admission_grant(
+    runtime: MachineRuntime,
+    dispatchable: dict[str, RootConfig],
+    probe: PrimaryDemandProbe,
+    enabled_ids: set[str],
+) -> _BorrowAdmissionGrant | None:
+    """Create a grant only after every enabled project's primary probe completed."""
+    if probe.state != "no_primary_demand":
+        return None
+    revisions: list[_BorrowAdmissionRevision] = []
+    for project_id in sorted(enabled_ids):
+        cfg = dispatchable.get(project_id)
+        if cfg is None:
+            return None
+        for scope in ("shared", "home"):
+            cursor_key = (project_id, scope)
+            revision = runtime.primary_probe_revisions.get(cursor_key)
+            if not runtime.primary_probe_complete.get(cursor_key) or not isinstance(
+                revision, int
+            ):
+                return None
+            revisions.append(_BorrowAdmissionRevision(project_id, cfg, scope, revision))
+    return _BorrowAdmissionGrant(runtime.root, tuple(revisions))
 
 
 def _pid_alive(pid: int) -> bool:
@@ -150,6 +393,9 @@ def _publish_project_snapshots(
     started_at = started_at or utc_now()
     for project_id, cfg in readable.items():
         attempts = [item.get("attempt_id") for item in reservations if item.get("project_id") == project_id]
+        project_reservations = [
+            item for item in reservations if item.get("project_id") == project_id
+        ]
         agent_path = machine_state_path(cfg, "agent.json")
         idle_since_at = None
         if not reserved:
@@ -169,7 +415,7 @@ def _publish_project_snapshots(
                 observed_state="active" if reserved else "idle",
                 active_attempt_ids=[item for item in attempts if isinstance(item, str)],
                 visible_gpu_ids=visible, reserved_gpu_ids=reserved,
-                reservation_summaries=reservations,
+                reservation_summaries=project_reservations,
                 heartbeat_interval_seconds=heartbeat_interval_seconds, started_at=started_at,
                 idle_since_at=idle_since_at,
             )
@@ -319,7 +565,7 @@ class _MachineControlPlane:
         authority_interval = self._loop_interval
         reserved_before = {
             gpu_id
-            for item in active_reservations(self._runtime.root)
+            for item in reservation_snapshot(self._runtime.root).reservations
             for gpu_id in item.get("gpu_ids", [])
         }
         try:
@@ -343,7 +589,7 @@ class _MachineControlPlane:
                 continue
         reserved_after = {
             gpu_id
-            for item in active_reservations(self._runtime.root)
+            for item in reservation_snapshot(self._runtime.root).reservations
             for gpu_id in item.get("gpu_ids", [])
         }
         if (
@@ -381,7 +627,7 @@ class _MachineControlPlane:
                 instance_id=self._instance_id,
                 pid=_read_pid(self._runtime),
                 visible=self._visible_gpus or [],
-                reservations=active_reservations(self._runtime.root),
+                reservations=list(reservation_snapshot(self._runtime.root).reservations),
                 heartbeat_interval_seconds=self._loop_interval,
                 started_at=self._started_at,
             )
@@ -462,6 +708,93 @@ def dispatch_machine_cycle_locked(
     except OSError:
         pass
     return results
+
+
+def _dispatch_admission_layer(
+    runtime: MachineRuntime,
+    ordered_enabled: list[ProjectBinding],
+    dispatchable: dict[str, RootConfig],
+    executor: Executor,
+    free: list[int],
+    visible: list[int],
+    result_by_project: dict[str, dict[str, Any]],
+    batch_sizers: dict[str, AdaptiveBatchSizer],
+    budget: SliceBudget,
+    *,
+    admission_role: str,
+    borrow_admission_grant: _BorrowAdmissionGrant | None = None,
+) -> tuple[list[int], ProjectBinding | None]:
+    """Run one fair admission layer and return remaining GPUs and last winner."""
+    inspected_ready: set[tuple[str, str, str, str]] = set()
+    round_bindings = list(ordered_enabled)
+    last_successful_binding: ProjectBinding | None = None
+    has_retried_empty_round = False
+    while free and round_bindings:
+        if not budget.can_start_record():
+            diagnostic_increment("scheduler.work.immediate_slices")
+            time.sleep(0)
+            budget = SliceBudget(budget.policy)
+        round_claims = 0
+        records_before_round = budget.records_used
+        round_last_success: ProjectBinding | None = None
+        for binding in round_bindings:
+            cfg = dispatchable.get(binding.project_id)
+            if cfg is None or not free or not budget.can_start_record():
+                continue
+            claimed_task_ids: list[str] = []
+            try:
+                with diagnostic_span("scheduler.work"):
+                    launched = run_dispatch_cycle(
+                        cfg,
+                        available_gpus=free,
+                        executor=executor,
+                        reservation_runtime_root=runtime.root,
+                        project_id=binding.project_id,
+                        admission_role=admission_role,
+                        borrow_admission_grant=borrow_admission_grant,
+                        ready_cursor_namespace=f"{binding.project_id}.{admission_role}",
+                        preflight=lambda spec: _working_directory_reason(spec) is None,
+                        preflight_rejected=lambda task: _record_bad_task_spec(
+                            runtime, binding, task.task_id, task.spec
+                        ),
+                        claim_guard=lambda: runtime.enabled_claim_guard(binding),
+                        max_new_claims=1,
+                        on_claim=claimed_task_ids.append,
+                        should_recover_starting=False,
+                        work_budget=budget,
+                        batch_sizer=batch_sizers[binding.project_id],
+                        inspected_ready=inspected_ready,
+                    )
+                result_by_project[binding.project_id]["launched"].extend(launched)
+                if claimed_task_ids:
+                    round_claims += 1
+                    round_last_success = binding
+                    last_successful_binding = binding
+                    snapshot = reconcile_snapshot(runtime.root)
+                    free = [gpu_id for gpu_id in visible if gpu_id not in snapshot.reserved_gpu_ids]
+            except (OSError, RuntimeError, ValueError) as exc:
+                item = result_by_project[binding.project_id]
+                item["status"] = "error"
+                item["error"] = str(exc)
+        if (
+            round_claims == 0
+            and not budget.can_start_record()
+            and budget.records_used == records_before_round
+            and not has_retried_empty_round
+        ):
+            diagnostic_increment("scheduler.work.immediate_slices")
+            time.sleep(0)
+            budget = SliceBudget(budget.policy)
+            round_bindings = round_bindings[1:] + round_bindings[:1]
+            has_retried_empty_round = True
+            continue
+        if round_claims == 0:
+            break
+        diagnostic_increment("scheduler.work.rounds")
+        if round_last_success is not None:
+            index = round_bindings.index(round_last_success)
+            round_bindings = round_bindings[index + 1 :] + round_bindings[: index + 1]
+    return free, last_successful_binding
 
 
 def _dispatch_machine_cycle_locked(
@@ -573,7 +906,10 @@ def _dispatch_machine_cycle_locked(
             if cfg is None or read_ready_index_state(cfg) not in {"absent", "building"}:
                 continue
             try:
-                advance_ready_index_build(cfg)
+                for _ in range(8):
+                    state = advance_ready_index_build(cfg)
+                    if state.get("state") != "building":
+                        break
             except (OSError, RuntimeError, ValueError) as exc:
                 item = result_by_project[binding.project_id]
                 item["status"] = "error"
@@ -581,7 +917,7 @@ def _dispatch_machine_cycle_locked(
                 del dispatchable[binding.project_id]
     if not free:
         diagnostic_increment("scheduler.work.skipped_no_capacity", len(ordered_enabled))
-    budget = SliceBudget()
+    budget = SliceBudget(WorkBudgetPolicy())
     batch_sizers: dict[str, AdaptiveBatchSizer] = {}
     enabled_ids = {binding.project_id for binding in ordered_enabled}
     for project_id in set(runtime.ready_batch_sizers) - enabled_ids:
@@ -592,75 +928,37 @@ def _dispatch_machine_cycle_locked(
             sizer = AdaptiveBatchSizer(budget.policy)
             runtime.ready_batch_sizers[binding.project_id] = sizer
         batch_sizers[binding.project_id] = sizer
-    inspected_ready: set[tuple[str, str, str]] = set()
-    round_bindings = list(ordered_enabled)
+
+    probe_budget = SliceBudget(WorkBudgetPolicy())
+    probe = _probe_primary_demand(
+        runtime, readable, dispatchable, visible, free, probe_budget
+    ) if free else PrimaryDemandProbe("unresolved")
+    diagnostic_increment(f"scheduler.primary_probe.{probe.state}")
+    borrow_admission_grant = _build_borrow_admission_grant(
+        runtime, dispatchable, probe, enabled_ids
+    )
+    budget = SliceBudget(WorkBudgetPolicy())
     last_successful_binding: ProjectBinding | None = None
-    has_retried_empty_round = False
-    while free and round_bindings:
-        if not budget.can_start_record():
-            diagnostic_increment("scheduler.work.immediate_slices")
-            time.sleep(0)
-            budget = SliceBudget()
-        round_claims = 0
-        records_before_round = budget.records_used
-        round_last_success: ProjectBinding | None = None
-        for binding in round_bindings:
-            cfg = dispatchable.get(binding.project_id)
-            if cfg is None or not free or not budget.can_start_record():
-                continue
-            claimed_task_ids: list[str] = []
-            try:
-                with diagnostic_span("scheduler.work"):
-                    launched = run_dispatch_cycle(
-                        cfg,
-                        available_gpus=free,
-                        executor=executor,
-                        reservation_runtime_root=runtime.root,
-                        project_id=binding.project_id,
-                        preflight=lambda spec: _working_directory_reason(spec) is None,
-                        preflight_rejected=lambda task: _record_bad_task_spec(
-                            runtime, binding, task.task_id, task.spec
-                        ),
-                        claim_guard=lambda: runtime.enabled_claim_guard(binding),
-                        max_new_claims=1,
-                        on_claim=claimed_task_ids.append,
-                        should_recover_starting=False,
-                        work_budget=budget,
-                        batch_sizer=batch_sizers[binding.project_id],
-                        inspected_ready=inspected_ready,
-                    )
-                result_by_project[binding.project_id]["launched"].extend(launched)
-                if claimed_task_ids:
-                    round_claims += 1
-                    round_last_success = binding
-                    last_successful_binding = binding
-                    snapshot = reconcile_snapshot(runtime.root)
-                    free = [
-                        gpu_id for gpu_id in visible
-                        if gpu_id not in snapshot.reserved_gpu_ids
-                    ]
-            except (OSError, RuntimeError, ValueError) as exc:
-                item = result_by_project[binding.project_id]
-                item["status"] = "error"
-                item["error"] = str(exc)
-        if (
-            round_claims == 0
-            and not budget.can_start_record()
-            and budget.records_used == records_before_round
-            and not has_retried_empty_round
-        ):
-            diagnostic_increment("scheduler.work.immediate_slices")
-            time.sleep(0)
-            budget = SliceBudget()
-            round_bindings = round_bindings[1:] + round_bindings[:1]
-            has_retried_empty_round = True
-            continue
-        if round_claims == 0:
+    for admission_role in ("primary", "borrow"):
+        if admission_role == "borrow" and probe.state != "no_primary_demand":
             break
-        diagnostic_increment("scheduler.work.rounds")
-        if round_last_success is not None:
-            index = round_bindings.index(round_last_success)
-            round_bindings = round_bindings[index + 1 :] + round_bindings[: index + 1]
+        free, layer_winner = _dispatch_admission_layer(
+            runtime,
+            ordered_enabled,
+            dispatchable,
+            executor,
+            free,
+            visible,
+            result_by_project,
+            batch_sizers,
+            budget,
+            admission_role=admission_role,
+            borrow_admission_grant=(
+                borrow_admission_grant if admission_role == "borrow" else None
+            ),
+        )
+        if layer_winner is not None:
+            last_successful_binding = layer_winner
     if ordered_enabled:
         if last_successful_binding is not None:
             index = ordered_enabled.index(last_successful_binding)
@@ -669,7 +967,7 @@ def _dispatch_machine_cycle_locked(
             next_binding = ordered_enabled[1 % len(ordered_enabled)]
         runtime.save_cursor(next_binding.project_id)
     if publish_snapshots:
-        reservations = active_reservations(runtime.root)
+        reservations = list(reservation_snapshot(runtime.root).reservations)
         _publish_project_snapshots(
             readable, instance_id=instance_id, pid=_read_pid(runtime), visible=visible, reservations=reservations,
             heartbeat_interval_seconds=heartbeat_interval_seconds, started_at=started_at,
@@ -1009,15 +1307,19 @@ def run_machine_agent_loop(
             control_plane.start()
             while not stop:
                 scheduler_wakeup.clear()
-                with machine_runtime.migration_guard() as is_migration_clear:
-                    if is_migration_clear:
-                        dispatch_machine_cycle_locked(
-                            machine_runtime, available_gpus=available_gpus, executor=executor,
-                            instance_id=instance_id, heartbeat_interval_seconds=loop_interval,
-                            started_at=started_at,
-                            supervise=False,
-                            publish_snapshots=False,
-                        )
+                try:
+                    with machine_runtime.migration_guard() as is_migration_clear:
+                        if is_migration_clear:
+                            dispatch_machine_cycle_locked(
+                                machine_runtime, available_gpus=available_gpus, executor=executor,
+                                instance_id=instance_id, heartbeat_interval_seconds=loop_interval,
+                                started_at=started_at,
+                                supervise=False,
+                                publish_snapshots=False,
+                            )
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    # A transient shared-root failure must not stop supervision of other projects.
+                    pass
                 scheduler_wakeup.wait(loop_interval)
         finally:
             if control_plane is not None:
@@ -1028,7 +1330,7 @@ def run_machine_agent_loop(
                 )
                 if is_active_identity:
                     try:
-                        reservations = active_reservations(machine_runtime.root)
+                        reservations = list(reservation_snapshot(machine_runtime.root).reservations)
                         reserved = sorted({
                             gpu_id
                             for item in reservations

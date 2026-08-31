@@ -128,6 +128,31 @@ def test_group_json_remains_raw_workflow_result(tmp_path: Path, capsys):
     assert "action" not in created
 
 
+def test_group_machines_cli_exposes_normalized_role_and_limit(tmp_path: Path, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    assert main([*_base_args(cfg), "group", "create", "demo", "--format=json"]) == 0
+    capsys.readouterr()
+
+    assert main([
+        *_base_args(cfg), "group", "machines", "add", "demo", "gpu-2",
+        "--role", "borrow", "--max-gpus", "2", "--format=json",
+    ]) == 0
+    capsys.readouterr()
+    assert main([
+        *_base_args(cfg), "group", "machines", "list", "demo", "--format=json"
+    ]) == 0
+    machines = json.loads(capsys.readouterr().out)["machines"]
+    assert machines[-1]["scheduling_role"] == "borrow"
+    assert machines[-1]["borrow_limit_gpus"] == 2
+
+    assert main([
+        *_base_args(cfg), "group", "machines", "set", "demo", "gpu-2",
+        "--max-gpus", "unlimited", "--format=json",
+    ]) == 0
+    updated = json.loads(capsys.readouterr().out)
+    assert updated["group"]["worker_set"]["gpu-2"]["borrow_limit_gpus"] is None
+
+
 def test_batch_json_is_one_document_and_idempotent_retry_is_silent_on_stderr(tmp_path: Path, monkeypatch, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     manifest = tmp_path / "runs.yaml"

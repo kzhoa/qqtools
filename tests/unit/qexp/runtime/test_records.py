@@ -1,4 +1,4 @@
-from qqtools.plugins.qexp.runtime.records import TaskRecord, TaskSpec
+from qqtools.plugins.qexp.runtime.records import TaskRecord, TaskSpec, normalize_group_record
 
 
 def test_task_record_has_no_batch_or_retry_truth(tmp_path):
@@ -22,3 +22,30 @@ def test_private_task_cannot_become_shared(tmp_path):
         assert "private" in str(exc)
     else:
         raise AssertionError("private task was accepted in shared scope")
+
+
+def test_legacy_group_worker_defaults_to_primary():
+    group = {"group": {"worker_set": {"gpu-1": {"state": "active"}}}}
+
+    normalize_group_record(group)
+
+    assert group["group"]["worker_set"]["gpu-1"]["scheduling_role"] == "primary"
+    assert group["group"]["worker_set"]["gpu-1"]["borrow_limit_gpus"] is None
+
+
+def test_canonical_borrow_worker_encoding_is_readable():
+    group = {
+        "group": {
+            "worker_set": {
+                "gpu-1": {
+                    "state": "active",
+                    "scheduling_role": "borrow",
+                    "borrow_limit_gpus": 2,
+                }
+            }
+        }
+    }
+
+    normalize_group_record(group)
+
+    assert group["group"]["worker_set"]["gpu-1"]["scheduling_role"] == "borrow"

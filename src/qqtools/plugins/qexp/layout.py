@@ -13,6 +13,7 @@ from .runtime.paths import local_paths, machine_path, shared_log_path, shared_pa
 from .runtime.locks import exclusive, schema_lock
 from .runtime.records import AttemptRecord, SCHEMA_VERSION, TaskRecord, utc_now
 from .runtime.store import atomic_replace, read_json
+from .runtime.worker_encoding import ensure_primary_borrow_encoding
 from .lease import default_lease_policy_document
 
 
@@ -122,6 +123,7 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                 "created_at": utc_now(),
             }}
             atomic_replace(_schema_path(cfg), schema)
+        ensure_primary_borrow_encoding(cfg)
     ensure_machine_layout(cfg)
     identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
     if not identity_path.exists():

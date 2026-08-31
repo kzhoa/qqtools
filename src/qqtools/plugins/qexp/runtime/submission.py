@@ -16,19 +16,30 @@ from .records import (
     new_id,
     new_submission,
     new_worker_member,
+    normalize_group_record,
     utc_now,
     validate_identifier,
 )
 from .ready import (
     assert_ready_writer_compatible,
     delete_ready_marker,
+    primary_projection_transaction,
+    primary_projection_routes_for_group,
     prepare_ready_transition,
     retire_previous_ready_generation,
+    sync_primary_ready_group,
 )
 from .active_operations import operation_exists
 from .store import atomic_replace, create_if_absent, read_json
+from .worker_encoding import prepare_group_record_for_write
 from .availability import remove_deadline_index, sync_deadline_index
 from .tasks import save_task
+
+
+def _write_group_record(cfg: object, path: Path, data: dict[str, Any]) -> None:
+    """Persist a Group through this module's patchable atomic writer."""
+    prepare_group_record_for_write(cfg, data)
+    atomic_replace(path, data)
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
 
 
@@ -76,14 +87,43 @@ def semantic_digest(request: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _worker_additions(worker_set: list[str] | None) -> list[str]:
-    additions = list(worker_set or [])
-    seen: set[str] = set()
-    for index, machine in enumerate(additions):
-        validate_identifier(machine, f"worker_set[{index}]")
-        if machine in seen:
+def _worker_additions(
+    worker_set: dict[str, dict[str, Any]] | list[str] | None,
+) -> dict[str, dict[str, Any]]:
+    if worker_set is None:
+        return {}
+    if isinstance(worker_set, list):
+        seen: set[str] = set()
+        for index, machine in enumerate(worker_set):
+            validate_identifier(machine, f"worker_set[{index}]")
+            if machine in seen:
+                raise ValueError(f"worker_set must not contain duplicate machine {machine!r}.")
+            seen.add(machine)
+        worker_set = {
+            machine: {"scheduling_role": "primary", "borrow_limit_gpus": None}
+            for machine in worker_set
+        }
+    if not isinstance(worker_set, dict):
+        raise ValueError("worker_set must be a Worker declaration mapping.")
+    additions: dict[str, dict[str, Any]] = {}
+    for machine, declaration in worker_set.items():
+        validate_identifier(machine, f"worker_set.{machine}")
+        if machine in additions:
             raise ValueError(f"worker_set must not contain duplicate machine {machine!r}.")
-        seen.add(machine)
+        if not isinstance(declaration, dict):
+            raise ValueError(f"worker_set.{machine} must be a mapping.")
+        role = declaration.get("scheduling_role", "primary")
+        limit = declaration.get("borrow_limit_gpus")
+        if role == "primary" and limit is not None:
+            raise ValueError(f"worker_set.{machine} primary Worker cannot have a borrow limit.")
+        if role not in {"primary", "borrow"}:
+            raise ValueError(f"worker_set.{machine}.scheduling_role is invalid.")
+        if limit is not None and (type(limit) is not int or limit <= 0):
+            raise ValueError(f"worker_set.{machine}.borrow_limit_gpus must be positive or null.")
+        additions[machine] = {
+            "scheduling_role": role,
+            "borrow_limit_gpus": limit,
+        }
     return additions
 
 
@@ -169,22 +209,33 @@ def _validate_target_machine_record(cfg: Any, machine_name: str) -> None:
 
 
 def _active_workers(group: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    normalize_group_record(group)
     return {
-        machine: worker for machine, worker in group["group"]["worker_set"].items() if worker.get("state") == "active"
+        machine: worker
+        for machine, worker in group["group"]["worker_set"].items()
+        if worker.get("state") in {"active", "borrow"}
     }
 
 
 def _planned_worker_set(
-    group: dict[str, Any] | None, additions: list[str]
+    group: dict[str, Any] | None, additions: dict[str, dict[str, Any]]
 ) -> dict[str, dict[str, Any]]:
     active_workers = _active_workers(group) if group else {}
     all_workers = group["group"]["worker_set"] if group else {}
     planned = dict(active_workers)
-    for machine in additions:
+    for machine, declaration in additions.items():
         worker = all_workers.get(machine)
-        if worker is not None and worker.get("state") != "active":
-            raise ValueError(f"machine {machine!r} is not an active Group worker.")
-        planned.setdefault(machine, {"state": "active", "state_epoch": 0, "added_by_operation": None})
+        if worker is not None and worker.get("state") not in {"active", "borrow"}:
+            raise ValueError(f"machine {machine!r} is not a claimable Group worker.")
+        planned.setdefault(
+            machine,
+            {
+                "state": "borrow" if declaration["scheduling_role"] == "borrow" else "active",
+                **declaration,
+                "state_epoch": 0,
+                "added_by_operation": None,
+            },
+        )
     return planned
 
 
@@ -287,6 +338,7 @@ def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
                 f"{group_name!r}."
             )
         group = read_json(group_file)
+        normalize_group_record(group)
         pending = group["group"].get("pending_submission_commit") or {}
         if not pending:
             return
@@ -308,7 +360,7 @@ def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
         group["meta"]["revision"] += 1
         group["meta"]["updated_at"] = utc_now()
         group["group"]["pending_submission_commit"] = None
-        atomic_replace(group_file, group)
+        _write_group_record(cfg, group_file, group)
 
 
 def submit_specs(
@@ -324,7 +376,14 @@ def submit_specs(
     if not specs:
         raise ValueError("submission must contain at least one task.")
     worker_additions = _worker_additions(worker_set)
-    normalized = {"group": group_name, "tasks": _canonical_specs(specs), "worker_set": sorted(worker_additions)}
+    normalized = {
+        "group": group_name,
+        "tasks": _canonical_specs(specs),
+        "worker_set": {
+            machine: worker_additions[machine]
+            for machine in sorted(worker_additions)
+        },
+    }
     raw_digest = semantic_digest(normalized)
     key = idempotency_key or new_id()
     mapping_path = idempotency_path(cfg.shared_root, semantic_digest({"project": str(cfg.shared_root), "key": key}))
@@ -366,6 +425,8 @@ def submit_specs(
                 with group_lock(cfg.shared_root, group_name):
                     group_file = group_path(cfg.shared_root, group_name)
                     group = read_json(group_file) if group_file.exists() else None
+                    if group is not None:
+                        normalize_group_record(group)
                     if group is not None and group["group"]["admission_state"] != "open":
                         raise ValueError(f"Group {group_name!r} is sealed.")
                     group_precondition = _group_precondition(group)
@@ -399,7 +460,7 @@ def submit_specs(
                 "task_ids": [item["task_id"] for item in resolved],
                 "task_specs": resolved,
                 "create_group": bool(group_name and not group_precondition["exists"]),
-                "worker_set_additions": list(worker_additions),
+                "worker_set_additions": worker_additions,
                 "group_precondition": group_precondition,
                 "planned_worker_set": sorted(planned_workers),
             }
@@ -426,6 +487,7 @@ def submit_specs(
                     group = new_group(group_name, cfg.machine_name)
                 else:
                     group = read_json(group_file)
+                    normalize_group_record(group)
                 precondition = operation["submission"]["resolved_context"].get("group_precondition") or {}
                 pending = group["group"].get("pending_submission_commit") or {}
                 has_own_pending_commit = pending.get("operation_id") == operation_id
@@ -447,7 +509,7 @@ def submit_specs(
                     raise ValueError(f"Group {group_name!r} is sealed.")
                 planned_workers = _planned_worker_set(
                     group,
-                    operation["submission"]["resolved_context"].get("worker_set_additions", []),
+                    operation["submission"]["resolved_context"].get("worker_set_additions", {}),
                 )
                 _validate_placement_against_workers(resolved, group_name=group_name, planned_workers=planned_workers)
                 if operation["submission"]["commit_plan"]["group_membership_sequences"] is None:
@@ -464,21 +526,41 @@ def submit_specs(
                     "worker_set_additions": operation["submission"]["resolved_context"].get("worker_set_additions", []),
                 }
                 workers = group["group"]["worker_set"]
+                projection_routes = primary_projection_routes_for_group(cfg, group_name)
                 added_workers: list[dict[str, Any]] = []
+                added_worker_machines: list[str] = []
                 for machine in dict.fromkeys(
-                    operation["submission"]["resolved_context"].get("worker_set_additions", [])
+                    operation["submission"]["resolved_context"].get("worker_set_additions", {})
                 ):
+                    declaration = operation["submission"]["resolved_context"][
+                        "worker_set_additions"
+                    ][machine]
                     if machine not in workers:
-                        worker = new_worker_member(added_by_operation=operation_id)
+                        worker = new_worker_member(
+                            scheduling_role=declaration["scheduling_role"],
+                            borrow_limit_gpus=declaration["borrow_limit_gpus"],
+                            added_by_operation=operation_id,
+                        )
                         workers[machine] = worker
                         added_workers.append(worker)
+                        added_worker_machines.append(machine)
                 if added_workers:
                     group["group"]["worker_set_epoch"] += 1
                     for worker in added_workers:
                         worker["state_epoch"] = group["group"]["worker_set_epoch"]
                 group["meta"]["revision"] += 1
                 group["meta"]["updated_at"] = utc_now()
-                atomic_replace(group_file, group)
+                if added_worker_machines:
+                    routes = projection_routes + [
+                        (scope, machine)
+                        for machine in added_worker_machines
+                        for scope in ("shared", "home")
+                    ]
+                    with primary_projection_transaction(cfg, routes):
+                        _write_group_record(cfg, group_file, group)
+                        sync_primary_ready_group(cfg, group_name)
+                else:
+                    _write_group_record(cfg, group_file, group)
         else:
             sequences = [None] * len(resolved)
 
@@ -554,6 +636,7 @@ def submit_specs(
                     group_file = group_path(cfg.shared_root, group_name)
                     if group_file.exists():
                         group = read_json(group_file)
+                        normalize_group_record(group)
                         has_pending_commit = (group["group"].get("pending_submission_commit") or {}).get(
                             "operation_id"
                         ) == operation_id
@@ -565,7 +648,7 @@ def submit_specs(
                                 group["group"]["pending_submission_commit"] = None
                                 group["meta"]["revision"] += 1
                                 group["meta"]["updated_at"] = utc_now()
-                                atomic_replace(group_file, group)
+                                _write_group_record(cfg, group_file, group)
             for item in operation["submission"]["resolved_context"].get("task_specs", []):
                 task_id = item["task_id"]
                 path = task_path(cfg.shared_root, task_id)

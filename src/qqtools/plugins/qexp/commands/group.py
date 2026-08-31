@@ -12,10 +12,17 @@ from ..runtime.claims import archive_claim
 from ..runtime.locks import group_lock, task_lock
 from ..runtime.paths import attempt_path, group_path, shared_paths, submission_path
 from ..runtime.records import (AttemptRecord, SCHEMA_VERSION, TaskRecord, new_group, new_id,
-                               new_worker_member, utc_now, validate_group_name, validate_identifier)
+                               new_worker_member, normalize_group_record, utc_now,
+                               validate_borrow_limit, validate_group_name, validate_identifier)
 from ..runtime.store import atomic_replace, iter_json, read_json
+from ..runtime.worker_encoding import write_group_record
 from ..runtime.tasks import load_task, save_task
-from ..runtime.ready import retire_current_ready_generation
+from ..runtime.ready import (
+    primary_projection_transaction,
+    primary_projection_routes_for_group,
+    retire_current_ready_generation,
+    sync_primary_ready_group,
+)
 from ..runtime.active_operations import (
     active_operation_path,
     archive_operation,
@@ -34,6 +41,7 @@ def _finalize_pending_submission_before_group_mutation(
         if not path.exists():
             return
         data = read_json(path)
+        normalize_group_record(data)
         pending = data["group"].get("pending_submission_commit") or {}
         if not pending:
             return
@@ -103,7 +111,7 @@ def group_control(
             data["cancellation_operation"] = operation["group_control"]
             data["meta"]["revision"] += 1
             data["meta"]["updated_at"] = utc_now()
-            atomic_replace(path, data)
+            write_group_record(cfg, path, data)
             operation["group_control"]["state"] = "converging"
             operation["group_control"]["updated_at"] = utc_now()
             write_active_operation(cfg, "group_control", operation_id, operation)
@@ -184,7 +192,7 @@ def group_control(
             raise ValueError(f"unknown group action {action!r}.")
         data["meta"]["revision"] += 1
         data["meta"]["updated_at"] = utc_now()
-        atomic_replace(path, data)
+        write_group_record(cfg, path, data)
         result_data = data
     for result in post_commit_results:
         if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
@@ -223,6 +231,7 @@ def reconcile_group_cancel_operations(
             if not group_file.exists():
                 continue
             group_data = read_json(group_file)
+            normalize_group_record(group_data)
             barriers = group_data["group"].get("cancellation_barriers", [])
             has_barrier = any(
                 barrier.get("operation_id") == control["operation_id"] for barrier in barriers
@@ -242,7 +251,7 @@ def reconcile_group_cancel_operations(
                     group_data["cancellation_operation"] = control
                     group_data["meta"]["revision"] += 1
                     group_data["meta"]["updated_at"] = utc_now()
-                    atomic_replace(group_file, group_data)
+                    write_group_record(cfg, group_file, group_data)
                 reconciled.append(control)
                 continue
             pending: dict[str, list[str]] = {}
@@ -304,7 +313,7 @@ def reconcile_group_cancel_operations(
                 group_data["cancellation_operation"] = control
                 group_data["meta"]["revision"] += 1
                 group_data["meta"]["updated_at"] = utc_now()
-                atomic_replace(group_file, group_data)
+                write_group_record(cfg, group_file, group_data)
             reconciled.append(control)
     return reconciled
 
@@ -324,6 +333,7 @@ def _reconcile_worker_remove_operation(
         if not group_file.exists():
             return None
         group_data = read_json(group_file)
+        normalize_group_record(group_data)
         workers = group_data["group"].get("worker_set", {})
         worker = workers.get(machine)
         if worker is None:
@@ -376,7 +386,7 @@ def _reconcile_worker_remove_operation(
             group_data["worker_control"] = control
         group_data["meta"]["revision"] += 1
         group_data["meta"]["updated_at"] = utc_now()
-        atomic_replace(group_file, group_data)
+        write_group_record(cfg, group_file, group_data)
         if control["state"] == "completed":
             archive_operation(cfg, "group_control", control["operation_id"], operation)
         return control
@@ -396,22 +406,27 @@ def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -
                 raise ValueError(f"group workers must not contain duplicate machine {machine!r}.")
             seen.add(machine)
             data["group"]["worker_set"][machine] = new_worker_member()
-        atomic_replace(path, data)
+        write_group_record(cfg, path, data)
         return data
 
 
 def show_group(cfg: RootConfig, name: str) -> dict[str, Any]:
     name = validate_group_name(name) or name
     reconcile_group_cancel_operations(cfg, name)
-    return read_json(group_path(cfg.shared_root, name))
+    result = read_json(group_path(cfg.shared_root, name))
+    normalize_group_record(result)
+    return result
 
 
 def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
-                  *, terminate_running: bool = False) -> dict[str, Any]:
+                  *, terminate_running: bool = False, role: str | None = None,
+                  borrow_limit_gpus: int | None = None,
+                  has_borrow_limit: bool = False) -> dict[str, Any]:
     path = group_path(cfg.shared_root, validate_group_name(group_name) or group_name)
     _finalize_pending_submission_before_group_mutation(cfg, group_name, path)
     with group_lock(cfg.shared_root, group_name):
         data = read_json(path)
+        normalize_group_record(data)
         pending = data["group"].get("pending_submission_commit")
         if pending:
             operation_path = submission_path(cfg.shared_root, pending["operation_id"])
@@ -426,11 +441,68 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                 f"Group {group_name!r} received a concurrent submission commit; retry the mutation."
             )
         workers = data["group"]["worker_set"]
+        projection_routes = primary_projection_routes_for_group(cfg, group_name)
+        worker_changed = True
+        if has_borrow_limit:
+            borrow_limit_gpus = validate_borrow_limit(borrow_limit_gpus, "max_gpus")
         if action == "add":
-            workers.setdefault(machine, new_worker_member())
-            workers[machine]["state"] = "active"
+            validate_identifier(machine, "worker_machine")
+            if role not in {None, "primary", "borrow"}:
+                raise ValueError("role must be 'primary' or 'borrow'.")
+            selected_role = role or "primary"
+            if selected_role == "primary" and borrow_limit_gpus is not None:
+                raise ValueError("primary Worker cannot have a borrow limit.")
+            current = workers.get(machine)
+            if current is None:
+                workers[machine] = new_worker_member(
+                    scheduling_role=selected_role,
+                    borrow_limit_gpus=borrow_limit_gpus,
+                )
+            else:
+                current_role = selected_role if role is not None else current["scheduling_role"]
+                current_limit = borrow_limit_gpus if has_borrow_limit else (
+                    None if role == "primary" else current["borrow_limit_gpus"]
+                )
+                if current_role == "primary":
+                    current_limit = None
+                current.update({
+                    "scheduling_role": current_role,
+                    "borrow_limit_gpus": current_limit,
+                    "state": "borrow" if current_role == "borrow" else "active",
+                })
+                current["state_epoch"] += 1
         elif machine not in workers:
             raise ValueError(f"machine {machine!r} is not a Worker Set member.")
+        elif action == "set":
+            if role is None and not has_borrow_limit:
+                raise ValueError("machines set requires --role or --max-gpus.")
+            worker = workers[machine]
+            selected_role = role or worker["scheduling_role"]
+            if selected_role not in {"primary", "borrow"}:
+                raise ValueError("role must be 'primary' or 'borrow'.")
+            selected_limit = borrow_limit_gpus if has_borrow_limit else worker["borrow_limit_gpus"]
+            if selected_role == "primary" and has_borrow_limit and selected_limit is not None:
+                raise ValueError("primary Worker cannot have a borrow limit.")
+            if selected_role == "borrow" and role == "borrow" and not has_borrow_limit:
+                selected_limit = None
+            if selected_role == "primary":
+                selected_limit = None
+            selected_state = worker["state"]
+            if selected_state in {"active", "borrow"}:
+                selected_state = "borrow" if selected_role == "borrow" else "active"
+            changed = (
+                worker["scheduling_role"] != selected_role
+                or worker["borrow_limit_gpus"] != selected_limit
+                or worker["state"] != selected_state
+            )
+            worker_changed = changed
+            worker.update({
+                "scheduling_role": selected_role,
+                "borrow_limit_gpus": selected_limit,
+                "state": selected_state,
+            })
+            if changed:
+                worker["state_epoch"] += 1
         elif action == "drain":
             workers[machine]["state"] = "draining"
             workers[machine]["state_epoch"] += 1
@@ -443,7 +515,6 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
             data["group"]["worker_set_epoch"] += 1
             data["meta"]["revision"] += 1
             data["meta"]["updated_at"] = utc_now()
-            atomic_replace(path, data)
             operation_path = active_operation_path(
                 cfg, "group_control", operation_id
             )
@@ -492,14 +563,30 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
             data["worker_control"] = operation["group_control"]
             data["meta"]["revision"] += 1
             data["meta"]["updated_at"] = utc_now()
-            atomic_replace(path, data)
+            with primary_projection_transaction(
+                cfg, sorted(set(projection_routes + [("shared", machine), ("home", machine)]))
+            ):
+                write_group_record(cfg, path, data)
+                sync_primary_ready_group(cfg, group_name)
             return data
         else:
             raise ValueError(f"unknown Worker Set action {action!r}.")
-        data["group"]["worker_set_epoch"] += 1
+        if worker_changed:
+            data["group"]["worker_set_epoch"] += 1
+            if action in {"add", "set"} and machine in workers:
+                workers[machine]["state_epoch"] = data["group"]["worker_set_epoch"]
         data["meta"]["revision"] += 1
         data["meta"]["updated_at"] = utc_now()
-        atomic_replace(path, data)
+        if worker_changed:
+            # Keep borrow admission closed from the role mutation until the
+            # corresponding primary candidate projection is published.
+            with primary_projection_transaction(
+                cfg, sorted(set(projection_routes + [("shared", machine), ("home", machine)]))
+            ):
+                write_group_record(cfg, path, data)
+                sync_primary_ready_group(cfg, group_name)
+        else:
+            write_group_record(cfg, path, data)
         return data
 
 

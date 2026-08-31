@@ -215,6 +215,25 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
                 ("Reason", result.get("reason")),
             ),
         )
+    if kind == "group-machines":
+        return _table(
+            ("Machine", "Role", "GPU usage", "GPU limit", "State", "Agent"),
+            [
+                (
+                    item.get("machine_name"),
+                    item.get("scheduling_role"),
+                    item.get("gpu_usage"),
+                    (
+                        item.get("borrow_limit_gpus")
+                        if item.get("borrow_limit_gpus") is not None
+                        else "unlimited"
+                    ),
+                    item.get("state"),
+                    item.get("agent"),
+                )
+                for item in result.get("machines", ())
+            ],
+        )
     if kind in {"machines", "top"}:
         machines = result.get("machines", ()) if isinstance(result, Mapping) else result
         return _table(
