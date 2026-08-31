@@ -7,6 +7,7 @@ import signal
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterator
@@ -31,7 +32,7 @@ from .config_types import RootConfig
 from .runtime.locks import group_lock, task_lock
 from .runtime.claims import archive_claim
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, submission_path
-from .runtime.records import AttemptRecord, TaskRecord, TaskSpec, utc_now
+from .runtime.records import AttemptRecord, TaskRecord, TaskSpec, normalize_group_record, utc_now
 from .runtime.ready import (
     advance_ready_index_build,
     ReadyMarkerRef,
@@ -45,7 +46,7 @@ from .runtime.ready import (
     retire_previous_ready_generation,
 )
 from .runtime.active_operations import operation_exists
-from .runtime.reservations import ReservationIdentity, attach, release, reserve
+from .runtime.reservations import ReservationIdentity, attach, release, reserve, reserve_admitted
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.tasks import load_task, save_task
 from .runtime.work_budget import (
@@ -58,6 +59,45 @@ from .runtime.work_budget import (
 LEASE_SECONDS = 120
 TERMINATION_GRACE_SECONDS = 5.0
 TERMINATION_POLL_SECONDS = 0.05
+
+
+class BorrowAdmissionRequired(RuntimeError):
+    """Raised when a borrow claim is attempted without machine-wide admission."""
+
+
+@dataclass(frozen=True, slots=True)
+class _BorrowAdmissionRevision:
+    project_id: str
+    cfg: RootConfig
+    queue_scope: str
+    revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class _BorrowAdmissionGrant:
+    """Machine-agent capability proving a stable no-primary-demand observation."""
+
+    runtime_root: Path
+    revisions: tuple[_BorrowAdmissionRevision, ...]
+
+    def is_valid(self, runtime_root: Path) -> bool:
+        if self.runtime_root.resolve() != Path(runtime_root).resolve():
+            return False
+        from .runtime.ready import (
+            is_primary_ready_index_active,
+            ready_index_route_revision,
+        )
+
+        try:
+            return all(
+                is_primary_ready_index_active(item.cfg)
+                and ready_index_route_revision(
+                    item.cfg, item.queue_scope, primary_only=True
+                ) == item.revision
+                for item in self.revisions
+            )
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return False
 
 
 def _reservation_root(cfg: RootConfig, value: Path | None = None) -> Path:
@@ -166,10 +206,11 @@ def authority_locks(cfg: RootConfig, task: TaskRecord) -> Iterator[None]:
 
 
 def _group_allows(group: dict[str, Any], task: TaskRecord, machine: str) -> bool:
+    normalize_group_record(group)
     if group["group"]["dispatch_state"] != "active":
         return False
     worker = group["group"]["worker_set"].get(machine)
-    if not worker or worker["state"] != "active":
+    if not worker or worker["state"] not in {"active", "borrow"}:
         return False
     if task.placement_runtime["queue_scope"] == "home":
         return task.placement_policy["home_machine"] == machine
@@ -200,6 +241,18 @@ def _eligible(cfg: RootConfig, task: TaskRecord) -> bool:
     return group_file.exists() and _group_allows(read_json(group_file), task, cfg.machine_name)
 
 
+def _task_worker_role(cfg: RootConfig, task: TaskRecord) -> str | None:
+    if not task.group_name:
+        return None
+    path = group_path(cfg.shared_root, task.group_name)
+    if not path.exists():
+        return None
+    group = read_json(path)
+    normalize_group_record(group)
+    worker = group["group"]["worker_set"].get(cfg.machine_name)
+    return worker.get("scheduling_role") if worker else None
+
+
 def _clock_evidence(observation: ClockObservation) -> dict[str, Any]:
     return {
         "clock_error_bound_seconds": observation.bound_at(time.monotonic()),
@@ -211,12 +264,15 @@ def _clock_evidence(observation: ClockObservation) -> dict[str, Any]:
 def _claim(
     cfg: RootConfig,
     task_id: str,
-    reservation: dict[str, Any],
+    assigned_gpus: list[int],
     *,
     lease_seconds: int,
     authority_mode: str,
     clock_evidence: dict[str, Any] | None,
     reservation_runtime_root: Path,
+    project_id: str | None,
+    admission_role: str | None,
+    borrow_admission_grant: _BorrowAdmissionGrant | None,
 ) -> AttemptRecord | None:
     task = load_task(cfg, task_id)
     if task.placement_policy["home_machine"] != cfg.machine_name and not _eligible(cfg, task):
@@ -225,9 +281,72 @@ def _claim(
         task = load_task(cfg, task_id)
         if not _eligible(cfg, task):
             return None
+        group: dict[str, Any] | None = None
+        worker: dict[str, Any] | None = None
+        if task.group_name:
+            group = read_json(group_path(cfg.shared_root, task.group_name))
+            normalize_group_record(group)
+            worker = group["group"]["worker_set"].get(cfg.machine_name)
+            if worker is None:
+                return None
+            if admission_role is not None and worker["scheduling_role"] != admission_role:
+                return None
+            if (
+                worker["scheduling_role"] == "borrow"
+                and (
+                    borrow_admission_grant is None
+                    or not borrow_admission_grant.is_valid(reservation_runtime_root)
+                )
+            ):
+                raise BorrowAdmissionRequired(
+                    "borrow claims require a current machine-agent admission grant."
+                )
         attempt_number = task.attempt_control["next_attempt_number"]
         attempt_id = f"{task.task_id}-attempt-{attempt_number}"
         token = task.claim_control["fencing_epoch"] + 1
+        if group is not None and worker is not None:
+            if worker["scheduling_role"] == "borrow":
+                reservation = reserve_admitted(
+                    reservation_runtime_root,
+                    task_id,
+                    assigned_gpus,
+                    project_id=project_id or "",
+                    group_name=task.group_name or "",
+                    machine_name=cfg.machine_name,
+                    borrow_limit_gpus=worker["borrow_limit_gpus"],
+                    worker_scheduling_role=worker["scheduling_role"],
+                    group_worker_set_epoch=group["group"]["worker_set_epoch"],
+                    worker_state_epoch=worker["state_epoch"],
+                    attempt_id=attempt_id,
+                    fencing_token=token,
+                    shared_root=str(cfg.shared_root),
+                )
+            else:
+                reservation = reserve(
+                    reservation_runtime_root,
+                    task_id,
+                    assigned_gpus,
+                    attempt_id=attempt_id,
+                    fencing_token=token,
+                    project_id=project_id,
+                    shared_root=str(cfg.shared_root),
+                    machine_name=cfg.machine_name,
+                    group_name=task.group_name,
+                    worker_scheduling_role=worker["scheduling_role"],
+                    group_worker_set_epoch=group["group"]["worker_set_epoch"],
+                    worker_state_epoch=worker["state_epoch"],
+                )
+        else:
+            reservation = reserve(
+                reservation_runtime_root,
+                task_id,
+                assigned_gpus,
+                attempt_id=attempt_id,
+                fencing_token=token,
+                project_id=project_id,
+                shared_root=str(cfg.shared_root),
+                machine_name=cfg.machine_name,
+            )
         attempt = AttemptRecord.claimed(
             task,
             cfg.machine_name,
@@ -258,15 +377,19 @@ def _claim(
             "group_dispatch_epoch": None,
             "group_worker_set_epoch": None,
         }
-        if task.group_name:
-            group = read_json(group_path(cfg.shared_root, task.group_name))
+        if task.group_name and group is not None and worker is not None:
             claim["group_dispatch_epoch"] = group["group"]["dispatch_epoch"]
             claim["group_worker_set_epoch"] = group["group"]["worker_set_epoch"]
-            worker = group["group"]["worker_set"][cfg.machine_name]
             claim["worker_state_epoch"] = worker["state_epoch"]
+            claim["worker_scheduling_role"] = worker["scheduling_role"]
+            claim["borrow_limit_gpus"] = worker["borrow_limit_gpus"]
+            claim["admitted_as_borrow"] = worker["scheduling_role"] == "borrow"
             attempt.authorization["group_dispatch_epoch"] = group["group"]["dispatch_epoch"]
             attempt.authorization["group_worker_set_epoch"] = group["group"]["worker_set_epoch"]
             attempt.authorization["worker_state_epoch"] = worker["state_epoch"]
+            attempt.authorization["worker_scheduling_role"] = worker["scheduling_role"]
+            attempt.authorization["borrow_limit_gpus"] = worker["borrow_limit_gpus"]
+            attempt.authorization["admitted_as_borrow"] = worker["scheduling_role"] == "borrow"
         task.claim_control.update({"fencing_epoch": token, "active_claim": claim})
         task.attempt_control.update(
             {
@@ -321,6 +444,8 @@ def claim_task(
     lease_seconds: int | None = None,
     reservation_runtime_root: Path | None = None,
     project_id: str | None = None,
+    admission_role: str | None = None,
+    borrow_admission_grant: _BorrowAdmissionGrant | None = None,
 ) -> AttemptRecord | None:
     task = load_task(cfg, task_id)
     if task.placement_policy["home_machine"] != cfg.machine_name and not _eligible(cfg, task):
@@ -335,30 +460,18 @@ def claim_task(
     reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     if lease_seconds is None:
         lease_seconds = policy.ttl_seconds
-    reservation = reserve(
-        reservation_runtime_root,
+    return _claim(
+        cfg,
         task_id,
         assigned_gpus,
+        lease_seconds=lease_seconds,
+        authority_mode=authority_mode,
+        clock_evidence=evidence,
+        reservation_runtime_root=reservation_runtime_root,
         project_id=project_id,
-        shared_root=str(cfg.shared_root),
-        machine_name=cfg.machine_name,
+        admission_role=admission_role,
+        borrow_admission_grant=borrow_admission_grant,
     )
-    try:
-        attempt = _claim(
-            cfg,
-            task_id,
-            reservation,
-            lease_seconds=lease_seconds,
-            authority_mode=authority_mode,
-            clock_evidence=evidence,
-            reservation_runtime_root=reservation_runtime_root,
-        )
-    except Exception:
-        release(reservation_runtime_root, reservation["reservation"]["reservation_id"], "claim_failed")
-        raise
-    if attempt is None:
-        release(reservation_runtime_root, reservation["reservation"]["reservation_id"], "claim_lost")
-    return attempt
 
 
 def _has_local_launch_evidence(cfg: RootConfig, attempt_id: str) -> bool:
@@ -615,6 +728,9 @@ def run_dispatch_cycle(
     executor: Executor | None = None,
     reservation_runtime_root: Path | None = None,
     project_id: str | None = None,
+    ready_cursor_namespace: str | None = None,
+    admission_role: str | None = None,
+    borrow_admission_grant: _BorrowAdmissionGrant | None = None,
     preflight: Callable[[TaskSpec], bool] | None = None,
     preflight_rejected: Callable[[TaskRecord], None] | None = None,
     before_claim: Callable[[], bool] | None = None,
@@ -633,6 +749,9 @@ def run_dispatch_cycle(
             executor=executor,
             reservation_runtime_root=reservation_runtime_root,
             project_id=project_id,
+            ready_cursor_namespace=ready_cursor_namespace,
+            admission_role=admission_role,
+            borrow_admission_grant=borrow_admission_grant,
             preflight=preflight,
             preflight_rejected=preflight_rejected,
             before_claim=before_claim,
@@ -653,6 +772,9 @@ def _run_dispatch_cycle(
     executor: Executor | None = None,
     reservation_runtime_root: Path | None = None,
     project_id: str | None = None,
+    ready_cursor_namespace: str | None = None,
+    admission_role: str | None = None,
+    borrow_admission_grant: _BorrowAdmissionGrant | None = None,
     preflight: Callable[[TaskSpec], bool] | None = None,
     preflight_rejected: Callable[[TaskRecord], None] | None = None,
     before_claim: Callable[[], bool] | None = None,
@@ -669,6 +791,10 @@ def _run_dispatch_cycle(
     executor = executor or Executor()
     launched: list[str] = []
     new_claims = 0
+    if admission_role == "borrow" and borrow_admission_grant is None:
+        raise BorrowAdmissionRequired(
+            "borrow dispatch requires a current machine-agent admission grant."
+        )
     if should_recover_starting:
         for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
             task = load_task(cfg, path.stem)
@@ -700,6 +826,7 @@ def _run_dispatch_cycle(
         budget = work_budget or SliceBudget()
         sizer = batch_sizer or AdaptiveBatchSizer(budget.policy)
         inspected = inspected_ready if inspected_ready is not None else set()
+        cursor_project_id = ready_cursor_namespace or project_id or "standalone"
         scopes = ("home", "shared")
         candidates: list[tuple[ReadyMarkerRef, str]] = []
         scope_identities: dict[str, set[str]] = {scope: set() for scope in scopes}
@@ -716,7 +843,7 @@ def _run_dispatch_cycle(
                     break
                 reference, has_wrapped = next_ready_marker(
                     cfg,
-                    project_id or "standalone",
+                    cursor_project_id,
                     scope,
                     scope_identities[scope],
                 )
@@ -724,7 +851,7 @@ def _run_dispatch_cycle(
                     diagnostic_increment("scheduler.ready.cursor_wraps")
                 if reference is None:
                     continue
-                identity = (project_id or "standalone", scope, reference.identity)
+                identity = (cursor_project_id, scope, reference.identity)
                 if identity in inspected:
                     made_progress = True
                     continue
@@ -735,7 +862,7 @@ def _run_dispatch_cycle(
             if not made_progress:
                 break
         for reference, _scope in candidates:
-            inspected.add((project_id or "standalone", _scope, reference.identity))
+            inspected.add((cursor_project_id, _scope, reference.identity))
             started_ns = time.monotonic_ns()
             diagnostic_increment("scheduler.ready.markers_inspected")
             result = classify_ready_marker(cfg, reference)
@@ -757,6 +884,22 @@ def _run_dispatch_cycle(
                 diagnostic_increment("scheduler.ready.machine_ineligible")
                 sizer.observe(max(1, time.monotonic_ns() - started_ns))
                 continue
+            if (
+                admission_role is not None
+                and task.group_name
+                and _task_worker_role(cfg, task) != admission_role
+            ):
+                sizer.observe(max(1, time.monotonic_ns() - started_ns))
+                continue
+            if (
+                borrow_admission_grant is None
+                and task.group_name
+                and _task_worker_role(cfg, task) == "borrow"
+            ):
+                diagnostic_increment("scheduler.borrow.skipped_without_admission")
+                raise BorrowAdmissionRequired(
+                    "borrow dispatch requires a current machine-agent admission grant."
+                )
             if preflight is not None and not preflight(task.spec):
                 if preflight_rejected is not None:
                     preflight_rejected(task)
@@ -783,6 +926,8 @@ def _run_dispatch_cycle(
                             cfg, task.task_id, gpus,
                             reservation_runtime_root=reservation_runtime_root,
                             project_id=project_id,
+                            admission_role=admission_role,
+                            borrow_admission_grant=borrow_admission_grant,
                         )
                 else:
                     if before_claim is not None and not before_claim():
@@ -792,6 +937,8 @@ def _run_dispatch_cycle(
                         cfg, task.task_id, gpus,
                         reservation_runtime_root=reservation_runtime_root,
                         project_id=project_id,
+                        admission_role=admission_role,
+                        borrow_admission_grant=borrow_admission_grant,
                     )
             except ValueError:
                 available = gpus + available
@@ -837,6 +984,21 @@ def _run_dispatch_cycle(
         task = load_task(cfg, path.stem)
         if not _eligible(cfg, task):
             continue
+        if (
+            admission_role is not None
+            and task.group_name
+            and _task_worker_role(cfg, task) != admission_role
+        ):
+            continue
+        if (
+            borrow_admission_grant is None
+            and task.group_name
+            and _task_worker_role(cfg, task) == "borrow"
+        ):
+            diagnostic_increment("scheduler.borrow.skipped_without_admission")
+            raise BorrowAdmissionRequired(
+                "borrow dispatch requires a current machine-agent admission grant."
+            )
         if preflight is not None and not preflight(task.spec):
             if preflight_rejected is not None:
                 preflight_rejected(task)
@@ -853,6 +1015,8 @@ def _run_dispatch_cycle(
                     attempt = claim_task(
                         cfg, task.task_id, gpus,
                         reservation_runtime_root=reservation_runtime_root, project_id=project_id,
+                        admission_role=admission_role,
+                        borrow_admission_grant=borrow_admission_grant,
                     )
             else:
                 if before_claim is not None and not before_claim():
@@ -861,6 +1025,8 @@ def _run_dispatch_cycle(
                 attempt = claim_task(
                     cfg, task.task_id, gpus,
                     reservation_runtime_root=reservation_runtime_root, project_id=project_id,
+                    admission_role=admission_role,
+                    borrow_admission_grant=borrow_admission_grant,
                 )
         except ValueError:
             available = gpus + available

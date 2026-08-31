@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .config_types import RootConfig
 from .runtime.paths import group_path, machine_path, shared_paths, submission_path, task_path
-from .runtime.records import TaskRecord
+from .runtime.records import TaskRecord, normalize_group_record
+from .runtime.reservations import reservation_snapshot
 from .runtime.store import iter_json, read_json
 from .runtime.tasks import load_task
 
@@ -52,7 +54,67 @@ def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
 
 
 def list_groups(cfg: RootConfig) -> list[dict[str, Any]]:
-    return [read_json(path) for path in iter_json(shared_paths(cfg.shared_root)["groups"])]
+    groups = []
+    for path in iter_json(shared_paths(cfg.shared_root)["groups"]):
+        group = read_json(path)
+        normalize_group_record(group)
+        groups.append(group)
+    return groups
+
+
+def list_group_machines(
+    cfg: RootConfig, name: str, *, reservation_runtime_root: Path | None = None
+) -> dict[str, Any]:
+    """Return normalized Worker roles, usage, limits, and machine observations."""
+    group = read_json(group_path(cfg.shared_root, name))
+    normalize_group_record(group)
+    machines = []
+    for machine, worker in sorted(group["group"]["worker_set"].items()):
+        summary_path = (
+            shared_paths(cfg.shared_root)["machines"] / machine / "state" / "summary.json"
+        )
+        reservations: list[dict[str, Any]] = []
+        agent_state = "unknown"
+        if summary_path.exists():
+            try:
+                summary = read_json(summary_path).get("summary", {})
+                reservations = [
+                    item for item in summary.get("machine_reservations", [])
+                    if isinstance(item, dict)
+                ]
+                agent_state = summary.get("agent_state", "unknown")
+            except (OSError, KeyError, TypeError, ValueError):
+                agent_state = "unknown"
+        if machine == cfg.machine_name and reservation_runtime_root is not None:
+            try:
+                reservations = list(reservation_snapshot(reservation_runtime_root).reservations)
+                reservations = [
+                    item for item in reservations
+                    if item.get("shared_root") in {None, str(cfg.shared_root)}
+                ]
+            except (OSError, KeyError, TypeError, ValueError):
+                pass
+        usage = sum(
+            len(item.get("gpu_ids", []))
+            for item in reservations
+            if item.get("group_name") == name
+        )
+        limit = worker["borrow_limit_gpus"]
+        state = worker["state"]
+        if worker["scheduling_role"] == "borrow":
+            if limit is not None and usage > limit:
+                state = "over_limit"
+            elif limit is not None and usage >= limit:
+                state = "full"
+        machines.append({
+            "machine_name": machine,
+            "scheduling_role": worker["scheduling_role"],
+            "gpu_usage": usage,
+            "borrow_limit_gpus": limit,
+            "state": state,
+            "agent": "registered" if agent_state in {"active", "idle"} else agent_state,
+        })
+    return {"group": name, "machines": machines}
 
 
 def list_machines(cfg: RootConfig) -> list[dict[str, Any]]:

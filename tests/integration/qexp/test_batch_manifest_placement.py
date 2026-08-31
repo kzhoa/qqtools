@@ -53,6 +53,91 @@ tasks:
     assert task.placement_runtime["offer_eligible_at"] is None
 
 
+def test_manifest_normalizes_primary_and_borrow_workers(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    manifest = _manifest(
+        tmp_path,
+        """
+group:
+  workers:
+    primary: [g1]
+    borrow:
+      g2: 2
+      g3: null
+tasks:
+  - command: [echo, ok]
+""",
+    )
+
+    batch_submit(cfg, manifest, group="exp")
+    group = read_json(group_path(cfg.shared_root, "exp"))["group"]["worker_set"]
+
+    assert group == {
+        "g1": {
+            "state": "active",
+            "scheduling_role": "primary",
+            "borrow_limit_gpus": None,
+            "state_epoch": 1,
+            "added_at": group["g1"]["added_at"],
+            "added_by_operation": group["g1"]["added_by_operation"],
+            "drain_requested_at": None,
+            "remove_requested_at": None,
+            "terminate_running": False,
+        },
+        "g2": {
+            "state": "borrow",
+            "scheduling_role": "borrow",
+            "borrow_limit_gpus": 2,
+            "state_epoch": 1,
+            "added_at": group["g2"]["added_at"],
+            "added_by_operation": group["g2"]["added_by_operation"],
+            "drain_requested_at": None,
+            "remove_requested_at": None,
+            "terminate_running": False,
+        },
+        "g3": {
+            "state": "borrow",
+            "scheduling_role": "borrow",
+            "borrow_limit_gpus": None,
+            "state_epoch": 1,
+            "added_at": group["g3"]["added_at"],
+            "added_by_operation": group["g3"]["added_by_operation"],
+            "drain_requested_at": None,
+            "remove_requested_at": None,
+            "terminate_running": False,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "workers",
+    [
+        "primary: [g1]\n  borrow: [g1]",
+        "primary: [g1, g1]",
+        "primary: [g1]\n  borrow:\n    g2: 0",
+        "primary: [g1]\n  borrow:\n    g2: nope",
+    ],
+)
+def test_manifest_rejects_invalid_worker_pool_before_group_creation(
+    tmp_path: Path, workers: str
+):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    manifest = _manifest(
+        tmp_path,
+        f"""
+group:
+  workers:
+    {workers}
+tasks:
+  - command: [echo, ok]
+""",
+    )
+
+    with pytest.raises(ValueError):
+        batch_submit(cfg, manifest, group="exp")
+    assert not group_path(cfg.shared_root, "exp").exists()
+
+
 def test_tasks_can_use_different_nested_placement_in_one_group(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
@@ -139,7 +224,9 @@ tasks:
     operation = read_json(submission_path(cfg.shared_root, task.submission_operation_id))
 
     assert task.placement_policy["home_machine"] == "g2"
-    assert operation["submission"]["resolved_context"]["worker_set_additions"] == ["g2"]
+    assert operation["submission"]["resolved_context"]["worker_set_additions"] == {
+        "g2": {"scheduling_role": "primary", "borrow_limit_gpus": None}
+    }
     assert operation["submission"]["resolved_context"]["planned_worker_set"] == ["g1", "g2"]
 
 

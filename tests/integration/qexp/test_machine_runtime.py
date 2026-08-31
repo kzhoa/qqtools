@@ -34,11 +34,41 @@ from qqtools.plugins.qexp.machine_runtime import (
 from qqtools.plugins.qexp.project_maintenance import maintain_project
 from qqtools.plugins.qexp.runtime.locks import exclusive
 from qqtools.plugins.qexp.runtime.paths import machine_project_paths, machine_runtime_paths
-from qqtools.plugins.qexp.runtime.reservations import active_reservations, attach, reserve, reserved_gpu_ids
+from qqtools.plugins.qexp.runtime.reservations import (
+    active_reservations,
+    attach,
+    reserve,
+    reserve_admitted,
+    reserved_gpu_ids,
+)
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
+
+
+def test_borrow_reservation_limit_is_atomic_across_provisionals(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    kwargs = {
+        "project_id": "project-1",
+        "group_name": "borrow-group",
+        "machine_name": "gpu-1",
+        "borrow_limit_gpus": 1,
+        "worker_scheduling_role": "borrow",
+        "group_worker_set_epoch": 1,
+        "worker_state_epoch": 1,
+    }
+
+    first = reserve_admitted(runtime_root, "task-1", [0], **kwargs)
+    with pytest.raises(ValueError, match="borrow limit"):
+        reserve_admitted(runtime_root, "task-2", [1], **kwargs)
+
+    assert active_reservations(runtime_root) == []
+    provisional = list((runtime_root / "reservations" / "provisional").glob("*.json"))
+    assert len(provisional) == 1
+    value = read_json(provisional[0])["reservation"]
+    assert value["reservation_id"] == first["reservation"]["reservation_id"]
+    assert value["admission"]["admitted_as_borrow"] is True
 
 def test_resolve_machine_runtime_root_prefers_explicit_override_and_uses_safe_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

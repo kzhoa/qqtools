@@ -8,7 +8,7 @@ from ..config_types import RootConfig
 from ..lease import clock_capability, lease_expiry, load_lease_policy, persist_clock_observation
 from ..scheduler import authority_locks, _manifest_supervisor
 from .paths import attempt_path, group_path
-from .records import AttemptRecord, utc_now
+from .records import AttemptRecord, normalize_group_record, utc_now
 from .reservations import retag
 from .store import atomic_replace, read_json
 from .tasks import load_task, save_task
@@ -56,8 +56,9 @@ def recover_running_attempt(cfg: RootConfig, task_id: str, attempt_id: str, expi
                 return None
             if task.group_name:
                 group = read_json(group_path(cfg.shared_root, task.group_name))
+                normalize_group_record(group)
                 worker = group["group"]["worker_set"].get(cfg.machine_name)
-                if not worker or worker["state"] not in {"active", "draining"}:
+                if not worker or worker["state"] not in {"active", "borrow", "draining"}:
                     return None
                 if task.control.get("terminate_running"):
                     return None

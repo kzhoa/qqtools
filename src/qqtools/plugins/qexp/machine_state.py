@@ -65,7 +65,8 @@ def _write_machine_snapshots(
                              ),
                              "machine_reservations": [
                                  {key: item.get(key) for key in (
-                                     "reservation_id", "project_id", "task_id", "attempt_id", "gpu_ids", "state"
+                                 "reservation_id", "project_id", "group_name", "machine_name",
+                                 "task_id", "attempt_id", "gpu_ids", "state", "admission"
                                  )}
                                  for item in reservations
                              ]}}
