@@ -727,6 +727,10 @@ def run_dispatch_cycle(
     batch_sizer: AdaptiveBatchSizer | None = None,
     inspected_ready: set[tuple[str, str, str]] | None = None,
 ) -> list[str]:
+    from .runtime.worker_encoding import ensure_canonical_primary_borrow_encoding
+
+    if any((cfg.shared_root / "groups").glob("*.json")):
+        ensure_canonical_primary_borrow_encoding(cfg, started_by_agent=cfg.machine_name)
     with diagnostic_span("run_dispatch_cycle"):
         return _run_dispatch_cycle(
             cfg,

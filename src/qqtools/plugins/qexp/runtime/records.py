@@ -276,7 +276,9 @@ def validate_gpu_limit(value: Any, label: str = "gpu_limit_gpus") -> int | None:
     return value
 
 
-def normalize_worker_member(worker: dict[str, Any], *, machine: str = "worker") -> dict[str, Any]:
+def normalize_worker_member(
+    worker: dict[str, Any], *, machine: str = "worker", allow_legacy: bool = False
+) -> dict[str, Any]:
     """Apply compatible defaults and validate one persisted Worker member."""
     if not isinstance(worker, dict):
         raise ValueError(f"{machine!r} Worker record must be a mapping.")
@@ -288,8 +290,12 @@ def normalize_worker_member(worker: dict[str, Any], *, machine: str = "worker") 
         raise ValueError(f"{machine!r} Worker scheduling_role is invalid.")
     if state not in {"active", "borrow", "draining", "removing"}:
         raise ValueError(f"{machine!r} Worker state is invalid.")
-    # QQTOOLS-COMPAT-0004: N reads the former field; N+1 keeps it only in the upgrader.
+    if state == "borrow" and not allow_legacy:
+        raise ValueError(f"{machine!r} Worker has obsolete borrow state encoding.")
+    # QQTOOLS-COMPAT-0004: N+1 reads the former field only in the encoding upgrader.
     has_legacy_limit = "borrow_limit_gpus" in worker
+    if has_legacy_limit and not allow_legacy:
+        raise ValueError(f"{machine!r} Worker has obsolete borrow_limit_gpus.")
     legacy_limit = worker.pop("borrow_limit_gpus", None)
     limit = validate_gpu_limit(worker.get("gpu_limit_gpus"), f"{machine}.gpu_limit_gpus")
     if "gpu_limit_gpus" not in worker:
@@ -306,13 +312,13 @@ def normalize_worker_member(worker: dict[str, Any], *, machine: str = "worker") 
     return worker
 
 
-def normalize_group_record(data: dict[str, Any]) -> dict[str, Any]:
+def normalize_group_record(data: dict[str, Any], *, allow_legacy: bool = False) -> dict[str, Any]:
     """Normalize compatible Worker fields in a Group record without writing it."""
     group = data.get("group")
     if not isinstance(group, dict) or not isinstance(group.get("worker_set"), dict):
         raise ValueError("Group Worker Set is malformed.")
     for machine, worker in group["worker_set"].items():
-        normalize_worker_member(worker, machine=str(machine))
+        normalize_worker_member(worker, machine=str(machine), allow_legacy=allow_legacy)
     return data
 
 
@@ -329,7 +335,7 @@ def new_worker_member(*, scheduling_role: str = "primary", gpu_limit_gpus: int |
     if scheduling_role not in WORKER_ROLES:
         raise ValueError("scheduling_role must be 'primary' or 'borrow'.")
     gpu_limit_gpus = validate_gpu_limit(gpu_limit_gpus)
-    return {"state": "borrow" if scheduling_role == "borrow" else "active",
+    return {"state": "active",
             "scheduling_role": scheduling_role, "gpu_limit_gpus": gpu_limit_gpus,
             "state_epoch": 0, "added_at": utc_now(),
             "added_by_operation": added_by_operation, "drain_requested_at": None,

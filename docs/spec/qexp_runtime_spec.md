@@ -192,10 +192,10 @@ binding supplies the submitting machine and the `MachineRuntime` project-local r
 saved-context machine/runtime fields, `--runtime-root`, and identity assertions cannot replace
 those values. Read-only project commands may observe shared truth without a local binding.
 
-The local CLI context is only a canonical `shared_root` locator. Existing context files may retain
-legacy machine/runtime fields during the 1.3.13 `QQTOOLS-COMPAT-0002` window, but only
-`agent add-project` and `agent migrate-project` may use them as warned recovery inputs when no
-binding exists. They never select ordinary execution or reservation authority.
+The local CLI context is only a canonical `shared_root` locator. Unknown legacy machine/runtime
+fields do not participate in resolution. Without a binding, `agent add-project` and
+`agent migrate-project` require an explicit machine input; `migrate-project` may receive an
+explicit custom legacy runtime. They never select ordinary execution or reservation authority.
 
 `MachineRuntime` owns the registry, scheduler and registry locks, one unified GPU reservation
 set, global-agent PID/status, round-robin cursor, and project-ID-partitioned local process,
@@ -501,19 +501,17 @@ Group rules:
 
 A Worker member contains `scheduling_role: primary | borrow` and
 `gpu_limit_gpus: positive-int | null`. Its persisted `state` is one of
-`active | borrow | draining | removing`: `active` is a primary claimable Worker, `borrow` is a
-borrow claimable Worker, and `draining`/`removing` are not claimable. Both roles may carry a
+`active | draining | removing`: claimable Workers use `active`, while `scheduling_role` controls
+primary/borrow admission; `draining`/`removing` are not claimable. Both roles may carry a
 finite limit. Existing Worker records without these fields read as `state: active`,
 `scheduling_role: primary`, and `gpu_limit_gpus: null`. Under `QQTOOLS-COMPAT-0004`, N readers
 temporarily normalize the legacy `borrow_limit_gpus` field into `gpu_limit_gpus`; writers emit
 only the new field. N+1 may read that field only while performing the schema-lock and Group-lock
 automatic upgrade; ordinary scheduling then requires `gpu_limit_gpus`. N+2 removes both paths.
 
-`state: borrow` is deliberately a fail-closed compatibility encoding. An agent that predates
-primary/borrow support already excludes any Worker whose state is not `active`, so it skips the
-borrow Worker instead of treating it as ordinary capacity. New agents must accept both claimable
-states and then apply the role policy. No Group-wide agent capability acknowledgement is required
-to write this encoding.
+N retained `state: borrow` as a fail-closed encoding for pre-primary/borrow agents. N+1's
+automatic upgrade rewrites it to `active` under the schema and Group locks; normal N+1 scheduling
+and mutation reject non-canonical encodings. No Group-wide capability acknowledgement is required.
 
 ### 8.3 Task Truth
 

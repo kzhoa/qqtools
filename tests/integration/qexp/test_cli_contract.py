@@ -143,7 +143,8 @@ def test_init_succeeds_when_context_save_fails(tmp_path: Path, monkeypatch, caps
     monkeypatch.setattr("qqtools.plugins.qexp.cli.save_context", fail_save_context)
 
     assert main([
-        "--shared-root", str(root), "--machine", "gpu-1", "--runtime-root", str(runtime_root), "init"
+        "--shared-root", str(root), "--machine", "gpu-1", "--runtime-root", str(runtime_root),
+        "--machine-runtime-root", str(tmp_path / "machine-runtime"), "init",
     ]) == 0
 
     captured = capsys.readouterr()
@@ -252,24 +253,27 @@ def test_use_saves_only_a_stable_shared_root_and_show_has_a_fixed_contract(
     assert load_context() == {"shared_root": str(project)}
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        lambda root: ["--machine", "gpu-1", "use", "--shared-root", str(root)],
-        lambda root: [
-            "use", "--shared-root", str(root), "--machine", "gpu-1", "--runtime-root", "/legacy"
-        ],
-    ],
-)
-def test_use_accepts_deprecated_identity_flags_only_during_n(
-        tmp_path: Path, monkeypatch, capsys, args) -> None:
+def test_use_rejects_removed_global_identity_flag_without_writing_context(
+        tmp_path: Path, monkeypatch, capsys) -> None:
     context_path = tmp_path / "context.json"
     monkeypatch.setattr("qqtools.plugins.qexp.layout._CONTEXT_PATH", context_path)
     root = tmp_path / "project" / ".qexp"
 
-    assert main(args(root)) == 0
-    assert "QQTOOLS-COMPAT-0002" in capsys.readouterr().err
-    assert json.loads(context_path.read_text(encoding="utf-8")) == {"shared_root": str(root)}
+    assert main(["--machine", "gpu-1", "use", "--shared-root", str(root)]) == 2
+    assert "accepts only" in capsys.readouterr().err
+    assert not context_path.exists()
+
+
+def test_use_rejects_removed_subcommand_identity_flags_without_writing_context(
+        tmp_path: Path, monkeypatch) -> None:
+    context_path = tmp_path / "context.json"
+    monkeypatch.setattr("qqtools.plugins.qexp.layout._CONTEXT_PATH", context_path)
+    root = tmp_path / "project" / ".qexp"
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["use", "--shared-root", str(root), "--machine", "gpu-1"])
+    assert exc_info.value.code == 2
+    assert not context_path.exists()
 
 
 def test_use_mode_conflicts_and_malformed_context_fail_without_rewriting(
@@ -282,8 +286,10 @@ def test_use_mode_conflicts_and_malformed_context_fail_without_rewriting(
     assert "Expected JSON object" in capsys.readouterr().err
     assert main(["use", "--shared-root", str(tmp_path / ".qexp"), "--show"]) == 2
     assert "exactly one" in capsys.readouterr().err
-    assert main(["use", "--clear", "--machine", "gpu-1"]) == 2
-    assert "cannot be combined" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as exc_info:
+        main(["use", "--clear", "--machine", "gpu-1"])
+    assert exc_info.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
     assert context_path.read_text(encoding="utf-8") == "[]"
 
 
@@ -312,7 +318,7 @@ def test_unbound_context_allows_reads_but_mutations_explain_join_and_recovery(
     assert not list((cfg.shared_root / "tasks").glob("*.json"))
 
 
-def test_agent_add_project_uses_legacy_context_only_as_a_warned_n_fallback(
+def test_agent_add_project_requires_explicit_identity_without_a_binding(
         tmp_path: Path, monkeypatch, capsys) -> None:
     context_path = tmp_path / "context.json"
     monkeypatch.setattr("qqtools.plugins.qexp.layout._CONTEXT_PATH", context_path)
@@ -322,12 +328,15 @@ def test_agent_add_project_uses_legacy_context_only_as_a_warned_n_fallback(
     )
     runtime_root = tmp_path / "machine-runtime"
 
-    assert main(
-        ["--machine-runtime-root", str(runtime_root), "agent", "add-project", "--format=json"]
-    ) == 0
-    captured = capsys.readouterr()
-    assert json.loads(captured.out)["action"] == "project_added"
-    assert "QQTOOLS-COMPAT-0002" in captured.err
+    assert main([
+        "--machine-runtime-root", str(runtime_root), "agent", "add-project", "--format=json"
+    ]) == 2
+    assert "require --machine or QEXP_MACHINE" in capsys.readouterr().err
+    assert main([
+        "--machine", "gpu-1", "--machine-runtime-root", str(runtime_root),
+        "agent", "add-project", "--format=json",
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "project_added"
 
 
 def test_agent_start_starts_the_registered_global_agent(tmp_path: Path, monkeypatch, capsys):

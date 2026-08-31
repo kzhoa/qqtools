@@ -52,8 +52,7 @@ identity.
 binding resolution or machine-identity validation.
 
 `--machine` remains the identity-establishment term for commands such as `init` and `migrate`.
-`qexp use` selects only a local default shared root; during 1.3.13 it accepts machine/runtime
-inputs only as warned compatibility no-ops (`QQTOOLS-COMPAT-0002`). During compatibility, an
+`qexp use` selects only a local default shared root and rejects machine/runtime inputs. An
 explicitly supplied global `--machine` on an operational command is an identity assertion:
 
 - if it equals the machine name derived from the local binding, the command may continue;

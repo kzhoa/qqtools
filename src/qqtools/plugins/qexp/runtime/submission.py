@@ -31,7 +31,7 @@ from .ready import (
 )
 from .active_operations import operation_exists
 from .store import atomic_replace, create_if_absent, read_json
-from .worker_encoding import prepare_group_record_for_write
+from .worker_encoding import ensure_canonical_primary_borrow_encoding, prepare_group_record_for_write
 from .availability import remove_deadline_index, sync_deadline_index
 from .tasks import save_task
 
@@ -113,15 +113,9 @@ def _worker_additions(
         if not isinstance(declaration, dict):
             raise ValueError(f"worker_set.{machine} must be a mapping.")
         role = declaration.get("scheduling_role", "primary")
-        has_gpu_limit = "gpu_limit_gpus" in declaration
-        # QQTOOLS-COMPAT-0004: Preserve N retries carrying a pre-unification Worker declaration.
-        has_legacy_limit = "borrow_limit_gpus" in declaration
+        if "borrow_limit_gpus" in declaration:
+            raise ValueError(f"worker_set.{machine} has obsolete borrow_limit_gpus.")
         limit = declaration.get("gpu_limit_gpus")
-        legacy_limit = declaration.get("borrow_limit_gpus")
-        if has_gpu_limit and has_legacy_limit and limit != legacy_limit:
-            raise ValueError(f"worker_set.{machine} has conflicting GPU limit fields.")
-        if not has_gpu_limit:
-            limit = legacy_limit
         if role not in {"primary", "borrow"}:
             raise ValueError(f"worker_set.{machine}.scheduling_role is invalid.")
         if limit is not None and (type(limit) is not int or limit <= 0):
@@ -382,6 +376,8 @@ def submit_specs(
     if not specs:
         raise ValueError("submission must contain at least one task.")
     worker_additions = _worker_additions(worker_set)
+    if group_name or worker_additions:
+        ensure_canonical_primary_borrow_encoding(cfg, started_by_agent=cfg.machine_name)
     normalized = {
         "group": group_name,
         "tasks": _canonical_specs(specs),

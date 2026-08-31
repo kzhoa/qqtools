@@ -779,14 +779,12 @@ limit below current usage reports `over_limit` and blocks later admission withou
 work. Under `QQTOOLS-COMPAT-0004`, N readers temporarily accept `borrow_limit_gpus` from
 existing Group records and pre-unification submission declarations, then normalize it to
 `gpu_limit_gpus`; all N writes and outputs use `gpu_limit_gpus`. N+1 retains that reader only
-inside its automatic Group upgrade, which rewrites every legacy field before normal scheduling;
-N+2 removes the reader and upgrade path.
+inside its automatic Group upgrade, which rewrites every legacy field before normal scheduling.
+Normal N+1 parsing rejects that field; N+2 removes the upgrader.
 
-For compatibility, a borrow Worker is persisted as both `scheduling_role: borrow` and
-`state: borrow`. Current agents treat `active` and `borrow` as claimable lifecycle states and
-apply the scheduling role. Agents that only recognize `state: active` skip `state: borrow` and
-therefore fail closed; they must never schedule it as primary capacity. `draining` and `removing`
-remain non-claimable.
+N+1 persists a borrow Worker as `scheduling_role: borrow, state: active`. The automatic upgrade
+rewrites N's fail-closed `state: borrow` encoding before normal scheduling or Group mutation;
+`draining` and `removing` remain non-claimable.
 
 An enabled local project binding is required on every target machine. `qexp init` creates the
 normal binding; `qexp agent add-project` restores a missing binding. Submitting on one machine
@@ -1274,8 +1272,9 @@ compatibility assertions only; a mismatch fails before project mutation and sugg
 `qexp use --shared-root <project/.qexp>` is a local default-project selector. It writes only a
 canonical `shared_root`; it does not validate or register the Project, create a machine record, or
 select machine identity. `qexp init` remains the normal path that joins a machine and writes its
-binding. In 1.3.13, deprecated `use` machine/runtime inputs are accepted and warned under
-`QQTOOLS-COMPAT-0002`; their N+1 removal follows the compatibility registry.
+binding. `qexp use` rejects machine/runtime inputs. With no binding, `agent add-project` and
+`agent migrate-project` require explicit `--machine` or `QEXP_MACHINE`; only `migrate-project`
+may additionally receive an explicit custom legacy runtime.
 
 `qexp submit --home-machine <name>` selects Task placement independently. `current` and omission
 resolve to the verified local machine. A remote home needs valid current-generation shared Project

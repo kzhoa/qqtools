@@ -15,7 +15,7 @@ from ..runtime.records import (AttemptRecord, SCHEMA_VERSION, TaskRecord, new_gr
                                new_worker_member, normalize_group_record, utc_now,
                                validate_gpu_limit, validate_group_name, validate_identifier)
 from ..runtime.store import atomic_replace, iter_json, read_json
-from ..runtime.worker_encoding import write_group_record
+from ..runtime.worker_encoding import ensure_canonical_primary_borrow_encoding, write_group_record
 from ..runtime.tasks import load_task, save_task
 from ..runtime.ready import (
     primary_projection_transaction,
@@ -68,6 +68,7 @@ def group_control(
 ) -> dict[str, Any]:
     from ..machine_runtime import resolve_execution_context
 
+    ensure_canonical_primary_borrow_encoding(cfg, started_by_agent=cfg.machine_name)
     reservation_runtime_root = reservation_runtime_root or resolve_execution_context(cfg).reservation_root
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
     _finalize_pending_submission_before_group_mutation(cfg, name, path)
@@ -207,6 +208,7 @@ def reconcile_group_cancel_operations(
         cfg: RootConfig, group_name: str | None = None, *,
         include_legacy: bool = True) -> list[dict[str, Any]]:
     """Rebuild durable Group control operation status from current Task truth."""
+    ensure_canonical_primary_borrow_encoding(cfg, started_by_agent=cfg.machine_name)
     reconciled: list[dict[str, Any]] = []
     for operation_path in iter_active_operation_paths(
         cfg, "group_control", include_legacy=include_legacy
@@ -393,6 +395,7 @@ def _reconcile_worker_remove_operation(
 
 
 def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -> dict[str, Any]:
+    ensure_canonical_primary_borrow_encoding(cfg, started_by_agent=cfg.machine_name)
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
     with group_lock(cfg.shared_root, name):
         if path.exists():
@@ -422,6 +425,7 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                   *, terminate_running: bool = False, role: str | None = None,
                   gpu_limit_gpus: int | None = None,
                   has_gpu_limit: bool = False) -> dict[str, Any]:
+    ensure_canonical_primary_borrow_encoding(cfg, started_by_agent=cfg.machine_name)
     path = group_path(cfg.shared_root, validate_group_name(group_name) or group_name)
     _finalize_pending_submission_before_group_mutation(cfg, group_name, path)
     with group_lock(cfg.shared_root, group_name):
@@ -462,7 +466,7 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                 current.update({
                     "scheduling_role": current_role,
                     "gpu_limit_gpus": current_limit,
-                    "state": "borrow" if current_role == "borrow" else "active",
+                    "state": "active",
                 })
                 current["state_epoch"] += 1
         elif machine not in workers:
@@ -477,7 +481,7 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
             selected_limit = gpu_limit_gpus if has_gpu_limit else worker["gpu_limit_gpus"]
             selected_state = worker["state"]
             if selected_state in {"active", "borrow"}:
-                selected_state = "borrow" if selected_role == "borrow" else "active"
+                selected_state = "active"
             changed = (
                 worker["scheduling_role"] != selected_role
                 or worker["gpu_limit_gpus"] != selected_limit

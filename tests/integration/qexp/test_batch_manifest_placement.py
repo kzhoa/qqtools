@@ -86,7 +86,7 @@ tasks:
             "terminate_running": False,
         },
         "g2": {
-            "state": "borrow",
+            "state": "active",
             "scheduling_role": "borrow",
             "gpu_limit_gpus": 2,
             "state_epoch": 1,
@@ -97,7 +97,7 @@ tasks:
             "terminate_running": False,
         },
         "g3": {
-            "state": "borrow",
+            "state": "active",
             "scheduling_role": "borrow",
             "gpu_limit_gpus": None,
             "state_epoch": 1,
@@ -110,21 +110,14 @@ tasks:
     }
 
 
-def test_submission_worker_legacy_limit_is_normalized_to_gpu_limit():
-    """QQTOOLS-COMPAT-0004: N retries retain a pre-unification Worker declaration."""
-    workers = submission_runtime._worker_additions({
-        "gpu-1": {
-            "scheduling_role": "borrow",
-            "borrow_limit_gpus": 2,
-        }
-    })
-
-    assert workers == {
-        "gpu-1": {
-            "scheduling_role": "borrow",
-            "gpu_limit_gpus": 2,
-        }
-    }
+def test_submission_rejects_obsolete_worker_limit_field():
+    with pytest.raises(ValueError, match="obsolete borrow_limit_gpus"):
+        submission_runtime._worker_additions({
+            "gpu-1": {
+                "scheduling_role": "borrow",
+                "borrow_limit_gpus": 2,
+            }
+        })
 
 
 def test_manifest_rejects_duplicate_yaml_machine_keys(tmp_path: Path):

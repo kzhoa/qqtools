@@ -51,16 +51,18 @@ def _assert_current_project_is_registered(
     assert any(project["shared_root"] == str(shared_root) for project in projects)
 
 
-# QQTOOLS-COMPAT-0002: N release CLI-context boundary.
-def test_use_writes_only_a_default_project_locator_during_n(tmp_path: Path) -> None:
+def test_use_rejects_removed_identity_inputs_and_keeps_locator_contract(tmp_path: Path) -> None:
     base = tmp_path / "use-context"
     shared_root = base / "project" / ".qexp"
     env = make_env(base)
 
-    selected = run(
-        ["qexp", "--machine", "gpu-1", "use", "--shared-root", str(shared_root)], env=env
+    rejected = run(
+        ["qexp", "--machine", "gpu-1", "use", "--shared-root", str(shared_root)],
+        env=env,
+        check=False,
     )
-    assert "QQTOOLS-COMPAT-0002" in selected.stderr
+    assert rejected.returncode == 2
+    selected = run(["qexp", "use", "--shared-root", str(shared_root)], env=env)
     assert json.loads((base / "home" / ".qqtools" / "qexp-context.json").read_text()) == {
         "shared_root": str(shared_root)
     }
