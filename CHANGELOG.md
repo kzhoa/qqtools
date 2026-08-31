@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- test: run installed-wheel E2E only for the exact tagged release artifact; retain its JUnit report
+  and temporary runtime evidence for seven days when it fails.
 - chore: add a project-wide compatibility registry and make the explicit target-version local
   release preflight enforce due compatibility transitions before regression and build work; keep
   the registry bounded to unfinished items while release tags audit retirement and ID continuity;

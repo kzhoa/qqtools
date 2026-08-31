@@ -97,18 +97,31 @@ jobs:
 
           pathlib.Path("RELEASE_BODY.md").write_text(body + "\n", encoding="utf-8")
           PY
-      - name: Run complete qexp regression suite
-        run: tox run -e qexp-full
-
       - name: Build package
         run: python -m build --sdist --wheel
 
       - name: Run installed-wheel e2e tests
+        env:
+          QQTOOLS_PRESERVE_TEST_ARTIFACTS: "1"
         run: |
           set -euo pipefail
+          mkdir -p test-results
           wheels=(dist/*.whl)
           test "${#wheels[@]}" -eq 1
-          tox run -e release-e2e --installpkg "${wheels[0]}"
+          tox run -e release-e2e --installpkg "${wheels[0]}" -- \
+            --junitxml=test-results/release-e2e.xml \
+            --tb=long
+
+      - name: Upload installed-wheel e2e diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-e2e-diagnostics
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            test-results/release-e2e.xml
+            tmp/
 
       - name: Release
         uses: softprops/action-gh-release@v2

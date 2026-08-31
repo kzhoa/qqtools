@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import argparse
 import ast
-import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 try:
@@ -176,34 +174,6 @@ def _check_compatibility(target: Version) -> None:
     )
 
 
-def _build_artifacts(output_dir: Path, *, env: dict[str, str]) -> Path:
-    _run(
-        sys.executable,
-        "-m",
-        "build",
-        "--quiet",
-        "--sdist",
-        "--wheel",
-        "--outdir",
-        str(output_dir),
-        env=env,
-    )
-    wheels = list(output_dir.glob("qqtools-*.whl"))
-    sdists = list(output_dir.glob("qqtools-*.tar.gz"))
-    if len(wheels) != 1 or len(sdists) != 1:
-        raise RuntimeError("Expected exactly one wheel and one sdist from the release build.")
-    return wheels[0]
-
-
-def _release_env() -> dict[str, str]:
-    """Use a repository-local pip cache for repeatable release preflight installs."""
-    pip_cache_dir = REPO_ROOT / ".tox" / "pip-cache"
-    pip_cache_dir.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
-    env["PIP_CACHE_DIR"] = str(pip_cache_dir)
-    return env
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-version", required=True)
@@ -221,19 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     _check_target_version(target)
     _check_compatibility(target)
     _check_lazy_export_stubs()
-    release_env = _release_env()
-    _run("tox", "run", "-e", "qexp-full", env=release_env)
-    with tempfile.TemporaryDirectory(prefix="qqtools-preflight-") as temporary_dir:
-        wheel = _build_artifacts(Path(temporary_dir), env=release_env)
-        _run(
-            "tox",
-            "run",
-            "-e",
-            "release-e2e",
-            "--installpkg",
-            str(wheel),
-            env=release_env,
-        )
+    _run("tox", "run", "-e", "qexp-full")
     print(f"Release preflight passed for {target}.")
     return 0
 
