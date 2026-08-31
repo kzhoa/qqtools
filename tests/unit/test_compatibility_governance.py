@@ -402,24 +402,20 @@ def test_preflight_runs_compatibility_gate_before_expensive_checks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     order: list[str] = []
+    commands: list[tuple[tuple[str, ...], dict[str, object]]] = []
     monkeypatch.setattr(release_preflight, "_require_clean_head", lambda: order.append("clean"))
     monkeypatch.setattr(release_preflight, "_check_target_version", lambda target: order.append("target"))
     monkeypatch.setattr(release_preflight, "_check_compatibility", lambda target: order.append("compatibility"))
     monkeypatch.setattr(release_preflight, "_check_lazy_export_stubs", lambda: order.append("stubs"))
-    monkeypatch.setattr(release_preflight, "_release_env", lambda: {})
     monkeypatch.setattr(
         release_preflight,
         "_run",
-        lambda *args, **kwargs: order.append("run"),
-    )
-    monkeypatch.setattr(
-        release_preflight,
-        "_build_artifacts",
-        lambda *args, **kwargs: Path("package.whl"),
+        lambda *args, **kwargs: commands.append((args, kwargs)),
     )
 
     assert release_preflight.main(["--target-version", "1.3.13"]) == 0
-    assert order[:4] == ["clean", "target", "compatibility", "stubs"]
+    assert order == ["clean", "target", "compatibility", "stubs"]
+    assert commands == [(("tox", "run", "-e", "qexp-full"), {})]
 
 
 def test_preflight_stops_when_compatibility_gate_fails(

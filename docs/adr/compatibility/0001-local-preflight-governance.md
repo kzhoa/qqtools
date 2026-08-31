@@ -41,7 +41,8 @@ python scripts/release_preflight.py --target-version X.Y.Z
 
 The preflight requires a clean committed candidate, validates that the target is later than the
 current source version, enforces all compatibility obligations for that target, and only then runs
-the expensive regression, build, and installed-wheel checks.
+the complete qexp source-level regression suite. The tag workflow builds and validates the exact
+tagged wheel once before publishing.
 
 The tag-triggered publish workflow deliberately does not repeat the compatibility gate. It trusts
 that the operator followed the local release procedure. Local `.codex` guidance may help register,

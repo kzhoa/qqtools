@@ -16,6 +16,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 TMP_ROOT = PROJECT_ROOT / "tmp"
 RELEASE_E2E_ROOT = PROJECT_ROOT / "tests" / "e2e" / "qexp"
 RELEASE_E2E_PYTEST_INI = PROJECT_ROOT / "tests" / "e2e" / "release_pytest.ini"
+PRESERVE_TEST_ARTIFACTS_ENV = "QQTOOLS_PRESERVE_TEST_ARTIFACTS"
 
 
 @pytest.fixture
@@ -62,6 +63,11 @@ def _build_case_tmp_dir_name(nodeid: str, name: str) -> str:
     safe_name = safe_name[:48]
     digest = hashlib.sha1(nodeid.encode("utf-8")).hexdigest()[:10]
     return f"{safe_name}-{digest}"
+
+
+def _should_preserve_test_artifacts() -> bool:
+    """Return whether test case directories should remain available after a run."""
+    return os.environ.get(PRESERVE_TEST_ARTIFACTS_ENV) == "1"
 
 
 def _workspace_mkdtemp(suffix=None, prefix=None, dir=None):
@@ -163,7 +169,8 @@ def tmp_path(request):
     try:
         yield case_dir
     finally:
-        shutil.rmtree(case_dir, ignore_errors=True)
+        if not _should_preserve_test_artifacts():
+            shutil.rmtree(case_dir, ignore_errors=True)
 
 
 @pytest.fixture

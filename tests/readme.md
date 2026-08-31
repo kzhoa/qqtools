@@ -52,7 +52,8 @@ qexp integration layer; the publish gate does.
 Default pytest collection excludes `tests/e2e/qexp`. `tox run -e release-e2e`
 builds and validates a wheel from the current checkout; use
 `tox run -e release-e2e --installpkg <wheel>` when validating a selected,
-non-editable release artifact rather than a checkout or arbitrary installed package.
+non-editable release artifact rather than a checkout or arbitrary installed package. The publish
+workflow is the release gate that runs this installed-wheel E2E against the exact tagged artifact.
 
 `CONTRACT_MATRIX.md` tracks public behavior and links it to protecting tests.
 `TODOLIST.md` tracks unfinished test work. Coverage reports only show executed
