@@ -224,8 +224,8 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
                     item.get("scheduling_role"),
                     item.get("gpu_usage"),
                     (
-                        item.get("borrow_limit_gpus")
-                        if item.get("borrow_limit_gpus") is not None
+                        item.get("gpu_limit_gpus")
+                        if item.get("gpu_limit_gpus") is not None
                         else "unlimited"
                     ),
                     item.get("state"),

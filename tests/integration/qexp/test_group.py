@@ -55,46 +55,46 @@ def test_group_worker_role_and_limit_change_is_epoch_linearized(tmp_path: Path):
     create_group(cfg, "exp")
 
     added = change_worker(
-        cfg, "exp", "g2", "add", role="borrow", borrow_limit_gpus=2, has_borrow_limit=True
+        cfg, "exp", "g2", "add", role="borrow", gpu_limit_gpus=2, has_gpu_limit=True
     )
     worker = added["group"]["worker_set"]["g2"]
     assert worker["state"] == "borrow"
     assert worker["scheduling_role"] == "borrow"
-    assert worker["borrow_limit_gpus"] == 2
+    assert worker["gpu_limit_gpus"] == 2
     epoch = added["group"]["worker_set_epoch"]
 
     updated = change_worker(
-        cfg, "exp", "g2", "set", borrow_limit_gpus=1, has_borrow_limit=True
+        cfg, "exp", "g2", "set", gpu_limit_gpus=1, has_gpu_limit=True
     )
-    assert updated["group"]["worker_set"]["g2"]["borrow_limit_gpus"] == 1
+    assert updated["group"]["worker_set"]["g2"]["gpu_limit_gpus"] == 1
     assert updated["group"]["worker_set_epoch"] == epoch + 1
 
     primary = change_worker(cfg, "exp", "g2", "set", role="primary")
     assert primary["group"]["worker_set"]["g2"]["state"] == "active"
-    assert primary["group"]["worker_set"]["g2"]["borrow_limit_gpus"] is None
+    assert primary["group"]["worker_set"]["g2"]["gpu_limit_gpus"] == 1
 
 
-def test_group_worker_set_rejects_primary_borrow_limit(tmp_path: Path):
+def test_group_worker_set_accepts_primary_gpu_limit(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")
 
-    with pytest.raises(ValueError, match="cannot have a borrow limit"):
-        change_worker(
-            cfg, "exp", "g2", "add", role="primary", borrow_limit_gpus=1, has_borrow_limit=True
-        )
+    group = change_worker(
+        cfg, "exp", "g2", "add", role="primary", gpu_limit_gpus=1, has_gpu_limit=True
+    )
+    assert group["group"]["worker_set"]["g2"]["gpu_limit_gpus"] == 1
 
 
 def test_canonical_marker_keeps_borrow_reader_and_writer_compatible(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")
-    change_worker(cfg, "exp", "g2", "add", role="borrow", borrow_limit_gpus=2,
-                  has_borrow_limit=True)
+    change_worker(cfg, "exp", "g2", "add", role="borrow", gpu_limit_gpus=2,
+                  has_gpu_limit=True)
     marker = read_primary_borrow_encoding(cfg)
     marker.update({"state": ENCODING_CANONICAL_V2, "revision": 2, "started_by_agent": "agent-1"})
     write_primary_borrow_encoding(cfg, marker)
 
     updated = change_worker(cfg, "exp", "g2", "set", role="borrow",
-                            borrow_limit_gpus=1, has_borrow_limit=True)
+                            gpu_limit_gpus=1, has_gpu_limit=True)
     assert updated["group"]["worker_set"]["g2"]["state"] == "active"
     persisted = read_json(group_path(cfg.shared_root, "exp"))
     assert persisted["group"]["worker_set"]["g2"]["scheduling_role"] == "borrow"
@@ -103,11 +103,11 @@ def test_canonical_marker_keeps_borrow_reader_and_writer_compatible(tmp_path: Pa
 def test_group_machine_usage_includes_unexpired_provisional_reservation(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")
-    change_worker(cfg, "exp", "g1", "set", role="borrow", borrow_limit_gpus=1,
-                  has_borrow_limit=True)
+    change_worker(cfg, "exp", "g1", "set", role="borrow", gpu_limit_gpus=1,
+                  has_gpu_limit=True)
     reserve_admitted(
         cfg.runtime_root, "task-1", [0], project_id="project", group_name="exp",
-        machine_name="g1", borrow_limit_gpus=1, worker_scheduling_role="borrow",
+        machine_name="g1", gpu_limit_gpus=1, worker_scheduling_role="borrow",
         shared_root=str(cfg.shared_root),
         group_worker_set_epoch=1, worker_state_epoch=1,
     )

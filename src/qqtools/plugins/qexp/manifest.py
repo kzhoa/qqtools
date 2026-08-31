@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Hashable
 from pathlib import Path
 from typing import Any
 
 import yaml
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
 
-from .runtime.records import validate_borrow_limit, validate_identifier
+from .runtime.records import validate_gpu_limit, validate_identifier
 
 _ROOT_KEYS = {"group", "defaults", "tasks"}
 _GROUP_KEYS = {"workers"}
@@ -32,6 +35,35 @@ _FLAT_PLACEMENT_FIELDS = {
     "fallback_machines": ("placement.sharing.fallback_machines", "fallback_machines"),
     "offer_after_seconds": ("placement.sharing.offer.after_seconds", "offer_after_seconds"),
 }
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Reject duplicate keys while PyYAML still has mapping pairs available."""
+
+    def construct_mapping(self, node: MappingNode, deep: bool = False) -> dict[Any, Any]:
+        if not isinstance(node, MappingNode):
+            raise ConstructorError(
+                None, None,
+                f"expected a mapping node, but found {node.id}",
+                node.start_mark,
+            )
+        explicit_keys: set[Hashable] = set()
+        for key_node, _ in node.value:
+            key = "<<" if key_node.tag == "tag:yaml.org,2002:merge" else self.construct_object(
+                key_node, deep=deep
+            )
+            if not isinstance(key, Hashable):
+                raise ConstructorError(
+                    "while constructing a mapping", node.start_mark,
+                    "found unhashable key", key_node.start_mark,
+                )
+            if key in explicit_keys:
+                raise ValueError(
+                    f"YAML mapping contains duplicate key {key!r} "
+                    f"(line {key_node.start_mark.line + 1})."
+                )
+            explicit_keys.add(key)
+        return super().construct_mapping(node, deep=deep)
 
 
 def _mapping(value: Any, path: str) -> dict[str, Any]:
@@ -121,7 +153,7 @@ def _worker_names(value: Any, path: str) -> list[str]:
     return result
 
 
-def _borrow_workers(value: Any, path: str) -> dict[str, int | None]:
+def _worker_pool(value: Any, path: str) -> dict[str, int | None]:
     if isinstance(value, list):
         return {machine: None for machine in _worker_names(value, path)}
     if not isinstance(value, dict):
@@ -131,7 +163,7 @@ def _borrow_workers(value: Any, path: str) -> dict[str, int | None]:
         validate_identifier(machine, f"{path}.{machine}")
         if machine in result:
             raise ValueError(f"{path} must not contain duplicate machine {machine!r}.")
-        result[machine] = validate_borrow_limit(limit, f"{path}.{machine}")
+        result[machine] = validate_gpu_limit(limit, f"{path}.{machine}")
     return result
 
 
@@ -140,7 +172,7 @@ def _workers(value: Any, path: str) -> dict[str, dict[str, Any]]:
         return {}
     if isinstance(value, list):
         return {
-            machine: {"scheduling_role": "primary", "borrow_limit_gpus": None}
+            machine: {"scheduling_role": "primary", "gpu_limit_gpus": None}
             for machine in _worker_names(value, path)
         }
     if not isinstance(value, dict):
@@ -148,15 +180,15 @@ def _workers(value: Any, path: str) -> dict[str, dict[str, Any]]:
     unknown = sorted(set(value) - {"primary", "borrow"})
     if unknown:
         raise ValueError(f"{path}.{unknown[0]} is not allowed.")
-    primary = _worker_names(value.get("primary", []), f"{path}.primary")
-    borrow = _borrow_workers(value.get("borrow", []), f"{path}.borrow")
+    primary = _worker_pool(value.get("primary", []), f"{path}.primary")
+    borrow = _worker_pool(value.get("borrow", []), f"{path}.borrow")
     result: dict[str, dict[str, Any]] = {}
-    for machine in primary:
-        result[machine] = {"scheduling_role": "primary", "borrow_limit_gpus": None}
+    for machine, limit in primary.items():
+        result[machine] = {"scheduling_role": "primary", "gpu_limit_gpus": limit}
     for machine, limit in borrow.items():
         if machine in result:
             raise ValueError(f"{path} declares machine {machine!r} as both primary and borrow.")
-        result[machine] = {"scheduling_role": "borrow", "borrow_limit_gpus": limit}
+        result[machine] = {"scheduling_role": "borrow", "gpu_limit_gpus": limit}
     return result
 
 
@@ -222,7 +254,7 @@ def parse_batch_manifest(
     path: Path, *, group_name: str | None
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Parse a batch-submit manifest into canonical Task specs and Worker Set additions."""
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    raw = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeySafeLoader) or {}
     root = _mapping(raw, "root")
     _reject_unknown(root, _ROOT_KEYS, "root")
     group = _optional_mapping(root.get("group"), "group")

@@ -100,7 +100,7 @@ def _worker_additions(
                 raise ValueError(f"worker_set must not contain duplicate machine {machine!r}.")
             seen.add(machine)
         worker_set = {
-            machine: {"scheduling_role": "primary", "borrow_limit_gpus": None}
+            machine: {"scheduling_role": "primary", "gpu_limit_gpus": None}
             for machine in worker_set
         }
     if not isinstance(worker_set, dict):
@@ -113,16 +113,21 @@ def _worker_additions(
         if not isinstance(declaration, dict):
             raise ValueError(f"worker_set.{machine} must be a mapping.")
         role = declaration.get("scheduling_role", "primary")
-        limit = declaration.get("borrow_limit_gpus")
-        if role == "primary" and limit is not None:
-            raise ValueError(f"worker_set.{machine} primary Worker cannot have a borrow limit.")
+        has_gpu_limit = "gpu_limit_gpus" in declaration
+        has_legacy_limit = "borrow_limit_gpus" in declaration
+        limit = declaration.get("gpu_limit_gpus")
+        legacy_limit = declaration.get("borrow_limit_gpus")
+        if has_gpu_limit and has_legacy_limit and limit != legacy_limit:
+            raise ValueError(f"worker_set.{machine} has conflicting GPU limit fields.")
+        if not has_gpu_limit:
+            limit = legacy_limit
         if role not in {"primary", "borrow"}:
             raise ValueError(f"worker_set.{machine}.scheduling_role is invalid.")
         if limit is not None and (type(limit) is not int or limit <= 0):
-            raise ValueError(f"worker_set.{machine}.borrow_limit_gpus must be positive or null.")
+            raise ValueError(f"worker_set.{machine}.gpu_limit_gpus must be positive or null.")
         additions[machine] = {
             "scheduling_role": role,
-            "borrow_limit_gpus": limit,
+            "gpu_limit_gpus": limit,
         }
     return additions
 
@@ -538,7 +543,7 @@ def submit_specs(
                     if machine not in workers:
                         worker = new_worker_member(
                             scheduling_role=declaration["scheduling_role"],
-                            borrow_limit_gpus=declaration["borrow_limit_gpus"],
+                            gpu_limit_gpus=declaration["gpu_limit_gpus"],
                             added_by_operation=operation_id,
                         )
                         workers[machine] = worker

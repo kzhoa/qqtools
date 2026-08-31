@@ -240,6 +240,28 @@ def test_primary_probe_uses_primary_projection_without_scanning_borrow_markers(
     assert probe.state == "no_primary_demand"
 
 
+def test_primary_probe_accepts_an_unestablished_empty_shared_route(
+    tmp_path: Path,
+) -> None:
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
+    )
+    _activate_ready(cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+
+    probe = machine_agent._probe_primary_demand(
+        runtime,
+        {binding.project_id: cfg},
+        {binding.project_id: cfg},
+        [0],
+        [0],
+        SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+    )
+
+    assert probe.state == "no_primary_demand"
+
+
 def test_missing_primary_projection_fails_closed(
     tmp_path: Path,
 ) -> None:
@@ -263,6 +285,79 @@ def test_missing_primary_projection_fails_closed(
     )
 
     assert probe.state == "unresolved"
+
+
+def test_primary_probe_skips_demand_that_exceeds_remaining_group_gpu_limit(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "workers")
+    change_worker(cfg, "workers", "gpu-1", "set", gpu_limit_gpus=1, has_gpu_limit=True)
+    task = submit(
+        cfg,
+        ["echo", "primary"],
+        group="workers",
+        task_id="primary-task",
+        sharing_mode="spillover",
+        working_dir=work,
+    )
+    share(cfg, task.task_id)
+    _activate_ready(cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    occupied = reserve(
+        runtime.root,
+        "occupied",
+        [0],
+        project_id=binding.project_id,
+        group_name="workers",
+        machine_name="gpu-1",
+    )
+
+    probe = machine_agent._probe_primary_demand(
+        runtime,
+        {binding.project_id: cfg},
+        {binding.project_id: cfg},
+        [0, 1],
+        [1],
+        SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+        (occupied["reservation"],),
+    )
+
+    assert probe.state == "no_primary_demand", probe.diagnostics
+
+
+@pytest.mark.parametrize("damage", ["catalog", "partition"])
+def test_established_primary_route_damage_fails_closed(tmp_path: Path, damage: str) -> None:
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
+    )
+    submit(cfg, ["echo", "primary"], task_id="primary-task")
+    _activate_ready(cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    catalog_path = shared_paths(cfg.shared_root)["ready_catalogs"] / "home.gpu-1" / (
+        "0000000000000000.json"
+    )
+    if damage == "catalog":
+        catalog_path.unlink()
+    else:
+        partition = read_json(catalog_path)["ready_catalog"]["partitions"][0]
+        (shared_paths(cfg.shared_root)["ready_home"] / "gpu-1" / partition / "partition.json").unlink()
+
+    probe = machine_agent._probe_primary_demand(
+        runtime,
+        {binding.project_id: cfg},
+        {binding.project_id: cfg},
+        [0],
+        [0],
+        SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+    )
+
+    assert probe.state == "unresolved"
+    assert machine_agent._build_borrow_admission_grant(
+        runtime, {binding.project_id: cfg}, probe, {binding.project_id}
+    ) is None
 
 
 def test_unprobeable_enabled_project_blocks_borrow_admission(
@@ -454,6 +549,65 @@ def test_primary_aggregation_waiting_blocks_borrow_admission(tmp_path: Path) -> 
     assert borrow_task.task_id not in executor.launched
     assert result_by_project[primary_binding.project_id]["launched"] == []
     assert result_by_project[borrow_binding.project_id]["launched"] == []
+
+
+def test_ungrouped_primary_demand_blocks_borrow_admission(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    primary_cfg = init_shared_root(
+        tmp_path / "primary" / ".qexp", "gpu-1", runtime_root=tmp_path / "primary-rt"
+    )
+    create_group(primary_cfg, "borrow-route")
+    change_worker(primary_cfg, "borrow-route", "gpu-1", "set", role="borrow")
+    shared_task = submit(
+        primary_cfg,
+        ["echo", "shared-route"],
+        group="borrow-route",
+        sharing_mode="spillover",
+        working_dir=work,
+    )
+    share(primary_cfg, shared_task.task_id)
+    primary_task = submit(
+        primary_cfg,
+        ["echo", "primary"],
+        requested_gpus=2,
+        working_dir=work,
+    )
+    borrow_cfg, borrow_task = _borrow_project(tmp_path, work)
+    _activate_ready(primary_cfg)
+    _activate_ready(borrow_cfg)
+
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    primary_binding = runtime.add_binding(primary_cfg.shared_root, primary_cfg.machine_name)
+    borrow_binding = runtime.add_binding(borrow_cfg.shared_root, borrow_cfg.machine_name)
+    occupied = reserve(runtime.root, "occupied", [0], project_id="external")
+    attach(runtime.root, occupied["reservation"]["reservation_id"], "occupied-attempt", 1)
+
+    probe = machine_agent._probe_primary_demand(
+        runtime,
+        {primary_binding.project_id: primary_cfg, borrow_binding.project_id: borrow_cfg},
+        {primary_binding.project_id: primary_cfg, borrow_binding.project_id: borrow_cfg},
+        [0, 1],
+        [1],
+        SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+    )
+    assert probe.state == "waiting_for_aggregation"
+
+    executor = _RecordingExecutor()
+    results = dispatch_machine_cycle_locked(
+        runtime,
+        available_gpus=[0, 1],
+        executor=executor,
+        supervise=False,
+        publish_snapshots=False,
+    )
+
+    result_by_project = {item["project_id"]: item for item in results}
+    assert executor.launched == []
+    assert result_by_project[primary_binding.project_id]["launched"] == []
+    assert result_by_project[borrow_binding.project_id]["launched"] == []
+    assert primary_task.task_id not in executor.launched
+    assert borrow_task.task_id not in executor.launched
 
 
 def _activate_ready(cfg) -> None:

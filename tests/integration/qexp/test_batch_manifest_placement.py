@@ -60,7 +60,8 @@ def test_manifest_normalizes_primary_and_borrow_workers(tmp_path: Path):
         """
 group:
   workers:
-    primary: [g1]
+    primary:
+      g1: 1
     borrow:
       g2: 2
       g3: null
@@ -76,7 +77,7 @@ tasks:
         "g1": {
             "state": "active",
             "scheduling_role": "primary",
-            "borrow_limit_gpus": None,
+            "gpu_limit_gpus": 1,
             "state_epoch": 1,
             "added_at": group["g1"]["added_at"],
             "added_by_operation": group["g1"]["added_by_operation"],
@@ -87,7 +88,7 @@ tasks:
         "g2": {
             "state": "borrow",
             "scheduling_role": "borrow",
-            "borrow_limit_gpus": 2,
+            "gpu_limit_gpus": 2,
             "state_epoch": 1,
             "added_at": group["g2"]["added_at"],
             "added_by_operation": group["g2"]["added_by_operation"],
@@ -98,7 +99,7 @@ tasks:
         "g3": {
             "state": "borrow",
             "scheduling_role": "borrow",
-            "borrow_limit_gpus": None,
+            "gpu_limit_gpus": None,
             "state_epoch": 1,
             "added_at": group["g3"]["added_at"],
             "added_by_operation": group["g3"]["added_by_operation"],
@@ -107,6 +108,67 @@ tasks:
             "terminate_running": False,
         },
     }
+
+
+def test_manifest_rejects_duplicate_yaml_machine_keys(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    manifest = _manifest(
+        tmp_path,
+        """
+group:
+  workers:
+    borrow:
+      gpu-1: 1
+      gpu-1: 4
+tasks:
+  - command: [echo, ok]
+""",
+    )
+
+    with pytest.raises(ValueError, match=r"duplicate key 'gpu-1'"):
+        batch_submit(cfg, manifest, group="exp")
+    assert not group_path(cfg.shared_root, "exp").exists()
+
+
+def test_manifest_preserves_yaml_anchor_and_merge_defaults(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    manifest = _manifest(
+        tmp_path,
+        """
+defaults: &defaults
+  requested_gpus: 2
+  working_directory: /tmp/qexp-defaults
+tasks:
+  - <<: *defaults
+    command: [echo, ok]
+""",
+    )
+
+    task = batch_submit(cfg, manifest, group="exp")[0]
+
+    assert task.spec.requested_gpus == 2
+    assert task.spec.working_directory == "/tmp/qexp-defaults"
+
+
+def test_manifest_rejects_duplicate_yaml_merge_keys(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    manifest = _manifest(
+        tmp_path,
+        """
+group:
+  workers:
+    borrow:
+      <<: &low {gpu-1: 1}
+      <<: &high {gpu-1: 4}
+tasks:
+  - command: [echo, ok]
+""",
+    )
+
+    with pytest.raises(ValueError, match=r"duplicate key '<<'"):
+        batch_submit(cfg, manifest, group="exp")
+    assert not group_path(cfg.shared_root, "exp").exists()
 
 
 @pytest.mark.parametrize(
@@ -225,7 +287,7 @@ tasks:
 
     assert task.placement_policy["home_machine"] == "g2"
     assert operation["submission"]["resolved_context"]["worker_set_additions"] == {
-        "g2": {"scheduling_role": "primary", "borrow_limit_gpus": None}
+        "g2": {"scheduling_role": "primary", "gpu_limit_gpus": None}
     }
     assert operation["submission"]["resolved_context"]["planned_worker_set"] == ["g1", "g2"]
 

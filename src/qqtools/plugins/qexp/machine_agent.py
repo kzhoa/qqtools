@@ -70,6 +70,7 @@ def _probe_primary_demand(
     visible: list[int],
     free: list[int],
     budget: SliceBudget,
+    reservations: tuple[dict[str, Any], ...] = (),
 ) -> PrimaryDemandProbe:
     """Scan primary candidates through an independent bounded ready cursor."""
     diagnostics: list[dict[str, str]] = []
@@ -205,19 +206,18 @@ def _probe_primary_demand(
                         "reason": "placement_rejected",
                     })
                     continue
-                if task.group_name is None:
-                    continue
-                try:
-                    group = read_json(cfg.shared_root / "groups" / f"{task.group_name}.json")
-                    normalize_group_record(group)
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    runtime.primary_probe_cursors[cursor_key] = cursor_before
-                    diagnostics.append({"project_id": project_id, "task_id": task.task_id,
-                                        "reason": f"group_unreadable:{exc}"})
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                worker = group["group"]["worker_set"].get(cfg.machine_name)
-                if worker is None or worker["scheduling_role"] != "primary":
-                    continue
+                if task.group_name is not None:
+                    try:
+                        group = read_json(cfg.shared_root / "groups" / f"{task.group_name}.json")
+                        normalize_group_record(group)
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                        runtime.primary_probe_cursors[cursor_key] = cursor_before
+                        diagnostics.append({"project_id": project_id, "task_id": task.task_id,
+                                            "reason": f"group_unreadable:{exc}"})
+                        return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                    worker = group["group"]["worker_set"].get(cfg.machine_name)
+                    if worker is None or worker["scheduling_role"] != "primary":
+                        continue
                 reason = _working_directory_reason(task.spec)
                 if reason is not None:
                     diagnostics.append({
@@ -227,6 +227,22 @@ def _probe_primary_demand(
                     })
                     continue
                 requested = task.spec.requested_gpus
+                gpu_limit_gpus = worker["gpu_limit_gpus"] if task.group_name is not None else None
+                if gpu_limit_gpus is not None:
+                    usage = sum(
+                        len(reservation.get("gpu_ids", []))
+                        for reservation in reservations
+                        if reservation.get("project_id") == project_id
+                        and reservation.get("group_name") == task.group_name
+                        and reservation.get("machine_name") == cfg.machine_name
+                    )
+                    if requested > gpu_limit_gpus - usage:
+                        diagnostics.append({
+                            "project_id": project_id,
+                            "task_id": task.task_id,
+                            "reason": "group_gpu_limit_reached",
+                        })
+                        continue
                 if requested > len(visible):
                     diagnostics.append({
                         "project_id": project_id,
@@ -931,7 +947,7 @@ def _dispatch_machine_cycle_locked(
 
     probe_budget = SliceBudget(WorkBudgetPolicy())
     probe = _probe_primary_demand(
-        runtime, readable, dispatchable, visible, free, probe_budget
+        runtime, readable, dispatchable, visible, free, probe_budget, snapshot.reservations
     ) if free else PrimaryDemandProbe("unresolved")
     diagnostic_increment(f"scheduler.primary_probe.{probe.state}")
     borrow_admission_grant = _build_borrow_admission_grant(

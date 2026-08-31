@@ -13,7 +13,7 @@ from ..runtime.locks import group_lock, task_lock
 from ..runtime.paths import attempt_path, group_path, shared_paths, submission_path
 from ..runtime.records import (AttemptRecord, SCHEMA_VERSION, TaskRecord, new_group, new_id,
                                new_worker_member, normalize_group_record, utc_now,
-                               validate_borrow_limit, validate_group_name, validate_identifier)
+                               validate_gpu_limit, validate_group_name, validate_identifier)
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.worker_encoding import write_group_record
 from ..runtime.tasks import load_task, save_task
@@ -420,8 +420,8 @@ def show_group(cfg: RootConfig, name: str) -> dict[str, Any]:
 
 def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                   *, terminate_running: bool = False, role: str | None = None,
-                  borrow_limit_gpus: int | None = None,
-                  has_borrow_limit: bool = False) -> dict[str, Any]:
+                  gpu_limit_gpus: int | None = None,
+                  has_gpu_limit: bool = False) -> dict[str, Any]:
     path = group_path(cfg.shared_root, validate_group_name(group_name) or group_name)
     _finalize_pending_submission_before_group_mutation(cfg, group_name, path)
     with group_lock(cfg.shared_root, group_name):
@@ -443,62 +443,50 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
         workers = data["group"]["worker_set"]
         projection_routes = primary_projection_routes_for_group(cfg, group_name)
         worker_changed = True
-        if has_borrow_limit:
-            borrow_limit_gpus = validate_borrow_limit(borrow_limit_gpus, "max_gpus")
+        if has_gpu_limit:
+            gpu_limit_gpus = validate_gpu_limit(gpu_limit_gpus, "gpu_limit_gpus")
         if action == "add":
             validate_identifier(machine, "worker_machine")
             if role not in {None, "primary", "borrow"}:
                 raise ValueError("role must be 'primary' or 'borrow'.")
             selected_role = role or "primary"
-            if selected_role == "primary" and borrow_limit_gpus is not None:
-                raise ValueError("primary Worker cannot have a borrow limit.")
             current = workers.get(machine)
             if current is None:
                 workers[machine] = new_worker_member(
                     scheduling_role=selected_role,
-                    borrow_limit_gpus=borrow_limit_gpus,
+                    gpu_limit_gpus=gpu_limit_gpus,
                 )
             else:
                 current_role = selected_role if role is not None else current["scheduling_role"]
-                current_limit = borrow_limit_gpus if has_borrow_limit else (
-                    None if role == "primary" else current["borrow_limit_gpus"]
-                )
-                if current_role == "primary":
-                    current_limit = None
+                current_limit = gpu_limit_gpus if has_gpu_limit else current["gpu_limit_gpus"]
                 current.update({
                     "scheduling_role": current_role,
-                    "borrow_limit_gpus": current_limit,
+                    "gpu_limit_gpus": current_limit,
                     "state": "borrow" if current_role == "borrow" else "active",
                 })
                 current["state_epoch"] += 1
         elif machine not in workers:
             raise ValueError(f"machine {machine!r} is not a Worker Set member.")
         elif action == "set":
-            if role is None and not has_borrow_limit:
-                raise ValueError("machines set requires --role or --max-gpus.")
+            if role is None and not has_gpu_limit:
+                raise ValueError("machines set requires --role or --gpu-limit-gpus.")
             worker = workers[machine]
             selected_role = role or worker["scheduling_role"]
             if selected_role not in {"primary", "borrow"}:
                 raise ValueError("role must be 'primary' or 'borrow'.")
-            selected_limit = borrow_limit_gpus if has_borrow_limit else worker["borrow_limit_gpus"]
-            if selected_role == "primary" and has_borrow_limit and selected_limit is not None:
-                raise ValueError("primary Worker cannot have a borrow limit.")
-            if selected_role == "borrow" and role == "borrow" and not has_borrow_limit:
-                selected_limit = None
-            if selected_role == "primary":
-                selected_limit = None
+            selected_limit = gpu_limit_gpus if has_gpu_limit else worker["gpu_limit_gpus"]
             selected_state = worker["state"]
             if selected_state in {"active", "borrow"}:
                 selected_state = "borrow" if selected_role == "borrow" else "active"
             changed = (
                 worker["scheduling_role"] != selected_role
-                or worker["borrow_limit_gpus"] != selected_limit
+                or worker["gpu_limit_gpus"] != selected_limit
                 or worker["state"] != selected_state
             )
             worker_changed = changed
             worker.update({
                 "scheduling_role": selected_role,
-                "borrow_limit_gpus": selected_limit,
+                "gpu_limit_gpus": selected_limit,
                 "state": selected_state,
             })
             if changed:

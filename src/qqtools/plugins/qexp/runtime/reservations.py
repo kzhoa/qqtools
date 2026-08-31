@@ -120,9 +120,9 @@ def _reserve_locked(
     paths: dict[str, Path], task_id: str, gpu_ids: list[int], *, attempt_id: str | None,
     fencing_token: int | None, project_id: str | None, shared_root: str | None,
     machine_name: str | None, group_name: str | None,
-    worker_scheduling_role: str | None, borrow_limit_gpus: int | None,
+    worker_scheduling_role: str | None, gpu_limit_gpus: int | None,
     group_worker_set_epoch: int | None, worker_state_epoch: int | None,
-    admitted_as_borrow: bool, enforce_borrow_limit: bool,
+    admitted_as_borrow: bool, enforce_gpu_limit: bool,
 ) -> dict[str, Any]:
     _expire_provisionals(paths)
     active = _reservation_values(paths["active"])
@@ -134,7 +134,7 @@ def _reserve_locked(
         gpu for value in active + provisional for gpu in value["reservation"]["gpu_ids"]
     }.intersection(gpu_ids):
         raise ValueError("requested GPU is already reserved by qexp.")
-    if enforce_borrow_limit and borrow_limit_gpus is not None:
+    if enforce_gpu_limit and gpu_limit_gpus is not None:
         usage = sum(
             len(value["reservation"].get("gpu_ids", []))
             for value in active + provisional
@@ -142,9 +142,9 @@ def _reserve_locked(
             and value["reservation"].get("group_name") == group_name
             and value["reservation"].get("machine_name") == machine_name
         )
-        if usage + len(gpu_ids) > borrow_limit_gpus:
+        if usage + len(gpu_ids) > gpu_limit_gpus:
             raise ValueError(
-                f"Group {group_name!r} borrow limit on machine {machine_name!r} would be exceeded."
+                f"Group {group_name!r} GPU limit on machine {machine_name!r} would be exceeded."
             )
     reservation_id = new_id()
     value = {"reservation": {
@@ -160,7 +160,7 @@ def _reserve_locked(
         "gpu_ids": list(gpu_ids),
         "admission": {
             "worker_scheduling_role": worker_scheduling_role,
-            "borrow_limit_gpus": borrow_limit_gpus,
+            "gpu_limit_gpus": gpu_limit_gpus,
             "group_worker_set_epoch": group_worker_set_epoch,
             "worker_state_epoch": worker_state_epoch,
             "admitted_as_borrow": admitted_as_borrow,
@@ -181,7 +181,7 @@ def reserve(runtime_root: Path, task_id: str, gpu_ids: list[int], *, attempt_id:
             fencing_token: int | None = None, project_id: str | None = None,
             shared_root: str | None = None, machine_name: str | None = None,
             group_name: str | None = None, worker_scheduling_role: str | None = None,
-            borrow_limit_gpus: int | None = None, group_worker_set_epoch: int | None = None,
+            gpu_limit_gpus: int | None = None, group_worker_set_epoch: int | None = None,
             worker_state_epoch: int | None = None,
             admitted_as_borrow: bool = False) -> dict[str, Any]:
     paths = local_paths(runtime_root)
@@ -190,31 +190,29 @@ def reserve(runtime_root: Path, task_id: str, gpu_ids: list[int], *, attempt_id:
             paths, task_id, gpu_ids, attempt_id=attempt_id, fencing_token=fencing_token,
             project_id=project_id, shared_root=shared_root, machine_name=machine_name,
             group_name=group_name, worker_scheduling_role=worker_scheduling_role,
-            borrow_limit_gpus=borrow_limit_gpus,
+            gpu_limit_gpus=gpu_limit_gpus,
             group_worker_set_epoch=group_worker_set_epoch, worker_state_epoch=worker_state_epoch,
-            admitted_as_borrow=admitted_as_borrow, enforce_borrow_limit=False,
+            admitted_as_borrow=admitted_as_borrow, enforce_gpu_limit=False,
         )
 
 
 def reserve_admitted(
     runtime_root: Path, task_id: str, gpu_ids: list[int], *, project_id: str,
-    group_name: str, machine_name: str, borrow_limit_gpus: int | None,
+    group_name: str, machine_name: str, gpu_limit_gpus: int | None,
     worker_scheduling_role: str, group_worker_set_epoch: int, worker_state_epoch: int,
     attempt_id: str | None = None, fencing_token: int | None = None,
     shared_root: str | None = None, admitted_as_borrow: bool = True,
 ) -> dict[str, Any]:
     """Atomically reserve GPUs after Group/Task admission authorization."""
-    if worker_scheduling_role != "borrow":
-        raise ValueError("reserve_admitted requires a borrow Worker role.")
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
         return _reserve_locked(
             paths, task_id, gpu_ids, attempt_id=attempt_id, fencing_token=fencing_token,
             project_id=project_id, shared_root=shared_root, machine_name=machine_name,
             group_name=group_name, worker_scheduling_role=worker_scheduling_role,
-            borrow_limit_gpus=borrow_limit_gpus,
+            gpu_limit_gpus=gpu_limit_gpus,
             group_worker_set_epoch=group_worker_set_epoch, worker_state_epoch=worker_state_epoch,
-            admitted_as_borrow=admitted_as_borrow, enforce_borrow_limit=True,
+            admitted_as_borrow=admitted_as_borrow, enforce_gpu_limit=True,
         )
 
 

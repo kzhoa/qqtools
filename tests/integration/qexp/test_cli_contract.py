@@ -108,6 +108,31 @@ def test_clean_help_documents_group_scope_and_work_directory_boundary(capsys):
     assert "preserving experiment work directories" in output
 
 
+def test_help_explains_existing_project_machine_join_and_context_only_use(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--help"])
+
+    assert exc_info.value.code == 0
+    top_level_output = " ".join(capsys.readouterr().out.split())
+    assert "To join a new machine to an existing project" in top_level_output
+    assert "qexp use only saves local CLI" in top_level_output
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["init", "--help"])
+
+    assert exc_info.value.code == 0
+    init_output = " ".join(capsys.readouterr().out.split())
+    assert "registers the project with the local machine agent" in init_output
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["use", "--help"])
+
+    assert exc_info.value.code == 0
+    use_output = " ".join(capsys.readouterr().out.split())
+    assert "does not initialize a shared root" in use_output
+    assert "or register the project with the local machine agent" in use_output
+
+
 def test_init_succeeds_when_context_save_fails(tmp_path: Path, monkeypatch, capsys):
     root = tmp_path / ".qexp"
     runtime_root = tmp_path / "rt"

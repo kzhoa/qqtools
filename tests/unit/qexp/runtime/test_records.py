@@ -30,7 +30,17 @@ def test_legacy_group_worker_defaults_to_primary():
     normalize_group_record(group)
 
     assert group["group"]["worker_set"]["gpu-1"]["scheduling_role"] == "primary"
-    assert group["group"]["worker_set"]["gpu-1"]["borrow_limit_gpus"] is None
+    assert group["group"]["worker_set"]["gpu-1"]["gpu_limit_gpus"] is None
+
+
+def test_legacy_borrow_limit_is_normalized_to_gpu_limit():
+    group = {"group": {"worker_set": {"gpu-1": {"borrow_limit_gpus": 2}}}}
+
+    normalize_group_record(group)
+
+    worker = group["group"]["worker_set"]["gpu-1"]
+    assert worker["gpu_limit_gpus"] == 2
+    assert "borrow_limit_gpus" not in worker
 
 
 def test_canonical_borrow_worker_encoding_is_readable():
@@ -40,7 +50,7 @@ def test_canonical_borrow_worker_encoding_is_readable():
                 "gpu-1": {
                     "state": "active",
                     "scheduling_role": "borrow",
-                    "borrow_limit_gpus": 2,
+                    "gpu_limit_gpus": 2,
                 }
             }
         }
