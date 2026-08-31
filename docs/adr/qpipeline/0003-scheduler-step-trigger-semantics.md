@@ -1,3 +1,13 @@
+---
+doc_type: adr
+adr_id: ADR-QPIPELINE-0003
+status: accepted
+updated_at: 2026-08-31
+archived_at:
+supersedes: []
+superseded_by:
+---
+
 # ADR-QPIPELINE-0003: Scheduler Step Trigger Semantics
 
 - Status: Accepted

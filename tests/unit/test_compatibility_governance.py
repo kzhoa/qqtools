@@ -287,7 +287,7 @@ def test_repository_registry_is_valid() -> None:
     use_context_item = next(item for item in items if item.item_id == "QQTOOLS-COMPAT-0002")
     assert use_context_item.pitch_refs == (
         Path("docs/pitch/qexp-use-project-context.md"),
-        Path("docs/pitch/qexp-compatibility-sunset.md"),
+        Path("docs/pitch/qexp-primary-borrow-cli-context-sunset.md"),
     )
 
 

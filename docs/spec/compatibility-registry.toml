@@ -35,7 +35,7 @@ decision_refs = [
 ]
 pitch_refs = [
     "docs/pitch/qexp-use-project-context.md",
-    "docs/pitch/qexp-compatibility-sunset.md",
+    "docs/pitch/qexp-primary-borrow-cli-context-sunset.md",
 ]
 verification = [
     "tests/integration/qexp/test_cli_contract.py",

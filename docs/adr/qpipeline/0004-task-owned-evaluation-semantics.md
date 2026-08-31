@@ -1,8 +1,11 @@
 ---
 doc_type: adr
-status: active
-updated_at: 2026-08-03
+adr_id: ADR-QPIPELINE-0004
+status: accepted
+updated_at: 2026-08-31
 archived_at:
+supersedes: []
+superseded_by:
 ---
 
 # ADR-QPIPELINE-0004: Task-Owned Evaluation Semantics
@@ -282,6 +285,6 @@ Rejected because source selection and aggregation are benchmark semantics, not f
 - `docs/pitch/qpipeline-single-multi-eval-loader-contract.md`
 - `docs/pitch/qpipeline-runtime-training-control-implementation-plan-zh.md`
 - `docs/pitch/qpipeline-runtime-training-control-implementation-plan.md`
-- `docs/adr/qpipeline/0003-scheduler-step-trigger-semantics.md`
+- [ADR-QPIPELINE-0003](0003-scheduler-step-trigger-semantics.md)
 - `docs/pitch/qpipeline-dynamic-csv-metric-schema.md`
 - `docs/pitch/qpipeline-structured-eval-metric-schema.md`
