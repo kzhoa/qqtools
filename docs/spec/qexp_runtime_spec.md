@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-30
+updated_at: 2026-08-31
 archived_at:
 ---
 
@@ -181,6 +181,10 @@ Deployment must provide user-local rather than shared control storage. It has no
 project's runtime root.
 Every qexp agent process uses this resolver to acquire the same lifetime-held machine scheduler
 lock.
+
+Temporary compatibility readers, migrations, and protocol adapters in this runtime must be
+registered under the project-wide [compatibility governance](compatibility-governance.md); the
+registry's release state does not replace the runtime invariants in this specification.
 
 Operational project commands resolve a canonical shared root and stable Project ID, then require
 one matching local registry binding before constructing an authoritative execution context. The
@@ -495,8 +499,10 @@ A Worker member contains `scheduling_role: primary | borrow` and
 `active | borrow | draining | removing`: `active` is a primary claimable Worker, `borrow` is a
 borrow claimable Worker, and `draining`/`removing` are not claimable. Both roles may carry a
 finite limit. Existing Worker records without these fields read as `state: active`,
-`scheduling_role: primary`, and `gpu_limit_gpus: null`. Schema-6 readers temporarily normalize
-the legacy `borrow_limit_gpus` field into `gpu_limit_gpus`; writers emit only the new field.
+`scheduling_role: primary`, and `gpu_limit_gpus: null`. Under `QQTOOLS-COMPAT-0004`, N readers
+temporarily normalize the legacy `borrow_limit_gpus` field into `gpu_limit_gpus`; writers emit
+only the new field. N+1 may read that field only while performing the schema-lock and Group-lock
+automatic upgrade; ordinary scheduling then requires `gpu_limit_gpus`. N+2 removes both paths.
 
 `state: borrow` is deliberately a fail-closed compatibility encoding. An agent that predates
 primary/borrow support already excludes any Worker whose state is not `active`, so it skips the

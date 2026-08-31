@@ -110,6 +110,23 @@ tasks:
     }
 
 
+def test_submission_worker_legacy_limit_is_normalized_to_gpu_limit():
+    """QQTOOLS-COMPAT-0004: N retries retain a pre-unification Worker declaration."""
+    workers = submission_runtime._worker_additions({
+        "gpu-1": {
+            "scheduling_role": "borrow",
+            "borrow_limit_gpus": 2,
+        }
+    })
+
+    assert workers == {
+        "gpu-1": {
+            "scheduling_role": "borrow",
+            "gpu_limit_gpus": 2,
+        }
+    }
+
+
 def test_manifest_rejects_duplicate_yaml_machine_keys(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     manifest = _manifest(

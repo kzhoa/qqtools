@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-30
+updated_at: 2026-08-31
 archived_at:
 ---
 
@@ -60,6 +60,11 @@ Document authority is divided as follows:
 Anything marked **Assumption / Unverified** is not a guarantee of the installed version.
 
 ## Compatibility policy
+
+Project-wide temporary compatibility lifecycles are registered in
+[`compatibility-registry.toml`](compatibility-registry.toml) and governed by
+[`compatibility-governance.md`](compatibility-governance.md). The registry schedules removal and
+purge work; this specification remains authoritative for qexp behavior and protected workflows.
 
 Workflows listed under **Protected workflows**, and workflows explicitly marked as stable in
 this specification, are stable public behavior. Experimental workflows are excluded only when
@@ -771,8 +776,11 @@ only later borrow claims stop.
 Group-level GPU limit; visible free qexp GPUs, placement, primary demand, and machine-wide
 reservations still apply. A finite limit is checked by GPU count, not Task count. Lowering a
 limit below current usage reports `over_limit` and blocks later admission without terminating
-work. Schema-6 readers temporarily accept `borrow_limit_gpus` from existing records and normalize
-it to `gpu_limit_gpus`; all new writes and outputs use `gpu_limit_gpus`.
+work. Under `QQTOOLS-COMPAT-0004`, N readers temporarily accept `borrow_limit_gpus` from
+existing Group records and pre-unification submission declarations, then normalize it to
+`gpu_limit_gpus`; all N writes and outputs use `gpu_limit_gpus`. N+1 retains that reader only
+inside its automatic Group upgrade, which rewrites every legacy field before normal scheduling;
+N+2 removes the reader and upgrade path.
 
 For compatibility, a borrow Worker is persisted as both `scheduling_role: borrow` and
 `state: borrow`. Current agents treat `active` and `borrow` as claimable lifecycle states and

@@ -8,6 +8,7 @@ from .paths import shared_paths
 from .store import atomic_replace, read_json
 
 ENCODING_COMPAT_V1 = "compat_v1"
+# QQTOOLS-COMPAT-0001: remove compat_v1 runtime support in 1.3.15.
 ENCODING_CANONICALIZING = "canonicalizing"
 ENCODING_CANONICAL_V2 = "canonical_v2"
 WORKER_ENCODING_STATES = {

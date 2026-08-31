@@ -160,6 +160,28 @@ def test_group_machines_cli_exposes_normalized_role_and_limit(tmp_path: Path, ca
     assert primary["group"]["worker_set"]["gpu-3"]["gpu_limit_gpus"] == 1
 
 
+def test_group_machines_cli_keeps_max_gpus_alias_compatible(tmp_path: Path, capsys):
+    """QQTOOLS-COMPAT-0003: Keep --max-gpus through the N release."""
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    assert main([*_base_args(cfg), "group", "create", "demo", "--format=json"]) == 0
+    capsys.readouterr()
+
+    assert main([
+        *_base_args(cfg), "group", "machines", "add", "demo", "gpu-2",
+        "--role", "borrow", "--max-gpus", "2", "--format=json",
+    ]) == 0
+    added = json.loads(capsys.readouterr().out)
+    assert added["group"]["worker_set"]["gpu-2"]["gpu_limit_gpus"] == 2
+
+    with pytest.raises(SystemExit) as exc_info:
+        main([
+            *_base_args(cfg), "group", "machines", "set", "demo", "gpu-2",
+            "--gpu-limit-gpus", "1", "--max-gpus", "1",
+        ])
+    assert exc_info.value.code == 2
+    assert "not allowed with argument --gpu-limit-gpus" in capsys.readouterr().err
+
+
 def test_batch_json_is_one_document_and_idempotent_retry_is_silent_on_stderr(tmp_path: Path, monkeypatch, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     manifest = tmp_path / "runs.yaml"

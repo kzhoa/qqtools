@@ -1,0 +1,75 @@
+schema_version = 1
+next_id = 5
+
+[[items]]
+id = "QQTOOLS-COMPAT-0001"
+component = "qexp.group-primary-borrow-encoding"
+kind = "persisted_schema"
+status = "compatibility_active"
+introduced_in = "1.3.13"
+legacy_removed_in = "1.3.14"
+transition_purged_in = "1.3.15"
+marker = "QQTOOLS-COMPAT-0001"
+owner = "qexp.runtime"
+decision_refs = [
+    "docs/spec/qexp_product_spec.md",
+    "docs/spec/qexp_runtime_spec.md",
+]
+verification = [
+    "tests/integration/qexp/test_group.py",
+]
+
+[[items]]
+id = "QQTOOLS-COMPAT-0002"
+component = "qexp.cli-use-context"
+kind = "cli_and_local_state"
+status = "planned"
+introduced_in = "1.3.13"
+legacy_removed_in = "1.3.14"
+transition_purged_in = "1.3.15"
+marker = "QQTOOLS-COMPAT-0002"
+owner = "qexp.cli"
+decision_refs = [
+    "docs/spec/qexp_product_spec.md",
+    "docs/spec/qexp_runtime_spec.md",
+]
+verification = [
+    "tests/integration/qexp/test_cli_contract.py",
+    "tests/e2e/qexp/test_compatibility_contract.py",
+]
+
+[[items]]
+id = "QQTOOLS-COMPAT-0003"
+component = "qexp.group-machine-gpu-limit-cli"
+kind = "cli"
+status = "compatibility_active"
+introduced_in = "1.3.13"
+legacy_removed_in = "1.3.14"
+transition_purged_in = "1.3.14"
+marker = "QQTOOLS-COMPAT-0003"
+owner = "qexp.cli"
+decision_refs = [
+    "docs/spec/qexp_product_spec.md",
+]
+verification = [
+    "tests/integration/qexp/test_output_format.py",
+]
+
+[[items]]
+id = "QQTOOLS-COMPAT-0004"
+component = "qexp.group-gpu-limit-field"
+kind = "persisted_schema"
+status = "compatibility_active"
+introduced_in = "1.3.13"
+legacy_removed_in = "1.3.14"
+transition_purged_in = "1.3.15"
+marker = "QQTOOLS-COMPAT-0004"
+owner = "qexp.runtime"
+decision_refs = [
+    "docs/spec/qexp_product_spec.md",
+    "docs/spec/qexp_runtime_spec.md",
+]
+verification = [
+    "tests/unit/qexp/runtime/test_records.py",
+    "tests/integration/qexp/test_batch_manifest_placement.py",
+]

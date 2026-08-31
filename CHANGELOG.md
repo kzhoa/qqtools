@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- chore: add a project-wide compatibility registry and make the explicit target-version local
+  release preflight enforce due compatibility transitions before regression and build work; keep
+  the registry bounded to unfinished items while release tags audit retirement and ID continuity.
 - feat: add qexp Group primary/borrow Worker roles, optional per-machine borrow GPU limits, and
   machine-agent admission that preserves primary demand before launching new borrowed work.
 - docs: archive the completed qexp Group primary/borrow resource-pool pitch.
