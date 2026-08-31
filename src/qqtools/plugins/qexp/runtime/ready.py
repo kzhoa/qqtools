@@ -827,7 +827,11 @@ def peek_primary_ready_marker(
             successor = catalog.get("successor")
             if not isinstance(partitions, list) or not all(isinstance(item, str) for item in partitions):
                 raise ValueError("primary catalog is invalid.")
-        except (FileNotFoundError, KeyError, TypeError, ValueError):
+        except FileNotFoundError:
+            if page_number == 0 and not _allocator_path(cfg.shared_root, route_key).exists():
+                return ReadyPeek(None, current)
+            return ReadyPeek(None, current, unresolved=True)
+        except (KeyError, TypeError, ValueError):
             return ReadyPeek(None, current, unresolved=True)
         partition_index = partitions.index(partition_name) if partition_name in partitions else 0
         if partition_name not in partitions:

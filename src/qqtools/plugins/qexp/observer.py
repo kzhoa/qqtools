@@ -99,18 +99,17 @@ def list_group_machines(
             for item in reservations
             if item.get("group_name") == name
         )
-        limit = worker["borrow_limit_gpus"]
+        limit = worker["gpu_limit_gpus"]
         state = worker["state"]
-        if worker["scheduling_role"] == "borrow":
-            if limit is not None and usage > limit:
-                state = "over_limit"
-            elif limit is not None and usage >= limit:
-                state = "full"
+        if limit is not None and usage > limit:
+            state = "over_limit"
+        elif limit is not None and usage >= limit:
+            state = "full"
         machines.append({
             "machine_name": machine,
             "scheduling_role": worker["scheduling_role"],
             "gpu_usage": usage,
-            "borrow_limit_gpus": limit,
+            "gpu_limit_gpus": limit,
             "state": state,
             "agent": "registered" if agent_state in {"active", "idle"} else agent_state,
         })

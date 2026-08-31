@@ -305,37 +305,22 @@ def _claim(
         attempt_id = f"{task.task_id}-attempt-{attempt_number}"
         token = task.claim_control["fencing_epoch"] + 1
         if group is not None and worker is not None:
-            if worker["scheduling_role"] == "borrow":
-                reservation = reserve_admitted(
-                    reservation_runtime_root,
-                    task_id,
-                    assigned_gpus,
-                    project_id=project_id or "",
-                    group_name=task.group_name or "",
-                    machine_name=cfg.machine_name,
-                    borrow_limit_gpus=worker["borrow_limit_gpus"],
-                    worker_scheduling_role=worker["scheduling_role"],
-                    group_worker_set_epoch=group["group"]["worker_set_epoch"],
-                    worker_state_epoch=worker["state_epoch"],
-                    attempt_id=attempt_id,
-                    fencing_token=token,
-                    shared_root=str(cfg.shared_root),
-                )
-            else:
-                reservation = reserve(
-                    reservation_runtime_root,
-                    task_id,
-                    assigned_gpus,
-                    attempt_id=attempt_id,
-                    fencing_token=token,
-                    project_id=project_id,
-                    shared_root=str(cfg.shared_root),
-                    machine_name=cfg.machine_name,
-                    group_name=task.group_name,
-                    worker_scheduling_role=worker["scheduling_role"],
-                    group_worker_set_epoch=group["group"]["worker_set_epoch"],
-                    worker_state_epoch=worker["state_epoch"],
-                )
+            reservation = reserve_admitted(
+                reservation_runtime_root,
+                task_id,
+                assigned_gpus,
+                project_id=project_id or "",
+                group_name=task.group_name or "",
+                machine_name=cfg.machine_name,
+                gpu_limit_gpus=worker["gpu_limit_gpus"],
+                worker_scheduling_role=worker["scheduling_role"],
+                group_worker_set_epoch=group["group"]["worker_set_epoch"],
+                worker_state_epoch=worker["state_epoch"],
+                attempt_id=attempt_id,
+                fencing_token=token,
+                shared_root=str(cfg.shared_root),
+                admitted_as_borrow=worker["scheduling_role"] == "borrow",
+            )
         else:
             reservation = reserve(
                 reservation_runtime_root,
@@ -382,13 +367,13 @@ def _claim(
             claim["group_worker_set_epoch"] = group["group"]["worker_set_epoch"]
             claim["worker_state_epoch"] = worker["state_epoch"]
             claim["worker_scheduling_role"] = worker["scheduling_role"]
-            claim["borrow_limit_gpus"] = worker["borrow_limit_gpus"]
+            claim["gpu_limit_gpus"] = worker["gpu_limit_gpus"]
             claim["admitted_as_borrow"] = worker["scheduling_role"] == "borrow"
             attempt.authorization["group_dispatch_epoch"] = group["group"]["dispatch_epoch"]
             attempt.authorization["group_worker_set_epoch"] = group["group"]["worker_set_epoch"]
             attempt.authorization["worker_state_epoch"] = worker["state_epoch"]
             attempt.authorization["worker_scheduling_role"] = worker["scheduling_role"]
-            attempt.authorization["borrow_limit_gpus"] = worker["borrow_limit_gpus"]
+            attempt.authorization["gpu_limit_gpus"] = worker["gpu_limit_gpus"]
             attempt.authorization["admitted_as_borrow"] = worker["scheduling_role"] == "borrow"
         task.claim_control.update({"fencing_epoch": token, "active_claim": claim})
         task.attempt_control.update(

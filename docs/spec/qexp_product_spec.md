@@ -767,10 +767,12 @@ existing Attempt. A primary demand that is runnable now or waiting only for qexp
 blocks new borrow admission. Existing borrow Attempts continue after primary demand appears;
 only later borrow claims stop.
 
-`borrow_limit_gpus` is `null` or a positive integer. `null` removes only the Group-level borrow
-quota; visible free qexp GPUs, placement, primary demand, and machine-wide reservations still
-apply. A finite quota is checked by GPU count, not Task count. Lowering a quota below current
-usage reports `over_limit` and blocks later borrow admission without terminating work.
+`gpu_limit_gpus` is `null` or a positive integer for both Worker roles. `null` removes only the
+Group-level GPU limit; visible free qexp GPUs, placement, primary demand, and machine-wide
+reservations still apply. A finite limit is checked by GPU count, not Task count. Lowering a
+limit below current usage reports `over_limit` and blocks later admission without terminating
+work. Schema-6 readers temporarily accept `borrow_limit_gpus` from existing records and normalize
+it to `gpu_limit_gpus`; all new writes and outputs use `gpu_limit_gpus`.
 
 For compatibility, a borrow Worker is persisted as both `scheduling_role: borrow` and
 `state: borrow`. Current agents treat `active` and `borrow` as claimable lifecycle states and
@@ -801,8 +803,8 @@ Worker Set invariants:
 Required operations:
 
 ```bash
-qexp group machines add <group> g11 --role borrow --max-gpus 2
-qexp group machines set <group> g11 --role primary
+qexp group machines add <group> g11 --role borrow --gpu-limit-gpus 2
+qexp group machines set <group> g11 --role primary --gpu-limit-gpus 2
 qexp group machines drain <group> g5
 qexp group machines remove <group> g5 --terminate-running
 qexp group machines list <group>
@@ -814,7 +816,7 @@ Adding a machine:
 - does not modify running or terminal Attempts
 - does not remotely start the agent
 
-Role and borrow-limit changes are Group-lock-linearized. They affect later claims but do not
+Role and GPU-limit changes are Group-lock-linearized. They affect later claims but do not
 revoke a successfully created claim. Drain, remove, pause, cancellation, lease, and fencing keep
 their existing launch-gate meaning.
 

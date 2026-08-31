@@ -459,7 +459,7 @@ group:
     <machine-name>:
       state: active | borrow | draining | removing
       scheduling_role: primary | borrow
-      borrow_limit_gpus: int | null
+      gpu_limit_gpus: int | null
       state_epoch: int
       added_at: str
       added_by_operation: str | null
@@ -491,11 +491,12 @@ Group rules:
 - removed machines remain auditable through events or tombstone history
 
 A Worker member contains `scheduling_role: primary | borrow` and
-`borrow_limit_gpus: positive-int | null`. Its persisted `state` is one of
+`gpu_limit_gpus: positive-int | null`. Its persisted `state` is one of
 `active | borrow | draining | removing`: `active` is a primary claimable Worker, `borrow` is a
-borrow claimable Worker, and `draining`/`removing` are not claimable. `primary` requires a null
-borrow limit. Existing Worker records without these fields read as `state: active`,
-`scheduling_role: primary`, and `borrow_limit_gpus: null`.
+borrow claimable Worker, and `draining`/`removing` are not claimable. Both roles may carry a
+finite limit. Existing Worker records without these fields read as `state: active`,
+`scheduling_role: primary`, and `gpu_limit_gpus: null`. Schema-6 readers temporarily normalize
+the legacy `borrow_limit_gpus` field into `gpu_limit_gpus`; writers emit only the new field.
 
 `state: borrow` is deliberately a fail-closed compatibility encoding. An agent that predates
 primary/borrow support already excludes any Worker whose state is not `active`, so it skips the
@@ -886,7 +887,7 @@ reservation:
   gpu_ids: list[int]
   admission:
     worker_scheduling_role: primary | borrow | null
-    borrow_limit_gpus: int | null
+    gpu_limit_gpus: int | null
     group_worker_set_epoch: int | null
     worker_state_epoch: int | null
   state: provisional | active | released
@@ -1323,7 +1324,7 @@ permanently blocking borrow.
 
 When primary demand is absent, eligible primary and borrow candidates use separate deterministic
 fair rounds: the primary layer is always exhausted or blocked before borrow is considered, and
-the borrow layer skips a candidate whose Group usage has reached its finite borrow limit. Role
+either layer skips a candidate whose Group usage has reached its finite GPU limit. Role
 selection occurs only after existing Group, Task, and placement authorization. This is not a
 project priority, quota, preemption, or capacity reservation feature.
 
@@ -1534,20 +1535,21 @@ must revalidate under authoritative locks:
 - shared queue claimant is allowed by Worker Set and fallback constraint
 - Task requires no more locally reservable qexp GPUs than available
 
-For a borrow Worker, eligibility additionally requires a `no_primary_demand` probe result and a
-successful atomic borrow-quota reservation. A Task requiring more GPUs than the finite quota is
-ineligible for that Worker but remains eligible elsewhere when placement allows it.
+For a borrow Worker, eligibility additionally requires a `no_primary_demand` probe result. Every
+grouped Worker role requires a successful atomic GPU-limit reservation. A Task requiring more
+GPUs than the finite limit is ineligible for that Worker but remains eligible elsewhere when
+placement allows it.
 
 ### 13.3 Provisional Reservation
 
 The agent creates a TTL-bound local provisional reservation keyed by an acquisition ID.
 It must not reserve more Tasks than it can promptly launch.
 
-`reserve_admitted` is the only borrow admission API. While holding the machine reservation lock,
+`reserve_admitted` is the only grouped admission API. While holding the machine reservation lock,
 it expires unattached provisionals, aggregates active and unexpired provisional GPU IDs for the
-same `(project_id, group_name, machine_name)`, checks the finite quota, and writes the provisional
-record atomically. Group and Task truth are re-read under Group -> Task locks before this call;
-the reservation lock performs no shared Group/Task I/O.
+same `(project_id, group_name, machine_name)`, checks the finite GPU limit, and writes the
+provisional record atomically. Group and Task truth are re-read under Group -> Task locks before
+this call; the reservation lock performs no shared Group/Task I/O.
 
 If shared-lock acquisition is delayed beyond the provisional TTL, the agent releases and
 restarts acquisition rather than extending capacity indefinitely without ownership.

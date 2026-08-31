@@ -267,10 +267,8 @@ class AttemptRecord:
         return cls(meta=data["meta"], **value)
 
 
-def validate_borrow_limit(
-    value: Any, label: str = "borrow_limit_gpus"
-) -> int | None:
-    """Validate and return a Group-level borrow GPU limit."""
+def validate_gpu_limit(value: Any, label: str = "gpu_limit_gpus") -> int | None:
+    """Validate and return a Group Worker GPU limit."""
     if value is None:
         return None
     if type(value) is not int or value <= 0:
@@ -290,16 +288,20 @@ def normalize_worker_member(worker: dict[str, Any], *, machine: str = "worker") 
         raise ValueError(f"{machine!r} Worker scheduling_role is invalid.")
     if state not in {"active", "borrow", "draining", "removing"}:
         raise ValueError(f"{machine!r} Worker state is invalid.")
-    limit = validate_borrow_limit(
-        worker.get("borrow_limit_gpus"), f"{machine}.borrow_limit_gpus"
-    )
-    if role == "primary" and limit is not None:
-        raise ValueError(f"{machine!r} primary Worker cannot have a borrow limit.")
+    has_legacy_limit = "borrow_limit_gpus" in worker
+    legacy_limit = worker.pop("borrow_limit_gpus", None)
+    limit = validate_gpu_limit(worker.get("gpu_limit_gpus"), f"{machine}.gpu_limit_gpus")
+    if "gpu_limit_gpus" not in worker:
+        limit = validate_gpu_limit(legacy_limit, f"{machine}.borrow_limit_gpus")
+    elif has_legacy_limit and limit != validate_gpu_limit(
+        legacy_limit, f"{machine}.borrow_limit_gpus"
+    ):
+        raise ValueError(f"{machine!r} Worker has conflicting GPU limit fields.")
     if state == "borrow" and role != "borrow":
         raise ValueError(f"{machine!r} borrow Worker must have borrow scheduling_role.")
     worker["state"] = state
     worker["scheduling_role"] = role
-    worker["borrow_limit_gpus"] = limit
+    worker["gpu_limit_gpus"] = limit
     return worker
 
 
@@ -321,15 +323,13 @@ def new_group(name: str, machine: str) -> dict[str, Any]:
         "cancellation_barriers": []}}
 
 
-def new_worker_member(*, scheduling_role: str = "primary", borrow_limit_gpus: int | None = None,
+def new_worker_member(*, scheduling_role: str = "primary", gpu_limit_gpus: int | None = None,
                       added_by_operation: str | None = None) -> dict[str, Any]:
     if scheduling_role not in WORKER_ROLES:
         raise ValueError("scheduling_role must be 'primary' or 'borrow'.")
-    borrow_limit_gpus = validate_borrow_limit(borrow_limit_gpus)
-    if scheduling_role == "primary" and borrow_limit_gpus is not None:
-        raise ValueError("primary Worker cannot have a borrow limit.")
+    gpu_limit_gpus = validate_gpu_limit(gpu_limit_gpus)
     return {"state": "borrow" if scheduling_role == "borrow" else "active",
-            "scheduling_role": scheduling_role, "borrow_limit_gpus": borrow_limit_gpus,
+            "scheduling_role": scheduling_role, "gpu_limit_gpus": gpu_limit_gpus,
             "state_epoch": 0, "added_at": utc_now(),
             "added_by_operation": added_by_operation, "drain_requested_at": None,
             "remove_requested_at": None, "terminate_running": False}

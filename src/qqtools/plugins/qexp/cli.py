@@ -153,7 +153,12 @@ def build_parser() -> argparse.ArgumentParser:
             "qexp schema-6 experiment queue; --machine is local identity, --home-machine is Task "
             "placement, and Attempt machine is selected later by claim. qexp does not remotely "
             "start a target agent."
-        )
+        ),
+        epilog=(
+            "To join a new machine to an existing project, run: qexp init --shared-root "
+            "<project/.qexp> --machine <local-machine>. qexp use only saves local CLI context; "
+            "it does not initialize or register a project."
+        ),
     )
     parser.add_argument("--shared-root", help="Locate the shared project control root.")
     parser.add_argument(
@@ -163,7 +168,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-root")
     parser.add_argument("--machine-runtime-root")
     commands = parser.add_subparsers(dest="command", required=True)
-    init = commands.add_parser("init")
+    init = commands.add_parser(
+        "init",
+        help="Initialize a project or join this machine to an existing project.",
+        description=(
+            "Initialize a new shared project or join this machine to an existing project. "
+            "It creates or updates this machine's Project record, registers the project with "
+            "the local machine agent, and saves CLI context. It does not start the agent."
+        ),
+    )
     init.add_argument("--agent-mode", choices=["on_demand", "daemon"], default="on_demand")
     migrate = commands.add_parser("migrate")
     migrate.add_argument("--to-schema", type=int, required=True)
@@ -298,7 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
             action.add_argument("worker_machine")
         if name in {"add", "set"}:
             action.add_argument("--role", choices=("primary", "borrow"))
-            action.add_argument("--max-gpus", type=_max_gpus)
+            action.add_argument("--gpu-limit-gpus", type=_gpu_limit_gpus)
         if name == "remove":
             action.add_argument("--terminate-running", action="store_true")
     agent = commands.add_parser("agent")
@@ -335,10 +348,24 @@ def build_parser() -> argparse.ArgumentParser:
     clean.add_argument("--limit", type=int, default=100,
                        help="Maximum number of bulk-cleanup candidates (default: 100).")
     clean.add_argument("--dry-run", action="store_true", help="Show candidates without cleaning them.")
-    use = commands.add_parser("use")
-    use.add_argument("--shared-root", dest="use_shared_root")
-    use.add_argument("--machine", dest="use_machine")
-    use.add_argument("--runtime-root", dest="use_runtime_root")
+    use = commands.add_parser(
+        "use",
+        help="Save local CLI context without initializing or registering a project.",
+        description=(
+            "Save local default CLI context for an existing shared root and machine name. "
+            "This command does not initialize a shared root, create a Project machine record, "
+            "or register the project with the local machine agent."
+        ),
+    )
+    use.add_argument(
+        "--shared-root", dest="use_shared_root", help="Shared project control root to save."
+    )
+    use.add_argument(
+        "--machine", dest="use_machine", help="Local machine name to save as context."
+    )
+    use.add_argument(
+        "--runtime-root", dest="use_runtime_root", help="Legacy runtime root to save."
+    )
     use.add_argument("--show", action="store_true")
     use.add_argument("--clear", action="store_true")
     use.add_argument("--format", choices=("human", "json"))
@@ -361,18 +388,18 @@ def _duration_seconds(value: str) -> int:
     return amount * {"s": 1, "m": 60, "h": 3600}[matched.group(2)]
 
 
-def _max_gpus(value: str) -> int | str:
+def _gpu_limit_gpus(value: str) -> int | str:
     if value == "unlimited":
         return value
     try:
         parsed = int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            "max-gpus must be a positive integer or 'unlimited'."
+            "gpu-limit-gpus must be a positive integer or 'unlimited'."
         ) from exc
     if parsed <= 0:
         raise argparse.ArgumentTypeError(
-            "max-gpus must be a positive integer or 'unlimited'."
+            "gpu-limit-gpus must be a positive integer or 'unlimited'."
         )
     return parsed
 
@@ -723,7 +750,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     _emit("group-machines", result, args.format)
                     return 0
-                max_gpus = getattr(args, "max_gpus", None)
+                gpu_limit_gpus = getattr(args, "gpu_limit_gpus", None)
                 result = group_commands.change_worker(
                     cfg,
                     args.group_name,
@@ -731,8 +758,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.machine_action,
                     terminate_running=getattr(args, "terminate_running", False),
                     role=getattr(args, "role", None),
-                    borrow_limit_gpus=None if max_gpus in {None, "unlimited"} else max_gpus,
-                    has_borrow_limit=max_gpus is not None,
+                    gpu_limit_gpus=None if gpu_limit_gpus in {None, "unlimited"} else gpu_limit_gpus,
+                    has_gpu_limit=gpu_limit_gpus is not None,
                 )
                 kind = "group-operation"
                 presentation = {
