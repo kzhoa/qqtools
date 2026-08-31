@@ -1271,6 +1271,12 @@ compatibility assertions only; a mismatch fails before project mutation and sugg
 `--home-machine` for placement intent. Saved-context machine/runtime fields and standalone
 `--runtime-root` inputs do not select operational identity or local resource ownership.
 
+`qexp use --shared-root <project/.qexp>` is a local default-project selector. It writes only a
+canonical `shared_root`; it does not validate or register the Project, create a machine record, or
+select machine identity. `qexp init` remains the normal path that joins a machine and writes its
+binding. In 1.3.13, deprecated `use` machine/runtime inputs are accepted and warned under
+`QQTOOLS-COMPAT-0002`; their N+1 removal follows the compatibility registry.
+
 `qexp submit --home-machine <name>` selects Task placement independently. `current` and omission
 resolve to the verified local machine. A remote home needs valid current-generation shared Project
 machine metadata, but qexp does not remotely activate its agent or transfer project files.

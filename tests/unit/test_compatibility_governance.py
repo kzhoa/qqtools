@@ -24,6 +24,7 @@ def _write_registry(
     legacy_removed_in: str = "3.0.0",
     transition_purged_in: str = "4.0.0",
     extensions: str = "",
+    pitch_refs: tuple[str, ...] | None = None,
     next_id: int | None = None,
 ) -> Path:
     for path in (root / "docs/spec/decision.md", root / "tests/test_example.py"):
@@ -36,6 +37,14 @@ def _write_registry(
     registry = root / "docs/spec/compatibility-registry.toml"
     item_number = int(item_id.rsplit("-", 1)[1])
     effective_next_id = next_id if next_id is not None else item_number + 1
+    pitch_section = ""
+    if pitch_refs is not None:
+        for pitch_ref in pitch_refs:
+            pitch_path = root / pitch_ref
+            pitch_path.parent.mkdir(parents=True, exist_ok=True)
+            pitch_path.write_text("pitch\n", encoding="utf-8")
+        quoted_refs = ", ".join(f'"{pitch_ref}"' for pitch_ref in pitch_refs)
+        pitch_section = f"pitch_refs = [{quoted_refs}]\n"
     registry.write_text(
         f"""schema_version = 1
 next_id = {effective_next_id}
@@ -51,7 +60,7 @@ transition_purged_in = "{transition_purged_in}"
 marker = "{item_id}"
 owner = "example"
 decision_refs = ["docs/spec/decision.md"]
-verification = ["tests/test_example.py"]
+{pitch_section}verification = ["tests/test_example.py"]
 {extensions}
 """,
         encoding="utf-8",
@@ -128,12 +137,58 @@ def test_registry_rejects_invalid_version_contract(
 
 
 def test_registry_rejects_marker_for_planned_item(tmp_path: Path) -> None:
-    registry = _write_registry(tmp_path, status="planned")
+    registry = _write_registry(
+        tmp_path,
+        status="planned",
+        pitch_refs=("docs/pitch/example.md",),
+    )
     marker = tmp_path / "src/example.py"
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("# QQTOOLS-COMPAT-9001\n", encoding="utf-8")
 
     with pytest.raises(RegistryError, match="planned but its marker exists"):
+        load_registry(registry, tmp_path)
+
+
+def test_registry_requires_pitch_reference_for_planned_item(tmp_path: Path) -> None:
+    registry = _write_registry(tmp_path, status="planned")
+
+    with pytest.raises(RegistryError, match="pitch_refs is required"):
+        load_registry(registry, tmp_path)
+
+
+def test_registry_allows_active_item_without_pitch_reference(tmp_path: Path) -> None:
+    registry = _write_registry(tmp_path)
+
+    assert load_registry(registry, tmp_path)[0].pitch_refs == ()
+
+
+@pytest.mark.parametrize(
+    ("pitch_refs", "message"),
+    [
+        ((), "must be a non-empty array"),
+        (("docs/spec/not-a-pitch.md",), "must be .md files under docs/pitch/"),
+        (("docs/pitch/not-a-pitch.txt",), "must be .md files under docs/pitch/"),
+        (("docs/pitch/example.md", "docs/pitch/example.md"), "must not contain duplicate"),
+    ],
+)
+def test_registry_rejects_invalid_pitch_references(
+    tmp_path: Path,
+    pitch_refs: tuple[str, ...],
+    message: str,
+) -> None:
+    registry = _write_registry(tmp_path, pitch_refs=pitch_refs)
+
+    with pytest.raises(RegistryError, match=message):
+        load_registry(registry, tmp_path)
+
+
+def test_registry_rejects_missing_local_pitch_reference(tmp_path: Path) -> None:
+    pitch_ref = "docs/pitch/example.md"
+    registry = _write_registry(tmp_path, status="planned", pitch_refs=(pitch_ref,))
+    (tmp_path / pitch_ref).unlink()
+
+    with pytest.raises(RegistryError, match="pitch_refs path does not exist"):
         load_registry(registry, tmp_path)
 
 
@@ -229,6 +284,11 @@ def test_repository_registry_is_valid() -> None:
         "QQTOOLS-COMPAT-" + "0001",
         "QQTOOLS-COMPAT-" + "0002",
     } <= {item.item_id for item in items}
+    use_context_item = next(item for item in items if item.item_id == "QQTOOLS-COMPAT-0002")
+    assert use_context_item.pitch_refs == (
+        Path("docs/pitch/qexp-use-project-context.md"),
+        Path("docs/pitch/qexp-compatibility-sunset.md"),
+    )
 
 
 def test_planned_future_item_passes_an_earlier_release(tmp_path: Path) -> None:
@@ -238,6 +298,7 @@ def test_planned_future_item_passes_an_earlier_release(tmp_path: Path) -> None:
         introduced_in="3.0.0",
         legacy_removed_in="4.0.0",
         transition_purged_in="5.0.0",
+        pitch_refs=("docs/pitch/example.md",),
     )
     item = load_registry(registry, tmp_path)[0]
 

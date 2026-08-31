@@ -8,7 +8,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.commands.task import submit as submit_task
-from qqtools.plugins.qexp.layout import load_context, save_context
+from qqtools.plugins.qexp.layout import load_context
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.observer import inspect_task
 from qqtools.plugins.qexp.runtime.paths import group_path, submission_path
@@ -281,7 +281,16 @@ def test_saved_machine_and_legacy_runtime_do_not_override_verified_context(
     shared_root, runtime = _setup_project(tmp_path)
     context_path = tmp_path / "saved-context.json"
     monkeypatch.setattr("qqtools.plugins.qexp.layout._CONTEXT_PATH", context_path)
-    save_context(str(shared_root), "g4", str(tmp_path / "wrong-runtime"))
+    context_path.write_text(
+        json.dumps(
+            {
+                "shared_root": str(shared_root),
+                "machine": "g4",
+                "runtime_root": str(tmp_path / "wrong-runtime"),
+            }
+        ),
+        encoding="utf-8",
+    )
 
     assert main(
         [

@@ -7,7 +7,7 @@ from qqtools.plugins.qexp import AGENT_MODE_DAEMON, init_shared_root, submit
 from qqtools.plugins.qexp.agent import get_agent_status
 from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.commands.group import create_group
-from qqtools.plugins.qexp.layout import load_root_config, runtime_pid_path
+from qqtools.plugins.qexp.layout import load_context, load_root_config, runtime_pid_path
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, expire_claim, fail_attempt
@@ -230,9 +230,104 @@ def test_use_still_fails_when_context_save_fails(tmp_path: Path, monkeypatch):
 
     with pytest.raises(OSError, match="Read-only file system"):
         main([
-            "use", "--shared-root", str(tmp_path / ".qexp"), "--machine", "gpu-1", "--runtime-root",
-            str(tmp_path / "rt")
+            "use", "--shared-root", str(tmp_path / ".qexp")
         ])
+
+
+def test_use_saves_only_a_stable_shared_root_and_show_has_a_fixed_contract(
+        tmp_path: Path, monkeypatch, capsys) -> None:
+    context_path = tmp_path / "context.json"
+    monkeypatch.setattr("qqtools.plugins.qexp.layout._CONTEXT_PATH", context_path)
+    project = tmp_path / "project" / ".qexp"
+    other_directory = tmp_path / "other"
+    other_directory.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["use", "--shared-root", "project/.qexp"]) == 0
+    assert json.loads(context_path.read_text(encoding="utf-8")) == {"shared_root": str(project)}
+
+    monkeypatch.chdir(other_directory)
+    assert main(["use", "--show", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"shared_root": str(project)}
+    assert load_context() == {"shared_root": str(project)}
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        lambda root: ["--machine", "gpu-1", "use", "--shared-root", str(root)],
+        lambda root: [
+            "use", "--shared-root", str(root), "--machine", "gpu-1", "--runtime-root", "/legacy"
+        ],
+    ],
+)
+def test_use_accepts_deprecated_identity_flags_only_during_n(
+        tmp_path: Path, monkeypatch, capsys, args) -> None:
+    context_path = tmp_path / "context.json"
+    monkeypatch.setattr("qqtools.plugins.qexp.layout._CONTEXT_PATH", context_path)
+    root = tmp_path / "project" / ".qexp"
+
+    assert main(args(root)) == 0
+    assert "QQTOOLS-COMPAT-0002" in capsys.readouterr().err
+    assert json.loads(context_path.read_text(encoding="utf-8")) == {"shared_root": str(root)}
+
+
+def test_use_mode_conflicts_and_malformed_context_fail_without_rewriting(
+        tmp_path: Path, monkeypatch, capsys) -> None:
+    context_path = tmp_path / "context.json"
+    monkeypatch.setattr("qqtools.plugins.qexp.layout._CONTEXT_PATH", context_path)
+    context_path.write_text("[]", encoding="utf-8")
+
+    assert main(["use", "--show"]) == 2
+    assert "Expected JSON object" in capsys.readouterr().err
+    assert main(["use", "--shared-root", str(tmp_path / ".qexp"), "--show"]) == 2
+    assert "exactly one" in capsys.readouterr().err
+    assert main(["use", "--clear", "--machine", "gpu-1"]) == 2
+    assert "cannot be combined" in capsys.readouterr().err
+    assert context_path.read_text(encoding="utf-8") == "[]"
+
+
+def test_use_clear_is_idempotent_and_empty_show_is_explicit(
+        tmp_path: Path, monkeypatch, capsys) -> None:
+    context_path = tmp_path / "context.json"
+    monkeypatch.setattr("qqtools.plugins.qexp.layout._CONTEXT_PATH", context_path)
+
+    assert main(["use", "--clear"]) == 0
+    assert main(["use", "--show"]) == 0
+    assert capsys.readouterr().out == "shared_root: <not set>\n"
+
+
+def test_unbound_context_allows_reads_but_mutations_explain_join_and_recovery(
+        tmp_path: Path, monkeypatch, capsys) -> None:
+    context_path = tmp_path / "context.json"
+    monkeypatch.setattr("qqtools.plugins.qexp.layout._CONTEXT_PATH", context_path)
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    assert main(["use", "--shared-root", str(cfg.shared_root)]) == 0
+
+    assert main(["task", "list", "--format=json"]) == 0
+    assert main(["submit", "--no-activate", "--", "echo", "blocked"]) == 2
+    error = capsys.readouterr().err
+    assert "qexp init" in error
+    assert "qexp agent add-project" in error
+    assert not list((cfg.shared_root / "tasks").glob("*.json"))
+
+
+def test_agent_add_project_uses_legacy_context_only_as_a_warned_n_fallback(
+        tmp_path: Path, monkeypatch, capsys) -> None:
+    context_path = tmp_path / "context.json"
+    monkeypatch.setattr("qqtools.plugins.qexp.layout._CONTEXT_PATH", context_path)
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    context_path.write_text(
+        json.dumps({"shared_root": str(cfg.shared_root), "machine": "gpu-1"}), encoding="utf-8"
+    )
+    runtime_root = tmp_path / "machine-runtime"
+
+    assert main(
+        ["--machine-runtime-root", str(runtime_root), "agent", "add-project", "--format=json"]
+    ) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["action"] == "project_added"
+    assert "QQTOOLS-COMPAT-0002" in captured.err
 
 
 def test_agent_start_starts_the_registered_global_agent(tmp_path: Path, monkeypatch, capsys):

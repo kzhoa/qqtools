@@ -125,7 +125,10 @@ qexp submit --name demo3 -- python train.py -c config3.yaml
 # 3 tasks will be queued and run sequentially
 ```
 
-After `init`, `qexp` saves the current `shared_root` and `machine` as CLI context, so you usually do not need to repeat them on every command.
+After `init`, `qexp` saves the canonical `shared_root` as this user's default project. Use
+`qexp use --shared-root <project/.qexp>` to switch that default; it neither joins a machine nor
+registers the project. Joining a machine remains `qexp init --shared-root <project/.qexp>
+--machine <local-machine>`.
 
 Each qexp Machine has one global `qexp agent` process. `qexp init` registers a normal new project
 with it; a project created by an older qexp release uses the one-time `qexp agent migrate-project`.
