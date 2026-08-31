@@ -287,13 +287,7 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
             ),
         )
     if kind == "context":
-        return _details(
-            (
-                ("Shared root", result.get("shared_root")),
-                ("Machine", result.get("machine")),
-                ("Runtime root", result.get("runtime_root")),
-            )
-        )
+        return f"shared_root: {result.get('shared_root') or '<not set>'}"
     if kind in {"doctor", "clean", "notifications", "lease-policy"}:
         action = result.get("action", kind)
         status = result.get("status", result.get("state", "completed"))

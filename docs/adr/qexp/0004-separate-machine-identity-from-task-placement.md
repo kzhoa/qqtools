@@ -1,7 +1,7 @@
 ---
 doc_type: adr
 status: active
-updated_at: 2026-08-30
+updated_at: 2026-08-31
 archived_at:
 ---
 
@@ -48,9 +48,10 @@ identity.
 `--no-activate` suppresses the request to start the local agent only. It does not bypass project
 binding resolution or machine-identity validation.
 
-`--machine` remains the identity-establishment or context-selection term for commands such as
-`init`, `migrate`, and `use`. During compatibility, an explicitly supplied global `--machine` on
-an operational command is an identity assertion:
+`--machine` remains the identity-establishment term for commands such as `init` and `migrate`.
+`qexp use` selects only a local default shared root; during 1.3.13 it accepts machine/runtime
+inputs only as warned compatibility no-ops (`QQTOOLS-COMPAT-0002`). During compatibility, an
+explicitly supplied global `--machine` on an operational command is an identity assertion:
 
 - if it equals the machine name derived from the local binding, the command may continue;
 - if it differs, the command fails before mutation and directs the user to `--home-machine` when

@@ -79,6 +79,41 @@ def _shared_root_input(args: argparse.Namespace) -> tuple[str | None, dict | Non
     return shared, context
 
 
+def _legacy_context_value(context: dict | None, field: str) -> str | None:
+    """Read one N-release recovery input from a legacy local context."""
+    value = (context or {}).get(field)
+    return value if isinstance(value, str) and value else None
+
+
+def _warn_legacy_context_fallback(field: str) -> None:
+    print(
+        "qexp: saved context "
+        f"{field} is deprecated and used only for agent recovery/migration. "
+        "QQTOOLS-COMPAT-0002",
+        file=sys.stderr,
+    )
+
+
+def _warn_deprecated_use_flags(args: argparse.Namespace) -> None:
+    names = [
+        name
+        for value, name in (
+            (args.machine, "--machine"),
+            (args.runtime_root, "--runtime-root"),
+            (args.use_machine, "--machine"),
+            (args.use_runtime_root, "--runtime-root"),
+        )
+        if value is not None
+    ]
+    if names:
+        print(
+            "qexp: "
+            f"{', '.join(dict.fromkeys(names))} is deprecated for 'qexp use' and ignored; "
+            "use only --shared-root. QQTOOLS-COMPAT-0002",
+            file=sys.stderr,
+        )
+
+
 def _requires_verified_binding(args: argparse.Namespace) -> bool:
     """Classify commands that can create or change project-owned state."""
     if args.command in {"submit", "batch-submit", "clean"}:
@@ -109,7 +144,16 @@ def _resolve_cfg(
     machine_runtime = MachineRuntime(getattr(args, "machine_runtime_root", None))
 
     if require_binding:
-        execution_context = machine_runtime.verified_execution_context(shared)
+        try:
+            execution_context = machine_runtime.verified_execution_context(shared)
+        except ValueError as exc:
+            if str(exc).startswith("no local project binding exists"):
+                raise ValueError(
+                    f"{exc} To join this machine for the first time, run 'qexp init'; "
+                    "to restore a missing current-generation binding, run "
+                    "'qexp agent add-project'."
+                ) from exc
+            raise
         verified_machine = execution_context.cfg.machine_name
         if assertion is not None and assertion != verified_machine:
             raise ValueError(
@@ -137,12 +181,18 @@ def _resolve_cfg(
     # never used as an authority source because this branch is not used for mutations.
     legacy_machine = assertion
     if args.command == "agent" and args.agent_action in {"add-project", "migrate-project"}:
-        legacy_machine = legacy_machine or (saved_context or {}).get("machine")
+        if legacy_machine is None:
+            legacy_machine = _legacy_context_value(saved_context, "machine")
+            if legacy_machine is not None:
+                _warn_legacy_context_fallback("machine")
     machine = legacy_machine or "unbound"
     runtime = None
     if args.command == "agent" and args.agent_action == "migrate-project":
         runtime = getattr(args, "runtime_root", None) or os.environ.get("QEXP_RUNTIME_ROOT")
-        runtime = runtime or (saved_context or {}).get("runtime_root")
+        if runtime is None:
+            runtime = _legacy_context_value(saved_context, "runtime_root")
+            if runtime is not None:
+                _warn_legacy_context_fallback("runtime_root")
     cfg = load_root_config(shared, machine, runtime, require_initialized=True)
     return cfg, ExecutionContext(cfg, machine_runtime)
 
@@ -359,7 +409,7 @@ def build_parser() -> argparse.ArgumentParser:
         "use",
         help="Save local CLI context without initializing or registering a project.",
         description=(
-            "Save local default CLI context for an existing shared root and machine name. "
+            "Save the local default shared root without validating it. "
             "This command does not initialize a shared root, create a Project machine record, "
             "or register the project with the local machine agent."
         ),
@@ -368,10 +418,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--shared-root", dest="use_shared_root", help="Shared project control root to save."
     )
     use.add_argument(
-        "--machine", dest="use_machine", help="Local machine name to save as context."
+        "--machine",
+        dest="use_machine",
+        help="Deprecated compatibility input; ignored. QQTOOLS-COMPAT-0002",
     )
     use.add_argument(
-        "--runtime-root", dest="use_runtime_root", help="Legacy runtime root to save."
+        "--runtime-root",
+        dest="use_runtime_root",
+        help="Deprecated compatibility input; ignored. QQTOOLS-COMPAT-0002",
     )
     use.add_argument("--show", action="store_true")
     use.add_argument("--clear", action="store_true")
@@ -420,9 +474,9 @@ def _split_machine_list(values: list[str] | None) -> list[str] | None:
     return machines
 
 
-def _try_save_context(shared_root: str, machine: str, runtime_root: str | None) -> None:
+def _try_save_context(shared_root: str) -> None:
     try:
-        save_context(shared_root, machine, runtime_root)
+        save_context(shared_root)
     except OSError as exc:
         print(
             "qexp: initialized successfully, but failed to save CLI context "
@@ -450,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
                     "qexp project initialized but was not registered with the machine agent; "
                     f"resolve the registration error and run 'qexp agent add-project': {exc}"
                 ) from exc
-            _try_save_context(str(cfg.shared_root), cfg.machine_name, str(cfg.runtime_root))
+            _try_save_context(str(cfg.shared_root))
             print(cfg.shared_root)
             return 0
         if args.command == "migrate":
@@ -464,17 +518,31 @@ def main(argv: list[str] | None = None) -> int:
             print(root)
             return 0
         if args.command == "use":
+            is_selecting = args.use_shared_root is not None
+            if sum((is_selecting, args.show, args.clear)) != 1:
+                raise ValueError("use requires exactly one of --shared-root, --show, or --clear.")
+            if (args.show or args.clear) and any(
+                value is not None
+                for value in (args.machine, args.runtime_root, args.use_machine, args.use_runtime_root)
+            ):
+                raise ValueError("deprecated use flags cannot be combined with --show or --clear.")
             if args.clear:
                 clear_context()
                 return 0
             if args.show:
-                _emit("context", load_context() or {}, args.format or "human")
+                context = load_context()
+                _emit(
+                    "context",
+                    {"shared_root": context["shared_root"] if context else None},
+                    args.format or "human",
+                )
                 return 0
             if args.format:
                 raise ValueError("--format requires --show.")
-            if not args.use_shared_root or not args.use_machine:
-                raise ValueError("use requires --shared-root and --machine.")
-            save_context(args.use_shared_root, args.use_machine, args.use_runtime_root)
+            if not args.use_shared_root:
+                raise ValueError("use requires a non-empty --shared-root.")
+            _warn_deprecated_use_flags(args)
+            save_context(args.use_shared_root)
             return 0
         if args.command == "agent" and args.agent_action in {
             "status", "list-projects", "disable-project", "remove-project", "stop", "restart"

@@ -192,6 +192,11 @@ binding supplies the submitting machine and the `MachineRuntime` project-local r
 saved-context machine/runtime fields, `--runtime-root`, and identity assertions cannot replace
 those values. Read-only project commands may observe shared truth without a local binding.
 
+The local CLI context is only a canonical `shared_root` locator. Existing context files may retain
+legacy machine/runtime fields during the 1.3.13 `QQTOOLS-COMPAT-0002` window, but only
+`agent add-project` and `agent migrate-project` may use them as warned recovery inputs when no
+binding exists. They never select ordinary execution or reservation authority.
+
 `MachineRuntime` owns the registry, scheduler and registry locks, one unified GPU reservation
 set, global-agent PID/status, round-robin cursor, and project-ID-partitioned local process,
 launch, observation, termination, and recovery records. It does not own or duplicate Task,

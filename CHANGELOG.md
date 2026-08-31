@@ -4,7 +4,10 @@
 
 - chore: add a project-wide compatibility registry and make the explicit target-version local
   release preflight enforce due compatibility transitions before regression and build work; keep
-  the registry bounded to unfinished items while release tags audit retirement and ID continuity.
+  the registry bounded to unfinished items while release tags audit retirement and ID continuity;
+  require local implementation-pitch references for deferred compatibility work.
+- feat: make `qexp use` a canonical default-project selector, keeping machine identity binding-owned
+  while temporarily warning for legacy context and CLI recovery inputs.
 - feat: add qexp Group primary/borrow Worker roles, optional per-machine borrow GPU limits, and
   machine-agent admission that preserves primary demand before launching new borrowed work.
 - docs: archive the completed qexp Group primary/borrow resource-pool pitch.

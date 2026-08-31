@@ -418,14 +418,24 @@ def load_root_config(shared_root: str | Path, machine_name: str, runtime_root: s
 _CONTEXT_PATH = Path.home() / ".qqtools" / "qexp-context.json"
 
 
-def save_context(shared_root: str, machine: str, runtime_root: str | None = None) -> Path:
+def save_context(shared_root: str | Path) -> Path:
+    """Save the canonical local default-project locator."""
     _CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    atomic_replace(_CONTEXT_PATH, {"shared_root": shared_root, "machine": machine, "runtime_root": runtime_root})
+    root = Path(shared_root).expanduser().resolve()
+    atomic_replace(_CONTEXT_PATH, {"shared_root": str(root)})
     return _CONTEXT_PATH
 
 
 def load_context() -> dict[str, Any] | None:
-    return read_json(_CONTEXT_PATH) if _CONTEXT_PATH.exists() else None
+    if not _CONTEXT_PATH.exists():
+        return None
+    context = read_json(_CONTEXT_PATH)
+    if not isinstance(context, dict):
+        raise ValueError("qexp CLI context must be an object.")
+    shared_root = context.get("shared_root")
+    if not isinstance(shared_root, str) or not shared_root:
+        raise ValueError("qexp CLI context shared_root must be a non-empty string.")
+    return context
 
 
 def clear_context() -> bool:

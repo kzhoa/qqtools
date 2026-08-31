@@ -51,6 +51,24 @@ def _assert_current_project_is_registered(
     assert any(project["shared_root"] == str(shared_root) for project in projects)
 
 
+# QQTOOLS-COMPAT-0002: N release CLI-context boundary.
+def test_use_writes_only_a_default_project_locator_during_n(tmp_path: Path) -> None:
+    base = tmp_path / "use-context"
+    shared_root = base / "project" / ".qexp"
+    env = make_env(base)
+
+    selected = run(
+        ["qexp", "--machine", "gpu-1", "use", "--shared-root", str(shared_root)], env=env
+    )
+    assert "QQTOOLS-COMPAT-0002" in selected.stderr
+    assert json.loads((base / "home" / ".qqtools" / "qexp-context.json").read_text()) == {
+        "shared_root": str(shared_root)
+    }
+
+    shown = run(["qexp", "use", "--show", "--format=json"], env=env)
+    assert json.loads(shown.stdout) == {"shared_root": str(shared_root)}
+
+
 # Protected compatibility test: New project workflow
 def test_new_project_activation_uses_registered_binding_without_add_project(tmp_path: Path) -> None:
     base = tmp_path / "protected-new-project-activation"

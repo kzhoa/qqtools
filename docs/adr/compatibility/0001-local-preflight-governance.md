@@ -28,6 +28,11 @@ premature deletion, remaining markers, `next_id` rollback, and reuse of retired 
 predate the registry form an explicit bootstrap boundary. Git history, release tags, and the
 CHANGELOG retain completed history.
 
+Planned items also carry one or more local `pitch_refs` so later agents can find their deferred
+implementation requirements. These references are limited to existing Markdown files under
+`docs/pitch/`, are not required to be Git-tracked, and are removed with the registry item. They are
+implementation navigation only; tracked `decision_refs` remain the formal behavior authority.
+
 The only hard compatibility gate is the local command:
 
 ```bash
@@ -52,6 +57,9 @@ review, and retire compatibility items, but it is ignored by Git and is not an a
   the repository's trusted local-publish model.
 - Registry and checker changes are tracked and reviewable even though local Codex instructions and
   active pitch documents are not.
+- A fresh clone without the local pitch set cannot pass registry validation or release preflight
+  for an item that references those pitches. This is accepted within the trusted local-publish
+  model.
 - Deadline extensions require an append-only decision record rather than silently changing the
   original release targets.
 

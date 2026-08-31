@@ -52,6 +52,10 @@ Every unfinished `[[items]]` entry contains:
 - lifecycle `status` and the three release versions;
 - tracked or non-ignored `decision_refs` and `verification` files; the clean committed preflight
   guarantees they are tracked before release;
+- `pitch_refs` when a planned item needs later implementation. Planned items require at least one
+  local pitch reference; active and legacy-removed items may omit it. References must be unique,
+  repository-relative `.md` files under `docs/pitch/` and must exist locally, but are deliberately
+  not required to be Git-tracked;
 - optional append-only `extensions` for approved deadline changes.
 
 An extension names `legacy_removed_in` or `transition_purged_in`, chains from the previous effective
@@ -61,6 +65,12 @@ Original deadlines are not overwritten.
 Temporary implementation and behavior fixtures carry their compatibility ID. The checker scans
 tracked and non-ignored files under `src/`, `tests/`, and `scripts/`. Planned items must have no
 marker; active and legacy-removed items must retain at least one marker.
+
+`pitch_refs` are implementation navigation, not behavior authority: `decision_refs` remain the
+formal specification and ADR basis. A pitch archive or rename must update any live reference. On
+registry removal, its pitch references disappear with the item. Because pitches are intentionally
+Git-ignored, a new clone without the local pitch set fails registry validation and local preflight;
+this is an accepted consequence of the trusted local-publish workflow.
 
 Completed items are not a registry state and are not retained indefinitely. At release check time,
 the checker reads the registry from the exact `v<current source version>` tag. An item may disappear

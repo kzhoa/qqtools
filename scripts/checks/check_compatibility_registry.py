@@ -15,6 +15,7 @@ from typing import Any, Iterable
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REGISTRY = Path("docs/spec/compatibility-registry.toml")
 DEFAULT_VERSION_PATH = Path("src/qqtools/version.py")
+PITCH_ROOT = Path("docs/pitch")
 MARKER_ROOTS = (Path("src"), Path("tests"), Path("scripts"))
 ID_PATTERN = re.compile(r"QQTOOLS-COMPAT-[0-9]{4}")
 VERSION_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
@@ -40,6 +41,7 @@ ITEM_FIELDS = {
     "marker",
     "owner",
     "decision_refs",
+    "pitch_refs",
     "verification",
     "extensions",
 }
@@ -78,6 +80,7 @@ class CompatibilityItem:
     marker: str
     owner: str
     decision_refs: tuple[Path, ...]
+    pitch_refs: tuple[Path, ...]
     verification: tuple[Path, ...]
 
     def expected_status(self, target: Version) -> str | None:
@@ -127,6 +130,21 @@ def _require_paths(value: object, field: str) -> tuple[Path, ...]:
             raise RegistryError(f"{field}[{index}] must be a repository-relative path.")
         paths.append(path)
     return tuple(paths)
+
+
+def _require_pitch_refs(value: object, field: str, *, is_required: bool) -> tuple[Path, ...]:
+    """Validate local pitch references without requiring Git tracking."""
+    if value is None:
+        if is_required:
+            raise RegistryError(f"{field} is required while the item is planned.")
+        return ()
+    paths = _require_paths(value, field)
+    if len(paths) != len(set(paths)):
+        raise RegistryError(f"{field} must not contain duplicate paths.")
+    for path in paths:
+        if not path.is_relative_to(PITCH_ROOT) or path.suffix != ".md":
+            raise RegistryError(f"{field} entries must be .md files under {PITCH_ROOT}/.")
+    return paths
 
 
 def _is_tracked_candidate(repo_root: Path, path: Path) -> bool:
@@ -260,6 +278,11 @@ def _parse_item(
         raise RegistryError(f"{item_id}.marker must equal its compatibility ID.")
     owner = _require_string(raw_item.get("owner"), f"{item_id}.owner")
     decision_refs = _require_paths(raw_item.get("decision_refs"), f"{item_id}.decision_refs")
+    pitch_refs = _require_pitch_refs(
+        raw_item.get("pitch_refs"),
+        f"{item_id}.pitch_refs",
+        is_required=status == "planned",
+    )
     verification = _require_paths(raw_item.get("verification"), f"{item_id}.verification")
     if validate_references:
         _validate_reference_paths(
@@ -274,6 +297,12 @@ def _parse_item(
             f"{item_id}.verification",
             require_tracked=require_tracked,
         )
+        _validate_reference_paths(
+            repo_root,
+            pitch_refs,
+            f"{item_id}.pitch_refs",
+            require_tracked=False,
+        )
     return CompatibilityItem(
         item_id=item_id,
         component=component,
@@ -285,6 +314,7 @@ def _parse_item(
         marker=marker,
         owner=owner,
         decision_refs=decision_refs,
+        pitch_refs=pitch_refs,
         verification=verification,
     )
 
