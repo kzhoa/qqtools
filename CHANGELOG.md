@@ -1,6 +1,6 @@
 # History
 
-## Unreleased
+## v1.3.13
 
 - test: run installed-wheel E2E only for the exact tagged release artifact; retain its JUnit report
   and temporary runtime evidence for seven days when it fails.

@@ -109,6 +109,7 @@ jobs:
           wheels=(dist/*.whl)
           test "${#wheels[@]}" -eq 1
           tox run -e release-e2e --installpkg "${wheels[0]}" -- \
+            tests/e2e/qexp -q \
             --junitxml=test-results/release-e2e.xml \
             --tb=long
 
