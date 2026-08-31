@@ -288,6 +288,7 @@ def normalize_worker_member(worker: dict[str, Any], *, machine: str = "worker") 
         raise ValueError(f"{machine!r} Worker scheduling_role is invalid.")
     if state not in {"active", "borrow", "draining", "removing"}:
         raise ValueError(f"{machine!r} Worker state is invalid.")
+    # QQTOOLS-COMPAT-0004: N reads the former field; N+1 keeps it only in the upgrader.
     has_legacy_limit = "borrow_limit_gpus" in worker
     legacy_limit = worker.pop("borrow_limit_gpus", None)
     limit = validate_gpu_limit(worker.get("gpu_limit_gpus"), f"{machine}.gpu_limit_gpus")

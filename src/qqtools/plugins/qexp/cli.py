@@ -311,7 +311,14 @@ def build_parser() -> argparse.ArgumentParser:
             action.add_argument("worker_machine")
         if name in {"add", "set"}:
             action.add_argument("--role", choices=("primary", "borrow"))
-            action.add_argument("--gpu-limit-gpus", type=_gpu_limit_gpus)
+            gpu_limit = action.add_mutually_exclusive_group()
+            gpu_limit.add_argument("--gpu-limit-gpus", type=_gpu_limit_gpus)
+            gpu_limit.add_argument(
+                "--max-gpus",
+                dest="gpu_limit_gpus",
+                type=_gpu_limit_gpus,
+                help="Deprecated compatibility alias for --gpu-limit-gpus. QQTOOLS-COMPAT-0003",
+            )
         if name == "remove":
             action.add_argument("--terminate-running", action="store_true")
     agent = commands.add_parser("agent")

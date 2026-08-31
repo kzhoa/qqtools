@@ -114,6 +114,7 @@ def _worker_additions(
             raise ValueError(f"worker_set.{machine} must be a mapping.")
         role = declaration.get("scheduling_role", "primary")
         has_gpu_limit = "gpu_limit_gpus" in declaration
+        # QQTOOLS-COMPAT-0004: Preserve N retries carrying a pre-unification Worker declaration.
         has_legacy_limit = "borrow_limit_gpus" in declaration
         limit = declaration.get("gpu_limit_gpus")
         legacy_limit = declaration.get("borrow_limit_gpus")

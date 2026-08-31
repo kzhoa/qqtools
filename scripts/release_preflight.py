@@ -2,6 +2,7 @@
 """Validate a committed release candidate before creating a release commit."""
 from __future__ import annotations
 
+import argparse
 import ast
 import os
 import subprocess
@@ -9,8 +10,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+try:
+    from scripts.checks.check_compatibility_registry import RegistryError, Version
+except ModuleNotFoundError:  # Direct script execution adds scripts/ rather than the repo root.
+    from checks.check_compatibility_registry import RegistryError, Version
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+VERSION_PATH = REPO_ROOT / "src" / "qqtools" / "version.py"
 
 
 def _imported_names(module: ast.Module) -> set[str]:
@@ -139,6 +146,36 @@ def _require_clean_head() -> None:
         raise RuntimeError("Release preflight requires a clean, committed worktree.")
 
 
+def _current_version() -> Version:
+    module = ast.parse(VERSION_PATH.read_text(encoding="utf-8"), filename=str(VERSION_PATH))
+    for node in module.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id == "__version__":
+            value = ast.literal_eval(node.value)
+            return Version.parse(value, "src/qqtools/version.py::__version__")
+    raise RuntimeError("Could not resolve __version__ from src/qqtools/version.py.")
+
+
+def _check_target_version(target: Version) -> None:
+    current = _current_version()
+    if target <= current:
+        raise RuntimeError(
+            f"Release target {target} must be later than current source version {current}."
+        )
+
+
+def _check_compatibility(target: Version) -> None:
+    _run(
+        sys.executable,
+        "scripts/checks/check_compatibility_registry.py",
+        "check",
+        "--release-version",
+        str(target),
+    )
+
+
 def _build_artifacts(output_dir: Path, *, env: dict[str, str]) -> Path:
     _run(
         sys.executable,
@@ -167,8 +204,22 @@ def _release_env() -> dict[str, str]:
     return env
 
 
-def main() -> int:
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target-version", required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        target = Version.parse(args.target_version, "--target-version")
+    except RegistryError as exc:
+        parser.error(str(exc))
     _require_clean_head()
+    _check_target_version(target)
+    _check_compatibility(target)
     _check_lazy_export_stubs()
     release_env = _release_env()
     _run("tox", "run", "-e", "qexp-full", env=release_env)
@@ -183,7 +234,7 @@ def main() -> int:
             str(wheel),
             env=release_env,
         )
-    print("Release preflight passed.")
+    print(f"Release preflight passed for {target}.")
     return 0
 
 

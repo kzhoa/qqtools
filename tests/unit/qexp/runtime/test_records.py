@@ -34,6 +34,7 @@ def test_legacy_group_worker_defaults_to_primary():
 
 
 def test_legacy_borrow_limit_is_normalized_to_gpu_limit():
+    """QQTOOLS-COMPAT-0004: N reads legacy Group truth into the canonical field."""
     group = {"group": {"worker_set": {"gpu-1": {"borrow_limit_gpus": 2}}}}
 
     normalize_group_record(group)
