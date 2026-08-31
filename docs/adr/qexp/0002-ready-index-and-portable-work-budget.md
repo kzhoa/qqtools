@@ -1,11 +1,14 @@
 ---
 doc_type: adr
-status: active
-updated_at: 2026-08-29
+adr_id: ADR-QEXP-0002
+status: accepted
+updated_at: 2026-08-31
 archived_at:
+supersedes: []
+superseded_by:
 ---
 
-# Ready Index and Portable Work Budget
+# ADR-QEXP-0002: Ready Index and Portable Work Budget
 
 ## Context
 
@@ -113,9 +116,9 @@ Attempt named by an active reservation; machine-agent recovery never discovers `
 scanning the Task directory.
 
 At the time of this decision, cross-host use required the deployment-specific, two-host
-qualification contract in [0001-shared-filesystem-coordination.md](0001-shared-filesystem-coordination.md).
+qualification contract in [ADR-QEXP-0001](0001-shared-filesystem-coordination.md).
 That requirement was superseded by
-[0003-remove-filesystem-qualification-gate.md](0003-remove-filesystem-qualification-gate.md).
+[ADR-QEXP-0003](0003-remove-filesystem-qualification-gate.md).
 
 ## Consequences
 

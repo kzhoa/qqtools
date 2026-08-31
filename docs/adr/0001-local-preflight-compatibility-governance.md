@@ -1,11 +1,18 @@
 ---
 doc_type: adr
-status: active
+adr_id: ADR-0001
+status: accepted
 updated_at: 2026-08-31
 archived_at:
+supersedes: []
+superseded_by:
 ---
 
-# Govern Compatibility Through the Local Release Preflight
+# ADR-0001: Govern Compatibility Through the Local Release Preflight
+
+Governance migration: this decision previously lived at
+`docs/adr/compatibility/0001-local-preflight-governance.md` before repository-wide decisions were
+normalized into the root ADR namespace.
 
 ## Context
 

@@ -1,11 +1,14 @@
 ---
 doc_type: adr
-status: active
+adr_id: ADR-QEXP-0004
+status: accepted
 updated_at: 2026-08-31
 archived_at:
+supersedes: []
+superseded_by:
 ---
 
-# Separate Machine Identity from Task Placement
+# ADR-QEXP-0004: Separate Machine Identity from Task Placement
 
 ## Context
 

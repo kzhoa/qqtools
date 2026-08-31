@@ -1,11 +1,21 @@
 ---
 doc_type: adr
-status: active
-updated_at: 2026-08-29
+adr_id: ADR-QEXP-0001
+status: accepted
+updated_at: 2026-08-31
 archived_at:
+supersedes: []
+superseded_by:
 ---
 
-# Shared Filesystem Coordination
+# ADR-QEXP-0001: Shared Filesystem Coordination
+
+## Context
+
+qexp coordinates Task claims, launch authority, recovery, and shared records across machines without
+a central transaction coordinator. Its safety therefore depends on explicit filesystem
+serialization, record fencing, and conservative behavior when ownership or time evidence is
+uncertain.
 
 ## Decision
 
@@ -51,4 +61,10 @@ Attempt from starting. There is no boolean override for cross-machine dispatch.
 - A single-host development run can test probe judgment logic but cannot certify cross-host
   filesystem behavior.
 - Ready-index liveness, budgeting, and cutover decisions are recorded in
-  [0002-ready-index-and-portable-work-budget.md](0002-ready-index-and-portable-work-budget.md).
+  [ADR-QEXP-0002](0002-ready-index-and-portable-work-budget.md).
+
+## Later Decision
+
+The deployment qualification gate described here was removed by
+[ADR-QEXP-0003](0003-remove-filesystem-qualification-gate.md). The remaining locking, atomic-write,
+revision, and fencing decisions continue to apply.

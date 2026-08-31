@@ -1,4 +1,14 @@
-﻿# ADR-QPIPELINE-0002: Gradient Accumulation Uses Optimizer-Step Semantics
+---
+doc_type: adr
+adr_id: ADR-QPIPELINE-0002
+status: accepted
+updated_at: 2026-08-31
+archived_at:
+supersedes: []
+superseded_by:
+---
+
+# ADR-QPIPELINE-0002: Gradient Accumulation Uses Optimizer-Step Semantics
 
 - Status: Accepted
 - Date: 2026-03-14

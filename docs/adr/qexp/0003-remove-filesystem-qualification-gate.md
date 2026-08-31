@@ -1,11 +1,21 @@
 ---
 doc_type: adr
-status: active
-updated_at: 2026-08-29
+adr_id: ADR-QEXP-0003
+status: accepted
+updated_at: 2026-08-31
 archived_at:
+supersedes: []
+superseded_by:
 ---
 
-# Remove Filesystem Qualification Gate
+# ADR-QEXP-0003: Remove Filesystem Qualification Gate
+
+## Context
+
+qexp is a lightweight experiment queue. Requiring deployment-specific qualification evidence made
+ordinary multi-machine use depend on an additional stateful operational procedure. Existing shared
+record locking, atomic replacement, Task revision checks, claim fencing, and local GPU reservations
+remain the concurrency protections for normal operation.
 
 ## Decision
 
@@ -14,17 +24,11 @@ claim, authorize, or resume a cross-machine Attempt. Project initialization and 
 registration also ignore malformed or absent legacy records. The qualification probe APIs and their
 persisted record format are removed.
 
-## Rationale
-
-qexp is a lightweight experiment queue. Requiring deployment-specific qualification evidence made
-ordinary multi-machine use depend on an additional stateful operational procedure. Existing shared
-record locking, atomic replacement, Task revision checks, claim fencing, and local GPU reservations
-remain the concurrency protections for normal operation.
-
 ## Consequences
 
 - Stale qualification files have no effect on qexp scheduling and may be removed by operators.
 - qexp does not certify filesystem semantics before cross-machine use; operators remain responsible
   for choosing a shared filesystem compatible with qexp's documented coordination primitives.
 - The prior qualification decision is superseded where it made cross-machine execution conditional
-  on recorded evidence.
+  on recorded evidence; the remaining decisions in
+  [ADR-QEXP-0001](0001-shared-filesystem-coordination.md) continue to apply.

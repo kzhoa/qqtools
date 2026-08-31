@@ -1,4 +1,14 @@
-﻿# ADR-QPIPELINE-0001: Runner Boundary Ownership
+---
+doc_type: adr
+adr_id: ADR-QPIPELINE-0001
+status: accepted
+updated_at: 2026-08-31
+archived_at:
+supersedes: []
+superseded_by:
+---
+
+# ADR-QPIPELINE-0001: Runner Boundary Ownership
 
 - Status: Accepted
 - Date: 2026-04-21
