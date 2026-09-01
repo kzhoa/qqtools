@@ -14,9 +14,12 @@ def _case_directory_generator(nodeid: str, name: str) -> Generator[Path, None, N
     return conftest.tmp_path.__wrapped__(request)
 
 
-def test_test_tmp_base_prefers_usable_system_root(tmp_path: Path) -> None:
+def test_test_tmp_base_prefers_usable_system_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     system_root = tmp_path / "system-tmp"
     fallback_root = tmp_path / "repository-tmp"
+    monkeypatch.setattr(conftest, "_is_usable_temp_root", lambda root: root == system_root)
 
     selected = conftest._select_test_tmp_base(system_root, fallback_root)
 
@@ -24,10 +27,41 @@ def test_test_tmp_base_prefers_usable_system_root(tmp_path: Path) -> None:
     assert not fallback_root.exists()
 
 
-def test_test_tmp_base_falls_back_when_system_root_is_unusable(tmp_path: Path) -> None:
+def test_test_tmp_base_falls_back_when_system_root_is_unusable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     system_root = tmp_path / "system-tmp"
-    system_root.write_text("not a directory", encoding="utf-8")
     fallback_root = tmp_path / "repository-tmp"
+    monkeypatch.setattr(conftest, "_is_usable_temp_root", lambda root: root == fallback_root)
+
+    selected = conftest._select_test_tmp_base(system_root, fallback_root)
+
+    assert selected == fallback_root
+
+
+def test_test_tmp_base_falls_back_when_system_root_cannot_bind_unix_sockets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system_root = tmp_path / "system-tmp"
+    fallback_root = tmp_path / "repository-tmp"
+    original_socket = conftest.socket.socket
+
+    class SocketWithoutSystemRootAccess:
+        def __init__(self, *args, **kwargs) -> None:
+            self._socket = original_socket(*args, **kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            self._socket.close()
+
+        def bind(self, address: str) -> None:
+            if str(system_root) in address:
+                raise PermissionError("system root denies Unix sockets")
+            Path(address).touch()
+
+    monkeypatch.setattr(conftest.socket, "socket", SocketWithoutSystemRootAccess)
 
     selected = conftest._select_test_tmp_base(system_root, fallback_root)
 

@@ -29,6 +29,7 @@ def spawn_machine_agent_process(
 ) -> subprocess.Popen:
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     machine_runtime.ensure_layout()
+    startup_stderr = subprocess.PIPE if stderr is None else stderr
     process = subprocess.Popen(
         [
             sys.executable,
@@ -40,7 +41,7 @@ def spawn_machine_agent_process(
         env=os.environ.copy(),
         stdin=subprocess.DEVNULL if stdin is None else stdin,
         stdout=subprocess.DEVNULL if stdout is None else stdout,
-        stderr=subprocess.DEVNULL if stderr is None else stderr,
+        stderr=startup_stderr,
         start_new_session=True,
     )
     deadline = time.monotonic() + 5.0
@@ -55,7 +56,11 @@ def spawn_machine_agent_process(
                 return process
         exit_code = process.poll()
         if exit_code is not None:
-            raise RuntimeError(f"machine agent exited during startup with exit code {exit_code}.")
+            details = ""
+            if process.stderr is not None:
+                details = process.stderr.read().strip()
+            message = f"machine agent exited during startup with exit code {exit_code}."
+            raise RuntimeError(f"{message} {details}".strip())
         time.sleep(0.02)
     process.terminate()
     try:
