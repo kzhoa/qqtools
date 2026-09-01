@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from configparser import ConfigParser, Error as ConfigError
 from pathlib import Path
 
@@ -13,11 +14,11 @@ RETIRED_TOX_LANES = (
     "testenv:qexp-host-exclusive",
     "testenv:qexp-stress",
 )
-SOURCE_CI_COMMANDS = (
-    "tox run -e unit",
-    "tox run -e integration",
-    "tox run -e qexp",
-    "tox run -e preflight",
+SOURCE_TOX_LANES = frozenset(("unit", "integration", "qexp", "preflight"))
+TOX_ENVIRONMENT_PATTERN = re.compile(
+    r"(?:^|\s)(?:python(?:\d+(?:\.\d+)*)?\s+-m\s+)?tox(?:\s+run)?"
+    r"(?:\s+(?!--?e(?:\s|=|$))--?[A-Za-z][\w-]*(?:[= ][^\s]+)?)*\s+-e\s*=?\s*"
+    r"([A-Za-z0-9_.-]+(?:,[A-Za-z0-9_.-]+)*)"
 )
 
 
@@ -105,9 +106,13 @@ def _check_ci_boundaries(repo_root: Path) -> list[str]:
     errors: list[str] = []
     if "schedule:" in workflow:
         errors.append("ordinary CI may not define a schedule trigger")
-    for command in SOURCE_CI_COMMANDS:
-        if command in workflow:
-            errors.append(f"ordinary CI may not run source-test lane: {command}")
+    for match in TOX_ENVIRONMENT_PATTERN.finditer(workflow):
+        command = match.group(0).strip()
+        for environment in match.group(1).split(","):
+            if environment in SOURCE_TOX_LANES:
+                errors.append(
+                    f"ordinary CI may not run source-test lane: {command}"
+                )
     if "tox run -e artifact-e2e" not in workflow:
         errors.append("ordinary CI must run artifact-e2e")
     return errors
