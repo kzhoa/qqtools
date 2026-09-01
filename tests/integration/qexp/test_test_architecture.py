@@ -13,6 +13,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import offer
+from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from tests.qexp_test_support import TestResourceScope
 from tests.qexp_architecture import SingleHostMachineLab
@@ -189,6 +190,40 @@ def test_machine_lab_two_participants_produce_one_real_task_claim(tmp_path: Path
         assert len(claims) == 1
         assert isinstance(claims[0]["attempt_id"], str)
         assert claims[0]["fencing_token"] == 1
+    finally:
+        lab.close()
+
+
+@pytest.mark.machine_lab
+def test_machine_lab_cas_race_preserves_the_single_winning_value(tmp_path: Path) -> None:
+    lab = SingleHostMachineLab(tmp_path, "machine-lab-cas")
+    record = lab.shared_root / "cas-record.json"
+    atomic_replace(record, {"meta": {"revision": 0}, "value": "initial"})
+    first = lab.start("first")
+    second = lab.start("second")
+
+    def update(participant, value: str) -> dict[str, object]:
+        return participant.request(
+            "cas_update",
+            payload={"record_name": record.name, "expected_revision": 0, "value": value},
+        )
+
+    try:
+        assert first.request(
+            "read_revision", payload={"record_name": record.name}
+        ) == {"revision": 0}
+        assert second.request(
+            "read_revision", payload={"record_name": record.name}
+        ) == {"revision": 0}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(
+                executor.map(lambda item: update(*item), ((first, "first"), (second, "second")))
+            )
+
+        assert sorted(result["committed"] for result in results) == [False, True]
+        stored = read_json(record)
+        assert stored["meta"]["revision"] == 1
+        assert stored["value"] in {"first", "second"}
     finally:
         lab.close()
 

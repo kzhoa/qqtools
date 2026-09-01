@@ -935,6 +935,23 @@ for line in sys.stdin:
         )
         task = retry(cfg, message["task_id"])
         print(json.dumps({"state": task.state["projection"]}), flush=True)
+    elif command == "read_revision":
+        from qqtools.plugins.qexp.runtime.store import read_json
+        path = Path(os.environ["QEXP_TEST_SHARED_ROOT"]) / message["record_name"]
+        print(json.dumps({"revision": read_json(path)["meta"]["revision"]}), flush=True)
+    elif command == "cas_update":
+        from qqtools.plugins.qexp.runtime.locks import exclusive
+        from qqtools.plugins.qexp.runtime.store import CASConflict, cas_update, read_json
+        path = Path(os.environ["QEXP_TEST_SHARED_ROOT"]) / message["record_name"]
+        with exclusive(path.with_suffix(".lock")):
+            value = read_json(path)
+            value["value"] = message["value"]
+            try:
+                cas_update(path, message["expected_revision"], value)
+            except CASConflict:
+                print(json.dumps({"committed": False}), flush=True)
+            else:
+                print(json.dumps({"committed": True}), flush=True)
     elif command == "checkpoint":
         print(json.dumps({"checkpoint": "reached", "pid": os.getpid()}), flush=True)
         while True:

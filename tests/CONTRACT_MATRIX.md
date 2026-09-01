@@ -22,7 +22,7 @@ filesystem. They do not certify NFS, Lustre, or any other cross-host filesystem 
 | --- | --- | --- | --- | --- |
 | machine-local authority isolation | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_test_architecture.py](integration/qexp/test_test_architecture.py) | hermetic / explicit qexp-fast | qexp maintainers |
 | production host-wide scheduler authority | N/A | [test_test_architecture.py](integration/qexp/test_test_architecture.py) | host-exclusive / merge | qexp maintainers |
-| revisioned CAS conflict preservation | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | Pending | hermetic / qexp-fast | qexp maintainers |
+| revisioned CAS conflict preservation | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_test_architecture.py](integration/qexp/test_test_architecture.py) | machine-lab / merge | qexp maintainers |
 | protocol fault, explicit interleaving, and replay envelope | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | Pending | hermetic / qexp-fast | qexp maintainers |
 | expanded model seeds and protocol crash matrix | [test_architecture_stress.py](unit/qexp/test_architecture_stress.py) | N/A | nightly / qexp-stress | qexp maintainers |
 | reference claim, fencing, launch-authority, and trace replay invariants | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | Pending | hermetic / qexp-fast | qexp maintainers |
