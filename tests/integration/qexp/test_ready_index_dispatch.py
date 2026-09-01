@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from qqtools.plugins.qexp.runtime.ready import (
     next_ready_marker,
     peek_primary_ready_marker,
     rebuild_primary_ready_index,
+    write_ready_marker,
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.ready import bump_primary_ready_revision, ready_index_route_revision
@@ -620,6 +622,80 @@ def _activate_ready(cfg) -> None:
     value["ready_index"]["writer_capability"] = "ready-v1"
     atomic_replace(ready_state_path(cfg.shared_root), value)
     rebuild_primary_ready_index(cfg)
+
+
+def test_primary_rebuild_keeps_concurrently_published_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
+    )
+    task = submit(cfg, ["echo", "ready"], task_id="task-ready", working_dir=work)
+    _activate_ready(cfg)
+
+    scan_finished = threading.Event()
+    allow_rebuild = threading.Event()
+    writer_reached_sync = threading.Event()
+    writer_finished = threading.Event()
+    original_iter_json = __import__(
+        "qqtools.plugins.qexp.runtime.ready", fromlist=["iter_json"]
+    ).iter_json
+    original_sync = __import__(
+        "qqtools.plugins.qexp.runtime.ready", fromlist=["_sync_primary_candidate"]
+    )._sync_primary_candidate
+
+    def pause_after_task_scan(directory):
+        yield from original_iter_json(directory)
+        if Path(directory) == shared_paths(cfg.shared_root)["tasks"]:
+            scan_finished.set()
+            assert allow_rebuild.wait(timeout=5)
+
+    def record_writer_sync(*args, **kwargs):
+        writer_reached_sync.set()
+        return original_sync(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.runtime.ready.iter_json", pause_after_task_scan
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.runtime.ready._sync_primary_candidate", record_writer_sync
+    )
+    rebuild_thread = threading.Thread(target=rebuild_primary_ready_index, args=(cfg,))
+    rebuild_thread.start()
+    assert scan_finished.wait(timeout=5)
+
+    generation = task.ready_generation + 1
+
+    def publish_marker() -> None:
+        write_ready_marker(
+            cfg,
+            task,
+            generation=generation,
+            source_transition="test",
+            source_revision=task.meta["revision"],
+            target_revision=task.meta["revision"] + 1,
+        )
+        writer_finished.set()
+
+    writer_thread = threading.Thread(target=publish_marker)
+    writer_thread.start()
+    assert writer_reached_sync.wait(timeout=5)
+    assert not writer_finished.is_set()
+
+    allow_rebuild.set()
+    rebuild_thread.join(timeout=5)
+    writer_thread.join(timeout=5)
+    assert not rebuild_thread.is_alive()
+    assert not writer_thread.is_alive()
+    candidate = (
+        shared_paths(cfg.shared_root)["ready_primary"]
+        / "routes"
+        / "home.gpu-1"
+        / f"{task.task_id}.{generation}.json"
+    )
+    assert candidate.exists()
 
 
 def test_active_ready_dispatch_does_not_enumerate_task_truth(

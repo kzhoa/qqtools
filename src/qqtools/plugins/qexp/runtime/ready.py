@@ -388,6 +388,17 @@ def _primary_index_state_path(cfg: object) -> Path:
     return shared_paths(cfg.shared_root)["ready_primary"] / "state.json"
 
 
+def _primary_projection_rebuild_lock_path(cfg: object) -> Path:
+    return shared_paths(cfg.shared_root)["ready_locks"] / "primary-projection-rebuild.lock"
+
+
+@contextmanager
+def _primary_projection_rebuild_lock(cfg: object):
+    """Serialize primary projection mutations with a full rebuild."""
+    with exclusive(_primary_projection_rebuild_lock_path(cfg)):
+        yield
+
+
 def _primary_route_path(cfg: object, route_key: str) -> Path:
     return shared_paths(cfg.shared_root)["ready_primary"] / "routes" / route_key
 
@@ -1260,7 +1271,7 @@ def _primary_candidate_value(reference: ReadyMarkerRef) -> dict[str, Any]:
     }}
 
 
-def _remove_primary_candidate_everywhere(cfg: object, identity: str) -> None:
+def _remove_primary_candidate_everywhere_unlocked(cfg: object, identity: str) -> None:
     routes = shared_paths(cfg.shared_root)["ready_primary"] / "routes"
     if not routes.exists():
         return
@@ -1270,11 +1281,21 @@ def _remove_primary_candidate_everywhere(cfg: object, identity: str) -> None:
         _primary_candidate_path(cfg, route.name, identity).unlink(missing_ok=True)
 
 
-def _sync_primary_candidate(cfg: object, task: TaskRecord, reference: ReadyMarkerRef) -> None:
-    """Mirror one authoritative marker into the primary-only candidate projection."""
-    if not _primary_index_is_active(cfg):
+def _remove_primary_candidate_everywhere(cfg: object, identity: str) -> None:
+    with _primary_projection_rebuild_lock(cfg):
+        _remove_primary_candidate_everywhere_unlocked(cfg, identity)
+
+
+def _sync_primary_candidate_unlocked(
+    cfg: object,
+    task: TaskRecord,
+    reference: ReadyMarkerRef,
+    *,
+    should_require_active: bool = True,
+) -> None:
+    if should_require_active and not _primary_index_is_active(cfg):
         return
-    _remove_primary_candidate_everywhere(cfg, reference.identity)
+    _remove_primary_candidate_everywhere_unlocked(cfg, reference.identity)
     for machine in _primary_machines_for_task(cfg, task):
         route_key = _primary_route_key(reference.queue_scope, machine)
         route = _primary_route_path(cfg, route_key)
@@ -1283,6 +1304,12 @@ def _sync_primary_candidate(cfg: object, task: TaskRecord, reference: ReadyMarke
             _primary_candidate_path(cfg, route_key, reference.identity),
             _primary_candidate_value(reference),
         )
+
+
+def _sync_primary_candidate(cfg: object, task: TaskRecord, reference: ReadyMarkerRef) -> None:
+    """Mirror one authoritative marker into the primary-only candidate projection."""
+    with _primary_projection_rebuild_lock(cfg):
+        _sync_primary_candidate_unlocked(cfg, task, reference)
 
 
 def _clear_primary_candidate_projection(cfg: object) -> None:
@@ -1297,51 +1324,47 @@ def _clear_primary_candidate_projection(cfg: object) -> None:
 def rebuild_primary_ready_index(cfg: object) -> None:
     """Rebuild primary candidates from authoritative queued Task records."""
     ensure_ready_layout(cfg)
-    atomic_replace(
-        _primary_index_state_path(cfg),
-        {"primary_ready_index": {
-            "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
-            "state": "rebuilding",
-            "updated_at": utc_now(),
-        }},
-    )
-    _clear_primary_candidate_projection(cfg)
-    for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
-        task = TaskRecord.from_dict(read_json(path))
-        if not _task_should_have_ready_marker(task):
-            continue
-        reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
-        if reference is None:
-            continue
-        for machine in _primary_machines_for_task(cfg, task):
-            route_key = _primary_route_key(reference.queue_scope, machine)
-            route = _primary_route_path(cfg, route_key)
-            route.mkdir(parents=True, exist_ok=True)
-            atomic_replace(
-                _primary_candidate_path(cfg, route_key, reference.identity),
-                _primary_candidate_value(reference),
-            )
-    atomic_replace(
-        _primary_index_state_path(cfg),
-        {"primary_ready_index": {
-            "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
-            "state": "active",
-            "updated_at": utc_now(),
-        }},
-    )
+    with _primary_projection_rebuild_lock(cfg):
+        atomic_replace(
+            _primary_index_state_path(cfg),
+            {"primary_ready_index": {
+                "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
+                "state": "rebuilding",
+                "updated_at": utc_now(),
+            }},
+        )
+        _clear_primary_candidate_projection(cfg)
+        for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
+            task = TaskRecord.from_dict(read_json(path))
+            if not _task_should_have_ready_marker(task):
+                continue
+            reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+            if reference is not None:
+                _sync_primary_candidate_unlocked(
+                    cfg, task, reference, should_require_active=False
+                )
+        atomic_replace(
+            _primary_index_state_path(cfg),
+            {"primary_ready_index": {
+                "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
+                "state": "active",
+                "updated_at": utc_now(),
+            }},
+        )
 
 
 def sync_primary_ready_group(cfg: object, group_name: str) -> None:
     """Refresh primary candidates affected by a Group worker-role mutation."""
-    if not _primary_index_is_active(cfg):
-        return
-    for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
-        task = TaskRecord.from_dict(read_json(path))
-        if task.group_name != group_name or not _task_should_have_ready_marker(task):
-            continue
-        reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
-        if reference is not None:
-            _sync_primary_candidate(cfg, task, reference)
+    with _primary_projection_rebuild_lock(cfg):
+        if not _primary_index_is_active(cfg):
+            return
+        for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
+            task = TaskRecord.from_dict(read_json(path))
+            if task.group_name != group_name or not _task_should_have_ready_marker(task):
+                continue
+            reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+            if reference is not None:
+                _sync_primary_candidate_unlocked(cfg, task, reference)
 
 
 def primary_projection_routes_for_group(
