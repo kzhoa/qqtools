@@ -9,8 +9,8 @@ Scope: track uncovered public behavior and test modules under local source
   `tests/unit/plugins/qpipeline/`.
 - Pending: classify qpipeline config/entry utilities, runner policy/trigger/checkpoint
   tests, qcgen and gau-reader user flows, then split the mixed runner test module.
-- `tests/functional` accepts maintenance of historical tests only; new tests belong
-  in `unit`, `integration`, or `e2e`.
+- Historical functional tests now live under `tests/integration/functional`; new tests belong in
+  the smallest sufficient Unit, Integration, or E2E layer.
 
 ## Base modules not covered (`0%` in `tests/unit`)
 
@@ -30,7 +30,7 @@ Scope: track uncovered public behavior and test modules under local source
 
 - Scheduler epoch-suffix public integration coverage remains to be added.
 - Checkpoint resume needs an explicit public-entry e2e scenario.
-- Installed `qexp` CLI remains covered by release E2E.
+- Installed `qexp` CLI is covered by artifact E2E.
 
 ## Other uncovered public modules
 
@@ -61,9 +61,9 @@ Scope: track uncovered public behavior and test modules under local source
 - Additional progress:
   - `src/qqtools/torch/qdataset.py` -> `62%` (improved from ~45%)
 
-## Latest Coverage Update (unit + qpipeline functional)
+## Latest Coverage Update (unit + qpipeline integration)
 
-- Updated by: `PYTHONPATH=src python -m pytest tests/unit tests/functional/test_qpipeline --cov=qqtools --cov-report=json:coverage_all_local.json -q`
+- Updated by: `PYTHONPATH=src python -m pytest tests/unit tests/integration/functional/test_qpipeline --cov=qqtools --cov-report=json:coverage_all_local.json -q`
 - Selected test suites: `84 passed`
 - Total coverage: `38%`
 - qpipeline key modules:

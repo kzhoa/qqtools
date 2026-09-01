@@ -1,10 +1,6 @@
 import os
-from pathlib import Path
 
 import pytest
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
-
-
 @pytest.fixture(autouse=True)
 def _qexp_integration_prerequisites(
     qexp_healthy_clock,
@@ -13,44 +9,22 @@ def _qexp_integration_prerequisites(
     request,
 ):
     """Use deterministic clock proof and honor the explicit fast-I/O marker."""
-    if request.node.get_closest_marker("host_exclusive") is None:
-        environment = qexp_resource_scope.child_environment()
-        for name in (
-            "TMPDIR",
-            "TMP",
-            "TEMP",
-            "HOME",
-            "XDG_CACHE_HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "TMUX_TMPDIR",
-            "QEXP_MACHINE_RUNTIME_ROOT",
-        ):
-            monkeypatch.setenv(name, environment[name])
-        monkeypatch.setattr(
-            "qqtools.plugins.qexp.machine_runtime.tempfile.gettempdir",
-            lambda: str(qexp_resource_scope.local_temp_root),
-        )
+    environment = qexp_resource_scope.child_environment()
+    for name in (
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "HOME",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "TMUX_TMPDIR",
+        "QEXP_MACHINE_RUNTIME_ROOT",
+    ):
+        monkeypatch.setenv(name, environment[name])
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.machine_runtime.tempfile.gettempdir",
+        lambda: str(qexp_resource_scope.local_temp_root),
+    )
     if request.node.get_closest_marker("qexp_fast_io") is not None:
         monkeypatch.setattr(os, "fsync", lambda _descriptor: None)
-    if request.node.get_closest_marker("host_exclusive") is not None:
-        probe = MachineRuntime(Path(str(request.config.cache.makedir("host-authority-probe"))))
-        with probe.scheduler_authority(blocking=False) as acquired:
-            if acquired:
-                return
-        message = "production scheduler authority is held by another qexp agent"
-        if os.environ.get("CI"):
-            pytest.fail(message)
-        pytest.skip(message)
-
-
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Classify ordinary qexp integration tests as hermetic by construction."""
-    for item in items:
-        if "tests/integration/qexp/" not in item.nodeid:
-            continue
-        if (
-            item.get_closest_marker("host_exclusive") is None
-            and item.get_closest_marker("machine_lab") is None
-        ):
-            item.add_marker(pytest.mark.hermetic)

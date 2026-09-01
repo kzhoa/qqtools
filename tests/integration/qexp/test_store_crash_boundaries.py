@@ -11,7 +11,6 @@ pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
 @pytest.mark.parametrize("point", ["file_fsync", "replace", "directory_fsync"])
-@pytest.mark.qexp_fast
 def test_atomic_replace_crash_boundaries_never_expose_partial_json(
     tmp_path: Path,
     checkout_subprocess_env: dict[str, str],

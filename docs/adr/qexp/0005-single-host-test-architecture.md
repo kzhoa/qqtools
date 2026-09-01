@@ -1,11 +1,11 @@
 ---
 doc_type: adr
-status: accepted
+status: superseded
 updated_at: 2026-09-01
 archived_at:
 adr_id: ADR-QEXP-0005
 supersedes: []
-superseded_by:
+superseded_by: ADR-QEXP-0006
 ---
 
 # ADR-QEXP-0005: Single-Host qexp Test Architecture
