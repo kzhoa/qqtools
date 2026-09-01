@@ -393,6 +393,7 @@ class MachineParticipant:
     name: str
     scope: TestResourceScope
     process: subprocess.Popen[str]
+    trace: TraceEnvelope
 
     def request(self, command: str, *, timeout_seconds: float = 2.0) -> dict[str, Any]:
         """Send one control command and wait for its structured response."""
@@ -402,6 +403,12 @@ class MachineParticipant:
             raise ValueError("participant request timeout must be positive")
         if self.process.stdin is None or self.process.stdout is None:
             raise RuntimeError(f"participant {self.name} has no IPC pipes")
+        self.trace.record(
+            "participant.command",
+            {"command": command, "pid": self.process.pid},
+            0.0,
+            self.name,
+        )
         self.process.stdin.write(json.dumps({"command": command}) + "\n")
         self.process.stdin.flush()
         ready, _, _ = select.select([self.process.stdout], [], [], timeout_seconds)
@@ -412,7 +419,9 @@ class MachineParticipant:
         response = self.process.stdout.readline()
         if not response:
             raise RuntimeError(f"participant {self.name} exited before responding")
-        return json.loads(response)
+        result = json.loads(response)
+        self.trace.record("participant.response", result, 0.0, self.name)
+        return result
 
     def close(self) -> None:
         if self.process.poll() is not None:
@@ -422,6 +431,12 @@ class MachineParticipant:
             self.process.wait(timeout=2.0)
         except (RuntimeError, subprocess.TimeoutExpired):
             self.process.terminate()
+            self.process.wait(timeout=2.0)
+
+    def kill(self) -> None:
+        """Terminate this participant without attempting graceful protocol cleanup."""
+        if self.process.poll() is None:
+            self.process.kill()
             self.process.wait(timeout=2.0)
 
 
@@ -443,6 +458,17 @@ for line in sys.stdin:
         runtime = MachineRuntime()
         with runtime.scheduler_authority(blocking=False) as acquired:
             print(json.dumps({"acquired": acquired, "tmpdir": os.environ["TMPDIR"]}), flush=True)
+    elif command == "checkpoint":
+        print(json.dumps({"checkpoint": "reached", "pid": os.getpid()}), flush=True)
+        while True:
+            follow_up = json.loads(sys.stdin.readline())["command"]
+            if follow_up == "continue":
+                print(json.dumps({"checkpoint": "continued", "pid": os.getpid()}), flush=True)
+                break
+            if follow_up == "exit":
+                print(json.dumps({"exited": True}), flush=True)
+                sys.exit(0)
+            print(json.dumps({"error": "checkpoint_requires_continue"}), flush=True)
     else:
         print(json.dumps({"error": "unknown command"}), flush=True)
 """
@@ -453,11 +479,37 @@ for line in sys.stdin:
         self.shared_root = root / "shared"
         self.shared_root.mkdir(parents=True, exist_ok=True)
         self.participants: list[MachineParticipant] = []
+        self.trace = TraceEnvelope("qexp-single-host-machine-lab/v1", seed=0)
 
     def start(self, name: str) -> MachineParticipant:
         if any(item.name == name for item in self.participants):
             raise ValueError(f"duplicate machine participant: {name}")
         scope = TestResourceScope.create(self.root / "participants", f"{self.nodeid}-{name}")
+        participant = self._start_with_scope(name, scope)
+        self.participants.append(participant)
+        return participant
+
+    def restart(self, name: str) -> MachineParticipant:
+        """Replace one terminated participant while preserving the shared project root."""
+        for index, participant in enumerate(self.participants):
+            if participant.name != name:
+                continue
+            if participant.process.poll() is None:
+                raise RuntimeError(f"participant is still running: {name}")
+            scope = TestResourceScope.create(
+                self.root / "participants",
+                f"{self.nodeid}-{name}-restart",
+            )
+            replacement = self._start_with_scope(name, scope)
+            self.participants[index] = replacement
+            return replacement
+        raise ValueError(f"participant does not exist: {name}")
+
+    def close(self) -> None:
+        for participant in reversed(self.participants):
+            participant.close()
+
+    def _start_with_scope(self, name: str, scope: TestResourceScope) -> MachineParticipant:
         environment = scope.child_environment()
         environment["QEXP_TEST_SHARED_ROOT"] = str(self.shared_root)
         process = subprocess.Popen(
@@ -469,10 +521,4 @@ for line in sys.stdin:
             text=True,
             start_new_session=True,
         )
-        participant = MachineParticipant(name, scope, process)
-        self.participants.append(participant)
-        return participant
-
-    def close(self) -> None:
-        for participant in reversed(self.participants):
-            participant.close()
+        return MachineParticipant(name, scope, process, self.trace)
