@@ -8,6 +8,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import socket
+import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +36,7 @@ class TestResourceScope:
     authority_root: Path
     home_root: Path
     xdg_root: Path
+    tmux_root: Path
     tmux_socket: Path
     resource_ledger_root: Path
     diagnostics_root: Path
@@ -47,7 +51,8 @@ class TestResourceScope:
         authority_root = local_temp_root / "authority"
         home_root = root / "home"
         xdg_root = root / "xdg"
-        tmux_socket = root / "tmux" / "server.sock"
+        tmux_root = Path("/tmp") / f"qqtools-tmux-{uuid.uuid4().hex}"
+        tmux_socket = tmux_root / "server.sock"
         resource_ledger_root = root / "resource-ledger"
         diagnostics_root = root / "diagnostics"
         for path in (
@@ -57,12 +62,12 @@ class TestResourceScope:
             authority_root,
             home_root,
             xdg_root,
-            tmux_socket.parent,
+            tmux_root,
             resource_ledger_root,
             diagnostics_root,
         ):
             path.mkdir(parents=True, exist_ok=True)
-        return cls(
+        scope = cls(
             run_id=run_id,
             root=root,
             runtime_root=runtime_root,
@@ -71,10 +76,13 @@ class TestResourceScope:
             authority_root=authority_root,
             home_root=home_root,
             xdg_root=xdg_root,
+            tmux_root=tmux_root,
             tmux_socket=tmux_socket,
             resource_ledger_root=resource_ledger_root,
             diagnostics_root=diagnostics_root,
         )
+        scope.record_resource("tmux-root", {"path": str(tmux_root)})
+        return scope
 
     def child_environment(self, base: dict[str, str] | None = None) -> dict[str, str]:
         """Build an environment frozen before a participant imports qexp."""
@@ -110,5 +118,100 @@ class TestResourceScope:
         if not kind or any(character in kind for character in "/\\"):
             raise ValueError("diagnostic kind must be a non-empty path component")
         path = self.diagnostics_root / f"{uuid.uuid4().hex[:12]}-{kind}.json"
-        path.write_text(json.dumps({"diagnostic": details}, sort_keys=True), encoding="utf-8")
+        path.write_text(
+            json.dumps({"consumed": False, "diagnostic": details}, sort_keys=True),
+            encoding="utf-8",
+        )
         return path
+
+    def consume_cleanup_diagnostic(self, path: Path) -> None:
+        """Mark one expected cleanup diagnostic as asserted by its owning test."""
+        if path.parent != self.diagnostics_root:
+            raise ValueError("cleanup diagnostic must belong to this resource scope")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "diagnostic" not in payload:
+            raise ValueError(f"invalid cleanup diagnostic: {path}")
+        payload["consumed"] = True
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    @staticmethod
+    def cleanup_violations(test_root: Path) -> list[str]:
+        """Return owned-resource cleanup failures below one test's temporary root."""
+        violations: list[str] = []
+        for ledger_path in sorted(test_root.rglob("resource-ledger/*.json")):
+            try:
+                payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+                resource = payload["resource"]
+                kind = resource["kind"]
+                identity = resource["identity"]
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                violations.append(f"invalid resource ledger {ledger_path}: {exc}")
+                continue
+            if kind != "participant":
+                if kind == "tmux-root":
+                    tmux_root = identity.get("path") if isinstance(identity, dict) else None
+                    if not isinstance(tmux_root, str):
+                        violations.append(f"tmux root ledger has invalid path: {ledger_path}")
+                    elif _has_active_unix_socket(Path(tmux_root)):
+                        violations.append(f"test-owned tmux socket remains active: {tmux_root}")
+                    else:
+                        shutil.rmtree(tmux_root, ignore_errors=True)
+                continue
+            pid = identity.get("pid") if isinstance(identity, dict) else None
+            pgid = identity.get("process_group_id") if isinstance(identity, dict) else None
+            if not isinstance(pid, int) or pid <= 0:
+                violations.append(f"participant ledger has invalid pid: {ledger_path}")
+            elif _is_process_alive(pid):
+                violations.append(f"participant pid {pid} remains alive: {ledger_path}")
+            if not isinstance(pgid, int) or pgid <= 0:
+                violations.append(f"participant ledger has invalid process group: {ledger_path}")
+            elif _is_process_group_alive(pgid):
+                violations.append(f"participant process group {pgid} remains alive: {ledger_path}")
+
+        for diagnostic_path in sorted(test_root.rglob("diagnostics/*.json")):
+            try:
+                payload = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                violations.append(f"invalid cleanup diagnostic {diagnostic_path}: {exc}")
+                continue
+            if not payload.get("consumed", False):
+                violations.append(f"unconsumed cleanup diagnostic: {diagnostic_path}")
+
+        return violations
+
+
+def _is_process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _is_process_group_alive(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _has_active_unix_socket(root: Path) -> bool:
+    for path in root.rglob("*"):
+        try:
+            if not stat.S_ISSOCK(path.stat().st_mode):
+                continue
+        except FileNotFoundError:
+            continue
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(0.1)
+            try:
+                client.connect(str(path))
+            except OSError:
+                continue
+        return True
+    return False

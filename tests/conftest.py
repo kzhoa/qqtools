@@ -89,7 +89,11 @@ def qexp_resource_scope(tmp_path: Path, request: pytest.FixtureRequest):
     """Provide isolated filesystem and local-process resources to qexp tests."""
     from tests.helpers.qexp.resources import TestResourceScope
 
-    return TestResourceScope.create(tmp_path / "qexp-resources", request.node.nodeid)
+    scope = TestResourceScope.create(tmp_path / "qexp-resources", request.node.nodeid)
+    yield scope
+    violations = TestResourceScope.cleanup_violations(tmp_path)
+    if violations:
+        pytest.fail("qexp test resource cleanup failed:\n" + "\n".join(violations))
 
 
 def pytest_ignore_collect(collection_path, config):
