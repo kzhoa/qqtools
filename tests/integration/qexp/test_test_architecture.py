@@ -21,6 +21,7 @@ from tests.qexp_architecture import SingleHostMachineLab
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
+@pytest.mark.qexp_fast
 def test_resource_scope_isolates_child_environment(qexp_resource_scope: TestResourceScope) -> None:
     environment = qexp_resource_scope.child_environment({"PATH": "test-path"})
 
@@ -30,6 +31,7 @@ def test_resource_scope_isolates_child_environment(qexp_resource_scope: TestReso
     assert environment["QEXP_MACHINE_RUNTIME_ROOT"] == str(qexp_resource_scope.runtime_root)
 
 
+@pytest.mark.qexp_fast
 def test_machine_participants_use_distinct_frozen_authority_roots(tmp_path: Path) -> None:
     first_scope = TestResourceScope.create(tmp_path, "first")
     second_scope = TestResourceScope.create(tmp_path, "second")
