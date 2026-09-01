@@ -48,6 +48,14 @@ def qexp_healthy_clock(monkeypatch):
     )
 
 
+@pytest.fixture
+def qexp_resource_scope(tmp_path: Path, request: pytest.FixtureRequest):
+    """Provide isolated filesystem and local-process resources to qexp tests."""
+    from tests.qexp_test_support import TestResourceScope
+
+    return TestResourceScope.create(tmp_path / "qexp-resources", request.node.nodeid)
+
+
 def pytest_ignore_collect(collection_path, config):
     """Reserve installed-wheel e2e tests for their isolated pytest config."""
     path = Path(str(collection_path)).resolve()
