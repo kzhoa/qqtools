@@ -1,6 +1,8 @@
 import os
+from pathlib import Path
 
 import pytest
+from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +33,15 @@ def _qexp_integration_prerequisites(
         )
     if request.node.get_closest_marker("qexp_fast_io") is not None:
         monkeypatch.setattr(os, "fsync", lambda _descriptor: None)
+    if request.node.get_closest_marker("host_exclusive") is not None:
+        probe = MachineRuntime(Path(str(request.config.cache.makedir("host-authority-probe"))))
+        with probe.scheduler_authority(blocking=False) as acquired:
+            if acquired:
+                return
+        message = "production scheduler authority is held by another qexp agent"
+        if os.environ.get("CI"):
+            pytest.fail(message)
+        pytest.skip(message)
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

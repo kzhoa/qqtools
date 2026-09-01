@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import select
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -155,3 +157,78 @@ def test_machine_lab_two_participants_produce_one_real_task_claim(tmp_path: Path
         assert claims[0]["fencing_token"] == 1
     finally:
         lab.close()
+
+
+@pytest.mark.host_exclusive
+def test_host_exclusive_authority_allows_only_one_runtime_per_os_user(tmp_path: Path) -> None:
+    source_root = Path(__file__).parents[3] / "src"
+    shared_tmpdir = tempfile.gettempdir()
+    participant = """
+import json
+import sys
+from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+
+runtime = MachineRuntime(sys.argv[1])
+with runtime.scheduler_authority(blocking=False) as acquired:
+    print(json.dumps({"acquired": acquired}), flush=True)
+    if acquired:
+        sys.stdin.readline()
+"""
+
+    def start(scope: TestResourceScope) -> subprocess.Popen[str]:
+        environment = scope.child_environment()
+        environment.update(
+            {
+                "PYTHONPATH": str(source_root),
+                "TMPDIR": shared_tmpdir,
+                "TMP": shared_tmpdir,
+                "TEMP": shared_tmpdir,
+            }
+        )
+        return subprocess.Popen(
+            [sys.executable, "-c", participant, str(scope.runtime_root)],
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def response(process: subprocess.Popen[str]) -> dict[str, object]:
+        assert process.stdout is not None
+        ready, _, _ = select.select([process.stdout], [], [], 2.0)
+        if not ready:
+            stderr = "participant is still running"
+            if process.stderr is not None and process.poll() is not None:
+                stderr = process.stderr.read()
+            pytest.fail(f"authority participant did not respond within 2 seconds: {stderr}")
+        line = process.stdout.readline()
+        if not line:
+            stderr = "stderr unavailable"
+            if process.stderr is not None:
+                stderr = process.stderr.read()
+            pytest.fail(f"authority participant exited before responding: {stderr}")
+        return json.loads(line)
+
+    first = start(TestResourceScope.create(tmp_path, "first"))
+    second = start(TestResourceScope.create(tmp_path, "second"))
+    third: subprocess.Popen[str] | None = None
+    try:
+        assert response(first)["acquired"] is True
+        assert response(second)["acquired"] is False
+
+        assert first.stdin is not None
+        first.stdin.close()
+        assert first.wait(timeout=2.0) == 0
+
+        third = start(TestResourceScope.create(tmp_path, "third"))
+        assert response(third)["acquired"] is True
+    finally:
+        for process in (first, second, third):
+            if process is None:
+                continue
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=2.0)
