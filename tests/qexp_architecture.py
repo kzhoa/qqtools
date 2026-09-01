@@ -545,6 +545,66 @@ class SimulatedRuntime:
         self.trace.record("store.commit", {"key": key, "revision": next_value.revision}, self.clock)
         return next_value
 
+    def atomic_replace(
+        self,
+        key: str,
+        revision: int | None,
+        value: Any,
+        *,
+        participant: str | None = None,
+    ) -> RevisionedValue | None:
+        """Model the durable write boundaries before committing a revisioned record."""
+        for point in (
+            ProtocolPoint.TEMP_WRITE,
+            ProtocolPoint.FILE_FSYNC,
+            ProtocolPoint.ATOMIC_REPLACE,
+            ProtocolPoint.DIRECTORY_FSYNC,
+        ):
+            if self.yield_at(point, participant=participant) == ProtocolDisposition.CONFLICT:
+                self.trace.record("store.conflict", {"key": key, "revision": revision}, self.clock)
+                return None
+        return self.cas(key, revision, value)
+
+    def publish_index(self, key: str, *, participant: str | None = None) -> None:
+        """Record an advisory index publication boundary."""
+        self.yield_at(ProtocolPoint.INDEX_PUBLISH, participant=participant)
+        self.trace.record("index.publish", {"key": key}, self.clock, participant)
+
+    def remove_index(self, key: str, *, participant: str | None = None) -> None:
+        """Record an advisory index removal boundary."""
+        self.yield_at(ProtocolPoint.INDEX_REMOVE, participant=participant)
+        self.trace.record("index.remove", {"key": key}, self.clock, participant)
+
+    def create_process(
+        self,
+        attempt_id: str,
+        *,
+        participant: str | None = None,
+    ) -> None:
+        """Record a simulated process creation boundary."""
+        self.yield_at(ProtocolPoint.PROCESS_CREATE, participant=participant)
+        self.trace.record(
+            "process.create",
+            {"attempt_id": attempt_id},
+            self.clock,
+            participant,
+        )
+
+    def publish_registration(
+        self,
+        attempt_id: str,
+        *,
+        participant: str | None = None,
+    ) -> None:
+        """Record a simulated process-registration boundary."""
+        self.yield_at(ProtocolPoint.REGISTRATION_PUBLISH, participant=participant)
+        self.trace.record(
+            "registration.publish",
+            {"attempt_id": attempt_id},
+            self.clock,
+            participant,
+        )
+
     def acquire(self, name: str) -> bool:
         if self.yield_at(ProtocolPoint.LOCK_ACQUIRE) == ProtocolDisposition.CONFLICT:
             return False
