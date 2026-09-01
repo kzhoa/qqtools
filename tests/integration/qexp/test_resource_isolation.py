@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import select
+import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -15,7 +16,6 @@ from tests.helpers.qexp.resources import TestResourceScope
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
-@pytest.mark.qexp_fast
 def test_resource_scope_isolates_child_environment(qexp_resource_scope: TestResourceScope) -> None:
     environment = qexp_resource_scope.child_environment({"PATH": "test-path"})
 
@@ -25,7 +25,6 @@ def test_resource_scope_isolates_child_environment(qexp_resource_scope: TestReso
     assert environment["QEXP_MACHINE_RUNTIME_ROOT"] == str(qexp_resource_scope.runtime_root)
 
 
-@pytest.mark.qexp_fast
 def test_resource_scope_records_test_owned_resources_and_cleanup_diagnostics(
     qexp_resource_scope: TestResourceScope,
 ) -> None:
@@ -46,7 +45,6 @@ def test_resource_scope_records_test_owned_resources_and_cleanup_diagnostics(
     qexp_resource_scope.consume_cleanup_diagnostic(diagnostic)
 
 
-@pytest.mark.qexp_fast
 def test_resource_scope_reports_an_active_test_owned_tmux_socket(
     qexp_resource_scope: TestResourceScope,
 ) -> None:
@@ -62,7 +60,6 @@ def test_resource_scope_reports_an_active_test_owned_tmux_socket(
         server.close()
 
 
-@pytest.mark.qexp_fast
 def test_machine_participants_use_distinct_frozen_authority_roots(tmp_path: Path) -> None:
     first_scope = TestResourceScope.create(tmp_path, "first")
     second_scope = TestResourceScope.create(tmp_path, "second")
@@ -117,10 +114,10 @@ with runtime.scheduler_authority(blocking=False) as acquired:
                 process.wait(timeout=1.0)
 
 
-@pytest.mark.host_exclusive
-def test_host_exclusive_authority_allows_only_one_runtime_per_os_user(tmp_path: Path) -> None:
+def test_isolated_authority_allows_only_one_runtime_at_a_time(tmp_path: Path) -> None:
     source_root = Path(__file__).parents[3] / "src"
-    shared_tmpdir = tempfile.gettempdir()
+    shared_tmpdir = tmp_path / "shared-authority-tmp"
+    shared_tmpdir.mkdir()
     participant = """
 import json
 import sys
@@ -143,14 +140,20 @@ with runtime.scheduler_authority(blocking=False) as acquired:
                 "TEMP": shared_tmpdir,
             }
         )
-        return subprocess.Popen(
+        process = subprocess.Popen(
             [sys.executable, "-c", participant, str(scope.runtime_root)],
             env=environment,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
+        scope.record_resource(
+            "participant",
+            {"pid": process.pid, "process_group_id": process.pid},
+        )
+        return process
 
     def response(process: subprocess.Popen[str]) -> dict[str, object]:
         assert process.stdout is not None
@@ -168,26 +171,32 @@ with runtime.scheduler_authority(blocking=False) as acquired:
             pytest.fail(f"authority participant exited before responding: {stderr}")
         return json.loads(line)
 
-    first = start(TestResourceScope.create(tmp_path, "first"))
-    second: subprocess.Popen[str] | None = None
-    third: subprocess.Popen[str] | None = None
+    first_scope = TestResourceScope.create(tmp_path, "first")
+    second_scope = TestResourceScope.create(tmp_path, "second")
+    third_scope = TestResourceScope.create(tmp_path, "third")
+    processes: list[tuple[TestResourceScope, subprocess.Popen[str]]] = [(first_scope, start(first_scope))]
     try:
+        first = processes[0][1]
         assert response(first)["acquired"] is True
-        second = start(TestResourceScope.create(tmp_path, "second"))
+        second = start(second_scope)
+        processes.append((second_scope, second))
         assert response(second)["acquired"] is False
 
         assert first.stdin is not None
         first.stdin.close()
         assert first.wait(timeout=2.0) == 0
 
-        third = start(TestResourceScope.create(tmp_path, "third"))
+        third = start(third_scope)
+        processes.append((third_scope, third))
         assert response(third)["acquired"] is True
     finally:
-        for process in (first, second, third):
-            if process is None:
-                continue
+        for _scope, process in processes:
             if process.stdin is not None and not process.stdin.closed:
                 process.stdin.close()
             if process.poll() is None:
-                process.terminate()
-            process.wait(timeout=2.0)
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2.0)

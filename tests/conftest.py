@@ -15,8 +15,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 SYSTEM_TEST_TMP_ROOT = Path("/tmp")
 FALLBACK_TEST_TMP_ROOT = PROJECT_ROOT / "tmp"
-RELEASE_E2E_ROOT = PROJECT_ROOT / "tests" / "e2e" / "qexp"
-RELEASE_E2E_PYTEST_INI = PROJECT_ROOT / "tests" / "e2e" / "release_pytest.ini"
+INSTALLED_E2E_ROOT = PROJECT_ROOT / "tests" / "e2e"
+INSTALLED_E2E_PYTEST_INI = PROJECT_ROOT / "tests" / "e2e" / "installed_artifact_pytest.ini"
 PRESERVE_TEST_ARTIFACTS_ENV = "QQTOOLS_PRESERVE_TEST_ARTIFACTS"
 
 
@@ -99,9 +99,9 @@ def qexp_resource_scope(tmp_path: Path, request: pytest.FixtureRequest):
 def pytest_ignore_collect(collection_path, config):
     """Reserve installed-wheel e2e tests for their isolated pytest config."""
     path = Path(str(collection_path)).resolve()
-    if path != RELEASE_E2E_ROOT and RELEASE_E2E_ROOT not in path.parents:
+    if path != INSTALLED_E2E_ROOT and INSTALLED_E2E_ROOT not in path.parents:
         return None
-    return config.inipath is None or Path(config.inipath).resolve() != RELEASE_E2E_PYTEST_INI
+    return config.inipath is None or Path(config.inipath).resolve() != INSTALLED_E2E_PYTEST_INI
 
 
 def _build_case_tmp_dir_name(nodeid: str, name: str) -> str:

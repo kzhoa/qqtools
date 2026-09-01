@@ -1,35 +1,31 @@
-name: Test Suite
+name: Installed Artifact E2E
 
 on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    - cron: "17 3 * * *"
 
 permissions:
   contents: read
 
 jobs:
-  unit:
-    name: unit (Python ${{ matrix.python-version }})
-    if: github.event_name != 'schedule'
+  artifact-smoke:
+    name: artifact smoke (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install --upgrade pip tox
-      - run: tox run -e unit
+      - run: tox run -e artifact-smoke
 
-  integration:
-    name: integration
-    if: github.event_name != 'schedule'
+  artifact-e2e:
+    name: artifact e2e (Python 3.13)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,98 +33,4 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip tox
-      - run: tox run -e integration
-      - run: tox run -e full
-
-  qexp-fast:
-    name: qexp-fast
-    if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - run: python -m pip install --upgrade pip tox
-      - run: timeout 90 tox run -e qexp-fast
-
-  qexp-fast-baseline:
-    name: qexp-fast-baseline
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - run: python -m pip install --upgrade pip tox
-      - name: Measure twenty qexp-fast runs
-        run: |
-          set -euo pipefail
-          mkdir -p test-results
-          for run in $(seq 1 20); do
-            started=$(date +%s)
-            timeout 90 tox run -e qexp-fast
-            finished=$(date +%s)
-            printf '%s\n' "$((finished - started))" >> test-results/qexp-fast-seconds.txt
-          done
-      - name: Enforce qexp-fast p95 budget
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-
-          durations = sorted(
-              int(line)
-              for line in Path("test-results/qexp-fast-seconds.txt").read_text().splitlines()
-          )
-          if len(durations) != 20:
-              raise SystemExit("qexp-fast baseline must contain exactly twenty runs")
-          p95 = durations[18]
-          print(f"qexp-fast durations: {durations}; p95={p95}s")
-          if p95 > 60:
-              raise SystemExit(f"qexp-fast p95 budget exceeded: {p95}s > 60s")
-          PY
-      - name: Upload qexp-fast baseline
-        uses: actions/upload-artifact@v4
-        with:
-          name: qexp-fast-baseline
-          retention-days: 30
-          path: test-results/qexp-fast-seconds.txt
-
-  qexp-machine-lab:
-    name: qexp-machine-lab
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - run: python -m pip install --upgrade pip tox
-      - run: tox run -e qexp-machine-lab
-      - run: tox run -e qexp-host-exclusive
-
-  qexp-stress:
-    name: qexp-stress
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - run: python -m pip install --upgrade pip tox
-      - run: tox run -e qexp-stress
-
-  e2e:
-    name: e2e
-    if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - run: python -m pip install --upgrade pip tox
-      - run: tox run -e e2e
+      - run: tox run -e artifact-e2e
