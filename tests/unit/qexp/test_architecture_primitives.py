@@ -127,6 +127,34 @@ def test_simulated_runtime_exposes_pause_and_crash_at_explicit_boundaries() -> N
         runtime.yield_at(ProtocolPoint.PROCESS_CREATE, participant="machine-a")
 
 
+def test_simulated_runtime_records_durable_write_and_process_boundaries() -> None:
+    runtime = SimulatedRuntime()
+
+    committed = runtime.atomic_replace("task", None, {"state": "queued"}, participant="machine-a")
+    runtime.publish_index("task", participant="machine-a")
+    runtime.create_process("attempt-1", participant="machine-a")
+    runtime.publish_registration("attempt-1", participant="machine-a")
+    runtime.remove_index("task", participant="machine-a")
+
+    assert committed is not None and committed.revision == 1
+    points = [
+        event.payload["point"]
+        for event in runtime.trace.events
+        if event.kind == "protocol.yield"
+    ]
+    assert points == [
+        ProtocolPoint.TEMP_WRITE,
+        ProtocolPoint.FILE_FSYNC,
+        ProtocolPoint.ATOMIC_REPLACE,
+        ProtocolPoint.DIRECTORY_FSYNC,
+        ProtocolPoint.CAS,
+        ProtocolPoint.INDEX_PUBLISH,
+        ProtocolPoint.PROCESS_CREATE,
+        ProtocolPoint.REGISTRATION_PUBLISH,
+        ProtocolPoint.INDEX_REMOVE,
+    ]
+
+
 def test_reference_scenario_trace_replays_serialized_commands_with_the_same_seed() -> None:
     commands = [
         ReferenceCommand("create_submission", submission_id="submission-1"),
