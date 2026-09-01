@@ -536,6 +536,32 @@ def _reference_from_slot(
     )
 
 
+def _is_partition_referenced_under_route_lock(
+    cfg: object,
+    route_key: str,
+    page_path: Path,
+    page_number: int,
+    partition_name: str,
+) -> bool:
+    """Return whether a partition remains referenced after a route-stable recheck."""
+    lock_path = shared_paths(cfg.shared_root)["ready_locks"] / f"{route_key}.lock"
+    with exclusive(lock_path):
+        try:
+            catalog = read_json(page_path)["ready_catalog"]
+            partitions = catalog["partitions"]
+            if (
+                catalog.get("schema_version") != READY_PROTOCOL_VERSION
+                or catalog.get("route") != route_key
+                or catalog.get("page") != page_number
+                or not isinstance(partitions, list)
+                or not all(isinstance(item, str) for item in partitions)
+            ):
+                raise ValueError("ready catalog is invalid.")
+            return partition_name in partitions
+        except (FileNotFoundError, KeyError, TypeError, ValueError):
+            return True
+
+
 def next_ready_marker(
     cfg: object,
     project_id: str,
@@ -602,23 +628,9 @@ def next_ready_marker(
             raise ValueError("ready partition slots are invalid.")
         names = sorted(slots)
     except FileNotFoundError:
-        lock_path = shared_paths(cfg.shared_root)["ready_locks"] / f"{route_key}.lock"
-        with exclusive(lock_path):
-            try:
-                current_catalog = read_json(page_path)["ready_catalog"]
-                current_partitions = current_catalog["partitions"]
-                if (
-                    current_catalog.get("schema_version") != READY_PROTOCOL_VERSION
-                    or current_catalog.get("route") != route_key
-                    or current_catalog.get("page") != page_number
-                    or not isinstance(current_partitions, list)
-                    or not all(isinstance(item, str) for item in current_partitions)
-                ):
-                    raise ValueError("ready catalog is invalid.")
-                is_still_referenced = partition_name in current_partitions
-            except (FileNotFoundError, KeyError, TypeError, ValueError):
-                is_still_referenced = True
-        if is_still_referenced:
+        if _is_partition_referenced_under_route_lock(
+            cfg, route_key, page_path, page_number, partition_name
+        ):
             mark_ready_index_degraded(
                 cfg, f"partition_missing:{route_key}:{partition_name}"
             )
@@ -752,10 +764,17 @@ def peek_ready_marker(
                     raise ValueError("ready partition is invalid.")
                 names = sorted(slots)
             except FileNotFoundError:
-                mark_ready_index_degraded(
-                    cfg, f"partition_missing:{route_key}:{partition_name}"
-                )
-                return ReadyPeek(None, current, unresolved=True)
+                if not budget.can_start_operation():
+                    return ReadyPeek(None, progress_cursor, exhausted=True)
+                budget.consume_operation()
+                if _is_partition_referenced_under_route_lock(
+                    cfg, route_key, page_path, page_number, partition_name
+                ):
+                    mark_ready_index_degraded(
+                        cfg, f"partition_missing:{route_key}:{partition_name}"
+                    )
+                    return ReadyPeek(None, current, unresolved=True)
+                names = []
             except (KeyError, TypeError, ValueError):
                 mark_ready_index_degraded(
                     cfg, f"partition_invalid:{route_key}:{partition_name}"
@@ -1396,7 +1415,10 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
     path = _reservation_path(cfg.shared_root, task_id, generation)
     if not path.exists():
         return False
-    record = read_json(path)["ready_reservation"]
+    try:
+        record = read_json(path)["ready_reservation"]
+    except FileNotFoundError:
+        return False
     reference = ReadyMarkerRef(
         task_id, generation, record["queue_scope"], record["home_machine"],
         record["partition"], record["catalog_page"], record["marker_name"],
@@ -1533,6 +1555,57 @@ def retire_current_ready_generation(cfg: object, task: TaskRecord) -> None:
             return
 
 
+def _recheck_missing_ready_marker(
+    cfg: object, reference: ReadyMarkerRef,
+) -> dict[str, Any] | ReadyClassificationResult:
+    """Recheck a missing marker against Task truth while its route is stable."""
+    route_key = _route_key(reference.queue_scope, reference.home_machine)
+    lock_path = shared_paths(cfg.shared_root)["ready_locks"] / f"{route_key}.lock"
+    with exclusive(lock_path):
+        task_file = task_path(cfg.shared_root, reference.task_id)
+        if not task_file.exists():
+            return ReadyClassificationResult("permanently_stale", "task_missing")
+        try:
+            task = TaskRecord.from_dict(read_json(task_file))
+        except (KeyError, TypeError, ValueError):
+            return ReadyClassificationResult("corrupt", "task_invalid")
+        if reference.generation != task.ready_generation:
+            return ReadyClassificationResult(
+                "permanently_stale", "generation_superseded", task
+            )
+        if (
+            reference.queue_scope != task.placement_runtime.get("queue_scope")
+            or reference.home_machine != task.placement_policy.get("home_machine")
+        ):
+            return ReadyClassificationResult("corrupt", "route_mismatch", task)
+        if task.state.get("projection") != "queued" or task.claim_control.get("active_claim"):
+            return ReadyClassificationResult("permanently_stale", "task_not_queued", task)
+        if (
+            task.control.get("cleanup_operation_id")
+            or task.control.get("cleanup_state")
+            or task.control.get("cancellation_requested_at")
+        ):
+            return ReadyClassificationResult("permanently_stale", "task_controlled", task)
+        try:
+            return read_json(_marker_path(cfg.shared_root, reference))["ready_marker"]
+        except FileNotFoundError:
+            partition_path = _partition_record_path(
+                cfg.shared_root,
+                reference.queue_scope,
+                reference.home_machine,
+                reference.partition,
+            )
+            try:
+                slots = read_json(partition_path)["ready_partition"]["slots"]
+            except (FileNotFoundError, KeyError, TypeError, ValueError):
+                return ReadyClassificationResult("corrupt", "marker_missing_unindexed", task)
+            if isinstance(slots, list) and reference.marker_name in slots:
+                return ReadyClassificationResult("corrupt", "marker_missing_indexed", task)
+            return ReadyClassificationResult("corrupt", "marker_missing_unindexed", task)
+        except (KeyError, TypeError, ValueError):
+            return ReadyClassificationResult("corrupt", "marker_invalid", task)
+
+
 def classify_ready_marker(
     cfg: object, reference: ReadyMarkerRef,
 ) -> ReadyClassificationResult:
@@ -1541,6 +1614,13 @@ def classify_ready_marker(
         return ReadyClassificationResult("corrupt", "marker_identity_invalid")
     try:
         marker = read_json(_marker_path(cfg.shared_root, reference))["ready_marker"]
+    except FileNotFoundError:
+        marker = _recheck_missing_ready_marker(cfg, reference)
+        if isinstance(marker, ReadyClassificationResult):
+            return marker
+    except (KeyError, TypeError, ValueError):
+        return ReadyClassificationResult("corrupt", "marker_invalid")
+    try:
         required = {
             "schema_version", "task_id", "generation", "source_transition",
             "source_revision", "target_revision", "queue_scope", "home_machine",
@@ -1555,7 +1635,7 @@ def classify_ready_marker(
             or marker["home_machine"] != reference.home_machine
         ):
             raise ValueError("ready marker identity is inconsistent.")
-    except (FileNotFoundError, KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError):
         return ReadyClassificationResult("corrupt", "marker_invalid")
     task_file = task_path(cfg.shared_root, reference.task_id)
     if not task_file.exists():

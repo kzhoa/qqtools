@@ -16,11 +16,13 @@ from qqtools.plugins.qexp.runtime.ready import (
     assert_ready_writer_compatible,
     classify_ready_marker,
     next_ready_marker,
+    peek_ready_marker,
     read_ready_index_state,
 )
 from qqtools.plugins.qexp.runtime.records import TaskRecord
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
+from qqtools.plugins.qexp.runtime.work_budget import SliceBudget, WorkBudgetPolicy
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -271,6 +273,74 @@ def test_partition_removal_recheck_avoids_false_degradation(tmp_path: Path) -> N
     thread.join(timeout=5)
 
     assert not thread.is_alive()
+    assert read_ready_index_state(cfg) == "active"
+
+
+def test_peek_partition_removal_recheck_avoids_false_degradation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "removed"], task_id="removed-task")
+    _finish_build(cfg)
+    reference = _ready_reference(cfg, load_task(cfg, task.task_id))
+    route_key = f"home.{cfg.machine_name}"
+    route_lock = shared_paths(cfg.shared_root)["ready_locks"] / f"{route_key}.lock"
+    partition_path = (
+        shared_paths(cfg.shared_root)["ready_home"]
+        / cfg.machine_name
+        / reference.partition
+        / "partition.json"
+    )
+    catalog_path = (
+        shared_paths(cfg.shared_root)["ready_catalogs"]
+        / route_key
+        / f"{reference.catalog_page:016d}.json"
+    )
+    catalog_read = threading.Event()
+    continue_read = threading.Event()
+    result = []
+    from qqtools.plugins.qexp.runtime import ready
+
+    original_read_json = ready.read_json
+    did_pause = False
+
+    def pause_after_catalog_read(path):
+        nonlocal did_pause
+        value = original_read_json(path)
+        if (
+            path == catalog_path
+            and threading.current_thread().name == "peek-reader"
+            and not did_pause
+        ):
+            did_pause = True
+            catalog_read.set()
+            assert continue_read.wait(timeout=5)
+        return value
+
+    monkeypatch.setattr(ready, "read_json", pause_after_catalog_read)
+
+    def read_candidate() -> None:
+        result.append(peek_ready_marker(
+            cfg,
+            project_id(cfg.shared_root),
+            "home",
+            None,
+            SliceBudget(WorkBudgetPolicy(soft_deadline_ms=60_000)),
+        ))
+
+    thread = threading.Thread(target=read_candidate, name="peek-reader")
+    thread.start()
+    assert catalog_read.wait(timeout=1)
+    with exclusive(route_lock):
+        partition_path.unlink()
+        catalog = read_json(catalog_path)
+        catalog["ready_catalog"]["partitions"].remove(reference.partition)
+        atomic_replace(catalog_path, catalog)
+    continue_read.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert result and not result[0].unresolved
     assert read_ready_index_state(cfg) == "active"
 
 

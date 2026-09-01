@@ -752,6 +752,42 @@ def test_degraded_ready_index_fails_closed_for_new_claims(tmp_path: Path) -> Non
     ) == []
 
 
+def test_claim_race_does_not_degrade_ready_index_or_block_other_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
+    )
+    raced = submit(cfg, ["echo", "raced"], task_id="task-a-raced")
+    unrelated = submit(cfg, ["echo", "unrelated"], task_id="task-b-unrelated")
+    _activate_ready(cfg)
+    from qqtools.plugins.qexp import scheduler
+
+    original_classify = scheduler.classify_ready_marker
+    did_claim = False
+
+    def claim_before_classify(config, reference):
+        nonlocal did_claim
+        if reference.task_id == raced.task_id and not did_claim:
+            did_claim = True
+            assert claim_task(config, raced.task_id, [1]) is not None
+        return original_classify(config, reference)
+
+    monkeypatch.setattr(scheduler, "classify_ready_marker", claim_before_classify)
+
+    launched = run_dispatch_cycle(
+        cfg,
+        available_gpus=[0],
+        should_recover_starting=False,
+        max_new_claims=1,
+        work_budget=SliceBudget(WorkBudgetPolicy(soft_deadline_ms=60_000)),
+    )
+
+    assert did_claim
+    assert launched == [unrelated.task_id]
+    assert read_json(ready_state_path(cfg.shared_root))["ready_index"]["state"] == "active"
+
+
 def test_slow_ready_reads_shrink_the_process_local_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
