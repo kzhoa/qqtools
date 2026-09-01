@@ -60,5 +60,4 @@ non-editable release artifact rather than a checkout or arbitrary installed pack
 workflow is the release gate that runs this installed-wheel E2E against the exact tagged artifact.
 
 `CONTRACT_MATRIX.md` tracks public behavior and links it to protecting tests.
-`TODOLIST.md` tracks unfinished test work. Coverage reports only show executed
-code and do not prove public behavior is protected.
+Coverage reports only show executed code and do not prove public behavior is protected.
