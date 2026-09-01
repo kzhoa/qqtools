@@ -42,12 +42,21 @@ For qexp, use these stable module entry points:
 tox run -e qexp-unit
 tox run -e qexp-integration
 tox run -e qexp-full
+tox run -e qexp-fast
+tox run -e qexp-machine-lab
+tox run -e qexp-host-exclusive
+tox run -e qexp-stress
 ```
 
 During development, run `qexp-unit` and the specific integration files that protect the changed
 behavior. `qexp-integration` is the complete integration layer, while `qexp-full` combines all
 qexp unit and integration tests for release validation. Pull-request CI does not run the complete
 qexp integration layer; the publish gate does.
+
+`qexp-fast` contains all qexp unit tests plus explicitly admitted hermetic integration contracts;
+it has a 90-second CI hard limit. `qexp-machine-lab` and `qexp-host-exclusive` are merge evidence.
+`qexp-stress` runs only in the scheduled nightly workflow. That workflow also measures twenty
+`qexp-fast` runs, uploads their durations, and enforces the 60-second p95 budget.
 
 Default pytest collection excludes `tests/e2e/qexp`. `tox run -e release-e2e`
 builds and validates a wheel from the current checkout; use
