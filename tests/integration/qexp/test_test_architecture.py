@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from tests.qexp_test_support import TestResourceScope
+from tests.qexp_architecture import SingleHostMachineLab
 
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -63,7 +64,9 @@ with runtime.scheduler_authority(blocking=False) as acquired:
         while any(not path.exists() for path in result_paths) and time.monotonic() < deadline:
             time.sleep(0.01)
         assert all(path.exists() for path in result_paths)
-        acquired = [json.loads(path.read_text(encoding="utf-8"))["acquired"] for path in result_paths]
+        acquired = [
+            json.loads(path.read_text(encoding="utf-8"))["acquired"] for path in result_paths
+        ]
         assert acquired == [True, True]
     finally:
         for process in processes:
@@ -74,3 +77,22 @@ with runtime.scheduler_authority(blocking=False) as acquired:
             except subprocess.TimeoutExpired:
                 process.terminate()
                 process.wait(timeout=1.0)
+
+
+@pytest.mark.machine_lab
+def test_machine_lab_participants_have_independent_local_identity(tmp_path: Path) -> None:
+    lab = SingleHostMachineLab(tmp_path, "machine-lab-identity")
+    first = lab.start("first")
+    second = lab.start("second")
+
+    try:
+        first_identity = first.request("identity")
+        second_identity = second.request("identity")
+        assert first_identity["pid"] != second_identity["pid"]
+        assert first_identity["tmpdir"] != second_identity["tmpdir"]
+        assert first_identity["runtime_root"] != second_identity["runtime_root"]
+        assert lab.shared_root.exists()
+        assert first.request("scheduler_authority")["acquired"] is True
+        assert second.request("scheduler_authority")["acquired"] is True
+    finally:
+        lab.close()
