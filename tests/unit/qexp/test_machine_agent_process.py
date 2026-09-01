@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
+
+import pytest
 
 from qqtools.plugins.qexp.machine_agent_process import spawn_machine_agent_process
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 
 
-def test_machine_agent_default_stderr_does_not_create_an_unread_pipe(
+def test_machine_agent_default_stderr_captures_startup_errors_without_a_pipe(
     tmp_path: Path, monkeypatch
 ) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
@@ -36,4 +37,26 @@ def test_machine_agent_default_stderr_does_not_create_an_unread_pipe(
     )
 
     assert spawn_machine_agent_process(runtime).pid == FakeProcess.pid
-    assert captured["stderr"] is subprocess.DEVNULL
+    assert captured["stderr"] is not None
+
+
+def test_machine_agent_startup_error_includes_child_failure(tmp_path: Path, monkeypatch) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+
+    class FakeProcess:
+        pid = 123
+
+        def poll(self) -> int:
+            return 1
+
+    def start_process(*_args, **kwargs) -> FakeProcess:
+        kwargs["stderr"].write("RuntimeError: machine scheduler authority is already held.\n")
+        kwargs["stderr"].flush()
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.machine_agent_process.subprocess.Popen", start_process
+    )
+
+    with pytest.raises(RuntimeError, match="machine scheduler authority is already held"):
+        spawn_machine_agent_process(runtime)
