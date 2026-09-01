@@ -13,6 +13,7 @@ permissions:
 jobs:
   unit:
     name: unit (Python ${{ matrix.python-version }})
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -28,6 +29,7 @@ jobs:
 
   integration:
     name: integration
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +42,7 @@ jobs:
 
   qexp-fast:
     name: qexp-fast
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +50,51 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip tox
-      - run: tox run -e qexp-fast
+      - run: timeout 90 tox run -e qexp-fast
+
+  qexp-fast-baseline:
+    name: qexp-fast-baseline
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip tox
+      - name: Measure twenty qexp-fast runs
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          for run in $(seq 1 20); do
+            started=$(date +%s)
+            timeout 90 tox run -e qexp-fast
+            finished=$(date +%s)
+            printf '%s\n' "$((finished - started))" >> test-results/qexp-fast-seconds.txt
+          done
+      - name: Enforce qexp-fast p95 budget
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          durations = sorted(
+              int(line)
+              for line in Path("test-results/qexp-fast-seconds.txt").read_text().splitlines()
+          )
+          if len(durations) != 20:
+              raise SystemExit("qexp-fast baseline must contain exactly twenty runs")
+          p95 = durations[18]
+          print(f"qexp-fast durations: {durations}; p95={p95}s")
+          if p95 > 60:
+              raise SystemExit(f"qexp-fast p95 budget exceeded: {p95}s > 60s")
+          PY
+      - name: Upload qexp-fast baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: qexp-fast-baseline
+          retention-days: 30
+          path: test-results/qexp-fast-seconds.txt
 
   qexp-machine-lab:
     name: qexp-machine-lab
@@ -76,6 +123,7 @@ jobs:
 
   e2e:
     name: e2e
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
