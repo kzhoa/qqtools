@@ -4,9 +4,12 @@ import pytest
 
 from tests.qexp_architecture import (
     InjectedProtocolError,
+    ProtocolDisposition,
     ProtocolPoint,
     QexpReferenceModel,
     ScenarioRunner,
+    SimulatedParticipantCrash,
+    SimulatedProtocolPause,
     SimulatedRuntime,
     TraceEnvelope,
 )
@@ -31,7 +34,10 @@ def test_simulated_runtime_records_and_injects_protocol_fault() -> None:
         runtime.yield_at(ProtocolPoint.ATOMIC_REPLACE, participant="machine-a")
 
     replay = TraceEnvelope.from_json(runtime.trace.to_json())
-    assert replay.events[-1].payload == {"point": ProtocolPoint.ATOMIC_REPLACE}
+    assert replay.events[-1].payload == {
+        "point": ProtocolPoint.ATOMIC_REPLACE,
+        "disposition": ProtocolDisposition.CONTINUE,
+    }
     assert replay.events[-1].participant == "machine-a"
 
 
@@ -98,3 +104,22 @@ def test_reference_model_cancel_linearizes_against_launch_authorization() -> Non
     assert model.cancel("task-1") is None
     assert model.authorize_launch("task-1", token) is None
     assert model.task_state("task-1") == "cancelled"
+
+
+def test_simulated_runtime_schedules_a_cas_conflict_without_overwriting_truth() -> None:
+    runtime = SimulatedRuntime()
+    runtime.schedule(ProtocolPoint.CAS, ProtocolDisposition.CONFLICT)
+
+    assert runtime.cas("task", None, {"state": "queued"}) is None
+    assert runtime.read("task") is None
+
+
+def test_simulated_runtime_exposes_pause_and_crash_at_explicit_boundaries() -> None:
+    runtime = SimulatedRuntime()
+    runtime.schedule(ProtocolPoint.LOCK_ACQUIRE, ProtocolDisposition.PAUSE)
+    runtime.schedule(ProtocolPoint.PROCESS_CREATE, ProtocolDisposition.CRASH)
+
+    with pytest.raises(SimulatedProtocolPause, match="lock_acquire"):
+        runtime.acquire("scheduler")
+    with pytest.raises(SimulatedParticipantCrash, match="process_create"):
+        runtime.yield_at(ProtocolPoint.PROCESS_CREATE, participant="machine-a")

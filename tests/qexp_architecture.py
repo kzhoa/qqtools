@@ -39,6 +39,23 @@ class InjectedProtocolError(RuntimeError):
     """Raised when a scheduled protocol fault is reached."""
 
 
+class SimulatedProtocolPause(RuntimeError):
+    """Raised when an interleaving pauses one simulated participant."""
+
+
+class SimulatedParticipantCrash(RuntimeError):
+    """Raised when an interleaving crashes one simulated participant."""
+
+
+class ProtocolDisposition(StrEnum):
+    """The scheduled outcome for one explicit protocol yield point."""
+
+    CONTINUE = "continue"
+    CONFLICT = "conflict"
+    PAUSE = "pause"
+    CRASH = "crash"
+
+
 @dataclass(frozen=True, slots=True)
 class TraceEvent:
     """One replayable test action or protocol observation."""
@@ -266,6 +283,7 @@ class SimulatedRuntime:
         self._records: dict[str, RevisionedValue] = {}
         self._locks: set[str] = set()
         self._faults: dict[ProtocolPoint, list[BaseException]] = {}
+        self._dispositions: dict[ProtocolPoint, list[ProtocolDisposition]] = {}
 
     def advance(self, seconds: float) -> None:
         if seconds < 0:
@@ -276,18 +294,41 @@ class SimulatedRuntime:
     def inject_fault(self, point: ProtocolPoint, error: BaseException | None = None) -> None:
         self._faults.setdefault(point, []).append(error or InjectedProtocolError(point))
 
-    def yield_at(self, point: ProtocolPoint, *, participant: str | None = None) -> None:
-        self.trace.record("protocol.yield", {"point": point}, self.clock, participant)
+    def schedule(self, point: ProtocolPoint, disposition: ProtocolDisposition) -> None:
+        """Schedule one deterministic interleaving outcome at a protocol point."""
+        self._dispositions.setdefault(point, []).append(disposition)
+
+    def yield_at(
+        self,
+        point: ProtocolPoint,
+        *,
+        participant: str | None = None,
+    ) -> ProtocolDisposition:
+        """Record and apply one scheduled protocol boundary outcome."""
+        disposition = self._next_disposition(point)
+        self.trace.record(
+            "protocol.yield",
+            {"point": point, "disposition": disposition},
+            self.clock,
+            participant,
+        )
         faults = self._faults.get(point)
         if faults:
             raise faults.pop(0)
+        if disposition == ProtocolDisposition.PAUSE:
+            raise SimulatedProtocolPause(f"paused at {point}")
+        if disposition == ProtocolDisposition.CRASH:
+            raise SimulatedParticipantCrash(f"crashed at {point}")
+        return disposition
 
     def read(self, key: str) -> RevisionedValue | None:
         self.yield_at(ProtocolPoint.SNAPSHOT_READ)
         return self._records.get(key)
 
     def cas(self, key: str, revision: int | None, value: Any) -> RevisionedValue | None:
-        self.yield_at(ProtocolPoint.CAS)
+        if self.yield_at(ProtocolPoint.CAS) == ProtocolDisposition.CONFLICT:
+            self.trace.record("store.conflict", {"key": key, "revision": revision}, self.clock)
+            return None
         current = self._records.get(key)
         if (current.revision if current else None) != revision:
             self.trace.record("store.conflict", {"key": key, "revision": revision}, self.clock)
@@ -298,7 +339,8 @@ class SimulatedRuntime:
         return next_value
 
     def acquire(self, name: str) -> bool:
-        self.yield_at(ProtocolPoint.LOCK_ACQUIRE)
+        if self.yield_at(ProtocolPoint.LOCK_ACQUIRE) == ProtocolDisposition.CONFLICT:
+            return False
         if name in self._locks:
             return False
         self._locks.add(name)
@@ -306,6 +348,12 @@ class SimulatedRuntime:
 
     def release(self, name: str) -> None:
         self._locks.discard(name)
+
+    def _next_disposition(self, point: ProtocolPoint) -> ProtocolDisposition:
+        dispositions = self._dispositions.get(point)
+        if not dispositions:
+            return ProtocolDisposition.CONTINUE
+        return dispositions.pop(0)
 
 
 Action = Callable[[SimulatedRuntime], None]
