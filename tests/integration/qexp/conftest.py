@@ -38,5 +38,8 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
         if "tests/integration/qexp/" not in item.nodeid:
             continue
-        if item.get_closest_marker("host_exclusive") is None:
+        if (
+            item.get_closest_marker("host_exclusive") is None
+            and item.get_closest_marker("machine_lab") is None
+        ):
             item.add_marker(pytest.mark.hermetic)

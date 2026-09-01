@@ -20,7 +20,10 @@ filesystem. They do not certify NFS, Lustre, or any other cross-host filesystem 
 
 | Requirement | Decision evidence | Local protocol evidence | Profile / lane | Owner |
 | --- | --- | --- | --- | --- |
-| machine-local authority isolation | [test_test_architecture.py](integration/qexp/test_test_architecture.py) | [test_machine_runtime.py](integration/qexp/test_machine_runtime.py) | hermetic / qexp-fast | qexp maintainers |
+| machine-local authority isolation | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_test_architecture.py](integration/qexp/test_test_architecture.py) | hermetic / qexp-fast | qexp maintainers |
+| revisioned CAS conflict preservation | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | Pending | hermetic / qexp-fast | qexp maintainers |
+| protocol fault trace and replay envelope | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | Pending | hermetic / qexp-fast | qexp maintainers |
+| independent machine participant environment | N/A | [test_test_architecture.py](integration/qexp/test_test_architecture.py) | machine-lab / merge | qexp maintainers |
 | CW-01 Submission Operation creation | Pending | Pending | hermetic / qexp-fast | qexp maintainers |
 | CW-02 Operation before Task staging | Pending | Pending | hermetic / qexp-fast | qexp maintainers |
 | CW-03 Partial Task staging | Pending | Pending | hermetic / qexp-fast | qexp maintainers |
