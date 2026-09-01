@@ -13,6 +13,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import offer
+from qqtools.plugins.qexp.runtime.tasks import load_task
 from tests.qexp_test_support import TestResourceScope
 from tests.qexp_architecture import SingleHostMachineLab
 
@@ -155,6 +156,52 @@ def test_machine_lab_two_participants_produce_one_real_task_claim(tmp_path: Path
         assert len(claims) == 1
         assert isinstance(claims[0]["attempt_id"], str)
         assert claims[0]["fencing_token"] == 1
+    finally:
+        lab.close()
+
+
+@pytest.mark.machine_lab
+def test_machine_lab_cancel_and_launch_gate_have_one_lock_order(tmp_path: Path) -> None:
+    lab = SingleHostMachineLab(tmp_path, "machine-lab-cancel-launch")
+    cfg = init_shared_root(lab.shared_root, "gpu-1", runtime_root=tmp_path / "bootstrap-runtime")
+    create_group(cfg, "workers")
+    change_worker(cfg, "workers", "gpu-2", "add")
+    task = submit(cfg, ["echo", "race"], group="workers", sharing_mode="spillover")
+    offer(cfg, task.task_id)
+    first = lab.start("first")
+    second = lab.start("second")
+
+    try:
+        claim = first.request(
+            "claim_task",
+            payload={"machine_name": "gpu-1", "task_id": task.task_id, "gpu_ids": [0]},
+        )
+        assert claim["claimed"] is True
+        assert isinstance(claim["attempt_id"], str)
+        assert claim["fencing_token"] == 1
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            launch = executor.submit(
+                first.request,
+                "authorize_launch",
+                payload={
+                    "machine_name": "gpu-1",
+                    "task_id": task.task_id,
+                    "attempt_id": claim["attempt_id"],
+                    "fencing_token": claim["fencing_token"],
+                },
+            )
+            cancellation = executor.submit(
+                second.request,
+                "cancel_task",
+                payload={"machine_name": "gpu-2", "task_id": task.task_id},
+            )
+            launch_result = launch.result()
+            cancellation.result()
+
+        state = load_task(cfg, task.task_id).state["projection"]
+        assert launch_result["authorized"] == (state == "running")
+        assert state in {"running", "cancelled"}
     finally:
         lab.close()
 

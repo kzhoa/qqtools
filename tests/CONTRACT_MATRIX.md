@@ -42,7 +42,7 @@ filesystem. They do not certify NFS, Lustre, or any other cross-host filesystem 
 | CW-13 Orphan-token recovery | Pending | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | machine-lab / merge | qexp maintainers |
 | CW-14 Successor fencing rejects old writer | Pending | [test_cross_host_claims.py](integration/qexp/test_cross_host_claims.py) | machine-lab / merge | qexp maintainers |
 | CW-15 Worker removal race | Pending | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | machine-lab / merge | qexp maintainers |
-| CW-16 Pause/cancel launch race | Pending | [test_scheduling_pipeline.py](integration/qexp/test_scheduling_pipeline.py) | machine-lab / merge | qexp maintainers |
+| CW-16 Pause/cancel launch race | Pending | [test_test_architecture.py](integration/qexp/test_test_architecture.py) | machine-lab / merge | qexp maintainers |
 | CW-17 Recovery drain/remove race | Pending | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | machine-lab / merge | qexp maintainers |
 | CW-18 Cancellation restart | Pending | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | machine-lab / merge | qexp maintainers |
 | Protected workflows from installed wheel | N/A | N/A | [release-e2e](e2e/qexp/test_compatibility_contract.py) | qexp maintainers |
