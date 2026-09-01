@@ -7,6 +7,8 @@ from tests.qexp_architecture import (
     ProtocolDisposition,
     ProtocolPoint,
     QexpReferenceModel,
+    ReferenceCommand,
+    ReferenceScenarioRunner,
     ScenarioRunner,
     SimulatedParticipantCrash,
     SimulatedProtocolPause,
@@ -123,3 +125,28 @@ def test_simulated_runtime_exposes_pause_and_crash_at_explicit_boundaries() -> N
         runtime.acquire("scheduler")
     with pytest.raises(SimulatedParticipantCrash, match="process_create"):
         runtime.yield_at(ProtocolPoint.PROCESS_CREATE, participant="machine-a")
+
+
+def test_reference_scenario_trace_replays_serialized_commands_with_the_same_seed() -> None:
+    commands = [
+        ReferenceCommand("create_submission", submission_id="submission-1"),
+        ReferenceCommand("stage_task", task_id="task-1", submission_id="submission-1"),
+        ReferenceCommand("commit_submission", submission_id="submission-1"),
+        ReferenceCommand("claim", task_id="task-1"),
+        ReferenceCommand("authorize_launch", task_id="task-1", fencing_token=1),
+        ReferenceCommand("publish_running", task_id="task-1", fencing_token=1),
+    ]
+    runner = ReferenceScenarioRunner(seed=41)
+
+    model = runner.run(commands)
+    replayed = ReferenceScenarioRunner.replay(TraceEnvelope.from_json(runner.trace.to_json()))
+
+    assert runner.trace.seed == 41
+    assert model.task_state("task-1") == replayed.task_state("task-1") == "running"
+
+
+def test_reference_scenario_rejects_a_trace_command_with_an_invalid_fencing_token() -> None:
+    model = QexpReferenceModel()
+
+    with pytest.raises(ValueError, match="positive fencing_token"):
+        model.execute(ReferenceCommand("authorize_launch", task_id="task-1", fencing_token=0))

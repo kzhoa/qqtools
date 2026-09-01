@@ -145,6 +145,17 @@ class RevisionedValue:
 
 
 ModelTaskState = Literal["queued", "claimed", "starting", "running", "cancelled", "finished"]
+ReferenceCommandKind = Literal[
+    "create_submission",
+    "commit_submission",
+    "abort_submission",
+    "stage_task",
+    "claim",
+    "cancel",
+    "authorize_launch",
+    "publish_running",
+    "publish_terminal",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +176,36 @@ class ModelTask:
     state: ModelTaskState = "queued"
     fencing_token: int = 0
     has_cancellation_requested: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceCommand:
+    """Serializable reference-model action used by generated scenarios and replay."""
+
+    kind: ReferenceCommandKind
+    task_id: str | None = None
+    submission_id: str | None = None
+    fencing_token: int | None = None
+    is_cancelled: bool = False
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "task_id": self.task_id,
+            "submission_id": self.submission_id,
+            "fencing_token": self.fencing_token,
+            "is_cancelled": self.is_cancelled,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "ReferenceCommand":
+        return cls(
+            kind=payload["kind"],
+            task_id=payload.get("task_id"),
+            submission_id=payload.get("submission_id"),
+            fencing_token=payload.get("fencing_token"),
+            is_cancelled=payload.get("is_cancelled", False),
+        )
 
 
 class QexpReferenceModel:
@@ -250,6 +291,37 @@ class QexpReferenceModel:
     def task_state(self, task_id: str) -> ModelTaskState:
         return self._task(task_id).state
 
+    def execute(self, command: ReferenceCommand) -> bool | int | ModelEffectPlan | None:
+        """Apply one serializable command and return its normalized model outcome."""
+        if command.kind == "create_submission":
+            self.create_submission(self._required_text(command.submission_id, "submission_id"))
+            return None
+        if command.kind == "commit_submission":
+            self.commit_submission(self._required_text(command.submission_id, "submission_id"))
+            return None
+        if command.kind == "abort_submission":
+            self.abort_submission(self._required_text(command.submission_id, "submission_id"))
+            return None
+        if command.kind == "stage_task":
+            self.stage_task(
+                self._required_text(command.task_id, "task_id"),
+                self._required_text(command.submission_id, "submission_id"),
+            )
+            return None
+        task_id = self._required_text(command.task_id, "task_id")
+        if command.kind == "claim":
+            return self.claim(task_id)
+        if command.kind == "cancel":
+            return self.cancel(task_id)
+        fencing_token = self._required_token(command.fencing_token)
+        if command.kind == "authorize_launch":
+            return self.authorize_launch(task_id, fencing_token)
+        if command.kind == "publish_running":
+            return self.publish_running(task_id, fencing_token)
+        if command.kind == "publish_terminal":
+            return self.publish_terminal(task_id, fencing_token, cancelled=command.is_cancelled)
+        raise ValueError(f"unsupported reference command: {command.kind}")
+
     def assert_invariants(self) -> None:
         for task in self._tasks.values():
             submission_state = self._submission_states[task.submission_id]
@@ -271,6 +343,57 @@ class QexpReferenceModel:
             return self._tasks[task_id]
         except KeyError as exc:
             raise ValueError(f"task does not exist: {task_id}") from exc
+
+    @staticmethod
+    def _required_text(value: str | None, field_name: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"reference command requires a non-empty {field_name}")
+        return value
+
+    @staticmethod
+    def _required_token(value: int | None) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError("reference command requires a positive fencing_token")
+        return value
+
+
+class ReferenceScenarioRunner:
+    """Runs and replays serialized reference-model commands with a trace envelope."""
+
+    def __init__(self, *, seed: int) -> None:
+        self.seed = seed
+        self.trace = TraceEnvelope("qexp-reference-model/v1", seed)
+
+    def run(self, commands: Iterable[ReferenceCommand]) -> QexpReferenceModel:
+        model = QexpReferenceModel()
+        for index, command in enumerate(commands):
+            self.trace.record("model.command", command.to_payload(), float(index))
+            result = model.execute(command)
+            self.trace.record("model.result", _reference_result_payload(result), float(index))
+        model.assert_invariants()
+        return model
+
+    @classmethod
+    def replay(cls, trace: TraceEnvelope) -> QexpReferenceModel:
+        if trace.scenario_version != "qexp-reference-model/v1":
+            raise ValueError("trace does not contain a reference-model scenario")
+        commands = [
+            ReferenceCommand.from_payload(event.payload)
+            for event in trace.events
+            if event.kind == "model.command"
+        ]
+        return cls(seed=trace.seed).run(commands)
+
+
+def _reference_result_payload(result: bool | int | ModelEffectPlan | None) -> dict[str, Any]:
+    """Convert a reference-model outcome into trace-safe JSON data."""
+    if isinstance(result, ModelEffectPlan):
+        return {
+            "effect": result.kind,
+            "task_id": result.task_id,
+            "fencing_token": result.fencing_token,
+        }
+    return {"result": result}
 
 
 class SimulatedRuntime:
