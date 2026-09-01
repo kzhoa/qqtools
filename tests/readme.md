@@ -41,13 +41,12 @@ For qexp, use these stable module entry points:
 ```bash
 tox run -e qexp-unit
 tox run -e qexp-integration
-tox run -e qexp-full
 tox run -e qexp-machine-lab
 ```
 
 During development, run `qexp-unit` and the specific integration files that protect the changed
-behavior. `qexp-integration` is the complete integration layer, while `qexp-full` combines all
-qexp unit and integration tests for release validation. `preflight` is the local push gate.
+behavior. `qexp-integration` is the complete qexp integration layer. `preflight` is the local
+push gate.
 
 Main CI runs only installed-artifact evidence. The canonical Python runs `artifact-e2e`; declared
 non-canonical Python versions run `artifact-smoke`. Unit and Integration evidence belongs to the

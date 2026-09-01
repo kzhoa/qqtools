@@ -172,7 +172,7 @@ class TestResourceScope:
             elif _is_process_group_alive(pgid):
                 violations.append(f"participant process group {pgid} remains alive: {ledger_path}")
 
-        for diagnostic_path in sorted(test_root.rglob("diagnostics/*.json")):
+        for diagnostic_path in sorted((test_root / "diagnostics").glob("*.json")):
             try:
                 payload = json.loads(diagnostic_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:

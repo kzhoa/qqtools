@@ -57,6 +57,16 @@ def test_resource_scope_records_test_owned_resources_and_cleanup_diagnostics(
     qexp_resource_scope.consume_cleanup_diagnostic(diagnostic)
 
 
+def test_resource_scope_ignores_runtime_diagnostics(
+    qexp_resource_scope: TestResourceScope,
+) -> None:
+    runtime_diagnostic = qexp_resource_scope.runtime_root / "diagnostics" / "scheduler-cycle.json"
+    runtime_diagnostic.parent.mkdir(parents=True, exist_ok=True)
+    runtime_diagnostic.write_text('{"scheduler_diagnostic": {}}', encoding="utf-8")
+
+    assert TestResourceScope.cleanup_violations(qexp_resource_scope.root) == []
+
+
 def test_resource_scope_reports_an_active_test_owned_tmux_socket(
     qexp_resource_scope: TestResourceScope,
 ) -> None:

@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     _check_lazy_export_stubs()
     _run("tox", "run", "-e", "unit")
     _run("tox", "run", "-e", "integration")
-    _run("tox", "run", "-e", "qexp-full")
+    _run("tox", "run", "-e", "qexp-integration")
     _run("tox", "run", "-e", "release-e2e")
     print(f"Release preflight passed for {target}.")
     return 0
