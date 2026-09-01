@@ -1992,9 +1992,16 @@ unresolved action rather than reporting generic inconsistency.
 
 ## 21. Verification Requirements
 
+The project verifies its coordination protocol on one development machine using independent
+processes with isolated local runtime resources and one shared POSIX project root. This evidence
+does not certify cache consistency, lock-service behavior, or failure modes of NFS, Lustre, or
+other cross-host shared filesystems. Those profiles require separate deployment validation before
+they can be claimed as supported coordination environments.
+
 The runtime implementation is not releasable until tests demonstrate:
 
-- exclusive Task claims across separate processes and target hosts
+- exclusive Task claims across separate local processes; supported cross-host profiles require
+  separate deployment validation
 - home-versus-fallback claim races produce one active Attempt
 - pause and cancellation linearize against the final launch gate
 - stale fencing tokens cannot mutate Task or Attempt truth
