@@ -75,6 +75,69 @@ def evaluate_primary_candidate(
 
 
 @dataclass(frozen=True, slots=True)
+class PrimaryProbeRouteState:
+    """The persisted cursor and revision for one primary ready route."""
+
+    cursor: object | None
+    revision: int | None
+    is_complete: bool
+
+    def __post_init__(self) -> None:
+        if self.revision is not None and self.revision < 0:
+            raise ValueError("ready route revision must not be negative.")
+
+
+@dataclass(frozen=True, slots=True)
+class PrimaryProbeRouteDecision:
+    """The pure revision reduction before or after one route scan."""
+
+    state: PrimaryProbeRouteState
+    should_scan: bool
+    has_index_changed: bool = False
+
+
+def begin_primary_probe_route(
+    state: PrimaryProbeRouteState,
+    observed_revision: int | None,
+) -> PrimaryProbeRouteDecision:
+    """Reduce route state before scanning, using a revision when one was read."""
+    if state.is_complete:
+        if observed_revision is None:
+            raise ValueError("a completed route requires an observed revision.")
+        if observed_revision != state.revision:
+            return PrimaryProbeRouteDecision(
+                PrimaryProbeRouteState(None, observed_revision, False),
+                should_scan=False,
+                has_index_changed=True,
+            )
+        return PrimaryProbeRouteDecision(state, should_scan=False)
+    if state.cursor is None or state.revision is None:
+        if observed_revision is None:
+            raise ValueError("an uninitialized route requires an observed revision.")
+        return PrimaryProbeRouteDecision(
+            PrimaryProbeRouteState(state.cursor, observed_revision, False),
+            should_scan=True,
+        )
+    return PrimaryProbeRouteDecision(state, should_scan=True)
+
+
+def finish_primary_probe_route(
+    state: PrimaryProbeRouteState,
+    observed_revision: int,
+) -> PrimaryProbeRouteDecision:
+    """Reduce a completed scan against the route revision observed afterward."""
+    if not state.is_complete:
+        raise ValueError("only a completed route scan can be finalized.")
+    if observed_revision != state.revision:
+        return PrimaryProbeRouteDecision(
+            PrimaryProbeRouteState(None, observed_revision, False),
+            should_scan=False,
+            has_index_changed=True,
+        )
+    return PrimaryProbeRouteDecision(state, should_scan=False)
+
+
+@dataclass(frozen=True, slots=True)
 class MachineDispatchSnapshot:
     """Validated inputs required to choose dispatch order and admission roles."""
 

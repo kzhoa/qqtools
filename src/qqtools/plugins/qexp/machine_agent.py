@@ -19,8 +19,11 @@ from .machine_runtime import MachineRuntime, ProjectBinding
 from .machine_dispatch_plan import (
     MachineDispatchSnapshot,
     PrimaryCandidateObservation,
+    PrimaryProbeRouteState,
+    begin_primary_probe_route,
     build_machine_dispatch_plan,
     evaluate_primary_candidate,
+    finish_primary_probe_route,
     order_dispatch_project_ids,
     reduce_dispatch_cursor,
 )
@@ -117,7 +120,12 @@ def _probe_primary_demand(
         for scope in ("shared", "home"):
             cursor_key = (project_id, scope)
             cursor = runtime.primary_probe_cursors.get(cursor_key)
-            if runtime.primary_probe_complete.get(cursor_key, False):
+            route_state = PrimaryProbeRouteState(
+                cursor,
+                runtime.primary_probe_revisions.get(cursor_key),
+                runtime.primary_probe_complete.get(cursor_key, False),
+            )
+            if route_state.is_complete:
                 try:
                     current_revision = ready_index_route_revision(
                         cfg, scope, budget, primary_only=True
@@ -130,16 +138,17 @@ def _probe_primary_demand(
                     diagnostics.append({"project_id": project_id,
                                         "reason": f"index_unreadable:{exc}"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                if current_revision != runtime.primary_probe_revisions.get(cursor_key):
-                    runtime.primary_probe_cursors[cursor_key] = None
-                    runtime.primary_probe_revisions[cursor_key] = current_revision
-                    runtime.primary_probe_complete[cursor_key] = False
+                decision = begin_primary_probe_route(route_state, current_revision)
+                runtime.primary_probe_cursors[cursor_key] = decision.state.cursor
+                runtime.primary_probe_revisions[cursor_key] = decision.state.revision
+                runtime.primary_probe_complete[cursor_key] = decision.state.is_complete
+                if decision.has_index_changed:
                     diagnostics.append({"project_id": project_id,
                                         "reason": "ready_index_changed"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                continue
-            previous_revision = runtime.primary_probe_revisions.get(cursor_key)
-            if cursor is None or previous_revision is None:
+                if not decision.should_scan:
+                    continue
+            if route_state.cursor is None or route_state.revision is None:
                 try:
                     start_revision = ready_index_route_revision(
                         cfg, scope, budget, primary_only=True
@@ -152,9 +161,11 @@ def _probe_primary_demand(
                     diagnostics.append({"project_id": project_id,
                                         "reason": f"index_unreadable:{exc}"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                runtime.primary_probe_revisions[cursor_key] = start_revision
+                decision = begin_primary_probe_route(route_state, start_revision)
+                runtime.primary_probe_revisions[cursor_key] = decision.state.revision
+                cursor = decision.state.cursor
             else:
-                start_revision = previous_revision
+                start_revision = route_state.revision
             runtime.primary_probe_complete[cursor_key] = False
             while True:
                 cursor_before = cursor
@@ -275,10 +286,18 @@ def _probe_primary_demand(
                 diagnostics.append({"project_id": project_id,
                                     "reason": f"index_unreadable:{exc}"})
                 return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-            if end_revision != start_revision:
-                runtime.primary_probe_cursors[cursor_key] = None
-                runtime.primary_probe_revisions[cursor_key] = end_revision
-                runtime.primary_probe_complete[cursor_key] = False
+            decision = finish_primary_probe_route(
+                PrimaryProbeRouteState(
+                    runtime.primary_probe_cursors.get(cursor_key),
+                    start_revision,
+                    runtime.primary_probe_complete.get(cursor_key, False),
+                ),
+                end_revision,
+            )
+            runtime.primary_probe_cursors[cursor_key] = decision.state.cursor
+            runtime.primary_probe_revisions[cursor_key] = decision.state.revision
+            runtime.primary_probe_complete[cursor_key] = decision.state.is_complete
+            if decision.has_index_changed:
                 diagnostics.append({"project_id": project_id,
                                     "reason": "ready_index_changed"})
                 return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
