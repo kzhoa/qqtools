@@ -12,6 +12,66 @@ PrimaryDemandState = Literal[
     "no_primary_demand",
     "unresolved",
 ]
+PrimaryCandidateOutcome = Literal["skip", "runnable_now", "waiting_for_aggregation"]
+
+
+@dataclass(frozen=True, slots=True)
+class PrimaryCandidateObservation:
+    """Validated candidate facts used to reduce primary demand."""
+
+    is_eligible: bool
+    has_primary_group_worker: bool
+    working_directory_reason: str | None
+    requested_gpus: int
+    visible_gpu_count: int
+    free_gpu_count: int
+    group_gpu_limit: int | None = None
+    group_gpu_usage: int = 0
+
+    def __post_init__(self) -> None:
+        if self.requested_gpus < 1:
+            raise ValueError("requested GPU count must be positive.")
+        if self.visible_gpu_count < 0 or self.free_gpu_count < 0:
+            raise ValueError("GPU counts must not be negative.")
+        if self.free_gpu_count > self.visible_gpu_count:
+            raise ValueError("free GPU count must not exceed visible GPU count.")
+        if self.group_gpu_limit is not None and self.group_gpu_limit < 0:
+            raise ValueError("group GPU limit must not be negative.")
+        if self.group_gpu_usage < 0:
+            raise ValueError("group GPU usage must not be negative.")
+
+
+@dataclass(frozen=True, slots=True)
+class PrimaryCandidateDecision:
+    """The pure primary-demand result for one ready candidate."""
+
+    outcome: PrimaryCandidateOutcome
+    reason: str | None = None
+
+
+def evaluate_primary_candidate(
+    observation: PrimaryCandidateObservation,
+) -> PrimaryCandidateDecision:
+    """Reduce validated candidate facts without reading runtime state."""
+    if not observation.is_eligible:
+        return PrimaryCandidateDecision("skip", "placement_rejected")
+    if not observation.has_primary_group_worker:
+        return PrimaryCandidateDecision("skip")
+    if observation.working_directory_reason is not None:
+        return PrimaryCandidateDecision(
+            "skip", f"working_directory:{observation.working_directory_reason}"
+        )
+    if (
+        observation.group_gpu_limit is not None
+        and observation.requested_gpus
+        > observation.group_gpu_limit - observation.group_gpu_usage
+    ):
+        return PrimaryCandidateDecision("skip", "group_gpu_limit_reached")
+    if observation.requested_gpus > observation.visible_gpu_count:
+        return PrimaryCandidateDecision("skip", "exceeds_machine_capacity")
+    if observation.requested_gpus <= observation.free_gpu_count:
+        return PrimaryCandidateDecision("runnable_now")
+    return PrimaryCandidateDecision("waiting_for_aggregation")
 
 
 @dataclass(frozen=True, slots=True)

@@ -18,7 +18,9 @@ from .executor import Executor
 from .machine_runtime import MachineRuntime, ProjectBinding
 from .machine_dispatch_plan import (
     MachineDispatchSnapshot,
+    PrimaryCandidateObservation,
     build_machine_dispatch_plan,
+    evaluate_primary_candidate,
     order_dispatch_project_ids,
     reduce_dispatch_cursor,
 )
@@ -212,6 +214,7 @@ def _probe_primary_demand(
                         "reason": "placement_rejected",
                     })
                     continue
+                has_primary_group_worker = True
                 if task.group_name is not None:
                     try:
                         group = read_json(cfg.shared_root / "groups" / f"{task.group_name}.json")
@@ -223,42 +226,43 @@ def _probe_primary_demand(
                         return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                     worker = group["group"]["worker_set"].get(cfg.machine_name)
                     if worker is None or worker["scheduling_role"] != "primary":
-                        continue
-                reason = _working_directory_reason(task.spec)
-                if reason is not None:
-                    diagnostics.append({
-                        "project_id": project_id,
-                        "task_id": task.task_id,
-                        "reason": f"working_directory:{reason}",
-                    })
-                    continue
-                requested = task.spec.requested_gpus
-                gpu_limit_gpus = worker["gpu_limit_gpus"] if task.group_name is not None else None
-                if gpu_limit_gpus is not None:
-                    usage = sum(
+                        has_primary_group_worker = False
+                group_gpu_limit = (
+                    worker["gpu_limit_gpus"]
+                    if task.group_name is not None and has_primary_group_worker
+                    else None
+                )
+                group_gpu_usage = 0
+                if group_gpu_limit is not None:
+                    group_gpu_usage = sum(
                         len(reservation.get("gpu_ids", []))
                         for reservation in reservations
                         if reservation.get("project_id") == project_id
                         and reservation.get("group_name") == task.group_name
                         and reservation.get("machine_name") == cfg.machine_name
                     )
-                    if requested > gpu_limit_gpus - usage:
-                        diagnostics.append({
-                            "project_id": project_id,
-                            "task_id": task.task_id,
-                            "reason": "group_gpu_limit_reached",
-                        })
-                        continue
-                if requested > len(visible):
+                decision = evaluate_primary_candidate(
+                    PrimaryCandidateObservation(
+                        is_eligible=is_eligible,
+                        has_primary_group_worker=has_primary_group_worker,
+                        working_directory_reason=_working_directory_reason(task.spec),
+                        requested_gpus=task.spec.requested_gpus,
+                        visible_gpu_count=len(visible),
+                        free_gpu_count=len(free),
+                        group_gpu_limit=group_gpu_limit,
+                        group_gpu_usage=group_gpu_usage,
+                    )
+                )
+                if decision.reason is not None:
                     diagnostics.append({
                         "project_id": project_id,
                         "task_id": task.task_id,
-                        "reason": "exceeds_machine_capacity",
+                        "reason": decision.reason,
                     })
-                    continue
-                if requested <= len(free):
+                if decision.outcome == "runnable_now":
                     return PrimaryDemandProbe("runnable_now", tuple(diagnostics[-32:]))
-                waiting = True
+                if decision.outcome == "waiting_for_aggregation":
+                    waiting = True
             try:
                 end_revision = ready_index_route_revision(
                     cfg, scope, budget, primary_only=True

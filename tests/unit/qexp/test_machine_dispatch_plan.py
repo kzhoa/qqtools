@@ -5,7 +5,9 @@ import pytest
 from qqtools.plugins.qexp.machine_dispatch_plan import (
     MachineDispatchPlan,
     MachineDispatchSnapshot,
+    PrimaryCandidateObservation,
     build_machine_dispatch_plan,
+    evaluate_primary_candidate,
     order_dispatch_project_ids,
     reduce_dispatch_cursor,
 )
@@ -78,3 +80,47 @@ def test_machine_dispatch_snapshot_rejects_ambiguous_project_ids() -> None:
             has_free_capacity=True,
             primary_demand_state="unresolved",
         )
+
+
+@pytest.mark.parametrize(
+    ("observation", "expected_outcome", "expected_reason"),
+    [
+        (
+            PrimaryCandidateObservation(False, True, None, 1, 2, 2),
+            "skip",
+            "placement_rejected",
+        ),
+        (PrimaryCandidateObservation(True, False, None, 1, 2, 2), "skip", None),
+        (
+            PrimaryCandidateObservation(True, True, "missing", 1, 2, 2),
+            "skip",
+            "working_directory:missing",
+        ),
+        (
+            PrimaryCandidateObservation(True, True, None, 2, 2, 2, 2, 1),
+            "skip",
+            "group_gpu_limit_reached",
+        ),
+        (
+            PrimaryCandidateObservation(True, True, None, 3, 2, 2),
+            "skip",
+            "exceeds_machine_capacity",
+        ),
+        (PrimaryCandidateObservation(True, True, None, 1, 2, 2), "runnable_now", None),
+        (PrimaryCandidateObservation(True, True, None, 2, 2, 1), "waiting_for_aggregation", None),
+    ],
+)
+def test_evaluate_primary_candidate_reduces_admission_observations(
+    observation: PrimaryCandidateObservation,
+    expected_outcome: str,
+    expected_reason: str | None,
+) -> None:
+    decision = evaluate_primary_candidate(observation)
+
+    assert decision.outcome == expected_outcome
+    assert decision.reason == expected_reason
+
+
+def test_primary_candidate_observation_rejects_impossible_gpu_counts() -> None:
+    with pytest.raises(ValueError, match="free GPU count"):
+        PrimaryCandidateObservation(True, True, None, 1, 1, 2)
