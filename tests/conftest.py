@@ -97,7 +97,7 @@ def qexp_resource_scope(tmp_path: Path, request: pytest.FixtureRequest):
 
     scope = TestResourceScope.create(tmp_path / "qexp-resources", request.node.nodeid)
     yield scope
-    violations = TestResourceScope.cleanup_violations(tmp_path)
+    violations = TestResourceScope.cleanup_violations(scope.root)
     if violations:
         pytest.fail("qexp test resource cleanup failed:\n" + "\n".join(violations))
 
