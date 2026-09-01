@@ -16,6 +16,12 @@ from .config_types import RootConfig
 from .machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from .executor import Executor
 from .machine_runtime import MachineRuntime, ProjectBinding
+from .machine_dispatch_plan import (
+    MachineDispatchSnapshot,
+    build_machine_dispatch_plan,
+    order_dispatch_project_ids,
+    reduce_dispatch_cursor,
+)
 from .machine_config import is_legacy_agent_project, save_machine_config
 from .layout import load_root_config, machine_state_path, runtime_pid_path
 from .project_maintenance import maintain_project, reconcile_reservation
@@ -372,20 +378,6 @@ def _working_directory_reason(spec: TaskSpec) -> str | None:
     if not os.access(root, os.R_OK | os.X_OK):
         return "not_readable_or_searchable"
     return None
-
-
-def _ordered_bindings(runtime: MachineRuntime, bindings: list[ProjectBinding]) -> list[ProjectBinding]:
-    """Return enabled bindings in stable cursor order without touching project roots."""
-    enabled = sorted((binding for binding in bindings if binding.enabled), key=lambda item: item.project_id)
-    if not enabled:
-        return []
-    cursor = runtime.load_cursor()
-    if cursor is None:
-        return enabled
-    for index, binding in enumerate(enabled):
-        if binding.project_id == cursor:
-            return enabled[index:] + enabled[:index]
-    return enabled
 
 
 def _record_bad_task_spec(runtime: MachineRuntime, binding: ProjectBinding, task_id: str, spec: TaskSpec) -> None:
@@ -827,7 +819,6 @@ def _dispatch_machine_cycle_locked(
 ) -> list[dict[str, Any]]:
     executor = executor or Executor()
     _, registered = runtime.load_registry()
-    ordered_enabled = _ordered_bindings(runtime, registered)
     supervised = [
         binding
         for binding in registered
@@ -901,6 +892,15 @@ def _dispatch_machine_cycle_locked(
         else _visible_gpus(next(iter(readable.values()))) if readable else []
     )
     free = [gpu_id for gpu_id in visible if gpu_id not in snapshot.reserved_gpu_ids]
+    cursor_project_id = runtime.load_cursor()
+    enabled_by_project = {
+        binding.project_id: binding for binding in registered if binding.enabled
+    }
+    ordered_project_ids = order_dispatch_project_ids(
+        tuple(enabled_by_project),
+        cursor_project_id,
+    )
+    ordered_enabled = [enabled_by_project[project_id] for project_id in ordered_project_ids]
     diagnostic_increment("scheduler.capacity.visible_gpus", len(visible))
     diagnostic_increment("scheduler.capacity.reserved_gpus", len(snapshot.reserved_gpu_ids))
     diagnostic_increment("scheduler.capacity.free_gpus", len(free))
@@ -949,15 +949,23 @@ def _dispatch_machine_cycle_locked(
     probe = _probe_primary_demand(
         runtime, readable, dispatchable, visible, free, probe_budget, snapshot.reservations
     ) if free else PrimaryDemandProbe("unresolved")
-    diagnostic_increment(f"scheduler.primary_probe.{probe.state}")
-    borrow_admission_grant = _build_borrow_admission_grant(
-        runtime, dispatchable, probe, enabled_ids
+    dispatch_plan = build_machine_dispatch_plan(
+        MachineDispatchSnapshot(
+            enabled_project_ids=ordered_project_ids,
+            cursor_project_id=cursor_project_id,
+            has_free_capacity=bool(free),
+            primary_demand_state=probe.state,
+        )
     )
+    diagnostic_increment(f"scheduler.primary_probe.{probe.state}")
+    borrow_admission_grant = None
+    if "borrow" in dispatch_plan.admission_roles:
+        borrow_admission_grant = _build_borrow_admission_grant(
+            runtime, dispatchable, probe, enabled_ids
+        )
     budget = SliceBudget(WorkBudgetPolicy())
-    last_successful_binding: ProjectBinding | None = None
-    for admission_role in ("primary", "borrow"):
-        if admission_role == "borrow" and probe.state != "no_primary_demand":
-            break
+    last_successful_project_id: str | None = None
+    for admission_role in dispatch_plan.admission_roles:
         free, layer_winner = _dispatch_admission_layer(
             runtime,
             ordered_enabled,
@@ -974,14 +982,10 @@ def _dispatch_machine_cycle_locked(
             ),
         )
         if layer_winner is not None:
-            last_successful_binding = layer_winner
-    if ordered_enabled:
-        if last_successful_binding is not None:
-            index = ordered_enabled.index(last_successful_binding)
-            next_binding = ordered_enabled[(index + 1) % len(ordered_enabled)]
-        else:
-            next_binding = ordered_enabled[1 % len(ordered_enabled)]
-        runtime.save_cursor(next_binding.project_id)
+            last_successful_project_id = layer_winner.project_id
+    cursor_effect = reduce_dispatch_cursor(dispatch_plan, last_successful_project_id)
+    if cursor_effect is not None:
+        runtime.save_cursor(cursor_effect.project_id)
     if publish_snapshots:
         reservations = list(reservation_snapshot(runtime.root).reservations)
         _publish_project_snapshots(
