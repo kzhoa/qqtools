@@ -564,8 +564,16 @@ def test_machine_dispatch_uses_one_reservation_root_and_each_task_preflight(tmp_
     }
 
     missing_task = submit(first, ["echo", "missing"], working_dir=tmp_path / "missing")
-    dispatch_machine_cycle(runtime, available_gpus=[2], executor=executor)
-    diagnostic = read_json(runtime.paths["diagnostics"] / f"bad-task-spec-{first_binding.project_id}-{missing_task.task_id}.json")
+    diagnostic_path = (
+        runtime.paths["diagnostics"]
+        / f"bad-task-spec-{first_binding.project_id}-{missing_task.task_id}.json"
+    )
+    for _ in range(4):
+        dispatch_machine_cycle(runtime, available_gpus=[2], executor=executor)
+        if diagnostic_path.exists():
+            break
+    assert diagnostic_path.exists(), "bounded dispatch slices did not preflight the queued Task"
+    diagnostic = read_json(diagnostic_path)
     assert diagnostic["machine_diagnostic"] == {
         "kind": "bad_task_spec_working_directory", "project_id": first_binding.project_id,
         "task_id": missing_task.task_id, "path": str(tmp_path / "missing"), "reason": "missing",
