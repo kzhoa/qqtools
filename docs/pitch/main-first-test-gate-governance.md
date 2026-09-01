@@ -330,15 +330,15 @@ Phase 1 完成后，除待迁移的现有 `host_exclusive` 用例外，所有 qe
 
 #### 2.1 隔离 Integration
 
-- [ ] 在 `test_resource_isolation.py` 中让两个真实 participant 共享同一个测试专属 `TMPDIR`，但使用不同 runtime root。
-- [ ] 断言第一个 participant 持有 authority、第二个被拒绝；第一个退出后第三个能够取得 authority。
-- [ ] 该用例不得读取操作系统默认 tmp，不使用 `host_exclusive`，也不因开发机已有 agent 而 skip。
+- [x] 在 `test_resource_isolation.py` 中让两个真实 participant 共享同一个测试专属 `TMPDIR`，但使用不同 runtime root。
+- [x] 断言第一个 participant 持有 authority、第二个被拒绝；第一个退出后第三个能够取得 authority。
+- [x] 该用例不得读取操作系统默认 tmp，不使用 `host_exclusive`，也不因开发机已有 agent 而 skip。
 
 该用例证明锁互斥和释放算法。
 
 #### 2.2 安装态 E2E
 
-- [ ] 新增 `tests/e2e/qexp/test_host_authority.py`，标记 `host_exclusive`。
+- [x] 新增 `tests/e2e/qexp/test_host_authority.py`，标记 `host_exclusive`。
 - [ ] 使用安装 wheel 的 `qexp` CLI，针对两个独立 project/runtime root 启动 agent；两个子进程保持同一 OS user，并移除 `TMPDIR`、`TMP`、`TEMP` 的测试覆盖，使生产 resolver 使用 clean runner 的默认 authority namespace。
 - [ ] 断言第二个 agent 通过公共 CLI 返回明确的占用失败；停止第一个 agent 后，第二个能够启动。
 - [ ] `finally` 中只停止本用例创建的 agent，并保留失败时的 CLI 输出、PID/PGID 和 authority 诊断。
@@ -387,11 +387,11 @@ qexp 的其余 Integration 不进入普通 preflight；开发时按改动行为�
 
 修改 `.github/workflows/ci.yml` 时，在一个提交内完成以下切换：
 
-- [ ] 删除 `schedule` 触发器、`qexp-fast-baseline` 和 `qexp-stress`。
-- [ ] 删除普通 CI 的 `unit`、`integration`、`qexp-fast` 和 `qexp-machine-lab` 源码 Job。
-- [ ] 新增 installed wheel smoke：Python 3.11、3.12、3.14 只验证安装、import 和 CLI 启动。
-- [ ] Python 3.13 运行一次完整 `artifact-e2e`，其中 qexp 用例串行执行，`host_exclusive` 使用干净 runner。
-- [ ] push main 与偶发 PR 复用同一套 artifact 定义，不创建 PR 专属测试规则。
+- [x] 删除 `schedule` 触发器、`qexp-fast-baseline` 和 `qexp-stress`。
+- [x] 删除普通 CI 的 `unit`、`integration`、`qexp-fast` 和 `qexp-machine-lab` 源码 Job。
+- [x] 新增 installed wheel smoke：Python 3.11、3.12、3.14 只验证安装、import 和 CLI 启动。
+- [x] Python 3.13 运行一次完整 `artifact-e2e`，其中 qexp 用例串行执行，`host_exclusive` 使用干净 runner。
+- [x] push main 与偶发 PR 复用同一套 artifact 定义，不创建 PR 专属测试规则。
 
 切换前必须先证明 `tox run -e preflight` 在开发机通过，并证明 `tox run -e artifact-e2e` 在干净 runner 通过。main CI 切换后，普通 CI 的 pytest node ID 与 preflight 的 pytest node ID 交集必须为空。
 

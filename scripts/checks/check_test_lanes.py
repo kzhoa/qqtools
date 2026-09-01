@@ -2,6 +2,7 @@
 """Enforce the repository's Unit, Integration, and installed-E2E lane boundaries."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -44,6 +45,17 @@ def main() -> int:
             errors.append(f"ordinary CI may not run source-test lane: {retired}")
     if "tox run -e artifact-e2e" not in workflow:
         errors.append("ordinary CI must run artifact-e2e")
+
+    matrix_path = REPO_ROOT / "tests" / "CONTRACT_MATRIX.md"
+    matrix = matrix_path.read_text(encoding="utf-8")
+    for link in re.findall(r"\]\(([^)]+)\)", matrix):
+        if link.startswith(("http://", "https://", "#")):
+            continue
+        if not (matrix_path.parent / link).is_file():
+            errors.append(f"contract matrix links to a missing test: {link}")
+    for retired_term in ("hermetic", "qexp-fast", " / merge"):
+        if retired_term in matrix:
+            errors.append(f"contract matrix contains retired lane term: {retired_term}")
 
     _fail(errors)
     return 0

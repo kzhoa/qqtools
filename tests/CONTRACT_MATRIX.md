@@ -1,49 +1,21 @@
 # Public Behavior Contract Matrix
 
-This matrix records behavior protection, not coverage percentage. Every `Yes`
-cell links to the responsible test; `Pending` is an explicit coverage gap.
+This matrix records only cross-layer and architecture-level behavior whose ownership is not
+obvious from the test directory. Every linked test must exist; `Pending` is an explicit gap.
 
-| Public behavior | Unit | Integration | E2E | Release E2E | Notes |
-| --- | --- | --- | --- | --- | --- |
-| epoch-suffix parser | [Yes](unit/plugins/qpipeline/test_epoch_suffix_resolver.py) | N/A | N/A | N/A | syntax and conversion boundaries |
-| scheduler epoch suffix | [Yes](unit/plugins/qpipeline/test_epoch_suffix_resolver.py) | Pending | Optional | N/A | public scheduler configuration |
-| runner eval/save epoch suffix | [Yes](unit/plugins/qpipeline/test_epoch_suffix_resolver.py) | [Yes](integration/qpipeline/runner/test_epoch_suffix_config_flow.py) | [Yes](e2e/qpipeline/test_step_epoch_suffix_training.py) | N/A | step-mode configuration flow |
-| step-mode max-step inference | [Yes](integration/functional/test_qpipeline/test_qpipeline_train_flow.py) | Pending | Optional | N/A | historical integration coverage |
-| checkpoint resume | [Yes](integration/functional/test_qpipeline/test_qpipeline_train_flow.py) | Pending | Pending | N/A | public-entry scenario still needed |
-| installed `qexp` CLI | N/A | [Yes](integration/qexp/test_cli_contract.py) | N/A | [Yes](e2e/qexp/test_cli.py) | validates installed wheel; the prior unit-test link did not exist |
+| Contract | Lowest sufficient evidence | Delivery boundary | Status |
+| --- | --- | --- | --- |
+| qpipeline epoch-suffix configuration | [Integration](integration/qpipeline/runner/test_epoch_suffix_config_flow.py) | [E2E](e2e/qpipeline/test_step_epoch_suffix_training.py) | covered |
+| qexp isolated scheduler-authority algorithm | [Integration](integration/qexp/test_resource_isolation.py) | local preflight | covered |
+| qexp production default host authority | [installed CLI E2E](e2e/qexp/test_host_authority.py) | serial clean CI runner | covered |
+| qexp durable-write crash boundaries | [Integration](integration/qexp/test_store_crash_boundaries.py) | local preflight | covered |
+| qexp multi-participant claim, CAS, fencing, and cancel races | [machine lab](integration/qexp/test_machine_lab.py) | local preflight | covered |
+| qexp deterministic recovery decisions | [Unit](unit/qexp/test_architecture_primitives.py) | local preflight | covered |
+| qexp expanded seed and crash-point matrix | [Unit](unit/qexp/test_architecture_stress.py) | local preflight | covered |
+| qexp protected installed workflows | [installed E2E](e2e/qexp/test_compatibility_contract.py) | artifact E2E / release | covered |
 
-## qexp runtime verification matrix
+## Maintenance rule
 
-Single-host tests prove the qexp protocol between independent local processes on one POSIX
-filesystem. They do not certify NFS, Lustre, or any other cross-host filesystem implementation.
-`Pending` is an intentional evidence gap, not a passing substitute.
-
-| Requirement | Decision evidence | Local protocol evidence | Profile / lane | Owner |
-| --- | --- | --- | --- | --- |
-| machine-local authority isolation | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_resource_isolation.py](integration/qexp/test_resource_isolation.py) | preflight | qexp maintainers |
-| production host-wide scheduler authority | N/A | N/A | [host authority E2E](e2e/qexp/test_host_authority.py) | qexp maintainers |
-| revisioned CAS conflict preservation | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_test_architecture.py](integration/qexp/test_test_architecture.py) | machine-lab / merge | qexp maintainers |
-| protocol fault, explicit interleaving, and replay envelope | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_machine_lab.py](integration/qexp/test_machine_lab.py) | preflight | qexp maintainers |
-| expanded model seeds and protocol crash matrix | [test_architecture_stress.py](unit/qexp/test_architecture_stress.py) | N/A | Unit | qexp maintainers |
-| reference claim, fencing, launch-authority, and trace replay invariants | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | N/A | Unit | qexp maintainers |
-| machine dispatch order, primary-probe admission, revision, and cursor plan | [test_machine_dispatch_plan.py](unit/qexp/test_machine_dispatch_plan.py) | [test_ready_index_dispatch.py](integration/qexp/test_ready_index_dispatch.py) | hermetic / qexp-fast | qexp maintainers |
-| independent participant environment, checkpoint, and restart | N/A | [test_machine_lab.py](integration/qexp/test_machine_lab.py) | preflight / machine_lab | qexp maintainers |
-| CW-01 Submission Operation creation | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_submission_protocol.py](integration/qexp/test_submission_protocol.py) | hermetic / qexp-fast | qexp maintainers |
-| CW-02 Operation before Task staging | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | hermetic / qexp-fast | qexp maintainers |
-| CW-03 Partial Task staging | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_batch_manifest_placement.py](integration/qexp/test_batch_manifest_placement.py) | hermetic / qexp-fast | qexp maintainers |
-| CW-04 Worker addition before commit | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_batch_manifest_placement.py](integration/qexp/test_batch_manifest_placement.py) | hermetic / qexp-fast | qexp maintainers |
-| CW-05 Reservation before claim | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_machine_dispatch.py](integration/qexp/test_machine_dispatch.py) | hermetic / qexp-fast | qexp maintainers |
-| CW-06 Claim before Attempt | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_machine_lab.py](integration/qexp/test_machine_lab.py) | preflight / machine_lab | qexp maintainers |
-| CW-07 Attempt before launch gate | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | machine-lab / merge | qexp maintainers |
-| CW-08 Launch gate before spawn | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | OS / merge | qexp maintainers |
-| CW-09 Process before metadata | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_runner_pipeline.py](integration/qexp/test_runner_pipeline.py) | OS / merge | qexp maintainers |
-| CW-10 Process exit before terminal publish | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_runner_pipeline.py](integration/qexp/test_runner_pipeline.py) | OS / merge | qexp maintainers |
-| CW-11 Lease expiry before authorization | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | hermetic / qexp-fast | qexp maintainers |
-| CW-12 Lease expiry after authorization | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_lease_hardening.py](integration/qexp/test_lease_hardening.py) | hermetic / qexp-fast | qexp maintainers |
-| CW-13 Orphan-token recovery | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | machine-lab / merge | qexp maintainers |
-| CW-14 Successor fencing rejects old writer | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_machine_lab.py](integration/qexp/test_machine_lab.py) | preflight / machine_lab | qexp maintainers |
-| CW-15 Worker removal race | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | machine-lab / merge | qexp maintainers |
-| CW-16 Pause/cancel launch race | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_machine_lab.py](integration/qexp/test_machine_lab.py) | preflight / machine_lab | qexp maintainers |
-| CW-17 Recovery drain/remove race | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | machine-lab / merge | qexp maintainers |
-| CW-18 Cancellation restart | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_scheduling_recovery_regressions.py](integration/qexp/test_scheduling_recovery_regressions.py) | machine-lab / merge | qexp maintainers |
-| Protected workflows from installed wheel | N/A | N/A | [artifact-e2e](e2e/qexp/test_compatibility_contract.py) | qexp maintainers |
+Update this file only when a listed contract, its lowest sufficient test layer, its delivery
+boundary, or an explicit `Pending` gap changes. Ordinary local test additions do not belong here.
+`scripts/checks/check_test_lanes.py` verifies local test links and rejects retired lane terms.
