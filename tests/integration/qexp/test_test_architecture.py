@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import subprocess
 import sys
@@ -7,6 +8,9 @@ import time
 from pathlib import Path
 
 import pytest
+from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp.commands.group import change_worker, create_group
+from qqtools.plugins.qexp.commands.task import offer
 from tests.qexp_test_support import TestResourceScope
 from tests.qexp_architecture import SingleHostMachineLab
 
@@ -118,5 +122,36 @@ def test_machine_lab_checkpoint_allows_participant_interleaving_and_restart(
         assert restarted_identity["pid"] != first.process.pid
         assert restarted_identity["tmpdir"] != second_identity["tmpdir"]
         assert [event.kind for event in lab.trace.events].count("participant.command") == 4
+    finally:
+        lab.close()
+
+
+@pytest.mark.machine_lab
+def test_machine_lab_two_participants_produce_one_real_task_claim(tmp_path: Path) -> None:
+    lab = SingleHostMachineLab(tmp_path, "machine-lab-claim")
+    cfg = init_shared_root(lab.shared_root, "gpu-1", runtime_root=tmp_path / "bootstrap-runtime")
+    create_group(cfg, "workers")
+    change_worker(cfg, "workers", "gpu-2", "add")
+    task = submit(cfg, ["echo", "claim"], group="workers", sharing_mode="spillover")
+    offer(cfg, task.task_id)
+    first = lab.start("first")
+    second = lab.start("second")
+
+    def claim(participant, machine_name: str) -> dict[str, object]:
+        return participant.request(
+            "claim_task",
+            payload={"machine_name": machine_name, "task_id": task.task_id, "gpu_ids": [0]},
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(
+                executor.map(lambda item: claim(*item), ((first, "gpu-1"), (second, "gpu-2")))
+            )
+
+        claims = [result for result in results if result["claimed"] is True]
+        assert len(claims) == 1
+        assert isinstance(claims[0]["attempt_id"], str)
+        assert claims[0]["fencing_token"] == 1
     finally:
         lab.close()
