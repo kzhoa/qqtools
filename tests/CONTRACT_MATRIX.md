@@ -18,4 +18,4 @@ obvious from the test directory. Every linked test must exist; `Pending` is an e
 
 Update this file only when a listed contract, its lowest sufficient test layer, its delivery
 boundary, or an explicit `Pending` gap changes. Ordinary local test additions do not belong here.
-`scripts/checks/check_test_lanes.py` verifies local test links and rejects retired lane terms.
+`scripts/checks/check_contract_matrix.py` verifies local test links and rejects retired lane terms.
