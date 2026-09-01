@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+TEST_TMUX_BASE_ENV = "QQTOOLS_TEST_TMUX_BASE"
+
+
 def _safe_node_name(nodeid: str) -> str:
     """Return a filesystem-safe, bounded test identifier."""
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", nodeid).strip("._")
@@ -51,7 +54,8 @@ class TestResourceScope:
         authority_root = local_temp_root / "authority"
         home_root = root / "home"
         xdg_root = root / "xdg"
-        tmux_root = Path("/tmp") / f"qqtools-tmux-{uuid.uuid4().hex}"
+        tmux_base = Path(os.environ.get(TEST_TMUX_BASE_ENV, base_root))
+        tmux_root = tmux_base / f"qqtools-tmux-{uuid.uuid4().hex[:12]}"
         tmux_socket = tmux_root / "server.sock"
         resource_ledger_root = root / "resource-ledger"
         diagnostics_root = root / "diagnostics"

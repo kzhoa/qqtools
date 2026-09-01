@@ -25,6 +25,18 @@ def test_resource_scope_isolates_child_environment(qexp_resource_scope: TestReso
     assert environment["QEXP_MACHINE_RUNTIME_ROOT"] == str(qexp_resource_scope.runtime_root)
 
 
+def test_resource_scope_derives_tmux_root_from_selected_test_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected_base = tmp_path / "fallback-test-base"
+    monkeypatch.setenv("QQTOOLS_TEST_TMUX_BASE", str(selected_base))
+
+    scope = TestResourceScope.create(tmp_path / "resources", "tmux-fallback")
+
+    assert scope.tmux_root.parent == selected_base
+
+
 def test_resource_scope_records_test_owned_resources_and_cleanup_diagnostics(
     qexp_resource_scope: TestResourceScope,
 ) -> None:
