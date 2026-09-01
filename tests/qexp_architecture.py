@@ -57,6 +57,103 @@ class ProtocolDisposition(StrEnum):
     CRASH = "crash"
 
 
+class CrashWindow(StrEnum):
+    """Runtime Spec crash windows covered by deterministic recovery decisions."""
+
+    SUBMISSION_BEFORE_OPERATION = "CW-01"
+    OPERATION_BEFORE_TASK_STAGING = "CW-02"
+    PARTIAL_TASK_STAGING = "CW-03"
+    WORKER_BEFORE_COMMIT = "CW-04"
+    RESERVATION_BEFORE_CLAIM = "CW-05"
+    CLAIM_BEFORE_ATTEMPT = "CW-06"
+    ATTEMPT_BEFORE_LAUNCH_GATE = "CW-07"
+    LAUNCH_GATE_BEFORE_PROCESS = "CW-08"
+    PROCESS_BEFORE_METADATA = "CW-09"
+    PROCESS_EXIT_BEFORE_TERMINAL = "CW-10"
+    LEASE_EXPIRY_BEFORE_AUTHORIZATION = "CW-11"
+    LEASE_EXPIRY_AFTER_AUTHORIZATION = "CW-12"
+    ORPHAN_TOKEN_RECOVERY = "CW-13"
+    SUCCESSOR_FENCING = "CW-14"
+    WORKER_REMOVAL_RACE = "CW-15"
+    CANCEL_LAUNCH_RACE = "CW-16"
+    RECOVERY_DRAIN_RACE = "CW-17"
+    CANCELLATION_RESTART = "CW-18"
+
+
+@dataclass(frozen=True, slots=True)
+class CrashWindowRecoveryPlan:
+    """Pure convergence decision for one Runtime Spec crash window."""
+
+    action: str
+    invariant: str
+
+
+_CRASH_WINDOW_RECOVERY_PLANS: dict[CrashWindow, CrashWindowRecoveryPlan] = {
+    CrashWindow.SUBMISSION_BEFORE_OPERATION: CrashWindowRecoveryPlan(
+        "preserve_absence", "no_operation_or_task"
+    ),
+    CrashWindow.OPERATION_BEFORE_TASK_STAGING: CrashWindowRecoveryPlan(
+        "abort_or_resume_preparing_submission", "no_claimable_task"
+    ),
+    CrashWindow.PARTIAL_TASK_STAGING: CrashWindowRecoveryPlan(
+        "complete_or_abort_submission", "no_partial_visibility"
+    ),
+    CrashWindow.WORKER_BEFORE_COMMIT: CrashWindowRecoveryPlan(
+        "remove_inactive_worker_addition", "worker_inactive_until_commit"
+    ),
+    CrashWindow.RESERVATION_BEFORE_CLAIM: CrashWindowRecoveryPlan(
+        "release_or_expire_reservation", "task_remains_queued"
+    ),
+    CrashWindow.CLAIM_BEFORE_ATTEMPT: CrashWindowRecoveryPlan(
+        "release_claim_and_reservation", "no_launch_without_attempt"
+    ),
+    CrashWindow.ATTEMPT_BEFORE_LAUNCH_GATE: CrashWindowRecoveryPlan(
+        "honor_pause_or_cancel", "no_process_without_authorization"
+    ),
+    CrashWindow.LAUNCH_GATE_BEFORE_PROCESS: CrashWindowRecoveryPlan(
+        "recover_starting_or_fail_spawn", "no_untracked_process"
+    ),
+    CrashWindow.PROCESS_BEFORE_METADATA: CrashWindowRecoveryPlan(
+        "reconcile_manifest_and_token", "one_attempt_identity"
+    ),
+    CrashWindow.PROCESS_EXIT_BEFORE_TERMINAL: CrashWindowRecoveryPlan(
+        "republish_terminal_idempotently", "terminal_truth_converges"
+    ),
+    CrashWindow.LEASE_EXPIRY_BEFORE_AUTHORIZATION: CrashWindowRecoveryPlan(
+        "return_claim_to_queue", "no_automatic_launch"
+    ),
+    CrashWindow.LEASE_EXPIRY_AFTER_AUTHORIZATION: CrashWindowRecoveryPlan(
+        "block_task_as_orphaned", "no_automatic_replacement"
+    ),
+    CrashWindow.ORPHAN_TOKEN_RECOVERY: CrashWindowRecoveryPlan(
+        "issue_successor_for_same_attempt", "attempt_identity_preserved"
+    ),
+    CrashWindow.SUCCESSOR_FENCING: CrashWindowRecoveryPlan(
+        "reject_stale_writer", "stale_token_cannot_mutate_truth"
+    ),
+    CrashWindow.WORKER_REMOVAL_RACE: CrashWindowRecoveryPlan(
+        "serialize_under_group_lock", "queued_work_not_stranded"
+    ),
+    CrashWindow.CANCEL_LAUNCH_RACE: CrashWindowRecoveryPlan(
+        "serialize_final_launch_gate", "one_group_lock_order_wins"
+    ),
+    CrashWindow.RECOVERY_DRAIN_RACE: CrashWindowRecoveryPlan(
+        "serialize_group_then_task_recovery", "forbidden_recovery_is_quarantined"
+    ),
+    CrashWindow.CANCELLATION_RESTART: CrashWindowRecoveryPlan(
+        "resume_group_cancellation", "pending_machine_set_preserved"
+    ),
+}
+
+
+def plan_crash_window_recovery(window: CrashWindow) -> CrashWindowRecoveryPlan:
+    """Return the reference recovery decision for a Runtime Spec crash window."""
+    try:
+        return _CRASH_WINDOW_RECOVERY_PLANS[window]
+    except KeyError as exc:
+        raise ValueError(f"unsupported crash window: {window}") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class TraceEvent:
     """One replayable test action or protocol observation."""
