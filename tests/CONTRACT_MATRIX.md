@@ -31,7 +31,7 @@ filesystem. They do not certify NFS, Lustre, or any other cross-host filesystem 
 | CW-03 Partial Task staging | Pending | Pending | hermetic / qexp-fast | qexp maintainers |
 | CW-04 Worker addition before commit | Pending | Pending | hermetic / qexp-fast | qexp maintainers |
 | CW-05 Reservation before claim | Pending | [test_machine_dispatch.py](integration/qexp/test_machine_dispatch.py) | hermetic / qexp-fast | qexp maintainers |
-| CW-06 Claim before Attempt | Pending | Pending | machine-lab / merge | qexp maintainers |
+| CW-06 Claim before Attempt | Pending | [test_test_architecture.py](integration/qexp/test_test_architecture.py) | machine-lab / merge | qexp maintainers |
 | CW-07 Attempt before launch gate | Pending | [test_runner_pipeline.py](integration/qexp/test_runner_pipeline.py) | machine-lab / merge | qexp maintainers |
 | CW-08 Launch gate before spawn | Pending | [test_runner_pipeline.py](integration/qexp/test_runner_pipeline.py) | OS / merge | qexp maintainers |
 | CW-09 Process before metadata | Pending | [test_runner_pipeline.py](integration/qexp/test_runner_pipeline.py) | OS / merge | qexp maintainers |

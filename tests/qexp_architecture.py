@@ -395,7 +395,13 @@ class MachineParticipant:
     process: subprocess.Popen[str]
     trace: TraceEnvelope
 
-    def request(self, command: str, *, timeout_seconds: float = 2.0) -> dict[str, Any]:
+    def request(
+        self,
+        command: str,
+        *,
+        payload: Mapping[str, Any] | None = None,
+        timeout_seconds: float = 2.0,
+    ) -> dict[str, Any]:
         """Send one control command and wait for its structured response."""
         if not command:
             raise ValueError("participant command must not be empty")
@@ -403,14 +409,20 @@ class MachineParticipant:
             raise ValueError("participant request timeout must be positive")
         if self.process.stdin is None or self.process.stdout is None:
             raise RuntimeError(f"participant {self.name} has no IPC pipes")
+        message = {"command": command, **dict(payload or {})}
         self.trace.record(
             "participant.command",
-            {"command": command, "pid": self.process.pid},
+            {**message, "pid": self.process.pid},
             0.0,
             self.name,
         )
-        self.process.stdin.write(json.dumps({"command": command}) + "\n")
-        self.process.stdin.flush()
+        try:
+            self.process.stdin.write(json.dumps(message) + "\n")
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError(
+                f"participant {self.name} has a closed command pipe: {self._stderr_diagnostics()}"
+            ) from exc
         ready, _, _ = select.select([self.process.stdout], [], [], timeout_seconds)
         if not ready:
             raise RuntimeError(
@@ -418,7 +430,9 @@ class MachineParticipant:
             )
         response = self.process.stdout.readline()
         if not response:
-            raise RuntimeError(f"participant {self.name} exited before responding")
+            raise RuntimeError(
+                f"participant {self.name} exited before responding: {self._stderr_diagnostics()}"
+            )
         result = json.loads(response)
         self.trace.record("participant.response", result, 0.0, self.name)
         return result
@@ -429,9 +443,10 @@ class MachineParticipant:
         try:
             self.request("exit")
             self.process.wait(timeout=2.0)
-        except (RuntimeError, subprocess.TimeoutExpired):
-            self.process.terminate()
-            self.process.wait(timeout=2.0)
+        except (BrokenPipeError, RuntimeError, subprocess.TimeoutExpired):
+            if self.process.poll() is None:
+                self.process.terminate()
+                self.process.wait(timeout=2.0)
 
     def kill(self) -> None:
         """Terminate this participant without attempting graceful protocol cleanup."""
@@ -439,14 +454,21 @@ class MachineParticipant:
             self.process.kill()
             self.process.wait(timeout=2.0)
 
+    def _stderr_diagnostics(self) -> str:
+        if self.process.stderr is None or self.process.poll() is None:
+            return "stderr unavailable while participant is running"
+        return self.process.stderr.read().strip() or "no stderr output"
+
 
 class SingleHostMachineLab:
     """Starts independently imported participants that share only a project root."""
 
     _PARTICIPANT = """
 import json, os, sys
+from pathlib import Path
 for line in sys.stdin:
-    command = json.loads(line)["command"]
+    message = json.loads(line)
+    command = message["command"]
     if command == "exit":
         print(json.dumps({"exited": True}), flush=True)
         break
@@ -458,6 +480,22 @@ for line in sys.stdin:
         runtime = MachineRuntime()
         with runtime.scheduler_authority(blocking=False) as acquired:
             print(json.dumps({"acquired": acquired, "tmpdir": os.environ["TMPDIR"]}), flush=True)
+    elif command == "claim_task":
+        from qqtools.plugins.qexp.config_types import RootConfig
+        from qqtools.plugins.qexp.scheduler import claim_task
+        shared_root = Path(os.environ["QEXP_TEST_SHARED_ROOT"])
+        cfg = RootConfig(
+            shared_root,
+            shared_root.parent,
+            message["machine_name"],
+            Path(os.environ["QEXP_MACHINE_RUNTIME_ROOT"]),
+        )
+        attempt = claim_task(cfg, message["task_id"], message["gpu_ids"])
+        print(json.dumps({
+            "claimed": attempt is not None,
+            "attempt_id": attempt.attempt_id if attempt else None,
+            "fencing_token": attempt.current_fencing_token if attempt else None,
+        }), flush=True)
     elif command == "checkpoint":
         print(json.dumps({"checkpoint": "reached", "pid": os.getpid()}), flush=True)
         while True:
@@ -476,7 +514,7 @@ for line in sys.stdin:
     def __init__(self, root: Path, nodeid: str) -> None:
         self.root = root
         self.nodeid = nodeid
-        self.shared_root = root / "shared"
+        self.shared_root = root / "shared-project" / ".qexp"
         self.shared_root.mkdir(parents=True, exist_ok=True)
         self.participants: list[MachineParticipant] = []
         self.trace = TraceEnvelope("qexp-single-host-machine-lab/v1", seed=0)
