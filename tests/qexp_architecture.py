@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from tests.qexp_test_support import TestResourceScope
 
@@ -125,6 +125,135 @@ def _redact_value(value: Any) -> Any:
 class RevisionedValue:
     revision: int
     value: Any
+
+
+ModelTaskState = Literal["queued", "claimed", "starting", "running", "cancelled", "finished"]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelEffectPlan:
+    """One external effect that a reference-model command authorizes."""
+
+    kind: Literal["launch", "terminate"]
+    task_id: str
+    fencing_token: int
+
+
+@dataclass(slots=True)
+class ModelTask:
+    """The minimal observable Task truth used by the reference model."""
+
+    task_id: str
+    submission_id: str
+    state: ModelTaskState = "queued"
+    fencing_token: int = 0
+    has_cancellation_requested: bool = False
+
+
+class QexpReferenceModel:
+    """Independent model of claim, fencing, and launch-authority semantics."""
+
+    def __init__(self) -> None:
+        self._submission_states: dict[str, Literal["preparing", "committed", "aborted"]] = {}
+        self._tasks: dict[str, ModelTask] = {}
+
+    def create_submission(self, submission_id: str) -> None:
+        if submission_id in self._submission_states:
+            raise ValueError(f"submission already exists: {submission_id}")
+        self._submission_states[submission_id] = "preparing"
+
+    def commit_submission(self, submission_id: str) -> None:
+        self._require_submission(submission_id, "preparing")
+        self._submission_states[submission_id] = "committed"
+
+    def abort_submission(self, submission_id: str) -> None:
+        self._require_submission(submission_id, "preparing")
+        self._submission_states[submission_id] = "aborted"
+
+    def stage_task(self, task_id: str, submission_id: str) -> None:
+        if task_id in self._tasks:
+            raise ValueError(f"task already exists: {task_id}")
+        if submission_id not in self._submission_states:
+            raise ValueError(f"submission does not exist: {submission_id}")
+        self._tasks[task_id] = ModelTask(task_id, submission_id)
+
+    def claim(self, task_id: str) -> int | None:
+        task = self._task(task_id)
+        if (
+            task.state != "queued"
+            or task.has_cancellation_requested
+            or self._submission_states[task.submission_id] != "committed"
+        ):
+            return None
+        task.fencing_token += 1
+        task.state = "claimed"
+        self.assert_invariants()
+        return task.fencing_token
+
+    def cancel(self, task_id: str) -> ModelEffectPlan | None:
+        task = self._task(task_id)
+        task.has_cancellation_requested = True
+        if task.state in {"queued", "claimed", "starting"}:
+            task.state = "cancelled"
+            self.assert_invariants()
+            return None
+        if task.state == "running":
+            self.assert_invariants()
+            return ModelEffectPlan("terminate", task.task_id, task.fencing_token)
+        return None
+
+    def authorize_launch(self, task_id: str, fencing_token: int) -> ModelEffectPlan | None:
+        task = self._task(task_id)
+        if (
+            task.state != "claimed"
+            or task.has_cancellation_requested
+            or task.fencing_token != fencing_token
+        ):
+            return None
+        task.state = "starting"
+        self.assert_invariants()
+        return ModelEffectPlan("launch", task.task_id, fencing_token)
+
+    def publish_running(self, task_id: str, fencing_token: int) -> bool:
+        task = self._task(task_id)
+        if task.state != "starting" or task.fencing_token != fencing_token:
+            return False
+        task.state = "running"
+        self.assert_invariants()
+        return True
+
+    def publish_terminal(self, task_id: str, fencing_token: int, *, cancelled: bool) -> bool:
+        task = self._task(task_id)
+        if task.state not in {"starting", "running"} or task.fencing_token != fencing_token:
+            return False
+        task.state = "cancelled" if cancelled else "finished"
+        self.assert_invariants()
+        return True
+
+    def task_state(self, task_id: str) -> ModelTaskState:
+        return self._task(task_id).state
+
+    def assert_invariants(self) -> None:
+        for task in self._tasks.values():
+            submission_state = self._submission_states[task.submission_id]
+            if task.state in {"claimed", "starting", "running"} and submission_state != "committed":
+                raise AssertionError(f"active task has uncommitted submission: {task.task_id}")
+            if task.fencing_token < 0:
+                raise AssertionError(f"task has invalid fencing token: {task.task_id}")
+
+    def _require_submission(
+        self,
+        submission_id: str,
+        expected_state: Literal["preparing"],
+    ) -> None:
+        if self._submission_states.get(submission_id) != expected_state:
+            raise ValueError(f"submission is not {expected_state}: {submission_id}")
+
+    def _task(self, task_id: str) -> ModelTask:
+        try:
+            return self._tasks[task_id]
+        except KeyError as exc:
+            raise ValueError(f"task does not exist: {task_id}") from exc
 
 
 class SimulatedRuntime:
