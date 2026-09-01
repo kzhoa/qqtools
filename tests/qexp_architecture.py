@@ -905,6 +905,36 @@ for line in sys.stdin:
         )
         task = cancel_task(cfg, message["task_id"])
         print(json.dumps({"state": task.state["projection"]}), flush=True)
+    elif command == "fail_attempt":
+        from qqtools.plugins.qexp.config_types import RootConfig
+        from qqtools.plugins.qexp.scheduler import fail_attempt
+        shared_root = Path(os.environ["QEXP_TEST_SHARED_ROOT"])
+        cfg = RootConfig(
+            shared_root,
+            shared_root.parent,
+            message["machine_name"],
+            Path(os.environ["QEXP_MACHINE_RUNTIME_ROOT"]),
+        )
+        failed = fail_attempt(
+            cfg,
+            message["task_id"],
+            message["attempt_id"],
+            message["fencing_token"],
+            "test_failure",
+        )
+        print(json.dumps({"failed": failed}), flush=True)
+    elif command == "retry_task":
+        from qqtools.plugins.qexp.commands.task import retry
+        from qqtools.plugins.qexp.config_types import RootConfig
+        shared_root = Path(os.environ["QEXP_TEST_SHARED_ROOT"])
+        cfg = RootConfig(
+            shared_root,
+            shared_root.parent,
+            message["machine_name"],
+            Path(os.environ["QEXP_MACHINE_RUNTIME_ROOT"]),
+        )
+        task = retry(cfg, message["task_id"])
+        print(json.dumps({"state": task.state["projection"]}), flush=True)
     elif command == "checkpoint":
         print(json.dumps({"checkpoint": "reached", "pid": os.getpid()}), flush=True)
         while True:
