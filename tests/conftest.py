@@ -2,6 +2,7 @@ import hashlib
 import os
 import re
 import shutil
+import socket
 import tempfile
 import time
 import uuid
@@ -25,11 +26,15 @@ def _is_usable_temp_root(root: Path) -> bool:
     """Return whether a root supports the filesystem operations required by tests."""
     probe_dir = root / f".qqtools-write-probe-{uuid.uuid4().hex}"
     probe_file = probe_dir / "probe"
+    probe_socket = probe_dir / "probe.sock"
     try:
         root.mkdir(parents=True, exist_ok=True)
         probe_dir.mkdir()
         probe_file.write_bytes(b"ok")
         probe_file.unlink()
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(probe_socket))
+        probe_socket.unlink()
         probe_dir.rmdir()
     except OSError:
         shutil.rmtree(probe_dir, ignore_errors=True)
