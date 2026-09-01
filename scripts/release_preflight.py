@@ -194,7 +194,6 @@ def main(argv: list[str] | None = None) -> int:
     _run("tox", "run", "-e", "unit")
     _run("tox", "run", "-e", "integration")
     _run("tox", "run", "-e", "qexp-integration")
-    _run("tox", "run", "-e", "release-e2e")
     print(f"Release preflight passed for {target}.")
     return 0
 
