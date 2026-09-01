@@ -96,3 +96,27 @@ def test_machine_lab_participants_have_independent_local_identity(tmp_path: Path
         assert second.request("scheduler_authority")["acquired"] is True
     finally:
         lab.close()
+
+
+@pytest.mark.machine_lab
+def test_machine_lab_checkpoint_allows_participant_interleaving_and_restart(
+    tmp_path: Path,
+) -> None:
+    lab = SingleHostMachineLab(tmp_path, "machine-lab-checkpoint")
+    first = lab.start("first")
+    second = lab.start("second")
+
+    try:
+        assert first.request("checkpoint")["checkpoint"] == "reached"
+        second_identity = second.request("identity")
+        assert first.request("continue")["checkpoint"] == "continued"
+
+        first.kill()
+        restarted = lab.restart("first")
+        restarted_identity = restarted.request("identity")
+
+        assert restarted_identity["pid"] != first.process.pid
+        assert restarted_identity["tmpdir"] != second_identity["tmpdir"]
+        assert [event.kind for event in lab.trace.events].count("participant.command") == 4
+    finally:
+        lab.close()
