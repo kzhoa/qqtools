@@ -116,6 +116,25 @@ jobs:
     ]
 
 
+def test_lane_check_rejects_equivalent_tox_source_test_syntax(tmp_path: Path) -> None:
+    _write_valid_repository(tmp_path)
+    _write(
+        tmp_path / ".github/workflows/ci.yml",
+        """on:
+  push:
+jobs:
+  source-tests:
+    steps:
+      - run: tox -eunit
+      - run: tox run -e artifact-e2e
+""",
+    )
+
+    assert check_test_lanes(tmp_path) == [
+        "ordinary CI may not run source-test lane: tox -eunit"
+    ]
+
+
 def test_contract_matrix_rejects_missing_test_link(tmp_path: Path) -> None:
     _write_valid_repository(tmp_path)
     _write(
