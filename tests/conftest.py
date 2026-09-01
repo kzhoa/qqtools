@@ -13,10 +13,46 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
-TMP_ROOT = PROJECT_ROOT / "tmp"
+SYSTEM_TEST_TMP_ROOT = Path("/tmp")
+FALLBACK_TEST_TMP_ROOT = PROJECT_ROOT / "tmp"
 RELEASE_E2E_ROOT = PROJECT_ROOT / "tests" / "e2e" / "qexp"
 RELEASE_E2E_PYTEST_INI = PROJECT_ROOT / "tests" / "e2e" / "release_pytest.ini"
 PRESERVE_TEST_ARTIFACTS_ENV = "QQTOOLS_PRESERVE_TEST_ARTIFACTS"
+
+
+def _is_usable_temp_root(root: Path) -> bool:
+    """Return whether a root supports the filesystem operations required by tests."""
+    probe_dir = root / f".qqtools-write-probe-{uuid.uuid4().hex}"
+    probe_file = probe_dir / "probe"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe_dir.mkdir()
+        probe_file.write_bytes(b"ok")
+        probe_file.unlink()
+        probe_dir.rmdir()
+    except OSError:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+        return False
+    return True
+
+
+def _select_test_tmp_base(
+    system_root: Path = SYSTEM_TEST_TMP_ROOT,
+    fallback_root: Path = FALLBACK_TEST_TMP_ROOT,
+) -> Path:
+    """Prefer the system temporary filesystem and fall back to the repository."""
+    if _is_usable_temp_root(system_root):
+        return system_root
+    if _is_usable_temp_root(fallback_root):
+        return fallback_root
+    raise RuntimeError(
+        "No usable test temporary root: both "
+        f"{system_root} and {fallback_root} failed a create/write/delete probe."
+    )
+
+
+TEST_TMP_BASE = _select_test_tmp_base()
+TMP_ROOT = TEST_TMP_BASE / f"qqtools-pytest-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 @pytest.fixture
@@ -51,7 +87,7 @@ def qexp_healthy_clock(monkeypatch):
 @pytest.fixture
 def qexp_resource_scope(tmp_path: Path, request: pytest.FixtureRequest):
     """Provide isolated filesystem and local-process resources to qexp tests."""
-    from tests.qexp_test_support import TestResourceScope
+    from tests.support.qexp.resources import TestResourceScope
 
     return TestResourceScope.create(tmp_path / "qexp-resources", request.node.nodeid)
 
@@ -161,12 +197,14 @@ def _configure_temp_root_for_session():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        if not _should_preserve_test_artifacts():
+            shutil.rmtree(TMP_ROOT, ignore_errors=True)
 
 
 @pytest.fixture
 def tmp_path(request):
     """
-    Provide a per-test child directory under ./tmp and clean only that child directory.
+    Provide a per-test child directory under the selected session root.
     """
     case_dir_name = _build_case_tmp_dir_name(request.node.nodeid, request.node.name)
     case_dir = TMP_ROOT / case_dir_name

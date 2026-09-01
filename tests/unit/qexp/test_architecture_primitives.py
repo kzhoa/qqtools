@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.qexp_architecture import (
+from tests.support.qexp.architecture import (
     CrashWindow,
     InjectedProtocolError,
     ProtocolDisposition,

@@ -14,6 +14,36 @@ def _case_directory_generator(nodeid: str, name: str) -> Generator[Path, None, N
     return conftest.tmp_path.__wrapped__(request)
 
 
+def test_test_tmp_base_prefers_usable_system_root(tmp_path: Path) -> None:
+    system_root = tmp_path / "system-tmp"
+    fallback_root = tmp_path / "repository-tmp"
+
+    selected = conftest._select_test_tmp_base(system_root, fallback_root)
+
+    assert selected == system_root
+    assert not fallback_root.exists()
+
+
+def test_test_tmp_base_falls_back_when_system_root_is_unusable(tmp_path: Path) -> None:
+    system_root = tmp_path / "system-tmp"
+    system_root.write_text("not a directory", encoding="utf-8")
+    fallback_root = tmp_path / "repository-tmp"
+
+    selected = conftest._select_test_tmp_base(system_root, fallback_root)
+
+    assert selected == fallback_root
+
+
+def test_test_tmp_base_fails_clearly_when_neither_root_is_usable(tmp_path: Path) -> None:
+    system_root = tmp_path / "system-tmp"
+    fallback_root = tmp_path / "repository-tmp"
+    system_root.write_text("not a directory", encoding="utf-8")
+    fallback_root.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="No usable test temporary root"):
+        conftest._select_test_tmp_base(system_root, fallback_root)
+
+
 def test_tmp_path_keeps_evidence_when_artifact_retention_is_enabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

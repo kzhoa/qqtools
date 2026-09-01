@@ -15,8 +15,8 @@ from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import offer
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
-from tests.qexp_test_support import TestResourceScope
-from tests.qexp_architecture import SingleHostMachineLab
+from tests.support.qexp.architecture import SingleHostMachineLab
+from tests.support.qexp.resources import TestResourceScope
 
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -432,10 +432,11 @@ with runtime.scheduler_authority(blocking=False) as acquired:
         return json.loads(line)
 
     first = start(TestResourceScope.create(tmp_path, "first"))
-    second = start(TestResourceScope.create(tmp_path, "second"))
+    second: subprocess.Popen[str] | None = None
     third: subprocess.Popen[str] | None = None
     try:
         assert response(first)["acquired"] is True
+        second = start(TestResourceScope.create(tmp_path, "second"))
         assert response(second)["acquired"] is False
 
         assert first.stdin is not None
