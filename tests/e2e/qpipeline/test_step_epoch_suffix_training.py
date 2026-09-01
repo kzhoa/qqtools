@@ -8,7 +8,7 @@ import pytest
 import qqtools as qt
 from qqtools.plugins.qpipeline.cmd_args import merge_basic_args
 from qqtools.plugins.qpipeline.entry import create_pipeline_class
-from tests.support.qpipeline import TinyModel, TinyTask
+from tests.helpers.qpipeline import TinyModel, TinyTask
 
 
 pytestmark = pytest.mark.e2e

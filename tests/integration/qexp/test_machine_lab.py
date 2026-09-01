@@ -10,7 +10,7 @@ from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import offer
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
-from tests.support.qexp.architecture import SingleHostMachineLab
+from tests.helpers.qexp.architecture import SingleHostMachineLab
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 

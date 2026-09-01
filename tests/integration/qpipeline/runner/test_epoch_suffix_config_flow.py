@@ -6,7 +6,7 @@ import torch
 import qqtools as qt
 import qqtools.plugins.qpipeline.runner.runner as runner_module
 from qqtools.plugins.qpipeline.runner.runner import train_runner
-from tests.support.qpipeline import TinyModel, TinyTask
+from tests.helpers.qpipeline import TinyModel, TinyTask
 
 
 pytestmark = pytest.mark.integration

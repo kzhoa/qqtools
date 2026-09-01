@@ -16,7 +16,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-from tests.support.qexp.resources import TestResourceScope
+from tests.helpers.qexp.resources import TestResourceScope
 
 
 class ProtocolPoint(StrEnum):
