@@ -58,6 +58,7 @@ jobs:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip tox
       - run: tox run -e qexp-machine-lab
+      - run: tox run -e qexp-host-exclusive
 
   e2e:
     name: e2e
