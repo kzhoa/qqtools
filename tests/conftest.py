@@ -18,6 +18,7 @@ FALLBACK_TEST_TMP_ROOT = PROJECT_ROOT / "tmp"
 INSTALLED_E2E_ROOT = PROJECT_ROOT / "tests" / "e2e"
 INSTALLED_E2E_PYTEST_INI = PROJECT_ROOT / "tests" / "e2e" / "installed_artifact_pytest.ini"
 PRESERVE_TEST_ARTIFACTS_ENV = "QQTOOLS_PRESERVE_TEST_ARTIFACTS"
+TEST_TMUX_BASE_ENV = "QQTOOLS_TEST_TMUX_BASE"
 
 
 def _is_usable_temp_root(root: Path) -> bool:
@@ -176,7 +177,10 @@ def _configure_temp_root_for_session():
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
     previous_tempdir = tempfile.tempdir
-    previous_env = {key: os.environ.get(key) for key in ("TMPDIR", "TMP", "TEMP")}
+    previous_env = {
+        key: os.environ.get(key)
+        for key in ("TMPDIR", "TMP", "TEMP", TEST_TMUX_BASE_ENV)
+    }
     original_mkdtemp = tempfile.mkdtemp
     original_temporary_directory = tempfile.TemporaryDirectory
     tmp_root_str = str(TMP_ROOT)
@@ -186,6 +190,7 @@ def _configure_temp_root_for_session():
     os.environ["TMPDIR"] = tmp_root_str
     os.environ["TMP"] = tmp_root_str
     os.environ["TEMP"] = tmp_root_str
+    os.environ[TEST_TMUX_BASE_ENV] = str(TEST_TMP_BASE)
     tempfile.mkdtemp = _workspace_mkdtemp
     tempfile.TemporaryDirectory = _WorkspaceTemporaryDirectory
 
