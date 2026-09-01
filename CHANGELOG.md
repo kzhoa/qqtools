@@ -8,6 +8,7 @@
   fallback, and the qexp Group `--max-gpus` alias.
 - chore: retire the 1.3.14 compatibility boundaries for primary/borrow encoding, CLI context, and
   Group GPU-limit fields; remove the completed CLI alias registry item.
+- fix: report the machine-agent startup failure cause when scheduler authority is already held.
 
 ## v1.3.13
 
