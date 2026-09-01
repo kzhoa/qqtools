@@ -23,7 +23,7 @@ filesystem. They do not certify NFS, Lustre, or any other cross-host filesystem 
 | machine-local authority isolation | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | [test_test_architecture.py](integration/qexp/test_test_architecture.py) | hermetic / qexp-fast | qexp maintainers |
 | revisioned CAS conflict preservation | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | Pending | hermetic / qexp-fast | qexp maintainers |
 | protocol fault trace and replay envelope | [test_architecture_primitives.py](unit/qexp/test_architecture_primitives.py) | Pending | hermetic / qexp-fast | qexp maintainers |
-| machine dispatch order, primary-candidate admission, and cursor plan | [test_machine_dispatch_plan.py](unit/qexp/test_machine_dispatch_plan.py) | [test_ready_index_dispatch.py](integration/qexp/test_ready_index_dispatch.py) | hermetic / qexp-fast | qexp maintainers |
+| machine dispatch order, primary-probe admission, revision, and cursor plan | [test_machine_dispatch_plan.py](unit/qexp/test_machine_dispatch_plan.py) | [test_ready_index_dispatch.py](integration/qexp/test_ready_index_dispatch.py) | hermetic / qexp-fast | qexp maintainers |
 | independent machine participant environment | N/A | [test_test_architecture.py](integration/qexp/test_test_architecture.py) | machine-lab / merge | qexp maintainers |
 | CW-01 Submission Operation creation | Pending | Pending | hermetic / qexp-fast | qexp maintainers |
 | CW-02 Operation before Task staging | Pending | Pending | hermetic / qexp-fast | qexp maintainers |

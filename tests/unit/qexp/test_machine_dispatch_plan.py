@@ -6,8 +6,11 @@ from qqtools.plugins.qexp.machine_dispatch_plan import (
     MachineDispatchPlan,
     MachineDispatchSnapshot,
     PrimaryCandidateObservation,
+    PrimaryProbeRouteState,
+    begin_primary_probe_route,
     build_machine_dispatch_plan,
     evaluate_primary_candidate,
+    finish_primary_probe_route,
     order_dispatch_project_ids,
     reduce_dispatch_cursor,
 )
@@ -124,3 +127,38 @@ def test_evaluate_primary_candidate_reduces_admission_observations(
 def test_primary_candidate_observation_rejects_impossible_gpu_counts() -> None:
     with pytest.raises(ValueError, match="free GPU count"):
         PrimaryCandidateObservation(True, True, None, 1, 1, 2)
+
+
+def test_begin_primary_probe_route_reuses_completed_route_until_revision_changes() -> None:
+    completed = PrimaryProbeRouteState("cursor", 3, True)
+
+    unchanged = begin_primary_probe_route(completed, 3)
+    changed = begin_primary_probe_route(completed, 4)
+
+    assert unchanged.should_scan is False
+    assert unchanged.state == completed
+    assert changed.state == PrimaryProbeRouteState(None, 4, False)
+    assert changed.has_index_changed is True
+
+
+def test_begin_primary_probe_route_initializes_only_uninitialized_routes() -> None:
+    initialized = begin_primary_probe_route(PrimaryProbeRouteState("cursor", None, False), 2)
+    resumed = begin_primary_probe_route(PrimaryProbeRouteState("cursor", 2, False), None)
+
+    assert initialized.state == PrimaryProbeRouteState("cursor", 2, False)
+    assert initialized.should_scan is True
+    assert resumed.state == PrimaryProbeRouteState("cursor", 2, False)
+    with pytest.raises(ValueError, match="requires an observed revision"):
+        begin_primary_probe_route(PrimaryProbeRouteState(None, None, False), None)
+
+
+def test_finish_primary_probe_route_resets_only_after_a_revision_change() -> None:
+    completed = PrimaryProbeRouteState("cursor", 3, True)
+
+    assert finish_primary_probe_route(completed, 3).state == completed
+    changed = finish_primary_probe_route(completed, 4)
+
+    assert changed.state == PrimaryProbeRouteState(None, 4, False)
+    assert changed.has_index_changed is True
+    with pytest.raises(ValueError, match="completed route scan"):
+        finish_primary_probe_route(PrimaryProbeRouteState(None, 3, False), 3)
