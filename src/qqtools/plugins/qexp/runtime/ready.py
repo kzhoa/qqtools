@@ -1555,6 +1555,25 @@ def retire_current_ready_generation(cfg: object, task: TaskRecord) -> None:
             return
 
 
+def _is_ready_publication_pending(
+    cfg: object, reference: ReadyMarkerRef, task: TaskRecord,
+) -> bool:
+    """Return whether a valid future generation is still being published."""
+    if reference.generation <= task.ready_generation:
+        return False
+    reservation = _reference_for_generation(cfg, reference.task_id, reference.generation)
+    if reservation is None:
+        return False
+    if (
+        reservation.queue_scope != reference.queue_scope
+        or reservation.partition != reference.partition
+        or reservation.catalog_page != reference.catalog_page
+        or reservation.marker_name != reference.marker_name
+    ):
+        return False
+    return reference.queue_scope == "shared" or reservation.home_machine == reference.home_machine
+
+
 def _recheck_missing_ready_marker(
     cfg: object, reference: ReadyMarkerRef,
 ) -> dict[str, Any] | ReadyClassificationResult:
@@ -1569,6 +1588,10 @@ def _recheck_missing_ready_marker(
             task = TaskRecord.from_dict(read_json(task_file))
         except (KeyError, TypeError, ValueError):
             return ReadyClassificationResult("corrupt", "task_invalid")
+        if _is_ready_publication_pending(cfg, reference, task):
+            return ReadyClassificationResult(
+                "temporarily_unavailable", "marker_publication_pending", task
+            )
         if reference.generation != task.ready_generation:
             return ReadyClassificationResult(
                 "permanently_stale", "generation_superseded", task
@@ -1644,6 +1667,10 @@ def classify_ready_marker(
         task = TaskRecord.from_dict(read_json(task_file))
     except (KeyError, TypeError, ValueError):
         return ReadyClassificationResult("corrupt", "task_invalid")
+    if _is_ready_publication_pending(cfg, reference, task):
+        return ReadyClassificationResult(
+            "temporarily_unavailable", "marker_publication_pending", task
+        )
     if reference.generation != task.ready_generation:
         return ReadyClassificationResult(
             "permanently_stale", "generation_superseded", task

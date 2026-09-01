@@ -17,6 +17,9 @@ from qqtools.plugins.qexp.runtime.ready import (
     ReadyMarkerRef,
     classify_ready_marker,
     delete_ready_marker,
+    delete_stale_ready_marker,
+    reserve_ready_generation,
+    write_ready_marker,
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -147,6 +150,48 @@ def test_ready_deletion_tolerates_concurrent_reservation_removal(
     monkeypatch.setattr(ready, "read_json", remove_reservation_before_read)
 
     assert delete_ready_marker(cfg, task.task_id, task.ready_generation) is False
+
+
+def test_ready_generation_publication_is_not_cleaned_as_stale(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    stored = load_task(cfg, task.task_id)
+    generation = stored.ready_generation + 1
+    reference = reserve_ready_generation(
+        cfg,
+        stored.task_id,
+        generation,
+        stored.placement_runtime["queue_scope"],
+        stored.placement_policy["home_machine"],
+    )
+    reservation_path = (
+        shared_paths(cfg.shared_root)["ready_reservations"]
+        / f"{stored.task_id}.{generation}.json"
+    )
+
+    before_marker = classify_ready_marker(cfg, reference)
+
+    assert before_marker.classification == "temporarily_unavailable"
+    assert before_marker.reason == "marker_publication_pending"
+    assert delete_stale_ready_marker(cfg, reference) is False
+    assert reservation_path.exists()
+
+    write_ready_marker(
+        cfg,
+        stored,
+        generation=generation,
+        source_transition="test_publication",
+        source_revision=stored.meta["revision"],
+        target_revision=stored.meta["revision"] + 1,
+        reference=reference,
+    )
+
+    after_marker = classify_ready_marker(cfg, reference)
+
+    assert after_marker.classification == "temporarily_unavailable"
+    assert after_marker.reason == "marker_publication_pending"
+    assert delete_stale_ready_marker(cfg, reference) is False
+    assert reservation_path.exists()
 
 
 def test_ready_delete_failure_does_not_roll_back_authoritative_claim(
