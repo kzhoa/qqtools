@@ -13,20 +13,20 @@ import yaml
 
 
 def _load_runner_schema():
-    schema_path = Path(__file__).resolve().parents[3] / "src/qqtools/plugins/qConfigGen/schemas/definitions/runner.json"
+    schema_path = Path(__file__).resolve().parents[4] / "src/qqtools/plugins/qConfigGen/schemas/definitions/runner.json"
     with open(schema_path, "r") as f:
         return json.load(f)
 
 
 def _load_optim_schema():
-    schema_path = Path(__file__).resolve().parents[3] / "src/qqtools/plugins/qConfigGen/schemas/definitions/optim.json"
+    schema_path = Path(__file__).resolve().parents[4] / "src/qqtools/plugins/qConfigGen/schemas/definitions/optim.json"
     with open(schema_path, "r") as f:
         return json.load(f)
 
 
 def _load_qconfig_schema():
     schema_path = (
-        Path(__file__).resolve().parents[3]
+        Path(__file__).resolve().parents[4]
         / "src/qqtools/plugins/qConfigGen/schemas/qConfigSchema.json"
     )
     with open(schema_path, "r") as f:
@@ -331,6 +331,8 @@ def test_prompt_runner_params_can_disable_regular_latest_only():
         "",
         "",
         "n",
+        "",
+        "",
     ]
 
     with (
@@ -355,6 +357,8 @@ def test_prompt_runner_params_accepts_step_mode_secondary_max_epochs():
         "",
         "",
         "y",
+        "",
+        "",
     ]
 
     with (
@@ -381,6 +385,8 @@ def test_prompt_runner_params_allows_inferred_step_mode_max_steps():
         "",
         "",
         "y",
+        "",
+        "",
     ]
 
     with (
