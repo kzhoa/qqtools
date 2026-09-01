@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from tests.qexp_architecture import (
+    CrashWindow,
     InjectedProtocolError,
     ProtocolDisposition,
     ProtocolPoint,
@@ -14,6 +15,7 @@ from tests.qexp_architecture import (
     SimulatedProtocolPause,
     SimulatedRuntime,
     TraceEnvelope,
+    plan_crash_window_recovery,
 )
 
 
@@ -195,3 +197,105 @@ def test_reference_scenario_generator_is_seeded_and_only_emits_valid_actions() -
         "cancelled",
         "finished",
     }
+
+
+@pytest.mark.parametrize(
+    ("window", "action", "invariant"),
+    [
+        (CrashWindow.SUBMISSION_BEFORE_OPERATION, "preserve_absence", "no_operation_or_task"),
+        (
+            CrashWindow.OPERATION_BEFORE_TASK_STAGING,
+            "abort_or_resume_preparing_submission",
+            "no_claimable_task",
+        ),
+        (
+            CrashWindow.PARTIAL_TASK_STAGING,
+            "complete_or_abort_submission",
+            "no_partial_visibility",
+        ),
+        (
+            CrashWindow.WORKER_BEFORE_COMMIT,
+            "remove_inactive_worker_addition",
+            "worker_inactive_until_commit",
+        ),
+        (
+            CrashWindow.RESERVATION_BEFORE_CLAIM,
+            "release_or_expire_reservation",
+            "task_remains_queued",
+        ),
+        (
+            CrashWindow.CLAIM_BEFORE_ATTEMPT,
+            "release_claim_and_reservation",
+            "no_launch_without_attempt",
+        ),
+        (
+            CrashWindow.ATTEMPT_BEFORE_LAUNCH_GATE,
+            "honor_pause_or_cancel",
+            "no_process_without_authorization",
+        ),
+        (
+            CrashWindow.LAUNCH_GATE_BEFORE_PROCESS,
+            "recover_starting_or_fail_spawn",
+            "no_untracked_process",
+        ),
+        (
+            CrashWindow.PROCESS_BEFORE_METADATA,
+            "reconcile_manifest_and_token",
+            "one_attempt_identity",
+        ),
+        (
+            CrashWindow.PROCESS_EXIT_BEFORE_TERMINAL,
+            "republish_terminal_idempotently",
+            "terminal_truth_converges",
+        ),
+        (
+            CrashWindow.LEASE_EXPIRY_BEFORE_AUTHORIZATION,
+            "return_claim_to_queue",
+            "no_automatic_launch",
+        ),
+        (
+            CrashWindow.LEASE_EXPIRY_AFTER_AUTHORIZATION,
+            "block_task_as_orphaned",
+            "no_automatic_replacement",
+        ),
+        (
+            CrashWindow.ORPHAN_TOKEN_RECOVERY,
+            "issue_successor_for_same_attempt",
+            "attempt_identity_preserved",
+        ),
+        (
+            CrashWindow.SUCCESSOR_FENCING,
+            "reject_stale_writer",
+            "stale_token_cannot_mutate_truth",
+        ),
+        (
+            CrashWindow.WORKER_REMOVAL_RACE,
+            "serialize_under_group_lock",
+            "queued_work_not_stranded",
+        ),
+        (
+            CrashWindow.CANCEL_LAUNCH_RACE,
+            "serialize_final_launch_gate",
+            "one_group_lock_order_wins",
+        ),
+        (
+            CrashWindow.RECOVERY_DRAIN_RACE,
+            "serialize_group_then_task_recovery",
+            "forbidden_recovery_is_quarantined",
+        ),
+        (
+            CrashWindow.CANCELLATION_RESTART,
+            "resume_group_cancellation",
+            "pending_machine_set_preserved",
+        ),
+    ],
+)
+def test_crash_window_recovery_plan_preserves_runtime_invariant(
+    window: CrashWindow,
+    action: str,
+    invariant: str,
+) -> None:
+    plan = plan_crash_window_recovery(window)
+
+    assert plan.action == action
+    assert plan.invariant == invariant
