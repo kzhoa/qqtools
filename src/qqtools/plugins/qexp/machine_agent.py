@@ -119,6 +119,8 @@ def _probe_primary_demand(
             return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
         for scope in ("shared", "home"):
             cursor_key = (project_id, scope)
+            has_waiting_candidate = False
+            waiting_cursor = None
             cursor = runtime.primary_probe_cursors.get(cursor_key)
             route_state = PrimaryProbeRouteState(
                 cursor,
@@ -274,6 +276,9 @@ def _probe_primary_demand(
                     return PrimaryDemandProbe("runnable_now", tuple(diagnostics[-32:]))
                 if decision.outcome == "waiting_for_aggregation":
                     waiting = True
+                    if not has_waiting_candidate:
+                        has_waiting_candidate = True
+                        waiting_cursor = cursor_before
             try:
                 end_revision = ready_index_route_revision(
                     cfg, scope, budget, primary_only=True
@@ -301,6 +306,9 @@ def _probe_primary_demand(
                 diagnostics.append({"project_id": project_id,
                                     "reason": "ready_index_changed"})
                 return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+            if has_waiting_candidate:
+                runtime.primary_probe_cursors[cursor_key] = waiting_cursor
+                runtime.primary_probe_complete[cursor_key] = False
     state = "waiting_for_aggregation" if waiting else "no_primary_demand"
     return PrimaryDemandProbe(state, tuple(diagnostics[-32:]))
 
@@ -1316,6 +1324,7 @@ def run_machine_agent_loop(
     def request_stop(_signum: int, _frame: object) -> None:
         nonlocal stop
         stop = True
+        scheduler_wakeup.set()
 
     with machine_runtime.scheduler_authority(blocking=False) as acquired:
         if not acquired:
@@ -1363,6 +1372,8 @@ def run_machine_agent_loop(
             control_plane.start()
             while not stop:
                 scheduler_wakeup.clear()
+                if stop:
+                    break
                 try:
                     with machine_runtime.migration_guard() as is_migration_clear:
                         if is_migration_clear:

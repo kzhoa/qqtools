@@ -263,13 +263,19 @@ def test_rebuild_deadline_indexes_removes_stale_index(tmp_path: Path):
     assert not stale.exists()
 
 
-def test_agent_removes_stale_deadline_index_without_skipping_remaining_work(tmp_path: Path):
+def test_agent_removes_stale_deadline_index_without_skipping_remaining_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     stale = shared_paths(cfg.shared_root)["offer_deadlines"] / "missing.json"
     atomic_replace(stale, {"offer_deadline": {"task_id": "missing"}})
     task = submit(cfg, ["echo", "ok"], group="exp")
     task_commands.share(cfg, task.task_id, after_seconds=0)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.project_maintenance.elapsed_offer_is_proven",
+        lambda *_args: True,
+    )
 
     offer_due_tasks(cfg)
 

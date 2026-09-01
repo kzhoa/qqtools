@@ -923,7 +923,9 @@ def test_background_machine_agent_publishes_pid_only_after_acquiring_authority(
         assert active["pid"] == process.pid
         assert runtime.paths["pid"].read_text(encoding="utf-8") == str(process.pid)
     finally:
+        started_at = time.monotonic()
         stop_machine_agent(runtime)
+        assert time.monotonic() - started_at < 2.0
         process.wait(timeout=1.0)
 
 
