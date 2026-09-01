@@ -703,6 +703,35 @@ for line in sys.stdin:
             "attempt_id": attempt.attempt_id if attempt else None,
             "fencing_token": attempt.current_fencing_token if attempt else None,
         }), flush=True)
+    elif command == "authorize_launch":
+        from qqtools.plugins.qexp.config_types import RootConfig
+        from qqtools.plugins.qexp.scheduler import authorize_launch
+        shared_root = Path(os.environ["QEXP_TEST_SHARED_ROOT"])
+        cfg = RootConfig(
+            shared_root,
+            shared_root.parent,
+            message["machine_name"],
+            Path(os.environ["QEXP_MACHINE_RUNTIME_ROOT"]),
+        )
+        authorized = authorize_launch(
+            cfg,
+            message["task_id"],
+            message["attempt_id"],
+            message["fencing_token"],
+        )
+        print(json.dumps({"authorized": authorized}), flush=True)
+    elif command == "cancel_task":
+        from qqtools.plugins.qexp.config_types import RootConfig
+        from qqtools.plugins.qexp.scheduler import cancel_task
+        shared_root = Path(os.environ["QEXP_TEST_SHARED_ROOT"])
+        cfg = RootConfig(
+            shared_root,
+            shared_root.parent,
+            message["machine_name"],
+            Path(os.environ["QEXP_MACHINE_RUNTIME_ROOT"]),
+        )
+        task = cancel_task(cfg, message["task_id"])
+        print(json.dumps({"state": task.state["projection"]}), flush=True)
     elif command == "checkpoint":
         print(json.dumps({"checkpoint": "reached", "pid": os.getpid()}), flush=True)
         while True:
