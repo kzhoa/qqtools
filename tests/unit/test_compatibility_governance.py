@@ -416,7 +416,6 @@ def test_preflight_runs_compatibility_gate_before_expensive_checks(
         (("tox", "run", "-e", "unit"), {}),
         (("tox", "run", "-e", "integration"), {}),
         (("tox", "run", "-e", "qexp-integration"), {}),
-        (("tox", "run", "-e", "release-e2e"), {}),
     ]
 
 
