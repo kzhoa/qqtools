@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import select
+import socket
 import subprocess
 import sys
 import tempfile
@@ -28,13 +29,37 @@ def test_resource_scope_isolates_child_environment(qexp_resource_scope: TestReso
 def test_resource_scope_records_test_owned_resources_and_cleanup_diagnostics(
     qexp_resource_scope: TestResourceScope,
 ) -> None:
-    resource = qexp_resource_scope.record_resource("participant", {"pid": 1234})
+    resource = qexp_resource_scope.record_resource("participant-intent", {"pid": 1234})
     diagnostic = qexp_resource_scope.record_cleanup_diagnostic("timeout", {"pid": 1234})
 
     assert json.loads(resource.read_text(encoding="utf-8")) == {
-        "resource": {"identity": {"pid": 1234}, "kind": "participant"}
+        "resource": {"identity": {"pid": 1234}, "kind": "participant-intent"}
     }
-    assert json.loads(diagnostic.read_text(encoding="utf-8")) == {"diagnostic": {"pid": 1234}}
+    assert json.loads(diagnostic.read_text(encoding="utf-8")) == {
+        "consumed": False,
+        "diagnostic": {"pid": 1234},
+    }
+    assert any(
+        "unconsumed cleanup diagnostic" in violation
+        for violation in TestResourceScope.cleanup_violations(qexp_resource_scope.root)
+    )
+    qexp_resource_scope.consume_cleanup_diagnostic(diagnostic)
+
+
+@pytest.mark.qexp_fast
+def test_resource_scope_reports_an_active_test_owned_tmux_socket(
+    qexp_resource_scope: TestResourceScope,
+) -> None:
+    server = socket.socket(socket.AF_UNIX)
+    try:
+        server.bind(str(qexp_resource_scope.tmux_socket))
+        server.listen()
+        assert any(
+            "tmux socket remains active" in violation
+            for violation in TestResourceScope.cleanup_violations(qexp_resource_scope.root)
+        )
+    finally:
+        server.close()
 
 
 @pytest.mark.qexp_fast

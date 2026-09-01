@@ -45,6 +45,8 @@ def test_machine_lab_records_participant_lifecycle_in_its_resource_ledger(tmp_pa
     ]
     kinds = {record["kind"] for record in records}
     assert {"participant-intent", "participant", "participant-exit"} <= kinds
+    participant_record = next(record for record in records if record["kind"] == "participant")
+    assert participant_record["identity"]["process_group_id"] == participant.process.pid
 
 
 @pytest.mark.machine_lab

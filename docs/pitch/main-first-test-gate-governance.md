@@ -301,7 +301,7 @@ Phase 0 不修改测试归属。交付物是一次性的基线记录和精确重
 | `tests/qexp_test_support.py` | `tests/helpers/qexp/resources.py` | 保留 `TestResourceScope`，不增加生产配置开关 |
 
 - [x] 新增 `tests/helpers/qexp/__init__.py`，更新 Unit、Integration 和 fixture 的导入路径。
-- [ ] 对移动后的 Unit 与 Integration 做 collect-only，再运行直接相关测试，保证目录迁移不改变行为。
+- [x] 对移动后的 Unit 与 Integration 做 collect-only，再运行直接相关测试，保证目录迁移不改变行为。
 
 #### 1.2 拆分现有架构 Integration
 
@@ -317,10 +317,10 @@ Phase 0 不修改测试归属。交付物是一次性的基线记录和精确重
 
 #### 1.3 让清理失败成为测试失败
 
-- [ ] 将 `qexp_resource_scope` 改为 yield fixture，在 teardown 检查账本中登记的 PID/PGID 已退出。
-- [ ] `SingleHostMachineLab.close()` 必须等待所有 participant；terminate 超时后只 kill 账本登记且由测试创建的进程组。
-- [ ] participant 未退出、存在未消费 cleanup diagnostic 或测试拥有的 tmux socket 仍活跃时，使当前用例失败并保留诊断路径。
-- [ ] 禁止通过进程名、用户级全量扫描或默认 tmp 根清理资源；清理范围只能来自本测试的 resource ledger。
+- [x] 将 `qexp_resource_scope` 改为 yield fixture，在 teardown 检查账本中登记的 PID/PGID 已退出。
+- [x] `SingleHostMachineLab.close()` 必须等待所有 participant；terminate 超时后只 kill 账本登记且由测试创建的进程组。
+- [x] participant 未退出、存在未消费 cleanup diagnostic 或测试拥有的 tmux socket 仍活跃时，使当前用例失败并保留诊断路径。
+- [x] 禁止通过进程名、用户级全量扫描或默认 tmp 根清理资源；清理范围只能来自本测试的 resource ledger。
 
 Phase 1 完成后，除待迁移的现有 `host_exclusive` 用例外，所有 qexp Integration 均可在开发机存在真实 qexp agent 时安全运行。
 

@@ -6,8 +6,10 @@ test switch to the production qexp authority implementation.
 from __future__ import annotations
 
 import json
+import os
 import random
 import select
+import signal
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping
@@ -816,9 +818,7 @@ class MachineParticipant:
                 "participant-close",
                 {"name": self.name, "pid": self.process.pid, "error": str(exc)},
             )
-            if self.process.poll() is None:
-                self.process.terminate()
-                self.process.wait(timeout=2.0)
+            self._terminate_owned_process_group()
         self.scope.record_resource(
             "participant-exit",
             {"name": self.name, "pid": self.process.pid, "returncode": self.process.returncode},
@@ -827,8 +827,14 @@ class MachineParticipant:
     def kill(self) -> None:
         """Terminate this participant without attempting graceful protocol cleanup."""
         if self.process.poll() is None:
-            self.process.kill()
-            self.process.wait(timeout=2.0)
+            self._signal_owned_process_group(signal.SIGKILL)
+            try:
+                self.process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired as exc:
+                self.scope.record_cleanup_diagnostic(
+                    "participant-kill",
+                    {"name": self.name, "pid": self.process.pid, "error": str(exc)},
+                )
         self.scope.record_resource(
             "participant-exit",
             {"name": self.name, "pid": self.process.pid, "returncode": self.process.returncode},
@@ -838,6 +844,32 @@ class MachineParticipant:
         if self.process.stderr is None or self.process.poll() is None:
             return "stderr unavailable while participant is running"
         return self.process.stderr.read().strip() or "no stderr output"
+
+    def _terminate_owned_process_group(self) -> None:
+        """Stop only the process group recorded for this test participant."""
+        self._signal_owned_process_group(signal.SIGTERM)
+        try:
+            self.process.wait(timeout=2.0)
+            return
+        except subprocess.TimeoutExpired as exc:
+            self.scope.record_cleanup_diagnostic(
+                "participant-terminate-timeout",
+                {"name": self.name, "pid": self.process.pid, "error": str(exc)},
+            )
+        self._signal_owned_process_group(signal.SIGKILL)
+        try:
+            self.process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired as exc:
+            self.scope.record_cleanup_diagnostic(
+                "participant-kill-timeout",
+                {"name": self.name, "pid": self.process.pid, "error": str(exc)},
+            )
+
+    def _signal_owned_process_group(self, signal_number: int) -> None:
+        try:
+            os.killpg(self.process.pid, signal_number)
+        except ProcessLookupError:
+            return
 
 
 class SingleHostMachineLab:
@@ -1016,5 +1048,8 @@ for line in sys.stdin:
             text=True,
             start_new_session=True,
         )
-        scope.record_resource("participant", {"name": name, "pid": process.pid})
+        scope.record_resource(
+            "participant",
+            {"name": name, "pid": process.pid, "process_group_id": process.pid},
+        )
         return MachineParticipant(name, scope, process, self.trace)
