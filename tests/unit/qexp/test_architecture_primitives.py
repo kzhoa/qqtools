@@ -150,3 +150,20 @@ def test_reference_scenario_rejects_a_trace_command_with_an_invalid_fencing_toke
 
     with pytest.raises(ValueError, match="positive fencing_token"):
         model.execute(ReferenceCommand("authorize_launch", task_id="task-1", fencing_token=0))
+
+
+def test_reference_scenario_generator_is_seeded_and_only_emits_valid_actions() -> None:
+    first = ReferenceScenarioRunner(seed=17)
+    second = ReferenceScenarioRunner(seed=17)
+
+    generated = first.generate(maximum_actions=8)
+
+    assert generated == second.generate(maximum_actions=8)
+    assert len(generated) <= 8
+    assert first.run(generated).task_state("task-1") in {
+        "claimed",
+        "starting",
+        "running",
+        "cancelled",
+        "finished",
+    }
