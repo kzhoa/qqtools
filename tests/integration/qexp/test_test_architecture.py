@@ -32,6 +32,21 @@ def test_resource_scope_isolates_child_environment(qexp_resource_scope: TestReso
 
 
 @pytest.mark.qexp_fast
+def test_resource_scope_records_test_owned_resources_and_cleanup_diagnostics(
+    qexp_resource_scope: TestResourceScope,
+) -> None:
+    resource = qexp_resource_scope.record_resource("participant", {"pid": 1234})
+    diagnostic = qexp_resource_scope.record_cleanup_diagnostic("timeout", {"pid": 1234})
+
+    assert json.loads(resource.read_text(encoding="utf-8")) == {
+        "resource": {"identity": {"pid": 1234}, "kind": "participant"}
+    }
+    assert json.loads(diagnostic.read_text(encoding="utf-8")) == {
+        "diagnostic": {"pid": 1234}
+    }
+
+
+@pytest.mark.qexp_fast
 def test_machine_participants_use_distinct_frozen_authority_roots(tmp_path: Path) -> None:
     first_scope = TestResourceScope.create(tmp_path, "first")
     second_scope = TestResourceScope.create(tmp_path, "second")
@@ -105,6 +120,22 @@ def test_machine_lab_participants_have_independent_local_identity(tmp_path: Path
         assert second.request("scheduler_authority")["acquired"] is True
     finally:
         lab.close()
+
+
+@pytest.mark.machine_lab
+def test_machine_lab_records_participant_lifecycle_in_its_resource_ledger(tmp_path: Path) -> None:
+    lab = SingleHostMachineLab(tmp_path, "machine-lab-ledger")
+    participant = lab.start("first")
+
+    participant.request("identity")
+    lab.close()
+
+    records = [
+        json.loads(path.read_text(encoding="utf-8"))["resource"]
+        for path in participant.scope.resource_ledger_root.glob("*.json")
+    ]
+    kinds = {record["kind"] for record in records}
+    assert {"participant-intent", "participant", "participant-exit"} <= kinds
 
 
 @pytest.mark.machine_lab

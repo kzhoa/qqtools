@@ -5,6 +5,7 @@ configuration switch that weakens its machine-authority semantics.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
@@ -33,6 +34,8 @@ class TestResourceScope:
     home_root: Path
     xdg_root: Path
     tmux_socket: Path
+    resource_ledger_root: Path
+    diagnostics_root: Path
 
     @classmethod
     def create(cls, base_root: Path, nodeid: str) -> "TestResourceScope":
@@ -45,6 +48,8 @@ class TestResourceScope:
         home_root = root / "home"
         xdg_root = root / "xdg"
         tmux_socket = root / "tmux" / "server.sock"
+        resource_ledger_root = root / "resource-ledger"
+        diagnostics_root = root / "diagnostics"
         for path in (
             runtime_root,
             shared_root,
@@ -53,6 +58,8 @@ class TestResourceScope:
             home_root,
             xdg_root,
             tmux_socket.parent,
+            resource_ledger_root,
+            diagnostics_root,
         ):
             path.mkdir(parents=True, exist_ok=True)
         return cls(
@@ -65,6 +72,8 @@ class TestResourceScope:
             home_root=home_root,
             xdg_root=xdg_root,
             tmux_socket=tmux_socket,
+            resource_ledger_root=resource_ledger_root,
+            diagnostics_root=diagnostics_root,
         )
 
     def child_environment(self, base: dict[str, str] | None = None) -> dict[str, str]:
@@ -84,3 +93,22 @@ class TestResourceScope:
             }
         )
         return environment
+
+    def record_resource(self, kind: str, identity: dict[str, object]) -> Path:
+        """Persist a test-owned external resource before cleanup can be attempted."""
+        if not kind or any(character in kind for character in "/\\"):
+            raise ValueError("resource kind must be a non-empty path component")
+        path = self.resource_ledger_root / f"{uuid.uuid4().hex[:12]}-{kind}.json"
+        path.write_text(
+            json.dumps({"resource": {"kind": kind, "identity": identity}}, sort_keys=True),
+            encoding="utf-8",
+        )
+        return path
+
+    def record_cleanup_diagnostic(self, kind: str, details: dict[str, object]) -> Path:
+        """Persist cleanup diagnostics without touching non-test resources."""
+        if not kind or any(character in kind for character in "/\\"):
+            raise ValueError("diagnostic kind must be a non-empty path component")
+        path = self.diagnostics_root / f"{uuid.uuid4().hex[:12]}-{kind}.json"
+        path.write_text(json.dumps({"diagnostic": details}, sort_keys=True), encoding="utf-8")
+        return path

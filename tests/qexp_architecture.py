@@ -803,20 +803,36 @@ class MachineParticipant:
 
     def close(self) -> None:
         if self.process.poll() is not None:
+            self.scope.record_resource(
+                "participant-exit",
+                {"name": self.name, "pid": self.process.pid, "returncode": self.process.returncode},
+            )
             return
         try:
             self.request("exit")
             self.process.wait(timeout=2.0)
-        except (BrokenPipeError, RuntimeError, subprocess.TimeoutExpired):
+        except (BrokenPipeError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            self.scope.record_cleanup_diagnostic(
+                "participant-close",
+                {"name": self.name, "pid": self.process.pid, "error": str(exc)},
+            )
             if self.process.poll() is None:
                 self.process.terminate()
                 self.process.wait(timeout=2.0)
+        self.scope.record_resource(
+            "participant-exit",
+            {"name": self.name, "pid": self.process.pid, "returncode": self.process.returncode},
+        )
 
     def kill(self) -> None:
         """Terminate this participant without attempting graceful protocol cleanup."""
         if self.process.poll() is None:
             self.process.kill()
             self.process.wait(timeout=2.0)
+        self.scope.record_resource(
+            "participant-exit",
+            {"name": self.name, "pid": self.process.pid, "returncode": self.process.returncode},
+        )
 
     def _stderr_diagnostics(self) -> str:
         if self.process.stderr is None or self.process.poll() is None:
@@ -943,6 +959,7 @@ for line in sys.stdin:
     def _start_with_scope(self, name: str, scope: TestResourceScope) -> MachineParticipant:
         environment = scope.child_environment()
         environment["QEXP_TEST_SHARED_ROOT"] = str(self.shared_root)
+        scope.record_resource("participant-intent", {"name": name})
         process = subprocess.Popen(
             [sys.executable, "-c", self._PARTICIPANT],
             env=environment,
@@ -952,4 +969,5 @@ for line in sys.stdin:
             text=True,
             start_new_session=True,
         )
+        scope.record_resource("participant", {"name": name, "pid": process.pid})
         return MachineParticipant(name, scope, process, self.trace)
