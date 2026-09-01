@@ -239,6 +239,61 @@ def test_machine_lab_cancel_and_launch_gate_have_one_lock_order(tmp_path: Path) 
         lab.close()
 
 
+@pytest.mark.machine_lab
+def test_machine_lab_rejects_a_stale_fencing_token_after_a_successor_claim(tmp_path: Path) -> None:
+    lab = SingleHostMachineLab(tmp_path, "machine-lab-fencing")
+    cfg = init_shared_root(lab.shared_root, "gpu-1", runtime_root=tmp_path / "bootstrap-runtime")
+    create_group(cfg, "workers")
+    change_worker(cfg, "workers", "gpu-2", "add")
+    task = submit(cfg, ["echo", "fencing"], group="workers", sharing_mode="spillover")
+    offer(cfg, task.task_id)
+    first = lab.start("first")
+    second = lab.start("second")
+
+    try:
+        original = first.request(
+            "claim_task",
+            payload={"machine_name": "gpu-1", "task_id": task.task_id, "gpu_ids": [0]},
+        )
+        assert original["claimed"] is True
+        assert isinstance(original["attempt_id"], str)
+        assert original["fencing_token"] == 1
+        assert first.request(
+            "fail_attempt",
+            payload={
+                "machine_name": "gpu-1",
+                "task_id": task.task_id,
+                "attempt_id": original["attempt_id"],
+                "fencing_token": original["fencing_token"],
+            },
+        )["failed"] is True
+        assert second.request(
+            "retry_task",
+            payload={"machine_name": "gpu-2", "task_id": task.task_id},
+        )["state"] == "queued"
+        successor = first.request(
+            "claim_task",
+            payload={"machine_name": "gpu-1", "task_id": task.task_id, "gpu_ids": [0]},
+        )
+        assert successor["claimed"] is True
+        assert successor["fencing_token"] == 2
+
+        stale = first.request(
+            "authorize_launch",
+            payload={
+                "machine_name": "gpu-1",
+                "task_id": task.task_id,
+                "attempt_id": original["attempt_id"],
+                "fencing_token": original["fencing_token"],
+            },
+        )
+
+        assert stale == {"authorized": False}
+        assert load_task(cfg, task.task_id).claim_control["active_claim"]["fencing_token"] == 2
+    finally:
+        lab.close()
+
+
 @pytest.mark.host_exclusive
 def test_host_exclusive_authority_allows_only_one_runtime_per_os_user(tmp_path: Path) -> None:
     source_root = Path(__file__).parents[3] / "src"
