@@ -87,7 +87,7 @@ def qexp_healthy_clock(monkeypatch):
 @pytest.fixture
 def qexp_resource_scope(tmp_path: Path, request: pytest.FixtureRequest):
     """Provide isolated filesystem and local-process resources to qexp tests."""
-    from tests.support.qexp.resources import TestResourceScope
+    from tests.helpers.qexp.resources import TestResourceScope
 
     return TestResourceScope.create(tmp_path / "qexp-resources", request.node.nodeid)
 
