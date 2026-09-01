@@ -6,6 +6,7 @@ test switch to the production qexp authority implementation.
 from __future__ import annotations
 
 import json
+import random
 import select
 import subprocess
 import sys
@@ -291,6 +292,67 @@ class QexpReferenceModel:
     def task_state(self, task_id: str) -> ModelTaskState:
         return self._task(task_id).state
 
+    def available_commands(self) -> tuple[ReferenceCommand, ...]:
+        """Return only model commands valid for the current state."""
+        commands: list[ReferenceCommand] = []
+        for submission_id, state in sorted(self._submission_states.items()):
+            if state == "preparing":
+                commands.extend(
+                    (
+                        ReferenceCommand("commit_submission", submission_id=submission_id),
+                        ReferenceCommand("abort_submission", submission_id=submission_id),
+                    )
+                )
+                for task_id, task in sorted(self._tasks.items()):
+                    if task.submission_id == submission_id and task.state == "queued":
+                        commands.append(ReferenceCommand("cancel", task_id=task_id))
+        for task_id, task in sorted(self._tasks.items()):
+            if (
+                task.state == "queued"
+                and self._submission_states[task.submission_id] == "committed"
+            ):
+                commands.extend(
+                    (
+                        ReferenceCommand("claim", task_id=task_id),
+                        ReferenceCommand("cancel", task_id=task_id),
+                    )
+                )
+            elif task.state == "claimed":
+                commands.extend(
+                    (
+                        ReferenceCommand(
+                            "authorize_launch",
+                            task_id=task_id,
+                            fencing_token=task.fencing_token,
+                        ),
+                        ReferenceCommand("cancel", task_id=task_id),
+                    )
+                )
+            elif task.state == "starting":
+                commands.extend(
+                    (
+                        ReferenceCommand(
+                            "publish_running",
+                            task_id=task_id,
+                            fencing_token=task.fencing_token,
+                        ),
+                        ReferenceCommand("cancel", task_id=task_id),
+                    )
+                )
+            elif task.state == "running":
+                commands.extend(
+                    (
+                        ReferenceCommand(
+                            "publish_terminal",
+                            task_id=task_id,
+                            fencing_token=task.fencing_token,
+                            is_cancelled=False,
+                        ),
+                        ReferenceCommand("cancel", task_id=task_id),
+                    )
+                )
+        return tuple(commands)
+
     def execute(self, command: ReferenceCommand) -> bool | int | ModelEffectPlan | None:
         """Apply one serializable command and return its normalized model outcome."""
         if command.kind == "create_submission":
@@ -372,6 +434,28 @@ class ReferenceScenarioRunner:
             self.trace.record("model.result", _reference_result_payload(result), float(index))
         model.assert_invariants()
         return model
+
+    def generate(self, *, maximum_actions: int) -> list[ReferenceCommand]:
+        """Generate a bounded valid lifecycle sequence from the runner seed."""
+        if maximum_actions < 4:
+            raise ValueError("maximum_actions must allow submission staging and commit")
+        generator = random.Random(self.seed)
+        commands = [
+            ReferenceCommand("create_submission", submission_id="submission-1"),
+            ReferenceCommand("stage_task", task_id="task-1", submission_id="submission-1"),
+            ReferenceCommand("commit_submission", submission_id="submission-1"),
+        ]
+        model = QexpReferenceModel()
+        for command in commands:
+            model.execute(command)
+        while len(commands) < maximum_actions:
+            available = model.available_commands()
+            if not available:
+                break
+            command = generator.choice(available)
+            commands.append(command)
+            model.execute(command)
+        return commands
 
     @classmethod
     def replay(cls, trace: TraceEnvelope) -> QexpReferenceModel:
