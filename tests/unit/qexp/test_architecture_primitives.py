@@ -5,6 +5,7 @@ import pytest
 from tests.qexp_architecture import (
     InjectedProtocolError,
     ProtocolPoint,
+    QexpReferenceModel,
     ScenarioRunner,
     SimulatedRuntime,
     TraceEnvelope,
@@ -58,3 +59,42 @@ def test_scenario_runner_shrinks_to_minimal_failing_trace() -> None:
 
     minimized = ScenarioRunner.shrink([harmless, fail, harmless], fails)
     assert minimized == [fail]
+
+
+def test_reference_model_rejects_claim_before_submission_commit() -> None:
+    model = QexpReferenceModel()
+    model.create_submission("submission-1")
+    model.stage_task("task-1", "submission-1")
+
+    assert model.claim("task-1") is None
+    model.commit_submission("submission-1")
+    assert model.claim("task-1") == 1
+    assert model.claim("task-1") is None
+
+
+def test_reference_model_fences_stale_launch_and_terminal_writes() -> None:
+    model = QexpReferenceModel()
+    model.create_submission("submission-1")
+    model.stage_task("task-1", "submission-1")
+    model.commit_submission("submission-1")
+    token = model.claim("task-1")
+
+    assert token == 1
+    assert model.authorize_launch("task-1", 0) is None
+    assert model.authorize_launch("task-1", token).kind == "launch"
+    assert model.publish_running("task-1", token) is True
+    assert model.publish_terminal("task-1", 0, cancelled=False) is False
+    assert model.task_state("task-1") == "running"
+
+
+def test_reference_model_cancel_linearizes_against_launch_authorization() -> None:
+    model = QexpReferenceModel()
+    model.create_submission("submission-1")
+    model.stage_task("task-1", "submission-1")
+    model.commit_submission("submission-1")
+    token = model.claim("task-1")
+
+    assert token == 1
+    assert model.cancel("task-1") is None
+    assert model.authorize_launch("task-1", token) is None
+    assert model.task_state("task-1") == "cancelled"
