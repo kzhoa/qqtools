@@ -16,8 +16,9 @@ from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
     ReadyMarkerRef,
     classify_ready_marker,
+    delete_ready_marker,
 )
-from qqtools.plugins.qexp.runtime.store import read_json
+from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import claim_task
 
@@ -64,6 +65,88 @@ def test_claim_commits_truth_before_retiring_ready_marker(tmp_path: Path):
     assert attempt is not None
     assert load_task(cfg, task.task_id).state["projection"] == "running"
     assert not reservation_path.exists()
+
+
+def test_marker_removed_by_successful_claim_is_permanently_stale(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    reference = _ready_reference(cfg, task.task_id, task.ready_generation)
+
+    assert claim_task(cfg, task.task_id, [0]) is not None
+
+    result = classify_ready_marker(cfg, reference)
+
+    assert result.classification == "permanently_stale"
+    assert result.reason == "task_not_queued"
+    assert result.task is not None and result.task.task_id == task.task_id
+
+
+def test_missing_queued_marker_with_indexed_slot_is_corrupt(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    reference = _ready_reference(cfg, task.task_id, task.ready_generation)
+    marker_path = (
+        shared_paths(cfg.shared_root)["ready_home"]
+        / reference.home_machine
+        / reference.partition
+        / reference.marker_name
+    )
+    marker_path.unlink()
+
+    result = classify_ready_marker(cfg, reference)
+
+    assert result.classification == "corrupt"
+    assert result.reason == "marker_missing_indexed"
+
+
+def test_missing_queued_marker_and_slot_is_corrupt(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    reference = _ready_reference(cfg, task.task_id, task.ready_generation)
+    marker_path = (
+        shared_paths(cfg.shared_root)["ready_home"]
+        / reference.home_machine
+        / reference.partition
+        / reference.marker_name
+    )
+    partition_path = (
+        shared_paths(cfg.shared_root)["ready_home"]
+        / reference.home_machine
+        / reference.partition
+        / "partition.json"
+    )
+    marker_path.unlink()
+    partition = read_json(partition_path)
+    partition["ready_partition"]["slots"].remove(reference.marker_name)
+    atomic_replace(partition_path, partition)
+
+    result = classify_ready_marker(cfg, reference)
+
+    assert result.classification == "corrupt"
+    assert result.reason == "marker_missing_unindexed"
+
+
+def test_ready_deletion_tolerates_concurrent_reservation_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    reservation_path = (
+        shared_paths(cfg.shared_root)["ready_reservations"]
+        / f"{task.task_id}.{task.ready_generation}.json"
+    )
+    from qqtools.plugins.qexp.runtime import ready
+
+    original_read_json = ready.read_json
+
+    def remove_reservation_before_read(path):
+        if path == reservation_path:
+            reservation_path.unlink()
+        return original_read_json(path)
+
+    monkeypatch.setattr(ready, "read_json", remove_reservation_before_read)
+
+    assert delete_ready_marker(cfg, task.task_id, task.ready_generation) is False
 
 
 def test_ready_delete_failure_does_not_roll_back_authoritative_claim(
