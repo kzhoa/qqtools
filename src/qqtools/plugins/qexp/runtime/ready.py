@@ -1410,7 +1410,7 @@ def write_ready_marker(
         or reference.home_machine != task.placement_policy["home_machine"]
     ):
         raise ValueError("ready reservation does not match the target Task route.")
-    marker = {"ready_marker": {
+    marker_value = {
         "schema_version": READY_PROTOCOL_VERSION,
         "task_id": task.task_id,
         "generation": generation,
@@ -1420,10 +1420,16 @@ def write_ready_marker(
         "queue_scope": scope,
         "home_machine": task.placement_policy["home_machine"],
         "group_name": task.group_name,
-        "requested_gpus": task.spec.requested_gpus,
         "submission_operation_id": task.submission_operation_id,
         "created_at": utc_now(),
-    }}
+    }
+    if task.spec.lane is None:
+        marker_value["requested_gpus"] = task.spec.requested_gpus
+    elif task.spec.is_cpu_only:
+        marker_value.update({"lane": "cpu", "requested_cpus": task.spec.requested_cpus})
+    else:
+        marker_value.update({"lane": "gpu", "requested_gpus": task.spec.requested_gpus})
+    marker = {"ready_marker": marker_value}
     if _has_primary_ready_demand(cfg, task):
         with primary_projection_transaction(cfg, [(scope, reference.home_machine)]):
             atomic_replace(_marker_path(cfg.shared_root, reference), marker)
@@ -1667,12 +1673,15 @@ def classify_ready_marker(
     except (KeyError, TypeError, ValueError):
         return ReadyClassificationResult("corrupt", "marker_invalid")
     try:
-        required = {
+        common = {
             "schema_version", "task_id", "generation", "source_transition",
             "source_revision", "target_revision", "queue_scope", "home_machine",
-            "group_name", "requested_gpus", "submission_operation_id", "created_at",
+            "group_name", "submission_operation_id", "created_at",
         }
-        if set(marker) != required or marker["schema_version"] != READY_PROTOCOL_VERSION:
+        is_legacy = set(marker) == common | {"requested_gpus"}
+        is_gpu = set(marker) == common | {"lane", "requested_gpus"} and marker.get("lane") == "gpu"
+        is_cpu = set(marker) == common | {"lane", "requested_cpus"} and marker.get("lane") == "cpu"
+        if not (is_legacy or is_gpu or is_cpu) or marker["schema_version"] != READY_PROTOCOL_VERSION:
             raise ValueError("ready marker schema is invalid.")
         if (
             marker["task_id"] != reference.task_id

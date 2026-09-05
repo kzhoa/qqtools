@@ -47,6 +47,7 @@ from .runtime.ready import (
 )
 from .runtime.active_operations import operation_exists
 from .runtime.reservations import ReservationIdentity, attach, release, reserve, reserve_admitted
+from .runtime.cpu_lane import attach_cpu, reserve_cpu
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.tasks import load_task, save_task
 from .runtime.work_budget import (
@@ -79,6 +80,7 @@ class _BorrowAdmissionGrant:
 
     runtime_root: Path
     revisions: tuple[_BorrowAdmissionRevision, ...]
+    lane: str = "gpu"
 
     def is_valid(self, runtime_root: Path) -> bool:
         if self.runtime_root.resolve() != Path(runtime_root).resolve():
@@ -304,7 +306,19 @@ def _claim(
         attempt_number = task.attempt_control["next_attempt_number"]
         attempt_id = f"{task.task_id}-attempt-{attempt_number}"
         token = task.claim_control["fencing_epoch"] + 1
-        if group is not None and worker is not None:
+        if task.spec.is_cpu_only:
+            reservation = reserve_cpu(
+                reservation_runtime_root,
+                task_id,
+                task.spec.requested_cpus or 0,
+                attempt_id=attempt_id,
+                fencing_token=token,
+                project_id=project_id,
+                shared_root=str(cfg.shared_root),
+                machine_name=cfg.machine_name,
+                group_name=task.group_name,
+            )
+        elif group is not None and worker is not None:
             reservation = reserve_admitted(
                 reservation_runtime_root,
                 task_id,
@@ -335,7 +349,7 @@ def _claim(
         attempt = AttemptRecord.claimed(
             task,
             cfg.machine_name,
-            reservation["reservation"]["gpu_ids"],
+            reservation["reservation"].get("gpu_ids", []),
             reservation["reservation"]["reservation_id"],
             token,
             authority_mode=authority_mode,
@@ -389,7 +403,10 @@ def _claim(
         save_task(cfg, task)
         try:
             atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
-            attach(reservation_runtime_root, attempt.reservation_id, attempt.attempt_id, token)
+            if task.spec.is_cpu_only:
+                attach_cpu(reservation_runtime_root, attempt.reservation_id, attempt.attempt_id, token)
+            else:
+                attach(reservation_runtime_root, attempt.reservation_id, attempt.attempt_id, token)
         except Exception:
             _release_claim_locked(
                 cfg, task, token, "attempt_materialization_failed",
@@ -710,6 +727,7 @@ def run_dispatch_cycle(
     cfg: RootConfig,
     *,
     available_gpus: list[int] | None = None,
+    available_cpus: int | None = None,
     executor: Executor | None = None,
     reservation_runtime_root: Path | None = None,
     project_id: str | None = None,
@@ -726,11 +744,13 @@ def run_dispatch_cycle(
     work_budget: SliceBudget | None = None,
     batch_sizer: AdaptiveBatchSizer | None = None,
     inspected_ready: set[tuple[str, str, str]] | None = None,
+    lane: str | None = None,
 ) -> list[str]:
     with diagnostic_span("run_dispatch_cycle"):
         return _run_dispatch_cycle(
             cfg,
             available_gpus=available_gpus,
+            available_cpus=available_cpus,
             executor=executor,
             reservation_runtime_root=reservation_runtime_root,
             project_id=project_id,
@@ -747,6 +767,7 @@ def run_dispatch_cycle(
             work_budget=work_budget,
             batch_sizer=batch_sizer,
             inspected_ready=inspected_ready,
+            lane=lane,
         )
 
 
@@ -754,6 +775,7 @@ def _run_dispatch_cycle(
     cfg: RootConfig,
     *,
     available_gpus: list[int] | None = None,
+    available_cpus: int | None = None,
     executor: Executor | None = None,
     reservation_runtime_root: Path | None = None,
     project_id: str | None = None,
@@ -770,9 +792,15 @@ def _run_dispatch_cycle(
     work_budget: SliceBudget | None = None,
     batch_sizer: AdaptiveBatchSizer | None = None,
     inspected_ready: set[tuple[str, str, str]] | None = None,
+    lane: str | None = None,
 ) -> list[str]:
+    if lane not in {None, "cpu", "gpu"}:
+        raise ValueError("lane must be cpu, gpu, or None.")
+    if borrow_admission_grant is not None and lane is not None and borrow_admission_grant.lane != lane:
+        raise BorrowAdmissionRequired("borrow admission grant belongs to a different resource lane.")
     reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     available = list(available_gpus or [])
+    available_cpu_slots = available_cpus or 0
     executor = executor or Executor()
     launched: list[str] = []
     new_claims = 0
@@ -801,7 +829,7 @@ def _run_dispatch_cycle(
                     reservation_runtime_root=reservation_runtime_root,
                 )
     ready_state = read_ready_index_state(cfg)
-    if available and project_id is None and ready_state in {"absent", "building"}:
+    if (available or available_cpu_slots) and project_id is None and ready_state in {"absent", "building"}:
         advance_ready_index_build(cfg)
         ready_state = read_ready_index_state(cfg)
     if ready_state == "degraded":
@@ -869,6 +897,10 @@ def _run_dispatch_cycle(
                 diagnostic_increment("scheduler.ready.machine_ineligible")
                 sizer.observe(max(1, time.monotonic_ns() - started_ns))
                 continue
+            if lane == "cpu" and not task.spec.is_cpu_only:
+                continue
+            if lane == "gpu" and task.spec.is_cpu_only:
+                continue
             if (
                 admission_role is not None
                 and task.group_name
@@ -890,17 +922,26 @@ def _run_dispatch_cycle(
                     preflight_rejected(task)
                 sizer.observe(max(1, time.monotonic_ns() - started_ns))
                 continue
-            if len(available) < task.spec.requested_gpus:
+            if task.spec.is_cpu_only:
+                if available_cpu_slots < (task.spec.requested_cpus or 0):
+                    diagnostic_increment("scheduler.ready.insufficient_cpu_capacity")
+                    sizer.observe(max(1, time.monotonic_ns() - started_ns))
+                    continue
+            elif len(available) < task.spec.requested_gpus:
                 diagnostic_increment("scheduler.ready.insufficient_capacity")
                 sizer.observe(max(1, time.monotonic_ns() - started_ns))
                 continue
             if max_new_claims is not None and new_claims >= max_new_claims:
                 sizer.observe(max(1, time.monotonic_ns() - started_ns))
                 continue
-            gpus, available = (
-                available[: task.spec.requested_gpus],
-                available[task.spec.requested_gpus :],
-            )
+            if task.spec.is_cpu_only:
+                gpus = []
+                available_cpu_slots -= task.spec.requested_cpus or 0
+            else:
+                gpus, available = (
+                    available[: task.spec.requested_gpus],
+                    available[task.spec.requested_gpus :],
+                )
             try:
                 if claim_guard is not None:
                     with claim_guard() as is_permitted:
@@ -969,6 +1010,10 @@ def _run_dispatch_cycle(
         task = load_task(cfg, path.stem)
         if not _eligible(cfg, task):
             continue
+        if lane == "cpu" and not task.spec.is_cpu_only:
+            continue
+        if lane == "gpu" and task.spec.is_cpu_only:
+            continue
         if (
             admission_role is not None
             and task.group_name
@@ -988,9 +1033,16 @@ def _run_dispatch_cycle(
             if preflight_rejected is not None:
                 preflight_rejected(task)
             continue
-        if len(available) < task.spec.requested_gpus:
+        if task.spec.is_cpu_only:
+            if available_cpu_slots < (task.spec.requested_cpus or 0):
+                continue
+        elif len(available) < task.spec.requested_gpus:
             continue
-        gpus, available = available[: task.spec.requested_gpus], available[task.spec.requested_gpus :]
+        if task.spec.is_cpu_only:
+            gpus = []
+            available_cpu_slots -= task.spec.requested_cpus or 0
+        else:
+            gpus, available = available[: task.spec.requested_gpus], available[task.spec.requested_gpus :]
         try:
             if claim_guard is not None:
                 with claim_guard() as is_permitted:

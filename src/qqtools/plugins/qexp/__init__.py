@@ -9,6 +9,7 @@ from .models import (AGENT_MODE_DAEMON, AGENT_MODE_ON_DEMAND, PHASE_BLOCKED, PHA
                      PHASE_FAILED, PHASE_QUEUED, PHASE_RUNNING, PHASE_SUCCEEDED)
 from .observer import inspect_task, list_groups, list_machines, list_tasks, top_view
 from .runtime.records import AttemptRecord, TaskRecord, TaskSpec
+from .runtime.cpu_lane import CpuLanePolicy, get_cpu_lane_policy, set_cpu_lane_capacity
 
 Task = TaskRecord
 
@@ -16,6 +17,7 @@ __all__ = ["AGENT_MODE_DAEMON", "AGENT_MODE_ON_DEMAND", "AttemptRecord",
            "RootConfig", "Task",
            "TaskRecord", "TaskSpec", "batch_submit", "cancel", "clean", "get_log_path", "init_shared_root",
            "inspect_task", "list_groups", "list_machines", "list_tasks",
-           "load_root_config", "offer", "read_logs",
+           "load_root_config", "offer", "read_logs", "CpuLanePolicy", "get_cpu_lane_policy",
+           "set_cpu_lane_capacity",
            "retry", "share", "keep_local", "submit", "tail_log", "top_view", "PHASE_BLOCKED",
            "PHASE_CANCELLED", "PHASE_FAILED", "PHASE_QUEUED", "PHASE_RUNNING", "PHASE_SUCCEEDED"]

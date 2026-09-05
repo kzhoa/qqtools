@@ -149,8 +149,12 @@ class MachineRuntime:
         self.root.mkdir(parents=True, exist_ok=True)
         if not os.access(self.root, os.W_OK | os.X_OK):
             raise RuntimeError(f"machine runtime root is not writable: {self.root}")
-        for name in ("locks", "agent", "provisional", "active", "released", "projects", "diagnostics"):
+        for name in (
+            "locks", "agent", "provisional", "active", "released", "cpu_provisional",
+            "cpu_active", "cpu_released", "projects", "diagnostics",
+        ):
             self.paths[name].mkdir(parents=True, exist_ok=True)
+        self.paths["cpu_policy"].parent.mkdir(parents=True, exist_ok=True)
         self.paths["cursor"].parent.mkdir(parents=True, exist_ok=True)
 
     def project_paths(self, project_id: str) -> dict[str, Path]:

@@ -15,12 +15,13 @@ from .runtime.records import validate_gpu_limit, validate_identifier
 
 _ROOT_KEYS = {"group", "defaults", "tasks"}
 _GROUP_KEYS = {"workers"}
-_DEFAULTS_KEYS = {"requested_gpus", "working_directory", "placement"}
+_DEFAULTS_KEYS = {"requested_gpus", "requested_cpus", "working_directory", "placement"}
 _TASK_KEYS = {
     "task_id",
     "name",
     "command",
     "requested_gpus",
+    "requested_cpus",
     "working_directory",
     "placement",
     "sharing_mode",
@@ -91,7 +92,15 @@ def _command(value: Any, path: str) -> list[str]:
 
 
 def _requested_gpus(value: Any, path: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{path} must be a non-negative integer.")
+    return value
+
+
+def _requested_cpus(value: Any, path: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value < 1:
         raise ValueError(f"{path} must be a positive integer.")
     return value
 
@@ -294,6 +303,10 @@ def parse_batch_manifest(
             "requested_gpus": _requested_gpus(
                 entry.get("requested_gpus", defaults.get("requested_gpus", 1)),
                 f"{task_path}.requested_gpus",
+            ),
+            "requested_cpus": _requested_cpus(
+                entry.get("requested_cpus", defaults.get("requested_cpus")),
+                f"{task_path}.requested_cpus",
             ),
             "working_directory": _working_directory(
                 entry.get("working_directory", defaults.get("working_directory", str(Path.cwd()))),
