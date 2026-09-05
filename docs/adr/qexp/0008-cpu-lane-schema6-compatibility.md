@@ -13,6 +13,11 @@ superseded_by: ADR-QEXP-0009
 > Superseded by [ADR-QEXP-0009](0009-staged-cpu-lane-rollout.md). The original single-release
 > activation schedule is retained below as historical context.
 
+> **Schedule clarification (2026-09-05):** The historical 1.3.17 retirement date below is not
+> the effective release plan. The effective three-version path is legacy roots before 1.3.15,
+> compatibility activation in 1.3.15, and retirement in 1.3.16. The compatibility registry is
+> authoritative for the effective deadline.
+
 ## Context
 
 ADR-QEXP-0007 defines independent GPU and CPU-only lanes. CPU support changes Task, Attempt and
@@ -61,4 +66,4 @@ CPU requests for GPU Tasks. Detailed release and activation behavior belongs to 
 - [CPU lane compatibility contract](../../spec/qexp_cpu_lane_compatibility.md)
 - [Compatibility governance](../../spec/compatibility-governance.md)
 - [Compatibility registry](../../spec/compatibility-registry.toml)
-- [CPU-only Task Lane pitch](../../pitch/qexp-cpu-only-task-scheduling.md)
+- [CPU-only Task Lane pitch](../../pitch/arxiv/053-qexp-cpu-only-task-scheduling.md)

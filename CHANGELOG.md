@@ -1,5 +1,15 @@
 # History
 
+## Unreleased
+
+- feat: add qexp Task dependencies with validated DAG submission and editing, claim-time dependency
+  gates, scheduler and observer diagnostics, and cleanup protection for referenced Tasks.
+- feat: coordinate schema-6 activation of `task-dependencies-v1` with the same-release
+  `cpu-lane-v1` capability, including resumable, participant-bound upgrade attestation.
+- fix: keep machine-agent primary-demand probing fair and bounded when dependency-blocked Tasks
+  are present. Dependency rechecks no longer count as resource aggregation demand, cannot starve
+  baseline scans in later projects, and rotate through every blocked candidate in a route.
+
 ## v1.3.14
 
 - feat: automatically canonicalize qexp primary/borrow Worker encoding and per-machine GPU limits

@@ -5,6 +5,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -48,7 +49,35 @@ def test_task_list_defaults_to_human_and_json_is_explicit(tmp_path: Path, capsys
             "queue_scope": "home",
             "current_attempt_id": None,
             "claim_machine": None,
+            "depends_on_task_ids": [],
+            "dependency_state": "ready",
+            "dependency_reasons": [],
         }
+    ]
+
+
+def test_task_list_json_reports_dependency_gate(tmp_path: Path, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "demo", ["gpu-1"])
+    parent = submit(cfg, ["echo", "parent"], task_id="parent", group="demo")
+    child = submit(
+        cfg,
+        ["echo", "child"],
+        task_id="child",
+        group="demo",
+        depends_on_task_ids=[parent.task_id],
+    )
+
+    assert main([*_base_args(cfg), "task", "list", "--format=json"]) == 0
+    tasks = {item["task_id"]: item for item in json.loads(capsys.readouterr().out)}
+
+    assert tasks[parent.task_id]["depends_on_task_ids"] == []
+    assert tasks[parent.task_id]["dependency_state"] == "ready"
+    assert tasks[parent.task_id]["dependency_reasons"] == []
+    assert tasks[child.task_id]["depends_on_task_ids"] == [parent.task_id]
+    assert tasks[child.task_id]["dependency_state"] == "waiting"
+    assert tasks[child.task_id]["dependency_reasons"] == [
+        {"task_id": parent.task_id, "reason": "queued"}
     ]
 
 
