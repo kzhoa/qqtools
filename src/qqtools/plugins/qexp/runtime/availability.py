@@ -488,7 +488,8 @@ def iter_flat_deadline_paths(cfg: RootConfig, *, limit: int = 64):
         (
             Path(entry.path)
             for entry in os.scandir(root)
-            if entry.is_file(follow_symlinks=False)
+            if not entry.is_symlink()
+            and entry.is_file(follow_symlinks=False)
             and entry.name.endswith(".json")
             and entry.name != "layout-v1.json"
         ),
