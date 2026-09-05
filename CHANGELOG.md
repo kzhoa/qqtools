@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.15
+
 - feat: add qexp Task dependencies with validated DAG submission and editing, claim-time dependency
   gates, scheduler and observer diagnostics, and cleanup protection for referenced Tasks.
 - feat: coordinate schema-6 activation of `task-dependencies-v1` with the same-release
