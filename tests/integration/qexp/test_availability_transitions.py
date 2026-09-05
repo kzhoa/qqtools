@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -77,6 +79,43 @@ def test_repeated_same_share_is_idempotent_without_revision_change(tmp_path: Pat
     assert first.operation_id != second.operation_id
     assert second.idempotent is True
     assert load_task(cfg, task.task_id).meta["revision"] == revision
+
+
+def test_concurrent_availability_replay_reuses_completed_operation_without_reserving(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    entered_reservation = Event()
+    release_reservation = Event()
+    original_reserve = availability_runtime.reserve_ready_generation
+    reserve_calls = 0
+
+    def reserve_while_holding_task_lock(*args, **kwargs):
+        nonlocal reserve_calls
+        reference = original_reserve(*args, **kwargs)
+        reserve_calls += 1
+        if reserve_calls == 1:
+            entered_reservation.set()
+            assert release_reservation.wait(timeout=5)
+        return reference
+
+    monkeypatch.setattr(
+        availability_runtime, "reserve_ready_generation", reserve_while_holding_task_lock
+    )
+    request = availability_runtime.AvailabilityTransitionRequest(
+        action="share_now", task_id=task.task_id, operation_id="concurrent-share"
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(availability_runtime.apply_availability_transition, cfg, request)
+        assert entered_reservation.wait(timeout=5)
+        second = pool.submit(availability_runtime.apply_availability_transition, cfg, request)
+        release_reservation.set()
+        results = [first.result(timeout=5), second.result(timeout=5)]
+
+    assert reserve_calls == 1
+    assert sorted(result.idempotent for result in results) == [False, True]
+    assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
 
 
 def test_keep_local_is_idempotent_for_private_standalone_task(tmp_path: Path):
