@@ -317,13 +317,49 @@ def _completed_operation_result(
         not isinstance(result, dict)
         or result.get("action") != request.action
         or result.get("task_id") != task.task_id
-        or result.get("resulting_state") != task.placement_runtime.get("queue_scope")
     ):
         raise RuntimeError("completed availability operation does not match Task truth.")
     projection_issue = ready_task_projection_issue(cfg, task.task_id)
     if projection_issue is not None:
         raise RuntimeError(
             "completed availability operation has an invalid ready marker: " + projection_issue
+        )
+    if result.get("resulting_state") != task.placement_runtime.get("queue_scope"):
+        revision_after = control.get("task_revision_after")
+        group_name = result.get("group")
+        home_machine = result.get("home_machine")
+        helper_machines = result.get("eligible_helper_machines")
+        effective_at = result.get("effective_at")
+        resulting_state = result.get("resulting_state")
+        message = result.get("message")
+        if (
+            not isinstance(revision_after, int)
+            or task.meta["revision"] <= revision_after
+            or task.placement_runtime.get("availability_operation_id") == operation_id
+            or group_name is not None and not isinstance(group_name, str)
+            or not isinstance(home_machine, str)
+            or not isinstance(helper_machines, list)
+            or not all(isinstance(machine, str) for machine in helper_machines)
+            or effective_at is not None and not isinstance(effective_at, str)
+            or not isinstance(resulting_state, str)
+            or not isinstance(message, str)
+        ):
+            raise RuntimeError("completed availability operation does not match Task truth.")
+        # A later availability operation changed Task truth.  Replaying this
+        # completed operation must return its historical result, never apply it
+        # again over that later transition.
+        return AvailabilityTransitionResult(
+            action=request.action,
+            task_id=task.task_id,
+            group=group_name,
+            home_machine=home_machine,
+            eligible_helper_machines=helper_machines,
+            effective_at=effective_at,
+            resulting_state=resulting_state,
+            idempotent=True,
+            operation_id=operation_id,
+            message=message,
+            task=task,
         )
     return _make_result(request.action, task, group, operation_id, idempotent=True)
 
