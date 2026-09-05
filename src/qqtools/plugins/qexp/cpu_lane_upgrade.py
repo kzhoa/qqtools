@@ -7,6 +7,7 @@ from typing import Any
 
 from .config_types import RootConfig
 from .layout import CPU_LANE_CAPABILITY, is_cpu_lane_root
+from .machine_runtime import MachineRuntime
 from .runtime.locks import schema_lock
 from .runtime.paths import local_paths, shared_paths
 from .runtime.records import TaskRecord, utc_now
@@ -19,7 +20,9 @@ def _journal_path(cfg: RootConfig) -> Path:
     return shared_paths(cfg.shared_root)["schema"] / _JOURNAL
 
 
-def _blockers(cfg: RootConfig) -> list[str]:
+def _blockers(
+    cfg: RootConfig, *, machine_runtime_root: str | Path | None = None
+) -> list[str]:
     blockers: list[str] = []
     for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
         task = read_json(path).get("task", {})
@@ -33,22 +36,40 @@ def _blockers(cfg: RootConfig) -> list[str]:
         path = shared_paths(cfg.shared_root)[directory]
         if iter_json(path):
             blockers.append(f"operation:{directory}")
-    for directory in (
-        "active",
-        "provisional",
-        "cpu_active",
-        "cpu_provisional",
-        "processes",
-        "registrations",
-        "launch_intents",
-        "termination_decisions",
-    ):
-        if iter_json(local_paths(cfg.runtime_root)[directory]):
+    runtime = MachineRuntime(machine_runtime_root or cfg.runtime_root)
+    try:
+        identity = read_json(shared_paths(cfg.shared_root)["project"] / "identity.json").get("project", {})
+        project_id = identity.get("project_id")
+        _revision, bindings = runtime.load_registry()
+        binding = next(
+            (
+                item
+                for item in bindings
+                if item.project_id == project_id and item.shared_root == cfg.shared_root
+            ),
+            None,
+        )
+        if binding is None:
+            raise ValueError("no matching machine runtime binding")
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        blockers.append(f"runtime:binding_unresolved:{exc}")
+        return blockers
+    for directory in ("active", "provisional", "cpu_active", "cpu_provisional"):
+        for path in iter_json(runtime.paths[directory]):
+            reservation = read_json(path).get("reservation", {})
+            if reservation.get("project_id") == binding.project_id:
+                blockers.append(f"runtime:{directory}")
+                break
+    project_paths = runtime.project_paths(binding.project_id)
+    for directory in ("processes", "registrations", "launch_intents", "termination_decisions"):
+        if iter_json(project_paths[directory]):
             blockers.append(f"runtime:{directory}")
     return blockers
 
 
-def check_cpu_lane_upgrade(cfg: RootConfig) -> dict[str, Any]:
+def check_cpu_lane_upgrade(
+    cfg: RootConfig, *, machine_runtime_root: str | Path | None = None
+) -> dict[str, Any]:
     """Return a read-only legacy-root activation preflight."""
     if _journal_path(cfg).exists():
         journal = read_json(_journal_path(cfg))["cpu_lane_upgrade"]
@@ -58,12 +79,14 @@ def check_cpu_lane_upgrade(cfg: RootConfig) -> dict[str, Any]:
     return {
         "shared_root": str(cfg.shared_root),
         "protocol_state": "canonical" if canonical else "legacy",
-        "blockers": [] if canonical else _blockers(cfg),
+        "blockers": [] if canonical else _blockers(cfg, machine_runtime_root=machine_runtime_root),
         "journal": _journal_path(cfg).exists(),
     }
 
 
-def start_cpu_lane_upgrade(cfg: RootConfig) -> dict[str, Any]:
+def start_cpu_lane_upgrade(
+    cfg: RootConfig, *, machine_runtime_root: str | Path | None = None
+) -> dict[str, Any]:
     """Create the sole activation session after the shared root is drained."""
     with schema_lock(cfg.shared_root):
         journal_path = _journal_path(cfg)
@@ -71,7 +94,7 @@ def start_cpu_lane_upgrade(cfg: RootConfig) -> dict[str, Any]:
             return read_json(journal_path)["cpu_lane_upgrade"]
         if is_cpu_lane_root(cfg):
             return {"protocol_state": "canonical", "phase": "completed", "activation_id": None}
-        blockers = _blockers(cfg)
+        blockers = _blockers(cfg, machine_runtime_root=machine_runtime_root)
         if blockers:
             raise RuntimeError("CPU lane upgrade requires a drained root: " + ", ".join(blockers))
         value = {
@@ -90,7 +113,13 @@ def start_cpu_lane_upgrade(cfg: RootConfig) -> dict[str, Any]:
         return value
 
 
-def attest_cpu_lane_upgrade(cfg: RootConfig, *, activation_id: str, machine_name: str) -> dict[str, Any]:
+def attest_cpu_lane_upgrade(
+    cfg: RootConfig,
+    *,
+    activation_id: str,
+    machine_name: str,
+    machine_runtime_root: str | Path | None = None,
+) -> dict[str, Any]:
     """Record one operator-confirmed participant after local shared-state checks."""
     with schema_lock(cfg.shared_root):
         journal = read_json(_journal_path(cfg))["cpu_lane_upgrade"]
@@ -98,7 +127,7 @@ def attest_cpu_lane_upgrade(cfg: RootConfig, *, activation_id: str, machine_name
             raise ValueError("activation ID does not match the pending CPU lane upgrade.")
         if machine_name not in journal["participants"]:
             raise ValueError("machine is not a participant in the pending CPU lane upgrade.")
-        blockers = _blockers(cfg)
+        blockers = _blockers(cfg, machine_runtime_root=machine_runtime_root)
         if blockers:
             raise RuntimeError("CPU lane attestation found blockers: " + ", ".join(blockers))
         attestations = dict(journal["attestations"])
@@ -108,7 +137,9 @@ def attest_cpu_lane_upgrade(cfg: RootConfig, *, activation_id: str, machine_name
         return journal
 
 
-def resume_cpu_lane_upgrade(cfg: RootConfig, *, activation_id: str) -> dict[str, Any]:
+def resume_cpu_lane_upgrade(
+    cfg: RootConfig, *, activation_id: str, machine_runtime_root: str | Path | None = None
+) -> dict[str, Any]:
     """Install the permanent gate and canonicalize drained legacy Task truth."""
     with schema_lock(cfg.shared_root):
         journal = read_json(_journal_path(cfg))["cpu_lane_upgrade"]
@@ -134,7 +165,7 @@ def resume_cpu_lane_upgrade(cfg: RootConfig, *, activation_id: str) -> dict[str,
         missing = sorted(set(journal["participants"]) - set(journal["attestations"]))
         if missing:
             raise RuntimeError("CPU lane upgrade is missing machine attestations: " + ", ".join(missing))
-        blockers = _blockers(cfg)
+        blockers = _blockers(cfg, machine_runtime_root=machine_runtime_root)
         if blockers:
             raise RuntimeError("CPU lane upgrade requires a drained root: " + ", ".join(blockers))
         journal["phase"] = "normalizing"

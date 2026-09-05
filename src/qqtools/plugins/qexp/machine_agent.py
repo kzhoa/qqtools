@@ -133,7 +133,7 @@ def _probe_primary_demand(
             if route_state.is_complete:
                 try:
                     current_revision = ready_index_route_revision(
-                        cfg, scope, budget, primary_only=True
+                        cfg, scope, budget, primary_only=True, lane=lane
                     )
                 except ReadyProbeBudgetExhausted:
                     diagnostics.append({"project_id": project_id,
@@ -156,7 +156,7 @@ def _probe_primary_demand(
             if route_state.cursor is None or route_state.revision is None:
                 try:
                     start_revision = ready_index_route_revision(
-                        cfg, scope, budget, primary_only=True
+                        cfg, scope, budget, primary_only=True, lane=lane
                     )
                 except ReadyProbeBudgetExhausted:
                     diagnostics.append({"project_id": project_id,
@@ -286,7 +286,7 @@ def _probe_primary_demand(
                         waiting_cursor = cursor_before
             try:
                 end_revision = ready_index_route_revision(
-                    cfg, scope, budget, primary_only=True
+                    cfg, scope, budget, primary_only=True, lane=lane
                 )
             except ReadyProbeBudgetExhausted:
                 diagnostics.append({"project_id": project_id,
@@ -1008,7 +1008,7 @@ def _dispatch_machine_cycle_locked(
             runtime,
             readable,
             dispatchable,
-            visible if lane == "gpu" else list(range(free_cpu_slots)),
+            visible if lane == "gpu" else list(range(cpu_policy.capacity)),
             free if lane == "gpu" else list(range(free_cpu_slots)),
             SliceBudget(WorkBudgetPolicy()),
             snapshot.reservations,

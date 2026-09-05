@@ -39,7 +39,11 @@ from .machine_agent import (
 )
 from .machine_config import init_shared_root, load_machine_policy
 from .machine_runtime import ExecutionContext, MachineRuntime
-from .runtime.cpu_lane import get_cpu_lane_policy, set_cpu_lane_capacity
+from .runtime.cpu_lane import (
+    get_cpu_lane_policy,
+    initialize_cpu_lane_capacity,
+    set_cpu_lane_capacity,
+)
 from .cpu_lane_upgrade import (
     attest_cpu_lane_upgrade,
     check_cpu_lane_upgrade,
@@ -476,9 +480,9 @@ def main(argv: list[str] | None = None) -> int:
             runtime = MachineRuntime(args.machine_runtime_root)
             runtime.ensure_layout()
             if args.cpu_lane_capacity is not None:
-                set_cpu_lane_capacity(runtime.root, capacity=args.cpu_lane_capacity)
+                initialize_cpu_lane_capacity(runtime.root, capacity=args.cpu_lane_capacity)
             elif not runtime.paths["cpu_policy"].exists():
-                set_cpu_lane_capacity(runtime.root, capacity=0)
+                initialize_cpu_lane_capacity(runtime.root, capacity=0)
             try:
                 register_project(MachineRuntime(args.machine_runtime_root), cfg.shared_root, cfg.machine_name)
             except (OSError, RuntimeError, ValueError) as exc:
@@ -506,18 +510,30 @@ def main(argv: list[str] | None = None) -> int:
             runtime = Path(args.runtime_root) if args.runtime_root else None
             cfg = load_root_config(args.shared_root, machine, runtime, require_initialized=False)
             if args.cpu_lane_upgrade_action == "check":
-                _emit("cpu-lane-upgrade", check_cpu_lane_upgrade(cfg), args.format)
+                _emit(
+                    "cpu-lane-upgrade",
+                    check_cpu_lane_upgrade(cfg, machine_runtime_root=args.machine_runtime_root),
+                    args.format,
+                )
                 return 0
             if args.cpu_lane_upgrade_action == "status":
                 _emit("cpu-lane-upgrade", cpu_lane_upgrade_status(cfg), args.format)
                 return 0
             if args.cpu_lane_upgrade_action == "start":
-                _emit("cpu-lane-upgrade", start_cpu_lane_upgrade(cfg), args.format)
+                _emit(
+                    "cpu-lane-upgrade",
+                    start_cpu_lane_upgrade(cfg, machine_runtime_root=args.machine_runtime_root),
+                    args.format,
+                )
                 return 0
             if args.cpu_lane_upgrade_action == "resume":
                 _emit(
                     "cpu-lane-upgrade",
-                    resume_cpu_lane_upgrade(cfg, activation_id=args.activation_id),
+                    resume_cpu_lane_upgrade(
+                        cfg,
+                        activation_id=args.activation_id,
+                        machine_runtime_root=args.machine_runtime_root,
+                    ),
                     args.format,
                 )
                 return 0
@@ -528,7 +544,10 @@ def main(argv: list[str] | None = None) -> int:
             _emit(
                 "cpu-lane-upgrade",
                 attest_cpu_lane_upgrade(
-                    cfg, activation_id=args.activation_id, machine_name=args.machine
+                    cfg,
+                    activation_id=args.activation_id,
+                    machine_name=args.machine,
+                    machine_runtime_root=args.machine_runtime_root,
                 ),
                 args.format,
             )

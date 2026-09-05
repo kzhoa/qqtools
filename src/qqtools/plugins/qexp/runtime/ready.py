@@ -952,7 +952,7 @@ def ready_index_revision(cfg: object, queue_scope: ReadyScope) -> str:
 
 def ready_index_route_revision(
     cfg: object, queue_scope: ReadyScope, budget: SliceBudget | None = None,
-    *, primary_only: bool = False,
+    *, primary_only: bool = False, lane: str = "gpu",
 ) -> int:
     """Read the constant-size route watermark used by bounded probes."""
     route_key = _route_key(queue_scope, cfg.machine_name)
@@ -970,25 +970,30 @@ def ready_index_route_revision(
     try:
         allocator = read_json(path)["ready_allocator"]
         revision_key = "primary_revision" if primary_only else "revision"
+        if primary_only:
+            _ensure_primary_lane_revisions(allocator)
+            revision = allocator["primary_lane_revisions"].get(lane)
+        else:
+            revision = allocator.get(revision_key)
         if (
             allocator.get("schema_version") != READY_PROTOCOL_VERSION
             or allocator.get("route") != route_key
-            or type(allocator.get(revision_key)) is not int
-            or allocator[revision_key] < 0
+            or type(revision) is not int
+            or revision < 0
             or (
                 primary_only
                 and allocator.get("primary_state", "active") != "active"
             )
         ):
             raise ValueError("ready allocator is invalid.")
-        return allocator[revision_key]
+        return revision
     except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"ready allocator is unreadable: {route_key}") from exc
 
 
 @contextmanager
 def primary_projection_transaction(
-    cfg: object, routes: list[tuple[ReadyScope, str]],
+    cfg: object, routes: list[tuple[ReadyScope, str]], *, lanes: tuple[str, ...] = ("gpu", "cpu"),
 ):
     """Publish primary candidates only after all affected routes are complete.
 
@@ -1006,6 +1011,7 @@ def primary_projection_transaction(
             lock.__enter__()
             locks.append(lock)
             allocator_path, allocator = _load_or_create_allocator(cfg.shared_root, route_key)
+            _ensure_primary_lane_revisions(allocator["ready_allocator"])
             allocator["ready_allocator"]["primary_state"] = "updating"
             atomic_replace(allocator_path, allocator)
             allocators.append((allocator_path, allocator))
@@ -1020,6 +1026,9 @@ def primary_projection_transaction(
             for allocator_path, allocator in allocators:
                 control = allocator["ready_allocator"]
                 control["primary_revision"] = control.get("primary_revision", control["revision"]) + 1
+                _ensure_primary_lane_revisions(control)
+                for lane in lanes:
+                    control["primary_lane_revisions"][lane] += 1
                 control["primary_state"] = "active"
                 atomic_replace(allocator_path, allocator)
     finally:
@@ -1028,10 +1037,10 @@ def primary_projection_transaction(
 
 
 def bump_primary_ready_revision(
-    cfg: object, queue_scope: ReadyScope, home_machine: str,
+    cfg: object, queue_scope: ReadyScope, home_machine: str, *, lane: str = "gpu",
 ) -> None:
     """Advance the independent revision for primary-demand changes."""
-    with primary_projection_transaction(cfg, [(queue_scope, home_machine)]):
+    with primary_projection_transaction(cfg, [(queue_scope, home_machine)], lanes=(lane,)):
         pass
 
 
@@ -1076,8 +1085,21 @@ def _new_allocator(route_key: str) -> dict[str, Any]:
             "revision": 1,
             "primary_revision": 1,
             "primary_state": "active",
+            "primary_lane_revisions": {"gpu": 1, "cpu": 1},
         }
     }
+
+
+def _ensure_primary_lane_revisions(control: dict[str, Any]) -> bool:
+    """Backfill the lane-local primary watermarks from the legacy watermark."""
+    revisions = control.get("primary_lane_revisions")
+    if isinstance(revisions, dict) and all(
+        type(revisions.get(lane)) is int and revisions[lane] >= 0 for lane in ("gpu", "cpu")
+    ):
+        return False
+    revision = control.get("primary_revision", control["revision"])
+    control["primary_lane_revisions"] = {"gpu": revision, "cpu": revision}
+    return True
 
 
 def _load_or_create_allocator(root: Path, route_key: str) -> tuple[Path, dict[str, Any]]:
@@ -1091,6 +1113,8 @@ def _load_or_create_allocator(root: Path, route_key: str) -> tuple[Path, dict[st
             atomic_replace(path, value)
         elif "primary_state" not in control:
             control["primary_state"] = "active"
+            atomic_replace(path, value)
+        if _ensure_primary_lane_revisions(control):
             atomic_replace(path, value)
         return path, value
     value = _new_allocator(route_key)
@@ -1431,7 +1455,9 @@ def write_ready_marker(
         marker_value.update({"lane": "gpu", "requested_gpus": task.spec.requested_gpus})
     marker = {"ready_marker": marker_value}
     if _has_primary_ready_demand(cfg, task):
-        with primary_projection_transaction(cfg, [(scope, reference.home_machine)]):
+        with primary_projection_transaction(
+            cfg, [(scope, reference.home_machine)], lanes=(task.spec.lane or "gpu",)
+        ):
             atomic_replace(_marker_path(cfg.shared_root, reference), marker)
             _sync_primary_candidate(cfg, task, reference)
     else:
@@ -1453,8 +1479,10 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
         record["partition"], record["catalog_page"], record["marker_name"],
     )
     is_primary = True
+    lane = "gpu"
     try:
         marker = read_json(_marker_path(cfg.shared_root, reference))["ready_marker"]
+        lane = marker.get("lane", "gpu")
         group_name = marker.get("group_name")
         if group_name:
             group = read_json(group_path(cfg.shared_root, group_name))
@@ -1531,6 +1559,8 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
             control["primary_revision"] = (
                 control.get("primary_revision", control["revision"]) + 1
             )
+            _ensure_primary_lane_revisions(control)
+            control["primary_lane_revisions"][lane] += 1
             control["primary_state"] = "active"
             atomic_replace(allocator_path, allocator)
     return True
