@@ -168,6 +168,7 @@ def test_deduper_collects_worker_real_ids_in_main_process(monkeypatch):
             rank=0,
             world_size=2,
             shuffle=False,
+            strategy="v3",
         )
     )
     remote_indices = list(
@@ -177,6 +178,7 @@ def test_deduper_collects_worker_real_ids_in_main_process(monkeypatch):
             rank=1,
             world_size=2,
             shuffle=False,
+            strategy="v3",
         )
     )
     local_batches = _to_batches(local_indices, batch_size=2)
@@ -211,6 +213,7 @@ def test_deduper_collects_worker_real_ids_in_main_process(monkeypatch):
         rank=0,
         world_size=2,
         shuffle=False,
+        strategy="v3",
     )
     loader = DataLoader(
         RawDataset(range(len(sample_costs))),
