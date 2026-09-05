@@ -21,6 +21,7 @@ from .records import SCHEMA_VERSION, TaskRecord, new_id, normalize_group_record,
 from .ready import (
     discard_ready_generation,
     prepare_ready_transition,
+    ready_task_projection_issue,
     reserve_ready_generation,
     retire_previous_ready_generation,
 )
@@ -284,6 +285,36 @@ def _make_result(action: AvailabilityAction, task: TaskRecord, group: dict[str, 
     )
 
 
+def _completed_operation_result(
+        cfg: RootConfig, request: AvailabilityTransitionRequest, operation_id: str,
+        operation: dict[str, Any], task: TaskRecord,
+        group: dict[str, Any] | None) -> AvailabilityTransitionResult | None:
+    """Return a verified idempotent result for an operation another writer completed."""
+    control = operation.get("availability_operation", {})
+    if control.get("state") != "completed":
+        return None
+    if (
+        control.get("operation_id") != operation_id
+        or control.get("operation_type") != request.action
+        or control.get("task_id") != request.task_id
+    ):
+        raise ValueError("availability operation identity does not match the request.")
+    result = control.get("result")
+    if (
+        not isinstance(result, dict)
+        or result.get("action") != request.action
+        or result.get("task_id") != task.task_id
+        or result.get("resulting_state") != task.placement_runtime.get("queue_scope")
+    ):
+        raise RuntimeError("completed availability operation does not match Task truth.")
+    projection_issue = ready_task_projection_issue(cfg, task.task_id)
+    if projection_issue is not None:
+        raise RuntimeError(
+            "completed availability operation has an invalid ready marker: " + projection_issue
+        )
+    return _make_result(request.action, task, group, operation_id, idempotent=True)
+
+
 def _write_audit_event(cfg: RootConfig, result: AvailabilityTransitionResult,
                        before: dict[str, Any], clock_proof: dict[str, Any] | None) -> None:
     timestamp = utc_now()
@@ -448,14 +479,7 @@ def apply_availability_transition(
         "shared" if request.action in {"share_now", "manual_offer", "elapsed_offer"}
         else "home"
     )
-    reserved_generation = initial.ready_generation + 1
-    ready_reference = reserve_ready_generation(
-        cfg,
-        initial.task_id,
-        reserved_generation,
-        target_scope,
-        initial.placement_policy["home_machine"],
-    )
+    ready_reference = None
     is_ready_committed = False
     try:
         with ExitStack() as stack:
@@ -464,6 +488,12 @@ def apply_availability_transition(
             stack.enter_context(task_lock(cfg.shared_root, request.task_id))
             task = load_task(cfg, request.task_id)
             group = _group_data(cfg, task)
+            operation = read_json(_operation_path(cfg, operation_id))
+            completed = _completed_operation_result(
+                cfg, request, operation_id, operation, task, group
+            )
+            if completed is not None:
+                return completed
             if request.action == "elapsed_offer":
                 if task.placement_policy["home_machine"] != cfg.machine_name:
                     result = _make_result(request.action, task, group, operation_id, idempotent=True)
@@ -538,6 +568,26 @@ def apply_availability_transition(
                         "offered_by": cfg.machine_name,
                         "availability_operation_id": operation_id})
             if not idempotent:
+                try:
+                    ready_reference = reserve_ready_generation(
+                        cfg,
+                        task.task_id,
+                        task.ready_generation + 1,
+                        target_scope,
+                        task.placement_policy["home_machine"],
+                    )
+                except RuntimeError as exc:
+                    if "already has an in-progress writer" not in str(exc):
+                        raise
+                    task = load_task(cfg, request.task_id)
+                    group = _group_data(cfg, task)
+                    operation = read_json(_operation_path(cfg, operation_id))
+                    completed = _completed_operation_result(
+                        cfg, request, operation_id, operation, task, group
+                    )
+                    if completed is None:
+                        raise
+                    return completed
                 old_generation, _ = prepare_ready_transition(
                     cfg,
                     task,
@@ -573,8 +623,8 @@ def apply_availability_transition(
             _update_operation(cfg, operation, state="blocked", blocked_reason=str(exc))
         raise
     finally:
-        if not is_ready_committed:
-            discard_ready_generation(cfg, initial.task_id, reserved_generation)
+        if ready_reference is not None and not is_ready_committed:
+            discard_ready_generation(cfg, ready_reference.task_id, ready_reference.generation)
 
 
 def reconcile_availability_operations(
