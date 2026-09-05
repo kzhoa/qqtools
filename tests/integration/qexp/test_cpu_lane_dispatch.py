@@ -3,10 +3,14 @@ from pathlib import Path
 from qqtools.plugins.qexp.commands.task import submit
 from qqtools.plugins.qexp.executor import Executor
 from qqtools.plugins.qexp.machine_config import init_shared_root
-from qqtools.plugins.qexp.runtime.cpu_lane import cpu_reservation_snapshot, set_cpu_lane_capacity
+from qqtools.plugins.qexp.runtime.cpu_lane import (
+    cpu_reservation_snapshot,
+    release_cpu,
+    set_cpu_lane_capacity,
+)
 from qqtools.plugins.qexp.runtime.paths import task_path
 from qqtools.plugins.qexp.project_maintenance import reconcile_project_reservations
-from qqtools.plugins.qexp.scheduler import claim_task, run_dispatch_cycle
+from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, run_dispatch_cycle
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
 
@@ -123,3 +127,17 @@ def test_project_reconciliation_releases_a_stale_cpu_reservation(tmp_path: Path)
 
     _policy, reservations = cpu_reservation_snapshot(cfg.runtime_root)
     assert reservations == ()
+
+
+def test_cpu_launch_authorization_rejects_a_released_reservation(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "cpu-host")
+    set_cpu_lane_capacity(cfg.runtime_root, capacity=1)
+    task = submit(cfg, ["echo", "cpu"], requested_gpus=0, requested_cpus=1, working_dir=work)
+    attempt = claim_task(cfg, task.task_id, [])
+    assert attempt is not None
+    assert release_cpu(cfg.runtime_root, attempt.reservation_id, "provisional_expired")
+
+    assert not authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    assert cpu_reservation_snapshot(cfg.runtime_root)[1] == ()

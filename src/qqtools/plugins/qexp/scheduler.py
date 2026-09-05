@@ -47,7 +47,7 @@ from .runtime.ready import (
 )
 from .runtime.active_operations import operation_exists
 from .runtime.reservations import ReservationIdentity, attach, release, reserve, reserve_admitted
-from .runtime.cpu_lane import attach_cpu, reserve_cpu
+from .runtime.cpu_lane import attach_cpu, has_active_cpu_reservation, release_cpu, reserve_cpu
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.tasks import load_task, save_task
 from .runtime.work_budget import (
@@ -94,7 +94,7 @@ class _BorrowAdmissionGrant:
             return all(
                 is_primary_ready_index_active(item.cfg)
                 and ready_index_route_revision(
-                    item.cfg, item.queue_scope, primary_only=True
+                    item.cfg, item.queue_scope, primary_only=True, lane=self.lane
                 ) == item.revision
                 for item in self.revisions
             )
@@ -435,7 +435,45 @@ def _release_claim_locked(
     task.meta["revision"] += 1
     task.meta["updated_at"] = utc_now()
     save_task(cfg, task)
-    release(reservation_runtime_root or cfg.runtime_root, claim["reservation_id"], reason)
+    reservation_root = reservation_runtime_root or cfg.runtime_root
+    if task.spec.is_cpu_only:
+        release_cpu(reservation_root, claim["reservation_id"], reason)
+    else:
+        release(reservation_root, claim["reservation_id"], reason)
+
+
+def _has_active_launch_reservation(
+    task: TaskRecord,
+    claim: dict[str, Any],
+    reservation_runtime_root: Path,
+) -> bool:
+    if not task.spec.is_cpu_only:
+        return True
+    reservation_id = claim.get("reservation_id")
+    attempt_id = claim.get("attempt_id")
+    fencing_token = claim.get("fencing_token")
+    return (
+        isinstance(reservation_id, str)
+        and isinstance(attempt_id, str)
+        and isinstance(fencing_token, int)
+        and has_active_cpu_reservation(
+            reservation_runtime_root,
+            reservation_id,
+            task_id=task.task_id,
+            attempt_id=attempt_id,
+            fencing_token=fencing_token,
+        )
+    )
+
+
+def _release_task_reservation(
+    task: TaskRecord, reservation_runtime_root: Path, reservation_id: str, reason: str
+) -> None:
+    """Release the reservation backend selected by the Task lane."""
+    if task.spec.is_cpu_only:
+        release_cpu(reservation_runtime_root, reservation_id, reason)
+    else:
+        release(reservation_runtime_root, reservation_id, reason)
 
 
 def claim_task(
@@ -534,6 +572,10 @@ def resume_starting_attempt(
             return None
         elif operation_exists(cfg, "cleanup", task.task_id):
             return None
+        elif not _has_active_launch_reservation(task, claim, reservation_runtime_root):
+            cancel_result = _cancel_prelaunch_locked(
+                cfg, task, "launch_reservation_lost", {"claimed", "starting"}
+            )
         elif task.group_name and not _group_allows(
             read_json(group_path(cfg.shared_root, task.group_name)), task, cfg.machine_name
         ):
@@ -555,7 +597,10 @@ def resume_starting_attempt(
             return attempt
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
-            release(reservation_runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled_before_launch")
+            _release_task_reservation(
+                task, reservation_runtime_root, cancel_result.reservation_id,
+                cancel_result.reason or "cancelled_before_launch",
+            )
         if cancel_result.event:
             dispatch_task_lifecycle_hooks_noexcept(cfg, cancel_result.event)
     return None
@@ -608,6 +653,8 @@ def authorize_launch(
             or task.control.get("cancellation_requested_at")
         ):
             cancel_result = _cancel_prelaunch_locked(cfg, task, "launch_gate_lost")
+        elif not _has_active_launch_reservation(task, claim, reservation_runtime_root):
+            cancel_result = _cancel_prelaunch_locked(cfg, task, "launch_reservation_lost")
         elif task.group_name:
             group = read_json(group_path(cfg.shared_root, task.group_name))
             if not _group_allows(group, task, cfg.machine_name):
@@ -630,7 +677,10 @@ def authorize_launch(
             atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
-            release(reservation_runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled")
+            _release_task_reservation(
+                task, reservation_runtime_root, cancel_result.reservation_id,
+                cancel_result.reason or "cancelled",
+            )
         if cancel_result.event:
             dispatch_task_lifecycle_hooks_noexcept(cfg, cancel_result.event)
         return False
@@ -706,7 +756,10 @@ def cancel_task(
             retire_current_ready_generation(cfg, task)
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
-            release(reservation_runtime_root, cancel_result.reservation_id, cancel_result.reason or "cancelled_before_launch")
+            _release_task_reservation(
+                task, reservation_runtime_root, cancel_result.reservation_id,
+                cancel_result.reason or "cancelled_before_launch",
+            )
         if cancel_result.event:
             dispatch_task_lifecycle_hooks_noexcept(cfg, cancel_result.event)
         return load_task(cfg, task_id)
@@ -1387,7 +1440,9 @@ def expire_claim(
             )
             attempt.phase = "cancelled"
             attempt.result["reason"] = "lease_expired_before_launch"
-            release(reservation_runtime_root, claim["reservation_id"], "lease_expired_before_launch")
+            _release_task_reservation(
+                task, reservation_runtime_root, claim["reservation_id"], "lease_expired_before_launch"
+            )
         else:
             attempt.phase = "orphaned"
             attempt.result.update({"exit_code": None, "signal": None, "category": None, "reason": None})
@@ -1462,7 +1517,7 @@ def fail_attempt(
     if result.outcome != "committed":
         return False
     if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
-        release(reservation_runtime_root, result.reservation_id, reason)
+        _release_task_reservation(task, reservation_runtime_root, result.reservation_id, reason)
     if result.event:
         dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
     return True
@@ -1511,7 +1566,7 @@ def finalize_agent_supervised_attempt(
     if result.outcome != "committed":
         return False
     if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
-        release(reservation_runtime_root, result.reservation_id, reason)
+        _release_task_reservation(task, reservation_runtime_root, result.reservation_id, reason)
     if result.event:
         dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
     return True
@@ -1582,7 +1637,7 @@ def finalize_orphaned_attempt(
     if result.outcome != "committed":
         return False
     if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
-        release(reservation_runtime_root, result.reservation_id, reason)
+        _release_task_reservation(task, reservation_runtime_root, result.reservation_id, reason)
     if result.event:
         dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
     return True

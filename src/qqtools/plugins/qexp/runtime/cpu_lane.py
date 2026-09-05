@@ -106,6 +106,29 @@ def set_cpu_lane_capacity(runtime_root: Path | Any, *, capacity: int) -> CpuLane
         return updated
 
 
+def initialize_cpu_lane_capacity(runtime_root: Path | Any, *, capacity: int) -> CpuLanePolicy:
+    """Set an initial CPU capacity, rejecting a conflicting shared policy."""
+    if type(capacity) is not int or capacity < 0:
+        raise ValueError("CPU lane capacity must be a non-negative integer.")
+    paths = local_paths(_runtime_root(runtime_root))
+    paths["cpu_policy"].parent.mkdir(parents=True, exist_ok=True)
+    for name in ("cpu_provisional", "cpu_active", "cpu_released", "locks"):
+        paths[name].mkdir(parents=True, exist_ok=True)
+    with exclusive(paths["locks"] / "cpu-lane.lock"):
+        _release_expired(paths)
+        if paths["cpu_policy"].exists():
+            current = _policy(paths)
+            if current.capacity != capacity:
+                raise ValueError(
+                    "CPU lane capacity is already configured as "
+                    f"{current.capacity}; use 'qexp agent cpu-lane set' to change it."
+                )
+            return current
+        policy = CpuLanePolicy(capacity, 1)
+        atomic_replace(paths["cpu_policy"], {"cpu_lane": {**policy.to_dict, "updated_at": utc_now()}})
+        return policy
+
+
 def cpu_reservation_snapshot(runtime_root: Path) -> tuple[CpuLanePolicy, tuple[dict[str, Any], ...]]:
     """Return a lock-consistent CPU policy and usage-bearing reservations."""
     paths = local_paths(runtime_root)
@@ -163,6 +186,31 @@ def attach_cpu(runtime_root: Path, reservation_id: str, attempt_id: str, fencing
         reservation["state"] = "active"
         atomic_replace(paths["cpu_active"] / source.name, value)
         source.unlink(missing_ok=True)
+
+
+def has_active_cpu_reservation(
+    runtime_root: Path,
+    reservation_id: str,
+    *,
+    task_id: str,
+    attempt_id: str,
+    fencing_token: int,
+) -> bool:
+    """Return whether the active CPU reservation still fences this launch."""
+    paths = local_paths(runtime_root)
+    with exclusive(paths["locks"] / "cpu-lane.lock"):
+        _release_expired(paths)
+        path = paths["cpu_active"] / f"{reservation_id}.json"
+        if not path.exists():
+            return False
+        reservation = read_json(path).get("reservation", {})
+        return (
+            reservation.get("state") == "active"
+            and reservation.get("reservation_id") == reservation_id
+            and reservation.get("task_id") == task_id
+            and reservation.get("attempt_id") == attempt_id
+            and reservation.get("fencing_token") == fencing_token
+        )
 
 
 def release_cpu(runtime_root: Path, reservation_id: str, reason: str = "completed") -> bool:

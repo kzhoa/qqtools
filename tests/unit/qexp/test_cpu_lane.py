@@ -6,6 +6,7 @@ from qqtools.plugins.qexp.runtime.cpu_lane import (
     attach_cpu,
     cpu_reservation_snapshot,
     get_cpu_lane_policy,
+    initialize_cpu_lane_capacity,
     release_cpu,
     reserve_cpu,
     set_cpu_lane_capacity,
@@ -59,3 +60,11 @@ def test_cpu_lane_public_policy_api_accepts_machine_runtime(tmp_path: Path):
 
     assert set_cpu_lane_capacity(runtime, capacity=3).capacity == 3
     assert get_cpu_lane_policy(runtime).capacity == 3
+
+
+def test_cpu_lane_initialization_rejects_a_conflicting_shared_capacity(tmp_path: Path):
+    runtime = tmp_path / "machine"
+    assert initialize_cpu_lane_capacity(runtime, capacity=4).capacity == 4
+    assert initialize_cpu_lane_capacity(runtime, capacity=4).capacity == 4
+    with pytest.raises(ValueError, match="already configured as 4"):
+        initialize_cpu_lane_capacity(runtime, capacity=8)

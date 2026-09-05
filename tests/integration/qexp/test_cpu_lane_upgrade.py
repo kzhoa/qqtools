@@ -12,11 +12,14 @@ from qqtools.plugins.qexp.cpu_lane_upgrade import (
 )
 from qqtools.plugins.qexp.layout import is_cpu_lane_root
 from qqtools.plugins.qexp.machine_config import init_shared_root
+from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.runtime.reservations import reserve
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
 
 def _legacy_root(tmp_path: Path):
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1")
+    MachineRuntime(cfg.runtime_root).add_binding(cfg.shared_root, cfg.machine_name)
     path = cfg.shared_root / "schema" / "version.json"
     schema = read_json(path)
     del schema["schema"]["required_capabilities"]
@@ -95,3 +98,14 @@ def test_upgrade_cli_requires_explicit_shared_root(tmp_path: Path) -> None:
     cfg = _legacy_root(tmp_path)
 
     assert main(["--shared-root", str(cfg.shared_root), "upgrade", "cpu-lane", "check"]) == 0
+
+
+def test_upgrade_checks_machine_runtime_reservations_not_legacy_runtime(tmp_path: Path) -> None:
+    cfg = _legacy_root(tmp_path)
+    runtime = MachineRuntime(cfg.runtime_root)
+    binding = runtime.resolve_project_binding(cfg.shared_root)
+    reserve(runtime.root, "running", [0], project_id=binding.project_id)
+
+    from qqtools.plugins.qexp.cpu_lane_upgrade import check_cpu_lane_upgrade
+
+    assert "runtime:provisional" in check_cpu_lane_upgrade(cfg)["blockers"]

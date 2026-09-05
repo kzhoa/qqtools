@@ -216,6 +216,26 @@ def test_borrow_marker_changes_do_not_advance_primary_revision(
     assert ready_index_route_revision(cfg, "shared", primary_only=True) == before
 
 
+def test_cpu_primary_revision_does_not_invalidate_a_gpu_borrow_grant(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    cfg, _task = _borrow_project(tmp_path, work)
+    _activate_ready(cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    revisions = tuple(
+        _BorrowAdmissionRevision(binding.project_id, cfg, scope, ready_index_route_revision(
+            cfg, scope, primary_only=True, lane="gpu"
+        ))
+        for scope in ("shared", "home")
+    )
+    grant = _BorrowAdmissionGrant(runtime.root, revisions, lane="gpu")
+
+    bump_primary_ready_revision(cfg, "shared", cfg.machine_name, lane="cpu")
+
+    assert grant.is_valid(runtime.root)
+
+
 def test_primary_probe_uses_primary_projection_without_scanning_borrow_markers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
