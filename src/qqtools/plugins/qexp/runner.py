@@ -178,7 +178,9 @@ def run_attempt(
             raise RuntimeError("Attempt is not authorized to launch.")
         _publish_launch_intent(cfg, attempt, task)
     environment = os.environ.copy()
-    if attempt.assigned_gpus:
+    if task.spec.is_cpu_only:
+        environment["CUDA_VISIBLE_DEVICES"] = ""
+    elif attempt.assigned_gpus:
         environment["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, attempt.assigned_gpus))
     log_path = shared_attempt_log_path(cfg, task_id, attempt_id)
     with log_path.open("ab") as log:

@@ -38,6 +38,7 @@ from .runtime.reservations import (
     reconcile_snapshot,
     reservation_snapshot,
 )
+from .runtime.cpu_lane import cpu_reservation_snapshot
 from .runtime.ready import (
     ReadyProbeBudgetExhausted,
     advance_ready_index_build,
@@ -82,6 +83,8 @@ def _probe_primary_demand(
     free: list[int],
     budget: SliceBudget,
     reservations: tuple[dict[str, Any], ...] = (),
+    *,
+    lane: str = "gpu",
 ) -> PrimaryDemandProbe:
     """Scan primary candidates through an independent bounded ready cursor."""
     diagnostics: list[dict[str, str]] = []
@@ -118,7 +121,7 @@ def _probe_primary_demand(
             diagnostics.append({"project_id": project_id, "reason": "ready_index_unresolved"})
             return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
         for scope in ("shared", "home"):
-            cursor_key = (project_id, scope)
+            cursor_key = (project_id, scope, lane)
             has_waiting_candidate = False
             waiting_cursor = None
             cursor = runtime.primary_probe_cursors.get(cursor_key)
@@ -213,6 +216,8 @@ def _probe_primary_demand(
                 if result.classification != "claimable" or result.task is None:
                     continue
                 task = result.task
+                if (lane == "cpu") != task.spec.is_cpu_only:
+                    continue
                 try:
                     is_eligible = _eligible(cfg, task)
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -242,7 +247,7 @@ def _probe_primary_demand(
                         has_primary_group_worker = False
                 group_gpu_limit = (
                     worker["gpu_limit_gpus"]
-                    if task.group_name is not None and has_primary_group_worker
+                    if lane == "gpu" and task.group_name is not None and has_primary_group_worker
                     else None
                 )
                 group_gpu_usage = 0
@@ -259,8 +264,8 @@ def _probe_primary_demand(
                         is_eligible=is_eligible,
                         has_primary_group_worker=has_primary_group_worker,
                         working_directory_reason=_working_directory_reason(task.spec),
-                        requested_gpus=task.spec.requested_gpus,
-                        visible_gpu_count=len(visible),
+                        requested_gpus=(task.spec.requested_cpus or 0) if lane == "cpu" else task.spec.requested_gpus,
+                        visible_gpu_count=len(visible) if lane == "gpu" else len(free),
                         free_gpu_count=len(free),
                         group_gpu_limit=group_gpu_limit,
                         group_gpu_usage=group_gpu_usage,
@@ -309,6 +314,13 @@ def _probe_primary_demand(
             if has_waiting_candidate:
                 runtime.primary_probe_cursors[cursor_key] = waiting_cursor
                 runtime.primary_probe_complete[cursor_key] = False
+    if lane == "gpu":
+        # QQTOOLS-COMPAT-0005: retain read-only legacy diagnostic keys during the transition.
+        for key, value in list(runtime.primary_probe_cursors.items()):
+            if len(key) == 3 and key[2] == "gpu":
+                runtime.primary_probe_cursors[key[:2]] = value
+                runtime.primary_probe_revisions[key[:2]] = runtime.primary_probe_revisions.get(key)
+                runtime.primary_probe_complete[key[:2]] = runtime.primary_probe_complete.get(key, False)
     state = "waiting_for_aggregation" if waiting else "no_primary_demand"
     return PrimaryDemandProbe(state, tuple(diagnostics[-32:]))
 
@@ -318,6 +330,8 @@ def _build_borrow_admission_grant(
     dispatchable: dict[str, RootConfig],
     probe: PrimaryDemandProbe,
     enabled_ids: set[str],
+    *,
+    lane: str = "gpu",
 ) -> _BorrowAdmissionGrant | None:
     """Create a grant only after every enabled project's primary probe completed."""
     if probe.state != "no_primary_demand":
@@ -328,14 +342,14 @@ def _build_borrow_admission_grant(
         if cfg is None:
             return None
         for scope in ("shared", "home"):
-            cursor_key = (project_id, scope)
+            cursor_key = (project_id, scope, lane)
             revision = runtime.primary_probe_revisions.get(cursor_key)
             if not runtime.primary_probe_complete.get(cursor_key) or not isinstance(
                 revision, int
             ):
                 return None
             revisions.append(_BorrowAdmissionRevision(project_id, cfg, scope, revision))
-    return _BorrowAdmissionGrant(runtime.root, tuple(revisions))
+    return _BorrowAdmissionGrant(runtime.root, tuple(revisions), lane)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -755,6 +769,7 @@ def _dispatch_admission_layer(
     dispatchable: dict[str, RootConfig],
     executor: Executor,
     free: list[int],
+    free_cpu_slots: int,
     visible: list[int],
     result_by_project: dict[str, dict[str, Any]],
     batch_sizers: dict[str, AdaptiveBatchSizer],
@@ -762,13 +777,14 @@ def _dispatch_admission_layer(
     *,
     admission_role: str,
     borrow_admission_grant: _BorrowAdmissionGrant | None = None,
-) -> tuple[list[int], ProjectBinding | None]:
+    lane: str,
+) -> tuple[list[int], int, ProjectBinding | None]:
     """Run one fair admission layer and return remaining GPUs and last winner."""
     inspected_ready: set[tuple[str, str, str, str]] = set()
     round_bindings = list(ordered_enabled)
     last_successful_binding: ProjectBinding | None = None
     has_retried_empty_round = False
-    while free and round_bindings:
+    while (free or free_cpu_slots) and round_bindings:
         if not budget.can_start_record():
             diagnostic_increment("scheduler.work.immediate_slices")
             time.sleep(0)
@@ -778,7 +794,7 @@ def _dispatch_admission_layer(
         round_last_success: ProjectBinding | None = None
         for binding in round_bindings:
             cfg = dispatchable.get(binding.project_id)
-            if cfg is None or not free or not budget.can_start_record():
+            if cfg is None or (not free and not free_cpu_slots) or not budget.can_start_record():
                 continue
             claimed_task_ids: list[str] = []
             try:
@@ -786,6 +802,7 @@ def _dispatch_admission_layer(
                     launched = run_dispatch_cycle(
                         cfg,
                         available_gpus=free,
+                        available_cpus=free_cpu_slots,
                         executor=executor,
                         reservation_runtime_root=runtime.root,
                         project_id=binding.project_id,
@@ -803,6 +820,7 @@ def _dispatch_admission_layer(
                         work_budget=budget,
                         batch_sizer=batch_sizers[binding.project_id],
                         inspected_ready=inspected_ready,
+                        lane=lane,
                     )
                 result_by_project[binding.project_id]["launched"].extend(launched)
                 if claimed_task_ids:
@@ -811,6 +829,10 @@ def _dispatch_admission_layer(
                     last_successful_binding = binding
                     snapshot = reconcile_snapshot(runtime.root)
                     free = [gpu_id for gpu_id in visible if gpu_id not in snapshot.reserved_gpu_ids]
+                    policy, cpu_reservations = cpu_reservation_snapshot(runtime.root)
+                    free_cpu_slots = policy.capacity - sum(
+                        item.get("cpu_slots", 0) for item in cpu_reservations
+                    )
             except (OSError, RuntimeError, ValueError) as exc:
                 item = result_by_project[binding.project_id]
                 item["status"] = "error"
@@ -833,7 +855,7 @@ def _dispatch_admission_layer(
         if round_last_success is not None:
             index = round_bindings.index(round_last_success)
             round_bindings = round_bindings[index + 1 :] + round_bindings[: index + 1]
-    return free, last_successful_binding
+    return free, free_cpu_slots, last_successful_binding
 
 
 def _dispatch_machine_cycle_locked(
@@ -923,6 +945,8 @@ def _dispatch_machine_cycle_locked(
         else _visible_gpus(next(iter(readable.values()))) if readable else []
     )
     free = [gpu_id for gpu_id in visible if gpu_id not in snapshot.reserved_gpu_ids]
+    cpu_policy, cpu_reservations = cpu_reservation_snapshot(runtime.root)
+    free_cpu_slots = cpu_policy.capacity - sum(item.get("cpu_slots", 0) for item in cpu_reservations)
     cursor_project_id = runtime.load_cursor()
     enabled_by_project = {
         binding.project_id: binding for binding in registered if binding.enabled
@@ -947,7 +971,7 @@ def _dispatch_machine_cycle_locked(
             }
             results.append(item)
             result_by_project[binding.project_id] = item
-    if free:
+    if free or free_cpu_slots:
         for binding in ordered_enabled:
             cfg = dispatchable.get(binding.project_id)
             if cfg is None or read_ready_index_state(cfg) not in {"absent", "building"}:
@@ -962,7 +986,7 @@ def _dispatch_machine_cycle_locked(
                 item["status"] = "error"
                 item["error"] = str(exc)
                 del dispatchable[binding.project_id]
-    if not free:
+    if not free and not free_cpu_slots:
         diagnostic_increment("scheduler.work.skipped_no_capacity", len(ordered_enabled))
     budget = SliceBudget(WorkBudgetPolicy())
     batch_sizers: dict[str, AdaptiveBatchSizer] = {}
@@ -976,47 +1000,71 @@ def _dispatch_machine_cycle_locked(
             runtime.ready_batch_sizers[binding.project_id] = sizer
         batch_sizers[binding.project_id] = sizer
 
-    probe_budget = SliceBudget(WorkBudgetPolicy())
-    probe = _probe_primary_demand(
-        runtime, readable, dispatchable, visible, free, probe_budget, snapshot.reservations
-    ) if free else PrimaryDemandProbe("unresolved")
-    dispatch_plan = build_machine_dispatch_plan(
-        MachineDispatchSnapshot(
-            enabled_project_ids=ordered_project_ids,
-            cursor_project_id=cursor_project_id,
-            has_free_capacity=bool(free),
-            primary_demand_state=probe.state,
-        )
-    )
-    diagnostic_increment(f"scheduler.primary_probe.{probe.state}")
-    borrow_admission_grant = None
-    if "borrow" in dispatch_plan.admission_roles:
-        borrow_admission_grant = _build_borrow_admission_grant(
-            runtime, dispatchable, probe, enabled_ids
-        )
-    budget = SliceBudget(WorkBudgetPolicy())
     last_successful_project_id: str | None = None
-    for admission_role in dispatch_plan.admission_roles:
-        free, layer_winner = _dispatch_admission_layer(
+    # CPU and GPU borrowing are separate admission domains.  A busy primary queue in one
+    # lane must never turn the other lane's complete no-demand probe into a denial.
+    for lane, has_capacity in (("gpu", bool(free)), ("cpu", bool(free_cpu_slots))):
+        probe = _probe_primary_demand(
             runtime,
-            ordered_enabled,
+            readable,
             dispatchable,
-            executor,
-            free,
-            visible,
-            result_by_project,
-            batch_sizers,
-            budget,
-            admission_role=admission_role,
-            borrow_admission_grant=(
-                borrow_admission_grant if admission_role == "borrow" else None
-            ),
+            visible if lane == "gpu" else list(range(free_cpu_slots)),
+            free if lane == "gpu" else list(range(free_cpu_slots)),
+            SliceBudget(WorkBudgetPolicy()),
+            snapshot.reservations,
+            lane=lane,
+        ) if has_capacity else PrimaryDemandProbe("unresolved")
+        if lane == "gpu":
+            # QQTOOLS-COMPAT-0005: retain legacy diagnostic keys; dispatch only reads lane keys.
+            for key in tuple(runtime.primary_probe_cursors):
+                if len(key) == 3 and key[2] == "gpu":
+                    runtime.primary_probe_cursors[key[:2]] = runtime.primary_probe_cursors[key]
+                    runtime.primary_probe_revisions[key[:2]] = runtime.primary_probe_revisions.get(key)
+                    runtime.primary_probe_complete[key[:2]] = runtime.primary_probe_complete.get(key, False)
+        dispatch_plan = build_machine_dispatch_plan(
+            MachineDispatchSnapshot(
+                enabled_project_ids=ordered_project_ids,
+                cursor_project_id=cursor_project_id,
+                has_free_capacity=has_capacity,
+                primary_demand_state=probe.state,
+            )
         )
-        if layer_winner is not None:
-            last_successful_project_id = layer_winner.project_id
-    cursor_effect = reduce_dispatch_cursor(dispatch_plan, last_successful_project_id)
-    if cursor_effect is not None:
-        runtime.save_cursor(cursor_effect.project_id)
+        diagnostic_increment(f"scheduler.primary_probe.{lane}.{probe.state}")
+        borrow_admission_grant = None
+        if "borrow" in dispatch_plan.admission_roles:
+            borrow_admission_grant = _build_borrow_admission_grant(
+                runtime, dispatchable, probe, enabled_ids, lane=lane
+            )
+        budget = SliceBudget(WorkBudgetPolicy())
+        for admission_role in dispatch_plan.admission_roles:
+            lane_gpus = free if lane == "gpu" else []
+            lane_cpus = free_cpu_slots if lane == "cpu" else 0
+            lane_gpus, lane_cpus, layer_winner = _dispatch_admission_layer(
+                runtime,
+                ordered_enabled,
+                dispatchable,
+                executor,
+                lane_gpus,
+                lane_cpus,
+                visible,
+                result_by_project,
+                batch_sizers,
+                budget,
+                admission_role=admission_role,
+                borrow_admission_grant=(
+                    borrow_admission_grant if admission_role == "borrow" else None
+                ),
+                lane=lane,
+            )
+            if lane == "gpu":
+                free = lane_gpus
+            else:
+                free_cpu_slots = lane_cpus
+            if layer_winner is not None:
+                last_successful_project_id = layer_winner.project_id
+        cursor_effect = reduce_dispatch_cursor(dispatch_plan, last_successful_project_id)
+        if cursor_effect is not None:
+            runtime.save_cursor(cursor_effect.project_id)
     if publish_snapshots:
         reservations = list(reservation_snapshot(runtime.root).reservations)
         _publish_project_snapshots(

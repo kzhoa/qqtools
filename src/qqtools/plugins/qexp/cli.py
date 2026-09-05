@@ -39,6 +39,14 @@ from .machine_agent import (
 )
 from .machine_config import init_shared_root, load_machine_policy
 from .machine_runtime import ExecutionContext, MachineRuntime
+from .runtime.cpu_lane import get_cpu_lane_policy, set_cpu_lane_capacity
+from .cpu_lane_upgrade import (
+    attest_cpu_lane_upgrade,
+    check_cpu_lane_upgrade,
+    cpu_lane_upgrade_status,
+    resume_cpu_lane_upgrade,
+    start_cpu_lane_upgrade,
+)
 from .notification_config import (
     DEFAULT_WEBHOOK_ENV,
     load_notifications,
@@ -189,8 +197,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     init.add_argument("--agent-mode", choices=["on_demand", "daemon"], default="on_demand")
+    init.add_argument("--cpu-lane-capacity", type=int)
     migrate = commands.add_parser("migrate")
     migrate.add_argument("--to-schema", type=int, required=True)
+    upgrade = commands.add_parser("upgrade")
+    upgrade_sub = upgrade.add_subparsers(dest="upgrade_feature", required=True)
+    cpu_lane_upgrade = upgrade_sub.add_parser("cpu-lane")
+    cpu_lane_upgrade_sub = cpu_lane_upgrade.add_subparsers(dest="cpu_lane_upgrade_action", required=True)
+    for name in ("check", "start", "status"):
+        action = cpu_lane_upgrade_sub.add_parser(name)
+        _add_output_format(action)
+    attest = cpu_lane_upgrade_sub.add_parser("attest")
+    _add_output_format(attest)
+    attest.add_argument("--activation-id", required=True)
+    attest.add_argument("--confirm-clients-stopped", action="store_true")
+    resume = cpu_lane_upgrade_sub.add_parser("resume")
+    _add_output_format(resume)
+    resume.add_argument("--activation-id", required=True)
     lease_policy = commands.add_parser("lease-policy")
     lease_policy_sub = lease_policy.add_subparsers(dest="lease_policy_action", required=True)
     lease_show = lease_policy_sub.add_parser("show")
@@ -241,6 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
         action.add_argument("--name")
         action.add_argument("--group")
         action.add_argument("--gpus", type=int, default=1)
+        action.add_argument("--cpus", type=int)
         action.add_argument("--cwd")
         action.add_argument(
             "--home-machine",
@@ -334,6 +358,13 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         action = agent_sub.add_parser(name)
         _add_output_format(action)
+    cpu_lane = agent_sub.add_parser("cpu-lane")
+    cpu_lane_sub = cpu_lane.add_subparsers(dest="cpu_lane_action", required=True)
+    cpu_lane_show = cpu_lane_sub.add_parser("show")
+    _add_output_format(cpu_lane_show)
+    cpu_lane_set = cpu_lane_sub.add_parser("set")
+    _add_output_format(cpu_lane_set)
+    cpu_lane_set.add_argument("--capacity", type=int, required=True)
     for name in ("disable-project", "remove-project"):
         agent_sub.choices[name].add_argument("project")
     top = commands.add_parser("top")
@@ -442,6 +473,12 @@ def main(argv: list[str] | None = None) -> int:
                 agent_mode=args.agent_mode,
                 runtime_root=Path(args.runtime_root) if args.runtime_root else None,
             )
+            runtime = MachineRuntime(args.machine_runtime_root)
+            runtime.ensure_layout()
+            if args.cpu_lane_capacity is not None:
+                set_cpu_lane_capacity(runtime.root, capacity=args.cpu_lane_capacity)
+            elif not runtime.paths["cpu_policy"].exists():
+                set_cpu_lane_capacity(runtime.root, capacity=0)
             try:
                 register_project(MachineRuntime(args.machine_runtime_root), cfg.shared_root, cfg.machine_name)
             except (OSError, RuntimeError, ValueError) as exc:
@@ -461,6 +498,40 @@ def main(argv: list[str] | None = None) -> int:
             runtime = Path(args.runtime_root) if args.runtime_root else root.parent / ".qexp-runtime" / args.machine
             migrate_schema5_to_schema6(RootConfig(root, root.parent, args.machine, runtime))
             print(root)
+            return 0
+        if args.command == "upgrade":
+            if args.upgrade_feature != "cpu-lane" or not args.shared_root:
+                raise ValueError("CPU lane upgrade requires an explicit --shared-root.")
+            machine = args.machine or "upgrade-coordinator"
+            runtime = Path(args.runtime_root) if args.runtime_root else None
+            cfg = load_root_config(args.shared_root, machine, runtime, require_initialized=False)
+            if args.cpu_lane_upgrade_action == "check":
+                _emit("cpu-lane-upgrade", check_cpu_lane_upgrade(cfg), args.format)
+                return 0
+            if args.cpu_lane_upgrade_action == "status":
+                _emit("cpu-lane-upgrade", cpu_lane_upgrade_status(cfg), args.format)
+                return 0
+            if args.cpu_lane_upgrade_action == "start":
+                _emit("cpu-lane-upgrade", start_cpu_lane_upgrade(cfg), args.format)
+                return 0
+            if args.cpu_lane_upgrade_action == "resume":
+                _emit(
+                    "cpu-lane-upgrade",
+                    resume_cpu_lane_upgrade(cfg, activation_id=args.activation_id),
+                    args.format,
+                )
+                return 0
+            if not args.confirm_clients_stopped:
+                raise ValueError("attest requires --confirm-clients-stopped.")
+            if not args.machine:
+                raise ValueError("attest requires --machine.")
+            _emit(
+                "cpu-lane-upgrade",
+                attest_cpu_lane_upgrade(
+                    cfg, activation_id=args.activation_id, machine_name=args.machine
+                ),
+                args.format,
+            )
             return 0
         if args.command == "use":
             is_selecting = args.use_shared_root is not None
@@ -514,6 +585,15 @@ def main(argv: list[str] | None = None) -> int:
                     },
                     args.format,
                 )
+            return 0
+        if args.command == "agent" and args.agent_action == "cpu-lane":
+            runtime = MachineRuntime(args.machine_runtime_root)
+            runtime.ensure_layout()
+            if args.cpu_lane_action == "set":
+                policy = set_cpu_lane_capacity(runtime.root, capacity=args.capacity)
+            else:
+                policy = get_cpu_lane_policy(runtime.root)
+            _emit("agent", {"cpu_lane": policy.to_dict}, args.format)
             return 0
         cfg, execution_context = _resolve_cfg(
             args, require_binding=_requires_verified_binding(args)
@@ -636,6 +716,7 @@ def main(argv: list[str] | None = None) -> int:
                 cfg,
                 _command(args.argv),
                 requested_gpus=args.gpus,
+                requested_cpus=args.cpus,
                 task_id=args.task_id,
                 name=args.name,
                 group=args.group,

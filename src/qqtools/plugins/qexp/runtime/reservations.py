@@ -26,6 +26,7 @@ class ReservationIdentity:
     attempt_id: str | None
     fencing_token: int | None
     gpu_ids: tuple[int, ...]
+    cpu_slots: int | None
 
     @classmethod
     def from_record(cls, reservation: dict[str, Any]) -> "ReservationIdentity":
@@ -33,6 +34,7 @@ class ReservationIdentity:
         acquisition_id = reservation.get("acquisition_id")
         task_id = reservation.get("task_id")
         gpu_ids = reservation.get("gpu_ids")
+        cpu_slots = reservation.get("cpu_slots")
         if (
             not isinstance(reservation_id, str)
             or not reservation_id
@@ -40,8 +42,11 @@ class ReservationIdentity:
             or not acquisition_id
             or not isinstance(task_id, str)
             or not task_id
-            or not isinstance(gpu_ids, list)
-            or any(type(gpu_id) is not int for gpu_id in gpu_ids)
+            or (gpu_ids is not None and (
+                not isinstance(gpu_ids, list) or any(type(gpu_id) is not int for gpu_id in gpu_ids)
+            ))
+            or (cpu_slots is not None and (type(cpu_slots) is not int or cpu_slots < 1))
+            or ((gpu_ids is None) == (cpu_slots is None))
         ):
             raise ValueError("active reservation has an invalid identity.")
         project_id = reservation.get("project_id")
@@ -60,7 +65,8 @@ class ReservationIdentity:
             task_id,
             attempt_id,
             fencing_token,
-            tuple(gpu_ids),
+            tuple(gpu_ids or ()),
+            cpu_slots,
         )
 
     def matches(self, reservation: dict[str, Any]) -> bool:
@@ -278,13 +284,15 @@ def release(runtime_root: Path, reservation_id: str, reason: str = "completed") 
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
         source = next((path for path in (paths["active"], paths["provisional"])
                        if (path / f"{reservation_id}.json").exists()), None)
-        if source is None:
+        if source is not None:
+            source_file = source / f"{reservation_id}.json"
+            value = read_json(source_file)
+            value["reservation"].update({"state": "released", "released_at": utc_now(), "release_reason": reason})
+            atomic_replace(paths["released"] / source_file.name, value)
+            source_file.unlink(missing_ok=True)
             return
-        source_file = source / f"{reservation_id}.json"
-        value = read_json(source_file)
-        value["reservation"].update({"state": "released", "released_at": utc_now(), "release_reason": reason})
-        atomic_replace(paths["released"] / source_file.name, value)
-        source_file.unlink(missing_ok=True)
+    from .cpu_lane import release_cpu
+    release_cpu(runtime_root, reservation_id, reason)
 
 
 def release_if_matches(
@@ -293,6 +301,9 @@ def release_if_matches(
     reason: str,
 ) -> bool:
     """Release an active reservation only if its full identity is unchanged."""
+    if identity.cpu_slots is not None:
+        from .cpu_lane import release_cpu_if_matches
+        return release_cpu_if_matches(runtime_root, identity, reason)
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
         source = paths["active"] / f"{identity.reservation_id}.json"

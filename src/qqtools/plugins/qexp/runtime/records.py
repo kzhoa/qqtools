@@ -74,17 +74,45 @@ class TaskSpec:
     command: list[str]
     working_directory: str
     requested_gpus: int
+    requested_cpus: int | None = None
+    lane: str | None = None
 
     def __post_init__(self) -> None:
         if not self.command or any(not isinstance(item, str) for item in self.command):
             raise ValueError("command must be a non-empty list of strings.")
         if not self.working_directory.startswith("/"):
             raise ValueError("working_directory must be absolute.")
-        if not isinstance(self.requested_gpus, int) or self.requested_gpus <= 0:
-            raise ValueError("requested_gpus must be a positive integer.")
+        if self.lane is None:
+            if not isinstance(self.requested_gpus, int) or self.requested_gpus <= 0:
+                raise ValueError("legacy requested_gpus must be a positive integer.")
+            if self.requested_cpus is not None:
+                raise ValueError("legacy TaskSpec cannot contain requested_cpus.")
+        elif self.lane == "gpu":
+            if not isinstance(self.requested_gpus, int) or self.requested_gpus <= 0:
+                raise ValueError("GPU lane requested_gpus must be a positive integer.")
+            if self.requested_cpus is not None:
+                raise ValueError("GPU lane cannot contain requested_cpus.")
+        elif self.lane == "cpu":
+            if self.requested_gpus != 0:
+                raise ValueError("CPU lane requested_gpus must be zero.")
+            if type(self.requested_cpus) is not int or self.requested_cpus < 1:
+                raise ValueError("CPU lane requested_cpus must be a positive integer.")
+        else:
+            raise ValueError("TaskSpec lane must be 'gpu', 'cpu', or null.")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"command": list(self.command), "working_directory": self.working_directory, "requested_gpus": self.requested_gpus}
+        value = {"command": list(self.command), "working_directory": self.working_directory}
+        if self.lane is None:
+            value["requested_gpus"] = self.requested_gpus
+        elif self.lane == "gpu":
+            value.update({"lane": "gpu", "requested_gpus": self.requested_gpus})
+        else:
+            value.update({"lane": "cpu", "requested_cpus": self.requested_cpus})
+        return value
+
+    @property
+    def is_cpu_only(self) -> bool:
+        return self.lane == "cpu"
 
 
 @dataclass(slots=True)
@@ -193,11 +221,14 @@ class TaskRecord:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskRecord":
         task = data["task"]
+        spec_value = dict(task["spec"])
+        if spec_value.get("lane") == "cpu":
+            spec_value.setdefault("requested_gpus", 0)
         return cls(meta=data["meta"], task_id=task["task_id"], group_name=task.get("group_name"),
                    group_membership_sequence=task.get("group_membership_sequence"),
                    submission_operation_id=task.get("submission_operation_id"), name=task.get("name"),
                    ready_generation=task.get("ready_generation", 0),
-                   spec=TaskSpec(**task["spec"]), placement_policy=task["placement_policy"],
+                   spec=TaskSpec(**spec_value), placement_policy=task["placement_policy"],
                    placement_runtime=task["placement_runtime"], state=task["state"], control=task["control"],
                    attempt_control=task["attempt_control"], claim_control=task["claim_control"])
 

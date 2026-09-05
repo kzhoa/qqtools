@@ -33,6 +33,7 @@ from .active_operations import operation_exists
 from .store import atomic_replace, create_if_absent, read_json
 from .availability import remove_deadline_index, sync_deadline_index
 from .tasks import save_task
+from ..layout import is_cpu_lane_root
 
 
 def _write_group_record(cfg: object, path: Path, data: dict[str, Any]) -> None:
@@ -159,6 +160,7 @@ def _resolved_specs(specs: list[dict[str, Any]], submitting_machine: str) -> lis
                 "command": list(raw["command"]),
                 "working_directory": raw.get("working_directory", str(Path.cwd())),
                 "requested_gpus": raw.get("requested_gpus", 1),
+                "requested_cpus": raw.get("requested_cpus"),
                 "sharing_mode": raw.get("sharing_mode", "private"),
                 "fallback_machines": raw.get("fallback_machines", "group"),
                 "offer_after_seconds": raw.get("offer_after_seconds"),
@@ -289,7 +291,7 @@ def _reject_cleanup_tombstones(cfg: Any, resolved: list[dict[str, Any]]) -> None
 def _task_matches_resolved(
     current: TaskRecord, item: dict[str, Any], operation_id: str, group_name: str | None
 ) -> bool:
-    spec = TaskSpec(item["command"], item["working_directory"], item["requested_gpus"])
+    spec = _task_spec(item, is_canonical=current.spec.lane is not None)
     expected_policy = {
         "home_machine": item["home_machine"],
         "sharing_mode": item["sharing_mode"],
@@ -302,6 +304,21 @@ def _task_matches_resolved(
         and current.name == item["name"]
         and current.spec.to_dict() == spec.to_dict()
         and current.placement_policy == expected_policy
+    )
+
+
+def _task_spec(item: dict[str, Any], *, is_canonical: bool) -> TaskSpec:
+    requested_gpus = item["requested_gpus"]
+    requested_cpus = item.get("requested_cpus")
+    if requested_gpus == 0:
+        if not is_canonical:
+            raise ValueError("CPU-only tasks require a canonical CPU-lane root.")
+        return TaskSpec(item["command"], item["working_directory"], 0, requested_cpus, "cpu")
+    if requested_cpus is not None:
+        raise ValueError("GPU tasks cannot declare requested_cpus.")
+    return TaskSpec(
+        item["command"], item["working_directory"], requested_gpus,
+        None, "gpu" if is_canonical else None,
     )
 
 
@@ -385,6 +402,7 @@ def submit_specs(
     raw_digest = semantic_digest(normalized)
     key = idempotency_key or new_id()
     mapping_path = idempotency_path(cfg.shared_root, semantic_digest({"project": str(cfg.shared_root), "key": key}))
+    is_canonical = is_cpu_lane_root(cfg)
     with schema_lock(cfg.shared_root):
         existing = mapping_path.exists()
         if existing:
@@ -411,6 +429,8 @@ def submit_specs(
             operation = read_json(submission_path(cfg.shared_root, operation_id))
         else:
             resolved = _resolved_specs(specs, cfg.machine_name)
+            for item in resolved:
+                _task_spec(item, is_canonical=is_canonical)
             for machine in sorted({
                 item["home_machine"]
                 for item in resolved
@@ -588,7 +608,7 @@ def submit_specs(
                 task = TaskRecord.new(
                     task_id=item["task_id"],
                     machine=item["home_machine"],
-                    spec=TaskSpec(item["command"], item["working_directory"], item["requested_gpus"]),
+                    spec=_task_spec(item, is_canonical=is_canonical),
                     group_name=group_name,
                     name=item["name"],
                     sharing_mode=item["sharing_mode"],
