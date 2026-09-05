@@ -58,7 +58,7 @@ def recover_running_attempt(cfg: RootConfig, task_id: str, attempt_id: str, expi
                 group = read_json(group_path(cfg.shared_root, task.group_name))
                 normalize_group_record(group)
                 worker = group["group"]["worker_set"].get(cfg.machine_name)
-                if not worker or worker["state"] not in {"active", "borrow", "draining"}:
+                if not worker or worker["state"] not in {"active", "draining"}:
                     return None
                 if task.control.get("terminate_running"):
                     return None

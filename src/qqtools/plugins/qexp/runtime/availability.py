@@ -198,7 +198,7 @@ def _validate_common(cfg: RootConfig, task: TaskRecord, group: dict[str, Any] | 
         raise ValueError(f"Group {task.group_name!r} is being cancelled.")
     home = task.placement_policy["home_machine"]
     worker = group["group"]["worker_set"].get(home)
-    if not worker or worker.get("state") not in {"active", "borrow"}:
+    if not worker or worker.get("state") != "active":
         raise ValueError(f"Task home machine {home!r} is not a claimable Group worker.")
 
 
@@ -221,7 +221,7 @@ def _normalize_helpers(
     invalid = [
         machine
         for machine in helper_machines
-        if workers.get(machine, {}).get("state") not in {"active", "borrow"}
+        if workers.get(machine, {}).get("state") != "active"
     ]
     if invalid:
         raise ValueError(f"shared helpers are not active Group workers: {invalid}")
@@ -236,11 +236,11 @@ def _eligible_helpers(task: TaskRecord, group: dict[str, Any] | None) -> list[st
     workers = group["group"]["worker_set"]
     if fallback == "group":
         return sorted(machine for machine, worker in workers.items()
-                      if machine != home and worker.get("state") in {"active", "borrow"})
+                      if machine != home and worker.get("state") == "active")
     return sorted(
         machine
         for machine in fallback
-        if machine != home and workers.get(machine, {}).get("state") in {"active", "borrow"}
+        if machine != home and workers.get(machine, {}).get("state") == "active"
     )
 
 

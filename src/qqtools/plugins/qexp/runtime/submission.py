@@ -211,7 +211,7 @@ def _active_workers(group: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {
         machine: worker
         for machine, worker in group["group"]["worker_set"].items()
-        if worker.get("state") in {"active", "borrow"}
+        if worker.get("state") == "active"
     }
 
 
@@ -223,7 +223,7 @@ def _planned_worker_set(
     planned = dict(active_workers)
     for machine, declaration in additions.items():
         worker = all_workers.get(machine)
-        if worker is not None and worker.get("state") not in {"active", "borrow"}:
+        if worker is not None and worker.get("state") != "active":
             raise ValueError(f"machine {machine!r} is not a claimable Group worker.")
         planned.setdefault(
             machine,
