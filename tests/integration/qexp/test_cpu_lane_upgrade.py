@@ -59,6 +59,38 @@ def test_upgrade_start_is_idempotent_for_a_legacy_root(tmp_path: Path) -> None:
     assert not is_cpu_lane_root(cfg)
 
 
+def test_interrupted_normalization_requires_fresh_attestations(tmp_path: Path) -> None:
+    cfg = _legacy_root(tmp_path)
+    session = start_cpu_lane_upgrade(cfg)
+    attest_cpu_lane_upgrade(cfg, activation_id=session["activation_id"], machine_name="gpu-1")
+    journal_path = cfg.shared_root / "schema" / "cpu-lane-upgrade.json"
+    journal = read_json(journal_path)
+    journal["cpu_lane_upgrade"]["phase"] = "normalizing"
+    atomic_replace(journal_path, journal)
+
+    with pytest.raises(RuntimeError, match="collect fresh"):
+        resume_cpu_lane_upgrade(cfg, activation_id=session["activation_id"])
+
+    recovered = read_json(journal_path)["cpu_lane_upgrade"]
+    assert recovered["phase"] == "awaiting_attestations"
+    assert recovered["attestations"] == {}
+
+
+def test_completed_upgrade_resume_is_idempotent_even_after_work_restarts(tmp_path: Path) -> None:
+    cfg = _legacy_root(tmp_path)
+    session = start_cpu_lane_upgrade(cfg)
+    attest_cpu_lane_upgrade(cfg, activation_id=session["activation_id"], machine_name="gpu-1")
+    completed = resume_cpu_lane_upgrade(cfg, activation_id=session["activation_id"])
+
+    task = submit(cfg, ["echo", "gpu"], working_dir=tmp_path)
+    task_path = cfg.shared_root / "tasks" / f"{task.task_id}.json"
+    value = read_json(task_path)
+    value["task"]["state"]["projection"] = "running"
+    atomic_replace(task_path, value)
+
+    assert resume_cpu_lane_upgrade(cfg, activation_id=session["activation_id"]) == completed
+
+
 def test_upgrade_cli_requires_explicit_shared_root(tmp_path: Path) -> None:
     cfg = _legacy_root(tmp_path)
 

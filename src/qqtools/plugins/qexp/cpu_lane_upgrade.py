@@ -114,6 +114,23 @@ def resume_cpu_lane_upgrade(cfg: RootConfig, *, activation_id: str) -> dict[str,
         journal = read_json(_journal_path(cfg))["cpu_lane_upgrade"]
         if journal["activation_id"] != activation_id:
             raise ValueError("activation ID does not match the pending CPU lane upgrade.")
+        if journal["phase"] == "completed":
+            return journal
+        if journal["phase"] == "normalizing":
+            # A process died after entering the write phase.  Earlier drain acknowledgments
+            # cannot prove that clients stayed stopped while the coordinator was unavailable.
+            journal.update({
+                "phase": "awaiting_attestations",
+                "attestations": {},
+                "recovery_required_at": utc_now(),
+            })
+            atomic_replace(_journal_path(cfg), {"cpu_lane_upgrade": journal})
+            raise RuntimeError(
+                "CPU lane upgrade was interrupted during normalization; collect fresh "
+                "machine attestations before resuming."
+            )
+        if journal["phase"] != "awaiting_attestations":
+            raise RuntimeError(f"CPU lane upgrade has unsupported phase {journal['phase']!r}.")
         missing = sorted(set(journal["participants"]) - set(journal["attestations"]))
         if missing:
             raise RuntimeError("CPU lane upgrade is missing machine attestations: " + ", ".join(missing))

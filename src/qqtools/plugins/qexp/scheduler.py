@@ -946,7 +946,10 @@ def _run_dispatch_cycle(
                 if claim_guard is not None:
                     with claim_guard() as is_permitted:
                         if not is_permitted:
-                            available = gpus + available
+                            if task.spec.is_cpu_only:
+                                available_cpu_slots += task.spec.requested_cpus or 0
+                            else:
+                                available = gpus + available
                             break
                         attempt = claim_task(
                             cfg, task.task_id, gpus,
@@ -957,7 +960,10 @@ def _run_dispatch_cycle(
                         )
                 else:
                     if before_claim is not None and not before_claim():
-                        available = gpus + available
+                        if task.spec.is_cpu_only:
+                            available_cpu_slots += task.spec.requested_cpus or 0
+                        else:
+                            available = gpus + available
                         break
                     attempt = claim_task(
                         cfg, task.task_id, gpus,
@@ -967,11 +973,17 @@ def _run_dispatch_cycle(
                         borrow_admission_grant=borrow_admission_grant,
                     )
             except ValueError:
-                available = gpus + available
+                if task.spec.is_cpu_only:
+                    available_cpu_slots += task.spec.requested_cpus or 0
+                else:
+                    available = gpus + available
                 sizer.observe(max(1, time.monotonic_ns() - started_ns))
                 continue
             if attempt is None:
-                available = gpus + available
+                if task.spec.is_cpu_only:
+                    available_cpu_slots += task.spec.requested_cpus or 0
+                else:
+                    available = gpus + available
                 diagnostic_increment("scheduler.ready.claim_races")
                 sizer.observe(max(1, time.monotonic_ns() - started_ns))
                 continue
@@ -990,6 +1002,15 @@ def _run_dispatch_cycle(
                     if authorized is not None:
                         executor.launch_attempt(cfg, task.task_id, authorized)
                         launched.append(task.task_id)
+                    elif task.spec.is_cpu_only:
+                        available_cpu_slots += task.spec.requested_cpus or 0
+                    else:
+                        available = gpus + available
+                else:
+                    if task.spec.is_cpu_only:
+                        available_cpu_slots += task.spec.requested_cpus or 0
+                    else:
+                        available = gpus + available
             except Exception:
                 fail_attempt(
                     cfg,
@@ -1047,7 +1068,10 @@ def _run_dispatch_cycle(
             if claim_guard is not None:
                 with claim_guard() as is_permitted:
                     if not is_permitted:
-                        available = gpus + available
+                        if task.spec.is_cpu_only:
+                            available_cpu_slots += task.spec.requested_cpus or 0
+                        else:
+                            available = gpus + available
                         break
                     attempt = claim_task(
                         cfg, task.task_id, gpus,
@@ -1057,7 +1081,10 @@ def _run_dispatch_cycle(
                     )
             else:
                 if before_claim is not None and not before_claim():
-                    available = gpus + available
+                    if task.spec.is_cpu_only:
+                        available_cpu_slots += task.spec.requested_cpus or 0
+                    else:
+                        available = gpus + available
                     break
                 attempt = claim_task(
                     cfg, task.task_id, gpus,
@@ -1066,10 +1093,16 @@ def _run_dispatch_cycle(
                     borrow_admission_grant=borrow_admission_grant,
                 )
         except ValueError:
-            available = gpus + available
+            if task.spec.is_cpu_only:
+                available_cpu_slots += task.spec.requested_cpus or 0
+            else:
+                available = gpus + available
             continue
         if attempt is None:
-            available = gpus + available
+            if task.spec.is_cpu_only:
+                available_cpu_slots += task.spec.requested_cpus or 0
+            else:
+                available = gpus + available
             continue
         new_claims += 1
         if on_claim is not None:
@@ -1082,11 +1115,17 @@ def _run_dispatch_cycle(
                 attempt.current_fencing_token,
                 reservation_runtime_root=reservation_runtime_root,
             ):
-                available = gpus + available
+                if task.spec.is_cpu_only:
+                    available_cpu_slots += task.spec.requested_cpus or 0
+                else:
+                    available = gpus + available
                 continue
             authorized = _load_current_attempt(cfg, load_task(cfg, task.task_id))
             if authorized is None:
-                available = gpus + available
+                if task.spec.is_cpu_only:
+                    available_cpu_slots += task.spec.requested_cpus or 0
+                else:
+                    available = gpus + available
                 continue
             executor.launch_attempt(cfg, task.task_id, authorized)
             launched.append(task.task_id)
