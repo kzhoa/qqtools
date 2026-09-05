@@ -503,15 +503,8 @@ A Worker member contains `scheduling_role: primary | borrow` and
 `gpu_limit_gpus: positive-int | null`. Its persisted `state` is one of
 `active | draining | removing`: claimable Workers use `active`, while `scheduling_role` controls
 primary/borrow admission; `draining`/`removing` are not claimable. Both roles may carry a
-finite limit. Existing Worker records without these fields read as `state: active`,
-`scheduling_role: primary`, and `gpu_limit_gpus: null`. Under `QQTOOLS-COMPAT-0004`, N readers
-temporarily normalize the legacy `borrow_limit_gpus` field into `gpu_limit_gpus`; writers emit
-only the new field. N+1 may read that field only while performing the schema-lock and Group-lock
-automatic upgrade; ordinary scheduling then requires `gpu_limit_gpus`. N+2 removes both paths.
-
-N retained `state: borrow` as a fail-closed encoding for pre-primary/borrow agents. N+1's
-automatic upgrade rewrites it to `active` under the schema and Group locks; normal N+1 scheduling
-and mutation reject non-canonical encodings. No Group-wide capability acknowledgement is required.
+finite limit. All three fields are required; legacy `state: borrow` and `borrow_limit_gpus`
+encodings are unsupported. No Group-wide capability acknowledgement is required.
 
 ### 8.3 Task Truth
 

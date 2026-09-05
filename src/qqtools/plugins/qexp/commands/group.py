@@ -15,7 +15,6 @@ from ..runtime.records import (AttemptRecord, SCHEMA_VERSION, TaskRecord, new_gr
                                new_worker_member, normalize_group_record, utc_now,
                                validate_gpu_limit, validate_group_name, validate_identifier)
 from ..runtime.store import atomic_replace, iter_json, read_json
-from ..runtime.worker_encoding import ensure_canonical_primary_borrow_encoding, write_group_record
 from ..runtime.tasks import load_task, save_task
 from ..runtime.ready import (
     primary_projection_transaction,
@@ -68,7 +67,6 @@ def group_control(
 ) -> dict[str, Any]:
     from ..machine_runtime import resolve_execution_context
 
-    ensure_canonical_primary_borrow_encoding(cfg, started_by_agent=cfg.machine_name)
     reservation_runtime_root = reservation_runtime_root or resolve_execution_context(cfg).reservation_root
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
     _finalize_pending_submission_before_group_mutation(cfg, name, path)
@@ -112,7 +110,7 @@ def group_control(
             data["cancellation_operation"] = operation["group_control"]
             data["meta"]["revision"] += 1
             data["meta"]["updated_at"] = utc_now()
-            write_group_record(cfg, path, data)
+            atomic_replace(path, data)
             operation["group_control"]["state"] = "converging"
             operation["group_control"]["updated_at"] = utc_now()
             write_active_operation(cfg, "group_control", operation_id, operation)
@@ -193,7 +191,7 @@ def group_control(
             raise ValueError(f"unknown group action {action!r}.")
         data["meta"]["revision"] += 1
         data["meta"]["updated_at"] = utc_now()
-        write_group_record(cfg, path, data)
+        atomic_replace(path, data)
         result_data = data
     for result in post_commit_results:
         if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
@@ -208,7 +206,6 @@ def reconcile_group_cancel_operations(
         cfg: RootConfig, group_name: str | None = None, *,
         include_legacy: bool = True) -> list[dict[str, Any]]:
     """Rebuild durable Group control operation status from current Task truth."""
-    ensure_canonical_primary_borrow_encoding(cfg, started_by_agent=cfg.machine_name)
     reconciled: list[dict[str, Any]] = []
     for operation_path in iter_active_operation_paths(
         cfg, "group_control", include_legacy=include_legacy
@@ -253,7 +250,7 @@ def reconcile_group_cancel_operations(
                     group_data["cancellation_operation"] = control
                     group_data["meta"]["revision"] += 1
                     group_data["meta"]["updated_at"] = utc_now()
-                    write_group_record(cfg, group_file, group_data)
+                    atomic_replace(group_file, group_data)
                 reconciled.append(control)
                 continue
             pending: dict[str, list[str]] = {}
@@ -315,7 +312,7 @@ def reconcile_group_cancel_operations(
                 group_data["cancellation_operation"] = control
                 group_data["meta"]["revision"] += 1
                 group_data["meta"]["updated_at"] = utc_now()
-                write_group_record(cfg, group_file, group_data)
+                atomic_replace(group_file, group_data)
             reconciled.append(control)
     return reconciled
 
@@ -388,14 +385,13 @@ def _reconcile_worker_remove_operation(
             group_data["worker_control"] = control
         group_data["meta"]["revision"] += 1
         group_data["meta"]["updated_at"] = utc_now()
-        write_group_record(cfg, group_file, group_data)
+        atomic_replace(group_file, group_data)
         if control["state"] == "completed":
             archive_operation(cfg, "group_control", control["operation_id"], operation)
         return control
 
 
 def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -> dict[str, Any]:
-    ensure_canonical_primary_borrow_encoding(cfg, started_by_agent=cfg.machine_name)
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
     with group_lock(cfg.shared_root, name):
         if path.exists():
@@ -409,7 +405,7 @@ def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -
                 raise ValueError(f"group workers must not contain duplicate machine {machine!r}.")
             seen.add(machine)
             data["group"]["worker_set"][machine] = new_worker_member()
-        write_group_record(cfg, path, data)
+        atomic_replace(path, data)
         return data
 
 
@@ -425,7 +421,6 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                   *, terminate_running: bool = False, role: str | None = None,
                   gpu_limit_gpus: int | None = None,
                   has_gpu_limit: bool = False) -> dict[str, Any]:
-    ensure_canonical_primary_borrow_encoding(cfg, started_by_agent=cfg.machine_name)
     path = group_path(cfg.shared_root, validate_group_name(group_name) or group_name)
     _finalize_pending_submission_before_group_mutation(cfg, group_name, path)
     with group_lock(cfg.shared_root, group_name):
@@ -558,7 +553,7 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
             with primary_projection_transaction(
                 cfg, sorted(set(projection_routes + [("shared", machine), ("home", machine)]))
             ):
-                write_group_record(cfg, path, data)
+                atomic_replace(path, data)
                 sync_primary_ready_group(cfg, group_name)
             return data
         else:
@@ -575,10 +570,10 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
             with primary_projection_transaction(
                 cfg, sorted(set(projection_routes + [("shared", machine), ("home", machine)]))
             ):
-                write_group_record(cfg, path, data)
+                atomic_replace(path, data)
                 sync_primary_ready_group(cfg, group_name)
         else:
-            write_group_record(cfg, path, data)
+            atomic_replace(path, data)
         return data
 
 

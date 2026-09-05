@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 import pytest
@@ -9,13 +8,6 @@ from qqtools.plugins.qexp.observer import list_group_machines, list_groups
 from qqtools.plugins.qexp.runtime.paths import group_path
 from qqtools.plugins.qexp.runtime.store import read_json
 from qqtools.plugins.qexp.runtime.reservations import reserve_admitted
-from qqtools.plugins.qexp.runtime.worker_encoding import (
-    ENCODING_CANONICAL_V2,
-    ENCODING_COMPAT_V1,
-    ensure_canonical_primary_borrow_encoding,
-    read_primary_borrow_encoding,
-    write_primary_borrow_encoding,
-)
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -85,64 +77,6 @@ def test_group_worker_set_accepts_primary_gpu_limit(tmp_path: Path):
         cfg, "exp", "g2", "add", role="primary", gpu_limit_gpus=1, has_gpu_limit=True
     )
     assert group["group"]["worker_set"]["g2"]["gpu_limit_gpus"] == 1
-
-
-def test_canonical_marker_keeps_borrow_reader_and_writer_compatible(tmp_path: Path):
-    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
-    create_group(cfg, "exp")
-    change_worker(cfg, "exp", "g2", "add", role="borrow", gpu_limit_gpus=2,
-                  has_gpu_limit=True)
-    marker = read_primary_borrow_encoding(cfg)
-    marker.update({"state": ENCODING_CANONICAL_V2, "revision": 2, "started_by_agent": "agent-1"})
-    write_primary_borrow_encoding(cfg, marker)
-
-
-def test_n_plus_one_upgrade_canonicalizes_group_encoding_idempotently(tmp_path: Path):
-    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
-    create_group(cfg, "exp")
-    path = group_path(cfg.shared_root, "exp")
-    group = read_json(path)
-    group["group"]["worker_set"] = {
-        "g2": {
-            "state": "borrow",
-            "scheduling_role": "borrow",
-            "borrow_limit_gpus": 2,
-            "state_epoch": 7,
-            "added_at": "2026-01-01T00:00:00Z",
-            "added_by_operation": None,
-            "drain_requested_at": None,
-            "remove_requested_at": None,
-            "terminate_running": False,
-        }
-    }
-    path.write_text(json.dumps(group), encoding="utf-8")
-    write_primary_borrow_encoding(
-        cfg,
-        {
-            "state": ENCODING_COMPAT_V1,
-            "revision": 1,
-            "started_at": None,
-            "completed_at": None,
-            "started_by_agent": None,
-        },
-    )
-
-    marker = ensure_canonical_primary_borrow_encoding(cfg, started_by_agent="g1")
-
-    worker = read_json(path)["group"]["worker_set"]["g2"]
-    assert marker["state"] == ENCODING_CANONICAL_V2
-    assert marker["revision"] == 3
-    assert worker["state"] == "active"
-    assert worker["gpu_limit_gpus"] == 2
-    assert "borrow_limit_gpus" not in worker
-    assert worker["state_epoch"] == 7
-    assert ensure_canonical_primary_borrow_encoding(cfg, started_by_agent="g1") == marker
-
-    updated = change_worker(cfg, "exp", "g2", "set", role="borrow",
-                            gpu_limit_gpus=1, has_gpu_limit=True)
-    assert updated["group"]["worker_set"]["g2"]["state"] == "active"
-    persisted = read_json(group_path(cfg.shared_root, "exp"))
-    assert persisted["group"]["worker_set"]["g2"]["scheduling_role"] == "borrow"
 
 
 def test_group_machine_usage_includes_unexpired_provisional_reservation(tmp_path: Path):

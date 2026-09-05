@@ -280,12 +280,13 @@ def test_repository_registry_is_valid() -> None:
 
     items = load_registry(root / "docs/spec/compatibility-registry.toml", root)
 
-    assert {
+    retired_ids = {
         "QQTOOLS-COMPAT-" + "0001",
         "QQTOOLS-COMPAT-" + "0002",
-    } <= {item.item_id for item in items}
-    use_context_item = next(item for item in items if item.item_id == "QQTOOLS-COMPAT-0002")
-    assert use_context_item.pitch_refs == ()
+        "QQTOOLS-COMPAT-" + "0004",
+    }
+    assert items.next_id >= 5
+    assert retired_ids.isdisjoint(item.item_id for item in items)
 
 
 def test_planned_future_item_passes_an_earlier_release(tmp_path: Path) -> None:
