@@ -20,6 +20,64 @@ def _journal_path(cfg: RootConfig) -> Path:
     return shared_paths(cfg.shared_root)["schema"] / _JOURNAL
 
 
+def _runtime_binding(
+    cfg: RootConfig, machine_runtime_root: str | Path | None
+) -> tuple[MachineRuntime, Any]:
+    """Resolve the caller's verified machine-local binding for this project."""
+    runtime = MachineRuntime(machine_runtime_root)
+    identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
+    identity = read_json(identity_path).get("project", {})
+    project_id = identity.get("project_id")
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError("project identity is malformed.")
+    _revision, bindings = runtime.load_registry()
+    matches = [
+        binding
+        for binding in bindings
+        if binding.project_id == project_id and binding.shared_root == cfg.shared_root
+    ]
+    if len(matches) != 1:
+        raise ValueError("no unique machine runtime binding matches this project.")
+    binding = matches[0]
+    record = read_json(
+        shared_paths(cfg.shared_root)["machines"] / binding.machine_name / "machine.json"
+    ).get("machine", {})
+    if (
+        not isinstance(record, dict)
+        or record.get("machine_name") != binding.machine_name
+        or record.get("project_id") != binding.project_id
+        or record.get("shared_root") != str(cfg.shared_root)
+        or record.get("agent_runtime") != "machine"
+    ):
+        raise ValueError("local machine runtime binding does not match Project truth.")
+    return runtime, binding
+
+
+def _validate_attestations(cfg: RootConfig, journal: dict[str, Any]) -> None:
+    """Ensure recorded attestations still identify their original local binding."""
+    identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
+    identity = read_json(identity_path).get("project", {})
+    project_id = identity.get("project_id")
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError("project identity is malformed.")
+    shared_root = str(cfg.shared_root)
+    attestations = journal.get("attestations")
+    if not isinstance(attestations, dict):
+        raise ValueError("CPU lane upgrade attestations are malformed.")
+    for machine_name, attestation in attestations.items():
+        if machine_name not in journal["participants"] or not isinstance(attestation, dict):
+            raise ValueError("CPU lane upgrade attestation is not a declared participant.")
+        if (
+            attestation.get("machine_name") != machine_name
+            or attestation.get("binding_machine_name") != machine_name
+            or attestation.get("project_id") != project_id
+            or attestation.get("shared_root") != shared_root
+        ):
+            raise ValueError(
+                f"CPU lane upgrade attestation does not match machine binding: {machine_name}."
+            )
+
+
 def _blockers(
     cfg: RootConfig, *, machine_runtime_root: str | Path | None = None
 ) -> list[str]:
@@ -36,21 +94,8 @@ def _blockers(
         path = shared_paths(cfg.shared_root)[directory]
         if iter_json(path):
             blockers.append(f"operation:{directory}")
-    runtime = MachineRuntime(machine_runtime_root or cfg.runtime_root)
     try:
-        identity = read_json(shared_paths(cfg.shared_root)["project"] / "identity.json").get("project", {})
-        project_id = identity.get("project_id")
-        _revision, bindings = runtime.load_registry()
-        binding = next(
-            (
-                item
-                for item in bindings
-                if item.project_id == project_id and item.shared_root == cfg.shared_root
-            ),
-            None,
-        )
-        if binding is None:
-            raise ValueError("no matching machine runtime binding")
+        runtime, binding = _runtime_binding(cfg, machine_runtime_root)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         blockers.append(f"runtime:binding_unresolved:{exc}")
         return blockers
@@ -127,11 +172,22 @@ def attest_cpu_lane_upgrade(
             raise ValueError("activation ID does not match the pending CPU lane upgrade.")
         if machine_name not in journal["participants"]:
             raise ValueError("machine is not a participant in the pending CPU lane upgrade.")
+        _runtime, binding = _runtime_binding(cfg, machine_runtime_root)
+        if binding.machine_name != machine_name:
+            raise ValueError(
+                "CPU lane upgrade attestation machine does not match the local machine binding."
+            )
         blockers = _blockers(cfg, machine_runtime_root=machine_runtime_root)
         if blockers:
             raise RuntimeError("CPU lane attestation found blockers: " + ", ".join(blockers))
         attestations = dict(journal["attestations"])
-        attestations[machine_name] = {"attested_at": utc_now(), "machine_name": machine_name}
+        attestations[machine_name] = {
+            "attested_at": utc_now(),
+            "machine_name": machine_name,
+            "binding_machine_name": binding.machine_name,
+            "project_id": binding.project_id,
+            "shared_root": str(binding.shared_root),
+        }
         journal["attestations"] = attestations
         atomic_replace(_journal_path(cfg), {"cpu_lane_upgrade": journal})
         return journal
@@ -165,6 +221,7 @@ def resume_cpu_lane_upgrade(
         missing = sorted(set(journal["participants"]) - set(journal["attestations"]))
         if missing:
             raise RuntimeError("CPU lane upgrade is missing machine attestations: " + ", ".join(missing))
+        _validate_attestations(cfg, journal)
         blockers = _blockers(cfg, machine_runtime_root=machine_runtime_root)
         if blockers:
             raise RuntimeError("CPU lane upgrade requires a drained root: " + ", ".join(blockers))
