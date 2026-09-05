@@ -31,14 +31,12 @@ from .ready import (
 )
 from .active_operations import operation_exists
 from .store import atomic_replace, create_if_absent, read_json
-from .worker_encoding import ensure_canonical_primary_borrow_encoding, prepare_group_record_for_write
 from .availability import remove_deadline_index, sync_deadline_index
 from .tasks import save_task
 
 
 def _write_group_record(cfg: object, path: Path, data: dict[str, Any]) -> None:
     """Persist a Group through this module's patchable atomic writer."""
-    prepare_group_record_for_write(cfg, data)
     atomic_replace(path, data)
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
 
@@ -230,7 +228,7 @@ def _planned_worker_set(
         planned.setdefault(
             machine,
             {
-                "state": "borrow" if declaration["scheduling_role"] == "borrow" else "active",
+                "state": "active",
                 **declaration,
                 "state_epoch": 0,
                 "added_by_operation": None,
@@ -376,8 +374,6 @@ def submit_specs(
     if not specs:
         raise ValueError("submission must contain at least one task.")
     worker_additions = _worker_additions(worker_set)
-    if group_name or worker_additions:
-        ensure_canonical_primary_borrow_encoding(cfg, started_by_agent=cfg.machine_name)
     normalized = {
         "group": group_name,
         "tasks": _canonical_specs(specs),

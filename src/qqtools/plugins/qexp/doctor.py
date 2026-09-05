@@ -17,7 +17,6 @@ from .runtime.locks import group_lock, task_lock
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
 from .runtime.records import AttemptRecord, TaskRecord, normalize_group_record, utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
-from .runtime.worker_encoding import write_group_record
 from .runtime.submission import finalize_submission_group
 from .runtime.termination import list_decisions
 from .runtime.tasks import load_task
@@ -412,7 +411,7 @@ def repair_metadata(
             group_data["group"]["pending_submission_commit"] = None
             group_data["meta"]["revision"] += 1
             group_data["meta"]["updated_at"] = operation.get("committed_at") or group_data["meta"]["updated_at"]
-            write_group_record(cfg, group_file, group_data)
+            atomic_replace(group_file, group_data)
             repaired.append(operation["operation_id"])
         else:
             blocked.append(operation["operation_id"])

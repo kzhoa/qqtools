@@ -466,7 +466,6 @@ def main(argv: list[str] | None = None) -> int:
             is_selecting = args.use_shared_root is not None
             if sum((is_selecting, args.show, args.clear)) != 1:
                 raise ValueError("use requires exactly one of --shared-root, --show, or --clear.")
-            # QQTOOLS-COMPAT-0002: N+1 rejects the former qexp use identity inputs.
             if args.machine is not None or args.runtime_root is not None:
                 raise ValueError("qexp use accepts only --shared-root, --show, or --clear.")
             if args.clear:

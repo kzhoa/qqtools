@@ -276,49 +276,35 @@ def validate_gpu_limit(value: Any, label: str = "gpu_limit_gpus") -> int | None:
     return value
 
 
-def normalize_worker_member(
-    worker: dict[str, Any], *, machine: str = "worker", allow_legacy: bool = False
-) -> dict[str, Any]:
-    """Apply compatible defaults and validate one persisted Worker member."""
+def normalize_worker_member(worker: dict[str, Any], *, machine: str = "worker") -> dict[str, Any]:
+    """Validate one canonical persisted Worker member."""
     if not isinstance(worker, dict):
         raise ValueError(f"{machine!r} Worker record must be a mapping.")
-    state = worker.get("state", "active")
-    role = worker.get("scheduling_role")
-    if role is None:
-        role = "borrow" if state == "borrow" else "primary"
+    required = {"state", "scheduling_role", "gpu_limit_gpus"}
+    missing = sorted(required - set(worker))
+    if missing:
+        raise ValueError(f"{machine!r} Worker is missing required fields: {', '.join(missing)}.")
+    state = worker["state"]
+    role = worker["scheduling_role"]
     if role not in WORKER_ROLES:
         raise ValueError(f"{machine!r} Worker scheduling_role is invalid.")
-    if state not in {"active", "borrow", "draining", "removing"}:
+    if state not in {"active", "draining", "removing"}:
         raise ValueError(f"{machine!r} Worker state is invalid.")
-    if state == "borrow" and not allow_legacy:
-        raise ValueError(f"{machine!r} Worker has obsolete borrow state encoding.")
-    # QQTOOLS-COMPAT-0004: N+1 reads the former field only in the encoding upgrader.
-    has_legacy_limit = "borrow_limit_gpus" in worker
-    if has_legacy_limit and not allow_legacy:
+    if "borrow_limit_gpus" in worker:
         raise ValueError(f"{machine!r} Worker has obsolete borrow_limit_gpus.")
-    legacy_limit = worker.pop("borrow_limit_gpus", None)
-    limit = validate_gpu_limit(worker.get("gpu_limit_gpus"), f"{machine}.gpu_limit_gpus")
-    if "gpu_limit_gpus" not in worker:
-        limit = validate_gpu_limit(legacy_limit, f"{machine}.borrow_limit_gpus")
-    elif has_legacy_limit and limit != validate_gpu_limit(
-        legacy_limit, f"{machine}.borrow_limit_gpus"
-    ):
-        raise ValueError(f"{machine!r} Worker has conflicting GPU limit fields.")
-    if state == "borrow" and role != "borrow":
-        raise ValueError(f"{machine!r} borrow Worker must have borrow scheduling_role.")
-    worker["state"] = state
-    worker["scheduling_role"] = role
-    worker["gpu_limit_gpus"] = limit
+    worker["gpu_limit_gpus"] = validate_gpu_limit(
+        worker["gpu_limit_gpus"], f"{machine}.gpu_limit_gpus"
+    )
     return worker
 
 
-def normalize_group_record(data: dict[str, Any], *, allow_legacy: bool = False) -> dict[str, Any]:
-    """Normalize compatible Worker fields in a Group record without writing it."""
+def normalize_group_record(data: dict[str, Any]) -> dict[str, Any]:
+    """Validate canonical Worker fields in a Group record without writing it."""
     group = data.get("group")
     if not isinstance(group, dict) or not isinstance(group.get("worker_set"), dict):
         raise ValueError("Group Worker Set is malformed.")
     for machine, worker in group["worker_set"].items():
-        normalize_worker_member(worker, machine=str(machine), allow_legacy=allow_legacy)
+        normalize_worker_member(worker, machine=str(machine))
     return data
 
 

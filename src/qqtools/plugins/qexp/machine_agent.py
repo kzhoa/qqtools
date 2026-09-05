@@ -1348,19 +1348,6 @@ def run_machine_agent_loop(
                 }
             })
             is_status_published = True
-            from .runtime.worker_encoding import ensure_canonical_primary_borrow_encoding
-
-            _, bindings = machine_runtime.load_registry()
-            for binding in bindings:
-                if not (binding.enabled or machine_runtime.binding_state(binding) == "draining"):
-                    continue
-                try:
-                    cfg = _binding_config(machine_runtime, binding)
-                    ensure_canonical_primary_borrow_encoding(
-                        cfg, started_by_agent=cfg.machine_name
-                    )
-                except (OSError, RuntimeError, ValueError):
-                    continue
             control_plane = _MachineControlPlane(
                 machine_runtime,
                 instance_id=instance_id,

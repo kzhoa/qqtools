@@ -776,15 +776,8 @@ only later borrow claims stop.
 Group-level GPU limit; visible free qexp GPUs, placement, primary demand, and machine-wide
 reservations still apply. A finite limit is checked by GPU count, not Task count. Lowering a
 limit below current usage reports `over_limit` and blocks later admission without terminating
-work. Under `QQTOOLS-COMPAT-0004`, N readers temporarily accept `borrow_limit_gpus` from
-existing Group records and pre-unification submission declarations, then normalize it to
-`gpu_limit_gpus`; all N writes and outputs use `gpu_limit_gpus`. N+1 retains that reader only
-inside its automatic Group upgrade, which rewrites every legacy field before normal scheduling.
-Normal N+1 parsing rejects that field; N+2 removes the upgrader.
-
-N+1 persists a borrow Worker as `scheduling_role: borrow, state: active`. The automatic upgrade
-rewrites N's fail-closed `state: borrow` encoding before normal scheduling or Group mutation;
-`draining` and `removing` remain non-claimable.
+work. All writes and outputs use `gpu_limit_gpus`. A borrow Worker is persisted as
+`scheduling_role: borrow, state: active`; `draining` and `removing` remain non-claimable.
 
 An enabled local project binding is required on every target machine. `qexp init` creates the
 normal binding; `qexp agent add-project` restores a missing binding. Submitting on one machine

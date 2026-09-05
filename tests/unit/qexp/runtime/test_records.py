@@ -26,26 +26,46 @@ def test_private_task_cannot_become_shared(tmp_path):
         raise AssertionError("private task was accepted in shared scope")
 
 
-def test_legacy_group_worker_defaults_to_primary():
+def test_group_worker_requires_canonical_fields():
     group = {"group": {"worker_set": {"gpu-1": {"state": "active"}}}}
 
-    normalize_group_record(group)
-
-    assert group["group"]["worker_set"]["gpu-1"]["scheduling_role"] == "primary"
-    assert group["group"]["worker_set"]["gpu-1"]["gpu_limit_gpus"] is None
+    with pytest.raises(ValueError, match="missing required fields"):
+        normalize_group_record(group)
 
 
-def test_legacy_borrow_limit_is_accepted_only_by_the_n_plus_one_upgrader():
-    """QQTOOLS-COMPAT-0004: N+1 keeps the legacy reader inside the upgrader only."""
-    group = {"group": {"worker_set": {"gpu-1": {"borrow_limit_gpus": 2}}}}
+def test_group_worker_rejects_legacy_limit_field():
+    group = {
+        "group": {
+            "worker_set": {
+                "gpu-1": {
+                    "state": "active",
+                    "scheduling_role": "borrow",
+                    "gpu_limit_gpus": 2,
+                    "borrow_limit_gpus": 2,
+                }
+            }
+        }
+    }
 
     with pytest.raises(ValueError, match="obsolete borrow_limit_gpus"):
         normalize_group_record(group)
-    normalize_group_record(group, allow_legacy=True)
 
-    worker = group["group"]["worker_set"]["gpu-1"]
-    assert worker["gpu_limit_gpus"] == 2
-    assert "borrow_limit_gpus" not in worker
+
+def test_group_worker_rejects_legacy_borrow_state():
+    group = {
+        "group": {
+            "worker_set": {
+                "gpu-1": {
+                    "state": "borrow",
+                    "scheduling_role": "borrow",
+                    "gpu_limit_gpus": 2,
+                }
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="Worker state is invalid"):
+        normalize_group_record(group)
 
 
 def test_canonical_borrow_worker_encoding_is_readable():
