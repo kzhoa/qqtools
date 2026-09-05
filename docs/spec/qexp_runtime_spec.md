@@ -1222,8 +1222,9 @@ active claim. It acquires Group then Task lock and validates:
 
 All queued availability changes use the same durable operation path:
 
-1. write `operations/availability/<operation-id>.json` in `prepared` state
-2. acquire Group then Task lock, or only Task lock for standalone idempotent `keep-local`
+1. acquire Group then Task lock, or only Task lock for standalone idempotent `keep-local`
+2. resolve an existing active or archived operation, or write
+   `operations/availability/<operation-id>.json` in `prepared` state only when neither exists
 3. re-read Task truth and validate submission, projection, claim, cleanup, cancellation, Group,
    home worker, and helper worker state
 4. commit at most one Task revision when policy or queue scope changes

@@ -93,10 +93,11 @@ def _operation_meta(cfg: RootConfig) -> dict[str, Any]:
 
 
 def _create_operation(
-        cfg: RootConfig, request: AvailabilityTransitionRequest) -> tuple[str, dict[str, Any]]:
-    operation_id = request.operation_id or new_id()
-    path = _operation_path(cfg, operation_id)
-    if path.exists():
+        cfg: RootConfig, request: AvailabilityTransitionRequest, *,
+        operation_id: str | None = None) -> tuple[str, dict[str, Any]]:
+    """Load an existing operation or create it while its Task is locked."""
+    operation_id = operation_id or request.operation_id or new_id()
+    if operation_exists(cfg, "availability", operation_id):
         return operation_id, _read_operation(cfg, operation_id)
     now = utc_now()
     operation = {"meta": _operation_meta(cfg), "availability_operation": {
@@ -484,7 +485,7 @@ def apply_availability_transition(
         cfg: RootConfig, request: AvailabilityTransitionRequest) -> AvailabilityTransitionResult:
     if request.after_seconds is not None and request.after_seconds < 0:
         raise ValueError("share --after must be non-negative.")
-    operation_id, operation = _create_operation(cfg, request)
+    operation_id = request.operation_id or new_id()
     initial = load_task(cfg, request.task_id)
     lock_group = initial.group_name
     target_scope = (
@@ -493,6 +494,7 @@ def apply_availability_transition(
     )
     ready_reference = None
     is_ready_committed = False
+    operation: dict[str, Any] | None = None
     try:
         with ExitStack() as stack:
             if lock_group:
@@ -500,7 +502,7 @@ def apply_availability_transition(
             stack.enter_context(task_lock(cfg.shared_root, request.task_id))
             task = load_task(cfg, request.task_id)
             group = _group_data(cfg, task)
-            operation = _read_operation(cfg, operation_id)
+            operation_id, operation = _create_operation(cfg, request, operation_id=operation_id)
             completed = _completed_operation_result(
                 cfg, request, operation_id, operation, task, group
             )
@@ -619,6 +621,10 @@ def apply_availability_transition(
                               revision_after=task.meta["revision"])
             return result
     except Exception as exc:
+        if operation is None:
+            raise
+        if operation.get("availability_operation", {}).get("state") == "completed":
+            raise
         try:
             current = load_task(cfg, request.task_id)
             if current.placement_runtime.get("availability_operation_id") == operation_id:
