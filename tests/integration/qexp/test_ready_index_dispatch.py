@@ -27,6 +27,7 @@ from qqtools.plugins.qexp.runtime.ready import (
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.ready import bump_primary_ready_revision, ready_index_route_revision
 from qqtools.plugins.qexp.runtime.reservations import attach, reserve
+from qqtools.plugins.qexp.runtime.cpu_lane import reserve_cpu, set_cpu_lane_capacity
 from qqtools.plugins.qexp.runtime.work_budget import (
     AdaptiveBatchSizer,
     SliceBudget,
@@ -458,6 +459,32 @@ def test_machine_agent_primary_demand_blocks_new_borrow_claim(
     assert result_by_project[primary_binding.project_id]["launched"] == [primary_task.task_id]
     assert result_by_project[borrow_binding.project_id]["launched"] == []
     assert borrow_task.task_id not in executor.launched
+
+
+def test_cpu_primary_probe_waits_for_aggregation_with_partial_free_capacity(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    cfg = init_shared_root(
+        tmp_path / "cpu-primary" / ".qexp", "cpu-1", runtime_root=tmp_path / "cpu-project-runtime"
+    )
+    submit(cfg, ["echo", "primary"], requested_gpus=0, requested_cpus=4, working_dir=work)
+    _activate_ready(cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    set_cpu_lane_capacity(runtime.root, capacity=4)
+    reserve_cpu(runtime.root, "occupied", 2, project_id="external")
+
+    probe = machine_agent._probe_primary_demand(
+        runtime,
+        {binding.project_id: cfg},
+        {binding.project_id: cfg},
+        list(range(4)),
+        list(range(2)),
+        SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+        lane="cpu",
+    )
+
+    assert probe.state == "waiting_for_aggregation"
 
 
 def test_primary_probe_rechecks_completed_shared_scope_before_borrow(

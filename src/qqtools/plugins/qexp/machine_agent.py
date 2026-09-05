@@ -265,7 +265,10 @@ def _probe_primary_demand(
                         has_primary_group_worker=has_primary_group_worker,
                         working_directory_reason=_working_directory_reason(task.spec),
                         requested_gpus=(task.spec.requested_cpus or 0) if lane == "cpu" else task.spec.requested_gpus,
-                        visible_gpu_count=len(visible) if lane == "gpu" else len(free),
+                        # CPU primary admission needs the policy capacity here, rather than
+                        # the currently free slots.  A request that fits the machine but not
+                        # its current free capacity must retain priority over borrowing.
+                        visible_gpu_count=len(visible),
                         free_gpu_count=len(free),
                         group_gpu_limit=group_gpu_limit,
                         group_gpu_usage=group_gpu_usage,
