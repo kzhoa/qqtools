@@ -188,10 +188,11 @@ def test_replay_does_not_recreate_archived_operation_after_later_transition(
     monkeypatch.setattr(availability_runtime, "write_active_operation", fail_if_recreated)
     monkeypatch.setattr(Path, "exists", archive_between_lookup_and_read)
 
-    with pytest.raises(RuntimeError, match="does not match Task truth"):
-        availability_runtime.apply_availability_transition(cfg, request)
+    replay = availability_runtime.apply_availability_transition(cfg, request)
 
     assert active_exists_calls == 2
+    assert replay.idempotent is True
+    assert replay.resulting_state == "shared"
     stored = load_task(cfg, task.task_id)
     assert stored.placement_policy["sharing_mode"] == "private"
     assert stored.placement_runtime["queue_scope"] == "home"
