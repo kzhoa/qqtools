@@ -7,7 +7,7 @@ from typing import Any
 
 from .config_types import RootConfig
 from .layout import CPU_LANE_CAPABILITY, is_cpu_lane_root
-from .machine_runtime import MachineRuntime
+from .machine_runtime import MachineRuntime, ProjectBinding
 from .runtime.locks import schema_lock
 from .runtime.paths import local_paths, shared_paths
 from .runtime.records import TaskRecord, utc_now
@@ -53,8 +53,14 @@ def _runtime_binding(
     return runtime, binding
 
 
-def _validate_attestations(cfg: RootConfig, journal: dict[str, Any]) -> None:
-    """Ensure recorded attestations still identify their original local binding."""
+def _validate_attestations(
+    cfg: RootConfig,
+    journal: dict[str, Any],
+    *,
+    runtime: MachineRuntime,
+    binding: ProjectBinding,
+) -> None:
+    """Ensure attestations retain their binding and the resumer's runtime identity."""
     identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
     identity = read_json(identity_path).get("project", {})
     project_id = identity.get("project_id")
@@ -75,6 +81,13 @@ def _validate_attestations(cfg: RootConfig, journal: dict[str, Any]) -> None:
         ):
             raise ValueError(
                 f"CPU lane upgrade attestation does not match machine binding: {machine_name}."
+            )
+        if (
+            machine_name == binding.machine_name
+            and attestation.get("runtime_root") != str(runtime.root)
+        ):
+            raise ValueError(
+                "CPU lane upgrade attestation does not match the local machine runtime."
             )
 
 
@@ -172,7 +185,7 @@ def attest_cpu_lane_upgrade(
             raise ValueError("activation ID does not match the pending CPU lane upgrade.")
         if machine_name not in journal["participants"]:
             raise ValueError("machine is not a participant in the pending CPU lane upgrade.")
-        _runtime, binding = _runtime_binding(cfg, machine_runtime_root)
+        runtime, binding = _runtime_binding(cfg, machine_runtime_root)
         if binding.machine_name != machine_name:
             raise ValueError(
                 "CPU lane upgrade attestation machine does not match the local machine binding."
@@ -187,6 +200,7 @@ def attest_cpu_lane_upgrade(
             "binding_machine_name": binding.machine_name,
             "project_id": binding.project_id,
             "shared_root": str(binding.shared_root),
+            "runtime_root": str(runtime.root),
         }
         journal["attestations"] = attestations
         atomic_replace(_journal_path(cfg), {"cpu_lane_upgrade": journal})
@@ -221,7 +235,8 @@ def resume_cpu_lane_upgrade(
         missing = sorted(set(journal["participants"]) - set(journal["attestations"]))
         if missing:
             raise RuntimeError("CPU lane upgrade is missing machine attestations: " + ", ".join(missing))
-        _validate_attestations(cfg, journal)
+        runtime, binding = _runtime_binding(cfg, machine_runtime_root)
+        _validate_attestations(cfg, journal, runtime=runtime, binding=binding)
         blockers = _blockers(cfg, machine_runtime_root=machine_runtime_root)
         if blockers:
             raise RuntimeError("CPU lane upgrade requires a drained root: " + ", ".join(blockers))
