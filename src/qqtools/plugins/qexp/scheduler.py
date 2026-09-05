@@ -210,7 +210,7 @@ def _group_allows(group: dict[str, Any], task: TaskRecord, machine: str) -> bool
     if group["group"]["dispatch_state"] != "active":
         return False
     worker = group["group"]["worker_set"].get(machine)
-    if not worker or worker["state"] not in {"active", "borrow"}:
+    if not worker or worker["state"] != "active":
         return False
     if task.placement_runtime["queue_scope"] == "home":
         return task.placement_policy["home_machine"] == machine

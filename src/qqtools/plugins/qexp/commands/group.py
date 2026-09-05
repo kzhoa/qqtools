@@ -475,8 +475,6 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                 raise ValueError("role must be 'primary' or 'borrow'.")
             selected_limit = gpu_limit_gpus if has_gpu_limit else worker["gpu_limit_gpus"]
             selected_state = worker["state"]
-            if selected_state in {"active", "borrow"}:
-                selected_state = "active"
             changed = (
                 worker["scheduling_role"] != selected_role
                 or worker["gpu_limit_gpus"] != selected_limit
