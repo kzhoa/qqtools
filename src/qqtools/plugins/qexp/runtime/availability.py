@@ -73,6 +73,18 @@ def _operation_path(cfg: RootConfig, operation_id: str) -> Path:
     return locate_operation_path(cfg, "availability", operation_id)
 
 
+def _read_operation(cfg: RootConfig, operation_id: str) -> dict[str, Any]:
+    """Read an operation across an active-to-archive transition."""
+    path = _operation_path(cfg, operation_id)
+    try:
+        return read_json(path)
+    except FileNotFoundError:
+        # archive_operation() publishes the archive before removing active.  A
+        # path selected just before that removal can therefore disappear while
+        # its terminal record remains available at the stable archive path.
+        return read_json(_operation_path(cfg, operation_id))
+
+
 def _operation_meta(cfg: RootConfig) -> dict[str, Any]:
     now = utc_now()
     return {"schema_version": SCHEMA_VERSION, "revision": 1, "created_at": now,
@@ -85,7 +97,7 @@ def _create_operation(
     operation_id = request.operation_id or new_id()
     path = _operation_path(cfg, operation_id)
     if path.exists():
-        return operation_id, read_json(path)
+        return operation_id, _read_operation(cfg, operation_id)
     now = utc_now()
     operation = {"meta": _operation_meta(cfg), "availability_operation": {
         "operation_id": operation_id, "operation_type": request.action,
@@ -488,7 +500,7 @@ def apply_availability_transition(
             stack.enter_context(task_lock(cfg.shared_root, request.task_id))
             task = load_task(cfg, request.task_id)
             group = _group_data(cfg, task)
-            operation = read_json(_operation_path(cfg, operation_id))
+            operation = _read_operation(cfg, operation_id)
             completed = _completed_operation_result(
                 cfg, request, operation_id, operation, task, group
             )
@@ -581,7 +593,7 @@ def apply_availability_transition(
                         raise
                     task = load_task(cfg, request.task_id)
                     group = _group_data(cfg, task)
-                    operation = read_json(_operation_path(cfg, operation_id))
+                    operation = _read_operation(cfg, operation_id)
                     completed = _completed_operation_result(
                         cfg, request, operation_id, operation, task, group
                     )
@@ -634,26 +646,31 @@ def reconcile_availability_operations(
     for path in iter_active_operation_paths(
         cfg, "availability", include_legacy=include_legacy
     ):
-        operation = read_json(path)
-        control = operation.get("availability_operation", {})
-        if control.get("state") not in {"prepared", "blocked"}:
-            continue
-        if control.get("state") == "blocked" and control.get("blocked_reason"):
-            archive_operation(cfg, "availability", control["operation_id"], operation)
-            continue
-        request = AvailabilityTransitionRequest(
-            action=control["operation_type"], task_id=control["task_id"],
-            helper_machines=control.get("helper_machines"),
-            after_seconds=control.get("after_seconds"), reason=control.get("reason") or "manual",
-            operation_id=control["operation_id"],
-        )
+        control: dict[str, Any] = {}
         try:
+            operation = read_json(path)
+            control = operation.get("availability_operation", {})
+            if control.get("state") not in {"prepared", "blocked"}:
+                continue
+            if control.get("state") == "blocked" and control.get("blocked_reason"):
+                archive_operation(cfg, "availability", control["operation_id"], operation)
+                continue
+            request = AvailabilityTransitionRequest(
+                action=control["operation_type"], task_id=control["task_id"],
+                helper_machines=control.get("helper_machines"),
+                after_seconds=control.get("after_seconds"), reason=control.get("reason") or "manual",
+                operation_id=control["operation_id"],
+            )
             result = apply_availability_transition(cfg, request)
             reconciled.append(result.to_dict())
         except Exception as exc:
             write_diagnostic_event(
-                cfg, "availability_operation_reconcile_failed", task_id=control.get("task_id"),
-                details={"operation_id": control.get("operation_id"), "reason": str(exc)},
+                cfg, "availability_operation_reconcile_failed",
+                task_id=control.get("task_id"),
+                details={
+                    "operation_id": control.get("operation_id") or path.stem,
+                    "reason": str(exc),
+                },
             )
     return reconciled
 

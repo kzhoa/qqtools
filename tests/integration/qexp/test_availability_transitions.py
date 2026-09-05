@@ -118,6 +118,81 @@ def test_concurrent_availability_replay_reuses_completed_operation_without_reser
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
 
 
+def test_availability_replay_reads_archived_operation_after_active_path_disappears(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    request = availability_runtime.AvailabilityTransitionRequest(
+        action="share_now", task_id=task.task_id, operation_id="archive-race"
+    )
+    availability_runtime.apply_availability_transition(cfg, request)
+    active_path = active_operation_path(cfg, "availability", request.operation_id)
+    archived_path = shared_paths(cfg.shared_root)["availability"] / f"{request.operation_id}.json"
+    write_active_operation(cfg, "availability", request.operation_id, read_json(archived_path))
+    original_read = availability_runtime.read_json
+    has_archived = False
+
+    def archive_before_read(path):
+        nonlocal has_archived
+        if path == active_path and not has_archived:
+            has_archived = True
+            availability_runtime.archive_operation(
+                cfg, "availability", request.operation_id, original_read(archived_path)
+            )
+        return original_read(path)
+
+    monkeypatch.setattr(availability_runtime, "read_json", archive_before_read)
+
+    result = availability_runtime.apply_availability_transition(cfg, request)
+
+    assert has_archived is True
+    assert result.idempotent is True
+    assert result.operation_id == request.operation_id
+
+
+def test_reconcile_continues_when_enumerated_operation_is_archived_before_read(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    completed_task = submit(cfg, ["echo", "completed"], group="exp")
+    completed_request = availability_runtime.AvailabilityTransitionRequest(
+        action="share_now", task_id=completed_task.task_id, operation_id="a-archive-race"
+    )
+    availability_runtime.apply_availability_transition(cfg, completed_request)
+    completed_active = active_operation_path(cfg, "availability", completed_request.operation_id)
+    completed_archive = (
+        shared_paths(cfg.shared_root)["availability"] / f"{completed_request.operation_id}.json"
+    )
+    write_active_operation(
+        cfg, "availability", completed_request.operation_id, read_json(completed_archive)
+    )
+    pending_task = submit(cfg, ["echo", "pending"], group="exp")
+    pending_request = availability_runtime.AvailabilityTransitionRequest(
+        action="share_now", task_id=pending_task.task_id, operation_id="z-pending"
+    )
+    availability_runtime._create_operation(cfg, pending_request)
+    original_read = availability_runtime.read_json
+    has_archived = False
+
+    def archive_before_read(path):
+        nonlocal has_archived
+        if path == completed_active and not has_archived:
+            has_archived = True
+            availability_runtime.archive_operation(
+                cfg, "availability", completed_request.operation_id, original_read(completed_archive)
+            )
+        return original_read(path)
+
+    monkeypatch.setattr(availability_runtime, "read_json", archive_before_read)
+
+    reconciled = availability_runtime.reconcile_availability_operations(cfg)
+
+    assert has_archived is True
+    assert [item["operation_id"] for item in reconciled] == [pending_request.operation_id]
+    assert load_task(cfg, pending_task.task_id).placement_runtime["queue_scope"] == "shared"
+
+
 def test_keep_local_is_idempotent_for_private_standalone_task(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
