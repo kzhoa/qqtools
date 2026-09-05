@@ -25,7 +25,7 @@ def test_global_even_sort_returns_deterministic_full_permutation(strategy):
     [
         ("v1", [0, 6, 7, 2, 4, 5, 1, 3]),
         ("v2", [0, 6, 2, 4, 1, 3, 7, 5]),
-        ("v3", [1, 4, 3, 2, 6, 0, 7, 5]),
+        ("v3", [0, 5, 6, 7, 2, 3, 4, 1]),
     ],
 )
 def test_global_even_sort_strategy_characterization(strategy, expected):
@@ -42,6 +42,21 @@ def test_global_even_sort_supports_empty_input(strategy):
 
     assert order.dtype == np.int64
     assert order.shape == (0,)
+
+
+@pytest.mark.parametrize("total", [1, 2, 31, 32, 33, 1025])
+def test_v3_covers_small_and_unequal_bins(total):
+    order = compute_global_even_sort_order(np.arange(total), seed=7, strategy="v3")
+    assert np.array_equal(np.sort(order), np.arange(total))
+
+
+def test_v3_pairs_opposite_cost_quantiles():
+    costs = np.arange(1024, dtype=np.float64)
+    order = compute_global_even_sort_order(costs, seed=7, strategy="v3")
+    pairs = costs[order].reshape(-1, 2)
+    assert np.all(pairs[:, 0] < 512)
+    assert np.all(pairs[:, 1] >= 512)
+    assert np.all(np.abs(pairs.sum(axis=1) - 1023) <= 31)
 
 
 @pytest.mark.parametrize(

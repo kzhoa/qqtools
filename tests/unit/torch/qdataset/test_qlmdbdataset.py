@@ -288,7 +288,7 @@ def test_balance_assets_are_deterministic_and_used_by_loader(tmp_path: Path):
     assert (dataset.processed_dir / "balance_meta.npz").exists()
     assert (dataset.processed_dir / "balance_order.npy").exists()
 
-    loader = dataset.to_dataloader(batch_size=2, shuffle=False)
+    loader = dataset.to_dataloader(batch_size=2, shuffle=True)
     assert isinstance(loader.batch_sampler, BalancedBatchSampler)
     observed_ids = sorted(int(value) for batch in loader for value in batch["id"])
     assert set(observed_ids) == set(range(costs.shape[0]))
@@ -348,7 +348,7 @@ def test_balanced_subset_uses_local_cost_and_order_coordinates(tmp_path: Path):
 
     assert np.array_equal(subset.sample_costs, costs[subset_indices])
     assert np.array_equal(subset.sample_order, expected_local_order)
-    loader = subset.to_dataloader(batch_size=2, shuffle=False)
+    loader = subset.to_dataloader(batch_size=2, shuffle=True)
     observed_ids = {int(value) for batch in loader for value in batch["id"]}
     assert observed_ids == {1, 3, 4}
 
@@ -472,7 +472,9 @@ def test_sequential_staged_reuses_cursor_blob_through_single_cost_hook(tmp_path:
     assert dataset.storage_open_calls == 0
     assert dataset._transactions is None
     assert dataset._prefetched_raw_blob is None
-    assert np.array_equal(dataset.sample_costs, np.asarray([4.0, 1.0, 7.0]))
+    source_costs = np.asarray([4.0, 1.0, 7.0])
+    expected_order = compute_global_even_sort_order(source_costs, strategy="v3")
+    assert np.array_equal(dataset.sample_costs, source_costs[expected_order])
 
 
 def test_prefetched_blob_scope_does_not_leak_through_copy_or_pickle(tmp_path: Path):

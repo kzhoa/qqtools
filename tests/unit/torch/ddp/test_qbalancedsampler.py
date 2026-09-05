@@ -32,7 +32,7 @@ def _rank_plans(sample_costs, **kwargs):
     ]
 
 
-@pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])
+@pytest.mark.parametrize("strategy", ["v1", "v2", "v3", "lpt"])
 def test_sampler_covers_each_sample_once_across_ranks_without_padding(
     monkeypatch,
     strategy,
@@ -61,7 +61,7 @@ def test_sampler_covers_each_sample_once_across_ranks_without_padding(
         assert len(global_window) == len(set(global_window)) == 4
 
 
-@pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])
+@pytest.mark.parametrize("strategy", ["v1", "v2", "v3", "lpt"])
 def test_shuffle_epoch_is_deterministic_and_changes_plan(monkeypatch, strategy):
     _mock_dist(monkeypatch)
     costs = np.linspace(1.0, 256.0, num=256)
@@ -85,6 +85,7 @@ def test_shuffle_epoch_is_deterministic_and_changes_plan(monkeypatch, strategy):
 
 
 def test_non_shuffled_sampler_ignores_epoch_and_respects_sample_order(monkeypatch):
+    # QQTOOLS-COMPAT-0006: legacy sample_order support until v1.4.0.
     _mock_dist(monkeypatch)
     sampler = BalancedDistributedSampler(
         [5.0, 4.0, 3.0, 2.0],
@@ -93,6 +94,7 @@ def test_non_shuffled_sampler_ignores_epoch_and_respects_sample_order(monkeypatc
         world_size=2,
         shuffle=False,
         sample_order=[3, 2, 1, 0],
+        strategy="v3",
     )
 
     before = list(sampler)
@@ -103,6 +105,7 @@ def test_non_shuffled_sampler_ignores_epoch_and_respects_sample_order(monkeypatc
 
 
 def test_sampler_prefix_padding_equalizes_rank_lengths(monkeypatch):
+    # QQTOOLS-COMPAT-0006: legacy validation padding until v1.4.0.
     _mock_dist(monkeypatch)
     costs = [5.0, 4.0, 3.0, 2.0, 1.0]
 
@@ -112,6 +115,7 @@ def test_sampler_prefix_padding_equalizes_rank_lengths(monkeypatch):
         world_size=2,
         shuffle=False,
         drop_last=False,
+        strategy="v3",
     )
 
     assert [len(plan) for plan in plans] == [4, 4]
@@ -135,6 +139,7 @@ def test_sampler_prefix_padding_handles_dataset_smaller_than_global_batch(monkey
 
 
 def test_sampler_drop_last_removes_incomplete_global_window(monkeypatch):
+    # QQTOOLS-COMPAT-0006: legacy prefix truncation until v1.4.0.
     _mock_dist(monkeypatch)
     costs = [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0]
 
@@ -144,13 +149,15 @@ def test_sampler_drop_last_removes_incomplete_global_window(monkeypatch):
         world_size=2,
         shuffle=False,
         drop_last=True,
+        strategy="v3",
     )
 
     assert plans == [[0, 3], [1, 2]]
     assert [len(plan) for plan in plans] == [2, 2]
 
 
-def test_batch_sampler_is_batched_view_of_distributed_sampler(monkeypatch):
+@pytest.mark.parametrize("strategy", ["v1", "v2", "v3", "lpt"])
+def test_batch_sampler_is_batched_view_of_distributed_sampler(monkeypatch, strategy):
     _mock_dist(monkeypatch)
     kwargs = {
         "sample_costs": [9.0, 1.0, 8.0, 2.0, 7.0],
@@ -159,7 +166,7 @@ def test_batch_sampler_is_batched_view_of_distributed_sampler(monkeypatch):
         "world_size": 2,
         "shuffle": True,
         "seed": 3,
-        "strategy": "v1",
+        "strategy": strategy,
         "drop_last": False,
     }
     distributed = BalancedDistributedSampler(**kwargs)
@@ -177,6 +184,7 @@ def test_batch_sampler_is_batched_view_of_distributed_sampler(monkeypatch):
 
 
 def test_batch_sampler_drop_last_preserves_equal_full_batches_per_rank(monkeypatch):
+    # QQTOOLS-COMPAT-0006: legacy prefix truncation until v1.4.0.
     _mock_dist(monkeypatch)
     costs = [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0]
     samplers = [
@@ -187,6 +195,7 @@ def test_batch_sampler_drop_last_preserves_equal_full_batches_per_rank(monkeypat
             world_size=2,
             shuffle=False,
             drop_last=True,
+            strategy="v3",
         )
         for rank in range(2)
     ]
