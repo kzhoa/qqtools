@@ -13,6 +13,7 @@ from .runtime.availability import (
     reconcile_availability_operations,
     remove_deadline_index,
     sync_deadline_index,
+    iter_flat_deadline_paths,
     iter_due_deadline_paths,
     migrate_legacy_deadline_indexes,
 )
@@ -138,6 +139,15 @@ def offer_due_tasks(cfg: RootConfig) -> None:
     """Move elapsed home-only work into its configured shared queue."""
     with diagnostic_span("offer_due_tasks"):
         migrate_legacy_deadline_indexes(cfg)
+        for path in iter_flat_deadline_paths(cfg):
+            task_id = path.stem
+            try:
+                task = load_task(cfg, task_id)
+            except FileNotFoundError:
+                remove_deadline_index(cfg, task_id)
+                continue
+            remove_deadline_index(cfg, task_id)
+            sync_deadline_index(cfg, task)
         for path in iter_due_deadline_paths(cfg):
             task_id = path.stem
             try:

@@ -476,6 +476,27 @@ def iter_due_deadline_paths(cfg: RootConfig, *, limit: int = 64):
                 yield Path(entry.path)
 
 
+def iter_flat_deadline_paths(cfg: RootConfig, *, limit: int = 64):
+    """Yield bounded legacy flat deadline records that still need reconciliation."""
+    if limit <= 0:
+        raise ValueError("deadline limit must be positive.")
+    root = shared_paths(cfg.shared_root)["offer_deadlines"]
+    if not root.exists():
+        return
+    paths = heapq.nsmallest(
+        limit,
+        (
+            Path(entry.path)
+            for entry in os.scandir(root)
+            if entry.is_file(follow_symlinks=False)
+            and entry.name.endswith(".json")
+            and entry.name != "layout-v1.json"
+        ),
+        key=lambda path: path.name,
+    )
+    yield from paths
+
+
 def migrate_legacy_deadline_indexes(cfg: RootConfig) -> None:
     """Move legacy flat deadline records into home/time buckets once."""
     marker = shared_paths(cfg.shared_root)["offer_deadlines_migration"]
