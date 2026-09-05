@@ -151,6 +151,52 @@ def test_availability_replay_reads_archived_operation_after_active_path_disappea
     assert result.operation_id == request.operation_id
 
 
+def test_replay_does_not_recreate_archived_operation_after_later_transition(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    request = availability_runtime.AvailabilityTransitionRequest(
+        action="share_now", task_id=task.task_id, operation_id="archived-share"
+    )
+    availability_runtime.apply_availability_transition(cfg, request)
+    task_commands.keep_local(cfg, task.task_id)
+    active_path = active_operation_path(cfg, "availability", request.operation_id)
+    archived_path = shared_paths(cfg.shared_root)["availability"] / f"{request.operation_id}.json"
+    archived_operation = read_json(archived_path)
+    write_active_operation(cfg, "availability", request.operation_id, archived_operation)
+    original_write = availability_runtime.write_active_operation
+    original_exists = Path.exists
+    active_exists_calls = 0
+
+    def fail_if_recreated(*args, **kwargs):
+        if args[2] == request.operation_id:
+            pytest.fail("a completed availability operation must not be recreated")
+        return original_write(*args, **kwargs)
+
+    def archive_between_lookup_and_read(path):
+        nonlocal active_exists_calls
+        if path == active_path:
+            active_exists_calls += 1
+            if active_exists_calls == 2:
+                availability_runtime.archive_operation(
+                    cfg, "availability", request.operation_id, archived_operation
+                )
+                return False
+        return original_exists(path)
+
+    monkeypatch.setattr(availability_runtime, "write_active_operation", fail_if_recreated)
+    monkeypatch.setattr(Path, "exists", archive_between_lookup_and_read)
+
+    with pytest.raises(RuntimeError, match="does not match Task truth"):
+        availability_runtime.apply_availability_transition(cfg, request)
+
+    assert active_exists_calls == 2
+    stored = load_task(cfg, task.task_id)
+    assert stored.placement_policy["sharing_mode"] == "private"
+    assert stored.placement_runtime["queue_scope"] == "home"
+
+
 def test_reconcile_continues_when_enumerated_operation_is_archived_before_read(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
