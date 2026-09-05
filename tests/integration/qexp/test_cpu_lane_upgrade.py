@@ -131,6 +131,23 @@ def test_upgrade_checks_machine_runtime_reservations_not_legacy_runtime(tmp_path
     )["blockers"]
 
 
+def test_upgrade_ignores_archived_operations_but_blocks_pending_claim_archives(tmp_path: Path) -> None:
+    cfg = _legacy_root(tmp_path)
+    operation_path = cfg.shared_root / "operations" / "availability" / "completed.json"
+    atomic_replace(operation_path, {"availability_operation": {"state": "completed"}})
+    pending_path = cfg.shared_root / "claims" / "pending" / "task-1" / "1.json"
+    atomic_replace(pending_path, {"claim_archive": {"task_id": "task-1", "fencing_token": 1}})
+
+    from qqtools.plugins.qexp.cpu_lane_upgrade import check_cpu_lane_upgrade
+
+    assert check_cpu_lane_upgrade(cfg, machine_runtime_root=cfg.runtime_root)["blockers"] == [
+        "operation:claim_pending"
+    ]
+    pending_path.unlink()
+
+    assert check_cpu_lane_upgrade(cfg, machine_runtime_root=cfg.runtime_root)["blockers"] == []
+
+
 def test_upgrade_default_runtime_uses_machine_runtime_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
