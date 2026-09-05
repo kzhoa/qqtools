@@ -51,6 +51,13 @@ from .cpu_lane_upgrade import (
     resume_cpu_lane_upgrade,
     start_cpu_lane_upgrade,
 )
+from .schema6_upgrade import (
+    attest_schema6_upgrade,
+    check_schema6_upgrade,
+    resume_schema6_upgrade,
+    schema6_upgrade_status,
+    start_schema6_upgrade,
+)
 from .notification_config import (
     DEFAULT_WEBHOOK_ENV,
     load_notifications,
@@ -103,7 +110,13 @@ def _requires_verified_binding(args: argparse.Namespace) -> bool:
     if args.command == "lease-policy":
         return args.lease_policy_action == "set"
     if args.command == "task":
-        return args.task_action not in {"list", "show", "logs"}
+        return not (
+            args.task_action in {"list", "show", "logs"}
+            or (
+                args.task_action == "dependencies"
+                and args.dependencies_action == "show"
+            )
+        )
     if args.command == "group":
         return args.group_action not in {"list", "show"}
     if args.command == "agent":
@@ -218,6 +231,23 @@ def build_parser() -> argparse.ArgumentParser:
     resume = cpu_lane_upgrade_sub.add_parser("resume")
     _add_output_format(resume)
     resume.add_argument("--activation-id", required=True)
+    schema6_upgrade = upgrade_sub.add_parser("schema6")
+    schema6_upgrade_sub = schema6_upgrade.add_subparsers(dest="schema6_upgrade_action", required=True)
+    for name in ("check", "start", "status"):
+        action = schema6_upgrade_sub.add_parser(name)
+        _add_output_format(action)
+        if name != "status":
+            action.add_argument(
+                "--capability", action="append", dest="capabilities",
+                choices=("cpu-lane-v1", "task-dependencies-v1"),
+            )
+    schema6_attest = schema6_upgrade_sub.add_parser("attest")
+    _add_output_format(schema6_attest)
+    schema6_attest.add_argument("--activation-id", required=True)
+    schema6_attest.add_argument("--confirm-clients-stopped", action="store_true")
+    schema6_resume = schema6_upgrade_sub.add_parser("resume")
+    _add_output_format(schema6_resume)
+    schema6_resume.add_argument("--activation-id", required=True)
     lease_policy = commands.add_parser("lease-policy")
     lease_policy_sub = lease_policy.add_subparsers(dest="lease_policy_action", required=True)
     lease_show = lease_policy_sub.add_parser("show")
@@ -278,6 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
         action.add_argument("--sharing", choices=["private", "spillover"], default="private")
         action.add_argument("--offer-after-seconds", type=int)
         action.add_argument("--idempotency-key")
+        action.add_argument("--depends-on", action="append", default=[])
         action.add_argument("--no-activate", action="store_true", help="Submit without activating the local agent.")
         action.add_argument("argv", nargs=argparse.REMAINDER)
     bulk = commands.add_parser("batch-submit")
@@ -323,6 +354,14 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("task_id")
     logs = task_sub.add_parser("logs")
     logs.add_argument("task_id")
+    dependencies = task_sub.add_parser("dependencies")
+    dependencies_sub = dependencies.add_subparsers(dest="dependencies_action", required=True)
+    for name in ("show", "replace", "add", "remove"):
+        action = dependencies_sub.add_parser(name)
+        _add_output_format(action)
+        action.add_argument("task_id")
+        if name != "show":
+            action.add_argument("--depends-on", action="append", default=[])
     group = commands.add_parser("group")
     group_sub = group.add_subparsers(dest="group_action", required=True)
     create = group_sub.add_parser("create")
@@ -504,11 +543,37 @@ def main(argv: list[str] | None = None) -> int:
             print(root)
             return 0
         if args.command == "upgrade":
-            if args.upgrade_feature != "cpu-lane" or not args.shared_root:
-                raise ValueError("CPU lane upgrade requires an explicit --shared-root.")
+            if not args.shared_root:
+                raise ValueError("schema-6 upgrade requires an explicit --shared-root.")
             machine = args.machine or "upgrade-coordinator"
             runtime = Path(args.runtime_root) if args.runtime_root else None
             cfg = load_root_config(args.shared_root, machine, runtime, require_initialized=False)
+            if args.upgrade_feature == "schema6":
+                if args.schema6_upgrade_action == "check":
+                    _emit("schema6-upgrade", check_schema6_upgrade(
+                        cfg, capabilities=args.capabilities, machine_runtime_root=args.machine_runtime_root,
+                    ), args.format)
+                    return 0
+                if args.schema6_upgrade_action == "status":
+                    _emit("schema6-upgrade", schema6_upgrade_status(cfg), args.format)
+                    return 0
+                if args.schema6_upgrade_action == "start":
+                    _emit("schema6-upgrade", start_schema6_upgrade(
+                        cfg, capabilities=args.capabilities, machine_runtime_root=args.machine_runtime_root,
+                    ), args.format)
+                    return 0
+                if args.schema6_upgrade_action == "resume":
+                    _emit("schema6-upgrade", resume_schema6_upgrade(
+                        cfg, activation_id=args.activation_id, machine_runtime_root=args.machine_runtime_root,
+                    ), args.format)
+                    return 0
+                if not args.confirm_clients_stopped or not args.machine:
+                    raise ValueError("attest requires --machine and --confirm-clients-stopped.")
+                _emit("schema6-upgrade", attest_schema6_upgrade(
+                    cfg, activation_id=args.activation_id, machine_name=args.machine,
+                    machine_runtime_root=args.machine_runtime_root,
+                ), args.format)
+                return 0
             if args.cpu_lane_upgrade_action == "check":
                 _emit(
                     "cpu-lane-upgrade",
@@ -743,6 +808,7 @@ def main(argv: list[str] | None = None) -> int:
                 home_machine=args.home_machine,
                 sharing_mode=args.sharing,
                 offer_after_seconds=args.offer_after_seconds,
+                depends_on_task_ids=args.depends_on,
                 idempotency_key=args.idempotency_key,
             )
             print(task_value.task_id)
@@ -768,6 +834,24 @@ def main(argv: list[str] | None = None) -> int:
             _emit("batch-submit", values.to_dict(), args.format)
             return 0
         if args.command == "task":
+            if args.task_action == "dependencies":
+                if args.dependencies_action == "show":
+                    task_value = task_commands.load_task(cfg, args.task_id)
+                    _emit(
+                        "dependencies",
+                        {"task_id": task_value.task_id, "depends_on_task_ids": task_value.depends_on_task_ids},
+                        args.format,
+                    )
+                else:
+                    task_value = task_commands.edit_dependencies(
+                        cfg, args.task_id, args.depends_on, action=args.dependencies_action
+                    )
+                    _emit(
+                        "dependencies",
+                        {"task_id": task_value.task_id, "depends_on_task_ids": task_value.depends_on_task_ids},
+                        args.format,
+                    )
+                return 0
             if args.task_action == "cancel":
                 context = get_execution_context()
                 task_value = task_commands.cancel(

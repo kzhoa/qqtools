@@ -111,6 +111,8 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
                 "Queue scope",
                 "Attempt",
                 "Claimed machine",
+                "Dependencies",
+                "Dependency gate",
                 "Reason",
             ),
             [
@@ -124,6 +126,8 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
                     item.get("queue_scope"),
                     item.get("current_attempt_id"),
                     item.get("claim_machine"),
+                    item.get("depends_on_task_ids"),
+                    item.get("dependency_state"),
                     item.get("reason"),
                 )
                 for item in result
@@ -150,6 +154,7 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
                 ("Command", spec.get("argv")),
                 ("GPUs", spec.get("requested_gpus")),
                 ("Group", task.get("group_name")),
+                ("Dependencies", task.get("depends_on_task_ids")),
             ),
             (
                 ("State", state.get("projection")),
@@ -160,6 +165,7 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
                 ("Control", control.get("cancellation_operation_id")),
                 ("Attempts", len(attempts)),
                 ("Reason", state.get("reason")),
+                ("Dependency gate", result.get("dependency_gate")),
             ),
         )
     if kind == "task-operation":

@@ -27,6 +27,7 @@ _TASK_KEYS = {
     "sharing_mode",
     "fallback_machines",
     "offer_after_seconds",
+    "depends_on_task_ids",
 }
 _PLACEMENT_KEYS = {"home_machine", "sharing"}
 _SHARING_KEYS = {"mode", "fallback_machines", "offer"}
@@ -312,6 +313,7 @@ def parse_batch_manifest(
                 entry.get("working_directory", defaults.get("working_directory", str(Path.cwd()))),
                 f"{task_path}.working_directory",
             ),
+            "depends_on_task_ids": entry.get("depends_on_task_ids", []),
             **placement,
         }
         if item["task_id"] is not None:

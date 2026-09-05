@@ -50,6 +50,8 @@ def read_schema_version(cfg: RootConfig) -> int | None:
 
 
 CPU_LANE_CAPABILITY = "cpu-lane-v1"
+TASK_DEPENDENCIES_CAPABILITY = "task-dependencies-v1"
+SUPPORTED_REQUIRED_CAPABILITIES = frozenset({CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY})
 # QQTOOLS-COMPAT-0005: legacy GPU-only roots remain readable and writable through 1.3.17.
 
 
@@ -63,9 +65,25 @@ def is_cpu_lane_root(cfg: RootConfig) -> bool:
         return False
     if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
         raise RuntimeError("qexp schema/version.json has malformed required capabilities.")
+    unknown = sorted(set(capabilities) - SUPPORTED_REQUIRED_CAPABILITIES)
+    if unknown:
+        raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
     if CPU_LANE_CAPABILITY not in capabilities:
         raise RuntimeError("qexp schema/version.json has unsupported required capabilities.")
     return True
+
+
+def is_task_dependencies_root(cfg: RootConfig) -> bool:
+    """Return whether Task truth must use the canonical dependency protocol."""
+    capabilities = read_json(_schema_path(cfg)).get("schema", {}).get("required_capabilities")
+    if capabilities is None:
+        return False
+    if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
+        raise RuntimeError("qexp schema/version.json has malformed required capabilities.")
+    unknown = sorted(set(capabilities) - SUPPORTED_REQUIRED_CAPABILITIES)
+    if unknown:
+        raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
+    return TASK_DEPENDENCIES_CAPABILITY in capabilities
 
 
 def validate_root_contract(cfg: RootConfig) -> None:
@@ -81,6 +99,11 @@ def validate_root_contract(cfg: RootConfig) -> None:
         upgrade = read_json(upgrade_journal).get("cpu_lane_upgrade", {})
         if upgrade.get("phase") != "completed":
             raise RuntimeError("CPU lane upgrade is preparing; run 'qexp upgrade cpu-lane status'.")
+    shared_upgrade_journal = shared_paths(cfg.shared_root)["schema"] / "schema6-upgrade.json"
+    if shared_upgrade_journal.exists():
+        upgrade = read_json(shared_upgrade_journal).get("schema6_upgrade", {})
+        if upgrade.get("phase") != "completed":
+            raise RuntimeError("schema-6 upgrade is preparing; run 'qexp upgrade schema6 status'.")
     forbidden = {"global", "batches", "resubmit", "resubmit_operations"}
     present = forbidden.intersection(path.name for path in cfg.shared_root.iterdir())
     if present:
@@ -148,7 +171,7 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                 "version": SCHEMA_VERSION,
                 "minimum_reader_version": SCHEMA_VERSION,
                 "created_at": utc_now(),
-                "required_capabilities": [CPU_LANE_CAPABILITY],
+                "required_capabilities": [CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY],
             }}
             atomic_replace(_schema_path(cfg), schema)
     ensure_machine_layout(cfg)

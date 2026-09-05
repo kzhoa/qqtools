@@ -1778,6 +1778,13 @@ def classify_ready_marker(
             return ReadyClassificationResult("corrupt", "group_invalid", task)
         if group.get("dispatch_state") != "active":
             return ReadyClassificationResult("temporarily_unavailable", "group_paused", task)
+    from .dependencies import dependency_gate
+
+    gate = dependency_gate(cfg, task)
+    if gate.state == "invalid":
+        return ReadyClassificationResult("corrupt", "dependency_invalid", task)
+    if gate.state != "ready":
+        return ReadyClassificationResult("temporarily_unavailable", f"dependency_{gate.state}", task)
     return ReadyClassificationResult("claimable", "eligible_truth", task)
 
 

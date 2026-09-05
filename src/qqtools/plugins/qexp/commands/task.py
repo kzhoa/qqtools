@@ -6,7 +6,12 @@ from pathlib import Path
 from typing import Callable
 
 from ..config_types import RootConfig
-from ..layout import ensure_machine_layout, ensure_shared_layout, validate_root_contract
+from ..layout import (
+    ensure_machine_layout,
+    ensure_shared_layout,
+    is_task_dependencies_root,
+    validate_root_contract,
+)
 from ..manifest import parse_batch_manifest
 from ..runtime.availability import (
     AvailabilityTransitionRequest,
@@ -25,6 +30,12 @@ from ..runtime.ready import (
     retire_previous_ready_generation,
 )
 from ..runtime.active_operations import operation_exists
+from ..runtime.dependencies import (
+    is_committed_submission_task,
+    normalize_dependency_ids,
+    validate_group_dependencies,
+)
+from ..runtime.locks import group_lock, task_lock
 
 
 def is_cleanup_blocked(task: TaskRecord) -> bool:
@@ -53,6 +64,7 @@ def submit(
     sharing_mode: str = "private",
     fallback_machines: str | list[str] = "group",
     offer_after_seconds: int | None = None,
+    depends_on_task_ids: list[str] | None = None,
     idempotency_key: str | None = None,
 ) -> TaskRecord:
     validate_root_contract(cfg)
@@ -70,6 +82,7 @@ def submit(
             "sharing_mode": sharing_mode,
             "fallback_machines": fallback_machines,
             "offer_after_seconds": offer_after_seconds,
+            "depends_on_task_ids": depends_on_task_ids or [],
         }
     ]
     return submit_specs(cfg, items, group_name=validate_group_name(group), idempotency_key=idempotency_key)[0]
@@ -197,6 +210,56 @@ def retry(cfg: RootConfig, task_id: str, *, acknowledge_duplicate_risk: bool = F
     finally:
         if not is_committed:
             discard_ready_generation(cfg, task_id, reserved_generation)
+
+
+def edit_dependencies(
+    cfg: RootConfig,
+    task_id: str,
+    dependency_ids: list[str],
+    *,
+    action: str = "replace",
+) -> TaskRecord:
+    """Atomically replace, add, or remove dependencies from an unstarted Task."""
+    validate_root_contract(cfg)
+    if not is_task_dependencies_root(cfg):
+        raise ValueError(
+            "Task dependencies require an activated task-dependencies-v1 root."
+        )
+    initial = load_task(cfg, task_id)
+    if initial.group_name is None:
+        raise ValueError("ungrouped tasks cannot declare dependencies.")
+    requested = normalize_dependency_ids(dependency_ids)
+    with group_lock(cfg.shared_root, initial.group_name):
+        with task_lock(cfg.shared_root, task_id):
+            task = load_task(cfg, task_id)
+            reject_cleanup_blocked(cfg, task, "have dependencies edited")
+            if not is_committed_submission_task(cfg, task):
+                raise ValueError(
+                    "a Task whose submission is not committed cannot have dependencies edited."
+                )
+            if task.group_name != initial.group_name:
+                raise RuntimeError("Task Group changed while editing dependencies.")
+            if task.state["projection"] in {"succeeded", "failed", "cancelled"}:
+                raise ValueError("terminal tasks cannot have dependencies edited.")
+            if task.claim_control.get("active_claim") or task.attempt_control["next_attempt_number"] != 1:
+                raise ValueError("a Task that has created an Attempt cannot have dependencies edited.")
+            current = set(task.depends_on_task_ids)
+            if action == "replace":
+                updated = requested
+            elif action == "add":
+                updated = sorted(current | set(requested))
+            elif action == "remove":
+                updated = sorted(current - set(requested))
+            else:
+                raise ValueError(f"unknown dependency edit action {action!r}.")
+            candidate = TaskRecord.from_dict(task.to_dict())
+            candidate.depends_on_task_ids = updated
+            validate_group_dependencies(cfg, task.group_name, [candidate])
+            task.depends_on_task_ids = updated
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task)
+            return task
 
 
 def share(

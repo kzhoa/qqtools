@@ -153,6 +153,9 @@ def start_cpu_lane_upgrade(
 ) -> dict[str, Any]:
     """Create the sole activation session after the shared root is drained."""
     with schema_lock(cfg.shared_root):
+        shared_upgrade = shared_paths(cfg.shared_root)["schema"] / "schema6-upgrade.json"
+        if shared_upgrade.exists() and read_json(shared_upgrade).get("schema6_upgrade", {}).get("phase") != "completed":
+            raise RuntimeError("CPU lane upgrade conflicts with an unfinished schema-6 upgrade.")
         journal_path = _journal_path(cfg)
         if journal_path.exists():
             return read_json(journal_path)["cpu_lane_upgrade"]

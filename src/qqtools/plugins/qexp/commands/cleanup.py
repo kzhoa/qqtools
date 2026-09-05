@@ -91,8 +91,25 @@ def _cleanup_required_machines(cfg: RootConfig, task: TaskRecord) -> list[str]:
     return sorted(machine for machine in machines if machine)
 
 
+def _dependency_references(cfg: RootConfig, task: TaskRecord) -> list[str]:
+    """Return all extant direct dependents that retain this Task's history."""
+    if task.group_name is None:
+        return []
+    references: list[str] = []
+    for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
+        candidate = TaskRecord.from_dict(read_json(path))
+        if candidate.group_name == task.group_name and task.task_id in candidate.depends_on_task_ids:
+            references.append(candidate.task_id)
+    return sorted(references)
+
+
 def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any]:
     from ..events import write_event
+    references = _dependency_references(cfg, task)
+    if references:
+        raise ValueError(
+            f"Task {task.task_id!r} cannot be cleaned while referenced by: {', '.join(references)}"
+        )
     operation_path = locate_operation_path(cfg, "cleanup", task.task_id)
     if operation_path.exists():
         operation = read_json(operation_path)
@@ -213,10 +230,18 @@ def _finalize_cleanup_operation(cfg: RootConfig, operation: dict[str, Any]) -> l
     from ..events import write_event
     cleanup = operation["cleanup"]
     task_id = cleanup["task_id"]
+    path = task_path(cfg.shared_root, task_id)
+    if path.exists():
+        task = load_task(cfg, task_id)
+        references = _dependency_references(cfg, task)
+        if references:
+            raise RuntimeError(
+                f"Task {task_id!r} cleanup retained truth because it is referenced by: "
+                f"{', '.join(references)}"
+            )
     if not reconcile_claim_archives(cfg, task_id):
         return []
     removed: list[str] = []
-    path = task_path(cfg.shared_root, task_id)
     if path.exists():
         assert_ready_writer_compatible(cfg)
         path.unlink()

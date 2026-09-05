@@ -122,6 +122,7 @@ class TaskRecord:
     group_membership_sequence: int | None
     submission_operation_id: str | None
     name: str | None
+    depends_on_task_ids: list[str]
     ready_generation: int
     spec: TaskSpec
     placement_policy: dict[str, Any]
@@ -135,6 +136,17 @@ class TaskRecord:
     def __post_init__(self) -> None:
         validate_identifier(self.task_id, "task_id")
         validate_group_name(self.group_name)
+        if not isinstance(self.depends_on_task_ids, list):
+            raise ValueError("task depends_on_task_ids must be a list.")
+        normalized_dependencies = sorted(
+            validate_identifier(item, "depends_on_task_ids") for item in self.depends_on_task_ids
+        )
+        if normalized_dependencies != self.depends_on_task_ids or len(set(normalized_dependencies)) != len(normalized_dependencies):
+            raise ValueError("task depends_on_task_ids must contain unique sorted task IDs.")
+        if self.group_name is None and self.depends_on_task_ids:
+            raise ValueError("ungrouped tasks cannot declare dependencies.")
+        if self.task_id in self.depends_on_task_ids:
+            raise ValueError("task cannot depend on itself.")
         _check_meta(self.meta)
         if type(self.ready_generation) is not int or self.ready_generation < 0:
             raise ValueError("task ready_generation must be a non-negative integer.")
@@ -171,10 +183,11 @@ class TaskRecord:
 
     @classmethod
     def new(cls, *, task_id: str, machine: str, spec: TaskSpec, group_name: str | None = None,
-            name: str | None = None, sharing_mode: str = "private", fallback_machines: str | list[str] = "group",
-            offer_after_seconds: int | None = None, offer_eligible_at: str | None = None,
-            offer_clock_evidence: dict[str, Any] | None = None,
-            operation_id: str | None = None) -> "TaskRecord":
+            name: str | None = None, sharing_mode: str = "private",
+            fallback_machines: str | list[str] = "group", offer_after_seconds: int | None = None,
+            offer_eligible_at: str | None = None, offer_clock_evidence: dict[str, Any] | None = None,
+            operation_id: str | None = None,
+            depends_on_task_ids: list[str] | None = None) -> "TaskRecord":
         validate_identifier(task_id, "task_id")
         validate_identifier(machine, "machine_name")
         validate_group_name(group_name)
@@ -194,7 +207,8 @@ class TaskRecord:
             raise ValueError("only timed offers may contain clock proof data.")
         return cls(
             task_id=task_id, group_name=group_name, group_membership_sequence=None,
-            submission_operation_id=operation_id, name=name, ready_generation=0, spec=spec,
+            submission_operation_id=operation_id, name=name,
+            depends_on_task_ids=sorted(depends_on_task_ids or []), ready_generation=0, spec=spec,
             placement_policy={"home_machine": machine, "sharing_mode": sharing_mode,
                               "fallback_constraint": fallback_machines, "offer_after_seconds": offer_after_seconds},
             placement_runtime={"queue_scope": "home", "queued_home_at": now,
@@ -213,6 +227,7 @@ class TaskRecord:
         return {"meta": self.meta, "task": {"task_id": self.task_id, "group_name": self.group_name,
                 "group_membership_sequence": self.group_membership_sequence,
                 "submission_operation_id": self.submission_operation_id, "name": self.name,
+                "depends_on_task_ids": list(self.depends_on_task_ids),
                 "ready_generation": self.ready_generation,
                 "spec": self.spec.to_dict(), "placement_policy": self.placement_policy,
                 "placement_runtime": self.placement_runtime, "state": self.state, "control": self.control,
@@ -227,6 +242,7 @@ class TaskRecord:
         return cls(meta=data["meta"], task_id=task["task_id"], group_name=task.get("group_name"),
                    group_membership_sequence=task.get("group_membership_sequence"),
                    submission_operation_id=task.get("submission_operation_id"), name=task.get("name"),
+                   depends_on_task_ids=task.get("depends_on_task_ids", []),
                    ready_generation=task.get("ready_generation", 0),
                    spec=TaskSpec(**spec_value), placement_policy=task["placement_policy"],
                    placement_runtime=task["placement_runtime"], state=task["state"], control=task["control"],

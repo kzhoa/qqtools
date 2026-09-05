@@ -33,7 +33,8 @@ from .active_operations import operation_exists
 from .store import atomic_replace, create_if_absent, read_json
 from .availability import remove_deadline_index, sync_deadline_index
 from .tasks import save_task
-from ..layout import is_cpu_lane_root
+from ..layout import is_cpu_lane_root, is_task_dependencies_root
+from .dependencies import normalize_dependency_ids, validate_group_dependencies
 
 
 def _write_group_record(cfg: object, path: Path, data: dict[str, Any]) -> None:
@@ -143,6 +144,16 @@ def _canonical_specs(specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return canonical
 
 
+def _legacy_empty_dependencies_digest(normalized: dict[str, Any]) -> str | None:
+    """Return the pre-dependency digest when every dependency declaration is empty."""
+    legacy = json.loads(json.dumps(normalized))
+    for task in legacy["tasks"]:
+        dependencies = task.pop("depends_on_task_ids", None)
+        if dependencies not in (None, []):
+            return None
+    return semantic_digest(legacy)
+
+
 def _resolved_specs(specs: list[dict[str, Any]], submitting_machine: str) -> list[dict[str, Any]]:
     result = []
     seen: set[str] = set()
@@ -164,9 +175,28 @@ def _resolved_specs(specs: list[dict[str, Any]], submitting_machine: str) -> lis
                 "sharing_mode": raw.get("sharing_mode", "private"),
                 "fallback_machines": raw.get("fallback_machines", "group"),
                 "offer_after_seconds": raw.get("offer_after_seconds"),
+                "depends_on_task_ids": normalize_dependency_ids(raw.get("depends_on_task_ids")),
             }
         )
     return result
+
+
+def _normalize_resolved_dependencies(operation: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    """Normalize legacy omitted dependency fields in a durable submission context."""
+    resolved = operation["submission"]["resolved_context"]["task_specs"]
+    changed = False
+    normalized: list[dict[str, Any]] = []
+    for item in resolved:
+        candidate = dict(item)
+        dependencies = normalize_dependency_ids(candidate.get("depends_on_task_ids"))
+        if candidate.get("depends_on_task_ids") != dependencies:
+            candidate["depends_on_task_ids"] = dependencies
+            changed = True
+        normalized.append(candidate)
+    if changed:
+        # QQTOOLS-COMPAT-0007: migrate durable legacy submission copies during replay.
+        operation["submission"]["resolved_context"]["task_specs"] = normalized
+    return normalized, changed
 
 
 def _validate_target_machine_record(cfg: Any, machine_name: str) -> None:
@@ -302,6 +332,7 @@ def _task_matches_resolved(
         current.submission_operation_id == operation_id
         and current.group_name == group_name
         and current.name == item["name"]
+        and current.depends_on_task_ids == item["depends_on_task_ids"]
         and current.spec.to_dict() == spec.to_dict()
         and current.placement_policy == expected_policy
     )
@@ -319,6 +350,21 @@ def _task_spec(item: dict[str, Any], *, is_canonical: bool) -> TaskSpec:
     return TaskSpec(
         item["command"], item["working_directory"], requested_gpus,
         None, "gpu" if is_canonical else None,
+    )
+
+
+def _new_task_from_resolved(
+    item: dict[str, Any], *, group_name: str | None, operation_id: str, is_canonical: bool,
+) -> TaskRecord:
+    return TaskRecord.new(
+        task_id=item["task_id"], machine=item["home_machine"],
+        spec=_task_spec(item, is_canonical=is_canonical), group_name=group_name,
+        name=item["name"], sharing_mode=item["sharing_mode"],
+        fallback_machines=item["fallback_machines"],
+        offer_after_seconds=item["offer_after_seconds"],
+        offer_eligible_at=item.get("offer_eligible_at"),
+        offer_clock_evidence=item.get("offer_clock_evidence"), operation_id=operation_id,
+        depends_on_task_ids=item["depends_on_task_ids"],
     )
 
 
@@ -403,14 +449,20 @@ def submit_specs(
     key = idempotency_key or new_id()
     mapping_path = idempotency_path(cfg.shared_root, semantic_digest({"project": str(cfg.shared_root), "key": key}))
     is_canonical = is_cpu_lane_root(cfg)
+    is_dependencies_canonical = is_task_dependencies_root(cfg)
     with schema_lock(cfg.shared_root):
         existing = mapping_path.exists()
         if existing:
             operation_id = read_json(mapping_path)["operation_id"]
             operation = read_json(submission_path(cfg.shared_root, operation_id))
             submission = operation["submission"]
-            if submission["raw_request_digest"] != raw_digest:
+            legacy_digest = _legacy_empty_dependencies_digest(normalized)
+            if submission["raw_request_digest"] not in {raw_digest, legacy_digest}:
                 raise IdempotencyConflict("idempotency key was already used with different semantic input.")
+            resolved, normalized_legacy_copy = _normalize_resolved_dependencies(operation)
+            if normalized_legacy_copy:
+                atomic_replace(submission_path(cfg.shared_root, operation_id), operation)
+            submission = operation["submission"]
             if submission["state"] == "committed":
                 try:
                     tasks = [
@@ -424,11 +476,15 @@ def submit_specs(
             if submission["state"] == "aborted":
                 raise RuntimeError(f"submission operation was aborted: {submission['failure_reason']}")
             group_name = submission["target_group"]
-            resolved = submission["resolved_context"]["task_specs"]
             operation_id = submission["operation_id"]
-            operation = read_json(submission_path(cfg.shared_root, operation_id))
         else:
             resolved = _resolved_specs(specs, cfg.machine_name)
+            if not is_dependencies_canonical and any(
+                item["depends_on_task_ids"] for item in resolved
+            ):
+                raise ValueError(
+                    "Task dependencies require an activated task-dependencies-v1 root."
+                )
             for item in resolved:
                 _task_spec(item, is_canonical=is_canonical)
             for machine in sorted({
@@ -584,9 +640,18 @@ def submit_specs(
 
         staged: list[TaskRecord] = []
         commit_durable = False
-        try:
-            if on_prepared:
-                on_prepared(operation_id, operation["submission"]["idempotency_key"])
+
+        def stage_and_commit() -> None:
+            """Validate and publish one submission while its Group cannot change."""
+            nonlocal commit_durable
+            candidates = [
+                _new_task_from_resolved(
+                    item, group_name=group_name, operation_id=operation_id,
+                    is_canonical=is_canonical,
+                )
+                for item in resolved
+            ]
+            validate_group_dependencies(cfg, group_name, candidates)
             for sequence, item in zip(sequences, resolved):
                 path = task_path(cfg.shared_root, item["task_id"])
                 _reject_cleanup_tombstones(cfg, [item])
@@ -605,18 +670,9 @@ def submit_specs(
                     sync_deadline_index(cfg, current)
                     staged.append(current)
                     continue
-                task = TaskRecord.new(
-                    task_id=item["task_id"],
-                    machine=item["home_machine"],
-                    spec=_task_spec(item, is_canonical=is_canonical),
-                    group_name=group_name,
-                    name=item["name"],
-                    sharing_mode=item["sharing_mode"],
-                    fallback_machines=item["fallback_machines"],
-                    offer_after_seconds=item["offer_after_seconds"],
-                    offer_eligible_at=item.get("offer_eligible_at"),
-                    offer_clock_evidence=item.get("offer_clock_evidence"),
-                    operation_id=operation_id,
+                task = _new_task_from_resolved(
+                    item, group_name=group_name, operation_id=operation_id,
+                    is_canonical=is_canonical,
                 )
                 task.group_membership_sequence = sequence
                 old_generation, _ = prepare_ready_transition(
@@ -641,6 +697,32 @@ def submit_specs(
                 if persisted.get("submission", {}).get("state") != "committed":
                     raise
             commit_durable = True
+
+        try:
+            # Preserve the prepared callback's existing contract: malformed dependency
+            # requests fail before callers observe preparation.  It cannot serve as the
+            # authoritative check because it runs outside the publication transaction.
+            prepared_candidates = [
+                _new_task_from_resolved(
+                    item, group_name=group_name, operation_id=operation_id,
+                    is_canonical=is_canonical,
+                )
+                for item in resolved
+            ]
+            if group_name:
+                with group_lock(cfg.shared_root, group_name):
+                    validate_group_dependencies(cfg, group_name, prepared_candidates)
+            else:
+                validate_group_dependencies(cfg, None, prepared_candidates)
+            if on_prepared:
+                on_prepared(operation_id, operation["submission"]["idempotency_key"])
+            # Validation and publication must be one Group-linearized operation. Otherwise a
+            # prerequisite can begin cleanup between the final check and Task creation.
+            if group_name:
+                with group_lock(cfg.shared_root, group_name):
+                    stage_and_commit()
+            else:
+                stage_and_commit()
             finalize_submission_group(cfg, operation["submission"])
             return _submission_result(staged, operation["submission"])
         except Exception as exc:

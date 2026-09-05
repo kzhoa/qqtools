@@ -11,6 +11,7 @@ from .runtime.records import TaskRecord, normalize_group_record
 from .runtime.reservations import reservation_snapshot
 from .runtime.store import iter_json, read_json
 from .runtime.tasks import load_task
+from .runtime.dependencies import dependency_gate
 
 
 def _task_view(task: TaskRecord) -> dict[str, Any]:
@@ -28,6 +29,10 @@ def list_tasks(cfg: RootConfig, *, phase: str | None = None, group: str | None =
     for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
         task = TaskRecord.from_dict(read_json(path))
         view = _task_view(task)
+        gate = dependency_gate(cfg, task)
+        view["depends_on_task_ids"] = task.depends_on_task_ids
+        view["dependency_state"] = gate.state
+        view["dependency_reasons"] = list(gate.reasons)
         if phase and view["phase"] != phase:
             continue
         if group and view["group"] != group:
@@ -39,6 +44,8 @@ def list_tasks(cfg: RootConfig, *, phase: str | None = None, group: str | None =
 def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
     task = load_task(cfg, task_id)
     result = task.to_dict()
+    gate = dependency_gate(cfg, task)
+    result["dependency_gate"] = {"state": gate.state, "reasons": list(gate.reasons)}
     attempts_dir = shared_paths(cfg.shared_root)["attempts"] / task_id
     result["attempts"] = [read_json(path) for path in iter_json(attempts_dir)]
     operation_id = task.submission_operation_id
