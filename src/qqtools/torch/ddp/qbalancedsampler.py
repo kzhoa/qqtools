@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -8,6 +9,9 @@ import torch.distributed as dist
 from torch.utils.data import BatchSampler, Sampler
 
 from qqtools.data.qbalance import (
+    _LPT_STRATEGIES,
+    _normalize_lpt_strategy,
+    _plan_rank_batches,
     assign_window_to_ranks,
     compute_global_even_sort_order,
     validate_balance_strategy,
@@ -98,10 +102,31 @@ class _BalancedPlanCache:
     rank_local_plan: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.int64)
     )
+    _lpt_plan: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        if self.strategy in _LPT_STRATEGIES:
+            if self.sample_order is not None:
+                raise ValueError(f"strategy={self.strategy!r} cannot be combined with sample_order")
+            remainder = len(self.sample_costs) % (self.batch_size * self.world_size)
+            if remainder and not self.shuffle and not self.drop_last:
+                raise ValueError(
+                    "Non-shuffled LPT requires N divisible by batch_size * world_size "
+                    "when drop_last=False; validation padding would duplicate samples. "
+                    "Use drop_last=True only if discarding samples is intended."
+                )
+            self._lpt_plan = _plan_rank_batches(
+                self.sample_costs,
+                batch_size=self.batch_size,
+                world_size=self.world_size,
+                seed=self.seed,
+                should_drop_last=self.drop_last,
+                should_shuffle=False,
+                strategy=self.strategy,
+            )
+            self._lpt_plan.setflags(write=False)
         self.rank_local_plan = self._build_rank_local_plan(self.epoch)
 
     def set_epoch(self, epoch: int) -> None:
@@ -110,10 +135,20 @@ class _BalancedPlanCache:
         epoch = int(epoch)
         if epoch == self.epoch:
             return
-        self.epoch = epoch
         self.rank_local_plan = self._build_rank_local_plan(epoch)
+        self.epoch = epoch
 
     def _build_rank_local_plan(self, epoch: int) -> np.ndarray:
+        if self._lpt_plan is not None:
+            if not self.shuffle:
+                return np.ascontiguousarray(self._lpt_plan[:, self.rank, :].reshape(-1))
+            rng = np.random.default_rng(self.seed + epoch)
+            steps = rng.permutation(len(self._lpt_plan))
+            ranks = np.broadcast_to(np.arange(self.world_size), (len(steps), self.world_size))
+            ranks = rng.permuted(ranks, axis=1)
+            return np.ascontiguousarray(
+                self._lpt_plan[steps, ranks[:, self.rank], :].reshape(-1)
+            )
         total = int(self.sample_costs.shape[0])
         global_chunk_size = self.world_size * self.batch_size
         if self.shuffle:
@@ -160,6 +195,59 @@ class _BalancedPlanCache:
 
 
 class BalancedDistributedSampler(Sampler[int]):
+    """Balance fixed-size rank batches with order strategies or direct LPT planning.
+
+    Prefer BalancedBatchSampler with DataLoader(batch_sampler=...) to preserve batch
+    boundaries automatically. With this index sampler, the DataLoader batch_size must
+    match the sampler's batch_size. Initialize the DDP process group before constructing
+    the sampler for automatic rank detection; detection is not repeated later.
+
+    Args:
+        sample_costs: One-dimensional finite, nonnegative additive costs, in dataset
+            index order. All ranks must supply identical costs and planning settings.
+        batch_size: Positive integer sample count per rank, not the global batch size.
+        rank: Rank index. None reads initialized torch.distributed, otherwise uses 0.
+            An explicit value must agree with an initialized process group.
+        world_size: Number of ranks. None reads initialized torch.distributed,
+            otherwise uses 1. An explicit value must agree with the process group.
+        shuffle: Boolean. For LPT, shuffle steps and rank assignments each epoch,
+            not batch membership or within-batch order. False retains deterministic
+            balanced order, not dataset order. Call set_epoch on every rank each epoch.
+        seed: Nonnegative integer random seed, shared across ranks. Booleans are invalid.
+        drop_last: Boolean. Drop the remainder of a global batch when True. With LPT,
+            False pads training data but rejects non-divisible input if shuffle=False.
+            Dropped or repeated sample occurrences stay fixed across epochs.
+        sample_order: Legacy V-only permutation used when shuffle=False. LPT rejects it.
+        strategy: Planning tier: lpt_fast, lpt-medium (alias/default lpt), or lpt_best.
+            Legacy v1 through v3 are deprecated and scheduled for removal in v1.4.0.
+
+    Raises:
+        TypeError: Boolean or integer settings have unsupported types.
+        ValueError: Costs, settings, rank configuration, or parameter combinations
+            are invalid, or accumulated batch costs are not finite.
+
+    ``lpt_fast``, ``lpt-medium`` (alias ``lpt``) and ``lpt_best`` trade planning work for
+    lexicographic
+    base-group quality (peak batch cost, P99, squared loads); higher tiers retain lower
+    base candidates and may tie. DDP tail repair is separate and does not guarantee
+    this tier ordering for final padded/dropped plans. Fast adds a derived two-pointer
+    pass; middle adds one bounded pair
+    pass on the derived plan; best adds multiple passes and three-batch repair.
+    Each step search protects peak, P99 and step-max sum. On divisible inputs higher
+    tiers retain the lower derived candidate under the lexicographic step score.
+    Base groups remain unchanged. All three cache final batch membership in memory. ``shuffle=True``
+    shuffles steps and rank labels using seed + epoch, not samples within batches.
+    Non-shuffled LPT is deterministic balanced order, not original dataset order.
+    LPT does not support ``sample_order``. Shuffled tails are selected/padded once
+    from a small repair pool using the base seed, or discarded with ``drop_last=True``;
+    at most 2*world_size-1 base batches are regrouped by tail repair (derived step
+    optimization can touch other batches in the derived plan). Changing epochs does
+    not change those occurrences. Non-shuffled LPT rejects non-divisible input unless
+    dropping is explicitly requested, preventing silent validation duplicates.
+    This strategy is sampler-only; dataset ordering and LMDB artifacts are unchanged.
+    Legacy sampler strategies ``v1`` through ``v3`` are deprecated and will be removed
+    in v1.4.0. The default is ``lpt``, normalized internally to ``lpt-medium``.
+    """
     def __init__(
         self,
         sample_costs: Sequence[float] | np.ndarray,
@@ -171,10 +259,31 @@ class BalancedDistributedSampler(Sampler[int]):
         seed: int = 0,
         drop_last: bool = False,
         sample_order: Sequence[int] | np.ndarray | None = None,
-        strategy: str = "v3",
+        strategy: str = "lpt",
     ) -> None:
+        for name, value in (("shuffle", shuffle), ("drop_last", drop_last)):
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError(f"{name} must be a boolean, got {value!r}")
+        if isinstance(seed, (bool, np.bool_)) or not isinstance(seed, (int, np.integer)):
+            raise TypeError(f"seed must be a non-negative integer, got {seed!r}")
+        if seed < 0:
+            raise ValueError(f"seed must be non-negative, got {seed}")
         costs = _normalize_sample_costs(sample_costs)
-        validated_strategy = validate_balance_strategy(strategy)
+        strategy = _normalize_lpt_strategy(strategy)
+        validated_strategy = strategy if strategy in _LPT_STRATEGIES else validate_balance_strategy(
+            strategy
+        )
+        if validated_strategy in _LPT_STRATEGIES:
+            for name, value in (("batch_size", batch_size), ("rank", rank),
+                                ("world_size", world_size)):
+                if value is not None and (
+                    isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, (int, np.integer))
+                ):
+                    raise TypeError(f"{name} must be an integer, got {value!r}")
+            # Cached grouping must not depend on subsequent caller-side array mutations.
+            costs = costs.copy()
+            costs.setflags(write=False)
         validated_order = None
         if sample_order is not None:
             validated_order = _validate_sample_order(sample_order, int(costs.shape[0]))
@@ -190,6 +299,16 @@ class BalancedDistributedSampler(Sampler[int]):
             sample_order=validated_order,
             strategy=validated_strategy,
         )
+        # QQTOOLS-COMPAT-0006: remove legacy sampler strategies and warning in v1.4.0.
+        if validated_strategy not in _LPT_STRATEGIES:
+            warnings.warn(
+                f"Sampler strategy={validated_strategy!r} is deprecated and will be removed "
+                "in v1.4.0. Switch to 'lpt_fast', 'lpt-medium' (alias 'lpt'), or 'lpt_best'. "
+                "LPT changes sample grouping/order, does not accept sample_order, and requires "
+                "divisible input or drop_last=True when shuffle=False.",
+                FutureWarning,
+                stacklevel=2,
+            )
 
     def __iter__(self):
         return iter(self._plan_cache.rank_local_plan.tolist())
@@ -202,6 +321,33 @@ class BalancedDistributedSampler(Sampler[int]):
 
 
 class BalancedBatchSampler(BatchSampler):
+    """Balance rank-local batches for DataLoader(dataset, batch_sampler=sampler).
+
+    Do not also supply batch_size, shuffle, sampler, or drop_last to DataLoader.
+    Initialize the DDP process group first for automatic rank detection. All ranks
+    must use identical costs and planning settings and call set_epoch each epoch.
+
+    Args:
+        sample_costs: Finite, nonnegative additive costs in dataset index order.
+        batch_size: Positive integer number of samples per rank-local batch.
+        rank: Rank index; None reads initialized DDP, otherwise uses 0.
+        world_size: Number of ranks; None reads initialized DDP, otherwise uses 1.
+            Explicit rank/world_size must match initialized DDP. Detection occurs once.
+        shuffle: Boolean. LPT shuffles steps and rank assignments, not batch membership
+            or within-batch order. False means deterministic balanced order.
+        seed: Nonnegative integer shared across ranks; booleans are invalid.
+        drop_last: Boolean. Drop an incomplete global batch when True. Otherwise LPT
+            pads with shuffle=True and rejects non-divisible input with shuffle=False.
+            Dropped/repeated occurrences remain fixed across epochs for LPT.
+        sample_order: Legacy V-only permutation for shuffle=False; invalid with LPT.
+        strategy: lpt_fast, lpt-medium (alias/default lpt), or lpt_best. Deprecated
+            v1 through v3 remain available until v1.4.0.
+
+    Raises:
+        TypeError: Boolean or integer settings have unsupported types.
+        ValueError: Costs, settings, or combinations are invalid. See
+            BalancedDistributedSampler for the full planning contract.
+    """
     def __init__(
         self,
         sample_costs: Sequence[float] | np.ndarray,
@@ -213,7 +359,7 @@ class BalancedBatchSampler(BatchSampler):
         seed: int = 0,
         drop_last: bool = False,
         sample_order: Sequence[int] | np.ndarray | None = None,
-        strategy: str = "v3",
+        strategy: str = "lpt",
     ) -> None:
         self.sampler = BalancedDistributedSampler(
             sample_costs,
@@ -228,19 +374,7 @@ class BalancedBatchSampler(BatchSampler):
         )
         self.batch_size = int(batch_size)
         self.drop_last = bool(drop_last)
-        self._plan_cache = _BalancedPlanCache(
-            sample_costs=self.sampler._plan_cache.sample_costs,
-            batch_size=self.batch_size,
-            rank=self.sampler._plan_cache.rank,
-            world_size=self.sampler._plan_cache.world_size,
-            shuffle=self.sampler._plan_cache.shuffle,
-            seed=self.sampler._plan_cache.seed,
-            drop_last=self.drop_last,
-            sample_order=self.sampler._plan_cache.sample_order,
-            strategy=self.sampler._plan_cache.strategy,
-            epoch=self.sampler._plan_cache.epoch,
-            rank_local_plan=self.sampler._plan_cache.rank_local_plan.copy(),
-        )
+        self._plan_cache = self.sampler._plan_cache
 
     def __iter__(self):
         plan = self.sampler._plan_cache.rank_local_plan
@@ -259,5 +393,3 @@ class BalancedBatchSampler(BatchSampler):
 
     def set_epoch(self, epoch: int) -> None:
         self.sampler.set_epoch(epoch)
-        self._plan_cache.epoch = self.sampler._plan_cache.epoch
-        self._plan_cache.rank_local_plan = self.sampler._plan_cache.rank_local_plan.copy()

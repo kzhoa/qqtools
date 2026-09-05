@@ -567,6 +567,11 @@ class qLmdbDataset(qLmdbDatasetBase):
     ) -> torch.utils.data.DataLoader:
         """Build a plain or balance-aware dataloader.
 
+        Balanced loaders use the sampler's default strategy, independently of the
+        dataset's balance_strategy and cached sample_order. With the current LPT
+        default, shuffle=False requires the sample count to be divisible by
+        batch_size * world_size, or drop_last=True.
+
         Args:
             batch_size: Number of samples assigned to each rank-local batch.
             shuffle: Whether to generate a seed- and epoch-dependent balanced order.
@@ -619,8 +624,6 @@ class qLmdbDataset(qLmdbDatasetBase):
             shuffle=bool(shuffle),
             seed=self.balance_seed,
             drop_last=bool(drop_last),
-            sample_order=None if shuffle else self.sample_order,
-            strategy=self.balance_strategy,
         )
         return qDictDataloader(
             dataset=self,
