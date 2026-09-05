@@ -343,10 +343,14 @@ def test_agent_supervises_recovered_child_without_runner(tmp_path: Path, monkeyp
     assert renewed == [load_task(cfg, task.task_id).claim_control["active_claim"]["fencing_token"]]
 
 
-def test_elapsed_offer_is_applied_by_home_agent(tmp_path: Path):
+def test_elapsed_offer_is_applied_by_home_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover", offer_after_seconds=0)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.project_maintenance.elapsed_offer_is_proven",
+        lambda *_args: True,
+    )
     offer_due_tasks(cfg)
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
 
