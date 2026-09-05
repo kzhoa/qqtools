@@ -141,9 +141,19 @@ class MachineRuntime:
         self.paths = machine_runtime_paths(self.root)
         self.last_diagnostic_publish_ns: int | None = None
         self.ready_batch_sizers: dict[str, AdaptiveBatchSizer] = {}
-        self.primary_probe_cursors: dict[tuple[str, str], ReadyCursor | None] = {}
-        self.primary_probe_revisions: dict[tuple[str, str], int] = {}
-        self.primary_probe_complete: dict[tuple[str, str], bool] = {}
+        self.primary_probe_cursors: dict[tuple[str, ...], ReadyCursor | None] = {}
+        self.primary_probe_revisions: dict[tuple[str, ...], int] = {}
+        self.primary_probe_complete: dict[tuple[str, ...], bool] = {}
+        # Finish each route once per probe round, even when the budget spans calls.
+        self.primary_probe_pending_routes: dict[str, set[tuple[str, str, str]]] = {}
+        # A temporarily unavailable marker can become claimable without an index
+        # revision change.  Keep its position separately from scan completion:
+        # dependency waiting is not resource demand and must not deny borrowing.
+        self.primary_probe_recheck_cursors: dict[tuple[str, str, str], ReadyCursor | None] = {}
+        # The next dependency route to revisit after every route has completed
+        # its baseline scan.  Advancing one route at a time prevents an early
+        # project from exhausting each slice before later projects are scanned.
+        self.primary_probe_recheck_round_cursors: dict[str, tuple[str, str, str]] = {}
 
     def ensure_layout(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)

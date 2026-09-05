@@ -10,7 +10,12 @@ from .work_budget import diagnostic_increment, diagnostic_span
 def load_task(cfg: object, task_id: str) -> TaskRecord:
     with diagnostic_span("task_json_read"):
         diagnostic_increment("task_json_read.records")
-        return TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id)))
+        value = read_json(task_path(cfg.shared_root, task_id))
+        from ..layout import is_task_dependencies_root
+
+        if is_task_dependencies_root(cfg) and "depends_on_task_ids" not in value.get("task", {}):
+            raise ValueError("canonical Task is missing depends_on_task_ids.")
+        return TaskRecord.from_dict(value)
 
 
 def save_task(cfg: object, task: TaskRecord) -> None:

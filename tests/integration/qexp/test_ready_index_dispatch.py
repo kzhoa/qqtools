@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,12 +10,13 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import group as group_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
-from qqtools.plugins.qexp.commands.task import share
+from qqtools.plugins.qexp.commands.task import cancel, edit_dependencies, share
 from qqtools.plugins.qexp.machine_agent import dispatch_machine_cycle_locked
 from qqtools.plugins.qexp import machine_agent
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
+    ReadyClassificationResult,
     ReadyCursor,
     ReadyPeek,
     delete_stale_ready_marker,
@@ -100,6 +102,358 @@ def test_machine_agent_admits_borrow_only_after_no_primary_demand(
         "status": "dispatched",
     }]
     assert executor.launched == [task.task_id]
+
+
+def test_temporary_primary_dependency_gate_is_rechecked_before_borrowing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
+    )
+    task = submit(cfg, ["echo", "primary"], task_id="primary", working_dir=work)
+    _activate_ready(cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    temporary = ReadyClassificationResult("temporarily_unavailable", "dependency_waiting")
+
+    monkeypatch.setattr(machine_agent, "classify_ready_marker", lambda *_args: temporary)
+    first = machine_agent._probe_primary_demand(
+        runtime,
+        {binding.project_id: cfg},
+        {binding.project_id: cfg},
+        [0],
+        [0],
+        SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+    )
+    # Dependency waiting needs revisiting, but is not primary resource demand
+    # and therefore must not block a borrow admission.
+    assert first.state == "no_primary_demand"
+    assert machine_agent._build_borrow_admission_grant(
+        runtime, {binding.project_id: cfg}, first, {binding.project_id}
+    ) is not None
+
+    claimable = ReadyClassificationResult("claimable", "eligible_truth", task)
+    monkeypatch.setattr(machine_agent, "classify_ready_marker", lambda *_args: claimable)
+    second = machine_agent._probe_primary_demand(
+        runtime,
+        {binding.project_id: cfg},
+        {binding.project_id: cfg},
+        [0],
+        [0],
+        SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+    )
+    assert second.state == "runnable_now"
+
+
+def test_primary_probe_retains_dependency_recheck_across_budgeted_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
+    )
+    first_task = submit(cfg, ["echo", "first"], task_id="first", working_dir=work)
+    submit(cfg, ["echo", "second"], task_id="second", working_dir=work)
+    _activate_ready(cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    temporary = ReadyClassificationResult("temporarily_unavailable", "dependency_waiting")
+    route_key = (binding.project_id, "home", "gpu")
+
+    monkeypatch.setattr(machine_agent, "classify_ready_marker", lambda *_args: temporary)
+    limited = SliceBudget(
+        WorkBudgetPolicy(
+            record_hard_limit=1, operation_hard_limit=32, initial_batch_size=1
+        ),
+        clock_ns=lambda: 0,
+    )
+    incomplete = machine_agent._probe_primary_demand(
+        runtime, {binding.project_id: cfg}, {binding.project_id: cfg}, [0], [0], limited
+    )
+    assert incomplete.state == "unresolved"
+    assert route_key in runtime.primary_probe_recheck_cursors
+
+    completed = machine_agent._probe_primary_demand(
+        runtime,
+        {binding.project_id: cfg},
+        {binding.project_id: cfg},
+        [0],
+        [0],
+        SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+    )
+    assert completed.state == "no_primary_demand"
+    assert runtime.primary_probe_complete[route_key]
+
+    claimable = ReadyClassificationResult("claimable", "eligible_truth", first_task)
+    monkeypatch.setattr(machine_agent, "classify_ready_marker", lambda *_args: claimable)
+    rechecked = machine_agent._probe_primary_demand(
+        runtime,
+        {binding.project_id: cfg},
+        {binding.project_id: cfg},
+        [0],
+        [0],
+        SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+    )
+    assert rechecked.state == "runnable_now"
+
+
+@pytest.mark.parametrize("is_dependency_first", [True, False])
+def test_dependency_rechecks_do_not_starve_later_project_baseline_scans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, is_dependency_first: bool,
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    dependency_cfg = init_shared_root(
+        tmp_path / "dependencies" / ".qexp", "gpu-1", runtime_root=tmp_path / "dependencies-rt"
+    )
+    create_group(dependency_cfg, "dependencies")
+    for index in range(3):
+        parent = submit(
+            dependency_cfg,
+            ["echo", "parent"],
+            task_id=f"parent-{index}",
+            group="dependencies",
+            working_dir=work,
+        )
+        submit(
+            dependency_cfg,
+            ["echo", "child"],
+            task_id=f"child-{index}",
+            group="dependencies",
+            working_dir=work,
+            depends_on_task_ids=[parent.task_id],
+        )
+        cancel(dependency_cfg, parent.task_id)
+    borrow_cfg, _ = _borrow_project(tmp_path, work)
+    borrow_parent = submit(
+        borrow_cfg,
+        ["echo", "borrow-parent"],
+        task_id="borrow-parent",
+        group="borrow-group",
+        working_dir=work,
+    )
+    submit(
+        borrow_cfg,
+        ["echo", "borrow-child"],
+        task_id="borrow-child",
+        group="borrow-group",
+        working_dir=work,
+        depends_on_task_ids=[borrow_parent.task_id],
+    )
+    cancel(borrow_cfg, borrow_parent.task_id)
+    _activate_ready(dependency_cfg)
+    _activate_ready(borrow_cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    dependency_binding = runtime.add_binding(
+        dependency_cfg.shared_root, dependency_cfg.machine_name
+    )
+    borrow_binding = runtime.add_binding(borrow_cfg.shared_root, borrow_cfg.machine_name)
+    # Fix the registry ordering; path-derived project IDs otherwise randomize
+    # which project's completed routes consume the next slice's budget first.
+    generation, _ = runtime.load_registry()
+    dependency_binding = replace(
+        dependency_binding, project_id="a" if is_dependency_first else "b"
+    )
+    borrow_binding = replace(
+        borrow_binding, project_id="b" if is_dependency_first else "a"
+    )
+    monkeypatch.setattr(
+        runtime, "load_registry", lambda: (generation, [dependency_binding, borrow_binding])
+    )
+    readable = {
+        dependency_binding.project_id: dependency_cfg,
+        borrow_binding.project_id: borrow_cfg,
+    }
+    budget_policy = WorkBudgetPolicy(
+        record_hard_limit=3, operation_hard_limit=12, initial_batch_size=1
+    )
+
+    for _round in range(3):
+        probe = machine_agent.PrimaryDemandProbe("unresolved")
+        for _slice in range(18):
+            probe = machine_agent._probe_primary_demand(
+                runtime,
+                readable,
+                readable,
+                [0],
+                [0],
+                SliceBudget(budget_policy, clock_ns=lambda: 0),
+            )
+            if probe.state == "no_primary_demand":
+                break
+
+        assert probe.state == "no_primary_demand"
+        grant = machine_agent._build_borrow_admission_grant(
+            runtime, readable, probe, set(readable)
+        )
+        assert grant is not None and grant.is_valid(runtime.root)
+
+
+def test_dependency_recheck_advances_past_a_still_blocked_first_candidate(
+    tmp_path: Path,
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
+    )
+    create_group(cfg, "dependencies")
+    children = []
+    for index in range(3):
+        parent = submit(
+            cfg,
+            ["echo", "parent"],
+            task_id=f"parent-{index}",
+            group="dependencies",
+            working_dir=work,
+        )
+        children.append(
+            submit(
+                cfg,
+                ["echo", "child"],
+                task_id=f"child-{index}",
+                group="dependencies",
+                working_dir=work,
+                depends_on_task_ids=[parent.task_id],
+            )
+        )
+        cancel(cfg, parent.task_id)
+    _activate_ready(cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    readable = {binding.project_id: cfg}
+    budget_policy = WorkBudgetPolicy(
+        record_hard_limit=16, operation_hard_limit=64, initial_batch_size=1
+    )
+
+    completed = machine_agent._probe_primary_demand(
+        runtime,
+        readable,
+        readable,
+        [0],
+        [0],
+        SliceBudget(budget_policy, clock_ns=lambda: 0),
+    )
+    assert completed.state == "no_primary_demand"
+
+    edit_dependencies(cfg, children[-1].task_id, [])
+    probe = machine_agent.PrimaryDemandProbe("no_primary_demand")
+    for _ in range(8):
+        probe = machine_agent._probe_primary_demand(
+            runtime,
+            readable,
+            readable,
+            [0],
+            [0],
+            SliceBudget(budget_policy, clock_ns=lambda: 0),
+        )
+        if probe.state == "runnable_now":
+            break
+
+    assert probe.state == "runnable_now"
+
+
+@pytest.mark.parametrize("ready_index", [0, 2])
+@pytest.mark.parametrize("lane", ["gpu", "cpu"])
+def test_dependency_recheck_retains_aggregation_demand(
+    tmp_path: Path, ready_index: int, lane: str,
+) -> None:
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
+    )
+    create_group(cfg, "dependencies")
+    parent = submit(
+        cfg, ["echo", "parent"], task_id="parent", group="dependencies", working_dir=tmp_path
+    )
+    for index in range(3):
+        submit(
+            cfg, ["echo", "child"], task_id=f"child-{index}", group="dependencies",
+            working_dir=tmp_path, depends_on_task_ids=[parent.task_id],
+            requested_gpus=2 if lane == "gpu" else 0,
+            requested_cpus=2 if lane == "cpu" else None,
+        )
+    cancel(cfg, parent.task_id)
+    _activate_ready(cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    readable = {binding.project_id: cfg}
+
+    def probe(free: list[int]) -> machine_agent.PrimaryDemandProbe:
+        return machine_agent._probe_primary_demand(
+            runtime, readable, readable, [0, 1], free,
+            SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0), lane=lane,
+        )
+
+    assert probe([0]).state == "no_primary_demand"
+    edit_dependencies(cfg, f"child-{ready_index}", [])
+    for _ in range(8):
+        result = probe([0])
+        if result.state == "waiting_for_aggregation":
+            break
+    assert result.state == "waiting_for_aggregation"
+    for _ in range(8):
+        result = probe([0])
+        assert result.state == "waiting_for_aggregation"
+        assert machine_agent._build_borrow_admission_grant(
+            runtime, readable, result, set(readable), lane=lane,
+        ) is None
+    assert probe([0, 1]).state == "runnable_now"
+    cancel(cfg, f"child-{ready_index}")
+    for _ in range(8):
+        result = probe([0])
+        if result.state == "no_primary_demand":
+            break
+    assert result.state == "no_primary_demand"
+    grant = machine_agent._build_borrow_admission_grant(
+        runtime, readable, result, set(readable), lane=lane,
+    )
+    assert grant is not None and grant.is_valid(runtime.root)
+
+
+def test_dependency_recheck_rounds_are_independent_between_lanes(tmp_path: Path) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    readable = {}
+    for index in range(2):
+        cfg = init_shared_root(
+            tmp_path / str(index) / ".qexp", "gpu-1", runtime_root=tmp_path / f"rt-{index}"
+        )
+        create_group(cfg, "dependencies")
+        parent = submit(
+            cfg, ["echo", "parent"], task_id="parent", group="dependencies",
+            working_dir=tmp_path,
+        )
+        for lane in ("gpu", "cpu"):
+            submit(
+                cfg, ["echo", lane], task_id=lane, group="dependencies",
+                working_dir=tmp_path, depends_on_task_ids=[parent.task_id],
+                requested_gpus=1 if lane == "gpu" else 0,
+                requested_cpus=1 if lane == "cpu" else None,
+            )
+        cancel(cfg, parent.task_id)
+        _activate_ready(cfg)
+        binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+        readable[binding.project_id] = cfg
+
+    def probe(lane: str) -> machine_agent.PrimaryDemandProbe:
+        return machine_agent._probe_primary_demand(
+            runtime, readable, readable, [0], [0],
+            SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0), lane=lane,
+        )
+
+    for lane in ("gpu", "cpu"):
+        assert probe(lane).state == "no_primary_demand"
+    last_cfg = readable[sorted(readable)[-1]]
+    for lane in ("gpu", "cpu"):
+        edit_dependencies(last_cfg, lane, [])
+    observed = set()
+    for _ in range(8):
+        for lane in ("gpu", "cpu"):
+            if probe(lane).state == "runnable_now":
+                observed.add(lane)
+    assert observed == {"gpu", "cpu"}
 
 
 def test_direct_borrow_claim_requires_machine_agent_admission(

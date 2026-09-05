@@ -10,6 +10,11 @@ from qqtools.plugins.qexp.cpu_lane_upgrade import (
     resume_cpu_lane_upgrade,
     start_cpu_lane_upgrade,
 )
+from qqtools.plugins.qexp.schema6_upgrade import (
+    attest_schema6_upgrade,
+    resume_schema6_upgrade,
+    start_schema6_upgrade,
+)
 from qqtools.plugins.qexp.layout import is_cpu_lane_root
 from qqtools.plugins.qexp.machine_config import init_shared_root
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
@@ -85,6 +90,42 @@ def test_interrupted_normalization_requires_fresh_attestations(tmp_path: Path) -
     recovered = read_json(journal_path)["cpu_lane_upgrade"]
     assert recovered["phase"] == "awaiting_attestations"
     assert recovered["attestations"] == {}
+
+
+def test_schema6_interruption_requires_fresh_bound_attestations(tmp_path: Path) -> None:
+    cfg = _legacy_root(tmp_path)
+    session = start_schema6_upgrade(cfg, machine_runtime_root=cfg.runtime_root)
+    attest_schema6_upgrade(
+        cfg,
+        activation_id=session["activation_id"],
+        machine_name="gpu-1",
+        machine_runtime_root=cfg.runtime_root,
+    )
+    journal_path = cfg.shared_root / "schema" / "schema6-upgrade.json"
+    journal = read_json(journal_path)
+    journal["schema6_upgrade"]["phase"] = "normalizing"
+    atomic_replace(journal_path, journal)
+
+    with pytest.raises(RuntimeError, match="collect fresh"):
+        resume_schema6_upgrade(
+            cfg, activation_id=session["activation_id"], machine_runtime_root=cfg.runtime_root
+        )
+
+    recovered = read_json(journal_path)["schema6_upgrade"]
+    assert recovered["phase"] == "awaiting_attestations"
+    assert recovered["attestations"] == {}
+
+
+@pytest.mark.parametrize("capabilities", [["cpu-lane-v1"], ["task-dependencies-v1"]])
+def test_schema6_rejects_partial_capability_activation(
+    tmp_path: Path, capabilities: list[str]
+) -> None:
+    cfg = _legacy_root(tmp_path)
+
+    with pytest.raises(ValueError, match="requires cpu-lane-v1 and task-dependencies-v1 together"):
+        start_schema6_upgrade(
+            cfg, capabilities=capabilities, machine_runtime_root=cfg.runtime_root
+        )
 
 
 def test_completed_upgrade_resume_is_idempotent_even_after_work_restarts(tmp_path: Path) -> None:

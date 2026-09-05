@@ -88,7 +88,6 @@ def _probe_primary_demand(
 ) -> PrimaryDemandProbe:
     """Scan primary candidates through an independent bounded ready cursor."""
     diagnostics: list[dict[str, str]] = []
-    waiting = False
     try:
         _, bindings = runtime.load_registry()
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -108,9 +107,42 @@ def _probe_primary_demand(
             for project_id in unavailable
         )
         return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-    for project_id, cfg in readable.items():
-        if project_id not in dispatchable or project_id not in enabled_ids:
-            continue
+    probe_project_ids = sorted(
+        project_id
+        for project_id in readable
+        if project_id in dispatchable and project_id in enabled_ids
+    )
+    probe_route_keys = [
+        (project_id, scope, lane)
+        for project_id in probe_project_ids
+        for scope in ("shared", "home")
+    ]
+    pending_routes = runtime.primary_probe_pending_routes.setdefault(lane, set())
+    pending_routes.intersection_update(probe_route_keys)
+    pending_routes.update(
+        key for key in probe_route_keys if not runtime.primary_probe_complete.get(key, False)
+    )
+    if not pending_routes:
+        pending_routes.update(probe_route_keys)
+    has_incomplete_route = any(
+        not runtime.primary_probe_complete.get(cursor_key, False)
+        for cursor_key in probe_route_keys
+    )
+    pending_recheck_routes = [
+        cursor_key
+        for cursor_key in probe_route_keys
+        if cursor_key in runtime.primary_probe_recheck_cursors
+    ]
+    recheck_route_cursor = runtime.primary_probe_recheck_round_cursors.get(lane)
+    if has_incomplete_route or not pending_recheck_routes:
+        selected_recheck_route = None
+    elif recheck_route_cursor in pending_recheck_routes:
+        selected_recheck_route = recheck_route_cursor
+    else:
+        selected_recheck_route = pending_recheck_routes[0]
+    has_completed_selected_recheck = False
+    for project_id in probe_project_ids:
+        cfg = readable[project_id]
         try:
             ready_state = read_ready_index_state(cfg)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -122,15 +154,35 @@ def _probe_primary_demand(
             return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
         for scope in ("shared", "home"):
             cursor_key = (project_id, scope, lane)
-            has_waiting_candidate = False
-            waiting_cursor = None
+            if cursor_key not in pending_routes:
+                continue
+            has_recheck_candidate = False
+            is_rechecking_pending_candidate = False
+            completed_route_cursor = None
             cursor = runtime.primary_probe_cursors.get(cursor_key)
             route_state = PrimaryProbeRouteState(
                 cursor,
                 runtime.primary_probe_revisions.get(cursor_key),
                 runtime.primary_probe_complete.get(cursor_key, False),
             )
-            if route_state.is_complete:
+            if route_state.is_complete and cursor_key == selected_recheck_route:
+                # Record the next route before any budget-limited work.  If this
+                # slice ends early, the incomplete route resumes via pending_routes.
+                selected_index = pending_recheck_routes.index(cursor_key)
+                runtime.primary_probe_recheck_round_cursors[lane] = pending_recheck_routes[
+                    (selected_index + 1) % len(pending_recheck_routes)
+                ]
+                # The cached revision is checked by the borrow grant immediately
+                # before a claim.  Do not spend this slice rereading every stable
+                # route before revisiting the one dependency candidate selected
+                # for this round.
+                completed_route_cursor = route_state.cursor
+                cursor = runtime.primary_probe_recheck_cursors[cursor_key]
+                route_state = PrimaryProbeRouteState(cursor, route_state.revision, False)
+                runtime.primary_probe_cursors[cursor_key] = cursor
+                runtime.primary_probe_complete[cursor_key] = False
+                is_rechecking_pending_candidate = True
+            elif route_state.is_complete:
                 try:
                     current_revision = ready_index_route_revision(
                         cfg, scope, budget, primary_only=True, lane=lane
@@ -152,8 +204,12 @@ def _probe_primary_demand(
                                         "reason": "ready_index_changed"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 if not decision.should_scan:
+                    pending_routes.discard(cursor_key)
                     continue
-            if route_state.cursor is None or route_state.revision is None:
+            if (
+                (route_state.cursor is None or route_state.revision is None)
+                and not is_rechecking_pending_candidate
+            ):
                 try:
                     start_revision = ready_index_route_revision(
                         cfg, scope, budget, primary_only=True, lane=lane
@@ -190,6 +246,14 @@ def _probe_primary_demand(
                 cursor = peek.cursor
                 runtime.primary_probe_cursors[cursor_key] = cursor
                 if peek.reference is None:
+                    if is_rechecking_pending_candidate:
+                        # Recheck cursors move through every dependency candidate
+                        # in this route.  At the end, wrap to the route start so a
+                        # still-blocked first candidate cannot starve later ones.
+                        runtime.primary_probe_recheck_cursors[cursor_key] = None
+                        runtime.primary_probe_cursors[cursor_key] = completed_route_cursor
+                        runtime.primary_probe_complete[cursor_key] = True
+                        has_completed_selected_recheck = True
                     runtime.primary_probe_complete[cursor_key] = True
                     break
                 reference = peek.reference
@@ -213,6 +277,25 @@ def _probe_primary_demand(
                         "reason": result.reason,
                     })
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                if result.classification == "temporarily_unavailable":
+                    if result.reason.startswith("dependency_"):
+                        # A dependency can become claimable without changing this
+                        # route's revision.  Preserve its cursor across bounded scan
+                        # batches, but do not count it as resource demand: a dependency
+                        # wait must not prevent an otherwise eligible borrow claim.
+                        has_recheck_candidate = True
+                        runtime.primary_probe_recheck_cursors.setdefault(cursor_key, cursor_before)
+                        if is_rechecking_pending_candidate:
+                            runtime.primary_probe_recheck_cursors[cursor_key] = cursor
+                            # The completed baseline scan already established that
+                            # this route has no runnable primary work.  Recheck only
+                            # its dependency candidate this round, then let the next
+                            # pending route consume the shared budget.
+                            runtime.primary_probe_cursors[cursor_key] = completed_route_cursor
+                            runtime.primary_probe_complete[cursor_key] = True
+                            has_completed_selected_recheck = True
+                            break
+                    continue
                 if result.classification != "claimable" or result.task is None:
                     continue
                 task = result.task
@@ -281,12 +364,17 @@ def _probe_primary_demand(
                         "reason": decision.reason,
                     })
                 if decision.outcome == "runnable_now":
+                    runtime.primary_probe_cursors[cursor_key] = cursor_before
                     return PrimaryDemandProbe("runnable_now", tuple(diagnostics[-32:]))
                 if decision.outcome == "waiting_for_aggregation":
-                    waiting = True
-                    if not has_waiting_candidate:
-                        has_waiting_candidate = True
-                        waiting_cursor = cursor_before
+                    # Keep real primary demand at the resume position until it
+                    # disappears or can claim resources.  Later dependency-only
+                    # candidates must not turn this route into a negative cache.
+                    runtime.primary_probe_cursors[cursor_key] = cursor_before
+                    return PrimaryDemandProbe("waiting_for_aggregation", tuple(diagnostics[-32:]))
+            if is_rechecking_pending_candidate and has_completed_selected_recheck:
+                pending_routes.discard(cursor_key)
+                continue
             try:
                 end_revision = ready_index_route_revision(
                     cfg, scope, budget, primary_only=True, lane=lane
@@ -314,9 +402,15 @@ def _probe_primary_demand(
                 diagnostics.append({"project_id": project_id,
                                     "reason": "ready_index_changed"})
                 return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-            if has_waiting_candidate:
-                runtime.primary_probe_cursors[cursor_key] = waiting_cursor
-                runtime.primary_probe_complete[cursor_key] = False
+            if (
+                is_rechecking_pending_candidate
+                and not has_recheck_candidate
+                and not has_completed_selected_recheck
+            ):
+                runtime.primary_probe_recheck_cursors.pop(cursor_key, None)
+            if cursor_key == selected_recheck_route:
+                has_completed_selected_recheck = True
+            pending_routes.discard(cursor_key)
     if lane == "gpu":
         # QQTOOLS-COMPAT-0005: retain read-only legacy diagnostic keys during the transition.
         for key, value in list(runtime.primary_probe_cursors.items()):
@@ -324,8 +418,7 @@ def _probe_primary_demand(
                 runtime.primary_probe_cursors[key[:2]] = value
                 runtime.primary_probe_revisions[key[:2]] = runtime.primary_probe_revisions.get(key)
                 runtime.primary_probe_complete[key[:2]] = runtime.primary_probe_complete.get(key, False)
-    state = "waiting_for_aggregation" if waiting else "no_primary_demand"
-    return PrimaryDemandProbe(state, tuple(diagnostics[-32:]))
+    return PrimaryDemandProbe("no_primary_demand", tuple(diagnostics[-32:]))
 
 
 def _build_borrow_admission_grant(
@@ -352,7 +445,22 @@ def _build_borrow_admission_grant(
             ):
                 return None
             revisions.append(_BorrowAdmissionRevision(project_id, cfg, scope, revision))
-    return _BorrowAdmissionGrant(runtime.root, tuple(revisions), lane)
+    grant = _BorrowAdmissionGrant(runtime.root, tuple(revisions), lane)
+    if not grant.is_valid(runtime.root):
+        # A route checked in an earlier slice may have changed.  Reject the
+        # observation here instead of passing a known-stale grant to a claim.
+        for item in revisions:
+            key = (item.project_id, item.queue_scope, lane)
+            runtime.primary_probe_cursors[key] = None
+            runtime.primary_probe_complete[key] = False
+            runtime.primary_probe_revisions.pop(key, None)
+            # QQTOOLS-COMPAT-0005: mirror invalidation in legacy diagnostic keys.
+            if lane == "gpu":
+                runtime.primary_probe_cursors[key[:2]] = None
+                runtime.primary_probe_complete[key[:2]] = False
+                runtime.primary_probe_revisions.pop(key[:2], None)
+        return None
+    return grant
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1017,6 +1125,13 @@ def _dispatch_machine_cycle_locked(
             snapshot.reservations,
             lane=lane,
         ) if has_capacity else PrimaryDemandProbe("unresolved")
+        borrow_admission_grant = None
+        if probe.state == "no_primary_demand":
+            borrow_admission_grant = _build_borrow_admission_grant(
+                runtime, dispatchable, probe, enabled_ids, lane=lane
+            )
+            if borrow_admission_grant is None:
+                probe = PrimaryDemandProbe("unresolved", probe.diagnostics)
         if lane == "gpu":
             # QQTOOLS-COMPAT-0005: retain legacy diagnostic keys; dispatch only reads lane keys.
             for key in tuple(runtime.primary_probe_cursors):
@@ -1033,11 +1148,6 @@ def _dispatch_machine_cycle_locked(
             )
         )
         diagnostic_increment(f"scheduler.primary_probe.{lane}.{probe.state}")
-        borrow_admission_grant = None
-        if "borrow" in dispatch_plan.admission_roles:
-            borrow_admission_grant = _build_borrow_admission_grant(
-                runtime, dispatchable, probe, enabled_ids, lane=lane
-            )
         budget = SliceBudget(WorkBudgetPolicy())
         for admission_role in dispatch_plan.admission_roles:
             lane_gpus = free if lane == "gpu" else []

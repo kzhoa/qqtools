@@ -50,6 +50,7 @@ from .runtime.reservations import ReservationIdentity, attach, release, reserve,
 from .runtime.cpu_lane import attach_cpu, has_active_cpu_reservation, release_cpu, reserve_cpu
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.tasks import load_task, save_task
+from .runtime.dependencies import dependency_gate, dependency_locks
 from .runtime.work_budget import (
     AdaptiveBatchSizer,
     SliceBudget,
@@ -198,13 +199,8 @@ def _process_evidence_state(attempt: AttemptRecord, data: dict[str, Any]) -> str
 @contextmanager
 def authority_locks(cfg: RootConfig, task: TaskRecord) -> Iterator[None]:
     """Acquire the only permitted shared authority order."""
-    if task.group_name:
-        with group_lock(cfg.shared_root, task.group_name):
-            with task_lock(cfg.shared_root, task.task_id):
-                yield
-    else:
-        with task_lock(cfg.shared_root, task.task_id):
-            yield
+    with dependency_locks(cfg, task):
+        yield
 
 
 def _group_allows(group: dict[str, Any], task: TaskRecord, machine: str) -> bool:
@@ -282,6 +278,8 @@ def _claim(
     with authority_locks(cfg, task):
         task = load_task(cfg, task_id)
         if not _eligible(cfg, task):
+            return None
+        if not dependency_gate(cfg, task).is_ready:
             return None
         group: dict[str, Any] | None = None
         worker: dict[str, Any] | None = None
