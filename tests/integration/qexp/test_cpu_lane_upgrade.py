@@ -176,3 +176,24 @@ def test_resume_rejects_tampered_attestation_binding(tmp_path: Path) -> None:
         resume_cpu_lane_upgrade(
             cfg, activation_id=session["activation_id"], machine_runtime_root=cfg.runtime_root
         )
+
+
+def test_resume_rejects_attestation_from_replaced_machine_runtime(tmp_path: Path) -> None:
+    cfg = _legacy_root(tmp_path)
+    first_runtime = tmp_path / "first-machine-runtime"
+    MachineRuntime(first_runtime).add_binding(cfg.shared_root, cfg.machine_name)
+    replacement_runtime = tmp_path / "replacement-machine-runtime"
+    MachineRuntime(replacement_runtime).add_binding(cfg.shared_root, cfg.machine_name)
+    session = start_cpu_lane_upgrade(cfg, machine_runtime_root=first_runtime)
+    attest_cpu_lane_upgrade(
+        cfg,
+        activation_id=session["activation_id"],
+        machine_name=cfg.machine_name,
+        machine_runtime_root=first_runtime,
+    )
+    with pytest.raises(ValueError, match="does not match the local machine runtime"):
+        resume_cpu_lane_upgrade(
+            cfg,
+            activation_id=session["activation_id"],
+            machine_runtime_root=replacement_runtime,
+        )
