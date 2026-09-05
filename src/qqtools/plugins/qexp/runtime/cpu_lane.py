@@ -194,6 +194,7 @@ def release_cpu_if_matches(runtime_root: Path, identity: Any, reason: str) -> bo
         if (
             reservation.get("reservation_id") != identity.reservation_id
             or reservation.get("acquisition_id") != identity.acquisition_id
+            or reservation.get("project_id") != identity.project_id
             or reservation.get("task_id") != identity.task_id
             or reservation.get("attempt_id") != identity.attempt_id
             or reservation.get("fencing_token") != identity.fencing_token

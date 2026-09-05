@@ -339,7 +339,7 @@ def reserved_gpu_ids(runtime_root: Path) -> set[int]:
 
 
 def active_reservations(runtime_root: Path) -> list[dict[str, Any]]:
-    return [value["reservation"] for value in _reservation_values(local_paths(runtime_root)["active"])]
+    return list(reservation_snapshot(runtime_root).active)
 
 
 def reservation_snapshot(runtime_root: Path) -> ReservationSnapshot:
@@ -358,7 +358,22 @@ def reservation_snapshot(runtime_root: Path) -> ReservationSnapshot:
             for gpu_id in reservation.get("gpu_ids", [])
             if type(gpu_id) is int
         }
-        return ReservationSnapshot(tuple(active), frozenset(reserved), tuple(provisional))
+        gpu_snapshot = ReservationSnapshot(tuple(active), frozenset(reserved), tuple(provisional))
+    # CPU and GPU reservations have independent locks and capacity domains.  Do not nest
+    # their locks: callers need one complete machine view, but neither lane may block a
+    # mutation in the other while it performs shared-root work.
+    from .cpu_lane import cpu_reservation_snapshot
+
+    _policy, cpu_reservations = cpu_reservation_snapshot(runtime_root)
+    return ReservationSnapshot(
+        gpu_snapshot.active + tuple(
+            item for item in cpu_reservations if item.get("state") == "active"
+        ),
+        gpu_snapshot.reserved_gpu_ids,
+        gpu_snapshot.provisional + tuple(
+            item for item in cpu_reservations if item.get("state") == "provisional"
+        ),
+    )
 
 
 def reconcile_snapshot(runtime_root: Path) -> ReservationSnapshot:
@@ -392,7 +407,19 @@ def reconcile_snapshot(runtime_root: Path) -> ReservationSnapshot:
             for gpu_id in reservation.get("gpu_ids", [])
             if type(gpu_id) is int
         }
-        return ReservationSnapshot(tuple(active), frozenset(reserved), tuple(provisional))
+        gpu_snapshot = ReservationSnapshot(tuple(active), frozenset(reserved), tuple(provisional))
+    from .cpu_lane import cpu_reservation_snapshot
+
+    _policy, cpu_reservations = cpu_reservation_snapshot(runtime_root)
+    return ReservationSnapshot(
+        gpu_snapshot.active + tuple(
+            item for item in cpu_reservations if item.get("state") == "active"
+        ),
+        gpu_snapshot.reserved_gpu_ids,
+        gpu_snapshot.provisional + tuple(
+            item for item in cpu_reservations if item.get("state") == "provisional"
+        ),
+    )
 
 
 def release_expired_provisionals(runtime_root: Path) -> list[str]:
