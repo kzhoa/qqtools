@@ -37,8 +37,8 @@ component = "qexp.cpu-lane-schema6-transition"
 kind = "persisted_schema"
 status = "compatibility_active"
 introduced_in = "1.3.15"
-legacy_removed_in = "1.3.17"
-transition_purged_in = "1.3.17"
+legacy_removed_in = "1.3.16"
+transition_purged_in = "1.3.16"
 marker = "QQTOOLS-COMPAT-0005"
 owner = "qexp.runtime"
 decision_refs = [
@@ -46,7 +46,7 @@ decision_refs = [
     "docs/spec/qexp_cpu_lane_compatibility.md",
 ]
 pitch_refs = [
-    "docs/pitch/qexp-cpu-only-task-scheduling.md",
+    "docs/pitch/arxiv/053-qexp-cpu-only-task-scheduling.md",
 ]
 verification = [
     "tests/integration/qexp/test_schema_compatibility.py",

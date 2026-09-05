@@ -19,16 +19,15 @@ in the feature release after a drained, attested transition.
 | Release | Legacy read boundary | Writes | Lifecycle obligation |
 | --- | --- | --- | --- |
 | 1.3.15 | Explicit upgrader reads drained legacy roots; new roots are canonical | Canonical writes after activation | Mark `compatibility_active`; no automatic conversion |
-| 1.3.16 | Ordinary legacy parsing is removed; upgrader retains restricted legacy reads | Canonical records outside upgrader | Mark `legacy_removed` |
-| 1.3.17 | No legacy decoder or upgrader | Canonical records only | Remove registry item, temporary code, markers, warnings and legacy fixtures |
+| 1.3.16 | No legacy decoder or upgrader | Canonical records only | Remove registry item, temporary code, markers, warnings and legacy fixtures |
 
-1.3.17 is the planned cleanup release. Delay requires an append-only registry extension backed by
+1.3.16 is the planned cleanup release. Delay requires an append-only registry extension backed by
 an approved decision, not an overwritten deadline. Until implementation, the item stays `planned`
 and its marker must not appear in source, tests or scripts.
 
 Compatibility permits new code to read or upgrade old GPU data within this window. It does not
 authorize pre-1.3.15 binaries to use activated roots. Canonical protocol and gate remain permanent
-after 1.3.17. Indefinite reading of unconverted legacy roots would be permanent multi-format
+after 1.3.16. Indefinite reading of unconverted legacy roots would be permanent multi-format
 support, not this temporary transition.
 
 ## Canonical data and upgrade scope
@@ -51,8 +50,8 @@ when the temporary reader is removed.
 ## Activation and permanent gate
 
 Use a durable CPU protocol marker with states `legacy`, `preparing`, `canonical`. Missing marker
-means legacy during 1.3.15/1.3.16. Fresh roots initialize canonical before accepting work. 1.3.17
-rejects existing legacy or preparing roots and directs operators to complete upgrade using 1.3.16;
+means legacy during 1.3.15. Fresh roots initialize canonical before accepting work. 1.3.16
+rejects existing legacy or preparing roots and directs operators to complete upgrade using 1.3.15;
 it must not treat an old root as empty.
 
 Add `required_capabilities: [cpu-lane-v1]` to the schema envelope; keep `version` and
@@ -112,11 +111,11 @@ Activation follows this sequence:
    registrations require formal retirement after execution is accounted for, not automatic skipping.
 
 This normalizes the affected protocol without cloning/replacing the whole root or invoking a
-schema-7 migration. 1.3.16/1.3.17 do not repeat activation or reset capacity on canonical roots.
+schema-7 migration. 1.3.16 does not repeat activation or reset capacity on canonical roots.
 Rollback of an activated root to pre-1.3.15 binaries is unsupported; old unactivated GPU roots
 remain usable by their old binaries.
 
-## Operator entry points (1.3.15 and 1.3.16)
+## Operator entry points (1.3.15)
 
 Provide a feature-specific `qexp upgrade cpu-lane` command group. It is independent of the
 existing `qexp migrate --to-schema` interface and the machine CPU-capacity configuration commands.
@@ -180,8 +179,8 @@ and `resume`. `status` with phase `completed` is the signal to restart agents/cl
 any project binding that the operator disabled. Upgrade does not re-enable bindings, start agents
 or set positive CPU capacity; allocate CPU slots separately with `agent cpu-lane set`.
 
-1.3.17 removes this temporary command group with the upgrader. Permanent first-open diagnostics
-on legacy/preparing roots direct operators to use 1.3.16 and the same commands to finish conversion;
+1.3.16 removes this temporary command group with the upgrader. Permanent first-open diagnostics
+on legacy/preparing roots direct operators to use 1.3.15 and the same commands to finish conversion;
 canonical roots need no upgrade command. Release cleanup includes parser entries and command
 fixtures as well as the underlying decoder and journal recovery implementation.
 
@@ -196,12 +195,10 @@ CPU transition coverage.
 
 - 1.3.15: legacy GPU reads; canonical GPU/CPU writes; missing/nonzero CPU policy; submission replay;
   old CLI/API/agent rejection before writes; offline participant refusal.
-- 1.3.16: ordinary legacy parsing rejected; upgrade of pre-1.3.15 roots supported; canonical 1.3.15
-  roots unchanged; terminal history inspect/retry works after normalization.
+- 1.3.16: canonical roots remain unchanged; legacy/preparing roots reject without mutation and
+  direct operators to 1.3.15.
 - Both transition releases: crashes after journal/gate installation, within batches and before
   canonical commit; forward recovery; no premature dispatch or old writer resurrection.
-- 1.3.17: canonical roots unchanged; legacy/preparing roots rejected without mutation; fresh roots
-  canonical; temporary markers and legacy fixtures absent.
 - Release preflight enforces the exact lifecycle. Retirement obligations for earlier compatibility
   items are independent of this new item's introduction.
 - Count gate-specific file reads: concurrent initial opens perform one validation per process/root;
@@ -220,4 +217,4 @@ CPU transition coverage.
 
 - [ADR-QEXP-0008](../adr/qexp/0008-cpu-lane-schema6-compatibility.md)
 - [Compatibility governance](compatibility-governance.md)
-- [CPU-only Task Lane pitch](../pitch/qexp-cpu-only-task-scheduling.md)
+- [CPU-only Task Lane pitch](../pitch/arxiv/053-qexp-cpu-only-task-scheduling.md)

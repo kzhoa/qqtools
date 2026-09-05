@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-08-31
+updated_at: 2026-09-05
 archived_at:
 ---
 
@@ -1383,6 +1383,12 @@ are exposed through Task/Group JSON, events, and `doctor` only.
 - `qexp task retry`
 - `qexp task cancel`
 - `qexp task offer`
+
+`qexp task list --format=json` returns stable Task summary records. In addition to identity,
+placement, phase, claim, and GPU fields, each record includes `depends_on_task_ids`,
+`dependency_state`, and `dependency_reasons`. The IDs are sorted; a Task with no prerequisites
+has `[]`, `ready`, and `[]` respectively. `dependency_state` is `ready`, `waiting`, `blocked`,
+or `invalid`; each reason is an object containing the prerequisite `task_id` and its reason.
 
 ### 16.3 Group Commands
 
