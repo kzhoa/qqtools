@@ -103,10 +103,16 @@ def _blockers(
     for path in iter_json(shared_paths(cfg.shared_root)["submissions"]):
         if read_json(path).get("submission", {}).get("state") not in {"committed", "aborted"}:
             blockers.append(f"operation:submission:{path.stem}")
-    for directory in ("availability", "group_control", "cleanup", "claim_pending"):
-        path = shared_paths(cfg.shared_root)[directory]
-        if iter_json(path):
-            blockers.append(f"operation:{directory}")
+    # Terminal operations are retained as audit history under the stable operation
+    # directories.  Only their active truth directories can prevent a cutover.
+    for directory in ("availability_active", "group_control_active", "cleanup_active"):
+        if iter_json(shared_paths(cfg.shared_root)[directory]):
+            blockers.append(f"operation:{directory.removesuffix('_active')}")
+    # Claim archive retries are stored one level below the pending root, so a
+    # top-level iter_json() would silently miss them.
+    pending_claims = shared_paths(cfg.shared_root)["claim_pending"]
+    if pending_claims.exists() and any(path.is_file() for path in pending_claims.rglob("*.json")):
+        blockers.append("operation:claim_pending")
     try:
         runtime, binding = _runtime_binding(cfg, machine_runtime_root)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
