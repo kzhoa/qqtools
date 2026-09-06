@@ -9,6 +9,7 @@ from .runtime.locks import exclusive
 from .runtime.paths import local_paths
 from .runtime.records import utc_now
 from .runtime.store import atomic_replace, read_json
+from .runtime.group_members import GROUP_READY_MEMBERS_CAPABILITY
 from .runtime.ready import READY_WRITER_CAPABILITY
 
 
@@ -47,6 +48,9 @@ def _write_machine_snapshots(
                         "observed_state": observed_state, "started_at": started_at,
                         "heartbeat_at": now, "heartbeat_interval_seconds": heartbeat_interval_seconds,
                         "writer_capability": READY_WRITER_CAPABILITY,
+                        "writer_capabilities": [
+                            READY_WRITER_CAPABILITY, GROUP_READY_MEMBERS_CAPABILITY,
+                        ],
                         "idle_since_at": idle_since_at, "active_attempt_ids": attempts,
                         "stop_reason": stop_reason}}
     gpu = {"gpu": {"machine_name": cfg.machine_name, "observed_at": now,

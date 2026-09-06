@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- feat: add the qexp Group live-ready membership projection with resumable activation, bounded
+  rebuild audits, exact primary-candidate updates, and the three-release schema compatibility
+  transition required before narrow schema writers become active.
+- fix: keep Group member-projection repair within its paging budget by advancing only one slice per
+  `doctor repair` invocation and returning `building` until the operator resumes it.
+
 ## v1.3.15
 
 - feat: add qexp Task dependencies with validated DAG submission and editing, claim-time dependency

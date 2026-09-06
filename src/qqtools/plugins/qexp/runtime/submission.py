@@ -17,6 +17,7 @@ from .locks import (
     task_lock,
     task_locks,
 )
+from .group_members import assert_group_ready_members_writable
 from .paths import group_path, idempotency_path, machine_path, shared_paths, submission_path, task_path
 from .records import (
     TaskRecord,
@@ -42,7 +43,7 @@ from .active_operations import operation_exists
 from .store import atomic_replace, create_if_absent, read_json
 from .availability import remove_deadline_index, sync_deadline_index
 from .tasks import save_task
-from ..layout import is_cpu_lane_root, is_task_dependencies_root
+from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_task_dependencies_root
 from .dependencies import normalize_dependency_ids, validate_group_dependencies
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
 
@@ -418,6 +419,8 @@ def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
     if not group_name:
         return
     with group_writer_lock(cfg, group_name):
+        if is_group_ready_members_root(cfg):
+            assert_group_ready_members_writable(cfg)
         group_file = group_path(cfg.shared_root, group_name)
         if not group_file.exists():
             raise RuntimeError(
@@ -523,6 +526,8 @@ def submit_specs(
             planned_workers: dict[str, dict[str, Any]] = {}
             if group_name:
                 with group_lock(cfg.shared_root, group_name):
+                    if is_group_ready_members_root(cfg):
+                        assert_group_ready_members_writable(cfg)
                     group_file = group_path(cfg.shared_root, group_name)
                     group = read_json(group_file) if group_file.exists() else None
                     if group is not None:
@@ -626,6 +631,10 @@ def submit_specs(
                     "worker_set_additions": operation["submission"]["resolved_context"].get("worker_set_additions", []),
                 }
                 workers = group["group"]["worker_set"]
+                previous_workers = {
+                    worker_name: dict(worker)
+                    for worker_name, worker in workers.items()
+                }
                 projection_routes = primary_projection_routes_for_group(cfg, group_name)
                 added_workers: list[dict[str, Any]] = []
                 added_worker_machines: list[str] = []
@@ -658,7 +667,9 @@ def submit_specs(
                     ]
                     with primary_projection_transaction(cfg, routes):
                         _write_group_record(cfg, group_file, group)
-                        sync_primary_ready_group(cfg, group_name)
+                        sync_primary_ready_group(
+                            cfg, group_name, previous_workers=previous_workers
+                        )
                 else:
                     _write_group_record(cfg, group_file, group)
         else:

@@ -32,6 +32,7 @@ from .layout import load_root_config, machine_state_path, runtime_pid_path
 from .project_maintenance import maintain_project, reconcile_reservation
 from .runtime.paths import local_paths
 from .runtime.records import TaskSpec, normalize_group_record, utc_now
+from .runtime.group_members import is_group_ready_member_projection_usable
 from .runtime.reservations import (
     ReservationIdentity,
     ReservationSnapshot,
@@ -151,6 +152,9 @@ def _probe_primary_demand(
             return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
         if ready_state != "active":
             diagnostics.append({"project_id": project_id, "reason": "ready_index_unresolved"})
+            return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+        if not is_group_ready_member_projection_usable(cfg):
+            diagnostics.append({"project_id": project_id, "reason": "group_ready_members_unresolved"})
             return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
         for scope in ("shared", "home"):
             cursor_key = (project_id, scope, lane)

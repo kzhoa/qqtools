@@ -9,6 +9,7 @@ from ..config_types import RootConfig
 from ..lifecycle import (TerminalTransition, commit_terminal_transition_locked,
                          dispatch_task_lifecycle_hooks_noexcept)
 from ..runtime.claims import archive_claim
+from ..runtime.group_members import assert_group_ready_members_writable
 from ..runtime.locks import group_writer_lock, task_lock
 from ..runtime.paths import attempt_path, group_path, shared_paths, submission_path
 from ..runtime.records import (AttemptRecord, SCHEMA_VERSION, TaskRecord, new_group, new_id,
@@ -29,6 +30,7 @@ from ..runtime.active_operations import (
     write_active_operation,
 )
 from ..runtime.submission import finalize_submission_group
+from ..layout import is_group_ready_members_root
 from .task import has_cleanup_operation, is_cleanup_blocked, retry
 
 
@@ -424,6 +426,8 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
     path = group_path(cfg.shared_root, validate_group_name(group_name) or group_name)
     _finalize_pending_submission_before_group_mutation(cfg, group_name, path)
     with group_writer_lock(cfg, group_name):
+        if is_group_ready_members_root(cfg):
+            assert_group_ready_members_writable(cfg)
         data = read_json(path)
         normalize_group_record(data)
         pending = data["group"].get("pending_submission_commit")
@@ -440,6 +444,10 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                 f"Group {group_name!r} received a concurrent submission commit; retry the mutation."
             )
         workers = data["group"]["worker_set"]
+        previous_workers = {
+            worker_name: dict(worker)
+            for worker_name, worker in workers.items()
+        }
         projection_routes = primary_projection_routes_for_group(cfg, group_name)
         worker_changed = True
         if has_gpu_limit:
@@ -552,7 +560,9 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                 cfg, sorted(set(projection_routes + [("shared", machine), ("home", machine)]))
             ):
                 atomic_replace(path, data)
-                sync_primary_ready_group(cfg, group_name)
+                sync_primary_ready_group(
+                    cfg, group_name, previous_workers=previous_workers
+                )
             return data
         else:
             raise ValueError(f"unknown Worker Set action {action!r}.")
@@ -569,7 +579,9 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                 cfg, sorted(set(projection_routes + [("shared", machine), ("home", machine)]))
             ):
                 atomic_replace(path, data)
-                sync_primary_ready_group(cfg, group_name)
+                sync_primary_ready_group(
+                    cfg, group_name, previous_workers=previous_workers
+                )
         else:
             atomic_replace(path, data)
         return data

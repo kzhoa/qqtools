@@ -17,23 +17,8 @@ pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
 def _activate_narrow_submission_protocol(cfg, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Create the 0008 activation evidence without enabling its unfinished projection writer."""
-    from qqtools.plugins.qexp import layout
-    from qqtools.plugins.qexp.runtime.store import atomic_replace
-
-    monkeypatch.setattr(
-        layout,
-        "SUPPORTED_REQUIRED_CAPABILITIES",
-        layout.SUPPORTED_REQUIRED_CAPABILITIES | {"group-ready-members-v1"},
-    )
-    schema_path = cfg.shared_root / "schema" / "version.json"
-    schema = read_json(schema_path)
-    schema["schema"]["required_capabilities"].append("group-ready-members-v1")
-    atomic_replace(schema_path, schema)
-    atomic_replace(
-        cfg.shared_root / "indexes" / "ready" / "group-members" / "state.json",
-        {"group_ready_members": {"state": "active"}},
-    )
+    """Assert that a newly initialized root has the real joint activation evidence."""
+    del monkeypatch
     from qqtools.plugins.qexp.runtime.locks import is_schema_narrow_protocol_active
 
     assert is_schema_narrow_protocol_active(cfg)

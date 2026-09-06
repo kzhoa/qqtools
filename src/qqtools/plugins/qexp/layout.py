@@ -51,7 +51,10 @@ def read_schema_version(cfg: RootConfig) -> int | None:
 
 CPU_LANE_CAPABILITY = "cpu-lane-v1"
 TASK_DEPENDENCIES_CAPABILITY = "task-dependencies-v1"
-SUPPORTED_REQUIRED_CAPABILITIES = frozenset({CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY})
+GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
+SUPPORTED_REQUIRED_CAPABILITIES = frozenset({
+    CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY, GROUP_READY_MEMBERS_CAPABILITY,
+})
 # QQTOOLS-COMPAT-0005: legacy GPU-only roots remain readable and writable through 1.3.17.
 
 
@@ -84,6 +87,19 @@ def is_task_dependencies_root(cfg: RootConfig) -> bool:
     if unknown:
         raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
     return TASK_DEPENDENCIES_CAPABILITY in capabilities
+
+
+def is_group_ready_members_root(cfg: RootConfig) -> bool:
+    """Return whether the root requires the Group ready-member projection."""
+    capabilities = read_json(_schema_path(cfg)).get("schema", {}).get("required_capabilities")
+    if capabilities is None:
+        return False
+    if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
+        raise RuntimeError("qexp schema/version.json has malformed required capabilities.")
+    unknown = sorted(set(capabilities) - SUPPORTED_REQUIRED_CAPABILITIES)
+    if unknown:
+        raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
+    return GROUP_READY_MEMBERS_CAPABILITY in capabilities
 
 
 def validate_root_contract(cfg: RootConfig) -> None:
@@ -172,9 +188,15 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                 "version": SCHEMA_VERSION,
                 "minimum_reader_version": SCHEMA_VERSION,
                 "created_at": utc_now(),
-                "required_capabilities": [CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY],
+                "required_capabilities": [
+                    CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY,
+                    GROUP_READY_MEMBERS_CAPABILITY,
+                ],
             }}
             atomic_replace(_schema_path(cfg), schema)
+            from .runtime.group_members import initialize_group_ready_members
+
+            initialize_group_ready_members(cfg)
     ensure_machine_layout(cfg)
     identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
     if not identity_path.exists():

@@ -242,6 +242,8 @@ def test_final_audit_rechecks_schema_writer_gate(tmp_path: Path) -> None:
     atomic_replace(schema_path, schema)
 
     record = advance_ready_index_build(cfg, max_tasks=1)
+    assert record["build"]["phase"] == "primary-rebuild"
+    record = advance_ready_index_build(cfg, max_tasks=1)
 
     assert record["state"] == "degraded"
     assert any("capability gate is missing" in reason for reason in record["degraded_reasons"])

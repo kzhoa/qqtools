@@ -1,6 +1,6 @@
 ---
 doc_type: spec
-status: drafting
+status: active
 updated_at: 2026-09-06
 archived_at:
 ---
@@ -1981,7 +1981,53 @@ Manual confirmation is required when:
 Every repair is revisioned and emits an audit event. `doctor` must return a specific
 unresolved action rather than reporting generic inconsistency.
 
-## 20. Crash-Window Matrix
+## 20. Group live-ready membership and joint schema activation
+
+`group-ready-members-v1` is a required schema capability. Its `indexes/ready/group-members`
+projection is derived only: Group, Task, Submission, ready-marker, and primary-candidate records
+remain authoritative. Every grouped ready generation has one stable
+`group_name + task_id + generation` member identity, a precise locator, and enough marker-route
+metadata to recompute primary candidates without loading historical Task records.
+
+Member publication and retirement follow `Schema -> Group -> Task` authority ordering. Catalog,
+partition, count, digest, identity, and locator consistency are checked before a Group worker
+mutation consumes members. An invalid member projection is durably marked `degraded` before Group
+truth is changed; primary probes then return unresolved and deny new borrow admission. Exact
+identity and member revision checks make delayed cleanup a no-op after slot reuse.
+
+New roots initialize an empty active projection. Existing roots use the resumable
+`group-ready-members` upgrade: it writes `building`, installs the required capability as the
+writer-gate commit point, captures the legacy Task directory through a durable Linux
+directory-offset cursor, and writes watermark pages of at most 64 identities. Each resume consumes
+at most its declared entry budget and commits the capture cursor outside the short member-state
+fence; it never does an initial, held-lock full-directory inventory. It then backfills bounded
+pages while new writers dual-publish, captures and audits Task and actual member pages through
+durable cursors. Each Group-member audit snapshots `membership_revision`; a concurrent member
+publication or retirement restarts only that Group's audit instead of degrading the projection.
+Before the final Task watermark capture begins, the primary candidate rebuild atomically parks the
+old route tree under its build ID and establishes an empty owner-fenced route tree using bounded
+directory metadata operations. It does not enumerate or recursively delete candidates while holding
+the schema lock. Ready writers then dual-write into that cleared projection for every later Task or
+Group mutation, including work outside the final watermark. A missing captured Task is a legal
+cleanup tombstone. The primary rebuild is made active before, and is recoverable across, the final
+member `active` commit; it never performs a final full Task scan.
+This active-state commit jointly enables
+`QQTOOLS-COMPAT-0009` shared schema writer sections. Before it, all writers retain the legacy
+exclusive schema fence. Older writers fail before mutation because they do not recognize the
+required capability.
+
+Each Group catalog records only active pages and bounded reusable-page metadata. Empty pages are
+reclaimed, and publications select an existing writable page before allocating a new one; therefore
+Group-member reads visit only pages containing current members and cannot grow with retired-history
+churn.
+
+`doctor verify` reports member projection damage; `doctor repair` rebuilds a degraded projection
+from authority truth. Each `doctor repair` invocation advances at most one member-projection slice
+and returns `building` while more work remains; operators repeat the same command until it returns
+`active` or `degraded`. Recovery cannot treat an incomplete projection as proof that no primary
+work exists.
+
+## 21. Crash-Window Matrix
 
 | ID | Crash window | Required state after convergence |
 | :--- | :--- | :--- |
@@ -2005,7 +2051,7 @@ unresolved action rather than reporting generic inconsistency.
 | CW-18 | CLI restarts while Group cancellation waits for acknowledgements | Durable Group control operation resumes with the same pending-machine set |
 | CW-19 | Schema/capability mutation races an authoritative Task or Group writer | Exclusive schema mutation waits for the writer; the writer observes one schema protocol for its complete authority section |
 
-## 21. Verification Requirements
+## 22. Verification Requirements
 
 The project verifies its coordination protocol on one development machine using independent
 processes with isolated local runtime resources and one shared POSIX project root. This evidence
@@ -2043,7 +2089,7 @@ The runtime implementation is not releasable until tests demonstrate:
 Cross-machine correctness tests must run against every supported shared-filesystem profile.
 Mock-only tests are insufficient for the coordination release gate.
 
-## 22. Explicit Non-Goals
+## 23. Explicit Non-Goals
 
 - backward compatibility with Batch-era `.qexp` data
 - a public Batch truth object
