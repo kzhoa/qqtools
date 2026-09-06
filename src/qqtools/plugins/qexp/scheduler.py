@@ -893,40 +893,43 @@ def _run_dispatch_cycle(
         inspected = inspected_ready if inspected_ready is not None else set()
         cursor_project_id = ready_cursor_namespace or project_id or "standalone"
         scopes = ("home", "shared")
-        candidates: list[tuple[ReadyMarkerRef, str]] = []
         scope_identities: dict[str, set[str]] = {scope: set() for scope in scopes}
-        while (
-            len(candidates) < sizer.batch_size
-            and budget.can_start_record(operations=3)
-        ):
-            made_progress = False
-            for scope in scopes:
-                if (
-                    len(candidates) >= sizer.batch_size
-                    or not budget.can_start_record(operations=3)
-                ):
-                    break
-                reference, has_wrapped = next_ready_marker(
-                    cfg,
-                    cursor_project_id,
-                    scope,
-                    scope_identities[scope],
-                )
-                if has_wrapped:
-                    diagnostic_increment("scheduler.ready.cursor_wraps")
-                if reference is None:
-                    continue
-                identity = (cursor_project_id, scope, reference.identity)
-                if identity in inspected:
+        batch_limit = sizer.batch_size
+
+        def iter_candidates() -> Iterator[tuple[ReadyMarkerRef, str]]:
+            # Advance the durable cursor only when the caller is ready to process a candidate.
+            candidate_count = 0
+            while candidate_count < batch_limit and budget.can_start_record(operations=3):
+                made_progress = False
+                for scope in scopes:
+                    if (
+                        candidate_count >= batch_limit
+                        or not budget.can_start_record(operations=3)
+                    ):
+                        break
+                    reference, has_wrapped = next_ready_marker(
+                        cfg,
+                        cursor_project_id,
+                        scope,
+                        scope_identities[scope],
+                    )
+                    if has_wrapped:
+                        diagnostic_increment("scheduler.ready.cursor_wraps")
+                    if reference is None:
+                        continue
+                    identity = (cursor_project_id, scope, reference.identity)
+                    if identity in inspected:
+                        made_progress = True
+                        continue
+                    scope_identities[scope].add(reference.identity)
+                    budget.consume_record(operations=3)
+                    candidate_count += 1
                     made_progress = True
-                    continue
-                scope_identities[scope].add(reference.identity)
-                budget.consume_record(operations=3)
-                candidates.append((reference, scope))
-                made_progress = True
-            if not made_progress:
-                break
-        for reference, _scope in candidates:
+                    yield reference, scope
+                if not made_progress:
+                    break
+
+        for reference, _scope in iter_candidates():
             inspected.add((cursor_project_id, _scope, reference.identity))
             started_ns = time.monotonic_ns()
             diagnostic_increment("scheduler.ready.markers_inspected")
