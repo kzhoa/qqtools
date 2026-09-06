@@ -11,31 +11,22 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..locks import exclusive, schema_lock, schema_writer_lock
-from .group_members import (
-    is_group_ready_member_projection_usable,
-    publish_group_ready_member,
-    read_group_ready_members,
-    retire_group_ready_member,
-    group_ready_members_state,
-)
 from ..paths import group_path, ready_state_path, shared_paths, submission_path, task_path
 from ..records import TaskRecord, normalize_group_record, utc_now, validate_identifier
 from ..store import atomic_replace, iter_json, read_json
 from ..work_budget import SliceBudget
-from . import primary_candidates
+from . import primary_candidates, routes, state
+from .group_members import (
+    group_ready_members_state,
+    is_group_ready_member_projection_usable,
+    publish_group_ready_member,
+    read_group_ready_members,
+    retire_group_ready_member,
+)
 from .records import ReadyMarkerRef, ReadyScope
-from . import state
 
-READY_PARTITION_SLOTS = 64
-READY_CATALOG_PAGE_SIZE = 64
 READY_BUILD_PAGE_SIZE = 64
-ReadyClassification = Literal[
-    "claimable", "temporarily_unavailable", "permanently_stale", "corrupt"
-]
-
-
-class ReadyProbeBudgetExhausted(RuntimeError):
-    """Raised when a bounded ready revision read cannot start safely."""
+ReadyClassification = Literal["claimable", "temporarily_unavailable", "permanently_stale", "corrupt"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,16 +68,21 @@ def _build_page_path(cfg: object, build_id: str, page: int) -> Path:
 
 
 def _write_build_page(
-    cfg: object, build_id: str, page: int, task_ids: list[str],
+    cfg: object,
+    build_id: str,
+    page: int,
+    task_ids: list[str],
 ) -> None:
     atomic_replace(
         _build_page_path(cfg, build_id, page),
-        {"ready_build_page": {
-            "schema_version": state.READY_PROTOCOL_VERSION,
-            "build_id": build_id,
-            "page": page,
-            "task_ids": list(task_ids),
-        }},
+        {
+            "ready_build_page": {
+                "schema_version": state.READY_PROTOCOL_VERSION,
+                "build_id": build_id,
+                "page": page,
+                "task_ids": list(task_ids),
+            }
+        },
     )
 
 
@@ -197,11 +193,6 @@ def begin_ready_index_build(cfg: object, *, is_repair: bool = False) -> dict[str
         return record
 
 
-def _route_key(scope: ReadyScope, home_machine: str) -> str:
-    validate_identifier(home_machine, "home_machine")
-    return f"home.{home_machine}" if scope == "home" else "shared"
-
-
 def is_primary_ready_index_active(cfg: object) -> bool:
     """Return whether the primary-only candidate projection is usable."""
     return primary_candidates.is_projection_active(cfg) and is_group_ready_member_projection_usable(cfg)
@@ -211,39 +202,6 @@ def begin_primary_ready_index_rebuild(cfg: object, build_id: str) -> None:
     """Initialize the ready layout before starting a candidate-only rebuild."""
     state.ensure_ready_layout(cfg)
     primary_candidates.begin_primary_ready_index_rebuild(cfg, build_id)
-
-
-def _route_directory(root: Path, scope: ReadyScope, home_machine: str) -> Path:
-    paths = shared_paths(root)
-    if scope == "home":
-        return paths["ready_home"] / home_machine
-    return paths["ready_shared"]
-
-
-def _reservation_path(root: Path, task_id: str, generation: int) -> Path:
-    return shared_paths(root)["ready_reservations"] / f"{task_id}.{generation}.json"
-
-
-def _allocator_path(root: Path, route_key: str) -> Path:
-    return shared_paths(root)["ready"] / "allocators" / f"{route_key}.json"
-
-
-def _catalog_path(root: Path, route_key: str, page: int) -> Path:
-    return shared_paths(root)["ready_catalogs"] / route_key / f"{page:016d}.json"
-
-
-def _partition_record_path(
-    root: Path, scope: ReadyScope, home_machine: str, partition: str,
-) -> Path:
-    return _route_directory(root, scope, home_machine) / partition / "partition.json"
-
-
-def _marker_path(root: Path, reference: ReadyMarkerRef) -> Path:
-    return (
-        _route_directory(root, reference.queue_scope, reference.home_machine)
-        / reference.partition
-        / reference.marker_name
-    )
 
 
 def _cursor_path(root: Path, project_id: str, machine_name: str, scope: ReadyScope) -> Path:
@@ -257,7 +215,9 @@ def _default_cursor(project_id: str, machine_name: str, scope: ReadyScope) -> Re
 
 
 def load_ready_cursor(
-    cfg: object, project_id: str, queue_scope: ReadyScope,
+    cfg: object,
+    project_id: str,
+    queue_scope: ReadyScope,
 ) -> ReadyCursor:
     """Load advisory candidate progress, falling back conservatively on damage."""
     path = _cursor_path(cfg.shared_root, project_id, cfg.machine_name, queue_scope)
@@ -266,8 +226,14 @@ def load_ready_cursor(
     try:
         record = read_json(path)["cursor"]
         if set(record) != {
-            "schema_version", "project_id", "machine_name", "queue_scope",
-            "catalog_page", "partition", "after_name", "revision",
+            "schema_version",
+            "project_id",
+            "machine_name",
+            "queue_scope",
+            "catalog_page",
+            "partition",
+            "after_name",
+            "revision",
         }:
             raise ValueError("ready cursor schema is invalid.")
         if (
@@ -283,8 +249,13 @@ def load_ready_cursor(
         if page is not None:
             page = int(page)
         return ReadyCursor(
-            project_id, cfg.machine_name, queue_scope, page, record["partition"],
-            record["after_name"], record["revision"],
+            project_id,
+            cfg.machine_name,
+            queue_scope,
+            page,
+            record["partition"],
+            record["after_name"],
+            record["revision"],
         )
     except (KeyError, TypeError, ValueError):
         return _default_cursor(project_id, cfg.machine_name, queue_scope)
@@ -292,21 +263,19 @@ def load_ready_cursor(
 
 def _save_ready_cursor(cfg: object, cursor: ReadyCursor) -> None:
     atomic_replace(
-        _cursor_path(
-            cfg.shared_root, cursor.project_id, cursor.machine_name, cursor.queue_scope
-        ),
-        {"cursor": {
-            "schema_version": state.READY_PROTOCOL_VERSION,
-            "project_id": cursor.project_id,
-            "machine_name": cursor.machine_name,
-            "queue_scope": cursor.queue_scope,
-            "catalog_page": (
-                None if cursor.catalog_page is None else str(cursor.catalog_page)
-            ),
-            "partition": cursor.partition,
-            "after_name": cursor.after_name,
-            "revision": cursor.revision,
-        }},
+        _cursor_path(cfg.shared_root, cursor.project_id, cursor.machine_name, cursor.queue_scope),
+        {
+            "cursor": {
+                "schema_version": state.READY_PROTOCOL_VERSION,
+                "project_id": cursor.project_id,
+                "machine_name": cursor.machine_name,
+                "queue_scope": cursor.queue_scope,
+                "catalog_page": (None if cursor.catalog_page is None else str(cursor.catalog_page)),
+                "partition": cursor.partition,
+                "after_name": cursor.after_name,
+                "revision": cursor.revision,
+            }
+        },
     )
 
 
@@ -322,18 +291,14 @@ def _reference_from_slot(
     generation = int(generation_value) if separator else -1
     home_machine = cfg.machine_name
     if scope == "shared":
-        provisional = ReadyMarkerRef(
-            task_id, generation, scope, home_machine, partition, catalog_page, marker_name
-        )
+        provisional = ReadyMarkerRef(task_id, generation, scope, home_machine, partition, catalog_page, marker_name)
         try:
-            marker = read_json(_marker_path(cfg.shared_root, provisional))["ready_marker"]
+            marker = read_json(routes.marker_path(cfg.shared_root, provisional))["ready_marker"]
             if isinstance(marker.get("home_machine"), str):
                 home_machine = marker["home_machine"]
         except (FileNotFoundError, KeyError, TypeError, ValueError):
             pass
-    return ReadyMarkerRef(
-        task_id, generation, scope, home_machine, partition, catalog_page, marker_name
-    )
+    return ReadyMarkerRef(task_id, generation, scope, home_machine, partition, catalog_page, marker_name)
 
 
 def _is_partition_referenced_under_route_lock(
@@ -370,16 +335,21 @@ def next_ready_marker(
 ) -> tuple[ReadyMarkerRef | None, bool]:
     """Return and durably advance past one marker without unbounded enumeration."""
     cursor = load_ready_cursor(cfg, project_id, queue_scope)
-    route_key = _route_key(queue_scope, cfg.machine_name)
+    route_key = routes.route_key(queue_scope, cfg.machine_name)
     page_number = cursor.catalog_page or 0
-    page_path = _catalog_path(cfg.shared_root, route_key, page_number)
+    page_path = routes.catalog_path(cfg.shared_root, route_key, page_number)
     if not page_path.exists():
         if page_number == 0:
             return None, False
         _save_ready_cursor(
             cfg,
             ReadyCursor(
-                project_id, cfg.machine_name, queue_scope, 0, None, None,
+                project_id,
+                cfg.machine_name,
+                queue_scope,
+                0,
+                None,
+                None,
                 cursor.revision + 1,
             ),
         )
@@ -388,13 +358,9 @@ def next_ready_marker(
         catalog = read_json(page_path)["ready_catalog"]
         partitions = catalog["partitions"]
         successor = catalog.get("successor")
-        if not isinstance(partitions, list) or not all(
-            isinstance(item, str) for item in partitions
-        ):
+        if not isinstance(partitions, list) or not all(isinstance(item, str) for item in partitions):
             raise ValueError("ready catalog partitions are invalid.")
-        if successor is not None and (
-            not isinstance(successor, int) or successor < 0
-        ):
+        if successor is not None and (not isinstance(successor, int) or successor < 0):
             raise ValueError("ready catalog successor is invalid.")
     except (KeyError, TypeError, ValueError):
         state.mark_ready_index_degraded(cfg, f"catalog_invalid:{route_key}:{page_number}")
@@ -413,14 +379,17 @@ def next_ready_marker(
         _save_ready_cursor(
             cfg,
             ReadyCursor(
-                project_id, cfg.machine_name, queue_scope, next_page, None, None,
+                project_id,
+                cfg.machine_name,
+                queue_scope,
+                next_page,
+                None,
+                None,
                 cursor.revision + 1,
             ),
         )
         return None, has_wrapped
-    partition_path = _partition_record_path(
-        cfg.shared_root, queue_scope, cfg.machine_name, partition_name
-    )
+    partition_path = routes.partition_record_path(cfg.shared_root, queue_scope, cfg.machine_name, partition_name)
     try:
         partition = read_json(partition_path)["ready_partition"]
         slots = partition["slots"]
@@ -428,12 +397,8 @@ def next_ready_marker(
             raise ValueError("ready partition slots are invalid.")
         names = sorted(slots)
     except FileNotFoundError:
-        if _is_partition_referenced_under_route_lock(
-            cfg, route_key, page_path, page_number, partition_name
-        ):
-            state.mark_ready_index_degraded(
-                cfg, f"partition_missing:{route_key}:{partition_name}"
-            )
+        if _is_partition_referenced_under_route_lock(cfg, route_key, page_path, page_number, partition_name):
+            state.mark_ready_index_degraded(cfg, f"partition_missing:{route_key}:{partition_name}")
             return None, False
         names = []
     except (KeyError, TypeError, ValueError):
@@ -442,23 +407,31 @@ def next_ready_marker(
     for marker_name in names:
         if after_name is not None and marker_name <= after_name:
             continue
-        reference = _reference_from_slot(
-            cfg, queue_scope, page_number, partition_name, marker_name
-        )
+        reference = _reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name)
         if excluded_identities is not None and reference.identity in excluded_identities:
             _save_ready_cursor(
                 cfg,
                 ReadyCursor(
-                    project_id, cfg.machine_name, queue_scope, page_number,
-                    partition_name, marker_name, cursor.revision + 1,
+                    project_id,
+                    cfg.machine_name,
+                    queue_scope,
+                    page_number,
+                    partition_name,
+                    marker_name,
+                    cursor.revision + 1,
                 ),
             )
             return None, True
         _save_ready_cursor(
             cfg,
             ReadyCursor(
-                project_id, cfg.machine_name, queue_scope, page_number, partition_name,
-                marker_name, cursor.revision + 1,
+                project_id,
+                cfg.machine_name,
+                queue_scope,
+                page_number,
+                partition_name,
+                marker_name,
+                cursor.revision + 1,
             ),
         )
         return reference, False
@@ -477,7 +450,12 @@ def next_ready_marker(
     _save_ready_cursor(
         cfg,
         ReadyCursor(
-            project_id, cfg.machine_name, queue_scope, next_page, next_partition, None,
+            project_id,
+            cfg.machine_name,
+            queue_scope,
+            next_page,
+            next_partition,
+            None,
             cursor.revision + 1,
         ),
     )
@@ -498,13 +476,13 @@ def peek_ready_marker(
     read is preceded by an operation-budget check.
     """
     current = cursor or _default_cursor(project_id, cfg.machine_name, queue_scope)
-    route_key = _route_key(queue_scope, cfg.machine_name)
+    route_key = routes.route_key(queue_scope, cfg.machine_name)
     page_number = current.catalog_page or 0
     partition_name = current.partition
     after_name = current.after_name
     progress_cursor = current
     while True:
-        page_path = _catalog_path(cfg.shared_root, route_key, page_number)
+        page_path = routes.catalog_path(cfg.shared_root, route_key, page_number)
         if not budget.can_start_operation():
             return ReadyPeek(None, progress_cursor, exhausted=True)
         budget.consume_operation()
@@ -527,7 +505,7 @@ def peek_ready_marker(
                 or catalog.get("route") != route_key
                 or catalog.get("page") != page_number
                 or not isinstance(partitions, list)
-                or len(partitions) > READY_CATALOG_PAGE_SIZE
+                or len(partitions) > routes.READY_CATALOG_PAGE_SIZE
                 or not all(isinstance(item, str) for item in partitions)
                 or (successor is not None and (not isinstance(successor, int) or successor < 0))
             ):
@@ -544,7 +522,7 @@ def peek_ready_marker(
             after_name = None
         while partition_index < len(partitions):
             partition_name = partitions[partition_index]
-            partition_path = _partition_record_path(
+            partition_path = routes.partition_record_path(
                 cfg.shared_root, queue_scope, cfg.machine_name, partition_name
             )
             if not budget.can_start_operation():
@@ -558,7 +536,7 @@ def peek_ready_marker(
                     or partition.get("route") != route_key
                     or partition.get("partition") != partition_name
                     or not isinstance(slots, list)
-                    or len(slots) > READY_PARTITION_SLOTS
+                    or len(slots) > routes.READY_PARTITION_SLOTS
                     or not all(isinstance(name, str) for name in slots)
                 ):
                     raise ValueError("ready partition is invalid.")
@@ -567,18 +545,12 @@ def peek_ready_marker(
                 if not budget.can_start_operation():
                     return ReadyPeek(None, progress_cursor, exhausted=True)
                 budget.consume_operation()
-                if _is_partition_referenced_under_route_lock(
-                    cfg, route_key, page_path, page_number, partition_name
-                ):
-                    state.mark_ready_index_degraded(
-                        cfg, f"partition_missing:{route_key}:{partition_name}"
-                    )
+                if _is_partition_referenced_under_route_lock(cfg, route_key, page_path, page_number, partition_name):
+                    state.mark_ready_index_degraded(cfg, f"partition_missing:{route_key}:{partition_name}")
                     return ReadyPeek(None, current, unresolved=True)
                 names = []
             except (KeyError, TypeError, ValueError):
-                state.mark_ready_index_degraded(
-                    cfg, f"partition_invalid:{route_key}:{partition_name}"
-                )
+                state.mark_ready_index_degraded(cfg, f"partition_invalid:{route_key}:{partition_name}")
                 return ReadyPeek(None, current, unresolved=True)
             for marker_name in names:
                 if after_name is not None and marker_name <= after_name:
@@ -586,24 +558,37 @@ def peek_ready_marker(
                 if not budget.can_start_operation():
                     return ReadyPeek(None, progress_cursor, exhausted=True)
                 budget.consume_operation()
-                reference = _reference_from_slot(
-                    cfg, queue_scope, page_number, partition_name, marker_name
-                )
+                reference = _reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name)
                 next_cursor = ReadyCursor(
-                    project_id, cfg.machine_name, queue_scope, page_number,
-                    partition_name, marker_name, current.revision + 1,
+                    project_id,
+                    cfg.machine_name,
+                    queue_scope,
+                    page_number,
+                    partition_name,
+                    marker_name,
+                    current.revision + 1,
                 )
                 return ReadyPeek(reference, next_cursor)
             progress_cursor = ReadyCursor(
-                project_id, cfg.machine_name, queue_scope, page_number,
-                partition_name, names[-1] if names else "", current.revision + 1,
+                project_id,
+                cfg.machine_name,
+                queue_scope,
+                page_number,
+                partition_name,
+                names[-1] if names else "",
+                current.revision + 1,
             )
             partition_index += 1
             after_name = None
 
         if successor is not None:
             progress_cursor = ReadyCursor(
-                project_id, cfg.machine_name, queue_scope, successor, None, None,
+                project_id,
+                cfg.machine_name,
+                queue_scope,
+                successor,
+                None,
+                None,
                 current.revision + 1,
             )
             page_number = successor
@@ -612,8 +597,7 @@ def peek_ready_marker(
             continue
         return ReadyPeek(
             None,
-            ReadyCursor(project_id, cfg.machine_name, queue_scope, 0, None, None,
-                        current.revision + 1),
+            ReadyCursor(project_id, cfg.machine_name, queue_scope, 0, None, None, current.revision + 1),
             wrapped=True,
         )
 
@@ -629,14 +613,14 @@ def peek_primary_ready_marker(
     current = cursor or _default_cursor(project_id, cfg.machine_name, queue_scope)
     if not primary_candidates.is_projection_active(cfg):
         return ReadyPeek(None, current, unresolved=True)
-    route_key = _route_key(queue_scope, cfg.machine_name)
+    route_key = routes.route_key(queue_scope, cfg.machine_name)
     primary_route = primary_candidates.route_key(queue_scope, cfg.machine_name)
     page_number = current.catalog_page or 0
     partition_name = current.partition
     after_name = current.after_name
     progress_cursor = current
     while True:
-        page_path = _catalog_path(cfg.shared_root, route_key, page_number)
+        page_path = routes.catalog_path(cfg.shared_root, route_key, page_number)
         if not budget.can_start_operation():
             return ReadyPeek(None, progress_cursor, exhausted=True)
         budget.consume_operation()
@@ -647,7 +631,7 @@ def peek_primary_ready_marker(
             if not isinstance(partitions, list) or not all(isinstance(item, str) for item in partitions):
                 raise ValueError("primary catalog is invalid.")
         except FileNotFoundError:
-            if page_number == 0 and not _allocator_path(cfg.shared_root, route_key).exists():
+            if page_number == 0 and not routes.allocator_path(cfg.shared_root, route_key).exists():
                 return ReadyPeek(None, current)
             return ReadyPeek(None, current, unresolved=True)
         except (KeyError, TypeError, ValueError):
@@ -661,9 +645,9 @@ def peek_primary_ready_marker(
                 return ReadyPeek(None, progress_cursor, exhausted=True)
             budget.consume_operation()
             try:
-                slots = read_json(_partition_record_path(
-                    cfg.shared_root, queue_scope, cfg.machine_name, partition_name
-                ))["ready_partition"]["slots"]
+                slots = read_json(
+                    routes.partition_record_path(cfg.shared_root, queue_scope, cfg.machine_name, partition_name)
+                )["ready_partition"]["slots"]
                 if not isinstance(slots, list) or not all(isinstance(item, str) for item in slots):
                     raise ValueError("primary partition is invalid.")
             except (FileNotFoundError, KeyError, TypeError, ValueError):
@@ -672,8 +656,13 @@ def peek_primary_ready_marker(
                 if after_name is not None and marker_name <= after_name:
                     continue
                 progress_cursor = ReadyCursor(
-                    project_id, cfg.machine_name, queue_scope, page_number,
-                    partition_name, marker_name, current.revision + 1,
+                    project_id,
+                    cfg.machine_name,
+                    queue_scope,
+                    page_number,
+                    partition_name,
+                    marker_name,
+                    current.revision + 1,
                 )
                 if not budget.can_start_operation():
                     return ReadyPeek(None, progress_cursor, exhausted=True)
@@ -686,8 +675,14 @@ def peek_primary_ready_marker(
                 try:
                     candidate = read_json(candidate_path)["primary_ready_candidate"]
                     required = {
-                        "schema_version", "task_id", "generation", "queue_scope",
-                        "home_machine", "partition", "catalog_page", "marker_name",
+                        "schema_version",
+                        "task_id",
+                        "generation",
+                        "queue_scope",
+                        "home_machine",
+                        "partition",
+                        "catalog_page",
+                        "marker_name",
                     }
                     if (
                         set(candidate) != required
@@ -705,9 +700,13 @@ def peek_primary_ready_marker(
                     ):
                         raise ValueError("primary candidate is invalid.")
                     reference = ReadyMarkerRef(
-                        candidate["task_id"], candidate["generation"], queue_scope,
-                        candidate["home_machine"], candidate["partition"],
-                        candidate["catalog_page"], candidate["marker_name"],
+                        candidate["task_id"],
+                        candidate["generation"],
+                        queue_scope,
+                        candidate["home_machine"],
+                        candidate["partition"],
+                        candidate["catalog_page"],
+                        candidate["marker_name"],
                     )
                 except (KeyError, TypeError, ValueError, OSError):
                     return ReadyPeek(None, current, unresolved=True)
@@ -715,23 +714,32 @@ def peek_primary_ready_marker(
             partition_index += 1
             after_name = None
         if successor is None:
-            return ReadyPeek(None, ReadyCursor(
-                project_id, cfg.machine_name, queue_scope, 0, None, None,
-                current.revision + 1,
-            ), wrapped=True)
+            return ReadyPeek(
+                None,
+                ReadyCursor(
+                    project_id,
+                    cfg.machine_name,
+                    queue_scope,
+                    0,
+                    None,
+                    None,
+                    current.revision + 1,
+                ),
+                wrapped=True,
+            )
         page_number, partition_name, after_name = successor, None, None
 
 
 def ready_index_revision(cfg: object, queue_scope: ReadyScope) -> str:
     """Return a read-only revision fingerprint for one machine route."""
-    route_key = _route_key(queue_scope, cfg.machine_name)
+    route_key = routes.route_key(queue_scope, cfg.machine_name)
     catalog_root = shared_paths(cfg.shared_root)["ready_catalogs"] / route_key
     parts: list[object] = [state.read_ready_index_status(cfg).get("revision")]
     for page_path in sorted(catalog_root.glob("*.json")):
         catalog = read_json(page_path)["ready_catalog"]
         parts.append((catalog["page"], catalog["revision"], tuple(catalog["partitions"])))
         for partition_name in catalog["partitions"]:
-            partition_path = _partition_record_path(
+            partition_path = routes.partition_record_path(
                 cfg.shared_root, queue_scope, cfg.machine_name, partition_name
             )
             partition = read_json(partition_path)["ready_partition"]
@@ -739,119 +747,21 @@ def ready_index_revision(cfg: object, queue_scope: ReadyScope) -> str:
     return repr(parts)
 
 
-def ready_index_route_revision(
-    cfg: object, queue_scope: ReadyScope, budget: SliceBudget | None = None,
-    *, primary_only: bool = False, lane: str = "gpu",
-) -> int:
-    """Read the constant-size route watermark used by bounded probes."""
-    route_key = _route_key(queue_scope, cfg.machine_name)
-    path = _allocator_path(cfg.shared_root, route_key)
-    if budget is not None:
-        if not budget.can_start_operation():
-            raise ReadyProbeBudgetExhausted
-        budget.consume_operation()
-    if not path.exists():
-        return 0
-    if budget is not None:
-        if not budget.can_start_operation():
-            raise ReadyProbeBudgetExhausted
-        budget.consume_operation()
-    try:
-        allocator = read_json(path)["ready_allocator"]
-        revision_key = "primary_revision" if primary_only else "revision"
-        if primary_only:
-            _ensure_primary_lane_revisions(allocator)
-            revision = allocator["primary_lane_revisions"].get(lane)
-        else:
-            revision = allocator.get(revision_key)
-        if (
-            allocator.get("schema_version") != state.READY_PROTOCOL_VERSION
-            or allocator.get("route") != route_key
-            or type(revision) is not int
-            or revision < 0
-            or (
-                primary_only
-                and allocator.get("primary_state", "active") != "active"
-            )
-        ):
-            raise ValueError("ready allocator is invalid.")
-        return revision
-    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"ready allocator is unreadable: {route_key}") from exc
-
-
-@contextmanager
-def primary_projection_transaction(
-    cfg: object, routes: list[tuple[ReadyScope, str]], *, lanes: tuple[str, ...] = ("gpu", "cpu"),
-):
-    """Publish primary candidates only after all affected routes are complete.
-
-    A route remains non-admissible while its projection is being changed.  A
-    failed mutation is deliberately left degraded rather than exposing a
-    potentially incomplete candidate set to a borrow probe.
-    """
-    state.ensure_ready_layout(cfg)
-    route_keys = sorted({_route_key(scope, machine) for scope, machine in routes})
-    locks = []
-    allocators: list[tuple[Path, dict[str, Any]]] = []
-    try:
-        for route_key in route_keys:
-            lock = exclusive(shared_paths(cfg.shared_root)["ready_locks"] / f"{route_key}.lock")
-            lock.__enter__()
-            locks.append(lock)
-            allocator_path, allocator = _load_or_create_allocator(cfg.shared_root, route_key)
-            _ensure_primary_lane_revisions(allocator["ready_allocator"])
-            allocator["ready_allocator"]["primary_state"] = "updating"
-            atomic_replace(allocator_path, allocator)
-            allocators.append((allocator_path, allocator))
-        try:
-            yield
-        except BaseException:
-            for allocator_path, allocator in allocators:
-                allocator["ready_allocator"]["primary_state"] = "degraded"
-                atomic_replace(allocator_path, allocator)
-            raise
-        else:
-            for allocator_path, allocator in allocators:
-                control = allocator["ready_allocator"]
-                control["primary_revision"] = control.get("primary_revision", control["revision"]) + 1
-                _ensure_primary_lane_revisions(control)
-                for lane in lanes:
-                    control["primary_lane_revisions"][lane] += 1
-                control["primary_state"] = "active"
-                atomic_replace(allocator_path, allocator)
-    finally:
-        for lock in reversed(locks):
-            lock.__exit__(None, None, None)
-
-
-def bump_primary_ready_revision(
-    cfg: object, queue_scope: ReadyScope, home_machine: str, *, lane: str = "gpu",
-) -> None:
-    """Advance the independent revision for primary-demand changes."""
-    with primary_projection_transaction(cfg, [(queue_scope, home_machine)], lanes=(lane,)):
-        pass
-
-
 def iter_ready_marker_refs(cfg: object, queue_scope: ReadyScope) -> list[ReadyMarkerRef]:
     """Enumerate ready markers without advancing any dispatch cursor."""
-    route_key = _route_key(queue_scope, cfg.machine_name)
+    route_key = routes.route_key(queue_scope, cfg.machine_name)
     catalog_root = shared_paths(cfg.shared_root)["ready_catalogs"] / route_key
     references: list[ReadyMarkerRef] = []
     for page_path in sorted(catalog_root.glob("*.json")):
         catalog = read_json(page_path)["ready_catalog"]
         page_number = catalog["page"]
         for partition_name in catalog["partitions"]:
-            partition_path = _partition_record_path(
+            partition_path = routes.partition_record_path(
                 cfg.shared_root, queue_scope, cfg.machine_name, partition_name
             )
             partition = read_json(partition_path)["ready_partition"]
             for marker_name in sorted(partition["slots"]):
-                references.append(
-                    _reference_from_slot(
-                        cfg, queue_scope, page_number, partition_name, marker_name
-                    )
-                )
+                references.append(_reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name))
     return references
 
 
@@ -861,184 +771,6 @@ def delete_stale_ready_marker(cfg: object, reference: ReadyMarkerRef) -> bool:
     if result.classification != "permanently_stale":
         return False
     return delete_ready_marker(cfg, reference.task_id, reference.generation)
-
-
-def _new_allocator(route_key: str) -> dict[str, Any]:
-    return {
-        "ready_allocator": {
-            "schema_version": state.READY_PROTOCOL_VERSION,
-            "route": route_key,
-            "next_partition": 1,
-            "current_partition": None,
-            "current_catalog_page": 0,
-            "revision": 1,
-            "primary_revision": 1,
-            "primary_state": "active",
-            "primary_lane_revisions": {"gpu": 1, "cpu": 1},
-        }
-    }
-
-
-def _ensure_primary_lane_revisions(control: dict[str, Any]) -> bool:
-    """Backfill the lane-local primary watermarks from the legacy watermark."""
-    revisions = control.get("primary_lane_revisions")
-    if isinstance(revisions, dict) and all(
-        type(revisions.get(lane)) is int and revisions[lane] >= 0 for lane in ("gpu", "cpu")
-    ):
-        return False
-    revision = control.get("primary_revision", control["revision"])
-    control["primary_lane_revisions"] = {"gpu": revision, "cpu": revision}
-    return True
-
-
-def _load_or_create_allocator(root: Path, route_key: str) -> tuple[Path, dict[str, Any]]:
-    path = _allocator_path(root, route_key)
-    if path.exists():
-        value = read_json(path)
-        control = value["ready_allocator"]
-        if "primary_revision" not in control:
-            control["primary_revision"] = control["revision"]
-            control["primary_state"] = "active"
-            atomic_replace(path, value)
-        elif "primary_state" not in control:
-            control["primary_state"] = "active"
-            atomic_replace(path, value)
-        if _ensure_primary_lane_revisions(control):
-            atomic_replace(path, value)
-        return path, value
-    value = _new_allocator(route_key)
-    atomic_replace(path, value)
-    return path, value
-
-
-def _append_catalog_partition(
-    root: Path, route_key: str, allocator: dict[str, Any], partition: str,
-) -> int:
-    control = allocator["ready_allocator"]
-    page_number = control["current_catalog_page"]
-    path = _catalog_path(root, route_key, page_number)
-    if path.exists():
-        page = read_json(path)
-    else:
-        page = {"ready_catalog": {
-            "schema_version": state.READY_PROTOCOL_VERSION,
-            "route": route_key,
-            "page": page_number,
-            "partitions": [],
-            "successor": None,
-            "revision": 1,
-        }}
-    catalog = page["ready_catalog"]
-    if len(catalog["partitions"]) >= READY_CATALOG_PAGE_SIZE:
-        successor = page_number + 1
-        catalog["successor"] = successor
-        catalog["revision"] += 1
-        atomic_replace(path, page)
-        page_number = successor
-        control["current_catalog_page"] = page_number
-        path = _catalog_path(root, route_key, page_number)
-        page = {"ready_catalog": {
-            "schema_version": state.READY_PROTOCOL_VERSION,
-            "route": route_key,
-            "page": page_number,
-            "partitions": [],
-            "successor": None,
-            "revision": 1,
-        }}
-        catalog = page["ready_catalog"]
-    catalog["partitions"].append(partition)
-    catalog["revision"] += 1
-    atomic_replace(path, page)
-    return page_number
-
-
-def _reserve_slot(
-    cfg: object, task_id: str, generation: int, scope: ReadyScope, home_machine: str,
-) -> ReadyMarkerRef:
-    state.ensure_ready_layout(cfg)
-    root = cfg.shared_root
-    reservation_path = _reservation_path(root, task_id, generation)
-    if reservation_path.exists():
-        raise RuntimeError(
-            f"ready generation {task_id}.{generation} already has an in-progress writer."
-        )
-    route_key = _route_key(scope, home_machine)
-    lock_path = shared_paths(root)["ready_locks"] / f"{route_key}.lock"
-    with exclusive(lock_path):
-        if reservation_path.exists():
-            raise RuntimeError(
-                f"ready generation {task_id}.{generation} already has an in-progress writer."
-            )
-        allocator_path, allocator = _load_or_create_allocator(root, route_key)
-        control = allocator["ready_allocator"]
-        partition = control["current_partition"]
-        partition_record = None
-        if partition is not None:
-            path = _partition_record_path(root, scope, home_machine, partition)
-            if path.exists():
-                partition_record = read_json(path)
-        if (
-            partition_record is None
-            or partition_record["ready_partition"].get("sealed")
-            or len(partition_record["ready_partition"]["slots"]) >= READY_PARTITION_SLOTS
-        ):
-            partition = f"{control['next_partition']:016d}"
-            control["next_partition"] += 1
-            control["current_partition"] = partition
-            partition_record = {"ready_partition": {
-                "schema_version": state.READY_PROTOCOL_VERSION,
-                "route": route_key,
-                "partition": partition,
-                "slots": [],
-                "sealed": False,
-                "successor": None,
-                "revision": 1,
-            }}
-            catalog_page = _append_catalog_partition(root, route_key, allocator, partition)
-            partition_record["ready_partition"]["catalog_page"] = catalog_page
-        else:
-            catalog_page = partition_record["ready_partition"]["catalog_page"]
-        marker_name = f"{task_id}.{generation}.json"
-        partition_record["ready_partition"]["slots"].append(marker_name)
-        if len(partition_record["ready_partition"]["slots"]) >= READY_PARTITION_SLOTS:
-            partition_record["ready_partition"]["sealed"] = True
-        partition_record["ready_partition"]["revision"] += 1
-        atomic_replace(
-            _partition_record_path(root, scope, home_machine, partition), partition_record
-        )
-        control["revision"] += 1
-        atomic_replace(allocator_path, allocator)
-        reference = ReadyMarkerRef(
-            task_id, generation, scope, home_machine, partition, catalog_page, marker_name
-        )
-        atomic_replace(reservation_path, {"ready_reservation": {
-            "schema_version": state.READY_PROTOCOL_VERSION,
-            "task_id": task_id,
-            "generation": generation,
-            "queue_scope": scope,
-            "home_machine": home_machine,
-            "partition": partition,
-            "catalog_page": catalog_page,
-            "marker_name": marker_name,
-            "created_at": utc_now(),
-        }})
-        return reference
-
-
-def reserve_ready_generation(
-    cfg: object,
-    task_id: str,
-    generation: int,
-    queue_scope: ReadyScope,
-    home_machine: str,
-) -> ReadyMarkerRef:
-    """Reserve index capacity before acquiring shared Task or Group locks."""
-    if generation <= 0:
-        raise ValueError("ready generation must be positive.")
-    validate_identifier(task_id, "task_id")
-    if queue_scope not in {"home", "shared"}:
-        raise ValueError("ready queue_scope must be home or shared.")
-    return _reserve_slot(cfg, task_id, generation, queue_scope, home_machine)
 
 
 def _has_primary_ready_demand(cfg: object, task: TaskRecord) -> bool:
@@ -1061,42 +793,46 @@ def rebuild_primary_ready_index(cfg: object) -> None:
         build_id = uuid.uuid4().hex
         atomic_replace(
             primary_candidates.projection_state_path(cfg),
-            {"primary_ready_index": {
-                "schema_version": primary_candidates.PRIMARY_READY_PROTOCOL_VERSION,
-                "state": "rebuilding",
-                "build_id": build_id,
-                "cleared": False,
-                "updated_at": utc_now(),
-            }},
+            {
+                "primary_ready_index": {
+                    "schema_version": primary_candidates.PRIMARY_READY_PROTOCOL_VERSION,
+                    "state": "rebuilding",
+                    "build_id": build_id,
+                    "cleared": False,
+                    "updated_at": utc_now(),
+                }
+            },
         )
         primary_candidates.park_projection_under_lock(cfg, build_id)
         atomic_replace(
             primary_candidates.projection_state_path(cfg),
-            {"primary_ready_index": {
-                "schema_version": primary_candidates.PRIMARY_READY_PROTOCOL_VERSION,
-                "state": "rebuilding",
-                "build_id": build_id,
-                "cleared": True,
-                "updated_at": utc_now(),
-            }},
+            {
+                "primary_ready_index": {
+                    "schema_version": primary_candidates.PRIMARY_READY_PROTOCOL_VERSION,
+                    "state": "rebuilding",
+                    "build_id": build_id,
+                    "cleared": True,
+                    "updated_at": utc_now(),
+                }
+            },
         )
         for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
             task = TaskRecord.from_dict(read_json(path))
             if not _task_should_have_ready_marker(task):
                 continue
-            reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+            reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
             if reference is not None:
-                primary_candidates.sync_candidate_under_lock(
-                    cfg, task, reference, should_require_active=False
-                )
+                primary_candidates.sync_candidate_under_lock(cfg, task, reference, should_require_active=False)
         atomic_replace(
             primary_candidates.projection_state_path(cfg),
-            {"primary_ready_index": {
-                "schema_version": primary_candidates.PRIMARY_READY_PROTOCOL_VERSION,
-                "state": "active",
-                "completed_build_id": build_id,
-                "updated_at": utc_now(),
-            }},
+            {
+                "primary_ready_index": {
+                    "schema_version": primary_candidates.PRIMARY_READY_PROTOCOL_VERSION,
+                    "state": "active",
+                    "completed_build_id": build_id,
+                    "updated_at": utc_now(),
+                }
+            },
         )
 
 
@@ -1113,40 +849,43 @@ def sync_primary_ready_group(
         if group_ready_members_state(cfg) in {"building", "active"}:
             for entry in read_group_ready_members(cfg, group_name):
                 reference = ReadyMarkerRef(
-                    entry["task_id"], entry["generation"], entry["queue_scope"],
-                    entry["home_machine"], entry["partition"], entry["catalog_page"],
+                    entry["task_id"],
+                    entry["generation"],
+                    entry["queue_scope"],
+                    entry["home_machine"],
+                    entry["partition"],
+                    entry["catalog_page"],
                     entry["marker_name"],
                 )
-                primary_candidates.sync_member_candidate_under_lock(
-                    cfg, group_name, reference, previous_workers
-                )
+                primary_candidates.sync_member_candidate_under_lock(cfg, group_name, reference, previous_workers)
             return
         for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
             task = TaskRecord.from_dict(read_json(path))
             if task.group_name != group_name or not _task_should_have_ready_marker(task):
                 continue
-            reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+            reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
             if reference is not None:
                 primary_candidates.sync_candidate_under_lock(cfg, task, reference)
 
 
 def primary_projection_routes_for_group(
-    cfg: object, group_name: str,
+    cfg: object,
+    group_name: str,
 ) -> list[tuple[ReadyScope, str]]:
     """Return every authoritative route whose candidates a Group sync can alter."""
-    routes: set[tuple[ReadyScope, str]] = set()
+    primary_routes: set[tuple[ReadyScope, str]] = set()
     if group_ready_members_state(cfg) == "active":
         for entry in read_group_ready_members(cfg, group_name):
-            routes.add((entry["queue_scope"], entry["home_machine"]))
-        return sorted(routes)
+            primary_routes.add((entry["queue_scope"], entry["home_machine"]))
+        return sorted(primary_routes)
     for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
         task = TaskRecord.from_dict(read_json(path))
         if task.group_name != group_name or not _task_should_have_ready_marker(task):
             continue
-        reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+        reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
         if reference is not None:
-            routes.add((reference.queue_scope, reference.home_machine))
-    return sorted(routes)
+            primary_routes.add((reference.queue_scope, reference.home_machine))
+    return sorted(primary_routes)
 
 
 def write_ready_marker(
@@ -1164,10 +903,8 @@ def write_ready_marker(
         raise ValueError("target ready generation must exceed current generation.")
     scope = task.placement_runtime["queue_scope"]
     if reference is None:
-        reference = _reserve_slot(
-            cfg, task.task_id, generation, scope, task.placement_policy["home_machine"]
-        )
-    reservation_path = _reservation_path(cfg.shared_root, task.task_id, generation)
+        reference = routes.reserve_slot(cfg, task.task_id, generation, scope, task.placement_policy["home_machine"])
+    reservation_path = routes.reservation_path(cfg.shared_root, task.task_id, generation)
     if not reservation_path.exists():
         raise RuntimeError("ready reservation disappeared before marker publication.")
     if (
@@ -1198,21 +935,21 @@ def write_ready_marker(
         marker_value.update({"lane": "gpu", "requested_gpus": task.spec.requested_gpus})
     marker = {"ready_marker": marker_value}
     if _has_primary_ready_demand(cfg, task):
-        with primary_projection_transaction(
+        with routes.primary_route_update_transaction(
             cfg, [(scope, reference.home_machine)], lanes=(task.spec.lane or "gpu",)
         ):
-            atomic_replace(_marker_path(cfg.shared_root, reference), marker)
+            atomic_replace(routes.marker_path(cfg.shared_root, reference), marker)
             publish_group_ready_member(cfg, task, reference)
             primary_candidates.sync_candidate(cfg, task, reference)
     else:
-        atomic_replace(_marker_path(cfg.shared_root, reference), marker)
+        atomic_replace(routes.marker_path(cfg.shared_root, reference), marker)
         publish_group_ready_member(cfg, task, reference)
     return reference
 
 
 def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
     """Delete only the exact generation and its slot reservation."""
-    path = _reservation_path(cfg.shared_root, task_id, generation)
+    path = routes.reservation_path(cfg.shared_root, task_id, generation)
     if not path.exists():
         return False
     try:
@@ -1220,14 +957,19 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
     except FileNotFoundError:
         return False
     reference = ReadyMarkerRef(
-        task_id, generation, record["queue_scope"], record["home_machine"],
-        record["partition"], record["catalog_page"], record["marker_name"],
+        task_id,
+        generation,
+        record["queue_scope"],
+        record["home_machine"],
+        record["partition"],
+        record["catalog_page"],
+        record["marker_name"],
     )
     is_primary = True
     lane = "gpu"
     group_name: str | None = None
     try:
-        marker = read_json(_marker_path(cfg.shared_root, reference))["ready_marker"]
+        marker = read_json(routes.marker_path(cfg.shared_root, reference))["ready_marker"]
         lane = marker.get("lane", "gpu")
         group_name = marker.get("group_name")
         if group_name:
@@ -1238,22 +980,18 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
                 worker = workers.get(reference.home_machine)
                 is_primary = worker is not None and worker["scheduling_role"] == "primary"
             else:
-                is_primary = any(
-                    worker["scheduling_role"] == "primary" for worker in workers.values()
-                )
+                is_primary = any(worker["scheduling_role"] == "primary" for worker in workers.values())
     except (FileNotFoundError, KeyError, TypeError, ValueError):
         is_primary = True
-    route_key = _route_key(reference.queue_scope, reference.home_machine)
+    route_key = routes.route_key(reference.queue_scope, reference.home_machine)
     lock_path = shared_paths(cfg.shared_root)["ready_locks"] / f"{route_key}.lock"
     with exclusive(lock_path):
         if is_primary:
-            allocator_path, allocator = _load_or_create_allocator(
-                cfg.shared_root, route_key
-            )
+            allocator_path, allocator = routes.load_or_create_allocator_under_lock(cfg.shared_root, route_key)
             allocator["ready_allocator"]["primary_state"] = "updating"
             atomic_replace(allocator_path, allocator)
-        _marker_path(cfg.shared_root, reference).unlink(missing_ok=True)
-        partition_path = _partition_record_path(
+        routes.marker_path(cfg.shared_root, reference).unlink(missing_ok=True)
+        partition_path = routes.partition_record_path(
             cfg.shared_root,
             reference.queue_scope,
             reference.home_machine,
@@ -1262,25 +1000,18 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
         if partition_path.exists():
             partition_record = read_json(partition_path)
             partition = partition_record["ready_partition"]
-            partition["slots"] = [
-                name for name in partition["slots"] if name != reference.marker_name
-            ]
+            partition["slots"] = [name for name in partition["slots"] if name != reference.marker_name]
             partition["revision"] += 1
             if not partition["slots"] and partition.get("sealed"):
                 partition_path.unlink(missing_ok=True)
-                catalog_path = _catalog_path(
-                    cfg.shared_root, route_key, reference.catalog_page
-                )
+                catalog_path = routes.catalog_path(cfg.shared_root, route_key, reference.catalog_page)
                 if catalog_path.exists():
                     page = read_json(catalog_path)
                     catalog = page["ready_catalog"]
-                    catalog["partitions"] = [
-                        item for item in catalog["partitions"]
-                        if item != reference.partition
-                    ]
+                    catalog["partitions"] = [item for item in catalog["partitions"] if item != reference.partition]
                     catalog["revision"] += 1
                     atomic_replace(catalog_path, page)
-                allocator_path = _allocator_path(cfg.shared_root, route_key)
+                allocator_path = routes.allocator_path(cfg.shared_root, route_key)
                 if allocator_path.exists():
                     allocator = read_json(allocator_path)
                     control = allocator["ready_allocator"]
@@ -1290,7 +1021,7 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
                     atomic_replace(allocator_path, allocator)
             else:
                 atomic_replace(partition_path, partition_record)
-                allocator_path = _allocator_path(cfg.shared_root, route_key)
+                allocator_path = routes.allocator_path(cfg.shared_root, route_key)
                 if allocator_path.exists():
                     allocator = read_json(allocator_path)
                     allocator["ready_allocator"]["revision"] += 1
@@ -1300,14 +1031,10 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
             retire_group_ready_member(cfg, group_name, task_id, generation)
         primary_candidates.remove_candidate_everywhere(cfg, reference.identity)
         if is_primary:
-            allocator_path, allocator = _load_or_create_allocator(
-                cfg.shared_root, route_key
-            )
+            allocator_path, allocator = routes.load_or_create_allocator_under_lock(cfg.shared_root, route_key)
             control = allocator["ready_allocator"]
-            control["primary_revision"] = (
-                control.get("primary_revision", control["revision"]) + 1
-            )
-            _ensure_primary_lane_revisions(control)
+            control["primary_revision"] = control.get("primary_revision", control["revision"]) + 1
+            routes.ensure_primary_lane_revisions(control)
             control["primary_lane_revisions"][lane] += 1
             control["primary_state"] = "active"
             atomic_replace(allocator_path, allocator)
@@ -1363,12 +1090,14 @@ def retire_current_ready_generation(cfg: object, task: TaskRecord) -> None:
 
 
 def _is_ready_publication_pending(
-    cfg: object, reference: ReadyMarkerRef, task: TaskRecord,
+    cfg: object,
+    reference: ReadyMarkerRef,
+    task: TaskRecord,
 ) -> bool:
     """Return whether a valid future generation is still being published."""
     if reference.generation <= task.ready_generation:
         return False
-    reservation = _reference_for_generation(cfg, reference.task_id, reference.generation)
+    reservation = routes.reference_for_generation(cfg, reference.task_id, reference.generation)
     if reservation is None:
         return False
     if (
@@ -1382,10 +1111,11 @@ def _is_ready_publication_pending(
 
 
 def _recheck_missing_ready_marker(
-    cfg: object, reference: ReadyMarkerRef,
+    cfg: object,
+    reference: ReadyMarkerRef,
 ) -> dict[str, Any] | ReadyClassificationResult:
     """Recheck a missing marker against Task truth while its route is stable."""
-    route_key = _route_key(reference.queue_scope, reference.home_machine)
+    route_key = routes.route_key(reference.queue_scope, reference.home_machine)
     lock_path = shared_paths(cfg.shared_root)["ready_locks"] / f"{route_key}.lock"
     with exclusive(lock_path):
         task_file = task_path(cfg.shared_root, reference.task_id)
@@ -1396,17 +1126,12 @@ def _recheck_missing_ready_marker(
         except (KeyError, TypeError, ValueError):
             return ReadyClassificationResult("corrupt", "task_invalid")
         if _is_ready_publication_pending(cfg, reference, task):
-            return ReadyClassificationResult(
-                "temporarily_unavailable", "marker_publication_pending", task
-            )
+            return ReadyClassificationResult("temporarily_unavailable", "marker_publication_pending", task)
         if reference.generation != task.ready_generation:
-            return ReadyClassificationResult(
-                "permanently_stale", "generation_superseded", task
-            )
-        if (
-            reference.queue_scope != task.placement_runtime.get("queue_scope")
-            or reference.home_machine != task.placement_policy.get("home_machine")
-        ):
+            return ReadyClassificationResult("permanently_stale", "generation_superseded", task)
+        if reference.queue_scope != task.placement_runtime.get(
+            "queue_scope"
+        ) or reference.home_machine != task.placement_policy.get("home_machine"):
             return ReadyClassificationResult("corrupt", "route_mismatch", task)
         if task.state.get("projection") != "queued" or task.claim_control.get("active_claim"):
             return ReadyClassificationResult("permanently_stale", "task_not_queued", task)
@@ -1417,9 +1142,9 @@ def _recheck_missing_ready_marker(
         ):
             return ReadyClassificationResult("permanently_stale", "task_controlled", task)
         try:
-            return read_json(_marker_path(cfg.shared_root, reference))["ready_marker"]
+            return read_json(routes.marker_path(cfg.shared_root, reference))["ready_marker"]
         except FileNotFoundError:
-            partition_path = _partition_record_path(
+            partition_path = routes.partition_record_path(
                 cfg.shared_root,
                 reference.queue_scope,
                 reference.home_machine,
@@ -1437,13 +1162,14 @@ def _recheck_missing_ready_marker(
 
 
 def classify_ready_marker(
-    cfg: object, reference: ReadyMarkerRef,
+    cfg: object,
+    reference: ReadyMarkerRef,
 ) -> ReadyClassificationResult:
     """Classify one advisory marker against authoritative Task and Submission truth."""
     if reference.generation <= 0 or not reference.task_id:
         return ReadyClassificationResult("corrupt", "marker_identity_invalid")
     try:
-        marker = read_json(_marker_path(cfg.shared_root, reference))["ready_marker"]
+        marker = read_json(routes.marker_path(cfg.shared_root, reference))["ready_marker"]
     except FileNotFoundError:
         marker = _recheck_missing_ready_marker(cfg, reference)
         if isinstance(marker, ReadyClassificationResult):
@@ -1452,9 +1178,17 @@ def classify_ready_marker(
         return ReadyClassificationResult("corrupt", "marker_invalid")
     try:
         common = {
-            "schema_version", "task_id", "generation", "source_transition",
-            "source_revision", "target_revision", "queue_scope", "home_machine",
-            "group_name", "submission_operation_id", "created_at",
+            "schema_version",
+            "task_id",
+            "generation",
+            "source_transition",
+            "source_revision",
+            "target_revision",
+            "queue_scope",
+            "home_machine",
+            "group_name",
+            "submission_operation_id",
+            "created_at",
         }
         is_legacy = set(marker) == common | {"requested_gpus"}
         is_gpu = set(marker) == common | {"lane", "requested_gpus"} and marker.get("lane") == "gpu"
@@ -1478,17 +1212,12 @@ def classify_ready_marker(
     except (KeyError, TypeError, ValueError):
         return ReadyClassificationResult("corrupt", "task_invalid")
     if _is_ready_publication_pending(cfg, reference, task):
-        return ReadyClassificationResult(
-            "temporarily_unavailable", "marker_publication_pending", task
-        )
+        return ReadyClassificationResult("temporarily_unavailable", "marker_publication_pending", task)
     if reference.generation != task.ready_generation:
-        return ReadyClassificationResult(
-            "permanently_stale", "generation_superseded", task
-        )
-    if (
-        reference.queue_scope != task.placement_runtime.get("queue_scope")
-        or reference.home_machine != task.placement_policy.get("home_machine")
-    ):
+        return ReadyClassificationResult("permanently_stale", "generation_superseded", task)
+    if reference.queue_scope != task.placement_runtime.get(
+        "queue_scope"
+    ) or reference.home_machine != task.placement_policy.get("home_machine"):
         return ReadyClassificationResult("corrupt", "route_mismatch", task)
     if task.state.get("projection") != "queued" or task.claim_control.get("active_claim"):
         return ReadyClassificationResult("permanently_stale", "task_not_queued", task)
@@ -1509,9 +1238,7 @@ def classify_ready_marker(
     except (KeyError, TypeError, ValueError):
         return ReadyClassificationResult("corrupt", "submission_invalid", task)
     if submission_state in {"preparing", "committing", "blocked"}:
-        return ReadyClassificationResult(
-            "temporarily_unavailable", f"submission_{submission_state}", task
-        )
+        return ReadyClassificationResult("temporarily_unavailable", f"submission_{submission_state}", task)
     if submission_state == "aborted":
         return ReadyClassificationResult("permanently_stale", "submission_aborted", task)
     if submission_state != "committed":
@@ -1534,74 +1261,6 @@ def classify_ready_marker(
     if gate.state != "ready":
         return ReadyClassificationResult("temporarily_unavailable", f"dependency_{gate.state}", task)
     return ReadyClassificationResult("claimable", "eligible_truth", task)
-
-
-def _reference_for_generation(
-    cfg: object, task_id: str, generation: int,
-) -> ReadyMarkerRef | None:
-    path = _reservation_path(cfg.shared_root, task_id, generation)
-    try:
-        record = read_json(path)["ready_reservation"]
-        reference = ReadyMarkerRef(
-            task_id,
-            generation,
-            record["queue_scope"],
-            record["home_machine"],
-            record["partition"],
-            record["catalog_page"],
-            record["marker_name"],
-        )
-    except (FileNotFoundError, KeyError, TypeError, ValueError):
-        return None
-    if (
-        record.get("schema_version") != state.READY_PROTOCOL_VERSION
-        or record.get("task_id") != task_id
-        or record.get("generation") != generation
-        or record.get("queue_scope") not in {"home", "shared"}
-        or not isinstance(record.get("home_machine"), str)
-        or not isinstance(record.get("partition"), str)
-        or type(record.get("catalog_page")) is not int
-        or record["catalog_page"] < 0
-        or record.get("marker_name") != f"{task_id}.{generation}.json"
-    ):
-        return None
-    return reference
-
-
-def _is_ready_reference_indexed(cfg: object, reference: ReadyMarkerRef) -> bool:
-    """Verify the exact reservation is reachable through its partition and catalog."""
-    route_key = _route_key(reference.queue_scope, reference.home_machine)
-    try:
-        partition = read_json(
-            _partition_record_path(
-                cfg.shared_root,
-                reference.queue_scope,
-                reference.home_machine,
-                reference.partition,
-            )
-        )["ready_partition"]
-        catalog = read_json(
-            _catalog_path(cfg.shared_root, route_key, reference.catalog_page)
-        )["ready_catalog"]
-    except (FileNotFoundError, KeyError, TypeError, ValueError):
-        return False
-    slots = partition.get("slots")
-    partitions = catalog.get("partitions")
-    return (
-        isinstance(slots, list)
-        and all(isinstance(item, str) for item in slots)
-        and isinstance(partitions, list)
-        and all(isinstance(item, str) for item in partitions)
-        and partition.get("schema_version") == state.READY_PROTOCOL_VERSION
-        and partition.get("route") == route_key
-        and partition.get("partition") == reference.partition
-        and partition.get("catalog_page") == reference.catalog_page
-        and reference.marker_name in slots
-        and catalog.get("schema_version") == state.READY_PROTOCOL_VERSION
-        and catalog.get("route") == route_key
-        and catalog.get("page") == reference.catalog_page
-        and reference.partition in partitions
-    )
 
 
 def _task_should_have_ready_marker(task: TaskRecord) -> bool:
@@ -1630,26 +1289,22 @@ def _repair_task_ready_projection(cfg: object, task_id: str) -> tuple[int, int]:
             task = load_task(cfg, task_id)
         except FileNotFoundError:
             return repaired, stale_removed
-        reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+        reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
         classification = (
             classify_ready_marker(cfg, reference).classification
-            if reference is not None and _is_ready_reference_indexed(cfg, reference)
+            if reference is not None and routes.is_reference_indexed(cfg, reference)
             else None
         )
         if _task_should_have_ready_marker(task):
             if classification in {"claimable", "temporarily_unavailable"}:
                 return repaired, stale_removed
-            old_generation, _new_generation = prepare_ready_transition(
-                cfg, task, "ready_index_rebuild"
-            )
+            old_generation, _new_generation = prepare_ready_transition(cfg, task, "ready_index_rebuild")
             task.meta["revision"] += 1
             task.meta["updated_at"] = utc_now()
             save_task(cfg, task)
             retire_previous_ready_generation(cfg, old_generation, task)
             return 1, int(old_generation > 0)
-        if reference is not None and delete_ready_marker(
-            cfg, task.task_id, task.ready_generation
-        ):
+        if reference is not None and delete_ready_marker(cfg, task.task_id, task.ready_generation):
             stale_removed += 1
         return repaired, stale_removed
 
@@ -1670,7 +1325,10 @@ def _load_build_page(cfg: object, build_id: str, page: int) -> list[str]:
 
 
 def _advance_build_cursor(
-    cursor: dict[str, Any], *, item_count: int, page_count: int,
+    cursor: dict[str, Any],
+    *,
+    item_count: int,
+    page_count: int,
 ) -> bool:
     cursor["offset"] += 1
     if cursor["offset"] < item_count:
@@ -1696,9 +1354,7 @@ def _active_incompatible_writers(cfg: object) -> list[str]:
             path = Path(entry.path) / "state" / "agent.json"
             try:
                 agent = read_json(path)["agent"]
-                heartbeat = datetime.fromisoformat(
-                    agent["heartbeat_at"].replace("Z", "+00:00")
-                )
+                heartbeat = datetime.fromisoformat(agent["heartbeat_at"].replace("Z", "+00:00"))
                 interval = float(agent["heartbeat_interval_seconds"])
             except (FileNotFoundError, KeyError, TypeError, ValueError):
                 continue
@@ -1718,11 +1374,11 @@ def _audit_task_ready_projection(cfg: object, task_id: str) -> str | None:
         return None
     except (KeyError, TypeError, ValueError):
         return f"task_invalid:{task_id}"
-    reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+    reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
     if _task_should_have_ready_marker(task):
         if reference is None:
             return f"marker_missing:{task_id}"
-        if not _is_ready_reference_indexed(cfg, reference):
+        if not routes.is_reference_indexed(cfg, reference):
             return f"marker_unindexed:{task_id}"
         result = classify_ready_marker(cfg, reference)
         if result.classification not in {"claimable", "temporarily_unavailable"}:
@@ -1738,13 +1394,13 @@ def ready_task_projection_issue(cfg: object, task_id: str) -> str | None:
 
 
 def advance_ready_index_build(
-    cfg: object, *, max_tasks: int = READY_BUILD_PAGE_SIZE,
+    cfg: object,
+    *,
+    max_tasks: int = READY_BUILD_PAGE_SIZE,
 ) -> dict[str, Any]:
     """Advance at most ``max_tasks`` durable rebuild or audit records."""
     if type(max_tasks) is not int or not 1 <= max_tasks <= READY_BUILD_PAGE_SIZE:
-        raise ValueError(
-            f"max_tasks must be between 1 and {READY_BUILD_PAGE_SIZE}."
-        )
+        raise ValueError(f"max_tasks must be between 1 and {READY_BUILD_PAGE_SIZE}.")
     begin_ready_index_build(cfg)
     # A rebuild can repair Task truth.  Hold the schema fence before the ready
     # state lock so its nested Task writer follows Schema -> state -> Group -> Task.
@@ -1767,7 +1423,9 @@ def advance_ready_index_build(
                 return record
             phase = build.get("phase")
             cursor_name = {
-                "backfill": "cursor", "audit": "audit_cursor", "primary-rebuild": "primary_cursor",
+                "backfill": "cursor",
+                "audit": "audit_cursor",
+                "primary-rebuild": "primary_cursor",
             }.get(phase)
             if cursor_name is None:
                 state.degrade_state_record(record, f"build_phase_invalid:{phase}")
@@ -1805,17 +1463,17 @@ def advance_ready_index_build(
                         except FileNotFoundError:
                             task = None
                         if task is not None and _task_should_have_ready_marker(task):
-                            reference = _reference_for_generation(
-                                cfg, task.task_id, task.ready_generation,
+                            reference = routes.reference_for_generation(
+                                cfg,
+                                task.task_id,
+                                task.ready_generation,
                             )
                             if reference is None:
                                 state.degrade_state_record(record, f"marker_missing:{task.task_id}")
                                 break
                             primary_candidates.rebuild_primary_ready_candidate(cfg, build["build_id"], task, reference)
                     processed_now += 1
-                    _advance_build_cursor(
-                        cursor, item_count=len(task_ids), page_count=page_count
-                    )
+                    _advance_build_cursor(cursor, item_count=len(task_ids), page_count=page_count)
                 if record["state"] == "building" and cursor["page"] >= page_count:
                     if phase == "backfill":
                         build["phase"] = "audit"
@@ -1843,7 +1501,9 @@ def advance_ready_index_build(
 
 
 def repair_ready_index(
-    cfg: object, *, max_tasks: int = READY_BUILD_PAGE_SIZE,
+    cfg: object,
+    *,
+    max_tasks: int = READY_BUILD_PAGE_SIZE,
 ) -> dict[str, Any]:
     """Start degraded recovery and advance one bounded repair slice."""
     begin_ready_index_build(cfg, is_repair=True)

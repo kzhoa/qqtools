@@ -2,17 +2,13 @@
 
 from .index import (
     READY_BUILD_PAGE_SIZE,
-    READY_CATALOG_PAGE_SIZE,
-    READY_PARTITION_SLOTS,
     ReadyClassification,
     ReadyClassificationResult,
     ReadyCursor,
     ReadyPeek,
-    ReadyProbeBudgetExhausted,
     advance_ready_index_build,
     begin_primary_ready_index_rebuild,
     begin_ready_index_build,
-    bump_primary_ready_revision,
     classify_ready_marker,
     delete_ready_marker,
     delete_stale_ready_marker,
@@ -25,13 +21,10 @@ from .index import (
     peek_ready_marker,
     prepare_ready_transition,
     primary_projection_routes_for_group,
-    primary_projection_transaction,
     ready_index_revision,
-    ready_index_route_revision,
     ready_task_projection_issue,
     rebuild_primary_ready_index,
     repair_ready_index,
-    reserve_ready_generation,
     retire_current_ready_generation,
     retire_previous_ready_generation,
     sync_primary_ready_group,
@@ -43,6 +36,15 @@ from .primary_candidates import (
     rebuild_primary_ready_candidate,
 )
 from .records import ReadyMarkerRef, ReadyScope
+from .routes import (
+    READY_CATALOG_PAGE_SIZE,
+    READY_PARTITION_SLOTS,
+    ReadyProbeBudgetExhausted,
+    bump_primary_ready_revision,
+    primary_route_update_transaction,
+    ready_index_route_revision,
+    reserve_ready_generation,
+)
 from .state import (
     READY_PROTOCOL_VERSION,
     READY_WRITER_CAPABILITY,
@@ -89,7 +91,7 @@ __all__ = [
     "peek_ready_marker",
     "prepare_ready_transition",
     "primary_projection_routes_for_group",
-    "primary_projection_transaction",
+    "primary_route_update_transaction",
     "read_ready_index_state",
     "read_ready_index_status",
     "ready_index_revision",

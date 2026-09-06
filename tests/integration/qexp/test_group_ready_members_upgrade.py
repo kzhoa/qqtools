@@ -5,23 +5,23 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.cli import main
-from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.cleanup import clean
+from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
 from qqtools.plugins.qexp.group_ready_members_upgrade import (
     attest_group_ready_members_upgrade,
     resume_group_ready_members_upgrade,
     start_group_ready_members_upgrade,
 )
+from qqtools.plugins.qexp.runtime.locks import is_schema_narrow_protocol_active
+from qqtools.plugins.qexp.runtime.paths import shared_paths
+from qqtools.plugins.qexp.runtime.ready import advance_ready_index_build, is_primary_ready_index_active
 from qqtools.plugins.qexp.runtime.ready.group_members import (
     group_ready_members_state,
     mark_group_ready_members_degraded,
     read_group_ready_members,
     retire_group_ready_member,
 )
-from qqtools.plugins.qexp.runtime.locks import is_schema_narrow_protocol_active
-from qqtools.plugins.qexp.runtime.paths import shared_paths
-from qqtools.plugins.qexp.runtime.ready import advance_ready_index_build, is_primary_ready_index_active
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.scheduler import claim_task, fail_attempt
 
@@ -31,9 +31,18 @@ pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 def test_group_ready_members_upgrade_cli_exposes_status(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
 
-    assert main([
-        "--shared-root", str(cfg.shared_root), "upgrade", "group-ready-members", "status",
-    ]) == 0
+    assert (
+        main(
+            [
+                "--shared-root",
+                str(cfg.shared_root),
+                "upgrade",
+                "group-ready-members",
+                "status",
+            ]
+        )
+        == 0
+    )
 
 
 def test_new_root_publishes_and_retires_exact_group_ready_members(tmp_path: Path) -> None:
@@ -42,9 +51,7 @@ def test_new_root_publishes_and_retires_exact_group_ready_members(tmp_path: Path
     task = submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
 
     members = read_group_ready_members(cfg, "exp")
-    assert [(item["task_id"], item["generation"]) for item in members] == [
-        (task.task_id, task.ready_generation)
-    ]
+    assert [(item["task_id"], item["generation"]) for item in members] == [(task.task_id, task.ready_generation)]
 
     from qqtools.plugins.qexp.scheduler import claim_task
 
@@ -67,15 +74,21 @@ def test_legacy_root_backfills_then_jointly_activates_narrow_schema_protocol(tmp
     assert group_ready_members_state(cfg) == "building"
     assert not is_schema_narrow_protocol_active(cfg)
     attest_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], machine_name=cfg.machine_name,
+        cfg,
+        activation_id=session["activation_id"],
+        machine_name=cfg.machine_name,
     )
     first = resume_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], max_tasks=1,
+        cfg,
+        activation_id=session["activation_id"],
+        max_tasks=1,
     )
     completed = first
     while completed["phase"] == "building":
         completed = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
 
     assert completed["phase"] == "completed"
@@ -86,7 +99,8 @@ def test_legacy_root_backfills_then_jointly_activates_narrow_schema_protocol(tmp
 
 
 def test_active_group_change_uses_members_and_exact_primary_routes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
@@ -131,10 +145,7 @@ def test_group_members_are_paged_without_historical_task_scan(tmp_path: Path) ->
 def test_retired_empty_pages_are_reused_without_historical_catalog_growth(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
-    tasks = [
-        submit(cfg, ["echo", str(index)], task_id=f"member-{index}", group="exp")
-        for index in range(65)
-    ]
+    tasks = [submit(cfg, ["echo", str(index)], task_id=f"member-{index}", group="exp") for index in range(65)]
     from qqtools.plugins.qexp.runtime.ready import group_members
 
     for task in tasks:
@@ -197,9 +208,9 @@ def test_doctor_verify_degrades_when_a_group_member_directory_is_missing(tmp_pat
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
     submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
-    from qqtools.plugins.qexp.runtime.ready import group_members
-
     import shutil
+
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     shutil.rmtree(group_members._group_root(cfg, "exp"))
 
@@ -223,7 +234,9 @@ def test_degraded_projection_blocks_group_worker_truth_mutation(tmp_path: Path) 
 
 @pytest.mark.parametrize("failure_point", ["locator", "partition", "catalog", "group", "global"])
 def test_member_publication_write_failure_persists_degraded_gate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
@@ -258,7 +271,9 @@ def test_member_publication_write_failure_persists_degraded_gate(
 
 @pytest.mark.parametrize("failure_point", ["locator", "partition", "catalog", "group", "global"])
 def test_member_retirement_write_failure_persists_degraded_gate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
@@ -307,7 +322,8 @@ def test_stale_member_revision_update_cannot_reopen_degraded_gate(tmp_path: Path
 
 
 def test_concurrent_group_projection_updates_do_not_lose_the_global_revision(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "first")
@@ -345,7 +361,8 @@ def test_concurrent_group_projection_updates_do_not_lose_the_global_revision(
 
 
 def test_retirement_uses_its_exact_locator_without_group_catalog_scan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
@@ -374,22 +391,34 @@ def test_first_upgrade_resume_captures_only_its_declared_io_budget(tmp_path: Pat
 
     session = start_group_ready_members_upgrade(cfg)
     attest_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], machine_name=cfg.machine_name,
+        cfg,
+        activation_id=session["activation_id"],
+        machine_name=cfg.machine_name,
     )
     first = resume_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], max_tasks=1,
+        cfg,
+        activation_id=session["activation_id"],
+        max_tasks=1,
     )
 
     assert first["phase"] == "building"
     watermark = first["projection"]["build"]["watermark"]
     assert watermark["is_complete"] is False
     assert watermark["capture"]["task_count"] == 1
-    assert not (cfg.shared_root / "indexes" / "ready" / "group-members" / "builds" /
-                first["projection"]["build"]["build_id"] / "watermark").exists()
+    assert not (
+        cfg.shared_root
+        / "indexes"
+        / "ready"
+        / "group-members"
+        / "builds"
+        / first["projection"]["build"]["build_id"]
+        / "watermark"
+    ).exists()
 
 
 def test_upgrade_capture_commit_and_activation_fail_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     from qqtools.plugins.qexp.runtime.ready import group_members
@@ -417,7 +446,9 @@ def test_upgrade_capture_commit_and_activation_fail_closed(
     assert has_failed
 
     cfg = init_shared_root(
-        tmp_path / "second" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime-second",
+        tmp_path / "second" / ".qexp",
+        "gpu-1",
+        runtime_root=tmp_path / "runtime-second",
     )
     create_group(cfg, "exp")
     submit(cfg, ["echo", "audit"], task_id="audit-task", group="exp")
@@ -437,7 +468,8 @@ def test_upgrade_capture_commit_and_activation_fail_closed(
 
 
 def test_doctor_repair_crash_preserves_the_degraded_gate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     from qqtools.plugins.qexp.runtime.ready import group_members
@@ -475,27 +507,35 @@ def test_upgrade_dual_publishes_tasks_created_after_the_capture_cursor(tmp_path:
 
     session = start_group_ready_members_upgrade(cfg)
     attest_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], machine_name=cfg.machine_name,
+        cfg,
+        activation_id=session["activation_id"],
+        machine_name=cfg.machine_name,
     )
     state = resume_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], max_tasks=1,
+        cfg,
+        activation_id=session["activation_id"],
+        max_tasks=1,
     )
     assert state["phase"] == "building"
     submit(cfg, ["echo", "during"], task_id="during-upgrade", group="exp")
     while state["phase"] == "building":
         state = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
 
     assert state["phase"] == "completed"
     assert is_schema_narrow_protocol_active(cfg)
     assert {entry["task_id"] for entry in read_group_ready_members(cfg, "exp")} == {
-        "before-upgrade", "during-upgrade",
+        "before-upgrade",
+        "during-upgrade",
     }
 
 
 def test_resume_consumes_durable_watermark_without_reenumerating_tasks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
@@ -509,10 +549,14 @@ def test_resume_consumes_durable_watermark_without_reenumerating_tasks(
 
     session = start_group_ready_members_upgrade(cfg)
     attest_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], machine_name=cfg.machine_name,
+        cfg,
+        activation_id=session["activation_id"],
+        machine_name=cfg.machine_name,
     )
     first = resume_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], max_tasks=1,
+        cfg,
+        activation_id=session["activation_id"],
+        max_tasks=1,
     )
     assert first["phase"] == "building"
 
@@ -527,11 +571,15 @@ def test_resume_consumes_durable_watermark_without_reenumerating_tasks(
 
     monkeypatch.setattr(group_members.os, "scandir", fail_task_directory_scan)
     completed = resume_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], max_tasks=1,
+        cfg,
+        activation_id=session["activation_id"],
+        max_tasks=1,
     )
     while completed["phase"] == "building":
         completed = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
 
     assert completed["phase"] == "completed"
@@ -558,7 +606,9 @@ def test_upgrade_treats_a_normally_cleaned_watermark_task_as_a_tombstone(tmp_pat
     result = session
     for _ in range(32):
         result = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
         if result["phase"] != "building":
             break
@@ -567,7 +617,8 @@ def test_upgrade_treats_a_normally_cleaned_watermark_task_as_a_tombstone(tmp_pat
 
 
 def test_primary_rebuild_crash_before_member_activation_resumes_safely(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
@@ -581,11 +632,15 @@ def test_primary_rebuild_crash_before_member_activation_resumes_safely(
     attest_group_ready_members_upgrade(cfg, activation_id=session["activation_id"], machine_name=cfg.machine_name)
 
     state = resume_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], max_tasks=1,
+        cfg,
+        activation_id=session["activation_id"],
+        max_tasks=1,
     )
     while state["projection"]["build"]["phase"] != "primary-rebuild":
         state = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
     from qqtools.plugins.qexp.runtime.ready import group_members
 
@@ -618,31 +673,39 @@ def test_primary_rebuild_dual_writes_ready_tasks_created_after_its_watermark(tmp
     (cfg.shared_root / "indexes" / "ready" / "group-members" / "state.json").unlink()
     session = start_group_ready_members_upgrade(cfg)
     attest_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], machine_name=cfg.machine_name,
+        cfg,
+        activation_id=session["activation_id"],
+        machine_name=cfg.machine_name,
     )
 
     state = session
     while state.get("projection", {}).get("build", {}).get("phase") != "primary-rebuild":
         state = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
     state = resume_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], max_tasks=1,
+        cfg,
+        activation_id=session["activation_id"],
+        max_tasks=1,
     )
     assert state["projection"]["build"]["phase"] == "primary-rebuild"
 
     concurrent = submit(cfg, ["echo", "during"], task_id="during-primary-rebuild", group="exp")
-    from qqtools.plugins.qexp.runtime.ready.index import _reference_for_generation
     from qqtools.plugins.qexp.runtime.ready.primary_candidates import candidate_path
+    from qqtools.plugins.qexp.runtime.ready.routes import reference_for_generation
 
-    reference = _reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
+    reference = reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
     assert reference is not None
     primary_candidate_path = candidate_path(cfg, f"home.{cfg.machine_name}", reference.identity)
     assert primary_candidate_path.exists()
 
     while state["phase"] == "building":
         state = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
 
     assert state["phase"] == "completed"
@@ -667,31 +730,39 @@ def test_final_task_watermark_starts_primary_rebuild_before_later_task_writes(
     (cfg.shared_root / "indexes" / "ready" / "group-members" / "state.json").unlink()
     session = start_group_ready_members_upgrade(cfg)
     attest_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], machine_name=cfg.machine_name,
+        cfg,
+        activation_id=session["activation_id"],
+        machine_name=cfg.machine_name,
     )
 
     state = session
     while state.get("projection", {}).get("build", {}).get("phase") != "audit-task-capture":
         state = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
     state = resume_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], max_tasks=64,
+        cfg,
+        activation_id=session["activation_id"],
+        max_tasks=64,
     )
     assert state["projection"]["build"]["phase"] == "audit-tasks"
 
     concurrent = submit(cfg, ["echo", "late"], task_id="after-final-watermark", group="exp")
-    from qqtools.plugins.qexp.runtime.ready.index import _reference_for_generation
     from qqtools.plugins.qexp.runtime.ready.primary_candidates import candidate_path
+    from qqtools.plugins.qexp.runtime.ready.routes import reference_for_generation
 
-    reference = _reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
+    reference = reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
     assert reference is not None
     primary_candidate_path = candidate_path(cfg, f"home.{cfg.machine_name}", reference.identity)
     assert primary_candidate_path.exists()
 
     while state["phase"] == "building":
         state = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
 
     assert state["phase"] == "completed"
@@ -699,7 +770,8 @@ def test_final_task_watermark_starts_primary_rebuild_before_later_task_writes(
 
 
 def test_primary_rebuild_parks_existing_routes_without_enumerating_candidates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     routes = shared_paths(cfg.shared_root)["ready_primary"] / "routes"
@@ -723,17 +795,13 @@ def test_primary_rebuild_parks_existing_routes_without_enumerating_candidates(
 
     assert routes.is_dir()
     assert list(routes.iterdir()) == []
-    replaced = (
-        shared_paths(cfg.shared_root)["ready_primary"]
-        / "replaced-routes"
-        / "bounded-cutover"
-        / "home.gpu-1"
-    )
+    replaced = shared_paths(cfg.shared_root)["ready_primary"] / "replaced-routes" / "bounded-cutover" / "home.gpu-1"
     assert len(list(replaced.iterdir())) == 128
 
 
 def test_primary_rebuild_park_resumes_without_replacing_the_new_route_tree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     routes = shared_paths(cfg.shared_root)["ready_primary"] / "routes"
@@ -770,11 +838,7 @@ def test_primary_rebuild_park_resumes_without_replacing_the_new_route_tree(
 
     assert (new_route / "new.json").exists()
     replaced = (
-        shared_paths(cfg.shared_root)["ready_primary"]
-        / "replaced-routes"
-        / "crash-cutover"
-        / "home.gpu-1"
-        / "old.json"
+        shared_paths(cfg.shared_root)["ready_primary"] / "replaced-routes" / "crash-cutover" / "home.gpu-1" / "old.json"
     )
     assert replaced.exists()
 
@@ -792,22 +856,28 @@ def test_primary_rebuild_accepts_group_role_updates_for_new_members(tmp_path: Pa
     (cfg.shared_root / "indexes" / "ready" / "group-members" / "state.json").unlink()
     session = start_group_ready_members_upgrade(cfg)
     attest_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], machine_name=cfg.machine_name,
+        cfg,
+        activation_id=session["activation_id"],
+        machine_name=cfg.machine_name,
     )
 
     state = session
     while state.get("projection", {}).get("build", {}).get("phase") != "primary-rebuild":
         state = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
     state = resume_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], max_tasks=1,
+        cfg,
+        activation_id=session["activation_id"],
+        max_tasks=1,
     )
     concurrent = submit(cfg, ["echo", "during"], task_id="during-role-update", group="exp")
-    from qqtools.plugins.qexp.runtime.ready.index import _reference_for_generation
     from qqtools.plugins.qexp.runtime.ready.primary_candidates import candidate_path
+    from qqtools.plugins.qexp.runtime.ready.routes import reference_for_generation
 
-    reference = _reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
+    reference = reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
     assert reference is not None
     primary_candidate_path = candidate_path(cfg, f"home.{cfg.machine_name}", reference.identity)
     assert not primary_candidate_path.exists()
@@ -817,7 +887,9 @@ def test_primary_rebuild_accepts_group_role_updates_for_new_members(tmp_path: Pa
 
     while state["phase"] == "building":
         state = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
     assert state["phase"] == "completed"
     assert primary_candidate_path.exists()
@@ -835,20 +907,28 @@ def test_member_audit_restarts_a_group_after_a_legal_retirement(tmp_path: Path) 
     (cfg.shared_root / "indexes" / "ready" / "group-members" / "state.json").unlink()
     session = start_group_ready_members_upgrade(cfg)
     attest_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], machine_name=cfg.machine_name,
+        cfg,
+        activation_id=session["activation_id"],
+        machine_name=cfg.machine_name,
     )
 
     state = session
     while state.get("projection", {}).get("build", {}).get("phase") != "audit-members":
         state = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
     state = resume_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], max_tasks=1,
+        cfg,
+        activation_id=session["activation_id"],
+        max_tasks=1,
     )
     assert state["projection"]["build"]["audit_member_cursor"]["group_name"] == "exp"
     state = resume_group_ready_members_upgrade(
-        cfg, activation_id=session["activation_id"], max_tasks=1,
+        cfg,
+        activation_id=session["activation_id"],
+        max_tasks=1,
     )
 
     attempt = claim_task(cfg, "audit-one", [0])
@@ -862,7 +942,9 @@ def test_member_audit_restarts_a_group_after_a_legal_retirement(tmp_path: Path) 
 
     while state["phase"] == "building":
         state = resume_group_ready_members_upgrade(
-            cfg, activation_id=session["activation_id"], max_tasks=1,
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
         )
 
     assert state["phase"] == "completed"

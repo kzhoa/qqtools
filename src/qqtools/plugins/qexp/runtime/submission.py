@@ -8,6 +8,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_task_dependencies_root
+from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
+from .active_operations import operation_exists
+from .availability import remove_deadline_index, sync_deadline_index
+from .dependencies import normalize_dependency_ids, validate_group_dependencies
 from .locks import (
     group_lock,
     group_writer_lock,
@@ -17,8 +22,17 @@ from .locks import (
     task_lock,
     task_locks,
 )
-from .ready.group_members import assert_group_ready_members_writable
 from .paths import group_path, idempotency_path, machine_path, shared_paths, submission_path, task_path
+from .ready import (
+    assert_ready_writer_compatible,
+    delete_ready_marker,
+    prepare_ready_transition,
+    primary_projection_routes_for_group,
+    primary_route_update_transaction,
+    retire_previous_ready_generation,
+    sync_primary_ready_group,
+)
+from .ready.group_members import assert_group_ready_members_writable
 from .records import (
     TaskRecord,
     TaskSpec,
@@ -30,22 +44,8 @@ from .records import (
     utc_now,
     validate_identifier,
 )
-from .ready import (
-    assert_ready_writer_compatible,
-    delete_ready_marker,
-    primary_projection_transaction,
-    primary_projection_routes_for_group,
-    prepare_ready_transition,
-    retire_previous_ready_generation,
-    sync_primary_ready_group,
-)
-from .active_operations import operation_exists
 from .store import atomic_replace, create_if_absent, read_json
-from .availability import remove_deadline_index, sync_deadline_index
 from .tasks import save_task
-from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_task_dependencies_root
-from .dependencies import normalize_dependency_ids, validate_group_dependencies
-from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
 
 
 def _write_group_record(cfg: object, path: Path, data: dict[str, Any]) -> None:
@@ -126,10 +126,7 @@ def _worker_additions(
             if machine in seen:
                 raise ValueError(f"worker_set must not contain duplicate machine {machine!r}.")
             seen.add(machine)
-        worker_set = {
-            machine: {"scheduling_role": "primary", "gpu_limit_gpus": None}
-            for machine in worker_set
-        }
+        worker_set = {machine: {"scheduling_role": "primary", "gpu_limit_gpus": None} for machine in worker_set}
     if not isinstance(worker_set, dict):
         raise ValueError("worker_set must be a Worker declaration mapping.")
     additions: dict[str, dict[str, Any]] = {}
@@ -240,37 +237,27 @@ def _validate_target_machine_record(cfg: Any, machine_name: str) -> None:
 
     record_path = machine_path(cfg.shared_root, machine_name)
     if not record_path.exists():
-        raise ValueError(
-            f"home machine {machine_name!r} has no current-generation Project machine record."
-        )
+        raise ValueError(f"home machine {machine_name!r} has no current-generation Project machine record.")
     try:
         record = read_json(record_path)
         machine = record["machine"]
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"home machine {machine_name!r} has an invalid Project machine record."
-        ) from exc
+        raise ValueError(f"home machine {machine_name!r} has an invalid Project machine record.") from exc
     if not isinstance(machine, dict):
-        raise ValueError(
-            f"home machine {machine_name!r} has an invalid Project machine record."
-        )
+        raise ValueError(f"home machine {machine_name!r} has an invalid Project machine record.")
     if (
         machine.get("machine_name") != machine_name
         or machine.get("project_id") != stable_id
         or machine.get("shared_root") != str(cfg.shared_root)
         or machine.get("agent_runtime") != "machine"
     ):
-        raise ValueError(
-            f"home machine {machine_name!r} does not have a current-generation Project machine record."
-        )
+        raise ValueError(f"home machine {machine_name!r} does not have a current-generation Project machine record.")
 
 
 def _active_workers(group: dict[str, Any]) -> dict[str, dict[str, Any]]:
     normalize_group_record(group)
     return {
-        machine: worker
-        for machine, worker in group["group"]["worker_set"].items()
-        if worker.get("state") == "active"
+        machine: worker for machine, worker in group["group"]["worker_set"].items() if worker.get("state") == "active"
     }
 
 
@@ -375,22 +362,33 @@ def _task_spec(item: dict[str, Any], *, is_canonical: bool) -> TaskSpec:
     if requested_cpus is not None:
         raise ValueError("GPU tasks cannot declare requested_cpus.")
     return TaskSpec(
-        item["command"], item["working_directory"], requested_gpus,
-        None, "gpu" if is_canonical else None,
+        item["command"],
+        item["working_directory"],
+        requested_gpus,
+        None,
+        "gpu" if is_canonical else None,
     )
 
 
 def _new_task_from_resolved(
-    item: dict[str, Any], *, group_name: str | None, operation_id: str, is_canonical: bool,
+    item: dict[str, Any],
+    *,
+    group_name: str | None,
+    operation_id: str,
+    is_canonical: bool,
 ) -> TaskRecord:
     return TaskRecord.new(
-        task_id=item["task_id"], machine=item["home_machine"],
-        spec=_task_spec(item, is_canonical=is_canonical), group_name=group_name,
-        name=item["name"], sharing_mode=item["sharing_mode"],
+        task_id=item["task_id"],
+        machine=item["home_machine"],
+        spec=_task_spec(item, is_canonical=is_canonical),
+        group_name=group_name,
+        name=item["name"],
+        sharing_mode=item["sharing_mode"],
         fallback_machines=item["fallback_machines"],
         offer_after_seconds=item["offer_after_seconds"],
         offer_eligible_at=item.get("offer_eligible_at"),
-        offer_clock_evidence=item.get("offer_clock_evidence"), operation_id=operation_id,
+        offer_clock_evidence=item.get("offer_clock_evidence"),
+        operation_id=operation_id,
         depends_on_task_ids=item["depends_on_task_ids"],
     )
 
@@ -424,8 +422,7 @@ def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
         group_file = group_path(cfg.shared_root, group_name)
         if not group_file.exists():
             raise RuntimeError(
-                f"committed submission {submission['operation_id']!r} has a missing Group "
-                f"{group_name!r}."
+                f"committed submission {submission['operation_id']!r} has a missing Group " f"{group_name!r}."
             )
         group = read_json(group_file)
         normalize_group_record(group)
@@ -434,16 +431,13 @@ def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
             return
         if pending.get("operation_id") != submission["operation_id"]:
             raise RuntimeError(
-                f"Group {group_name!r} has pending submission commit "
-                f"{pending.get('operation_id')!r}."
+                f"Group {group_name!r} has pending submission commit " f"{pending.get('operation_id')!r}."
             )
         sequences = pending.get("membership_sequences")
         if sequences is None:
             sequences = submission["commit_plan"].get("group_membership_sequences")
         if not isinstance(sequences, list):
-            raise RuntimeError(
-                f"submission {submission['operation_id']!r} has no membership sequence plan."
-            )
+            raise RuntimeError(f"submission {submission['operation_id']!r} has no membership sequence plan.")
         group["group"]["next_membership_sequence"] = max(
             group["group"]["next_membership_sequence"], max(sequences, default=0) + 1
         )
@@ -469,10 +463,7 @@ def submit_specs(
     normalized = {
         "group": group_name,
         "tasks": _canonical_specs(specs),
-        "worker_set": {
-            machine: worker_additions[machine]
-            for machine in sorted(worker_additions)
-        },
+        "worker_set": {machine: worker_additions[machine] for machine in sorted(worker_additions)},
     }
     raw_digest = semantic_digest(normalized)
     key = idempotency_key or new_id()
@@ -508,19 +499,13 @@ def submit_specs(
             operation_id = submission["operation_id"]
         else:
             resolved = _resolved_specs(specs, cfg.machine_name)
-            if not is_dependencies_canonical and any(
-                item["depends_on_task_ids"] for item in resolved
-            ):
-                raise ValueError(
-                    "Task dependencies require an activated task-dependencies-v1 root."
-                )
+            if not is_dependencies_canonical and any(item["depends_on_task_ids"] for item in resolved):
+                raise ValueError("Task dependencies require an activated task-dependencies-v1 root.")
             for item in resolved:
                 _task_spec(item, is_canonical=is_canonical)
-            for machine in sorted({
-                item["home_machine"]
-                for item in resolved
-                if item["home_machine"] != cfg.machine_name
-            }):
+            for machine in sorted(
+                {item["home_machine"] for item in resolved if item["home_machine"] != cfg.machine_name}
+            ):
                 _validate_target_machine_record(cfg, machine)
             group_precondition = _group_precondition(None)
             planned_workers: dict[str, dict[str, Any]] = {}
@@ -536,18 +521,14 @@ def submit_specs(
                         raise ValueError(f"Group {group_name!r} is sealed.")
                     group_precondition = _group_precondition(group)
                 if group is None and kind == "single":
-                    raise ValueError(
-                        f"Group {group_name!r} does not exist; create it with 'qexp group create'."
-                    )
+                    raise ValueError(f"Group {group_name!r} does not exist; create it with 'qexp group create'.")
                 if group is None and not worker_additions:
                     raise ValueError(
                         f"Group {group_name!r} does not exist; batch-submit requires a non-empty "
                         "manifest group.workers declaration."
                     )
                 planned_workers = _planned_worker_set(group, worker_additions)
-                _validate_placement_against_workers(
-                    resolved, group_name=group_name, planned_workers=planned_workers
-                )
+                _validate_placement_against_workers(resolved, group_name=group_name, planned_workers=planned_workers)
             else:
                 _validate_placement_against_workers(resolved, group_name=None, planned_workers={cfg.machine_name: {}})
             if any(item["offer_after_seconds"] is not None for item in resolved):
@@ -631,19 +612,14 @@ def submit_specs(
                     "worker_set_additions": operation["submission"]["resolved_context"].get("worker_set_additions", []),
                 }
                 workers = group["group"]["worker_set"]
-                previous_workers = {
-                    worker_name: dict(worker)
-                    for worker_name, worker in workers.items()
-                }
+                previous_workers = {worker_name: dict(worker) for worker_name, worker in workers.items()}
                 projection_routes = primary_projection_routes_for_group(cfg, group_name)
                 added_workers: list[dict[str, Any]] = []
                 added_worker_machines: list[str] = []
                 for machine in dict.fromkeys(
                     operation["submission"]["resolved_context"].get("worker_set_additions", {})
                 ):
-                    declaration = operation["submission"]["resolved_context"][
-                        "worker_set_additions"
-                    ][machine]
+                    declaration = operation["submission"]["resolved_context"]["worker_set_additions"][machine]
                     if machine not in workers:
                         worker = new_worker_member(
                             scheduling_role=declaration["scheduling_role"],
@@ -661,15 +637,11 @@ def submit_specs(
                 group["meta"]["updated_at"] = utc_now()
                 if added_worker_machines:
                     routes = projection_routes + [
-                        (scope, machine)
-                        for machine in added_worker_machines
-                        for scope in ("shared", "home")
+                        (scope, machine) for machine in added_worker_machines for scope in ("shared", "home")
                     ]
-                    with primary_projection_transaction(cfg, routes):
+                    with primary_route_update_transaction(cfg, routes):
                         _write_group_record(cfg, group_file, group)
-                        sync_primary_ready_group(
-                            cfg, group_name, previous_workers=previous_workers
-                        )
+                        sync_primary_ready_group(cfg, group_name, previous_workers=previous_workers)
                 else:
                     _write_group_record(cfg, group_file, group)
         else:
@@ -683,7 +655,9 @@ def submit_specs(
             nonlocal commit_durable
             candidates = [
                 _new_task_from_resolved(
-                    item, group_name=group_name, operation_id=operation_id,
+                    item,
+                    group_name=group_name,
+                    operation_id=operation_id,
                     is_canonical=is_canonical,
                 )
                 for item in resolved
@@ -697,9 +671,7 @@ def submit_specs(
                     if not _task_matches_resolved(current, item, operation_id, group_name):
                         raise ValueError(f"Task {item['task_id']!r} already exists with different truth.")
                     if current.ready_generation == 0:
-                        old_generation, _ = prepare_ready_transition(
-                            cfg, current, "submission_resume"
-                        )
+                        old_generation, _ = prepare_ready_transition(cfg, current, "submission_resume")
                         current.meta["revision"] += 1
                         current.meta["updated_at"] = utc_now()
                         save_task(cfg, current)
@@ -708,7 +680,9 @@ def submit_specs(
                     staged.append(current)
                     continue
                 task = _new_task_from_resolved(
-                    item, group_name=group_name, operation_id=operation_id,
+                    item,
+                    group_name=group_name,
+                    operation_id=operation_id,
                     is_canonical=is_canonical,
                 )
                 task.group_membership_sequence = sequence
@@ -741,7 +715,9 @@ def submit_specs(
             # authoritative check because it runs outside the publication transaction.
             prepared_candidates = [
                 _new_task_from_resolved(
-                    item, group_name=group_name, operation_id=operation_id,
+                    item,
+                    group_name=group_name,
+                    operation_id=operation_id,
                     is_canonical=is_canonical,
                 )
                 for item in resolved
