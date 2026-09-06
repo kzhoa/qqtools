@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from .locks import exclusive, schema_lock
+from .locks import exclusive, schema_lock, schema_writer_lock
 from .paths import group_path, ready_state_path, shared_paths, submission_path, task_path
 from .records import TaskRecord, normalize_group_record, utc_now, validate_identifier
 from .store import atomic_replace, iter_json, read_json
@@ -1868,12 +1868,16 @@ def _task_should_have_ready_marker(task: TaskRecord) -> bool:
 
 def _repair_task_ready_projection(cfg: object, task_id: str) -> tuple[int, int]:
     """Repair one Task projection under its authority lock."""
-    from .locks import task_lock
+    from .locks import task_writer_lock
     from .tasks import load_task, save_task
 
     repaired = 0
     stale_removed = 0
-    with task_lock(cfg.shared_root, task_id):
+    try:
+        initial = load_task(cfg, task_id)
+    except FileNotFoundError:
+        return repaired, stale_removed
+    with task_writer_lock(cfg, task_id, initial.group_name):
         try:
             task = load_task(cfg, task_id)
         except FileNotFoundError:
@@ -1994,77 +1998,80 @@ def advance_ready_index_build(
             f"max_tasks must be between 1 and {READY_BUILD_PAGE_SIZE}."
         )
     begin_ready_index_build(cfg)
-    with exclusive(_state_lock_path(cfg)):
-        path = ready_state_path(cfg.shared_root)
-        value, record = _read_ready_state_record(cfg)
-        if record["state"] != "building":
-            return record
-        build = record.get("build")
-        if not isinstance(build, dict):
-            _degrade_ready_record(record, "build_state_missing")
-            _commit_ready_state(path, value, record)
-            return record
-        watermark = build.get("watermark", {})
-        page_count = watermark.get("page_count")
-        if type(page_count) is not int or page_count < 0 or not watermark.get("is_complete"):
-            _degrade_ready_record(record, "build_watermark_invalid")
-            _commit_ready_state(path, value, record)
-            return record
-        phase = build.get("phase")
-        cursor_name = "cursor" if phase == "backfill" else "audit_cursor"
-        if phase not in {"backfill", "audit"}:
-            _degrade_ready_record(record, f"build_phase_invalid:{phase}")
-            _commit_ready_state(path, value, record)
-            return record
-        cursor = build.get(cursor_name)
-        if not isinstance(cursor, dict):
-            _degrade_ready_record(record, f"build_cursor_invalid:{cursor_name}")
-            _commit_ready_state(path, value, record)
-            return record
-        processed_now = 0
-        try:
-            while processed_now < max_tasks and cursor["page"] < page_count:
-                task_ids = _load_build_page(cfg, build["build_id"], cursor["page"])
-                if cursor["offset"] >= len(task_ids):
-                    cursor["page"] += 1
-                    cursor["offset"] = 0
-                    continue
-                task_id = task_ids[cursor["offset"]]
-                if phase == "backfill":
-                    repaired, stale_removed = _repair_task_ready_projection(cfg, task_id)
-                    build["repaired"] += repaired
-                    build["stale_removed"] += stale_removed
-                    build["processed"] += 1
-                else:
-                    issue = _audit_task_ready_projection(cfg, task_id)
-                    if issue is not None:
-                        _degrade_ready_record(record, issue)
-                        break
-                processed_now += 1
-                _advance_build_cursor(
-                    cursor, item_count=len(task_ids), page_count=page_count
-                )
-            if record["state"] == "building" and cursor["page"] >= page_count:
-                if phase == "backfill":
-                    build["phase"] = "audit"
-                else:
-                    assert_ready_writer_compatible(cfg)
-                    incompatible = _active_incompatible_writers(cfg)
-                    if incompatible:
-                        _degrade_ready_record(
-                            record,
-                            "incompatible_active_writers:" + ",".join(incompatible),
-                        )
+    # A rebuild can repair Task truth.  Hold the schema fence before the ready
+    # state lock so its nested Task writer follows Schema -> state -> Group -> Task.
+    with schema_writer_lock(cfg):
+        with exclusive(_state_lock_path(cfg)):
+            path = ready_state_path(cfg.shared_root)
+            value, record = _read_ready_state_record(cfg)
+            if record["state"] != "building":
+                return record
+            build = record.get("build")
+            if not isinstance(build, dict):
+                _degrade_ready_record(record, "build_state_missing")
+                _commit_ready_state(path, value, record)
+                return record
+            watermark = build.get("watermark", {})
+            page_count = watermark.get("page_count")
+            if type(page_count) is not int or page_count < 0 or not watermark.get("is_complete"):
+                _degrade_ready_record(record, "build_watermark_invalid")
+                _commit_ready_state(path, value, record)
+                return record
+            phase = build.get("phase")
+            cursor_name = "cursor" if phase == "backfill" else "audit_cursor"
+            if phase not in {"backfill", "audit"}:
+                _degrade_ready_record(record, f"build_phase_invalid:{phase}")
+                _commit_ready_state(path, value, record)
+                return record
+            cursor = build.get(cursor_name)
+            if not isinstance(cursor, dict):
+                _degrade_ready_record(record, f"build_cursor_invalid:{cursor_name}")
+                _commit_ready_state(path, value, record)
+                return record
+            processed_now = 0
+            try:
+                while processed_now < max_tasks and cursor["page"] < page_count:
+                    task_ids = _load_build_page(cfg, build["build_id"], cursor["page"])
+                    if cursor["offset"] >= len(task_ids):
+                        cursor["page"] += 1
+                        cursor["offset"] = 0
+                        continue
+                    task_id = task_ids[cursor["offset"]]
+                    if phase == "backfill":
+                        repaired, stale_removed = _repair_task_ready_projection(cfg, task_id)
+                        build["repaired"] += repaired
+                        build["stale_removed"] += stale_removed
+                        build["processed"] += 1
                     else:
-                        record["state"] = "active"
-                        record["degraded_reasons"] = []
-                        build["phase"] = "completed"
-                        build["completed_at"] = utc_now()
-                        rebuild_primary_ready_index(cfg)
-        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            _degrade_ready_record(record, f"build_failed:{type(exc).__name__}:{exc}")
-        _commit_ready_state(path, value, record)
-        return record
+                        issue = _audit_task_ready_projection(cfg, task_id)
+                        if issue is not None:
+                            _degrade_ready_record(record, issue)
+                            break
+                    processed_now += 1
+                    _advance_build_cursor(
+                        cursor, item_count=len(task_ids), page_count=page_count
+                    )
+                if record["state"] == "building" and cursor["page"] >= page_count:
+                    if phase == "backfill":
+                        build["phase"] = "audit"
+                    else:
+                        assert_ready_writer_compatible(cfg)
+                        incompatible = _active_incompatible_writers(cfg)
+                        if incompatible:
+                            _degrade_ready_record(
+                                record,
+                                "incompatible_active_writers:" + ",".join(incompatible),
+                            )
+                        else:
+                            record["state"] = "active"
+                            record["degraded_reasons"] = []
+                            build["phase"] = "completed"
+                            build["completed_at"] = utc_now()
+                            rebuild_primary_ready_index(cfg)
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                _degrade_ready_record(record, f"build_failed:{type(exc).__name__}:{exc}")
+            _commit_ready_state(path, value, record)
+            return record
 
 
 def repair_ready_index(

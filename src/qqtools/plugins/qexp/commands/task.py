@@ -35,7 +35,7 @@ from ..runtime.dependencies import (
     normalize_dependency_ids,
     validate_group_dependencies,
 )
-from ..runtime.locks import group_lock, task_lock
+from ..runtime.locks import group_writer_lock, task_lock
 
 
 def is_cleanup_blocked(task: TaskRecord) -> bool:
@@ -229,7 +229,7 @@ def edit_dependencies(
     if initial.group_name is None:
         raise ValueError("ungrouped tasks cannot declare dependencies.")
     requested = normalize_dependency_ids(dependency_ids)
-    with group_lock(cfg.shared_root, initial.group_name):
+    with group_writer_lock(cfg, initial.group_name):
         with task_lock(cfg.shared_root, task_id):
             task = load_task(cfg, task_id)
             reject_cleanup_blocked(cfg, task, "have dependencies edited")

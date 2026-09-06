@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import os
 import shutil
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from ..config_types import RootConfig
-from ..runtime.locks import group_lock, schema_lock, task_lock
+from ..runtime.locks import group_lock, schema_writer_lock, task_lock
 from ..runtime.claims import reconcile_claim_archives
 from ..runtime.paths import group_path, local_paths, shared_paths, task_path
 from ..runtime.records import AttemptRecord, SCHEMA_VERSION, TaskRecord, new_id, utc_now
@@ -293,7 +294,7 @@ def _finalize_cleanup_if_ready(cfg: RootConfig, operation_path: Path) -> list[st
             return []
         return _finalize_cleanup_operation(cfg, operation)
 
-    with schema_lock(cfg.shared_root, blocking=False) as has_schema_lock:
+    with schema_writer_lock(cfg, blocking=False) as has_schema_lock:
         if not has_schema_lock:
             return []
         if group_name:
@@ -330,43 +331,60 @@ def reconcile_cleanup_operations(
                   "state": cleanup.get("state", "waiting_ack"),
                   "pending_machines": cleanup.get("pending_machines", []),
                   "removed": [], "blockers": []}
-        with task_lock(cfg.shared_root, task_id, blocking=False) as has_task_lock:
-            if not has_task_lock:
-                result["blockers"] = ["task_lock_busy"]
+        with schema_writer_lock(cfg, blocking=False) as has_schema_lock:
+            if not has_schema_lock:
+                result["blockers"] = ["schema_lock_busy"]
                 results.append(result)
                 continue
-            operation = read_json(operation_path)
-            cleanup = operation["cleanup"]
-            if cleanup.get("state") not in {"preparing", "waiting_ack"}:
-                continue
-            required = set(cleanup.get("required_machines", []))
-            acknowledgements = cleanup.setdefault("acknowledgements", {})
-            removed: list[str] = []
-            blockers: list[str] = []
-            if cfg.machine_name in required and cfg.machine_name not in acknowledgements:
-                removed, blockers = _cleanup_local_resources(
-                    cfg, task_id, reservation_runtime_root=reservation_runtime_root
-                )
-                if not blockers:
-                    acknowledgements[cfg.machine_name] = {"acknowledged_at": utc_now(),
-                                                          "removed": removed}
-            cleanup["state"] = "waiting_ack"
-            cleanup["pending_machines"] = sorted(required - set(acknowledgements))
             task_file = task_path(cfg.shared_root, task_id)
-            if task_file.exists():
-                task = load_task(cfg, task_id)
-                if task.control.get("cleanup_operation_id") == cleanup.get("operation_id"):
-                    task.control["cleanup_state"] = cleanup["state"]
-                    task.meta["revision"] += 1
-                    task.meta["updated_at"] = utc_now()
-                    save_task(cfg, task)
-            operation["meta"]["revision"] += 1
-            operation["meta"]["updated_at"] = utc_now()
-            atomic_replace(operation_path, operation)
-            result = {"operation_id": cleanup["operation_id"], "task_id": task_id,
-                      "state": cleanup["state"],
-                      "pending_machines": cleanup.get("pending_machines", []),
-                      "removed": removed, "blockers": blockers}
+            task = load_task(cfg, task_id) if task_file.exists() else None
+            with ExitStack() as stack:
+                if task and task.group_name:
+                    has_group_lock = stack.enter_context(
+                        group_lock(cfg.shared_root, task.group_name, blocking=False)
+                    )
+                    if not has_group_lock:
+                        result["blockers"] = ["group_lock_busy"]
+                        results.append(result)
+                        continue
+                has_task_lock = stack.enter_context(
+                    task_lock(cfg.shared_root, task_id, blocking=False)
+                )
+                if not has_task_lock:
+                    result["blockers"] = ["task_lock_busy"]
+                    results.append(result)
+                    continue
+                operation = read_json(operation_path)
+                cleanup = operation["cleanup"]
+                if cleanup.get("state") not in {"preparing", "waiting_ack"}:
+                    continue
+                required = set(cleanup.get("required_machines", []))
+                acknowledgements = cleanup.setdefault("acknowledgements", {})
+                removed: list[str] = []
+                blockers: list[str] = []
+                if cfg.machine_name in required and cfg.machine_name not in acknowledgements:
+                    removed, blockers = _cleanup_local_resources(
+                        cfg, task_id, reservation_runtime_root=reservation_runtime_root
+                    )
+                    if not blockers:
+                        acknowledgements[cfg.machine_name] = {"acknowledged_at": utc_now(),
+                                                              "removed": removed}
+                cleanup["state"] = "waiting_ack"
+                cleanup["pending_machines"] = sorted(required - set(acknowledgements))
+                if task_file.exists():
+                    task = load_task(cfg, task_id)
+                    if task.control.get("cleanup_operation_id") == cleanup.get("operation_id"):
+                        task.control["cleanup_state"] = cleanup["state"]
+                        task.meta["revision"] += 1
+                        task.meta["updated_at"] = utc_now()
+                        save_task(cfg, task)
+                operation["meta"]["revision"] += 1
+                operation["meta"]["updated_at"] = utc_now()
+                atomic_replace(operation_path, operation)
+                result = {"operation_id": cleanup["operation_id"], "task_id": task_id,
+                          "state": cleanup["state"],
+                          "pending_machines": cleanup.get("pending_machines", []),
+                          "removed": removed, "blockers": blockers}
         if not result["pending_machines"]:
             result["removed"].extend(_finalize_cleanup_if_ready(cfg, operation_path))
             finalized_path = locate_operation_path(cfg, "cleanup", task_id)
@@ -420,7 +438,7 @@ def clean(
                               "removed": [], "skipped": {}}
     from ..scheduler import authority_locks
     for candidate in candidates:
-        with schema_lock(cfg.shared_root):
+        with schema_writer_lock(cfg):
             with authority_locks(cfg, candidate):
                 task = load_task(cfg, candidate.task_id)
                 blockers = _clean_blockers(

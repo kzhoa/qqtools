@@ -1,5 +1,6 @@
 import multiprocessing
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -200,6 +201,51 @@ def test_doctor_finalizes_committed_submission_group(tmp_path: Path, monkeypatch
     group = read_json(group_path(cfg.shared_root, "exp"))
     assert group["group"]["pending_submission_commit"] is None
     assert group["group"]["next_membership_sequence"] == 2
+
+
+def test_doctor_does_not_clear_pending_group_commit_from_a_stale_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal-operation repair must reread Group truth after taking its fence."""
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
+    operation_id = "aborted-submission"
+    operation_path = shared_paths(cfg.shared_root)["submissions"] / f"{operation_id}.json"
+    atomic_replace(
+        operation_path,
+        {
+            "meta": {"revision": 1},
+            "submission": {
+                "operation_id": operation_id,
+                "target_group": "exp",
+                "state": "aborted",
+                "committed_at": None,
+            },
+        },
+    )
+    path = group_path(cfg.shared_root, "exp")
+    group = read_json(path)
+    group["group"]["pending_submission_commit"] = {"operation_id": operation_id}
+    atomic_replace(path, group)
+
+    from qqtools.plugins.qexp.doctor import group_writer_lock as real_group_writer_lock
+
+    @contextmanager
+    def replace_pending_before_doctor_read(*args, **kwargs):
+        with real_group_writer_lock(*args, **kwargs) as acquired:
+            assert acquired
+            current = read_json(path)
+            current["group"]["pending_submission_commit"] = {"operation_id": "new-owner"}
+            atomic_replace(path, current)
+            yield acquired
+
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.doctor.group_writer_lock", replace_pending_before_doctor_read
+    )
+    repaired = repair_metadata(cfg)
+
+    assert operation_id not in repaired["repaired"]
+    assert read_json(path)["group"]["pending_submission_commit"] == {"operation_id": "new-owner"}
 
 
 def test_clean_bulk_is_bounded_by_retention_and_limit(tmp_path: Path):

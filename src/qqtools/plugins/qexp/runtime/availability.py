@@ -15,7 +15,7 @@ from ..events import write_diagnostic_event
 from ..lease import (ClockObservation, clock_capability, new_timed_offer_proof,
                      persist_clock_observation, timed_offer_deadline_upper)
 from .locks import group_lock, task_lock
-from .locks import schema_lock
+from .locks import schema_lock, schema_writer_lock
 from .paths import group_path, shared_paths, submission_path
 from .records import SCHEMA_VERSION, TaskRecord, new_id, normalize_group_record, utc_now
 from .ready import (
@@ -555,6 +555,7 @@ def apply_availability_transition(
     operation: dict[str, Any] | None = None
     try:
         with ExitStack() as stack:
+            stack.enter_context(schema_writer_lock(cfg))
             if lock_group:
                 stack.enter_context(group_lock(cfg.shared_root, lock_group))
             stack.enter_context(task_lock(cfg.shared_root, request.task_id))

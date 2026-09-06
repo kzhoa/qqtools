@@ -1,7 +1,7 @@
 ---
 doc_type: spec
-status: active
-updated_at: 2026-08-31
+status: drafting
+updated_at: 2026-09-06
 archived_at:
 ---
 
@@ -250,6 +250,7 @@ create_if_absent(path, value)
 compare_and_swap(path, expected_revision, new_value)
 atomic_replace(path, value)
 acquire_exclusive(lock_path, owner, timeout)
+acquire_shared(lock_path, owner, timeout)
 release_exclusive(lock_path, owner)
 ```
 
@@ -273,7 +274,9 @@ lock solely from wall-clock age.
 All implementations use this global lock order:
 
 ```text
-project schema lock
+project schema lock (exclusive for migration/activation, shared for active narrow writers)
+  -> ready-index state lock (ready build/repair only)
+  -> idempotency-key lock (submission only)
   -> Group control lock
        -> Task lock, ordered lexicographically by task_id
 ```
@@ -282,10 +285,15 @@ Rules:
 
 - a grouped Task control operation acquires Group then Task
 - an ungrouped Task operation acquires only the Task lock
-- operations that create, permanently tombstone, or delete Task identity acquire the project
-  schema lock before any Group or Task lock
+- legacy roots use the exclusive schema lock for operations that create, permanently tombstone,
+  or delete Task identity; an active group-ready-members root uses the shared side of that same
+  lock, then its identity fences
+- submission acquires its keyed idempotency lock before its Group lock; same-key retries serialize
+  on that lock, while unrelated keys do not
 - a multi-Task operation acquires Task locks in sorted `task_id` order
 - no code path may acquire a Group lock while holding a Task lock
+- ready-index build and repair acquire the schema fence before the ready-index state lock; any
+  nested Task repair then continues with Group and Task locks in this same order
 - machine-local reservation locks are outside the shared lock order and must not be held
   while waiting indefinitely for a shared lock
 
@@ -923,11 +931,11 @@ matching active or provisional reservations, exited process manifests, and logs.
 and Attempt truth is deleted only after all acknowledgements exist; the operation then becomes
 `completed`. Agent and doctor reconciliation are idempotent and resume interrupted local
 cleanup or shared finalization. A live or unverifiable local process prevents acknowledgement.
-Acknowledgement updates acquire the Task lock only. Cleanup startup acquires
-`Schema -> Group -> Task` for grouped Tasks or `Schema -> Task` for ungrouped Tasks. Final
-shared deletion uses the same grouped/ungrouped lock split. These schema-lock sections ensure
-cleanup tombstone creation and Task truth deletion cannot interleave with submission staging,
-while the Group lock prevents grouped Task deletion from racing Group control enumeration.
+Acknowledgement updates, cleanup startup, and final shared deletion acquire
+`Schema -> Group -> Task` for grouped Tasks or `Schema -> Task` for ungrouped Tasks. These
+schema-lock sections ensure cleanup tombstone creation and Task truth deletion cannot interleave
+with submission staging, while the Group lock prevents grouped Task deletion from racing Group
+control enumeration.
 All writes to `operations/cleanup/<task-id>.json` are serialized by the Task lock for the same
 `task_id`; the operation revision is not an independent compare-and-swap authority.
 
@@ -1053,7 +1061,19 @@ Submission executes:
 7. persist the Submission Operation in `preparing`
 8. release the Group lock
 
+Before the group-ready-members projection is active, all of this work remains under the legacy
+exclusive schema lock. Once that projection is active, a normal submission holds a shared schema
+lock, keyed idempotency lock, Group lock when applicable, and sorted Task identity locks for its
+stage/commit interval. Every authoritative Task or Group writer, including scheduler lifecycle,
+availability, Group control, dependency edits, and cleanup reconciliation, acquires the same shared
+schema fence before its Group or Task locks. Schema/capability mutation holds the exclusive schema
+lock, which waits for all narrow writers and prevents a mutation from overtaking one. The projection
+activation commit is the sole selector of the narrow path.
+
 The operation exists before Task staging, so `doctor` can recover a terminal interruption.
+Doctor reads, validates, and clears a terminal operation's pending Group commit only while holding
+the same schema and Group writer fences; it must not overwrite a Group snapshot read before those
+fences were acquired.
 
 ### 10.3 Stage and Commit
 
@@ -1983,6 +2003,7 @@ unresolved action rather than reporting generic inconsistency.
 | CW-16 | Pause/cancel races with launch | Exactly one Group-lock order wins and defines running semantics |
 | CW-17 | Recovery races with drain/remove or terminating cancellation | Group-then-Task lock order yields one result; forbidden recovery terminates or quarantines the process |
 | CW-18 | CLI restarts while Group cancellation waits for acknowledgements | Durable Group control operation resumes with the same pending-machine set |
+| CW-19 | Schema/capability mutation races an authoritative Task or Group writer | Exclusive schema mutation waits for the writer; the writer observes one schema protocol for its complete authority section |
 
 ## 21. Verification Requirements
 

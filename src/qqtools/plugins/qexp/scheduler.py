@@ -29,7 +29,7 @@ from .lease import (
 )
 from .executor import Executor
 from .config_types import RootConfig
-from .runtime.locks import group_lock, task_lock
+from .runtime.locks import group_lock, schema_writer_lock, task_lock
 from .runtime.claims import archive_claim
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, submission_path
 from .runtime.records import AttemptRecord, TaskRecord, TaskSpec, normalize_group_record, utc_now
@@ -199,8 +199,9 @@ def _process_evidence_state(attempt: AttemptRecord, data: dict[str, Any]) -> str
 @contextmanager
 def authority_locks(cfg: RootConfig, task: TaskRecord) -> Iterator[None]:
     """Acquire the only permitted shared authority order."""
-    with dependency_locks(cfg, task):
-        yield
+    with schema_writer_lock(cfg):
+        with dependency_locks(cfg, task):
+            yield
 
 
 def _group_allows(group: dict[str, Any], task: TaskRecord, machine: str) -> bool:
