@@ -1036,7 +1036,11 @@ def advance_group_ready_members_build(
     if record["state"] != "building":
         return record
     from . import primary_candidates
-    from .index import _reference_for_generation, _task_should_have_ready_marker
+    from .index import (
+        _reference_for_generation,
+        _task_should_have_ready_marker,
+        begin_primary_ready_index_rebuild,
+    )
     from ..records import TaskRecord
     try:
         with exclusive(_state_lock_path(cfg)):
@@ -1101,7 +1105,7 @@ def advance_group_ready_members_build(
             # watermark.  Every Task or Group mutation after that fence will
             # dual-write the cleared rebuild, including work outside the
             # watermark that is captured below.
-            primary_candidates.begin_primary_ready_index_rebuild(cfg, build_id)
+            begin_primary_ready_index_rebuild(cfg, build_id)
             captured = _capture_build_watermark(cfg, build_id=build_id, watermark=current,
                                                 max_entries=max_tasks, collection="audit-tasks")
             updates = {"audit_task_watermark": captured}
@@ -1162,7 +1166,7 @@ def advance_group_ready_members_build(
             page_count = audit.get("page_count")
             if not audit.get("is_complete") or type(page_count) is not int:
                 raise ValueError("Primary candidate rebuild cursor is invalid.")
-            primary_candidates.begin_primary_ready_index_rebuild(cfg, build_id)
+            begin_primary_ready_index_rebuild(cfg, build_id)
             processed = 0
             while processed < max_tasks and cursor["page"] < page_count:
                 items = _load_build_page(cfg, build_id, cursor["page"], collection="audit-tasks")
