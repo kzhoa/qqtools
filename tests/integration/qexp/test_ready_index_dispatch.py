@@ -1042,10 +1042,10 @@ def test_primary_rebuild_keeps_concurrently_published_candidate(
     writer_reached_sync = threading.Event()
     writer_finished = threading.Event()
     original_iter_json = __import__(
-        "qqtools.plugins.qexp.runtime.ready", fromlist=["iter_json"]
+        "qqtools.plugins.qexp.runtime.ready.index", fromlist=["iter_json"]
     ).iter_json
     original_sync = __import__(
-        "qqtools.plugins.qexp.runtime.ready", fromlist=["_sync_primary_candidate"]
+        "qqtools.plugins.qexp.runtime.ready.index", fromlist=["_sync_primary_candidate"]
     )._sync_primary_candidate
 
     def pause_after_task_scan(directory):
@@ -1059,10 +1059,10 @@ def test_primary_rebuild_keeps_concurrently_published_candidate(
         return original_sync(*args, **kwargs)
 
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.runtime.ready.iter_json", pause_after_task_scan
+        "qqtools.plugins.qexp.runtime.ready.index.iter_json", pause_after_task_scan
     )
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.runtime.ready._sync_primary_candidate", record_writer_sync
+        "qqtools.plugins.qexp.runtime.ready.index._sync_primary_candidate", record_writer_sync
     )
     rebuild_thread = threading.Thread(target=rebuild_primary_ready_index, args=(cfg,))
     rebuild_thread.start()

@@ -8,7 +8,7 @@ from typing import Any
 
 from .config_types import RootConfig
 from .layout import GROUP_READY_MEMBERS_CAPABILITY
-from .runtime.group_members import (
+from .runtime.ready.group_members import (
     advance_group_ready_members_build,
     begin_group_ready_members_build,
     read_group_ready_members_state,

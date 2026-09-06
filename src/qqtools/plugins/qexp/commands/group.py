@@ -9,7 +9,7 @@ from ..config_types import RootConfig
 from ..lifecycle import (TerminalTransition, commit_terminal_transition_locked,
                          dispatch_task_lifecycle_hooks_noexcept)
 from ..runtime.claims import archive_claim
-from ..runtime.group_members import assert_group_ready_members_writable
+from ..runtime.ready.group_members import assert_group_ready_members_writable
 from ..runtime.locks import group_writer_lock, task_lock
 from ..runtime.paths import attempt_path, group_path, shared_paths, submission_path
 from ..runtime.records import (AttemptRecord, SCHEMA_VERSION, TaskRecord, new_group, new_id,

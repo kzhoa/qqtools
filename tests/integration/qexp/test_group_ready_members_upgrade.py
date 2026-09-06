@@ -13,7 +13,7 @@ from qqtools.plugins.qexp.group_ready_members_upgrade import (
     resume_group_ready_members_upgrade,
     start_group_ready_members_upgrade,
 )
-from qqtools.plugins.qexp.runtime.group_members import (
+from qqtools.plugins.qexp.runtime.ready.group_members import (
     group_ready_members_state,
     mark_group_ready_members_degraded,
     read_group_ready_members,
@@ -92,7 +92,7 @@ def test_active_group_change_uses_members_and_exact_primary_routes(
     create_group(cfg, "exp")
     submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
     from qqtools.plugins.qexp.commands import group as group_commands
-    from qqtools.plugins.qexp.runtime import ready as ready_runtime
+    from qqtools.plugins.qexp.runtime.ready import index as ready_runtime
 
     state = advance_ready_index_build(cfg)
     while state["state"] == "building":
@@ -135,7 +135,7 @@ def test_retired_empty_pages_are_reused_without_historical_catalog_growth(tmp_pa
         submit(cfg, ["echo", str(index)], task_id=f"member-{index}", group="exp")
         for index in range(65)
     ]
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     for task in tasks:
         assert retire_group_ready_member(cfg, "exp", task.task_id, task.ready_generation)
@@ -154,7 +154,7 @@ def test_locator_damage_degrades_then_doctor_rebuilds_active_projection(tmp_path
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
     task = submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     entry = read_group_ready_members(cfg, "exp")[0]
     locator_path = group_members._locator_path(cfg, "exp", entry["identity"])
@@ -197,7 +197,7 @@ def test_doctor_verify_degrades_when_a_group_member_directory_is_missing(tmp_pat
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
     submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     import shutil
 
@@ -227,7 +227,7 @@ def test_member_publication_write_failure_persists_degraded_gate(
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     original_atomic_replace = group_members.atomic_replace
     has_failed = False
@@ -264,7 +264,7 @@ def test_member_retirement_write_failure_persists_degraded_gate(
     create_group(cfg, "exp")
     first = submit(cfg, ["echo", "one"], task_id="member-one", group="exp")
     submit(cfg, ["echo", "two"], task_id="member-two", group="exp")
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     original_atomic_replace = group_members.atomic_replace
     has_failed = False
@@ -295,7 +295,7 @@ def test_member_retirement_write_failure_persists_degraded_gate(
 
 def test_stale_member_revision_update_cannot_reopen_degraded_gate(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     state, catalog, partition = group_members._load_group(cfg, "exp")
     mark_group_ready_members_degraded(cfg, "concurrent_projection_failure")
@@ -312,7 +312,7 @@ def test_concurrent_group_projection_updates_do_not_lose_the_global_revision(
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "first")
     create_group(cfg, "second")
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     original_write_group = group_members._write_group
     barrier = Barrier(2)
@@ -350,7 +350,7 @@ def test_retirement_uses_its_exact_locator_without_group_catalog_scan(
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
     task = submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     def fail_catalog_scan(*_args, **_kwargs):
         raise AssertionError("retirement must not scan all Group member pages")
@@ -392,7 +392,7 @@ def test_upgrade_capture_commit_and_activation_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     (cfg.shared_root / "indexes" / "ready" / "group-members" / "state.json").unlink()
     group_members.begin_group_ready_members_build(cfg)
@@ -440,7 +440,7 @@ def test_doctor_repair_crash_preserves_the_degraded_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     mark_group_ready_members_degraded(cfg, "injected projection damage")
     original_atomic_replace = group_members.atomic_replace
@@ -516,7 +516,7 @@ def test_resume_consumes_durable_watermark_without_reenumerating_tasks(
     )
     assert first["phase"] == "building"
 
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     original_scandir = group_members.os.scandir
 
@@ -587,7 +587,7 @@ def test_primary_rebuild_crash_before_member_activation_resumes_safely(
         state = resume_group_ready_members_upgrade(
             cfg, activation_id=session["activation_id"], max_tasks=1,
         )
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     original_commit = group_members._commit_build_record
 
@@ -632,7 +632,7 @@ def test_primary_rebuild_dual_writes_ready_tasks_created_after_its_watermark(tmp
     assert state["projection"]["build"]["phase"] == "primary-rebuild"
 
     concurrent = submit(cfg, ["echo", "during"], task_id="during-primary-rebuild", group="exp")
-    from qqtools.plugins.qexp.runtime.ready import _primary_candidate_path, _reference_for_generation
+    from qqtools.plugins.qexp.runtime.ready.index import _primary_candidate_path, _reference_for_generation
 
     reference = _reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
     assert reference is not None
@@ -680,7 +680,7 @@ def test_final_task_watermark_starts_primary_rebuild_before_later_task_writes(
     assert state["projection"]["build"]["phase"] == "audit-tasks"
 
     concurrent = submit(cfg, ["echo", "late"], task_id="after-final-watermark", group="exp")
-    from qqtools.plugins.qexp.runtime.ready import _primary_candidate_path, _reference_for_generation
+    from qqtools.plugins.qexp.runtime.ready.index import _primary_candidate_path, _reference_for_generation
 
     reference = _reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
     assert reference is not None
@@ -706,7 +706,7 @@ def test_primary_rebuild_parks_existing_routes_without_enumerating_candidates(
     for index in range(128):
         atomic_replace(route / f"candidate-{index}.json", {"candidate": index})
 
-    from qqtools.plugins.qexp.runtime import ready as ready_runtime
+    from qqtools.plugins.qexp.runtime.ready import index as ready_runtime
 
     original_scandir = ready_runtime.os.scandir
 
@@ -739,7 +739,7 @@ def test_primary_rebuild_park_resumes_without_replacing_the_new_route_tree(
     old_route.mkdir(parents=True)
     atomic_replace(old_route / "old.json", {"candidate": "old"})
 
-    from qqtools.plugins.qexp.runtime import ready as ready_runtime
+    from qqtools.plugins.qexp.runtime.ready import index as ready_runtime
 
     original_atomic_replace = ready_runtime.atomic_replace
     is_crash_injected = False
@@ -802,7 +802,7 @@ def test_primary_rebuild_accepts_group_role_updates_for_new_members(tmp_path: Pa
         cfg, activation_id=session["activation_id"], max_tasks=1,
     )
     concurrent = submit(cfg, ["echo", "during"], task_id="during-role-update", group="exp")
-    from qqtools.plugins.qexp.runtime.ready import _primary_candidate_path, _reference_for_generation
+    from qqtools.plugins.qexp.runtime.ready.index import _primary_candidate_path, _reference_for_generation
 
     reference = _reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
     assert reference is not None
@@ -850,7 +850,7 @@ def test_member_audit_restarts_a_group_after_a_legal_retirement(tmp_path: Path) 
 
     attempt = claim_task(cfg, "audit-one", [0])
     assert attempt is not None
-    from qqtools.plugins.qexp.runtime import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members
 
     cursor = state["projection"]["build"]["audit_member_cursor"]
     revision = read_json(group_members._group_state_path(cfg, "exp"))["group_ready_members"]

@@ -17,7 +17,7 @@ from .locks import (
     task_lock,
     task_locks,
 )
-from .group_members import assert_group_ready_members_writable
+from .ready.group_members import assert_group_ready_members_writable
 from .paths import group_path, idempotency_path, machine_path, shared_paths, submission_path, task_path
 from .records import (
     TaskRecord,

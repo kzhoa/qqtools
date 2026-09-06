@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from .locks import exclusive, schema_lock, schema_writer_lock
+from ..locks import exclusive, schema_lock, schema_writer_lock
 from .group_members import (
     is_group_ready_member_projection_usable,
     publish_group_ready_member,
@@ -18,10 +18,10 @@ from .group_members import (
     retire_group_ready_member,
     group_ready_members_state,
 )
-from .paths import group_path, ready_state_path, shared_paths, submission_path, task_path
-from .records import TaskRecord, normalize_group_record, utc_now, validate_identifier
-from .store import atomic_replace, iter_json, read_json
-from .work_budget import SliceBudget
+from ..paths import group_path, ready_state_path, shared_paths, submission_path, task_path
+from ..records import TaskRecord, normalize_group_record, utc_now, validate_identifier
+from ..store import atomic_replace, iter_json, read_json
+from ..work_budget import SliceBudget
 
 READY_PROTOCOL_VERSION = 1
 READY_WRITER_CAPABILITY = "ready-v1"
@@ -2018,7 +2018,7 @@ def classify_ready_marker(
             return ReadyClassificationResult("corrupt", "group_invalid", task)
         if group.get("dispatch_state") != "active":
             return ReadyClassificationResult("temporarily_unavailable", "group_paused", task)
-    from .dependencies import dependency_gate
+    from ..dependencies import dependency_gate
 
     gate = dependency_gate(cfg, task)
     if gate.state == "invalid":
@@ -2108,8 +2108,8 @@ def _task_should_have_ready_marker(task: TaskRecord) -> bool:
 
 def _repair_task_ready_projection(cfg: object, task_id: str) -> tuple[int, int]:
     """Repair one Task projection under its authority lock."""
-    from .locks import task_writer_lock
-    from .tasks import load_task, save_task
+    from ..locks import task_writer_lock
+    from ..tasks import load_task, save_task
 
     repaired = 0
     stale_removed = 0

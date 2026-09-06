@@ -32,7 +32,7 @@ from .layout import load_root_config, machine_state_path, runtime_pid_path
 from .project_maintenance import maintain_project, reconcile_reservation
 from .runtime.paths import local_paths
 from .runtime.records import TaskSpec, normalize_group_record, utc_now
-from .runtime.group_members import is_group_ready_member_projection_usable
+from .runtime.ready.group_members import is_group_ready_member_projection_usable
 from .runtime.reservations import (
     ReservationIdentity,
     ReservationSnapshot,

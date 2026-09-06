@@ -9,7 +9,7 @@ from .runtime.locks import exclusive
 from .runtime.paths import local_paths
 from .runtime.records import utc_now
 from .runtime.store import atomic_replace, read_json
-from .runtime.group_members import GROUP_READY_MEMBERS_CAPABILITY
+from .runtime.ready.group_members import GROUP_READY_MEMBERS_CAPABILITY
 from .runtime.ready import READY_WRITER_CAPABILITY
 
 
