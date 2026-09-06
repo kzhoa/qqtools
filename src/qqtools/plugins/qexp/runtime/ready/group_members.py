@@ -10,14 +10,14 @@ import uuid
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from .locks import exclusive
-from .paths import shared_paths
-from .records import TaskRecord, utc_now, validate_identifier
-from .store import atomic_replace, read_json
+from ..locks import exclusive
+from ..paths import shared_paths
+from ..records import TaskRecord, utc_now, validate_identifier
+from ..store import atomic_replace, read_json
 
 if TYPE_CHECKING:
-    from .ready import ReadyMarkerRef
-    from .records import TaskRecord
+    from .index import ReadyMarkerRef
+    from ..records import TaskRecord
 
 GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
 GROUP_READY_MEMBERS_VERSION = 1
@@ -148,7 +148,7 @@ def group_ready_members_state(cfg: object) -> str:
 
 def is_group_ready_member_projection_usable(cfg: object) -> bool:
     """Return whether the installed member protocol is safe for primary probes."""
-    from ..layout import is_group_ready_members_root
+    from ...layout import is_group_ready_members_root
 
     return not is_group_ready_members_root(cfg) or group_ready_members_state(cfg) == "active"
 
@@ -395,7 +395,7 @@ def publish_group_ready_member(cfg: object, task: TaskRecord, reference: ReadyMa
     """Publish one grouped ready generation after its marker is durable."""
     if not task.group_name:
         return
-    from ..layout import is_group_ready_members_root
+    from ...layout import is_group_ready_members_root
 
     if not is_group_ready_members_root(cfg):
         return
@@ -616,9 +616,9 @@ def _should_index(task: TaskRecord) -> bool:
 
 def audit_group_ready_members(cfg: object) -> dict[str, Any]:
     """Verify member entries against authoritative queued Task and ready-marker truth."""
-    from .ready import _reference_for_generation
-    from .records import TaskRecord
-    from .store import iter_json
+    from .index import _reference_for_generation
+    from ..records import TaskRecord
+    from ..store import iter_json
 
     state = read_group_ready_members_state(cfg)
     if state["state"] not in {"building", "active"}:
@@ -716,7 +716,7 @@ def _audit_task_member(
         if _locator_path(cfg, task.group_name, identity).exists():
             raise ValueError(f"Group ready-member is stale for Task {task.task_id!r}.")
         return task, None
-    from .ready import _reference_for_generation
+    from .index import _reference_for_generation
 
     reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
     if reference is None:
@@ -735,7 +735,7 @@ def _audit_member_entry(cfg: object, group_name: str, entry: dict[str, Any]) -> 
     )
     if task.group_name != group_name or not _should_index(task):
         raise ValueError(f"Group {group_name!r} has a stale ready-member entry.")
-    from .ready import _reference_for_generation
+    from .index import _reference_for_generation
 
     reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
     if reference is None:
@@ -1035,12 +1035,12 @@ def advance_group_ready_members_build(
     record = begin_group_ready_members_build(cfg)
     if record["state"] != "building":
         return record
-    from .ready import (
+    from .index import (
         _reference_for_generation, _task_should_have_ready_marker,
         begin_primary_ready_index_rebuild, complete_primary_ready_index_rebuild,
         rebuild_primary_ready_candidate,
     )
-    from .records import TaskRecord
+    from ..records import TaskRecord
     try:
         with exclusive(_state_lock_path(cfg)):
             value = read_json(_state_path(cfg))
@@ -1200,7 +1200,7 @@ def advance_group_ready_members_build(
 
 def repair_group_ready_members(cfg: object, *, max_tasks: int = GROUP_MEMBER_PAGE_SIZE) -> dict[str, Any]:
     """Rebuild damaged derived membership from durable Task and ready truth."""
-    from ..layout import is_group_ready_members_root
+    from ...layout import is_group_ready_members_root
 
     if not is_group_ready_members_root(cfg):
         return {"state": "legacy", "required_capability": GROUP_READY_MEMBERS_CAPABILITY}

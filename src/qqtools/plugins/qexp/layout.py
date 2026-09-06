@@ -194,7 +194,7 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                 ],
             }}
             atomic_replace(_schema_path(cfg), schema)
-            from .runtime.group_members import initialize_group_ready_members
+            from .runtime.ready.group_members import initialize_group_ready_members
 
             initialize_group_ready_members(cfg)
     ensure_machine_layout(cfg)

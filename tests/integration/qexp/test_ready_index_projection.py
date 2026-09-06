@@ -138,7 +138,7 @@ def test_ready_deletion_tolerates_concurrent_reservation_removal(
         shared_paths(cfg.shared_root)["ready_reservations"]
         / f"{task.task_id}.{task.ready_generation}.json"
     )
-    from qqtools.plugins.qexp.runtime import ready
+    from qqtools.plugins.qexp.runtime.ready import index as ready
 
     original_read_json = ready.read_json
 
@@ -200,7 +200,7 @@ def test_ready_delete_failure_does_not_roll_back_authoritative_claim(
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.runtime.ready.delete_ready_marker",
+        "qqtools.plugins.qexp.runtime.ready.index.delete_ready_marker",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("shared storage unavailable")),
     )
 

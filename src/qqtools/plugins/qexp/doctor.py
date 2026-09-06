@@ -29,7 +29,7 @@ from .runtime.ready import (
     repair_ready_index,
     retire_current_ready_generation,
 )
-from .runtime.group_members import (
+from .runtime.ready.group_members import (
     GROUP_MEMBER_PAGE_SIZE,
     audit_group_ready_members,
     group_ready_members_state,
