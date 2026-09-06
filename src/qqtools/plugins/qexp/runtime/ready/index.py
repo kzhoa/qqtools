@@ -24,16 +24,14 @@ from ..store import atomic_replace, iter_json, read_json
 from ..work_budget import SliceBudget
 from . import primary_candidates
 from .records import ReadyMarkerRef, ReadyScope
+from . import state
 
-READY_PROTOCOL_VERSION = 1
-READY_WRITER_CAPABILITY = "ready-v1"
 READY_PARTITION_SLOTS = 64
 READY_CATALOG_PAGE_SIZE = 64
 READY_BUILD_PAGE_SIZE = 64
 ReadyClassification = Literal[
     "claimable", "temporarily_unavailable", "permanently_stale", "corrupt"
 ]
-ReadyIndexState = Literal["absent", "building", "active", "degraded"]
 
 
 class ReadyProbeBudgetExhausted(RuntimeError):
@@ -69,150 +67,6 @@ class ReadyPeek:
     unresolved: bool = False
 
 
-def ensure_ready_layout(cfg: object) -> None:
-    """Create the additive ready layout without activating ready-only scheduling."""
-    paths = shared_paths(cfg.shared_root)
-    for name in (
-        "ready", "ready_home", "ready_shared", "ready_catalogs", "ready_reservations",
-        "ready_cursors", "ready_builds", "ready_locks",
-        "ready_primary",
-    ):
-        paths[name].mkdir(parents=True, exist_ok=True)
-    state_path = ready_state_path(cfg.shared_root)
-    if not state_path.exists():
-        atomic_replace(state_path, {
-            "ready_index": {
-                "schema_version": READY_PROTOCOL_VERSION,
-                "state": "absent",
-                "writer_capability": None,
-                "revision": 0,
-                "build": None,
-                "updated_at": utc_now(),
-                "degraded_reasons": [],
-            }
-        })
-
-
-def read_ready_index_state(cfg: object) -> ReadyIndexState:
-    """Return the scheduling gate for this project's ready projection."""
-    path = ready_state_path(cfg.shared_root)
-    if not path.exists():
-        return "absent"
-    try:
-        record = read_json(path)["ready_index"]
-        state = record["state"]
-        if record["schema_version"] != READY_PROTOCOL_VERSION:
-            return "degraded"
-        if state not in {"absent", "building", "active", "degraded"}:
-            return "degraded"
-        if (
-            state in {"building", "active"}
-            and record.get("writer_capability") != READY_WRITER_CAPABILITY
-        ):
-            return "degraded"
-        return state
-    except (KeyError, TypeError, ValueError):
-        return "degraded"
-
-
-def _state_lock_path(cfg: object) -> Path:
-    return shared_paths(cfg.shared_root)["ready_locks"] / "state.lock"
-
-
-def _read_ready_state_record(cfg: object) -> tuple[dict[str, Any], dict[str, Any]]:
-    value = read_json(ready_state_path(cfg.shared_root))
-    record = value["ready_index"]
-    if record.get("schema_version") != READY_PROTOCOL_VERSION:
-        raise ValueError("ready index state schema is unsupported.")
-    if record.get("state") not in {"absent", "building", "active", "degraded"}:
-        raise ValueError("ready index state is invalid.")
-    record.setdefault("writer_capability", None)
-    record.setdefault("revision", 0)
-    record.setdefault("build", None)
-    record.setdefault("degraded_reasons", [])
-    if type(record["revision"]) is not int or record["revision"] < 0:
-        raise ValueError("ready index revision is invalid.")
-    return value, record
-
-
-def read_ready_index_status(cfg: object) -> dict[str, Any]:
-    """Return the durable build, cursor, watermark, and degradation status."""
-    try:
-        _value, record = _read_ready_state_record(cfg)
-        return record
-    except (FileNotFoundError, KeyError, TypeError, ValueError):
-        return {
-            "schema_version": READY_PROTOCOL_VERSION,
-            "state": "degraded",
-            "writer_capability": None,
-            "revision": 0,
-            "build": None,
-            "degraded_reasons": ["state_invalid"],
-            "updated_at": None,
-        }
-
-
-def _commit_ready_state(path: Path, value: dict[str, Any], record: dict[str, Any]) -> None:
-    record["revision"] += 1
-    record["updated_at"] = utc_now()
-    atomic_replace(path, value)
-
-
-def _schema_capability_path(cfg: object) -> Path:
-    return shared_paths(cfg.shared_root)["schema"] / "version.json"
-
-
-def _install_writer_capability_gate(cfg: object) -> None:
-    """Make pre-ready schema readers reject the root before they can mutate Tasks."""
-    path = _schema_capability_path(cfg)
-    value = read_json(path)
-    schema = value.get("schema")
-    if not isinstance(schema, dict):
-        raise RuntimeError("qexp schema/version.json is malformed.")
-    capabilities = schema.get("writer_capabilities")
-    if capabilities is None:
-        schema["writer_capabilities"] = [READY_WRITER_CAPABILITY]
-    elif (
-        not isinstance(capabilities, list)
-        or not all(isinstance(item, str) for item in capabilities)
-        or READY_WRITER_CAPABILITY not in capabilities
-    ):
-        raise RuntimeError("qexp schema writer capability gate is incompatible.")
-    else:
-        return
-    atomic_replace(path, value)
-
-
-def assert_ready_writer_compatible(
-    cfg: object, writer_capability: str | None = READY_WRITER_CAPABILITY,
-) -> None:
-    """Reject an incompatible writer before authoritative Task mutation."""
-    state = read_ready_index_state(cfg)
-    if state == "absent":
-        return
-    try:
-        _value, record = _read_ready_state_record(cfg)
-    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("ready index state is invalid; Task mutation is disabled.") from exc
-    required = record.get("writer_capability")
-    if required != READY_WRITER_CAPABILITY or writer_capability != required:
-        raise RuntimeError(
-            f"ready index requires writer capability {required!r}; "
-            f"writer declared {writer_capability!r}."
-        )
-    try:
-        schema = read_json(_schema_capability_path(cfg))["schema"]
-        capabilities = schema["writer_capabilities"]
-    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("ready writer schema capability gate is missing.") from exc
-    if (
-        not isinstance(capabilities, list)
-        or not all(isinstance(item, str) for item in capabilities)
-        or READY_WRITER_CAPABILITY not in capabilities
-    ):
-        raise RuntimeError("ready writer schema capability gate is incompatible.")
-
-
 def _build_root(cfg: object, build_id: str) -> Path:
     validate_identifier(build_id, "ready build id")
     return shared_paths(cfg.shared_root)["ready_builds"] / build_id
@@ -228,7 +82,7 @@ def _write_build_page(
     atomic_replace(
         _build_page_path(cfg, build_id, page),
         {"ready_build_page": {
-            "schema_version": READY_PROTOCOL_VERSION,
+            "schema_version": state.READY_PROTOCOL_VERSION,
             "build_id": build_id,
             "page": page,
             "task_ids": list(task_ids),
@@ -288,25 +142,25 @@ def _reset_ready_projection_for_repair(cfg: object, build_id: str) -> None:
 
 def begin_ready_index_build(cfg: object, *, is_repair: bool = False) -> dict[str, Any]:
     """Start or resume the single durable ready-index build."""
-    ensure_ready_layout(cfg)
-    state = read_ready_index_state(cfg)
-    if state == "active" or (state == "degraded" and not is_repair):
-        return read_ready_index_status(cfg)
-    if state in {"absent", "degraded"}:
+    state.ensure_ready_layout(cfg)
+    current_state = state.read_ready_index_state(cfg)
+    if current_state == "active" or (current_state == "degraded" and not is_repair):
+        return state.read_ready_index_status(cfg)
+    if current_state in {"absent", "degraded"}:
         with schema_lock(cfg.shared_root):
-            with exclusive(_state_lock_path(cfg)):
+            with exclusive(state.state_lock_path(cfg)):
                 path = ready_state_path(cfg.shared_root)
-                value, record = _read_ready_state_record(cfg)
-                state = record["state"]
-                if state == "active" or (state == "degraded" and not is_repair):
+                value, record = state.read_state_record(cfg)
+                current_state = record["state"]
+                if current_state == "active" or (current_state == "degraded" and not is_repair):
                     return record
-                if state in {"absent", "degraded"}:
-                    _install_writer_capability_gate(cfg)
+                if current_state in {"absent", "degraded"}:
+                    state.install_writer_capability_gate(cfg)
                     build_id = uuid.uuid4().hex
-                    if state == "degraded" and is_repair:
+                    if current_state == "degraded" and is_repair:
                         _reset_ready_projection_for_repair(cfg, build_id)
                     record["state"] = "building"
-                    record["writer_capability"] = READY_WRITER_CAPABILITY
+                    record["writer_capability"] = state.READY_WRITER_CAPABILITY
                     record["build"] = {
                         "build_id": build_id,
                         "phase": "inventory",
@@ -325,44 +179,22 @@ def begin_ready_index_build(cfg: object, *, is_repair: bool = False) -> dict[str
                         "started_at": utc_now(),
                         "completed_at": None,
                     }
-                    _commit_ready_state(path, value, record)
-    with exclusive(_state_lock_path(cfg)):
+                    state.commit_state_under_lock(path, value, record)
+    with exclusive(state.state_lock_path(cfg)):
         path = ready_state_path(cfg.shared_root)
-        value, record = _read_ready_state_record(cfg)
-        state = record["state"]
-        if state == "active":
+        value, record = state.read_state_record(cfg)
+        current_state = record["state"]
+        if current_state == "active":
             return record
-        if state == "degraded" and not is_repair:
+        if current_state == "degraded" and not is_repair:
             return record
         build = record.get("build")
         if not isinstance(build, dict):
             raise RuntimeError("ready index build state is missing.")
         if not build.get("watermark", {}).get("is_complete"):
             _capture_build_watermark(cfg, record)
-            _commit_ready_state(path, value, record)
+            state.commit_state_under_lock(path, value, record)
         return record
-
-
-def mark_ready_index_degraded(cfg: object, reason: str) -> None:
-    """Fail closed after detecting a corrupt active projection."""
-    path = ready_state_path(cfg.shared_root)
-    try:
-        with exclusive(_state_lock_path(cfg)):
-            value, record = _read_ready_state_record(cfg)
-            _degrade_ready_record(record, reason)
-            _commit_ready_state(path, value, record)
-    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
-        return
-
-
-def _degrade_ready_record(record: dict[str, Any], reason: str) -> None:
-    reasons = record.get("degraded_reasons", [])
-    if not isinstance(reasons, list):
-        reasons = []
-    if reason not in reasons:
-        reasons.append(reason)
-    record["state"] = "degraded"
-    record["degraded_reasons"] = reasons
 
 
 def _route_key(scope: ReadyScope, home_machine: str) -> str:
@@ -377,7 +209,7 @@ def is_primary_ready_index_active(cfg: object) -> bool:
 
 def begin_primary_ready_index_rebuild(cfg: object, build_id: str) -> None:
     """Initialize the ready layout before starting a candidate-only rebuild."""
-    ensure_ready_layout(cfg)
+    state.ensure_ready_layout(cfg)
     primary_candidates.begin_primary_ready_index_rebuild(cfg, build_id)
 
 
@@ -439,7 +271,7 @@ def load_ready_cursor(
         }:
             raise ValueError("ready cursor schema is invalid.")
         if (
-            record["schema_version"] != READY_PROTOCOL_VERSION
+            record["schema_version"] != state.READY_PROTOCOL_VERSION
             or record["project_id"] != project_id
             or record["machine_name"] != cfg.machine_name
             or record["queue_scope"] != queue_scope
@@ -464,7 +296,7 @@ def _save_ready_cursor(cfg: object, cursor: ReadyCursor) -> None:
             cfg.shared_root, cursor.project_id, cursor.machine_name, cursor.queue_scope
         ),
         {"cursor": {
-            "schema_version": READY_PROTOCOL_VERSION,
+            "schema_version": state.READY_PROTOCOL_VERSION,
             "project_id": cursor.project_id,
             "machine_name": cursor.machine_name,
             "queue_scope": cursor.queue_scope,
@@ -518,7 +350,7 @@ def _is_partition_referenced_under_route_lock(
             catalog = read_json(page_path)["ready_catalog"]
             partitions = catalog["partitions"]
             if (
-                catalog.get("schema_version") != READY_PROTOCOL_VERSION
+                catalog.get("schema_version") != state.READY_PROTOCOL_VERSION
                 or catalog.get("route") != route_key
                 or catalog.get("page") != page_number
                 or not isinstance(partitions, list)
@@ -565,7 +397,7 @@ def next_ready_marker(
         ):
             raise ValueError("ready catalog successor is invalid.")
     except (KeyError, TypeError, ValueError):
-        mark_ready_index_degraded(cfg, f"catalog_invalid:{route_key}:{page_number}")
+        state.mark_ready_index_degraded(cfg, f"catalog_invalid:{route_key}:{page_number}")
         return None, False
     if cursor.partition in partitions:
         partition_index = partitions.index(cursor.partition)
@@ -599,13 +431,13 @@ def next_ready_marker(
         if _is_partition_referenced_under_route_lock(
             cfg, route_key, page_path, page_number, partition_name
         ):
-            mark_ready_index_degraded(
+            state.mark_ready_index_degraded(
                 cfg, f"partition_missing:{route_key}:{partition_name}"
             )
             return None, False
         names = []
     except (KeyError, TypeError, ValueError):
-        mark_ready_index_degraded(cfg, f"partition_invalid:{route_key}:{partition_name}")
+        state.mark_ready_index_degraded(cfg, f"partition_invalid:{route_key}:{partition_name}")
         return None, False
     for marker_name in names:
         if after_name is not None and marker_name <= after_name:
@@ -691,7 +523,7 @@ def peek_ready_marker(
             partitions = catalog["partitions"]
             successor = catalog.get("successor")
             if (
-                catalog.get("schema_version") != READY_PROTOCOL_VERSION
+                catalog.get("schema_version") != state.READY_PROTOCOL_VERSION
                 or catalog.get("route") != route_key
                 or catalog.get("page") != page_number
                 or not isinstance(partitions, list)
@@ -701,7 +533,7 @@ def peek_ready_marker(
             ):
                 raise ValueError("ready catalog is invalid.")
         except (FileNotFoundError, KeyError, TypeError, ValueError):
-            mark_ready_index_degraded(cfg, f"catalog_invalid:{route_key}:{page_number}")
+            state.mark_ready_index_degraded(cfg, f"catalog_invalid:{route_key}:{page_number}")
             return ReadyPeek(None, current, unresolved=True)
 
         if partition_name in partitions:
@@ -722,7 +554,7 @@ def peek_ready_marker(
                 partition = read_json(partition_path)["ready_partition"]
                 slots = partition["slots"]
                 if (
-                    partition.get("schema_version") != READY_PROTOCOL_VERSION
+                    partition.get("schema_version") != state.READY_PROTOCOL_VERSION
                     or partition.get("route") != route_key
                     or partition.get("partition") != partition_name
                     or not isinstance(slots, list)
@@ -738,13 +570,13 @@ def peek_ready_marker(
                 if _is_partition_referenced_under_route_lock(
                     cfg, route_key, page_path, page_number, partition_name
                 ):
-                    mark_ready_index_degraded(
+                    state.mark_ready_index_degraded(
                         cfg, f"partition_missing:{route_key}:{partition_name}"
                     )
                     return ReadyPeek(None, current, unresolved=True)
                 names = []
             except (KeyError, TypeError, ValueError):
-                mark_ready_index_degraded(
+                state.mark_ready_index_degraded(
                     cfg, f"partition_invalid:{route_key}:{partition_name}"
                 )
                 return ReadyPeek(None, current, unresolved=True)
@@ -894,7 +726,7 @@ def ready_index_revision(cfg: object, queue_scope: ReadyScope) -> str:
     """Return a read-only revision fingerprint for one machine route."""
     route_key = _route_key(queue_scope, cfg.machine_name)
     catalog_root = shared_paths(cfg.shared_root)["ready_catalogs"] / route_key
-    parts: list[object] = [read_ready_index_status(cfg).get("revision")]
+    parts: list[object] = [state.read_ready_index_status(cfg).get("revision")]
     for page_path in sorted(catalog_root.glob("*.json")):
         catalog = read_json(page_path)["ready_catalog"]
         parts.append((catalog["page"], catalog["revision"], tuple(catalog["partitions"])))
@@ -933,7 +765,7 @@ def ready_index_route_revision(
         else:
             revision = allocator.get(revision_key)
         if (
-            allocator.get("schema_version") != READY_PROTOCOL_VERSION
+            allocator.get("schema_version") != state.READY_PROTOCOL_VERSION
             or allocator.get("route") != route_key
             or type(revision) is not int
             or revision < 0
@@ -958,7 +790,7 @@ def primary_projection_transaction(
     failed mutation is deliberately left degraded rather than exposing a
     potentially incomplete candidate set to a borrow probe.
     """
-    ensure_ready_layout(cfg)
+    state.ensure_ready_layout(cfg)
     route_keys = sorted({_route_key(scope, machine) for scope, machine in routes})
     locks = []
     allocators: list[tuple[Path, dict[str, Any]]] = []
@@ -1034,7 +866,7 @@ def delete_stale_ready_marker(cfg: object, reference: ReadyMarkerRef) -> bool:
 def _new_allocator(route_key: str) -> dict[str, Any]:
     return {
         "ready_allocator": {
-            "schema_version": READY_PROTOCOL_VERSION,
+            "schema_version": state.READY_PROTOCOL_VERSION,
             "route": route_key,
             "next_partition": 1,
             "current_partition": None,
@@ -1089,7 +921,7 @@ def _append_catalog_partition(
         page = read_json(path)
     else:
         page = {"ready_catalog": {
-            "schema_version": READY_PROTOCOL_VERSION,
+            "schema_version": state.READY_PROTOCOL_VERSION,
             "route": route_key,
             "page": page_number,
             "partitions": [],
@@ -1106,7 +938,7 @@ def _append_catalog_partition(
         control["current_catalog_page"] = page_number
         path = _catalog_path(root, route_key, page_number)
         page = {"ready_catalog": {
-            "schema_version": READY_PROTOCOL_VERSION,
+            "schema_version": state.READY_PROTOCOL_VERSION,
             "route": route_key,
             "page": page_number,
             "partitions": [],
@@ -1123,7 +955,7 @@ def _append_catalog_partition(
 def _reserve_slot(
     cfg: object, task_id: str, generation: int, scope: ReadyScope, home_machine: str,
 ) -> ReadyMarkerRef:
-    ensure_ready_layout(cfg)
+    state.ensure_ready_layout(cfg)
     root = cfg.shared_root
     reservation_path = _reservation_path(root, task_id, generation)
     if reservation_path.exists():
@@ -1154,7 +986,7 @@ def _reserve_slot(
             control["next_partition"] += 1
             control["current_partition"] = partition
             partition_record = {"ready_partition": {
-                "schema_version": READY_PROTOCOL_VERSION,
+                "schema_version": state.READY_PROTOCOL_VERSION,
                 "route": route_key,
                 "partition": partition,
                 "slots": [],
@@ -1180,7 +1012,7 @@ def _reserve_slot(
             task_id, generation, scope, home_machine, partition, catalog_page, marker_name
         )
         atomic_replace(reservation_path, {"ready_reservation": {
-            "schema_version": READY_PROTOCOL_VERSION,
+            "schema_version": state.READY_PROTOCOL_VERSION,
             "task_id": task_id,
             "generation": generation,
             "queue_scope": scope,
@@ -1224,7 +1056,7 @@ def _has_primary_ready_demand(cfg: object, task: TaskRecord) -> bool:
 
 def rebuild_primary_ready_index(cfg: object) -> None:
     """Rebuild primary candidates from authoritative queued Task records."""
-    ensure_ready_layout(cfg)
+    state.ensure_ready_layout(cfg)
     with primary_candidates.projection_rebuild_lock(cfg):
         build_id = uuid.uuid4().hex
         atomic_replace(
@@ -1346,7 +1178,7 @@ def write_ready_marker(
     ):
         raise ValueError("ready reservation does not match the target Task route.")
     marker_value = {
-        "schema_version": READY_PROTOCOL_VERSION,
+        "schema_version": state.READY_PROTOCOL_VERSION,
         "task_id": task.task_id,
         "generation": generation,
         "source_transition": source_transition,
@@ -1627,7 +1459,7 @@ def classify_ready_marker(
         is_legacy = set(marker) == common | {"requested_gpus"}
         is_gpu = set(marker) == common | {"lane", "requested_gpus"} and marker.get("lane") == "gpu"
         is_cpu = set(marker) == common | {"lane", "requested_cpus"} and marker.get("lane") == "cpu"
-        if not (is_legacy or is_gpu or is_cpu) or marker["schema_version"] != READY_PROTOCOL_VERSION:
+        if not (is_legacy or is_gpu or is_cpu) or marker["schema_version"] != state.READY_PROTOCOL_VERSION:
             raise ValueError("ready marker schema is invalid.")
         if (
             marker["task_id"] != reference.task_id
@@ -1722,7 +1554,7 @@ def _reference_for_generation(
     except (FileNotFoundError, KeyError, TypeError, ValueError):
         return None
     if (
-        record.get("schema_version") != READY_PROTOCOL_VERSION
+        record.get("schema_version") != state.READY_PROTOCOL_VERSION
         or record.get("task_id") != task_id
         or record.get("generation") != generation
         or record.get("queue_scope") not in {"home", "shared"}
@@ -1760,12 +1592,12 @@ def _is_ready_reference_indexed(cfg: object, reference: ReadyMarkerRef) -> bool:
         and all(isinstance(item, str) for item in slots)
         and isinstance(partitions, list)
         and all(isinstance(item, str) for item in partitions)
-        and partition.get("schema_version") == READY_PROTOCOL_VERSION
+        and partition.get("schema_version") == state.READY_PROTOCOL_VERSION
         and partition.get("route") == route_key
         and partition.get("partition") == reference.partition
         and partition.get("catalog_page") == reference.catalog_page
         and reference.marker_name in slots
-        and catalog.get("schema_version") == READY_PROTOCOL_VERSION
+        and catalog.get("schema_version") == state.READY_PROTOCOL_VERSION
         and catalog.get("route") == route_key
         and catalog.get("page") == reference.catalog_page
         and reference.partition in partitions
@@ -1826,7 +1658,7 @@ def _load_build_page(cfg: object, build_id: str, page: int) -> list[str]:
     record = read_json(_build_page_path(cfg, build_id, page))["ready_build_page"]
     task_ids = record.get("task_ids")
     if (
-        record.get("schema_version") != READY_PROTOCOL_VERSION
+        record.get("schema_version") != state.READY_PROTOCOL_VERSION
         or record.get("build_id") != build_id
         or record.get("page") != page
         or not isinstance(task_ids, list)
@@ -1874,7 +1706,7 @@ def _active_incompatible_writers(cfg: object) -> list[str]:
                 continue
             if (now - heartbeat).total_seconds() > max(30.0, interval * 3.0):
                 continue
-            if agent.get("writer_capability") != READY_WRITER_CAPABILITY:
+            if agent.get("writer_capability") != state.READY_WRITER_CAPABILITY:
                 incompatible.append(entry.name)
     return sorted(incompatible)
 
@@ -1917,34 +1749,34 @@ def advance_ready_index_build(
     # A rebuild can repair Task truth.  Hold the schema fence before the ready
     # state lock so its nested Task writer follows Schema -> state -> Group -> Task.
     with schema_writer_lock(cfg):
-        with exclusive(_state_lock_path(cfg)):
+        with exclusive(state.state_lock_path(cfg)):
             path = ready_state_path(cfg.shared_root)
-            value, record = _read_ready_state_record(cfg)
+            value, record = state.read_state_record(cfg)
             if record["state"] != "building":
                 return record
             build = record.get("build")
             if not isinstance(build, dict):
-                _degrade_ready_record(record, "build_state_missing")
-                _commit_ready_state(path, value, record)
+                state.degrade_state_record(record, "build_state_missing")
+                state.commit_state_under_lock(path, value, record)
                 return record
             watermark = build.get("watermark", {})
             page_count = watermark.get("page_count")
             if type(page_count) is not int or page_count < 0 or not watermark.get("is_complete"):
-                _degrade_ready_record(record, "build_watermark_invalid")
-                _commit_ready_state(path, value, record)
+                state.degrade_state_record(record, "build_watermark_invalid")
+                state.commit_state_under_lock(path, value, record)
                 return record
             phase = build.get("phase")
             cursor_name = {
                 "backfill": "cursor", "audit": "audit_cursor", "primary-rebuild": "primary_cursor",
             }.get(phase)
             if cursor_name is None:
-                _degrade_ready_record(record, f"build_phase_invalid:{phase}")
-                _commit_ready_state(path, value, record)
+                state.degrade_state_record(record, f"build_phase_invalid:{phase}")
+                state.commit_state_under_lock(path, value, record)
                 return record
             cursor = build.get(cursor_name)
             if not isinstance(cursor, dict):
-                _degrade_ready_record(record, f"build_cursor_invalid:{cursor_name}")
-                _commit_ready_state(path, value, record)
+                state.degrade_state_record(record, f"build_cursor_invalid:{cursor_name}")
+                state.commit_state_under_lock(path, value, record)
                 return record
             processed_now = 0
             try:
@@ -1965,7 +1797,7 @@ def advance_ready_index_build(
                     elif phase == "audit":
                         issue = _audit_task_ready_projection(cfg, task_id)
                         if issue is not None:
-                            _degrade_ready_record(record, issue)
+                            state.degrade_state_record(record, issue)
                             break
                     else:
                         try:
@@ -1977,7 +1809,7 @@ def advance_ready_index_build(
                                 cfg, task.task_id, task.ready_generation,
                             )
                             if reference is None:
-                                _degrade_ready_record(record, f"marker_missing:{task.task_id}")
+                                state.degrade_state_record(record, f"marker_missing:{task.task_id}")
                                 break
                             primary_candidates.rebuild_primary_ready_candidate(cfg, build["build_id"], task, reference)
                     processed_now += 1
@@ -1992,10 +1824,10 @@ def advance_ready_index_build(
                         build["primary_cursor"] = {"page": 0, "offset": 0}
                     else:
                         primary_candidates.complete_primary_ready_index_rebuild(cfg, build["build_id"])
-                        assert_ready_writer_compatible(cfg)
+                        state.assert_ready_writer_compatible(cfg)
                         incompatible = _active_incompatible_writers(cfg)
                         if incompatible:
-                            _degrade_ready_record(
+                            state.degrade_state_record(
                                 record,
                                 "incompatible_active_writers:" + ",".join(incompatible),
                             )
@@ -2005,8 +1837,8 @@ def advance_ready_index_build(
                             build["phase"] = "completed"
                             build["completed_at"] = utc_now()
             except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-                _degrade_ready_record(record, f"build_failed:{type(exc).__name__}:{exc}")
-            _commit_ready_state(path, value, record)
+                state.degrade_state_record(record, f"build_failed:{type(exc).__name__}:{exc}")
+            state.commit_state_under_lock(path, value, record)
             return record
 
 

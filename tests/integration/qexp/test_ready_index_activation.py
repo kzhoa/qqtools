@@ -23,12 +23,23 @@ from qqtools.plugins.qexp.runtime.ready import (
     peek_ready_marker,
     read_ready_index_state,
 )
+from qqtools.plugins.qexp.runtime.ready import state as ready_state
 from qqtools.plugins.qexp.runtime.records import TaskRecord
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.runtime.work_budget import SliceBudget, WorkBudgetPolicy
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
+
+
+def test_ready_state_facade_exports_the_actual_owner_symbols() -> None:
+    from qqtools.plugins.qexp.runtime import ready
+
+    assert ready.READY_PROTOCOL_VERSION is ready_state.READY_PROTOCOL_VERSION
+    assert ready.READY_WRITER_CAPABILITY is ready_state.READY_WRITER_CAPABILITY
+    assert ready.assert_ready_writer_compatible is ready_state.assert_ready_writer_compatible
+    assert ready.read_ready_index_state is ready_state.read_ready_index_state
+    assert ready.read_ready_index_status is ready_state.read_ready_index_status
 
 
 def test_primary_rebuild_initializes_the_complete_ready_layout(tmp_path: Path) -> None:
