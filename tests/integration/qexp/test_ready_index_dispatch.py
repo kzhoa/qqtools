@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -28,7 +29,7 @@ from qqtools.plugins.qexp.runtime.ready import (
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.ready import bump_primary_ready_revision, ready_index_route_revision
-from qqtools.plugins.qexp.runtime.reservations import attach, reserve
+from qqtools.plugins.qexp.runtime.reservations import attach, reconcile_snapshot, reserve
 from qqtools.plugins.qexp.runtime.cpu_lane import reserve_cpu, set_cpu_lane_capacity
 from qqtools.plugins.qexp.runtime.work_budget import (
     AdaptiveBatchSizer,
@@ -1160,7 +1161,7 @@ def test_ready_cursor_advances_past_temporarily_unavailable_candidate(tmp_path: 
 
     assert launched == [ready.task_id]
     cursor = load_ready_cursor(cfg, "standalone", "home")
-    assert cursor.after_name is None
+    assert cursor.after_name == f"{ready.task_id}.{ready.ready_generation}.json"
     assert cursor.revision >= 2
     assert paused.task_id not in launched
 
@@ -1184,7 +1185,22 @@ def test_candidate_cursor_wraps_without_repeating_a_marker_in_one_slice(tmp_path
     assert third_wrapped is False
 
 
-def test_machine_cycle_fills_multiple_gpus_across_fair_rounds(tmp_path: Path) -> None:
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_machine_cycle_fills_available_gpus_when_budget_permits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, batch_size: int,
+) -> None:
+    def make_budget(policy: WorkBudgetPolicy | None = None) -> SliceBudget:
+        # Test capacity filling independently of I/O latency, retaining production count limits.
+        selected_policy = policy if policy is not None else WorkBudgetPolicy()
+        return SliceBudget(selected_policy, clock_ns=lambda: 0)
+
+    monkeypatch.setattr(machine_agent, "SliceBudget", make_budget)
+    # Exercise batch boundaries deterministically; adaptation has separate unit coverage.
+    def observe_batch(self: AdaptiveBatchSizer, elapsed_ns: int) -> int:
+        self.batch_size = batch_size
+        return self.batch_size
+
+    monkeypatch.setattr(AdaptiveBatchSizer, "observe", observe_batch)
     work = tmp_path / "work"
     work.mkdir()
     cfg = init_shared_root(
@@ -1207,12 +1223,18 @@ def test_machine_cycle_fills_multiple_gpus_across_fair_rounds(tmp_path: Path) ->
         publish_snapshots=False,
     )
 
-    assert results == [{
-        "project_id": binding.project_id,
-        "launched": [task.task_id for task in tasks],
-        "status": "dispatched",
-    }]
-    assert executor.launched == [task.task_id for task in tasks]
+    expected_tasks = Counter(task.task_id for task in tasks)
+    assert len(results) == 1
+    assert results[0]["project_id"] == binding.project_id
+    assert results[0]["status"] == "dispatched"
+    assert Counter(results[0]["launched"]) == expected_tasks
+    assert Counter(executor.launched) == expected_tasks
+
+    reservations = reconcile_snapshot(runtime.root).reservations
+    assert Counter(item["task_id"] for item in reservations) == expected_tasks
+    assert all(item["project_id"] == binding.project_id for item in reservations)
+    assert all(len(item["gpu_ids"]) == 1 for item in reservations)
+    assert Counter(gpu for item in reservations for gpu in item["gpu_ids"]) == Counter([0, 1, 2])
 
 
 def test_degraded_ready_index_fails_closed_for_new_claims(tmp_path: Path) -> None:
