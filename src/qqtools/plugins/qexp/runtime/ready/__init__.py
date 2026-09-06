@@ -1,7 +1,6 @@
 """Public aggregation for the durable ready liveness projection."""
 
 from .index import (
-    PRIMARY_READY_PROTOCOL_VERSION,
     READY_BUILD_PAGE_SIZE,
     READY_CATALOG_PAGE_SIZE,
     READY_PARTITION_SLOTS,
@@ -11,17 +10,13 @@ from .index import (
     ReadyClassificationResult,
     ReadyCursor,
     ReadyIndexState,
-    ReadyMarkerRef,
     ReadyPeek,
     ReadyProbeBudgetExhausted,
-    ReadyScope,
     advance_ready_index_build,
     assert_ready_writer_compatible,
-    begin_primary_ready_index_rebuild,
     begin_ready_index_build,
     bump_primary_ready_revision,
     classify_ready_marker,
-    complete_primary_ready_index_rebuild,
     delete_ready_marker,
     delete_stale_ready_marker,
     discard_ready_generation,
@@ -41,7 +36,6 @@ from .index import (
     ready_index_revision,
     ready_index_route_revision,
     ready_task_projection_issue,
-    rebuild_primary_ready_candidate,
     rebuild_primary_ready_index,
     repair_ready_index,
     reserve_ready_generation,
@@ -50,6 +44,13 @@ from .index import (
     sync_primary_ready_group,
     write_ready_marker,
 )
+from .primary_candidates import (
+    PRIMARY_READY_PROTOCOL_VERSION,
+    begin_primary_ready_index_rebuild,
+    complete_primary_ready_index_rebuild,
+    rebuild_primary_ready_candidate,
+)
+from .records import ReadyMarkerRef, ReadyScope
 
 __all__ = [
     "PRIMARY_READY_PROTOCOL_VERSION",

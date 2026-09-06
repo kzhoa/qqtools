@@ -16,7 +16,7 @@ from ..records import TaskRecord, utc_now, validate_identifier
 from ..store import atomic_replace, read_json
 
 if TYPE_CHECKING:
-    from .index import ReadyMarkerRef
+    from .records import ReadyMarkerRef
     from ..records import TaskRecord
 
 GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
@@ -1035,11 +1035,8 @@ def advance_group_ready_members_build(
     record = begin_group_ready_members_build(cfg)
     if record["state"] != "building":
         return record
-    from .index import (
-        _reference_for_generation, _task_should_have_ready_marker,
-        begin_primary_ready_index_rebuild, complete_primary_ready_index_rebuild,
-        rebuild_primary_ready_candidate,
-    )
+    from . import primary_candidates
+    from .index import _reference_for_generation, _task_should_have_ready_marker
     from ..records import TaskRecord
     try:
         with exclusive(_state_lock_path(cfg)):
@@ -1104,7 +1101,7 @@ def advance_group_ready_members_build(
             # watermark.  Every Task or Group mutation after that fence will
             # dual-write the cleared rebuild, including work outside the
             # watermark that is captured below.
-            begin_primary_ready_index_rebuild(cfg, build_id)
+            primary_candidates.begin_primary_ready_index_rebuild(cfg, build_id)
             captured = _capture_build_watermark(cfg, build_id=build_id, watermark=current,
                                                 max_entries=max_tasks, collection="audit-tasks")
             updates = {"audit_task_watermark": captured}
@@ -1165,7 +1162,7 @@ def advance_group_ready_members_build(
             page_count = audit.get("page_count")
             if not audit.get("is_complete") or type(page_count) is not int:
                 raise ValueError("Primary candidate rebuild cursor is invalid.")
-            begin_primary_ready_index_rebuild(cfg, build_id)
+            primary_candidates.begin_primary_ready_index_rebuild(cfg, build_id)
             processed = 0
             while processed < max_tasks and cursor["page"] < page_count:
                 items = _load_build_page(cfg, build_id, cursor["page"], collection="audit-tasks")
@@ -1182,12 +1179,12 @@ def advance_group_ready_members_build(
                     reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
                     if reference is None:
                         raise ValueError(f"Primary candidate marker is missing for Task {task.task_id!r}.")
-                    rebuild_primary_ready_candidate(cfg, build_id, task, reference)
+                    primary_candidates.rebuild_primary_ready_candidate(cfg, build_id, task, reference)
                 processed += 1
                 _advance_page_cursor(cursor, len(items))
             updates = {"primary_cursor": cursor}
             if cursor["page"] >= page_count:
-                complete_primary_ready_index_rebuild(cfg, build_id)
+                primary_candidates.complete_primary_ready_index_rebuild(cfg, build_id)
                 return _commit_build_record(
                     cfg, build_id=build_id, build_updates=updates, should_activate=True,
                 )

@@ -632,12 +632,13 @@ def test_primary_rebuild_dual_writes_ready_tasks_created_after_its_watermark(tmp
     assert state["projection"]["build"]["phase"] == "primary-rebuild"
 
     concurrent = submit(cfg, ["echo", "during"], task_id="during-primary-rebuild", group="exp")
-    from qqtools.plugins.qexp.runtime.ready.index import _primary_candidate_path, _reference_for_generation
+    from qqtools.plugins.qexp.runtime.ready.index import _reference_for_generation
+    from qqtools.plugins.qexp.runtime.ready.primary_candidates import candidate_path
 
     reference = _reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
     assert reference is not None
-    candidate_path = _primary_candidate_path(cfg, f"home.{cfg.machine_name}", reference.identity)
-    assert candidate_path.exists()
+    primary_candidate_path = candidate_path(cfg, f"home.{cfg.machine_name}", reference.identity)
+    assert primary_candidate_path.exists()
 
     while state["phase"] == "building":
         state = resume_group_ready_members_upgrade(
@@ -645,7 +646,7 @@ def test_primary_rebuild_dual_writes_ready_tasks_created_after_its_watermark(tmp
         )
 
     assert state["phase"] == "completed"
-    assert candidate_path.exists()
+    assert primary_candidate_path.exists()
 
 
 def test_final_task_watermark_starts_primary_rebuild_before_later_task_writes(
@@ -680,12 +681,13 @@ def test_final_task_watermark_starts_primary_rebuild_before_later_task_writes(
     assert state["projection"]["build"]["phase"] == "audit-tasks"
 
     concurrent = submit(cfg, ["echo", "late"], task_id="after-final-watermark", group="exp")
-    from qqtools.plugins.qexp.runtime.ready.index import _primary_candidate_path, _reference_for_generation
+    from qqtools.plugins.qexp.runtime.ready.index import _reference_for_generation
+    from qqtools.plugins.qexp.runtime.ready.primary_candidates import candidate_path
 
     reference = _reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
     assert reference is not None
-    candidate_path = _primary_candidate_path(cfg, f"home.{cfg.machine_name}", reference.identity)
-    assert candidate_path.exists()
+    primary_candidate_path = candidate_path(cfg, f"home.{cfg.machine_name}", reference.identity)
+    assert primary_candidate_path.exists()
 
     while state["phase"] == "building":
         state = resume_group_ready_members_upgrade(
@@ -693,7 +695,7 @@ def test_final_task_watermark_starts_primary_rebuild_before_later_task_writes(
         )
 
     assert state["phase"] == "completed"
-    assert candidate_path.exists()
+    assert primary_candidate_path.exists()
 
 
 def test_primary_rebuild_parks_existing_routes_without_enumerating_candidates(
@@ -706,18 +708,18 @@ def test_primary_rebuild_parks_existing_routes_without_enumerating_candidates(
     for index in range(128):
         atomic_replace(route / f"candidate-{index}.json", {"candidate": index})
 
-    from qqtools.plugins.qexp.runtime.ready import index as ready_runtime
+    from qqtools.plugins.qexp.runtime.ready import primary_candidates
 
-    original_scandir = ready_runtime.os.scandir
+    original_scandir = primary_candidates.os.scandir
 
     def reject_candidate_enumeration(path):
         if Path(path) == routes or Path(path) == route:
             raise AssertionError("primary rebuild cutover must not enumerate candidates")
         return original_scandir(path)
 
-    monkeypatch.setattr(ready_runtime.os, "scandir", reject_candidate_enumeration)
-    ready_runtime.begin_primary_ready_index_rebuild(cfg, "bounded-cutover")
-    monkeypatch.setattr(ready_runtime.os, "scandir", original_scandir)
+    monkeypatch.setattr(primary_candidates.os, "scandir", reject_candidate_enumeration)
+    primary_candidates.begin_primary_ready_index_rebuild(cfg, "bounded-cutover")
+    monkeypatch.setattr(primary_candidates.os, "scandir", original_scandir)
 
     assert routes.is_dir()
     assert list(routes.iterdir()) == []
@@ -739,9 +741,9 @@ def test_primary_rebuild_park_resumes_without_replacing_the_new_route_tree(
     old_route.mkdir(parents=True)
     atomic_replace(old_route / "old.json", {"candidate": "old"})
 
-    from qqtools.plugins.qexp.runtime.ready import index as ready_runtime
+    from qqtools.plugins.qexp.runtime.ready import primary_candidates
 
-    original_atomic_replace = ready_runtime.atomic_replace
+    original_atomic_replace = primary_candidates.atomic_replace
     is_crash_injected = False
 
     def crash_before_cleared_commit(path, value):
@@ -757,14 +759,14 @@ def test_primary_rebuild_park_resumes_without_replacing_the_new_route_tree(
             raise OSError("simulated crash after primary route park")
         return original_atomic_replace(path, value)
 
-    monkeypatch.setattr(ready_runtime, "atomic_replace", crash_before_cleared_commit)
+    monkeypatch.setattr(primary_candidates, "atomic_replace", crash_before_cleared_commit)
     with pytest.raises(OSError, match="simulated crash"):
-        ready_runtime.begin_primary_ready_index_rebuild(cfg, "crash-cutover")
+        primary_candidates.begin_primary_ready_index_rebuild(cfg, "crash-cutover")
 
     new_route = routes / "home.gpu-2"
     new_route.mkdir(parents=True)
     atomic_replace(new_route / "new.json", {"candidate": "new"})
-    ready_runtime.begin_primary_ready_index_rebuild(cfg, "crash-cutover")
+    primary_candidates.begin_primary_ready_index_rebuild(cfg, "crash-cutover")
 
     assert (new_route / "new.json").exists()
     replaced = (
@@ -802,22 +804,23 @@ def test_primary_rebuild_accepts_group_role_updates_for_new_members(tmp_path: Pa
         cfg, activation_id=session["activation_id"], max_tasks=1,
     )
     concurrent = submit(cfg, ["echo", "during"], task_id="during-role-update", group="exp")
-    from qqtools.plugins.qexp.runtime.ready.index import _primary_candidate_path, _reference_for_generation
+    from qqtools.plugins.qexp.runtime.ready.index import _reference_for_generation
+    from qqtools.plugins.qexp.runtime.ready.primary_candidates import candidate_path
 
     reference = _reference_for_generation(cfg, concurrent.task_id, concurrent.ready_generation)
     assert reference is not None
-    candidate_path = _primary_candidate_path(cfg, f"home.{cfg.machine_name}", reference.identity)
-    assert not candidate_path.exists()
+    primary_candidate_path = candidate_path(cfg, f"home.{cfg.machine_name}", reference.identity)
+    assert not primary_candidate_path.exists()
 
     change_worker(cfg, "exp", "gpu-1", "set", role="primary")
-    assert candidate_path.exists()
+    assert primary_candidate_path.exists()
 
     while state["phase"] == "building":
         state = resume_group_ready_members_upgrade(
             cfg, activation_id=session["activation_id"], max_tasks=1,
         )
     assert state["phase"] == "completed"
-    assert candidate_path.exists()
+    assert primary_candidate_path.exists()
 
 
 def test_member_audit_restarts_a_group_after_a_legal_retirement(tmp_path: Path) -> None:
