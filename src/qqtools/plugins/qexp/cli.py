@@ -58,6 +58,13 @@ from .schema6_upgrade import (
     schema6_upgrade_status,
     start_schema6_upgrade,
 )
+from .group_ready_members_upgrade import (
+    attest_group_ready_members_upgrade,
+    check_group_ready_members_upgrade,
+    group_ready_members_upgrade_status,
+    resume_group_ready_members_upgrade,
+    start_group_ready_members_upgrade,
+)
 from .notification_config import (
     DEFAULT_WEBHOOK_ENV,
     load_notifications,
@@ -248,6 +255,20 @@ def build_parser() -> argparse.ArgumentParser:
     schema6_resume = schema6_upgrade_sub.add_parser("resume")
     _add_output_format(schema6_resume)
     schema6_resume.add_argument("--activation-id", required=True)
+    group_members_upgrade = upgrade_sub.add_parser("group-ready-members")
+    group_members_upgrade_sub = group_members_upgrade.add_subparsers(
+        dest="group_ready_members_upgrade_action", required=True
+    )
+    for name in ("check", "start", "status"):
+        action = group_members_upgrade_sub.add_parser(name)
+        _add_output_format(action)
+    group_members_attest = group_members_upgrade_sub.add_parser("attest")
+    _add_output_format(group_members_attest)
+    group_members_attest.add_argument("--activation-id", required=True)
+    group_members_resume = group_members_upgrade_sub.add_parser("resume")
+    _add_output_format(group_members_resume)
+    group_members_resume.add_argument("--activation-id", required=True)
+    group_members_resume.add_argument("--max-tasks", type=int, default=64)
     lease_policy = commands.add_parser("lease-policy")
     lease_policy_sub = lease_policy.add_subparsers(dest="lease_policy_action", required=True)
     lease_show = lease_policy_sub.add_parser("show")
@@ -548,6 +569,35 @@ def main(argv: list[str] | None = None) -> int:
             machine = args.machine or "upgrade-coordinator"
             runtime = Path(args.runtime_root) if args.runtime_root else None
             cfg = load_root_config(args.shared_root, machine, runtime, require_initialized=False)
+            if args.upgrade_feature == "group-ready-members":
+                if args.group_ready_members_upgrade_action == "check":
+                    _emit("group-ready-members-upgrade", check_group_ready_members_upgrade(cfg), args.format)
+                    return 0
+                if args.group_ready_members_upgrade_action == "status":
+                    _emit("group-ready-members-upgrade", group_ready_members_upgrade_status(cfg), args.format)
+                    return 0
+                if args.group_ready_members_upgrade_action == "start":
+                    _emit("group-ready-members-upgrade", start_group_ready_members_upgrade(cfg), args.format)
+                    return 0
+                if args.group_ready_members_upgrade_action == "attest":
+                    if not args.machine:
+                        raise ValueError("attest requires --machine.")
+                    _emit(
+                        "group-ready-members-upgrade",
+                        attest_group_ready_members_upgrade(
+                            cfg, activation_id=args.activation_id, machine_name=args.machine,
+                        ),
+                        args.format,
+                    )
+                    return 0
+                _emit(
+                    "group-ready-members-upgrade",
+                    resume_group_ready_members_upgrade(
+                        cfg, activation_id=args.activation_id, max_tasks=args.max_tasks,
+                    ),
+                    args.format,
+                )
+                return 0
             if args.upgrade_feature == "schema6":
                 if args.schema6_upgrade_action == "check":
                     _emit("schema6-upgrade", check_schema6_upgrade(

@@ -90,6 +90,22 @@ def test_malformed_narrow_activation_state_falls_back_to_wide_fence(tmp_path) ->
         assert acquired
 
 
+def test_incomplete_active_member_state_does_not_select_narrow_fence(tmp_path) -> None:
+    class Config:
+        shared_root = tmp_path / ".qexp"
+
+    atomic_replace(
+        Config.shared_root / "schema" / "version.json",
+        {"schema": {"required_capabilities": ["group-ready-members-v1"]}},
+    )
+    atomic_replace(
+        Config.shared_root / "indexes" / "ready" / "group-members" / "state.json",
+        {"group_ready_members": {"state": "active"}},
+    )
+
+    assert is_schema_narrow_protocol_active(Config()) is False
+
+
 def test_group_writer_waits_for_schema_mutation(tmp_path, monkeypatch) -> None:
     from qqtools.plugins.qexp.runtime import locks
 

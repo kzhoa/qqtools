@@ -13,7 +13,7 @@ from .lifecycle import (TerminalTransition, commit_terminal_transition_locked,
                         dispatch_task_lifecycle_hooks_noexcept)
 from .runtime.availability import rebuild_deadline_indexes, reconcile_availability_operations
 from .layout import validate_root_contract
-from .runtime.locks import group_writer_lock, task_lock
+from .runtime.locks import group_writer_lock, schema_lock, task_lock
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
 from .runtime.records import AttemptRecord, TaskRecord, normalize_group_record, utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
@@ -28,6 +28,13 @@ from .runtime.ready import (
     ready_task_projection_issue,
     repair_ready_index,
     retire_current_ready_generation,
+)
+from .runtime.group_members import (
+    GROUP_MEMBER_PAGE_SIZE,
+    audit_group_ready_members,
+    group_ready_members_state,
+    mark_group_ready_members_degraded,
+    repair_group_ready_members,
 )
 from .lease import clock_capability
 
@@ -100,6 +107,14 @@ def verify_integrity(
             shared_paths(cfg.shared_root)["ready"] / "state.json",
             "high",
         )
+    member_state = group_ready_members_state(cfg)
+    if member_state == "degraded":
+        _issue(
+            issues,
+            "group_ready_members_degraded",
+            shared_paths(cfg.shared_root)["ready_group_members"] / "state.json",
+            "high",
+        )
     paths = shared_paths(cfg.shared_root)
     cleaned = _cleaned_task_ids(cfg)
     submissions = _records_by_stem(
@@ -118,6 +133,24 @@ def verify_integrity(
                 str(exc),
             )
     groups = {name: {"group": group} for name, group in group_records.items()}
+    if member_state in {"building", "active"}:
+        try:
+            with schema_lock(cfg.shared_root):
+                audit_group_ready_members(cfg)
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            # A verify finding is itself an admission-safety event.  Do not
+            # leave an incomplete derived projection eligible for borrow.
+            with schema_lock(cfg.shared_root):
+                mark_group_ready_members_degraded(
+                    cfg, f"doctor_verify:{type(exc).__name__}"
+                )
+            _issue(
+                issues,
+                "group_ready_members_inconsistent",
+                shared_paths(cfg.shared_root)["ready_group_members"] / "state.json",
+                "high",
+                str(exc),
+            )
     deadline_task_ids: set[str] = set()
     for deadline_path in iter_json(paths["offer_deadlines"]):
         if deadline_path == paths["offer_deadlines_migration"]:
@@ -368,6 +401,7 @@ def verify_integrity(
             _issue(issues, "termination_decision_invalid", decision_path, "high")
     return {"schema_version": 6, "tasks_checked": checked, "issues": issues, "healthy": not issues,
             "ready_index": read_ready_index_status(cfg),
+            "group_ready_members": {"state": group_ready_members_state(cfg)},
             "clock_capability": {"status": capability.status, "reason": capability.reason,
                                  "provider": capability.observation.provider if capability.observation else None,
                                  "observation_id": capability.observation.observation_id if capability.observation else None,
@@ -386,6 +420,7 @@ def repair_metadata(
     repaired: list[str] = []
     blocked: list[str] = []
     initial_ready_state = read_ready_index_state(cfg)
+    initial_member_state = group_ready_members_state(cfg)
     operations = shared_paths(cfg.shared_root)["submissions"]
     for path in iter_json(operations):
         operation = read_json(path)["submission"]
@@ -545,11 +580,24 @@ def repair_metadata(
         )
     elif ready_record.get("state") == "degraded":
         blocked.append("ready_index")
+    with schema_lock(cfg.shared_root):
+        member_record = repair_group_ready_members(cfg, max_tasks=GROUP_MEMBER_PAGE_SIZE)
+    if member_record.get("state") == "active" and initial_member_state != "active":
+        repaired.append("group_ready_members")
+    elif member_record.get("state") == "degraded":
+        blocked.append("group_ready_members")
+    message = "Submission, Group control, and ready-index operations reconciled."
+    if member_record.get("state") == "building":
+        message = (
+            "Member projection repair slice completed; rerun doctor repair while "
+            "group_ready_members.state is building."
+        )
     return {"repaired": repaired, "blocked": blocked,
             "ready_index": {"state": ready_record.get("state"),
                             "build": ready_build,
                             "degraded_reasons": ready_record.get("degraded_reasons", [])},
-            "message": "Submission, Group control, and ready-index operations reconciled."}
+            "group_ready_members": member_record,
+            "message": message}
 
 
 def repair_orphans(

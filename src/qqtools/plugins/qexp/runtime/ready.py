@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -12,6 +11,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .locks import exclusive, schema_lock, schema_writer_lock
+from .group_members import (
+    is_group_ready_member_projection_usable,
+    publish_group_ready_member,
+    read_group_ready_members,
+    retire_group_ready_member,
+    group_ready_members_state,
+)
 from .paths import group_path, ready_state_path, shared_paths, submission_path, task_path
 from .records import TaskRecord, normalize_group_record, utc_now, validate_identifier
 from .store import atomic_replace, iter_json, read_json
@@ -419,9 +425,22 @@ def _primary_index_is_active(cfg: object) -> bool:
         return False
 
 
+def _primary_index_accepts_updates_unlocked(cfg: object) -> bool:
+    """Return whether the caller may update an active or cleared rebuild projection."""
+    primary = _primary_rebuild_record(cfg)
+    return bool(
+        primary is not None
+        and primary.get("schema_version") == PRIMARY_READY_PROTOCOL_VERSION
+        and (
+            primary.get("state") == "active"
+            or (primary.get("state") == "rebuilding" and primary.get("cleared") is True)
+        )
+    )
+
+
 def is_primary_ready_index_active(cfg: object) -> bool:
     """Return whether the primary-only candidate projection is usable."""
-    return _primary_index_is_active(cfg)
+    return _primary_index_is_active(cfg) and is_group_ready_member_projection_usable(cfg)
 
 
 def _route_directory(root: Path, scope: ReadyScope, home_machine: str) -> Path:
@@ -1310,6 +1329,17 @@ def _remove_primary_candidate_everywhere(cfg: object, identity: str) -> None:
         _remove_primary_candidate_everywhere_unlocked(cfg, identity)
 
 
+def _remove_primary_candidate_from_machines_unlocked(
+    cfg: object,
+    reference: ReadyMarkerRef,
+    machines: set[str],
+) -> None:
+    """Remove one candidate only from the Group routes that could own it."""
+    for machine in sorted(machines):
+        route_key = _primary_route_key(reference.queue_scope, machine)
+        _primary_candidate_path(cfg, route_key, reference.identity).unlink(missing_ok=True)
+
+
 def _sync_primary_candidate_unlocked(
     cfg: object,
     task: TaskRecord,
@@ -1317,7 +1347,7 @@ def _sync_primary_candidate_unlocked(
     *,
     should_require_active: bool = True,
 ) -> None:
-    if should_require_active and not _primary_index_is_active(cfg):
+    if should_require_active and not _primary_index_accepts_updates_unlocked(cfg):
         return
     _remove_primary_candidate_everywhere_unlocked(cfg, reference.identity)
     for machine in _primary_machines_for_task(cfg, task):
@@ -1336,28 +1366,212 @@ def _sync_primary_candidate(cfg: object, task: TaskRecord, reference: ReadyMarke
         _sync_primary_candidate_unlocked(cfg, task, reference)
 
 
-def _clear_primary_candidate_projection(cfg: object) -> None:
-    routes = shared_paths(cfg.shared_root)["ready_primary"] / "routes"
-    if routes.exists():
-        for route in os.scandir(routes):
-            if route.is_dir():
-                shutil.rmtree(route.path)
+def _sync_primary_member_candidate_unlocked(
+    cfg: object,
+    group_name: str,
+    reference: ReadyMarkerRef,
+    previous_workers: dict[str, dict[str, Any]],
+) -> None:
+    """Refresh one member without rereading historical Task truth."""
+    group = read_json(group_path(cfg.shared_root, group_name))
+    normalize_group_record(group)
+    current_workers = group["group"]["worker_set"]
+    previous_machines = _primary_member_machines(reference, previous_workers)
+    current_machines = _primary_member_machines(reference, current_workers)
+    _remove_primary_candidate_from_machines_unlocked(
+        cfg, reference, previous_machines - current_machines
+    )
+    for machine in sorted(current_machines - previous_machines):
+        route_key = _primary_route_key(reference.queue_scope, machine)
+        _primary_route_path(cfg, route_key).mkdir(parents=True, exist_ok=True)
+        atomic_replace(
+            _primary_candidate_path(cfg, route_key, reference.identity),
+            _primary_candidate_value(reference),
+        )
+
+
+def _primary_member_machines(
+    reference: ReadyMarkerRef,
+    workers: dict[str, dict[str, Any]],
+) -> set[str]:
+    """Return the primary candidate routes a member has under one Worker Set snapshot."""
+    if reference.queue_scope == "home":
+        worker = workers.get(reference.home_machine)
+        return {
+            reference.home_machine
+        } if worker is not None and worker.get("scheduling_role") == "primary" else set()
+    return {
+        machine for machine, worker in workers.items()
+        if worker.get("scheduling_role") == "primary"
+    }
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _park_primary_candidate_projection(cfg: object, build_id: str) -> None:
+    """Replace active routes with an empty tree using bounded metadata operations."""
+    validate_identifier(build_id, "primary ready rebuild id")
+    primary_root = shared_paths(cfg.shared_root)["ready_primary"]
+    routes = primary_root / "routes"
+    replaced_root = primary_root / "replaced-routes"
+    replaced = replaced_root / build_id
+    replaced_root.mkdir(parents=True, exist_ok=True)
+    if not replaced.exists():
+        if routes.exists():
+            os.replace(routes, replaced)
+        else:
+            replaced.mkdir()
     routes.mkdir(parents=True, exist_ok=True)
+    _fsync_directory(replaced_root)
+    _fsync_directory(primary_root)
+
+
+def _primary_rebuild_record(cfg: object) -> dict[str, Any] | None:
+    """Return the optional durable owner record for a candidate rebuild."""
+    path = _primary_index_state_path(cfg)
+    if not path.exists():
+        return None
+    value = read_json(path).get("primary_ready_index")
+    return value if isinstance(value, dict) else None
+
+
+def begin_primary_ready_index_rebuild(cfg: object, build_id: str) -> None:
+    """Start or resume one owner-fenced, empty-first candidate rebuild."""
+    validate_identifier(build_id, "primary ready rebuild id")
+    ensure_ready_layout(cfg)
+    with _primary_projection_rebuild_lock(cfg):
+        current = _primary_rebuild_record(cfg)
+        if (
+            current is not None
+            and current.get("schema_version") == PRIMARY_READY_PROTOCOL_VERSION
+            and current.get("state") == "rebuilding"
+            and current.get("build_id") == build_id
+            and current.get("cleared") is True
+        ):
+            return
+        if (
+            current is not None
+            and current.get("schema_version") == PRIMARY_READY_PROTOCOL_VERSION
+            and current.get("state") == "active"
+            and current.get("completed_build_id") == build_id
+        ):
+            return
+        atomic_replace(
+            _primary_index_state_path(cfg),
+            {"primary_ready_index": {
+                "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
+                "state": "rebuilding",
+                "build_id": build_id,
+                "cleared": False,
+                "updated_at": utc_now(),
+            }},
+        )
+        _park_primary_candidate_projection(cfg, build_id)
+        atomic_replace(
+            _primary_index_state_path(cfg),
+            {"primary_ready_index": {
+                "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
+                "state": "rebuilding",
+                "build_id": build_id,
+                "cleared": True,
+                "updated_at": utc_now(),
+            }},
+        )
+
+
+def rebuild_primary_ready_candidate(
+    cfg: object, build_id: str, task: TaskRecord, reference: ReadyMarkerRef,
+) -> None:
+    """Publish one candidate into a rebuild already cleared by its owner."""
+    with _primary_projection_rebuild_lock(cfg):
+        current = _primary_rebuild_record(cfg)
+        is_rebuilding = (
+            current is not None
+            and current.get("schema_version") == PRIMARY_READY_PROTOCOL_VERSION
+            and current.get("state") == "rebuilding"
+            and current.get("build_id") == build_id
+            and current.get("cleared") is True
+        )
+        is_completed = (
+            current is not None
+            and current.get("schema_version") == PRIMARY_READY_PROTOCOL_VERSION
+            and current.get("state") == "active"
+            and current.get("completed_build_id") == build_id
+        )
+        if not is_rebuilding and not is_completed:
+            raise RuntimeError("primary candidate rebuild ownership is invalid.")
+        for machine in _primary_machines_for_task(cfg, task):
+            route_key = _primary_route_key(reference.queue_scope, machine)
+            route = _primary_route_path(cfg, route_key)
+            route.mkdir(parents=True, exist_ok=True)
+            atomic_replace(
+                _primary_candidate_path(cfg, route_key, reference.identity),
+                _primary_candidate_value(reference),
+            )
+
+
+def complete_primary_ready_index_rebuild(cfg: object, build_id: str) -> None:
+    """Make a fully populated owner-fenced candidate projection observable."""
+    with _primary_projection_rebuild_lock(cfg):
+        current = _primary_rebuild_record(cfg)
+        if (
+            current is not None
+            and current.get("schema_version") == PRIMARY_READY_PROTOCOL_VERSION
+            and current.get("state") == "active"
+            and current.get("completed_build_id") == build_id
+        ):
+            return
+        if (
+            current is None
+            or current.get("schema_version") != PRIMARY_READY_PROTOCOL_VERSION
+            or current.get("state") != "rebuilding"
+            or current.get("build_id") != build_id
+            or current.get("cleared") is not True
+        ):
+            raise RuntimeError("primary candidate rebuild cannot be completed by this owner.")
+        atomic_replace(
+            _primary_index_state_path(cfg),
+            {"primary_ready_index": {
+                "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
+                "state": "active",
+                "completed_build_id": build_id,
+                "updated_at": utc_now(),
+            }},
+        )
 
 
 def rebuild_primary_ready_index(cfg: object) -> None:
     """Rebuild primary candidates from authoritative queued Task records."""
     ensure_ready_layout(cfg)
     with _primary_projection_rebuild_lock(cfg):
+        build_id = uuid.uuid4().hex
         atomic_replace(
             _primary_index_state_path(cfg),
             {"primary_ready_index": {
                 "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
                 "state": "rebuilding",
+                "build_id": build_id,
+                "cleared": False,
                 "updated_at": utc_now(),
             }},
         )
-        _clear_primary_candidate_projection(cfg)
+        _park_primary_candidate_projection(cfg, build_id)
+        atomic_replace(
+            _primary_index_state_path(cfg),
+            {"primary_ready_index": {
+                "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
+                "state": "rebuilding",
+                "build_id": build_id,
+                "cleared": True,
+                "updated_at": utc_now(),
+            }},
+        )
         for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
             task = TaskRecord.from_dict(read_json(path))
             if not _task_should_have_ready_marker(task):
@@ -1372,15 +1586,32 @@ def rebuild_primary_ready_index(cfg: object) -> None:
             {"primary_ready_index": {
                 "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
                 "state": "active",
+                "completed_build_id": build_id,
                 "updated_at": utc_now(),
             }},
         )
 
 
-def sync_primary_ready_group(cfg: object, group_name: str) -> None:
+def sync_primary_ready_group(
+    cfg: object,
+    group_name: str,
+    *,
+    previous_workers: dict[str, dict[str, Any]],
+) -> None:
     """Refresh primary candidates affected by a Group worker-role mutation."""
     with _primary_projection_rebuild_lock(cfg):
-        if not _primary_index_is_active(cfg):
+        if not _primary_index_accepts_updates_unlocked(cfg):
+            return
+        if group_ready_members_state(cfg) in {"building", "active"}:
+            for entry in read_group_ready_members(cfg, group_name):
+                reference = ReadyMarkerRef(
+                    entry["task_id"], entry["generation"], entry["queue_scope"],
+                    entry["home_machine"], entry["partition"], entry["catalog_page"],
+                    entry["marker_name"],
+                )
+                _sync_primary_member_candidate_unlocked(
+                    cfg, group_name, reference, previous_workers
+                )
             return
         for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
             task = TaskRecord.from_dict(read_json(path))
@@ -1396,6 +1627,10 @@ def primary_projection_routes_for_group(
 ) -> list[tuple[ReadyScope, str]]:
     """Return every authoritative route whose candidates a Group sync can alter."""
     routes: set[tuple[ReadyScope, str]] = set()
+    if group_ready_members_state(cfg) == "active":
+        for entry in read_group_ready_members(cfg, group_name):
+            routes.add((entry["queue_scope"], entry["home_machine"]))
+        return sorted(routes)
     for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
         task = TaskRecord.from_dict(read_json(path))
         if task.group_name != group_name or not _task_should_have_ready_marker(task):
@@ -1459,9 +1694,11 @@ def write_ready_marker(
             cfg, [(scope, reference.home_machine)], lanes=(task.spec.lane or "gpu",)
         ):
             atomic_replace(_marker_path(cfg.shared_root, reference), marker)
+            publish_group_ready_member(cfg, task, reference)
             _sync_primary_candidate(cfg, task, reference)
     else:
         atomic_replace(_marker_path(cfg.shared_root, reference), marker)
+        publish_group_ready_member(cfg, task, reference)
     return reference
 
 
@@ -1480,6 +1717,7 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
     )
     is_primary = True
     lane = "gpu"
+    group_name: str | None = None
     try:
         marker = read_json(_marker_path(cfg.shared_root, reference))["ready_marker"]
         lane = marker.get("lane", "gpu")
@@ -1550,6 +1788,8 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
                     allocator["ready_allocator"]["revision"] += 1
                     atomic_replace(allocator_path, allocator)
         path.unlink(missing_ok=True)
+        if group_name:
+            retire_group_ready_member(cfg, group_name, task_id, generation)
         _remove_primary_candidate_everywhere(cfg, reference.identity)
         if is_primary:
             allocator_path, allocator = _load_or_create_allocator(
@@ -2018,8 +2258,10 @@ def advance_ready_index_build(
                 _commit_ready_state(path, value, record)
                 return record
             phase = build.get("phase")
-            cursor_name = "cursor" if phase == "backfill" else "audit_cursor"
-            if phase not in {"backfill", "audit"}:
+            cursor_name = {
+                "backfill": "cursor", "audit": "audit_cursor", "primary-rebuild": "primary_cursor",
+            }.get(phase)
+            if cursor_name is None:
                 _degrade_ready_record(record, f"build_phase_invalid:{phase}")
                 _commit_ready_state(path, value, record)
                 return record
@@ -2030,6 +2272,8 @@ def advance_ready_index_build(
                 return record
             processed_now = 0
             try:
+                if phase == "primary-rebuild":
+                    begin_primary_ready_index_rebuild(cfg, build["build_id"])
                 while processed_now < max_tasks and cursor["page"] < page_count:
                     task_ids = _load_build_page(cfg, build["build_id"], cursor["page"])
                     if cursor["offset"] >= len(task_ids):
@@ -2042,11 +2286,24 @@ def advance_ready_index_build(
                         build["repaired"] += repaired
                         build["stale_removed"] += stale_removed
                         build["processed"] += 1
-                    else:
+                    elif phase == "audit":
                         issue = _audit_task_ready_projection(cfg, task_id)
                         if issue is not None:
                             _degrade_ready_record(record, issue)
                             break
+                    else:
+                        try:
+                            task = TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id)))
+                        except FileNotFoundError:
+                            task = None
+                        if task is not None and _task_should_have_ready_marker(task):
+                            reference = _reference_for_generation(
+                                cfg, task.task_id, task.ready_generation,
+                            )
+                            if reference is None:
+                                _degrade_ready_record(record, f"marker_missing:{task.task_id}")
+                                break
+                            rebuild_primary_ready_candidate(cfg, build["build_id"], task, reference)
                     processed_now += 1
                     _advance_build_cursor(
                         cursor, item_count=len(task_ids), page_count=page_count
@@ -2054,7 +2311,11 @@ def advance_ready_index_build(
                 if record["state"] == "building" and cursor["page"] >= page_count:
                     if phase == "backfill":
                         build["phase"] = "audit"
+                    elif phase == "audit":
+                        build["phase"] = "primary-rebuild"
+                        build["primary_cursor"] = {"page": 0, "offset": 0}
                     else:
+                        complete_primary_ready_index_rebuild(cfg, build["build_id"])
                         assert_ready_writer_compatible(cfg)
                         incompatible = _active_incompatible_writers(cfg)
                         if incompatible:
@@ -2067,7 +2328,6 @@ def advance_ready_index_build(
                             record["degraded_reasons"] = []
                             build["phase"] = "completed"
                             build["completed_at"] = utc_now()
-                            rebuild_primary_ready_index(cfg)
             except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
                 _degrade_ready_record(record, f"build_failed:{type(exc).__name__}:{exc}")
             _commit_ready_state(path, value, record)

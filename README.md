@@ -186,6 +186,10 @@ provider permits full bounded-lease coordination; otherwise eligible work runs i
 local-safe mode and is never expired, remotely recovered, or automatically replaced. `qexp
 doctor verify` and `qexp agent status` expose the provider, authority mode, and blocker.
 
+For existing-project upgrades, including recovery from `ready_index=degraded` / `marker corrupt`
+and the explicit 1.3.15 schema-6 capability activation, see
+[the qexp upgrade guide](docs/spec/qexp_upgrade_guide.md).
+
 ```bash
 qexp task share TASK_ID
 qexp task share TASK_ID --after 10m --with gpu-b,gpu-c

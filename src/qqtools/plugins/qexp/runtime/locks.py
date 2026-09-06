@@ -33,7 +33,11 @@ def is_schema_narrow_protocol_active(cfg: object) -> bool:
     return (
         isinstance(capabilities, list)
         and GROUP_READY_MEMBERS_CAPABILITY in capabilities
+        and state.get("schema_version") == 1
+        and state.get("required_capability") == GROUP_READY_MEMBERS_CAPABILITY
         and state.get("state") == "active"
+        and type(state.get("revision")) is int
+        and state["revision"] >= 0
     )
 
 

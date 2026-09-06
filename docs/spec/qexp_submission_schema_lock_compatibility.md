@@ -1,6 +1,6 @@
 ---
 doc_type: spec
-status: drafting
+status: active
 updated_at: 2026-09-06
 archived_at:
 ---
@@ -44,13 +44,13 @@ uncommitted staged Tasks and inactive additions.
 | 1.3.17 | Only narrow protocol permits ordinary mutation | Restricted upgrader/repair may activate legacy roots |
 | 1.3.18 | Narrow protocol only | Remove the marker, legacy path, and fixtures |
 
-This change is intentionally unshipped while `QQTOOLS-COMPAT-0008` remains planned. The two
-transitions must be released together; no current root can activate this branch by itself.
+`QQTOOLS-COMPAT-0008` and `QQTOOLS-COMPAT-0009` are jointly active in 1.3.16. New roots create
+the canonical member projection immediately. Existing roots use `qexp upgrade group-ready-members`
+to build and audit it under the wide schema fence; the atomic `active` state transition is also the
+only point at which the narrow writer protocol becomes selectable.
 
 ## Verification boundary
 
-The integration matrix writes the future capability and active-state evidence and exercises the
-real gate, while a test-only reader capability shim stands in for the unfinished 0008 reader.
-It verifies the 0009 locking contract but is not evidence that a production root may activate.
-Release activation, including the compatibility-registry lifecycle transition, remains blocked on
-the 0008 projection writer, audit, and joint activation commit.
+The integration matrix exercises the production capability, build, audit, and active-state gate.
+It verifies that legacy roots retain the exclusive fence during construction, and that the first
+active member projection selects the shared schema writer fence without permitting mixed writers.

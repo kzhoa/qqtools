@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-05
+updated_at: 2026-09-06
 archived_at:
 ---
 
@@ -818,6 +818,13 @@ Adding a machine:
 Role and GPU-limit changes are Group-lock-linearized. They affect later claims but do not
 revoke a successfully created claim. Drain, remove, pause, cancellation, lease, and fencing keep
 their existing launch-gate meaning.
+
+Live ready membership is a derived, Group-partitioned projection. It records only current ready
+Task generations and is rebuilt from Task, Group, Submission, ready-marker, and candidate truth.
+Worker role changes therefore update candidates only for that Group's live references, rather than
+scanning project Task history. A missing, building, damaged, or revision-changing projection makes
+the primary-demand probe unresolved and blocks new borrow admission; it never means that primary
+demand is absent.
 
 Draining a machine:
 
