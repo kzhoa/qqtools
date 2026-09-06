@@ -365,7 +365,7 @@ def test_peek_partition_removal_recheck_avoids_false_degradation(
     catalog_read = threading.Event()
     continue_read = threading.Event()
     result = []
-    from qqtools.plugins.qexp.runtime.ready import index as ready
+    from qqtools.plugins.qexp.runtime.ready import traversal as ready
 
     original_read_json = ready.read_json
     did_pause = False
