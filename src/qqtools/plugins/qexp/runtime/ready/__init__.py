@@ -4,8 +4,6 @@ from .index import (
     READY_BUILD_PAGE_SIZE,
     ReadyClassification,
     ReadyClassificationResult,
-    ReadyCursor,
-    ReadyPeek,
     advance_ready_index_build,
     begin_primary_ready_index_rebuild,
     begin_ready_index_build,
@@ -14,14 +12,8 @@ from .index import (
     delete_stale_ready_marker,
     discard_ready_generation,
     is_primary_ready_index_active,
-    iter_ready_marker_refs,
-    load_ready_cursor,
-    next_ready_marker,
-    peek_primary_ready_marker,
-    peek_ready_marker,
     prepare_ready_transition,
     primary_projection_routes_for_group,
-    ready_index_revision,
     ready_task_projection_issue,
     rebuild_primary_ready_index,
     repair_ready_index,
@@ -54,6 +46,16 @@ from .state import (
     mark_ready_index_degraded,
     read_ready_index_state,
     read_ready_index_status,
+)
+from .traversal import (
+    ReadyCursor,
+    ReadyPeek,
+    iter_ready_marker_refs,
+    load_ready_cursor,
+    next_ready_marker,
+    peek_primary_ready_marker,
+    peek_ready_marker,
+    ready_index_revision,
 )
 
 __all__ = [
