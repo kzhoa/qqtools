@@ -151,7 +151,7 @@ def test_build_advance_never_waits_for_schema_while_holding_ready_state_lock(
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     _make_legacy_task(cfg, "deadlock-task")
     begin_ready_index_build(cfg)
-    from qqtools.plugins.qexp.runtime.ready import index as ready_runtime
+    from qqtools.plugins.qexp.runtime.ready import rebuild as ready_runtime
 
     real_schema_writer_lock = ready_runtime.schema_writer_lock
     schema_acquire_attempted = threading.Event()

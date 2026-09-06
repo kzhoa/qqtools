@@ -1,12 +1,9 @@
 """Public aggregation for the durable ready liveness projection."""
 
 from .index import (
-    READY_BUILD_PAGE_SIZE,
     ReadyClassification,
     ReadyClassificationResult,
-    advance_ready_index_build,
     begin_primary_ready_index_rebuild,
-    begin_ready_index_build,
     classify_ready_marker,
     delete_ready_marker,
     delete_stale_ready_marker,
@@ -14,9 +11,6 @@ from .index import (
     is_primary_ready_index_active,
     prepare_ready_transition,
     primary_projection_routes_for_group,
-    ready_task_projection_issue,
-    rebuild_primary_ready_index,
-    repair_ready_index,
     retire_current_ready_generation,
     retire_previous_ready_generation,
     sync_primary_ready_group,
@@ -26,6 +20,14 @@ from .primary_candidates import (
     PRIMARY_READY_PROTOCOL_VERSION,
     complete_primary_ready_index_rebuild,
     rebuild_primary_ready_candidate,
+)
+from .rebuild import (
+    READY_BUILD_PAGE_SIZE,
+    advance_ready_index_build,
+    begin_ready_index_build,
+    ready_task_projection_issue,
+    rebuild_primary_ready_index,
+    repair_ready_index,
 )
 from .records import ReadyMarkerRef, ReadyScope
 from .routes import (
