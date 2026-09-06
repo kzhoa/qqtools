@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,6 +16,7 @@ from qqtools.plugins.qexp.runtime.ready import (
     READY_WRITER_CAPABILITY,
     advance_ready_index_build,
     assert_ready_writer_compatible,
+    begin_primary_ready_index_rebuild,
     begin_ready_index_build,
     classify_ready_marker,
     next_ready_marker,
@@ -27,6 +29,21 @@ from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.runtime.work_budget import SliceBudget, WorkBudgetPolicy
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
+
+
+def test_primary_rebuild_initializes_the_complete_ready_layout(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    paths = shared_paths(cfg.shared_root)
+    shutil.rmtree(paths["ready"])
+
+    begin_primary_ready_index_rebuild(cfg, "missing-ready-layout")
+
+    assert ready_state_path(cfg.shared_root).exists()
+    assert paths["ready_catalogs"].is_dir()
+    assert paths["ready_reservations"].is_dir()
+    assert paths["ready_primary"].is_dir()
+    primary = read_json(paths["ready_primary"] / "state.json")["primary_ready_index"]
+    assert primary["state"] == "rebuilding"
 
 def _ready_reference(cfg, task: TaskRecord):
     from qqtools.plugins.qexp.runtime.ready import ReadyMarkerRef

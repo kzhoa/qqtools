@@ -375,6 +375,12 @@ def is_primary_ready_index_active(cfg: object) -> bool:
     return primary_candidates.is_projection_active(cfg) and is_group_ready_member_projection_usable(cfg)
 
 
+def begin_primary_ready_index_rebuild(cfg: object, build_id: str) -> None:
+    """Initialize the ready layout before starting a candidate-only rebuild."""
+    ensure_ready_layout(cfg)
+    primary_candidates.begin_primary_ready_index_rebuild(cfg, build_id)
+
+
 def _route_directory(root: Path, scope: ReadyScope, home_machine: str) -> Path:
     paths = shared_paths(root)
     if scope == "home":
@@ -1943,7 +1949,7 @@ def advance_ready_index_build(
             processed_now = 0
             try:
                 if phase == "primary-rebuild":
-                    primary_candidates.begin_primary_ready_index_rebuild(cfg, build["build_id"])
+                    begin_primary_ready_index_rebuild(cfg, build["build_id"])
                 while processed_now < max_tasks and cursor["page"] < page_count:
                     task_ids = _load_build_page(cfg, build["build_id"], cursor["page"])
                     if cursor["offset"] >= len(task_ids):

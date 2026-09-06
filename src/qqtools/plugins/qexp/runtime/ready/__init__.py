@@ -14,6 +14,7 @@ from .index import (
     ReadyProbeBudgetExhausted,
     advance_ready_index_build,
     assert_ready_writer_compatible,
+    begin_primary_ready_index_rebuild,
     begin_ready_index_build,
     bump_primary_ready_revision,
     classify_ready_marker,
@@ -46,7 +47,6 @@ from .index import (
 )
 from .primary_candidates import (
     PRIMARY_READY_PROTOCOL_VERSION,
-    begin_primary_ready_index_rebuild,
     complete_primary_ready_index_rebuild,
     rebuild_primary_ready_candidate,
 )
