@@ -1,4 +1,5 @@
 """Derived live-ready membership indexed by Group."""
+
 from __future__ import annotations
 
 import ctypes
@@ -8,7 +9,7 @@ import os
 import shutil
 import uuid
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..locks import exclusive
 from ..paths import shared_paths
@@ -16,8 +17,8 @@ from ..records import TaskRecord, utc_now, validate_identifier
 from ..store import atomic_replace, read_json
 
 if TYPE_CHECKING:
-    from .records import ReadyMarkerRef
     from ..records import TaskRecord
+    from .records import ReadyMarkerRef
 
 GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
 GROUP_READY_MEMBERS_VERSION = 1
@@ -97,9 +98,7 @@ def _digest(entries: list[dict[str, Any]]) -> str:
     digest = 0
     for item in entries:
         value = (item["identity"], item["task_id"], item["generation"], item["member_revision"])
-        digest ^= int.from_bytes(
-            hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).digest(), "big"
-        )
+        digest ^= int.from_bytes(hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).digest(), "big")
     return f"{digest:064x}"
 
 
@@ -116,12 +115,20 @@ def initialize_group_ready_members(cfg: object) -> None:
     shared_paths(cfg.shared_root)["ready_group_member_groups"].mkdir(parents=True, exist_ok=True)
     path = _state_path(cfg)
     if not path.exists():
-        atomic_replace(path, {"group_ready_members": {
-            "schema_version": GROUP_READY_MEMBERS_VERSION,
-            "required_capability": GROUP_READY_MEMBERS_CAPABILITY,
-            "state": "active", "revision": 0, "build": None,
-            "degraded_reasons": [], "updated_at": utc_now(),
-        }})
+        atomic_replace(
+            path,
+            {
+                "group_ready_members": {
+                    "schema_version": GROUP_READY_MEMBERS_VERSION,
+                    "required_capability": GROUP_READY_MEMBERS_CAPABILITY,
+                    "state": "active",
+                    "revision": 0,
+                    "build": None,
+                    "degraded_reasons": [],
+                    "updated_at": utc_now(),
+                }
+            },
+        )
 
 
 def read_group_ready_members_state(cfg: object) -> dict[str, Any]:
@@ -182,21 +189,40 @@ def assert_group_ready_members_writable(cfg: object) -> None:
 
 
 def _empty_group(group_name: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    catalog = {"group_ready_member_catalog": {
-        "schema_version": GROUP_READY_MEMBERS_VERSION, "group_name": group_name,
-        "page": 0, "identities": [], "revision": 0,
-    }}
-    partition = {"group_ready_member_partition": {
-        "schema_version": GROUP_READY_MEMBERS_VERSION, "group_name": group_name,
-        "page": 0, "entries": [], "revision": 0,
-    }}
-    state = {"group_ready_members": {
-        "schema_version": GROUP_READY_MEMBERS_VERSION, "group_name": group_name,
-        "membership_revision": 0, "member_count": 0, "catalog_head": 0,
-        "catalog_tail": 0, "catalog_pages": [], "available_catalog_pages": [],
-        "free_catalog_page": 0, "membership_digest": _digest([]),
-        "digest_algorithm": _MEMBERSHIP_DIGEST_ALGORITHM, "updated_at": utc_now(),
-    }}
+    catalog = {
+        "group_ready_member_catalog": {
+            "schema_version": GROUP_READY_MEMBERS_VERSION,
+            "group_name": group_name,
+            "page": 0,
+            "identities": [],
+            "revision": 0,
+        }
+    }
+    partition = {
+        "group_ready_member_partition": {
+            "schema_version": GROUP_READY_MEMBERS_VERSION,
+            "group_name": group_name,
+            "page": 0,
+            "entries": [],
+            "revision": 0,
+        }
+    }
+    state = {
+        "group_ready_members": {
+            "schema_version": GROUP_READY_MEMBERS_VERSION,
+            "group_name": group_name,
+            "membership_revision": 0,
+            "member_count": 0,
+            "catalog_head": 0,
+            "catalog_tail": 0,
+            "catalog_pages": [],
+            "available_catalog_pages": [],
+            "free_catalog_page": 0,
+            "membership_digest": _digest([]),
+            "digest_algorithm": _MEMBERSHIP_DIGEST_ALGORITHM,
+            "updated_at": utc_now(),
+        }
+    }
     return state, catalog, partition
 
 
@@ -208,7 +234,9 @@ def _empty_page(group_name: str, page: int) -> tuple[dict[str, Any], dict[str, A
 
 
 def _load_group(
-    cfg: object, group_name: str, page: int = 0,
+    cfg: object,
+    group_name: str,
+    page: int = 0,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     state_path = _group_state_path(cfg, group_name)
     if not state_path.exists():
@@ -219,13 +247,19 @@ def _load_group(
     return state, catalog, partition
 
 
-def _entries(group_name: str, state: dict[str, Any], catalog: dict[str, Any], partition: dict[str, Any]) -> list[dict[str, Any]]:
+def _entries(
+    group_name: str, state: dict[str, Any], catalog: dict[str, Any], partition: dict[str, Any]
+) -> list[dict[str, Any]]:
     group = state.get("group_ready_members")
     page = catalog.get("group_ready_member_catalog")
     slots = partition.get("group_ready_member_partition")
     if not all(isinstance(item, dict) for item in (group, page, slots)):
         raise ValueError("Group ready-member records are invalid.")
-    if group.get("group_name") != group_name or page.get("group_name") != group_name or slots.get("group_name") != group_name:
+    if (
+        group.get("group_name") != group_name
+        or page.get("group_name") != group_name
+        or slots.get("group_name") != group_name
+    ):
         raise ValueError("Group ready-member identity is invalid.")
     entries = slots.get("entries")
     identities = page.get("identities")
@@ -317,9 +351,7 @@ def _validate_entry_locator(
     entry: dict[str, Any],
 ) -> tuple[dict[str, Any], int]:
     """Return the exact page entry identified by one validated locator."""
-    locator = read_json(_locator_path(cfg, group_name, entry["identity"]))[
-        "group_ready_member_locator"
-    ]
+    locator = read_json(_locator_path(cfg, group_name, entry["identity"]))["group_ready_member_locator"]
     if not isinstance(locator, dict):
         raise ValueError("Group ready-member locator is invalid.")
     page = locator.get("page")
@@ -344,16 +376,17 @@ def _validate_entry_locator(
     if slot >= len(page_entries):
         raise ValueError("Group ready-member locator slot is invalid.")
     located = page_entries[slot]
-    if (
-        located.get("identity") != entry["identity"]
-        or located.get("member_revision") != entry["member_revision"]
-    ):
+    if located.get("identity") != entry["identity"] or located.get("member_revision") != entry["member_revision"]:
         raise ValueError("Group ready-member locator does not point to its entry.")
     return located, page
 
 
 def _write_group(
-    cfg: object, group_name: str, state: dict[str, Any], catalog: dict[str, Any], partition: dict[str, Any],
+    cfg: object,
+    group_name: str,
+    state: dict[str, Any],
+    catalog: dict[str, Any],
+    partition: dict[str, Any],
 ) -> None:
     page = catalog["group_ready_member_catalog"]["page"]
     atomic_replace(_partition_path(cfg, group_name, page), partition)
@@ -379,16 +412,19 @@ def _rewrite_page_locators(
 ) -> None:
     """Keep bounded-page locator slots exact after an entry is removed."""
     for slot, entry in enumerate(entries):
-        atomic_replace(_locator_path(cfg, group_name, entry["identity"]), {
-            "group_ready_member_locator": {
-                "schema_version": GROUP_READY_MEMBERS_VERSION,
-                "identity": entry["identity"],
-                "group_name": group_name,
-                "page": page,
-                "slot": slot,
-                "member_revision": entry["member_revision"],
-            }
-        })
+        atomic_replace(
+            _locator_path(cfg, group_name, entry["identity"]),
+            {
+                "group_ready_member_locator": {
+                    "schema_version": GROUP_READY_MEMBERS_VERSION,
+                    "identity": entry["identity"],
+                    "group_name": group_name,
+                    "page": page,
+                    "slot": slot,
+                    "member_revision": entry["member_revision"],
+                }
+            },
+        )
 
 
 def publish_group_ready_member(cfg: object, task: TaskRecord, reference: ReadyMarkerRef) -> None:
@@ -417,7 +453,9 @@ def publish_group_ready_member(cfg: object, task: TaskRecord, reference: ReadyMa
             if not isinstance(locator, dict):
                 raise ValueError("Group ready-member locator is invalid.")
             located, _page = _validate_entry_locator(
-                cfg, group_name, state,
+                cfg,
+                group_name,
+                state,
                 {"identity": identity, "member_revision": locator.get("member_revision")},
             )
             if located.get("task_id") != task.task_id or located.get("generation") != reference.generation:
@@ -450,12 +488,18 @@ def publish_group_ready_member(cfg: object, task: TaskRecord, reference: ReadyMa
             record["catalog_tail"] = pages[-1]
             record["free_catalog_page"] = record["catalog_tail"] + 1
         entry = {
-            "identity": identity, "task_id": task.task_id, "generation": reference.generation,
-            "queue_scope": reference.queue_scope, "home_machine": reference.home_machine,
-            "partition": reference.partition, "catalog_page": reference.catalog_page,
-            "marker_name": reference.marker_name, "lane": task.spec.lane or "gpu",
+            "identity": identity,
+            "task_id": task.task_id,
+            "generation": reference.generation,
+            "queue_scope": reference.queue_scope,
+            "home_machine": reference.home_machine,
+            "partition": reference.partition,
+            "catalog_page": reference.catalog_page,
+            "marker_name": reference.marker_name,
+            "lane": task.spec.lane or "gpu",
             "submission_operation_id": task.submission_operation_id,
-            "source_revision": task.meta["revision"], "target_revision": task.meta["revision"] + 1,
+            "source_revision": task.meta["revision"],
+            "target_revision": task.meta["revision"] + 1,
             "member_revision": 1,
         }
         page_entries.append(entry)
@@ -472,16 +516,22 @@ def publish_group_ready_member(cfg: object, task: TaskRecord, reference: ReadyMa
         record["membership_digest"] = _update_digest(record["membership_digest"], entry)
         record["membership_revision"] += 1
         record["updated_at"] = utc_now()
-        atomic_replace(locator_path, {"group_ready_member_locator": {
-            "schema_version": GROUP_READY_MEMBERS_VERSION, "identity": identity,
-            "group_name": group_name, "page": page, "slot": len(page_entries) - 1,
-            "member_revision": entry["member_revision"],
-        }})
+        atomic_replace(
+            locator_path,
+            {
+                "group_ready_member_locator": {
+                    "schema_version": GROUP_READY_MEMBERS_VERSION,
+                    "identity": identity,
+                    "group_name": group_name,
+                    "page": page,
+                    "slot": len(page_entries) - 1,
+                    "member_revision": entry["member_revision"],
+                }
+            },
+        )
         _write_group(cfg, group_name, state, catalog, partition)
     except (AttributeError, FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-        mark_group_ready_members_degraded(
-            cfg, f"member_publish_failed:{group_name}:{type(exc).__name__}"
-        )
+        mark_group_ready_members_degraded(cfg, f"member_publish_failed:{group_name}:{type(exc).__name__}")
         raise RuntimeError(
             f"Group {group_name!r} ready-member publication failed; grouped mutation is disabled."
         ) from exc
@@ -508,7 +558,9 @@ def retire_group_ready_member(cfg: object, group_name: str, task_id: str, genera
         if not isinstance(locator, dict):
             raise ValueError("Group ready-member locator is invalid.")
         located, page = _validate_entry_locator(
-            cfg, group_name, state,
+            cfg,
+            group_name,
+            state,
             {"identity": identity, "member_revision": locator.get("member_revision")},
         )
         if located.get("task_id") != task_id or located.get("generation") != generation:
@@ -516,9 +568,7 @@ def retire_group_ready_member(cfg: object, group_name: str, task_id: str, genera
         _state, catalog, partition = _load_group(cfg, group_name, page)
         page_entries = _entries(group_name, state, catalog, partition)
         page_entries.remove(located)
-        catalog["group_ready_member_catalog"]["identities"] = [
-            item["identity"] for item in page_entries
-        ]
+        catalog["group_ready_member_catalog"]["identities"] = [item["identity"] for item in page_entries]
         catalog["group_ready_member_catalog"]["revision"] += 1
         partition["group_ready_member_partition"]["entries"] = page_entries
         partition["group_ready_member_partition"]["revision"] += 1
@@ -572,9 +622,7 @@ def retire_group_ready_member(cfg: object, group_name: str, task_id: str, genera
         return True
     except (AttributeError, FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         mark_group_ready_members_degraded(cfg, f"member_retire_invalid:{group_name}:{type(exc).__name__}")
-        raise RuntimeError(
-            f"Group {group_name!r} ready-member projection is invalid; retirement is disabled."
-        ) from exc
+        raise RuntimeError(f"Group {group_name!r} ready-member projection is invalid; retirement is disabled.") from exc
 
 
 def begin_group_ready_members_build(cfg: object, *, is_repair: bool = False) -> dict[str, Any]:
@@ -598,13 +646,18 @@ def begin_group_ready_members_build(cfg: object, *, is_repair: bool = False) -> 
         record = {
             "schema_version": GROUP_READY_MEMBERS_VERSION,
             "required_capability": GROUP_READY_MEMBERS_CAPABILITY,
-            "state": "building", "revision": 0,
+            "state": "building",
+            "revision": 0,
             "build": {
-                "build_id": uuid.uuid4().hex, "cursor": {"page": 0, "offset": 0},
-                "processed": 0, "phase": "backfill", "watermark": {"is_complete": False},
+                "build_id": uuid.uuid4().hex,
+                "cursor": {"page": 0, "offset": 0},
+                "processed": 0,
+                "phase": "backfill",
+                "watermark": {"is_complete": False},
                 "started_at": utc_now(),
             },
-            "degraded_reasons": [], "updated_at": utc_now(),
+            "degraded_reasons": [],
+            "updated_at": utc_now(),
         }
         atomic_replace(path, {"group_ready_members": record})
         return record
@@ -616,9 +669,9 @@ def _should_index(task: TaskRecord) -> bool:
 
 def audit_group_ready_members(cfg: object) -> dict[str, Any]:
     """Verify member entries against authoritative queued Task and ready-marker truth."""
-    from .index import _reference_for_generation
     from ..records import TaskRecord
     from ..store import iter_json
+    from .routes import reference_for_generation
 
     state = read_group_ready_members_state(cfg)
     if state["state"] not in {"building", "active"}:
@@ -628,7 +681,7 @@ def audit_group_ready_members(cfg: object) -> dict[str, Any]:
         task = TaskRecord.from_dict(read_json(path))
         if not _should_index(task):
             continue
-        reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+        reference = reference_for_generation(cfg, task.task_id, task.ready_generation)
         if reference is None:
             raise ValueError(f"Group ready-member marker is missing for Task {task.task_id!r}.")
         identity = _identity(task.group_name or "", task.task_id, task.ready_generation)
@@ -667,7 +720,9 @@ def audit_group_ready_members(cfg: object) -> dict[str, Any]:
 
 
 def _assert_member_matches_task(
-    cfg: object, task: TaskRecord, reference: ReadyMarkerRef,
+    cfg: object,
+    task: TaskRecord,
+    reference: ReadyMarkerRef,
 ) -> None:
     """Check one exact member locator against its authoritative Task and marker."""
     if not task.group_name:
@@ -682,7 +737,9 @@ def _assert_member_matches_task(
     if not isinstance(locator, dict):
         raise ValueError("Group ready-member locator is invalid.")
     entry, _page = _validate_entry_locator(
-        cfg, group_name, state,
+        cfg,
+        group_name,
+        state,
         {"identity": identity, "member_revision": locator.get("member_revision")},
     )
     if (
@@ -700,13 +757,12 @@ def _assert_member_matches_task(
 
 
 def _audit_task_member(
-    cfg: object, task_id: str,
+    cfg: object,
+    task_id: str,
 ) -> tuple[TaskRecord | None, ReadyMarkerRef | None]:
     """Audit one captured Task; a cleaned Task is a legal watermark tombstone."""
     try:
-        task = TaskRecord.from_dict(
-            read_json(shared_paths(cfg.shared_root)["tasks"] / f"{task_id}.json")
-        )
+        task = TaskRecord.from_dict(read_json(shared_paths(cfg.shared_root)["tasks"] / f"{task_id}.json"))
     except FileNotFoundError:
         return None, None
     if not task.group_name or task.ready_generation <= 0:
@@ -716,9 +772,9 @@ def _audit_task_member(
         if _locator_path(cfg, task.group_name, identity).exists():
             raise ValueError(f"Group ready-member is stale for Task {task.task_id!r}.")
         return task, None
-    from .index import _reference_for_generation
+    from .routes import reference_for_generation
 
-    reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+    reference = reference_for_generation(cfg, task.task_id, task.ready_generation)
     if reference is None:
         raise ValueError(f"Group ready-member marker is missing for Task {task.task_id!r}.")
     _assert_member_matches_task(cfg, task, reference)
@@ -730,14 +786,12 @@ def _audit_member_entry(cfg: object, group_name: str, entry: dict[str, Any]) -> 
     task_id = entry.get("task_id")
     if not isinstance(task_id, str):
         raise ValueError("Group ready-member Task identity is invalid.")
-    task = TaskRecord.from_dict(
-        read_json(shared_paths(cfg.shared_root)["tasks"] / f"{task_id}.json")
-    )
+    task = TaskRecord.from_dict(read_json(shared_paths(cfg.shared_root)["tasks"] / f"{task_id}.json"))
     if task.group_name != group_name or not _should_index(task):
         raise ValueError(f"Group {group_name!r} has a stale ready-member entry.")
-    from .index import _reference_for_generation
+    from .routes import reference_for_generation
 
-    reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+    reference = reference_for_generation(cfg, task.task_id, task.ready_generation)
     if reference is None:
         raise ValueError(f"Group ready-member marker is missing for Task {task.task_id!r}.")
     _assert_member_matches_task(cfg, task, reference)
@@ -749,28 +803,44 @@ def _build_root(cfg: object, build_id: str) -> Path:
 
 
 def _build_page_path(
-    cfg: object, build_id: str, page: int, *, collection: str = "watermark",
+    cfg: object,
+    build_id: str,
+    page: int,
+    *,
+    collection: str = "watermark",
 ) -> Path:
     return _build_root(cfg, build_id) / collection / f"{page:016d}.json"
 
 
 def _write_build_page(
-    cfg: object, build_id: str, page: int, task_ids: list[str], *, collection: str = "watermark",
+    cfg: object,
+    build_id: str,
+    page: int,
+    task_ids: list[str],
+    *,
+    collection: str = "watermark",
 ) -> None:
-    atomic_replace(_build_page_path(cfg, build_id, page, collection=collection), {
-        "group_ready_member_build_page": {
-        "schema_version": GROUP_READY_MEMBERS_VERSION, "build_id": build_id,
-        "page": page, "task_ids": list(task_ids),
-        }
-    })
+    atomic_replace(
+        _build_page_path(cfg, build_id, page, collection=collection),
+        {
+            "group_ready_member_build_page": {
+                "schema_version": GROUP_READY_MEMBERS_VERSION,
+                "build_id": build_id,
+                "page": page,
+                "task_ids": list(task_ids),
+            }
+        },
+    )
 
 
 def _load_build_page(
-    cfg: object, build_id: str, page: int, *, collection: str = "watermark",
+    cfg: object,
+    build_id: str,
+    page: int,
+    *,
+    collection: str = "watermark",
 ) -> list[str]:
-    record = read_json(
-        _build_page_path(cfg, build_id, page, collection=collection)
-    )["group_ready_member_build_page"]
+    record = read_json(_build_page_path(cfg, build_id, page, collection=collection))["group_ready_member_build_page"]
     task_ids = record.get("task_ids")
     if (
         record.get("schema_version") != GROUP_READY_MEMBERS_VERSION
@@ -853,7 +923,10 @@ def _capture_build_watermark(
             capture["task_count"] += 1
             if len(capture["pending_task_ids"]) == GROUP_MEMBER_PAGE_SIZE:
                 _write_build_page(
-                    cfg, build_id, capture["page"], capture["pending_task_ids"],
+                    cfg,
+                    build_id,
+                    capture["page"],
+                    capture["pending_task_ids"],
                     collection=collection,
                 )
                 capture["page"] += 1
@@ -863,7 +936,10 @@ def _capture_build_watermark(
     if is_complete:
         if capture["pending_task_ids"]:
             _write_build_page(
-                cfg, build_id, capture["page"], capture["pending_task_ids"],
+                cfg,
+                build_id,
+                capture["page"],
+                capture["pending_task_ids"],
                 collection=collection,
             )
             capture["page"] += 1
@@ -916,7 +992,10 @@ def _advance_page_cursor(cursor: dict[str, int], item_count: int) -> None:
 
 
 def _advance_member_audit(
-    cfg: object, build_id: str, cursor: dict[str, Any], max_entries: int,
+    cfg: object,
+    build_id: str,
+    cursor: dict[str, Any],
+    max_entries: int,
 ) -> tuple[dict[str, Any], int, bool]:
     """Consume bounded actual-member records through durable Group and page cursors."""
 
@@ -932,14 +1011,16 @@ def _advance_member_audit(
             or revision < 0
         ):
             raise ValueError("Group ready-member audit state is invalid.")
-        cursor.update({
-            "pages": pages,
-            "page_index": 0,
-            "entry_offset": 0,
-            "seen_count": 0,
-            "seen_digest": _digest([]),
-            "membership_revision": revision,
-        })
+        cursor.update(
+            {
+                "pages": pages,
+                "page_index": 0,
+                "entry_offset": 0,
+                "seen_count": 0,
+                "seen_digest": _digest([]),
+                "membership_revision": revision,
+            }
+        )
 
     processed = 0
     while processed < max_entries:
@@ -949,8 +1030,11 @@ def _advance_member_audit(
             group_offset = cursor.get("group_offset", 0)
             group_page_count = cursor.get("group_page_count")
             if (
-                type(group_page) is not int or type(group_offset) is not int
-                or type(group_page_count) is not int or group_page < 0 or group_offset < 0
+                type(group_page) is not int
+                or type(group_offset) is not int
+                or type(group_page_count) is not int
+                or group_page < 0
+                or group_offset < 0
             ):
                 raise ValueError("Group ready-member audit cursor is invalid.")
             if group_page >= group_page_count:
@@ -962,10 +1046,9 @@ def _advance_member_audit(
                 continue
             group_key = groups[group_offset]
             cursor["group_offset"] += 1
-            state = read_json(
-                shared_paths(cfg.shared_root)["ready_group_member_groups"]
-                / group_key / "state.json"
-            )["group_ready_members"]
+            state = read_json(shared_paths(cfg.shared_root)["ready_group_member_groups"] / group_key / "state.json")[
+                "group_ready_members"
+            ]
             pages = state.get("catalog_pages")
             if (
                 not isinstance(state.get("group_name"), str)
@@ -976,9 +1059,17 @@ def _advance_member_audit(
                 or state["membership_revision"] < 0
             ):
                 raise ValueError("Group ready-member audit state is invalid.")
-            cursor.update({"group_name": state["group_name"], "pages": pages, "page_index": 0,
-                           "entry_offset": 0, "seen_count": 0, "seen_digest": _digest([]),
-                           "membership_revision": state["membership_revision"]})
+            cursor.update(
+                {
+                    "group_name": state["group_name"],
+                    "pages": pages,
+                    "page_index": 0,
+                    "entry_offset": 0,
+                    "seen_count": 0,
+                    "seen_digest": _digest([]),
+                    "membership_revision": state["membership_revision"],
+                }
+            )
             processed += 1
             continue
         pages = cursor.get("pages")
@@ -991,13 +1082,20 @@ def _advance_member_audit(
             if cursor.get("membership_revision") != group.get("membership_revision"):
                 reset_group_audit(state)
                 continue
-            if (
-                cursor.get("seen_count") != group.get("member_count")
-                or cursor.get("seen_digest") != group.get("membership_digest")
+            if cursor.get("seen_count") != group.get("member_count") or cursor.get("seen_digest") != group.get(
+                "membership_digest"
             ):
                 raise ValueError(f"Group {group_name!r} ready-member count or digest is invalid.")
-            cursor.update({"group_name": None, "pages": [], "page_index": 0,
-                           "entry_offset": 0, "seen_count": 0, "seen_digest": _digest([])})
+            cursor.update(
+                {
+                    "group_name": None,
+                    "pages": [],
+                    "page_index": 0,
+                    "entry_offset": 0,
+                    "seen_count": 0,
+                    "seen_digest": _digest([]),
+                }
+            )
             continue
         state, catalog, partition = _load_group(cfg, group_name, pages[page_index])
         entries = _entries(group_name, state, catalog, partition)
@@ -1013,9 +1111,7 @@ def _advance_member_audit(
             _audit_member_entry(cfg, group_name, entry)
         except (FileNotFoundError, KeyError, TypeError, ValueError):
             state, _catalog, _partition = _load_group(cfg, group_name)
-            if cursor.get("membership_revision") != state["group_ready_members"].get(
-                "membership_revision"
-            ):
+            if cursor.get("membership_revision") != state["group_ready_members"].get("membership_revision"):
                 reset_group_audit(state)
                 continue
             raise
@@ -1027,7 +1123,9 @@ def _advance_member_audit(
 
 
 def advance_group_ready_members_build(
-    cfg: object, *, max_tasks: int = GROUP_MEMBER_PAGE_SIZE,
+    cfg: object,
+    *,
+    max_tasks: int = GROUP_MEMBER_PAGE_SIZE,
 ) -> dict[str, Any]:
     """Advance one bounded backfill, audit, or candidate-rebuild slice."""
     if type(max_tasks) is not int or not 1 <= max_tasks <= GROUP_MEMBER_PAGE_SIZE:
@@ -1035,13 +1133,11 @@ def advance_group_ready_members_build(
     record = begin_group_ready_members_build(cfg)
     if record["state"] != "building":
         return record
-    from . import primary_candidates
-    from .index import (
-        _reference_for_generation,
-        _task_should_have_ready_marker,
-        begin_primary_ready_index_rebuild,
-    )
     from ..records import TaskRecord
+    from . import primary_candidates
+    from .index import _task_should_have_ready_marker, begin_primary_ready_index_rebuild
+    from .routes import reference_for_generation
+
     try:
         with exclusive(_state_lock_path(cfg)):
             value = read_json(_state_path(cfg))
@@ -1058,10 +1154,15 @@ def advance_group_ready_members_build(
                 raise ValueError("Group ready-member build watermark is invalid.")
         if not watermark.get("is_complete"):
             captured = _capture_build_watermark(
-                cfg, build_id=build_id, watermark=watermark, max_entries=max_tasks,
+                cfg,
+                build_id=build_id,
+                watermark=watermark,
+                max_entries=max_tasks,
             )
             return _commit_build_record(
-                cfg, build_id=build_id, build_updates={"watermark": captured},
+                cfg,
+                build_id=build_id,
+                build_updates={"watermark": captured},
             )
         if phase == "backfill":
             cursor = dict(build.get("cursor", {}))
@@ -1079,13 +1180,13 @@ def advance_group_ready_members_build(
                     cursor.update({"page": cursor["page"] + 1, "offset": 0})
                     continue
                 try:
-                    task = TaskRecord.from_dict(read_json(
-                        shared_paths(cfg.shared_root)["tasks"] / f"{items[cursor['offset']]}.json"
-                    ))
+                    task = TaskRecord.from_dict(
+                        read_json(shared_paths(cfg.shared_root)["tasks"] / f"{items[cursor['offset']]}.json")
+                    )
                 except FileNotFoundError:
                     task = None
                 if task is not None and _should_index(task):
-                    reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+                    reference = reference_for_generation(cfg, task.task_id, task.ready_generation)
                     if reference is None:
                         raise ValueError(f"Group ready-member marker is missing for Task {task.task_id!r}.")
                     publish_group_ready_member(cfg, task, reference)
@@ -1095,7 +1196,11 @@ def advance_group_ready_members_build(
             if cursor["page"] >= page_count:
                 updates = {"phase": "audit-task-capture"}
             return _commit_build_record(
-                cfg, build_id=build_id, cursor=cursor, processed=processed, build_updates=updates,
+                cfg,
+                build_id=build_id,
+                cursor=cursor,
+                processed=processed,
+                build_updates=updates,
             )
         if phase == "audit-task-capture":
             current = build.get("audit_task_watermark", {"is_complete": False})
@@ -1106,13 +1211,17 @@ def advance_group_ready_members_build(
             # dual-write the cleared rebuild, including work outside the
             # watermark that is captured below.
             begin_primary_ready_index_rebuild(cfg, build_id)
-            captured = _capture_build_watermark(cfg, build_id=build_id, watermark=current,
-                                                max_entries=max_tasks, collection="audit-tasks")
+            captured = _capture_build_watermark(
+                cfg, build_id=build_id, watermark=current, max_entries=max_tasks, collection="audit-tasks"
+            )
             updates = {"audit_task_watermark": captured}
             if captured.get("is_complete"):
-                updates.update({
-                    "phase": "audit-tasks", "audit_task_cursor": {"page": 0, "offset": 0},
-                })
+                updates.update(
+                    {
+                        "phase": "audit-tasks",
+                        "audit_task_cursor": {"page": 0, "offset": 0},
+                    }
+                )
             return _commit_build_record(cfg, build_id=build_id, build_updates=updates)
         if phase == "audit-tasks":
             audit = build.get("audit_task_watermark", {})
@@ -1138,27 +1247,48 @@ def advance_group_ready_members_build(
             if not isinstance(current, dict):
                 raise ValueError("Group ready-member audit Group watermark is invalid.")
             captured = _capture_build_watermark(
-                cfg, build_id=build_id, watermark=current, max_entries=max_tasks,
+                cfg,
+                build_id=build_id,
+                watermark=current,
+                max_entries=max_tasks,
                 source_path=shared_paths(cfg.shared_root)["ready_group_member_groups"],
-                collection="audit-groups", should_include_json=False,
+                collection="audit-groups",
+                should_include_json=False,
             )
             updates = {"audit_group_watermark": captured}
             if captured.get("is_complete"):
-                updates.update({"phase": "audit-members", "audit_member_cursor": {
-                    "group_page": 0, "group_offset": 0, "group_page_count": captured["page_count"],
-                    "group_name": None, "pages": [], "page_index": 0, "entry_offset": 0,
-                    "seen_count": 0, "seen_digest": _digest([]),
-                }})
+                updates.update(
+                    {
+                        "phase": "audit-members",
+                        "audit_member_cursor": {
+                            "group_page": 0,
+                            "group_offset": 0,
+                            "group_page_count": captured["page_count"],
+                            "group_name": None,
+                            "pages": [],
+                            "page_index": 0,
+                            "entry_offset": 0,
+                            "seen_count": 0,
+                            "seen_digest": _digest([]),
+                        },
+                    }
+                )
             return _commit_build_record(cfg, build_id=build_id, build_updates=updates)
         if phase == "audit-members":
             cursor, _processed, complete = _advance_member_audit(
-                cfg, build_id, dict(build.get("audit_member_cursor", {})), max_tasks,
+                cfg,
+                build_id,
+                dict(build.get("audit_member_cursor", {})),
+                max_tasks,
             )
             updates = {"audit_member_cursor": cursor}
             if complete:
-                updates.update({
-                    "phase": "primary-rebuild", "primary_cursor": {"page": 0, "offset": 0},
-                })
+                updates.update(
+                    {
+                        "phase": "primary-rebuild",
+                        "primary_cursor": {"page": 0, "offset": 0},
+                    }
+                )
             return _commit_build_record(cfg, build_id=build_id, build_updates=updates)
         if phase == "primary-rebuild":
             audit = build.get("audit_task_watermark", {})
@@ -1174,13 +1304,13 @@ def advance_group_ready_members_build(
                     cursor.update({"page": cursor["page"] + 1, "offset": 0})
                     continue
                 try:
-                    task = TaskRecord.from_dict(read_json(
-                        shared_paths(cfg.shared_root)["tasks"] / f"{items[cursor['offset']]}.json"
-                    ))
+                    task = TaskRecord.from_dict(
+                        read_json(shared_paths(cfg.shared_root)["tasks"] / f"{items[cursor['offset']]}.json")
+                    )
                 except FileNotFoundError:
                     task = None
                 if task is not None and _task_should_have_ready_marker(task):
-                    reference = _reference_for_generation(cfg, task.task_id, task.ready_generation)
+                    reference = reference_for_generation(cfg, task.task_id, task.ready_generation)
                     if reference is None:
                         raise ValueError(f"Primary candidate marker is missing for Task {task.task_id!r}.")
                     primary_candidates.rebuild_primary_ready_candidate(cfg, build_id, task, reference)
@@ -1190,7 +1320,10 @@ def advance_group_ready_members_build(
             if cursor["page"] >= page_count:
                 primary_candidates.complete_primary_ready_index_rebuild(cfg, build_id)
                 return _commit_build_record(
-                    cfg, build_id=build_id, build_updates=updates, should_activate=True,
+                    cfg,
+                    build_id=build_id,
+                    build_updates=updates,
+                    should_activate=True,
                 )
             return _commit_build_record(cfg, build_id=build_id, build_updates=updates)
         raise ValueError("Group ready-member build phase is invalid.")
