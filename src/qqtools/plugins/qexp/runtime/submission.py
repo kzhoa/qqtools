@@ -4,10 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
-from .locks import group_lock, schema_lock
+from .locks import (
+    group_lock,
+    group_writer_lock,
+    idempotency_lock,
+    is_schema_narrow_protocol_active,
+    schema_writer_lock,
+    task_lock,
+    task_locks,
+)
 from .paths import group_path, idempotency_path, machine_path, shared_paths, submission_path, task_path
 from .records import (
     TaskRecord,
@@ -35,12 +44,29 @@ from .availability import remove_deadline_index, sync_deadline_index
 from .tasks import save_task
 from ..layout import is_cpu_lane_root, is_task_dependencies_root
 from .dependencies import normalize_dependency_ids, validate_group_dependencies
+from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
 
 
 def _write_group_record(cfg: object, path: Path, data: dict[str, Any]) -> None:
     """Persist a Group through this module's patchable atomic writer."""
     atomic_replace(path, data)
-from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
+
+
+def _is_submission_schema_lock_active(cfg: object) -> bool:
+    """Return whether member projection activated the narrow submission protocol."""
+    return is_schema_narrow_protocol_active(cfg)
+
+
+@contextmanager
+def _submission_protocol_lock(cfg: object, mapping_digest: str) -> Iterator[None]:
+    """Select the legacy-wide or projection-gated submission fencing protocol."""
+    # QQTOOLS-COMPAT-0009: legacy roots retain the exclusive schema lock through 1.3.17.
+    with schema_writer_lock(cfg):
+        if _is_submission_schema_lock_active(cfg):
+            with idempotency_lock(cfg.shared_root, mapping_digest):
+                yield
+            return
+        yield
 
 
 class IdempotencyConflict(ValueError):
@@ -391,7 +417,7 @@ def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
     group_name = submission.get("target_group")
     if not group_name:
         return
-    with group_lock(cfg.shared_root, group_name):
+    with group_writer_lock(cfg, group_name):
         group_file = group_path(cfg.shared_root, group_name)
         if not group_file.exists():
             raise RuntimeError(
@@ -450,7 +476,7 @@ def submit_specs(
     mapping_path = idempotency_path(cfg.shared_root, semantic_digest({"project": str(cfg.shared_root), "key": key}))
     is_canonical = is_cpu_lane_root(cfg)
     is_dependencies_canonical = is_task_dependencies_root(cfg)
-    with schema_lock(cfg.shared_root):
+    with _submission_protocol_lock(cfg, mapping_path.stem):
         existing = mapping_path.exists()
         if existing:
             operation_id = read_json(mapping_path)["operation_id"]
@@ -720,9 +746,11 @@ def submit_specs(
             # prerequisite can begin cleanup between the final check and Task creation.
             if group_name:
                 with group_lock(cfg.shared_root, group_name):
-                    stage_and_commit()
+                    with task_locks(cfg.shared_root, [item["task_id"] for item in resolved]):
+                        stage_and_commit()
             else:
-                stage_and_commit()
+                with task_locks(cfg.shared_root, [item["task_id"] for item in resolved]):
+                    stage_and_commit()
             finalize_submission_group(cfg, operation["submission"])
             return _submission_result(staged, operation["submission"])
         except Exception as exc:
@@ -752,17 +780,18 @@ def submit_specs(
             for item in operation["submission"]["resolved_context"].get("task_specs", []):
                 task_id = item["task_id"]
                 path = task_path(cfg.shared_root, task_id)
-                try:
-                    current = TaskRecord.from_dict(read_json(path))
-                except FileNotFoundError:
-                    remove_deadline_index(cfg, task_id)
-                    continue
-                if current.submission_operation_id == operation_id:
-                    remove_deadline_index(cfg, task_id)
+                with task_lock(cfg.shared_root, task_id):
                     try:
-                        delete_ready_marker(cfg, task_id, current.ready_generation)
-                    except (OSError, KeyError, TypeError, ValueError):
-                        pass
-                    assert_ready_writer_compatible(cfg)
-                    path.unlink(missing_ok=True)
+                        current = TaskRecord.from_dict(read_json(path))
+                    except FileNotFoundError:
+                        remove_deadline_index(cfg, task_id)
+                        continue
+                    if current.submission_operation_id == operation_id:
+                        remove_deadline_index(cfg, task_id)
+                        try:
+                            delete_ready_marker(cfg, task_id, current.ready_generation)
+                        except (OSError, KeyError, TypeError, ValueError):
+                            pass
+                        assert_ready_writer_compatible(cfg)
+                        path.unlink(missing_ok=True)
             raise

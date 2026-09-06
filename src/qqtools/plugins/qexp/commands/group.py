@@ -9,7 +9,7 @@ from ..config_types import RootConfig
 from ..lifecycle import (TerminalTransition, commit_terminal_transition_locked,
                          dispatch_task_lifecycle_hooks_noexcept)
 from ..runtime.claims import archive_claim
-from ..runtime.locks import group_lock, task_lock
+from ..runtime.locks import group_writer_lock, task_lock
 from ..runtime.paths import attempt_path, group_path, shared_paths, submission_path
 from ..runtime.records import (AttemptRecord, SCHEMA_VERSION, TaskRecord, new_group, new_id,
                                new_worker_member, normalize_group_record, utc_now,
@@ -36,7 +36,7 @@ def _finalize_pending_submission_before_group_mutation(
     cfg: RootConfig, name: str, path: Path
 ) -> None:
     """Finalize a committed submission before taking the Group mutation lock."""
-    with group_lock(cfg.shared_root, name):
+    with group_writer_lock(cfg, name):
         if not path.exists():
             return
         data = read_json(path)
@@ -71,7 +71,7 @@ def group_control(
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
     _finalize_pending_submission_before_group_mutation(cfg, name, path)
     post_commit_results = []
-    with group_lock(cfg.shared_root, name):
+    with group_writer_lock(cfg, name):
         data = read_json(path)
         group = data["group"]
         pending = group.get("pending_submission_commit")
@@ -225,7 +225,7 @@ def reconcile_group_cancel_operations(
         name = control.get("group_name")
         if not name or (group_name is not None and name != group_name):
             continue
-        with group_lock(cfg.shared_root, name):
+        with group_writer_lock(cfg, name):
             group_file = group_path(cfg.shared_root, name)
             if not group_file.exists():
                 continue
@@ -327,7 +327,7 @@ def _reconcile_worker_remove_operation(
     machine = control.get("machine_name")
     if not name or not machine or (group_name is not None and name != group_name):
         return None
-    with group_lock(cfg.shared_root, name):
+    with group_writer_lock(cfg, name):
         group_file = group_path(cfg.shared_root, name)
         if not group_file.exists():
             return None
@@ -393,7 +393,7 @@ def _reconcile_worker_remove_operation(
 
 def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -> dict[str, Any]:
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
-    with group_lock(cfg.shared_root, name):
+    with group_writer_lock(cfg, name):
         if path.exists():
             return read_json(path)
         data = new_group(name, cfg.machine_name)
@@ -423,7 +423,7 @@ def change_worker(cfg: RootConfig, group_name: str, machine: str, action: str,
                   has_gpu_limit: bool = False) -> dict[str, Any]:
     path = group_path(cfg.shared_root, validate_group_name(group_name) or group_name)
     _finalize_pending_submission_before_group_mutation(cfg, group_name, path)
-    with group_lock(cfg.shared_root, group_name):
+    with group_writer_lock(cfg, group_name):
         data = read_json(path)
         normalize_group_record(data)
         pending = data["group"].get("pending_submission_commit")

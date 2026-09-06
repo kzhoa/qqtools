@@ -13,7 +13,7 @@ from .lifecycle import (TerminalTransition, commit_terminal_transition_locked,
                         dispatch_task_lifecycle_hooks_noexcept)
 from .runtime.availability import rebuild_deadline_indexes, reconcile_availability_operations
 from .layout import validate_root_contract
-from .runtime.locks import group_lock, task_lock
+from .runtime.locks import group_writer_lock, task_lock
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
 from .runtime.records import AttemptRecord, TaskRecord, normalize_group_record, utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
@@ -392,13 +392,6 @@ def repair_metadata(
         group_name = operation.get("target_group")
         if not group_name:
             continue
-        group_file = shared_paths(cfg.shared_root)["groups"] / f"{group_name}.json"
-        if not group_file.exists():
-            continue
-        group_data = read_json(group_file)
-        pending = group_data["group"].get("pending_submission_commit") or {}
-        if pending.get("operation_id") != operation["operation_id"]:
-            continue
         if operation["state"] == "committed":
             try:
                 finalize_submission_group(cfg, operation)
@@ -408,11 +401,22 @@ def repair_metadata(
             repaired.append(operation["operation_id"])
             continue
         if operation["state"] in {"committed", "aborted", "blocked"}:
-            group_data["group"]["pending_submission_commit"] = None
-            group_data["meta"]["revision"] += 1
-            group_data["meta"]["updated_at"] = operation.get("committed_at") or group_data["meta"]["updated_at"]
-            atomic_replace(group_file, group_data)
-            repaired.append(operation["operation_id"])
+            with group_writer_lock(cfg, group_name):
+                group_file = group_path(cfg.shared_root, group_name)
+                if not group_file.exists():
+                    continue
+                group_data = read_json(group_file)
+                normalize_group_record(group_data)
+                pending = group_data["group"].get("pending_submission_commit") or {}
+                if pending.get("operation_id") != operation["operation_id"]:
+                    continue
+                group_data["group"]["pending_submission_commit"] = None
+                group_data["meta"]["revision"] += 1
+                group_data["meta"]["updated_at"] = (
+                    operation.get("committed_at") or group_data["meta"]["updated_at"]
+                )
+                atomic_replace(group_file, group_data)
+                repaired.append(operation["operation_id"])
         else:
             blocked.append(operation["operation_id"])
     for result in reconcile_cleanup_operations(
@@ -436,7 +440,7 @@ def repair_metadata(
         high_watermark = control["membership_high_watermark"]
         group_name = control["group_name"]
         post_commit_results = []
-        with group_lock(cfg.shared_root, group_name):
+        with group_writer_lock(cfg, group_name):
             group_file = group_path(cfg.shared_root, group_name)
             if not group_file.exists():
                 blocked.append(control["operation_id"])

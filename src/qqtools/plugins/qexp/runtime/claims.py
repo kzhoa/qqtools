@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..config_types import RootConfig
-from .locks import task_lock
+from .locks import task_writer_lock
 from .paths import shared_paths
 from .records import utc_now
 from .store import CASConflict, create_if_absent, iter_json, read_json
@@ -65,7 +65,8 @@ def reconcile_claim_archives(cfg: RootConfig, task_id: str | None = None) -> boo
 
 
 def release_claim(cfg: RootConfig, task_id: str, fencing_token: int, reason: str) -> bool:
-    with task_lock(cfg.shared_root, task_id):
+    initial = load_task(cfg, task_id)
+    with task_writer_lock(cfg, task_id, initial.group_name):
         task = load_task(cfg, task_id)
         claim = task.claim_control.get("active_claim") or {}
         if claim.get("fencing_token") != fencing_token:
@@ -81,7 +82,8 @@ def release_claim(cfg: RootConfig, task_id: str, fencing_token: int, reason: str
 
 
 def renew_lease(cfg: RootConfig, task_id: str, fencing_token: int, expires_at: str) -> bool:
-    with task_lock(cfg.shared_root, task_id):
+    initial = load_task(cfg, task_id)
+    with task_writer_lock(cfg, task_id, initial.group_name):
         task = load_task(cfg, task_id)
         claim = task.claim_control.get("active_claim") or {}
         if claim.get("fencing_token") != fencing_token:

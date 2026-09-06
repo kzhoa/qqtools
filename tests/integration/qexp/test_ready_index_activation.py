@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from qqtools.plugins.qexp.runtime.ready import (
     READY_WRITER_CAPABILITY,
     advance_ready_index_build,
     assert_ready_writer_compatible,
+    begin_ready_index_build,
     classify_ready_marker,
     next_ready_marker,
     peek_ready_marker,
@@ -112,6 +114,40 @@ def test_build_gate_waits_for_inflight_schema_writer(tmp_path: Path) -> None:
 
     assert not thread.is_alive()
     assert read_ready_index_state(cfg) == "building"
+
+
+def test_build_advance_never_waits_for_schema_while_holding_ready_state_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the former state -> schema lock-order inversion."""
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    _make_legacy_task(cfg, "deadlock-task")
+    begin_ready_index_build(cfg)
+    from qqtools.plugins.qexp.runtime import ready as ready_runtime
+
+    real_schema_writer_lock = ready_runtime.schema_writer_lock
+    schema_acquire_attempted = threading.Event()
+
+    @contextmanager
+    def signal_before_schema_acquire(*args, **kwargs):
+        schema_acquire_attempted.set()
+        with real_schema_writer_lock(*args, **kwargs) as acquired:
+            yield acquired
+
+    monkeypatch.setattr(ready_runtime, "schema_writer_lock", signal_before_schema_acquire)
+
+    with schema_lock(cfg.shared_root):
+        advance = threading.Thread(target=lambda: advance_ready_index_build(cfg, max_tasks=1))
+        advance.start()
+        assert schema_acquire_attempted.wait(timeout=2)
+        with exclusive(
+            shared_paths(cfg.shared_root)["ready_locks"] / "state.lock", blocking=False
+        ) as acquired:
+            assert acquired
+
+    advance.join(timeout=5)
+
+    assert not advance.is_alive()
 
 
 def test_build_cursor_is_persistent_and_batch_bounded(tmp_path: Path) -> None:

@@ -134,6 +134,7 @@ def ensure_shared_layout(cfg: RootConfig) -> None:
         path.mkdir(parents=True, exist_ok=True)
     (paths["locks"] / "groups").mkdir(exist_ok=True)
     (paths["locks"] / "tasks").mkdir(exist_ok=True)
+    (paths["locks"] / "idempotency").mkdir(exist_ok=True)
     from .runtime.ready import ensure_ready_layout
 
     ensure_ready_layout(cfg)

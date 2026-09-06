@@ -103,8 +103,10 @@ def lock_path(root: Path, kind: str, identifier: str | None = None) -> Path:
     base = shared_paths(root)["locks"]
     if kind == "schema":
         return base / "schema.lock"
-    if kind not in {"groups", "tasks", "machines"} or identifier is None:
-        raise ValueError("kind must be schema, groups, tasks, or machines with an identifier.")
+    if kind not in {"groups", "tasks", "machines", "idempotency"} or identifier is None:
+        raise ValueError(
+            "kind must be schema, groups, tasks, machines, or idempotency with an identifier."
+        )
     return base / kind / f"{identifier}.lock"
 
 
