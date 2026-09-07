@@ -577,6 +577,35 @@ def test_stale_member_revision_update_cannot_reopen_degraded_gate(tmp_path: Path
     assert group_ready_members_state(cfg) == "degraded"
 
 
+def test_degraded_diagnostics_remain_within_fixed_state_bounds(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+
+    for index in range(20):
+        mark_group_ready_members_degraded(cfg, f"failure-{index}:" + "é" * 600)
+
+    state = read_json(shared_paths(cfg.shared_root)["ready_group_members"] / "state.json")[
+        "group_ready_members"
+    ]
+    reasons = state["degraded_reasons"]
+    assert len(reasons) == 16
+    assert all(len(reason.encode("utf-8")) <= 512 for reason in reasons)
+
+
+def test_global_projection_state_is_size_checked_before_persistence(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    from qqtools.plugins.qexp.runtime.ready import group_members
+
+    state_path = shared_paths(cfg.shared_root)["ready_group_members"] / "state.json"
+    original = state_path.read_bytes()
+    value = read_json(state_path)
+    value["group_ready_members"]["audit"] = {"oversized": "x" * (64 * 1024)}
+
+    with pytest.raises(ValueError, match="projection_encoding_unsupported:member_global_state"):
+        group_members._write_global_state(cfg, value)
+
+    assert state_path.read_bytes() == original
+
+
 def test_concurrent_group_projection_updates_do_not_lose_the_global_revision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -749,6 +778,133 @@ def test_doctor_repair_crash_preserves_the_degraded_gate(
         group_members_rebuild.repair_group_ready_members(cfg, max_tasks=1)
 
     assert group_ready_members_state(cfg) == "degraded"
+
+
+@pytest.mark.parametrize("max_work_items", [True, 0, 65])
+def test_repair_rejects_invalid_budget_before_parking_projection(
+    tmp_path: Path,
+    max_work_items: object,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
+    mark_group_ready_members_degraded(cfg, "injected projection damage")
+    groups = shared_paths(cfg.shared_root)["ready_group_member_groups"]
+
+    from qqtools.plugins.qexp.runtime.ready import group_members_rebuild
+
+    with pytest.raises(ValueError, match="max_work_items must be between 1 and 64"):
+        group_members_rebuild.repair_group_ready_members(
+            cfg,
+            max_work_items=max_work_items,  # type: ignore[arg-type]
+        )
+
+    state = read_json(shared_paths(cfg.shared_root)["ready_group_members"] / "state.json")
+    assert state["group_ready_members"].get("park") is None
+    assert groups.is_dir()
+    assert not (groups.parent / "replaced-groups").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("archive", "replaced-groups/wrong-build"),
+        ("next_projection_id", "invalid"),
+    ],
+)
+def test_repair_rejects_invalid_prepared_park_before_moving_projection(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
+    mark_group_ready_members_degraded(cfg, "injected projection damage")
+    root = shared_paths(cfg.shared_root)["ready_group_members"]
+    groups = shared_paths(cfg.shared_root)["ready_group_member_groups"]
+    state_path = root / "state.json"
+    state = read_json(state_path)
+    state["group_ready_members"]["park"] = {
+        "state": "prepared",
+        "build_id": "a" * 32,
+        "next_projection_id": "b" * 32,
+        "archive": f"replaced-groups/{'a' * 32}",
+    }
+    state["group_ready_members"]["park"][field] = value
+    atomic_replace(state_path, state)
+
+    from qqtools.plugins.qexp.runtime.ready import group_members_rebuild
+
+    with pytest.raises(ValueError, match="park state is invalid"):
+        group_members_rebuild.begin_group_ready_members_build(cfg, is_repair=True)
+
+    assert groups.is_dir()
+    assert not (root / "replaced-groups").exists()
+
+
+def test_prepared_park_retry_preserves_the_new_groups_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
+    mark_group_ready_members_degraded(cfg, "injected projection damage")
+    root = shared_paths(cfg.shared_root)["ready_group_members"]
+    groups = shared_paths(cfg.shared_root)["ready_group_member_groups"]
+
+    from qqtools.plugins.qexp.runtime.ready import group_members_rebuild
+
+    original_write = group_members_rebuild._write_global_state
+
+    def fail_completed_park(_cfg, value):
+        record = value["group_ready_members"]
+        if record.get("state") == "building":
+            raise OSError("simulated crash after member tree park")
+        original_write(_cfg, value)
+
+    monkeypatch.setattr(group_members_rebuild, "_write_global_state", fail_completed_park)
+    with pytest.raises(OSError, match="crash after member tree park"):
+        group_members_rebuild.begin_group_ready_members_build(cfg, is_repair=True)
+
+    state = read_json(root / "state.json")["group_ready_members"]
+    archive = root / state["park"]["archive"]
+    sentinel = groups / "new-tree-sentinel"
+    sentinel.touch()
+    monkeypatch.setattr(group_members_rebuild, "_write_global_state", original_write)
+
+    result = group_members_rebuild.begin_group_ready_members_build(cfg, is_repair=True)
+
+    assert result["state"] == "building"
+    assert sentinel.exists()
+    assert archive.is_dir()
+
+
+def test_prepared_park_with_no_old_tree_does_not_register_an_archive(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    root = shared_paths(cfg.shared_root)["ready_group_members"]
+    groups = shared_paths(cfg.shared_root)["ready_group_member_groups"]
+    groups.rmdir()
+    state_path = root / "state.json"
+    state = read_json(state_path)
+    state["group_ready_members"]["state"] = "degraded"
+    state["group_ready_members"]["park"] = {
+        "state": "prepared",
+        "build_id": "a" * 32,
+        "next_projection_id": "b" * 32,
+        "archive": f"replaced-groups/{'a' * 32}",
+    }
+    atomic_replace(state_path, state)
+
+    from qqtools.plugins.qexp.runtime.ready import group_members_rebuild
+
+    result = group_members_rebuild.begin_group_ready_members_build(cfg, is_repair=True)
+
+    assert result["state"] == "building"
+    assert result["archive_count"] == 0
+    assert groups.is_dir()
+    assert not (root / result["park"]["archive"]).exists()
 
 
 def test_upgrade_dual_publishes_tasks_created_after_the_capture_cursor(tmp_path: Path) -> None:

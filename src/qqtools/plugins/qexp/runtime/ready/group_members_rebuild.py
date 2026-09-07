@@ -87,6 +87,12 @@ PHASE_IO_BOUNDS: dict[str, dict[str, int]] = {
 }
 
 
+def _write_global_state(cfg: object, value: dict[str, Any]) -> None:
+    """Persist the global projection state only within its encoding budget."""
+    require_json_size(value, max_bytes=_MAX_GLOBAL_STATE_BYTES, record_type="member_global_state")
+    atomic_replace(group_ready_members_state_path(cfg), value)
+
+
 class BudgetExhausted(RuntimeError):
     """Raised when a maintenance slice has no remaining work budget."""
 
@@ -141,13 +147,29 @@ def _park_groups_under_lock(cfg: object, value: dict[str, Any]) -> dict[str, Any
     if not isinstance(park, dict) or park.get("state") != "prepared":
         return record
     build_id = park.get("build_id")
-    if not isinstance(build_id, str) or len(build_id) != 32:
+    next_projection_id = park.get("next_projection_id")
+    expected_archive = f"replaced-groups/{build_id}"
+    if (
+        not isinstance(build_id, str)
+        or len(build_id) != 32
+        or not isinstance(next_projection_id, str)
+        or len(next_projection_id) != 32
+        or park.get("archive") != expected_archive
+    ):
         raise ValueError("Group ready-member park state is invalid.")
     root = group_ready_members_root(cfg)
     groups = group_ready_member_groups_root(cfg)
     replaced_root = root / "replaced-groups"
     archive = replaced_root / build_id
-    if archive.parent != replaced_root or archive.is_symlink() or groups.is_symlink():
+    if (
+        root.is_symlink()
+        or groups.parent != root
+        or replaced_root.parent != root
+        or replaced_root.is_symlink()
+        or archive.parent != replaced_root
+        or archive.is_symlink()
+        or groups.is_symlink()
+    ):
         raise ValueError("Group ready-member park path is invalid.")
     replaced_root.mkdir(parents=True, exist_ok=True)
     _fsync_directory(root)
@@ -163,8 +185,9 @@ def _park_groups_under_lock(cfg: object, value: dict[str, Any]) -> dict[str, Any
     groups.mkdir(parents=True, exist_ok=True)
     _fsync_directory(root)
     record["state"] = "building"
-    record["projection_id"] = park["next_projection_id"]
-    record["archive_count"] += 1
+    record["projection_id"] = next_projection_id
+    if archive.exists():
+        record["archive_count"] += 1
     record["park"] = {"state": "completed", "build_id": build_id, "archive": f"replaced-groups/{build_id}"}
     record["build"] = {
         "build_id": build_id,
@@ -176,7 +199,7 @@ def _park_groups_under_lock(cfg: object, value: dict[str, Any]) -> dict[str, Any
     }
     record["revision"] += 1
     record["updated_at"] = utc_now()
-    atomic_replace(group_ready_members_state_path(cfg), value)
+    _write_global_state(cfg, value)
     return record
 
 
@@ -207,7 +230,7 @@ def begin_group_ready_members_build(cfg: object, *, is_repair: bool = False) -> 
             }
             record["revision"] += 1
             record["updated_at"] = utc_now()
-            atomic_replace(path, value)
+            _write_global_state(cfg, value)
             return _park_groups_under_lock(cfg, value)
         group_ready_member_groups_root(cfg).mkdir(parents=True, exist_ok=True)
         record = {
@@ -231,7 +254,7 @@ def begin_group_ready_members_build(cfg: object, *, is_repair: bool = False) -> 
             "degraded_reasons": [],
             "updated_at": utc_now(),
         }
-        atomic_replace(path, {"group_ready_members": record})
+        _write_global_state(cfg, {"group_ready_members": record})
         return record
 
 
@@ -255,7 +278,7 @@ def _commit_audit(cfg: object, audit_id: str, audit: dict[str, Any]) -> dict[str
             }
         record["revision"] += 1
         record["updated_at"] = utc_now()
-        atomic_replace(group_ready_members_state_path(cfg), value)
+        _write_global_state(cfg, value)
         return record
 
 
@@ -290,7 +313,7 @@ def advance_group_ready_members_audit(
             }
             record["audit"] = audit
             record["revision"] += 1
-            atomic_replace(group_ready_members_state_path(cfg), value)
+            _write_global_state(cfg, value)
     audit_id = audit["audit_id"]
     try:
         phase = audit["phase"]
@@ -601,7 +624,7 @@ def _commit_build_record(
             record["state"] = "active"
         record["revision"] += 1
         record["updated_at"] = utc_now()
-        atomic_replace(group_ready_members_state_path(cfg), value)
+        _write_global_state(cfg, value)
         return record
 
 
@@ -1180,6 +1203,8 @@ def repair_group_ready_members(
 
     if max_tasks is not None:
         max_work_items = max_tasks
+    if type(max_work_items) is not int or not 1 <= max_work_items <= GROUP_MEMBER_PAGE_SIZE:
+        raise ValueError(f"max_work_items must be between 1 and {GROUP_MEMBER_PAGE_SIZE}.")
 
     if not is_group_ready_members_root(cfg):
         return {"state": "legacy", "required_capability": GROUP_READY_MEMBERS_CAPABILITY}
@@ -1239,7 +1264,7 @@ def cleanup_group_ready_member_archives(
                     record["archive_cleanup"] = cleanup
                     record["revision"] += 1
                     record["updated_at"] = utc_now()
-                    atomic_replace(group_ready_members_state_path(cfg), value)
+                    _write_global_state(cfg, value)
         archive = root / cleanup["build_id"]
         if archive.parent != root or archive.is_symlink():
             raise ValueError("Group ready-member archive cleanup target is invalid.")
@@ -1260,7 +1285,7 @@ def cleanup_group_ready_member_archives(
                     record["archive_cleanup"] = None
                 record["revision"] += 1
                 record["updated_at"] = utc_now()
-                atomic_replace(group_ready_members_state_path(cfg), value)
+                _write_global_state(cfg, value)
             return {
                 "state": "building" if archive.exists() else "completed",
                 "archive_count": record.get("archive_count", 0),
@@ -1278,7 +1303,7 @@ def _complete_empty_archive_cleanup(cfg: object) -> dict[str, Any]:
             record["archive_count"] = 0
             record["revision"] += 1
             record["updated_at"] = utc_now()
-            atomic_replace(group_ready_members_state_path(cfg), value)
+            _write_global_state(cfg, value)
         return {"state": "completed", "archive_count": record["archive_count"], "processed": 0}
 
 
@@ -1306,7 +1331,7 @@ def _cleanup_completed_audit_scratch(
                     record["audit_cleanup"] = cleanup
                     record["revision"] += 1
                     record["updated_at"] = utc_now()
-                    atomic_replace(group_ready_members_state_path(cfg), value)
+                    _write_global_state(cfg, value)
         audit_id = cleanup.get("audit_id")
         phase = cleanup.get("phase")
         if not isinstance(audit_id, str) or phase not in {
@@ -1332,7 +1357,7 @@ def _cleanup_completed_audit_scratch(
                     record["audit_cleanup"] = None
                 record["revision"] += 1
                 record["updated_at"] = utc_now()
-                atomic_replace(group_ready_members_state_path(cfg), value)
+                _write_global_state(cfg, value)
             return {
                 "state": "building" if root.exists() else "completed",
                 "archive_count": record.get("archive_count", 0),

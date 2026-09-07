@@ -2016,14 +2016,20 @@ This active-state commit jointly enables
 exclusive schema fence. Older writers fail before mutation because they do not recognize the
 required capability.
 
-The final v1 Group header contains only fixed-size directory pointers, counters, a projection
-identity, one current writable-page pointer, and fixed pointers for a paged writable-page FIFO.
+The final v1 global state contains the projection identity. Each Group header contains only
+fixed-size directory pointers, counters, one current writable-page pointer, and fixed pointers for
+a paged writable-page FIFO.
 Linked directory and writable-index pages contain at most 64 member-page references; neither
 headers nor audit cursors contain a complete page list. A writable-index page consumed by publish
 is linked onto a reusable free chain, so repeated retirement churn is bounded by historical peak
-capacity rather than the number of churn cycles. Projection records are
-size-limited before parsing and before persistence. Every copied identifier is at most 256 UTF-8
-bytes; an unsupported encoding fails closed before its authoritative grouped write commits.
+capacity rather than the number of churn cycles. Projection records are limited before parsing and
+before persistence: Group headers and directory/catalog/writable-index pages are at most 8 KiB,
+member pages and global state (including maintenance cursors) are at most 64 KiB, locators are at
+most 4 KiB, and build capture pages are at most 32 KiB. A global state retains at most 16 degraded
+reasons of at most 512 UTF-8 bytes each. Copied Task IDs, queue scopes, machine names, partitions,
+marker names, and submission-operation IDs are at most 256 UTF-8 bytes; Group names are at most 64
+characters and lanes are the `gpu` or `cpu` Task enum. An unsupported encoding fails closed before
+its authoritative grouped write commits.
 
 `doctor verify` and active `doctor repair` share a durable audit record keyed by projection
 identity. A completed audit is historical display data only: the next verify or active repair
