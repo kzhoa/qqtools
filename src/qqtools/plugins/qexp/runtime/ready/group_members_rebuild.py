@@ -731,6 +731,8 @@ def _advance_member_audit(
             {
                 "directory_page": group.get("directory_head"),
                 "directory_offset": 0,
+                "directory_pages_seen": 0,
+                "directory_page_count": group["directory_page_count"],
                 "member_page": None,
                 "entry_offset": 0,
                 "pending_entry": None,
@@ -750,6 +752,7 @@ def _advance_member_audit(
                 "writable_expected_digest": "0" * 64,
                 "writable_audit_complete": False,
                 "writable_current_page": group.get("writable_member_page"),
+                "writable_current_seen": False,
                 "writable_tail": group.get("writable_index_tail"),
                 "writable_index_count": group.get("writable_index_count"),
                 "next_writable_index_page": group.get("next_writable_index_page"),
@@ -797,6 +800,8 @@ def _advance_member_audit(
                     "group_name": state["group_name"],
                     "directory_page": state.get("directory_head"),
                     "directory_offset": 0,
+                    "directory_pages_seen": 0,
+                    "directory_page_count": state["directory_page_count"],
                     "member_page": None,
                     "entry_offset": 0,
                     "pending_entry": None,
@@ -817,6 +822,7 @@ def _advance_member_audit(
                     "writable_expected_digest": "0" * 64,
                     "writable_audit_complete": False,
                     "writable_current_page": state.get("writable_member_page"),
+                    "writable_current_seen": False,
                     "writable_tail": state.get("writable_index_tail"),
                     "writable_index_count": state.get("writable_index_count"),
                     "next_writable_index_page": state.get("next_writable_index_page"),
@@ -850,6 +856,12 @@ def _advance_member_audit(
                 "membership_digest"
             ):
                 raise ValueError(f"Group {group_name!r} ready-member count or digest is invalid.")
+            if cursor.get("directory_pages_seen") != group.get("directory_page_count"):
+                raise ValueError(f"Group {group_name!r} directory chain is incomplete.")
+            if cursor.get("writable_current_page") is not None and not cursor.get(
+                "writable_current_seen", False
+            ):
+                raise ValueError(f"Group {group_name!r} writable page pointer is invalid.")
             cursor.update(
                 {
                     "group_name": None,
@@ -868,10 +880,15 @@ def _advance_member_audit(
         if member_page is None:
             if processed >= max_entries:
                 return cursor, processed, False
+            page_count = cursor.get("directory_page_count")
+            pages_seen = cursor.get("directory_pages_seen")
+            if type(page_count) is not int or type(pages_seen) is not int or pages_seen >= page_count:
+                raise ValueError(f"Group {group_name!r} directory chain contains a cycle.")
             directory = read_group_ready_member_directory(cfg, group_name, directory_page)
             processed += 1
             member_pages = directory["member_pages"]
             if directory_offset >= len(member_pages):
+                cursor["directory_pages_seen"] = pages_seen + 1
                 cursor["directory_page"] = directory["next_page"]
                 cursor["directory_offset"] = 0
                 cursor["entry_offset"] = 0
@@ -904,6 +921,10 @@ def _advance_member_audit(
                 len(entries) < GROUP_MEMBER_PAGE_SIZE
                 and member_page != cursor.get("writable_current_page")
             )
+            if member_page == cursor.get("writable_current_page"):
+                if len(entries) >= GROUP_MEMBER_PAGE_SIZE:
+                    raise ValueError("Group ready-member current writable page is full.")
+                cursor["writable_current_seen"] = True
             if is_indexed != should_be_indexed:
                 raise ValueError("Group ready-member writable-index coverage is invalid.")
             if should_be_indexed:
