@@ -26,6 +26,8 @@ _MAX_DIRECTORY_PAGE_BYTES = 8 * 1024
 _MAX_MEMBER_PAGE_BYTES = 64 * 1024
 _MAX_LOCATOR_BYTES = 4 * 1024
 _MAX_GLOBAL_STATE_BYTES = 64 * 1024
+_MAX_DEGRADED_REASONS = 16
+_MAX_DEGRADED_REASON_BYTES = 512
 
 
 def _root(cfg: object) -> Path:
@@ -39,6 +41,12 @@ def _state_path(cfg: object) -> Path:
 def _state_lock_path(cfg: object) -> Path:
     """Return the short global fence for the member-projection state."""
     return shared_paths(cfg.shared_root)["ready_locks"] / "group-members-state.lock"
+
+
+def _write_global_state(cfg: object, value: dict[str, Any]) -> None:
+    """Persist the global projection state only within its encoding budget."""
+    require_json_size(value, max_bytes=_MAX_GLOBAL_STATE_BYTES, record_type="member_global_state")
+    atomic_replace(_state_path(cfg), value)
 
 
 def _group_key(group_name: str) -> str:
@@ -121,25 +129,23 @@ def initialize_group_ready_members(cfg: object) -> None:
     shared_paths(cfg.shared_root)["ready_group_member_groups"].mkdir(parents=True, exist_ok=True)
     path = _state_path(cfg)
     if not path.exists():
-        atomic_replace(
-            path,
-            {
-                "group_ready_members": {
-                    "schema_version": GROUP_READY_MEMBERS_VERSION,
-                    "required_capability": GROUP_READY_MEMBERS_CAPABILITY,
-                    "state": "active",
-                    "revision": 0,
-                    "projection_id": hashlib.sha256(f"{utc_now()}:{id(cfg)}".encode()).hexdigest()[:32],
-                    "build": None,
-                    "audit": None,
-                    "archive_count": 0,
-                    "archive_cleanup": None,
-                    "audit_cleanup": None,
-                    "degraded_reasons": [],
-                    "updated_at": utc_now(),
-                }
-            },
-        )
+        value = {
+            "group_ready_members": {
+                "schema_version": GROUP_READY_MEMBERS_VERSION,
+                "required_capability": GROUP_READY_MEMBERS_CAPABILITY,
+                "state": "active",
+                "revision": 0,
+                "projection_id": hashlib.sha256(f"{utc_now()}:{id(cfg)}".encode()).hexdigest()[:32],
+                "build": None,
+                "audit": None,
+                "archive_count": 0,
+                "archive_cleanup": None,
+                "audit_cleanup": None,
+                "degraded_reasons": [],
+                "updated_at": utc_now(),
+            }
+        }
+        _write_global_state(cfg, value)
 
 
 def read_group_ready_members_state(cfg: object) -> dict[str, Any]:
@@ -156,6 +162,12 @@ def read_group_ready_members_state(cfg: object) -> dict[str, Any]:
         or len(record["projection_id"]) != 32
         or type(record.get("archive_count")) is not int
         or record["archive_count"] < 0
+        or not isinstance(record.get("degraded_reasons"), list)
+        or len(record["degraded_reasons"]) > _MAX_DEGRADED_REASONS
+        or not all(
+            isinstance(reason, str) and len(reason.encode("utf-8")) <= _MAX_DEGRADED_REASON_BYTES
+            for reason in record["degraded_reasons"]
+        )
     ):
         raise ValueError("group ready-member state is invalid.")
     return record
@@ -184,13 +196,22 @@ def mark_group_ready_members_degraded(cfg: object, reason: str) -> None:
             read_group_ready_members_state(cfg)
         except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
             return
+        if not isinstance(reason, str):
+            reason = type(reason).__name__
+        encoded_reason = reason.encode("utf-8")
+        if len(encoded_reason) > _MAX_DEGRADED_REASON_BYTES:
+            digest = hashlib.sha256(encoded_reason).hexdigest()[:16]
+            prefix = encoded_reason[: _MAX_DEGRADED_REASON_BYTES - len(digest) - 1]
+            reason = f"{prefix.decode('utf-8', errors='ignore')}:{digest}"
         reasons = record.setdefault("degraded_reasons", [])
         if reason not in reasons:
+            if len(reasons) >= _MAX_DEGRADED_REASONS:
+                reasons.pop(0)
             reasons.append(reason)
         record["state"] = "degraded"
         record["revision"] += 1
         record["updated_at"] = utc_now()
-        atomic_replace(_state_path(cfg), value)
+        _write_global_state(cfg, value)
 
 
 def assert_group_ready_members_writable(cfg: object) -> None:
@@ -693,7 +714,7 @@ def _write_group(
             raise RuntimeError("group ready-member projection is degraded; publication is disabled.")
         record["revision"] += 1
         record["updated_at"] = utc_now()
-        atomic_replace(_state_path(cfg), value)
+        _write_global_state(cfg, value)
 
 
 def _rewrite_page_locators(
