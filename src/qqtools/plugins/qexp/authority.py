@@ -14,7 +14,7 @@ from .lease import (AuthorityResolutionOutcome, LeasePolicy, LeaseRenewalOutcome
 from .runtime.claims import archive_claim
 from .runtime.paths import attempt_path, local_paths
 from .runtime.records import AttemptRecord, utc_now
-from .runtime.reservations import release
+from .runtime.resources.reservations import release
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.tasks import load_task, save_task
 from .runtime.termination import (attempt_control_lock, commit_local_unavailable, commit_signal,

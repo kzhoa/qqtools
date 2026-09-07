@@ -153,7 +153,7 @@ def _cleanup_local_resources(
     cfg: RootConfig, task_id: str, *, reservation_runtime_root: Path | None = None
 ) -> tuple[list[str], list[str]]:
     from ..machine_runtime import resolve_execution_context
-    from ..runtime.reservations import release
+    from ..runtime.resources.reservations import release
 
     reservation_runtime_root = (
         reservation_runtime_root or resolve_execution_context(cfg).reservation_root

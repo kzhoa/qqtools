@@ -29,8 +29,8 @@ from qqtools.plugins.qexp.runtime.ready import (
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.ready import bump_primary_ready_revision, ready_index_route_revision
-from qqtools.plugins.qexp.runtime.reservations import attach, reconcile_snapshot, reserve
-from qqtools.plugins.qexp.runtime.cpu_lane import reserve_cpu, set_cpu_lane_capacity
+from qqtools.plugins.qexp.runtime.resources.reservations import attach, reconcile_snapshot, reserve
+from qqtools.plugins.qexp.runtime.resources.cpu_lane import reserve_cpu, set_cpu_lane_capacity
 from qqtools.plugins.qexp.runtime.work_budget import (
     AdaptiveBatchSizer,
     SliceBudget,
@@ -1358,7 +1358,7 @@ def test_full_capacity_machine_cycle_reads_no_ready_candidates(
     _activate_ready(cfg)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    from qqtools.plugins.qexp.runtime.reservations import attach, reserve
+    from qqtools.plugins.qexp.runtime.resources.reservations import attach, reserve
 
     reservation = reserve(
         runtime.root,

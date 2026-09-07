@@ -39,7 +39,7 @@ from .machine_agent import (
 )
 from .machine_config import init_shared_root, load_machine_policy
 from .machine_runtime import ExecutionContext, MachineRuntime
-from .runtime.cpu_lane import (
+from .runtime.resources.cpu_lane import (
     get_cpu_lane_policy,
     initialize_cpu_lane_capacity,
     set_cpu_lane_capacity,

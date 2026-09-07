@@ -18,7 +18,7 @@ from qqtools.plugins.qexp.schema6_upgrade import (
 from qqtools.plugins.qexp.layout import is_cpu_lane_root
 from qqtools.plugins.qexp.machine_config import init_shared_root
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
-from qqtools.plugins.qexp.runtime.reservations import reserve
+from qqtools.plugins.qexp.runtime.resources.reservations import reserve
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
 

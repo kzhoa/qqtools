@@ -23,7 +23,7 @@ from qqtools.plugins.qexp.runtime.claims import reconcile_claim_archives
 from qqtools.plugins.qexp.runtime.locks import group_lock, task_lock
 from qqtools.plugins.qexp.runtime.paths import attempt_path, group_path, shared_paths, task_path
 from qqtools.plugins.qexp.runtime.records import SCHEMA_VERSION, new_id, utc_now
-from qqtools.plugins.qexp.runtime.reservations import attach, reserve, reserved_gpu_ids
+from qqtools.plugins.qexp.runtime.resources.reservations import attach, reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import (

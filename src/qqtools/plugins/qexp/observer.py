@@ -8,7 +8,7 @@ from typing import Any
 from .config_types import RootConfig
 from .runtime.paths import group_path, machine_path, shared_paths, submission_path, task_path
 from .runtime.records import TaskRecord, normalize_group_record
-from .runtime.reservations import reservation_snapshot
+from .runtime.resources.reservations import reservation_snapshot
 from .runtime.store import iter_json, read_json
 from .runtime.tasks import load_task
 from .runtime.dependencies import dependency_gate
