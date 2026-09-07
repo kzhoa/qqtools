@@ -84,6 +84,8 @@ def test_verify_integrity_accepts_valid_holder_bound_claim(tmp_path: Path, monke
     assert attempt is not None
     assert attempt.authority_mode == "holder_bound"
     result = verify_integrity(cfg)
+    while not result["complete"]:
+        result = verify_integrity(cfg)
     codes = {issue["code"] for issue in result["issues"]}
     assert result["healthy"] is True
     assert not {"task_invalid", "claim_lease_invalid", "active_claim_lease_expired"} & codes
@@ -94,6 +96,8 @@ def test_verify_integrity_ignores_deadline_layout_marker(tmp_path: Path) -> None
     migrate_legacy_deadline_indexes(cfg)
 
     result = verify_integrity(cfg)
+    while not result["complete"]:
+        result = verify_integrity(cfg)
 
     assert shared_paths(cfg.shared_root)["offer_deadlines_migration"].exists()
     assert result["healthy"] is True
@@ -114,7 +118,10 @@ def test_clean_exact_terminal_task_supports_dry_run_and_audit(tmp_path: Path):
     assert cleanup_operation["state"] == "completed"
     events = [read_json(path) for path in (cfg.shared_root / "events").glob("*/*.json")]
     assert any(event.get("event_type") == "task_cleaned" for event in events)
-    assert verify_integrity(cfg)["healthy"] is True
+    verification = verify_integrity(cfg)
+    while not verification["complete"]:
+        verification = verify_integrity(cfg)
+    assert verification["healthy"] is True
 
 
 def test_clean_removes_timed_offer_deadline_index(tmp_path: Path):

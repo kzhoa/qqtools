@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from ..locks import exclusive
 from ..paths import shared_paths
 from ..records import TaskRecord, utc_now, validate_identifier
-from ..store import atomic_replace, read_json
+from ..store import atomic_replace, read_json, read_json_limited, require_json_size
 
 if TYPE_CHECKING:
     from ..records import TaskRecord
@@ -20,6 +20,12 @@ GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
 GROUP_READY_MEMBERS_VERSION = 1
 GROUP_MEMBER_PAGE_SIZE = 64
 _MEMBERSHIP_DIGEST_ALGORITHM = "xor-sha256-v1"
+_MAX_PROJECTION_IDENTIFIER_BYTES = 256
+_MAX_GROUP_HEADER_BYTES = 8 * 1024
+_MAX_DIRECTORY_PAGE_BYTES = 8 * 1024
+_MAX_MEMBER_PAGE_BYTES = 64 * 1024
+_MAX_LOCATOR_BYTES = 4 * 1024
+_MAX_GLOBAL_STATE_BYTES = 64 * 1024
 
 
 def _root(cfg: object) -> Path:
@@ -52,8 +58,22 @@ def _catalog_path(cfg: object, group_name: str, page: int = 0) -> Path:
     return _group_root(cfg, group_name) / "catalog" / f"{page:016d}.json"
 
 
+def _directory_path(cfg: object, group_name: str, page: int = 0) -> Path:
+    return _group_root(cfg, group_name) / "directories" / f"{page:016d}.json"
+
+
+def _writable_index_path(cfg: object, group_name: str, page: int) -> Path:
+    return _group_root(cfg, group_name) / "writable-pages" / f"{page:016d}.json"
+
+
 def _partition_path(cfg: object, group_name: str, page: int = 0) -> Path:
     return _group_root(cfg, group_name) / "partitions" / f"{page:016d}.json"
+
+
+def _validate_projection_identifier(value: object, label: str) -> str:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > _MAX_PROJECTION_IDENTIFIER_BYTES:
+        raise ValueError(f"projection_encoding_unsupported:{label}")
+    return value
 
 
 def _identity(group_name: str, task_id: str, generation: int) -> str:
@@ -109,7 +129,12 @@ def initialize_group_ready_members(cfg: object) -> None:
                     "required_capability": GROUP_READY_MEMBERS_CAPABILITY,
                     "state": "active",
                     "revision": 0,
+                    "projection_id": hashlib.sha256(f"{utc_now()}:{id(cfg)}".encode()).hexdigest()[:32],
                     "build": None,
+                    "audit": None,
+                    "archive_count": 0,
+                    "archive_cleanup": None,
+                    "audit_cleanup": None,
                     "degraded_reasons": [],
                     "updated_at": utc_now(),
                 }
@@ -119,7 +144,7 @@ def initialize_group_ready_members(cfg: object) -> None:
 
 def read_group_ready_members_state(cfg: object) -> dict[str, Any]:
     """Read and validate the global membership gate."""
-    record = read_json(_state_path(cfg))["group_ready_members"]
+    record = read_json_limited(_state_path(cfg), max_bytes=_MAX_GLOBAL_STATE_BYTES)["group_ready_members"]
     if (
         not isinstance(record, dict)
         or record.get("schema_version") != GROUP_READY_MEMBERS_VERSION
@@ -127,6 +152,10 @@ def read_group_ready_members_state(cfg: object) -> dict[str, Any]:
         or record.get("state") not in {"building", "active", "degraded"}
         or type(record.get("revision")) is not int
         or record["revision"] < 0
+        or not isinstance(record.get("projection_id"), str)
+        or len(record["projection_id"]) != 32
+        or type(record.get("archive_count")) is not int
+        or record["archive_count"] < 0
     ):
         raise ValueError("group ready-member state is invalid.")
     return record
@@ -150,7 +179,7 @@ def mark_group_ready_members_degraded(cfg: object, reason: str) -> None:
     """Persist the fail-closed state before returning a projection error."""
     with exclusive(_state_lock_path(cfg)):
         try:
-            value = read_json(_state_path(cfg))
+            value = read_json_limited(_state_path(cfg), max_bytes=_MAX_GLOBAL_STATE_BYTES)
             record = value["group_ready_members"]
             read_group_ready_members_state(cfg)
         except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
@@ -182,6 +211,7 @@ def _empty_group(group_name: str) -> tuple[dict[str, Any], dict[str, Any], dict[
             "page": 0,
             "identities": [],
             "revision": 0,
+            "writable_indexed": False,
         }
     }
     partition = {
@@ -199,11 +229,17 @@ def _empty_group(group_name: str) -> tuple[dict[str, Any], dict[str, Any], dict[
             "group_name": group_name,
             "membership_revision": 0,
             "member_count": 0,
-            "catalog_head": 0,
-            "catalog_tail": 0,
-            "catalog_pages": [],
-            "available_catalog_pages": [],
-            "free_catalog_page": 0,
+            "directory_head": None,
+            "directory_tail": None,
+            "directory_page_count": 0,
+            "next_directory_page": 0,
+            "next_member_page": 0,
+            "writable_member_page": None,
+            "writable_index_head": None,
+            "writable_index_tail": None,
+            "writable_index_free_head": None,
+            "next_writable_index_page": 0,
+            "writable_index_count": 0,
             "membership_digest": _digest([]),
             "digest_algorithm": _MEMBERSHIP_DIGEST_ALGORITHM,
             "updated_at": utc_now(),
@@ -219,6 +255,188 @@ def _empty_page(group_name: str, page: int) -> tuple[dict[str, Any], dict[str, A
     return catalog, partition
 
 
+def _directory_record(group_name: str, page: int, member_pages: list[int], next_page: int | None) -> dict[str, Any]:
+    value = {
+        "group_ready_member_directory": {
+            "schema_version": GROUP_READY_MEMBERS_VERSION,
+            "group_name": group_name,
+            "page": page,
+            "member_pages": member_pages,
+            "next_page": next_page,
+        }
+    }
+    require_json_size(value, max_bytes=_MAX_DIRECTORY_PAGE_BYTES, record_type="member_directory")
+    return value
+
+
+def _writable_index_record(
+    group_name: str, page: int, member_pages: list[int], next_page: int | None
+) -> dict[str, Any]:
+    value = {
+        "group_ready_member_writable_index": {
+            "schema_version": GROUP_READY_MEMBERS_VERSION,
+            "group_name": group_name,
+            "page": page,
+            "member_pages": member_pages,
+            "next_page": next_page,
+        }
+    }
+    require_json_size(value, max_bytes=_MAX_DIRECTORY_PAGE_BYTES, record_type="member_writable_index")
+    return value
+
+
+def _read_writable_index(cfg: object, group_name: str, page: int) -> dict[str, Any]:
+    value = read_json_limited(_writable_index_path(cfg, group_name, page), max_bytes=_MAX_DIRECTORY_PAGE_BYTES)
+    record = value.get("group_ready_member_writable_index")
+    pages = record.get("member_pages") if isinstance(record, dict) else None
+    if (
+        not isinstance(record, dict)
+        or record.get("schema_version") != GROUP_READY_MEMBERS_VERSION
+        or record.get("group_name") != group_name
+        or record.get("page") != page
+        or not isinstance(pages, list)
+        or len(pages) > GROUP_MEMBER_PAGE_SIZE
+        or not all(type(item) is int and item >= 0 for item in pages)
+        or type(record.get("next_page")) not in {int, type(None)}
+    ):
+        raise ValueError("Group ready-member writable index page is invalid.")
+    return record
+
+
+def _acquire_writable_index_page(cfg: object, group_name: str, group: dict[str, Any]) -> int:
+    """Take one recycled writable-index page or allocate one at historical peak."""
+    free = group.get("writable_index_free_head")
+    if free is None:
+        page = group.get("next_writable_index_page")
+        if type(page) is not int or page < 0:
+            raise ValueError("Group ready-member writable index state is invalid.")
+        group["next_writable_index_page"] = page + 1
+        return page
+    if type(free) is not int or free < 0:
+        raise ValueError("Group ready-member writable index free list is invalid.")
+    record = _read_writable_index(cfg, group_name, free)
+    group["writable_index_free_head"] = record["next_page"]
+    return free
+
+
+def _enqueue_writable_member_page(cfg: object, group_name: str, group: dict[str, Any], member_page: int) -> None:
+    """Append one non-current member page to the bounded reusable-page queue."""
+    tail = group.get("writable_index_tail")
+    if tail is None:
+        index_page = _acquire_writable_index_page(cfg, group_name, group)
+        atomic_replace(
+            _writable_index_path(cfg, group_name, index_page),
+            _writable_index_record(group_name, index_page, [member_page], None),
+        )
+        group["writable_index_head"] = index_page
+        group["writable_index_tail"] = index_page
+    else:
+        if type(tail) is not int or tail < 0:
+            raise ValueError("Group ready-member writable index tail is invalid.")
+        record = _read_writable_index(cfg, group_name, tail)
+        pages = list(record["member_pages"])
+        if len(pages) < GROUP_MEMBER_PAGE_SIZE:
+            pages.append(member_page)
+            atomic_replace(
+                _writable_index_path(cfg, group_name, tail),
+                _writable_index_record(group_name, tail, pages, record["next_page"]),
+            )
+        else:
+            index_page = _acquire_writable_index_page(cfg, group_name, group)
+            atomic_replace(
+                _writable_index_path(cfg, group_name, index_page),
+                _writable_index_record(group_name, index_page, [member_page], None),
+            )
+            atomic_replace(
+                _writable_index_path(cfg, group_name, tail),
+                _writable_index_record(group_name, tail, pages, index_page),
+            )
+            group["writable_index_tail"] = index_page
+    group["writable_index_count"] += 1
+
+
+def _dequeue_writable_member_page(cfg: object, group_name: str, group: dict[str, Any]) -> int | None:
+    """Take one member page from the reusable-page queue without scanning history."""
+    head = group.get("writable_index_head")
+    if head is None:
+        return None
+    if type(head) is not int or head < 0:
+        raise ValueError("Group ready-member writable index head is invalid.")
+    record = _read_writable_index(cfg, group_name, head)
+    pages = list(record["member_pages"])
+    if not pages:
+        raise ValueError("Group ready-member writable index queue is invalid.")
+    member_page = pages.pop(0)
+    if pages:
+        atomic_replace(
+            _writable_index_path(cfg, group_name, head),
+            _writable_index_record(group_name, head, pages, record["next_page"]),
+        )
+    else:
+        next_head = record["next_page"]
+        group["writable_index_head"] = next_head
+        if group.get("writable_index_tail") == head:
+            group["writable_index_tail"] = None
+        atomic_replace(
+            _writable_index_path(cfg, group_name, head),
+            _writable_index_record(group_name, head, [], group.get("writable_index_free_head")),
+        )
+        group["writable_index_free_head"] = head
+    group["writable_index_count"] -= 1
+    return member_page
+
+
+def _read_directory(cfg: object, group_name: str, page: int) -> dict[str, Any]:
+    value = read_json_limited(_directory_path(cfg, group_name, page), max_bytes=_MAX_DIRECTORY_PAGE_BYTES)
+    record = value.get("group_ready_member_directory")
+    pages = record.get("member_pages") if isinstance(record, dict) else None
+    if (
+        not isinstance(record, dict)
+        or record.get("schema_version") != GROUP_READY_MEMBERS_VERSION
+        or record.get("group_name") != group_name
+        or record.get("page") != page
+        or not isinstance(pages, list)
+        or not 0 < len(pages) <= GROUP_MEMBER_PAGE_SIZE
+        or not all(type(item) is int and item >= 0 for item in pages)
+        or type(record.get("next_page")) not in {int, type(None)}
+    ):
+        raise ValueError("Group ready-member directory page is invalid.")
+    return record
+
+
+def _iter_member_pages(cfg: object, group_name: str, group: dict[str, Any]):
+    """Yield member pages through fixed-size linked directory records."""
+    page = group.get("directory_head")
+    seen: set[int] = set()
+    while page is not None:
+        if type(page) is not int or page < 0 or page in seen:
+            raise ValueError("Group ready-member directory chain is invalid.")
+        seen.add(page)
+        directory = _read_directory(cfg, group_name, page)
+        yield from directory["member_pages"]
+        page = directory["next_page"]
+
+
+def _append_member_page(cfg: object, group_name: str, group: dict[str, Any], member_page: int) -> None:
+    """Append one member-page reference without materializing historical page IDs."""
+    tail = group["directory_tail"]
+    if tail is None:
+        directory_page = group["next_directory_page"]
+        atomic_replace(_directory_path(cfg, group_name, directory_page), _directory_record(group_name, directory_page, [member_page], None))
+        group.update({"directory_head": directory_page, "directory_tail": directory_page, "directory_page_count": 1, "next_directory_page": directory_page + 1})
+        return
+    directory = _read_directory(cfg, group_name, tail)
+    pages = list(directory["member_pages"])
+    if len(pages) < GROUP_MEMBER_PAGE_SIZE:
+        pages.append(member_page)
+        atomic_replace(_directory_path(cfg, group_name, tail), _directory_record(group_name, tail, pages, None))
+        return
+    directory_page = group["next_directory_page"]
+    atomic_replace(_directory_path(cfg, group_name, directory_page), _directory_record(group_name, directory_page, [member_page], None))
+    atomic_replace(_directory_path(cfg, group_name, tail), _directory_record(group_name, tail, pages, directory_page))
+    group.update({"directory_tail": directory_page, "directory_page_count": group["directory_page_count"] + 1, "next_directory_page": directory_page + 1})
+
+
 def _load_group(
     cfg: object,
     group_name: str,
@@ -227,9 +445,9 @@ def _load_group(
     state_path = _group_state_path(cfg, group_name)
     if not state_path.exists():
         return _empty_group(group_name)
-    state = read_json(state_path)
-    catalog = read_json(_catalog_path(cfg, group_name, page))
-    partition = read_json(_partition_path(cfg, group_name, page))
+    state = read_json_limited(state_path, max_bytes=_MAX_GROUP_HEADER_BYTES)
+    catalog = read_json_limited(_catalog_path(cfg, group_name, page), max_bytes=_MAX_DIRECTORY_PAGE_BYTES)
+    partition = read_json_limited(_partition_path(cfg, group_name, page), max_bytes=_MAX_MEMBER_PAGE_BYTES)
     return state, catalog, partition
 
 
@@ -251,6 +469,8 @@ def _entries(
     identities = page.get("identities")
     if not isinstance(entries, list) or not isinstance(identities, list):
         raise ValueError("Group ready-member page is invalid.")
+    if len(entries) > GROUP_MEMBER_PAGE_SIZE or len(identities) > GROUP_MEMBER_PAGE_SIZE:
+        raise ValueError("Group ready-member page exceeds its fixed record budget.")
     if len(entries) != len(identities):
         raise ValueError("Group ready-member count is invalid.")
     if [entry.get("identity") for entry in entries] != identities:
@@ -269,44 +489,126 @@ def _entries(
 def _read_entries(cfg: object, group_name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     state, _catalog, _partition = _load_group(cfg, group_name)
     group = state["group_ready_members"]
-    tail = group.get("catalog_tail")
-    pages = group.get("catalog_pages")
-    available_pages = group.get("available_catalog_pages")
-    free_page = group.get("free_catalog_page")
+    directory_page_count = group.get("directory_page_count")
     if (
-        type(tail) is not int
-        or tail < 0
-        or not isinstance(pages, list)
-        or not all(type(page) is int and page >= 0 for page in pages)
-        or pages != sorted(set(pages))
-        or not isinstance(available_pages, list)
-        or not all(type(page) is int and page in pages for page in available_pages)
-        or available_pages != sorted(set(available_pages))
-        or type(free_page) is not int
-        or free_page < 0
-        or free_page in pages
+        type(directory_page_count) is not int
+        or directory_page_count < 0
+        or type(group.get("next_directory_page")) is not int
+        or type(group.get("next_member_page")) is not int
+        or type(group.get("next_writable_index_page")) is not int
+        or type(group.get("writable_index_count")) is not int
+        or group["writable_index_count"] < 0
         or group.get("digest_algorithm") != _MEMBERSHIP_DIGEST_ALGORITHM
         or type(group.get("member_count")) is not int
         or group["member_count"] < 0
     ):
         raise ValueError("Group ready-member catalog tail is invalid.")
-    if pages and (group.get("catalog_head") != pages[0] or tail != pages[-1]):
-        raise ValueError("Group ready-member catalog range is invalid.")
-    if not pages and (group.get("catalog_head") != 0 or tail != 0):
-        raise ValueError("Group ready-member empty catalog range is invalid.")
     entries: list[dict[str, Any]] = []
-    writable_pages: set[int] = set()
-    for page in pages:
+    writable_pages: list[int] = []
+    for page in _iter_member_pages(cfg, group_name, group):
         _state, catalog, partition = _load_group(cfg, group_name, page)
         page_entries = _entries(group_name, state, catalog, partition)
         entries.extend(page_entries)
         if len(page_entries) < GROUP_MEMBER_PAGE_SIZE:
-            writable_pages.add(page)
-    if set(available_pages) != writable_pages:
-        raise ValueError("Group ready-member writable page coverage is invalid.")
+            writable_pages.append(page)
+    if group.get("writable_member_page") is not None and group["writable_member_page"] not in writable_pages:
+        raise ValueError("Group ready-member writable page is invalid.")
+    _validate_writable_index(cfg, group_name, group, writable_pages)
     if len(entries) != group.get("member_count") or _digest(entries) != group.get("membership_digest"):
         raise ValueError("Group ready-member count or digest is invalid.")
     return state, entries
+
+
+def _validate_writable_index(
+    cfg: object,
+    group_name: str,
+    group: dict[str, Any],
+    writable_pages: list[int],
+) -> None:
+    """Validate the bounded FIFO/free chains and their member-page coverage."""
+    for field in (
+        "writable_index_head",
+        "writable_index_tail",
+        "writable_index_free_head",
+    ):
+        value = group.get(field)
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError("Group ready-member writable index pointer is invalid.")
+    next_index_page = group.get("next_writable_index_page")
+    count = group.get("writable_index_count")
+    current_page = group.get("writable_member_page")
+    if (
+        type(next_index_page) is not int
+        or next_index_page < 0
+        or type(count) is not int
+        or count < 0
+        or (group.get("writable_index_head") is None) != (group.get("writable_index_tail") is None)
+    ):
+        raise ValueError("Group ready-member writable index state is invalid.")
+
+    queued_member_pages: set[int] = set()
+    active_index_pages: set[int] = set()
+    index_page = group.get("writable_index_head")
+    last_index_page: int | None = None
+    while index_page is not None:
+        if index_page >= next_index_page or index_page in active_index_pages:
+            raise ValueError("Group ready-member writable index chain is invalid.")
+        active_index_pages.add(index_page)
+        record = _read_writable_index(cfg, group_name, index_page)
+        for member_page in record["member_pages"]:
+            if (
+                member_page >= group.get("next_member_page", 0)
+                or member_page in queued_member_pages
+                or member_page == current_page
+            ):
+                raise ValueError("Group ready-member writable index coverage is invalid.")
+            _state, catalog, partition = _load_group(cfg, group_name, member_page)
+            entries = _entries(group_name, {"group_ready_members": group}, catalog, partition)
+            if len(entries) >= GROUP_MEMBER_PAGE_SIZE or not catalog["group_ready_member_catalog"].get(
+                "writable_indexed", False
+            ):
+                raise ValueError("Group ready-member writable index points to an invalid page.")
+            queued_member_pages.add(member_page)
+        last_index_page = index_page
+        index_page = record["next_page"]
+    if last_index_page != group.get("writable_index_tail") or len(queued_member_pages) != count:
+        raise ValueError("Group ready-member writable index count is invalid.")
+
+    free_index_pages: set[int] = set()
+    index_page = group.get("writable_index_free_head")
+    while index_page is not None:
+        if (
+            index_page >= next_index_page
+            or index_page in active_index_pages
+            or index_page in free_index_pages
+        ):
+            raise ValueError("Group ready-member writable index free chain is invalid.")
+        free_index_pages.add(index_page)
+        record = _read_writable_index(cfg, group_name, index_page)
+        if record["member_pages"]:
+            raise ValueError("Group ready-member writable index free page is not empty.")
+        index_page = record["next_page"]
+
+    for member_page in writable_pages:
+        _state, catalog, _partition = _load_group(cfg, group_name, member_page)
+        is_indexed = bool(catalog["group_ready_member_catalog"].get("writable_indexed", False))
+        if member_page == current_page:
+            if is_indexed:
+                raise ValueError("Group ready-member writable page is also indexed.")
+        elif is_indexed != (member_page in queued_member_pages):
+            raise ValueError("Group ready-member writable index coverage is invalid.")
+
+
+def validate_group_ready_member_writable_index(cfg: object, group_name: str) -> None:
+    """Validate all durable writable-page index records for one Group."""
+    state, _catalog, _partition = _load_group(cfg, group_name)
+    group = state["group_ready_members"]
+    writable_pages: list[int] = []
+    for member_page in _iter_member_pages(cfg, group_name, group):
+        _state, catalog, partition = _load_group(cfg, group_name, member_page)
+        if len(_entries(group_name, state, catalog, partition)) < GROUP_MEMBER_PAGE_SIZE:
+            writable_pages.append(member_page)
+    _validate_writable_index(cfg, group_name, group, writable_pages)
 
 
 def read_group_ready_members(cfg: object, group_name: str) -> list[dict[str, Any]]:
@@ -337,13 +639,14 @@ def _validate_entry_locator(
     entry: dict[str, Any],
 ) -> tuple[dict[str, Any], int]:
     """Return the exact page entry identified by one validated locator."""
-    locator = read_json(_locator_path(cfg, group_name, entry["identity"]))["group_ready_member_locator"]
+    locator = read_json_limited(
+        _locator_path(cfg, group_name, entry["identity"]), max_bytes=_MAX_LOCATOR_BYTES
+    )["group_ready_member_locator"]
     if not isinstance(locator, dict):
         raise ValueError("Group ready-member locator is invalid.")
     page = locator.get("page")
     slot = locator.get("slot")
     group = state["group_ready_members"]
-    pages = group.get("catalog_pages")
     if (
         locator.get("schema_version") != GROUP_READY_MEMBERS_VERSION
         or locator.get("identity") != entry["identity"]
@@ -353,8 +656,8 @@ def _validate_entry_locator(
         or page < 0
         or type(slot) is not int
         or slot < 0
-        or not isinstance(pages, list)
-        or page not in pages
+        or type(group.get("next_member_page")) is not int
+        or page >= group["next_member_page"]
     ):
         raise ValueError("Group ready-member locator is invalid.")
     _state, catalog, partition = _load_group(cfg, group_name, page)
@@ -375,13 +678,16 @@ def _write_group(
     partition: dict[str, Any],
 ) -> None:
     page = catalog["group_ready_member_catalog"]["page"]
+    require_json_size(partition, max_bytes=_MAX_MEMBER_PAGE_BYTES, record_type="member_page")
+    require_json_size(catalog, max_bytes=_MAX_DIRECTORY_PAGE_BYTES, record_type="member_catalog")
+    require_json_size(state, max_bytes=_MAX_GROUP_HEADER_BYTES, record_type="member_header")
     atomic_replace(_partition_path(cfg, group_name, page), partition)
     atomic_replace(_catalog_path(cfg, group_name, page), catalog)
     atomic_replace(_group_state_path(cfg, group_name), state)
     # This lock only covers the global read-modify-write.  It intentionally is
     # not held while acquiring a Group lock, preserving schema -> Group -> Task.
     with exclusive(_state_lock_path(cfg)):
-        value = read_json(_state_path(cfg))
+        value = read_json_limited(_state_path(cfg), max_bytes=_MAX_GLOBAL_STATE_BYTES)
         record = value["group_ready_members"]
         if record.get("state") not in {"building", "active"}:
             raise RuntimeError("group ready-member projection is degraded; publication is disabled.")
@@ -398,36 +704,37 @@ def _rewrite_page_locators(
 ) -> None:
     """Keep bounded-page locator slots exact after an entry is removed."""
     for slot, entry in enumerate(entries):
-        atomic_replace(
-            _locator_path(cfg, group_name, entry["identity"]),
-            {
-                "group_ready_member_locator": {
+        value = {
+            "group_ready_member_locator": {
                     "schema_version": GROUP_READY_MEMBERS_VERSION,
                     "identity": entry["identity"],
                     "group_name": group_name,
                     "page": page,
                     "slot": slot,
                     "member_revision": entry["member_revision"],
-                }
-            },
-        )
+            }
+        }
+        require_json_size(value, max_bytes=_MAX_LOCATOR_BYTES, record_type="member_locator")
+        atomic_replace(_locator_path(cfg, group_name, entry["identity"]), value)
 
 
 # These operations validate online storage; rebuild orchestration never reaches private helpers.
 load_group_ready_member_page = _load_group
 read_group_ready_member_page_entries = _entries
 validate_group_ready_member_locator = _validate_entry_locator
+read_group_ready_member_directory = _read_directory
+read_group_ready_member_writable_index = _read_writable_index
 
 
 def read_group_ready_member_audit_state(cfg: object, group_key: str) -> dict[str, Any]:
     """Read the minimal validated Group state required by a bounded audit."""
-    state = read_json(group_ready_member_groups_root(cfg) / group_key / "state.json")["group_ready_members"]
-    pages = state.get("catalog_pages")
+    state = read_json_limited(
+        group_ready_member_groups_root(cfg) / group_key / "state.json", max_bytes=_MAX_GROUP_HEADER_BYTES
+    )["group_ready_members"]
     if (
         not isinstance(state.get("group_name"), str)
-        or not isinstance(pages, list)
-        or not all(type(page) is int and page >= 0 for page in pages)
-        or pages != sorted(set(pages))
+        or type(state.get("directory_page_count")) is not int
+        or state["directory_page_count"] < 0
         or type(state.get("membership_revision")) is not int
         or state["membership_revision"] < 0
     ):
@@ -454,7 +761,7 @@ def assert_group_ready_member_matches_task(
     if not locator_path.exists():
         raise ValueError(f"Group ready-member is missing for Task {task.task_id!r}.")
     state, _catalog, _partition = _load_group(cfg, group_name)
-    locator = read_json(locator_path)["group_ready_member_locator"]
+    locator = read_json_limited(locator_path, max_bytes=_MAX_LOCATOR_BYTES)["group_ready_member_locator"]
     if not isinstance(locator, dict):
         raise ValueError("Group ready-member locator is invalid.")
     entry, _page = _validate_entry_locator(
@@ -499,7 +806,9 @@ def publish_group_ready_member(cfg: object, task: TaskRecord, reference: ReadyMa
             raise ValueError("Group ready-member state is invalid.")
         locator_path = _locator_path(cfg, group_name, identity)
         if locator_path.exists():
-            locator = read_json(locator_path)["group_ready_member_locator"]
+            locator = read_json_limited(
+                locator_path, max_bytes=_MAX_LOCATOR_BYTES
+            )["group_ready_member_locator"]
             if not isinstance(locator, dict):
                 raise ValueError("Group ready-member locator is invalid.")
             located, _page = _validate_entry_locator(
@@ -511,32 +820,28 @@ def publish_group_ready_member(cfg: object, task: TaskRecord, reference: ReadyMa
             if located.get("task_id") != task.task_id or located.get("generation") != reference.generation:
                 raise ValueError("Group ready-member identity conflicts with an existing entry.")
             return
-        pages = record.get("catalog_pages")
-        available_pages = record.get("available_catalog_pages")
-        free_page = record.get("free_catalog_page")
-        if (
-            not isinstance(pages, list)
-            or not isinstance(available_pages, list)
-            or type(free_page) is not int
-            or free_page < 0
-        ):
-            raise ValueError("Group ready-member catalog tail is invalid.")
-        if available_pages:
-            page = available_pages[0]
+        page = record.get("writable_member_page")
+        if page is not None:
+            if type(page) is not int or page < 0:
+                raise ValueError("Group ready-member writable page is invalid.")
             _state, catalog, partition = _load_group(cfg, group_name, page)
             page_entries = _entries(group_name, state, catalog, partition)
         else:
-            if pages:
-                page = free_page if free_page not in pages else record["catalog_tail"] + 1
+            page = _dequeue_writable_member_page(cfg, group_name, record)
+            if page is None:
+                page = record.get("next_member_page")
+                if type(page) is not int or page < 0:
+                    raise ValueError("Group ready-member next page is invalid.")
+                catalog, partition = _empty_page(group_name, page)
+                page_entries = []
+                _append_member_page(cfg, group_name, record, page)
+                record["next_member_page"] = page + 1
             else:
-                page = free_page
-            catalog, partition = _empty_page(group_name, page)
-            page_entries = []
-            pages.append(page)
-            pages.sort()
-            record["catalog_head"] = pages[0]
-            record["catalog_tail"] = pages[-1]
-            record["free_catalog_page"] = record["catalog_tail"] + 1
+                _state, catalog, partition = _load_group(cfg, group_name, page)
+                page_entries = _entries(group_name, state, catalog, partition)
+                if len(page_entries) >= GROUP_MEMBER_PAGE_SIZE:
+                    raise ValueError("Group ready-member writable index points to a full page.")
+                catalog["group_ready_member_catalog"]["writable_indexed"] = False
         entry = {
             "identity": identity,
             "task_id": task.task_id,
@@ -552,33 +857,32 @@ def publish_group_ready_member(cfg: object, task: TaskRecord, reference: ReadyMa
             "target_revision": task.meta["revision"] + 1,
             "member_revision": 1,
         }
+        for label in ("task_id", "queue_scope", "home_machine", "partition", "marker_name"):
+            _validate_projection_identifier(entry[label], label)
+        if entry["submission_operation_id"] is not None:
+            _validate_projection_identifier(entry["submission_operation_id"], "submission_operation_id")
         page_entries.append(entry)
         catalog["group_ready_member_catalog"]["identities"] = [item["identity"] for item in page_entries]
         catalog["group_ready_member_catalog"]["revision"] += 1
         partition["group_ready_member_partition"]["entries"] = page_entries
         partition["group_ready_member_partition"]["revision"] += 1
-        if len(page_entries) == GROUP_MEMBER_PAGE_SIZE:
-            available_pages.remove(page)
-        elif page not in available_pages:
-            available_pages.append(page)
-            available_pages.sort()
+        record["writable_member_page"] = page if len(page_entries) < GROUP_MEMBER_PAGE_SIZE else None
         record["member_count"] += 1
         record["membership_digest"] = _update_digest(record["membership_digest"], entry)
         record["membership_revision"] += 1
         record["updated_at"] = utc_now()
-        atomic_replace(
-            locator_path,
-            {
-                "group_ready_member_locator": {
+        locator_value = {
+            "group_ready_member_locator": {
                     "schema_version": GROUP_READY_MEMBERS_VERSION,
                     "identity": identity,
                     "group_name": group_name,
                     "page": page,
                     "slot": len(page_entries) - 1,
                     "member_revision": entry["member_revision"],
-                }
-            },
-        )
+            }
+        }
+        require_json_size(locator_value, max_bytes=_MAX_LOCATOR_BYTES, record_type="member_locator")
+        atomic_replace(locator_path, locator_value)
         _write_group(cfg, group_name, state, catalog, partition)
     except (AttributeError, FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         mark_group_ready_members_degraded(cfg, f"member_publish_failed:{group_name}:{type(exc).__name__}")
@@ -604,7 +908,7 @@ def retire_group_ready_member(cfg: object, group_name: str, task_id: str, genera
             or record["member_count"] <= 0
         ):
             raise ValueError("Group ready-member state is invalid.")
-        locator = read_json(locator_path)["group_ready_member_locator"]
+        locator = read_json_limited(locator_path, max_bytes=_MAX_LOCATOR_BYTES)["group_ready_member_locator"]
         if not isinstance(locator, dict):
             raise ValueError("Group ready-member locator is invalid.")
         located, page = _validate_entry_locator(
@@ -622,52 +926,19 @@ def retire_group_ready_member(cfg: object, group_name: str, task_id: str, genera
         catalog["group_ready_member_catalog"]["revision"] += 1
         partition["group_ready_member_partition"]["entries"] = page_entries
         partition["group_ready_member_partition"]["revision"] += 1
-        pages = record.get("catalog_pages")
-        available_pages = record.get("available_catalog_pages")
-        free_page = record.get("free_catalog_page")
-        if (
-            not isinstance(pages, list)
-            or page not in pages
-            or not isinstance(available_pages, list)
-            or type(free_page) is not int
-            or free_page < 0
-        ):
-            raise ValueError("Group ready-member page state is invalid.")
-        discarded_free_page: int | None = None
-        if page_entries:
-            if page not in available_pages:
-                available_pages.append(page)
-                available_pages.sort()
-        else:
-            pages.remove(page)
-            if page in available_pages:
-                available_pages.remove(page)
-            if pages:
-                record["catalog_head"] = pages[0]
-                record["catalog_tail"] = pages[-1]
-                if free_page in pages:
-                    free_page = page
-                elif page < free_page:
-                    discarded_free_page = free_page
-                    free_page = page
-                else:
-                    discarded_free_page = page
-            else:
-                record["catalog_head"] = 0
-                record["catalog_tail"] = 0
-                if page != 0:
-                    discarded_free_page = page
-                free_page = 0
-            record["free_catalog_page"] = free_page
+        current_page = record.get("writable_member_page")
+        if current_page is None:
+            record["writable_member_page"] = page
+        elif current_page != page:
+            if not catalog["group_ready_member_catalog"].get("writable_indexed", False):
+                _enqueue_writable_member_page(cfg, group_name, record, page)
+                catalog["group_ready_member_catalog"]["writable_indexed"] = True
         record["member_count"] -= 1
         record["membership_digest"] = _update_digest(record["membership_digest"], located)
         record["membership_revision"] += 1
         record["updated_at"] = utc_now()
         _rewrite_page_locators(cfg, group_name, page, page_entries)
         _write_group(cfg, group_name, state, catalog, partition)
-        if discarded_free_page is not None:
-            _catalog_path(cfg, group_name, discarded_free_page).unlink(missing_ok=True)
-            _partition_path(cfg, group_name, discarded_free_page).unlink(missing_ok=True)
         locator_path.unlink(missing_ok=True)
         return True
     except (AttributeError, FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:

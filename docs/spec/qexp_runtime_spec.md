@@ -2016,16 +2016,45 @@ This active-state commit jointly enables
 exclusive schema fence. Older writers fail before mutation because they do not recognize the
 required capability.
 
-Each Group catalog records only active pages and bounded reusable-page metadata. Empty pages are
-reclaimed, and publications select an existing writable page before allocating a new one; therefore
-Group-member reads visit only pages containing current members and cannot grow with retired-history
-churn.
+The final v1 Group header contains only fixed-size directory pointers, counters, a projection
+identity, one current writable-page pointer, and fixed pointers for a paged writable-page FIFO.
+Linked directory and writable-index pages contain at most 64 member-page references; neither
+headers nor audit cursors contain a complete page list. A writable-index page consumed by publish
+is linked onto a reusable free chain, so repeated retirement churn is bounded by historical peak
+capacity rather than the number of churn cycles. Projection records are
+size-limited before parsing and before persistence. Every copied identifier is at most 256 UTF-8
+bytes; an unsupported encoding fails closed before its authoritative grouped write commits.
 
-`doctor verify` reports member projection damage; `doctor repair` rebuilds a degraded projection
-from authority truth. Each `doctor repair` invocation advances at most one member-projection slice
-and returns `building` while more work remains; operators repeat the same command until it returns
-`active` or `degraded`. Recovery cannot treat an incomplete projection as proof that no primary
-work exists.
+`doctor verify` and active `doctor repair` share a durable audit record keyed by projection
+identity. A completed audit is historical display data only: the next verify or active repair
+creates a new audit ID. Each invocation consumes at most `--max-work-items` (1--64) across capture
+entries, Task checks, Group/directory/member-page reads, locator checks, and membership-revision
+restarts.
+The implementation publishes conservative physical-operation bounds for each maintenance phase
+(`PHASE_IO_BOUNDS`): for every operation class, `actual <= K_phase * N + C_phase`, where `N` is
+`max_work_items` and `C_phase` is the fixed setup/finalization allowance. Instrumentation tests
+must keep these bounds true for empty, full, damaged, and revision-restart paths.
+The implementation treats Group-header selection, directory-page selection, and member validation
+as separate work items: after a directory selection consumes the final unit, it persists the
+member-page cursor without opening that page. The terminal Group-header comparison is likewise
+deferred until one unit remains. Cleanup selects one archive or Group entry at a time and removes
+only regular files from one flat projection subdirectory per step; it never recursively walks an
+archive. A dedicated archive-cleaner lock gives each bounded unlink slice one owner while leaving
+the schema lock free for active writers. Completed audit capture pages are reclaimed by the same
+clean command through a separate fixed-layout, bounded cursor. The Group-member integration tests
+exercise both N=1 boundaries by preventing the next page operation and by rejecting use of
+recursive traversal.
+An incomplete audit returns `complete=false`, `healthy=false`, and `verification.state=building`;
+strict verify exits non-zero for that state. Damage first commits `degraded` in the discovering
+slice. The following repair invocation prepares and resumes one rebuild; it never combines a
+failed audit and rebuild slice.
+
+Repair parks `groups/` atomically beneath `replaced-groups/<build-id>/` after a durable prepared
+record, creates an empty replacement, fsyncs the fixed parent directories, and then publishes
+`building` with the already selected next projection identity. It does not enumerate or recursively
+delete the old tree. `qexp clean --max-work-items N` is the sole archive remover: it processes at
+most N archive entries outside the schema lock and records its current archive for retry. Archive
+retention does not change the active projection gate.
 
 ## 21. Crash-Window Matrix
 
