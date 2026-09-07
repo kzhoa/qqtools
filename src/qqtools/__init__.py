@@ -1,3 +1,4 @@
+# ruff: noqa: I001
 # isort:skip_file
 import importlib
 import sys
