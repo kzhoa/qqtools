@@ -104,14 +104,14 @@ class qDict(dict):
     def __getattr__(self, key):
         try:
             return self.__getitem__(key)
-        except Exception:
+        except KeyError:
             if "_default_function" in self.__dict__ and self.__dict__["_default_function"] is not None:
                 self.__setitem__(key, self.__dict__["_default_function"]())
                 return self.__getitem__(key)
             elif "_allow_notexist" in self.__dict__ and self.__dict__["_allow_notexist"]:
                 return None
             else:
-                raise AttributeError(str(key))
+                raise AttributeError(str(key)) from None
 
     def __getitem__(self, key):
         if key == "_default_function":
@@ -119,14 +119,14 @@ class qDict(dict):
 
         try:
             return super().__getitem__(key)
-        except Exception:
+        except KeyError:
             if "_default_function" in self.__dict__ and self.__dict__["_default_function"] is not None:
                 self.__setitem__(key, self.__dict__["_default_function"]())
                 return self.__getitem__(key)
             elif "_allow_notexist" in self.__dict__ and self.__dict__["_allow_notexist"]:
                 return None
             else:
-                raise KeyError(str(key))
+                raise KeyError(str(key)) from None
 
     def __setattr__(self, key, value):
         descriptor = getattr(type(self), key, None)
