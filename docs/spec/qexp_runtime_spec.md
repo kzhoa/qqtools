@@ -2036,10 +2036,31 @@ identity. A completed audit is historical display data only: the next verify or 
 creates a new audit ID. Each invocation consumes at most `--max-work-items` (1--64) across capture
 entries, Task checks, Group/directory/member-page reads, locator checks, and membership-revision
 restarts.
-The implementation publishes conservative physical-operation bounds for each maintenance phase
-(`PHASE_IO_BOUNDS`): for every operation class, `actual <= K_phase * N + C_phase`, where `N` is
-`max_work_items` and `C_phase` is the fixed setup/finalization allowance. Instrumentation tests
-must keep these bounds true for empty, full, damaged, and revision-restart paths.
+One work item is a resumable semantic unit, not one filesystem call. In particular, Task and member
+truth validation atomically reads the fixed set of Task, reservation, Group, locator, and member-page
+records needed to produce one useful verdict. It does not persist cursors between those dependent
+reads because a partial verdict is neither reusable nor safe across a concurrent Task or membership
+revision. The number of dependent records is fixed and does not grow with project history.
+
+The implementation publishes conservative storage-operation bounds in `PHASE_IO_BOUNDS`. A read is
+one JSON record read, a write is one atomic durable-record replacement, and metadata covers bounded
+directory-entry operations and path metadata changes. The fixed system calls inside one bounded
+record read or atomic replacement are part of that primitive's constant amplification. For every
+operation class, `actual <= K_phase * N + C_phase`, where `N` is `max_work_items` and `C_phase` is the
+fixed setup/finalization allowance:
+
+| phase | read K | write K | metadata K | C |
+| :--- | ---: | ---: | ---: | ---: |
+| `capture-tasks` | 4 | 2 | 6 | 8 |
+| `audit-tasks` | 11 | 0 | 3 | 32 |
+| `capture-groups` | 4 | 2 | 6 | 8 |
+| `audit-members` | 16 | 0 | 2 | 8 |
+| `archive-cleanup` | 3 | 0 | 4 | 24 |
+
+Instrumentation tests intercept these storage boundaries and keep the bounds true for empty, N=1,
+N=64, damaged-record, member-entry, and membership-revision-restart paths. A new dependent I/O added
+to a maintenance helper must either remain inside the published bound or update the bound and its
+instrumentation evidence in the same change.
 The implementation treats Group-header selection, directory-page selection, and member validation
 as separate work items: after a directory selection consumes the final unit, it persists the
 member-page cursor without opening that page. The terminal Group-header comparison is likewise

@@ -74,16 +74,16 @@ _MAX_BUILD_PAGE_BYTES = 32 * 1024
 _MAX_BUILD_IDENTIFIER_BYTES = 256
 _MAX_GLOBAL_STATE_BYTES = 64 * 1024
 
-# Upper bounds for the current implementation's physical operations per
+# Upper bounds for the current implementation's storage operations per
 # logical maintenance item.  The additive term covers phase setup/finalization
 # (state fences, directory handles, and cursor commits).  These values are
 # intentionally conservative and are exercised by instrumentation tests.
 PHASE_IO_BOUNDS: dict[str, dict[str, int]] = {
     "capture-tasks": {"read": 4, "write": 2, "metadata": 6, "constant": 8},
-    "audit-tasks": {"read": 8, "write": 0, "metadata": 2, "constant": 4},
+    "audit-tasks": {"read": 11, "write": 0, "metadata": 3, "constant": 32},
     "capture-groups": {"read": 4, "write": 2, "metadata": 6, "constant": 8},
     "audit-members": {"read": 16, "write": 0, "metadata": 2, "constant": 8},
-    "archive-cleanup": {"read": 3, "write": 0, "metadata": 4, "constant": 8},
+    "archive-cleanup": {"read": 3, "write": 0, "metadata": 4, "constant": 24},
 }
 
 

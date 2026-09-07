@@ -14,7 +14,7 @@ owner = "qexp.runtime"
 decision_refs = ["docs/spec/qexp_runtime_spec.md"]
 pitch_refs = [
     "docs/pitch/arxiv/055-qexp-group-ready-membership-projection.md",
-    "docs/pitch/qexp-group-ready-members-maintenance-io-budget.md",
+    "docs/pitch/arxiv/057-qexp-group-ready-members-maintenance-io-budget.md",
 ]
 verification = [
     "tests/integration/qexp/test_group_ready_members_upgrade.py",
