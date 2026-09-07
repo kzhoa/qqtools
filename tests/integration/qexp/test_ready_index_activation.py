@@ -56,13 +56,11 @@ def test_primary_rebuild_initializes_the_complete_ready_layout(tmp_path: Path) -
     primary = read_json(paths["ready_primary"] / "state.json")["primary_ready_index"]
     assert primary["state"] == "rebuilding"
 
+
 def _ready_reference(cfg, task: TaskRecord):
     from qqtools.plugins.qexp.runtime.ready import ReadyMarkerRef
 
-    path = (
-        shared_paths(cfg.shared_root)["ready_reservations"]
-        / f"{task.task_id}.{task.ready_generation}.json"
-    )
+    path = shared_paths(cfg.shared_root)["ready_reservations"] / f"{task.task_id}.{task.ready_generation}.json"
     record = read_json(path)["ready_reservation"]
     return ReadyMarkerRef(
         task.task_id,
@@ -77,15 +75,10 @@ def _ready_reference(cfg, task: TaskRecord):
 
 def _make_legacy_task(cfg, task_id: str) -> TaskRecord:
     task = submit(cfg, ["echo", task_id], task_id=task_id)
-    reservation = (
-        shared_paths(cfg.shared_root)["ready_reservations"]
-        / f"{task.task_id}.{task.ready_generation}.json"
-    )
+    reservation = shared_paths(cfg.shared_root)["ready_reservations"] / f"{task.task_id}.{task.ready_generation}.json"
     record = read_json(reservation)["ready_reservation"]
     marker = (
-        shared_paths(cfg.shared_root)[
-            "ready_home" if record["queue_scope"] == "home" else "ready_shared"
-        ]
+        shared_paths(cfg.shared_root)["ready_home" if record["queue_scope"] == "home" else "ready_shared"]
         / (record["home_machine"] if record["queue_scope"] == "home" else "")
         / record["partition"]
         / record["marker_name"]
@@ -145,7 +138,8 @@ def test_build_gate_waits_for_inflight_schema_writer(tmp_path: Path) -> None:
 
 
 def test_build_advance_never_waits_for_schema_while_holding_ready_state_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Regression for the former state -> schema lock-order inversion."""
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
@@ -168,9 +162,7 @@ def test_build_advance_never_waits_for_schema_while_holding_ready_state_lock(
         advance = threading.Thread(target=lambda: advance_ready_index_build(cfg, max_tasks=1))
         advance.start()
         assert schema_acquire_attempted.wait(timeout=2)
-        with exclusive(
-            shared_paths(cfg.shared_root)["ready_locks"] / "state.lock", blocking=False
-        ) as acquired:
+        with exclusive(shared_paths(cfg.shared_root)["ready_locks"] / "state.lock", blocking=False) as acquired:
             assert acquired
 
     advance.join(timeout=5)
@@ -204,9 +196,10 @@ def test_task_created_during_build_is_covered_by_writer_protocol(tmp_path: Path)
 
     assert record["state"] == "active"
     assert record["build"]["watermark"]["task_count"] == 1
-    assert classify_ready_marker(
-        cfg, _ready_reference(cfg, load_task(cfg, concurrent.task_id))
-    ).classification == "claimable"
+    assert (
+        classify_ready_marker(cfg, _ready_reference(cfg, load_task(cfg, concurrent.task_id))).classification
+        == "claimable"
+    )
 
 
 def test_mixed_writer_is_rejected_before_task_mutation(tmp_path: Path) -> None:
@@ -283,16 +276,11 @@ def test_missing_referenced_partition_degrades_active_index(tmp_path: Path) -> N
     _finish_build(cfg)
     reference = _ready_reference(cfg, load_task(cfg, task.task_id))
     partition_path = (
-        shared_paths(cfg.shared_root)["ready_home"]
-        / cfg.machine_name
-        / reference.partition
-        / "partition.json"
+        shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / "partition.json"
     )
     partition_path.unlink()
 
-    candidate, _has_wrapped = next_ready_marker(
-        cfg, project_id(cfg.shared_root), "home"
-    )
+    candidate, _has_wrapped = next_ready_marker(cfg, project_id(cfg.shared_root), "home")
 
     assert candidate is None
     assert read_ready_index_state(cfg) == "degraded"
@@ -309,16 +297,9 @@ def test_partition_removal_recheck_avoids_false_degradation(tmp_path: Path) -> N
     route_key = f"home.{cfg.machine_name}"
     route_lock = shared_paths(cfg.shared_root)["ready_locks"] / f"{route_key}.lock"
     partition_path = (
-        shared_paths(cfg.shared_root)["ready_home"]
-        / cfg.machine_name
-        / reference.partition
-        / "partition.json"
+        shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / "partition.json"
     )
-    catalog_path = (
-        shared_paths(cfg.shared_root)["ready_catalogs"]
-        / route_key
-        / f"{reference.catalog_page:016d}.json"
-    )
+    catalog_path = shared_paths(cfg.shared_root)["ready_catalogs"] / route_key / f"{reference.catalog_page:016d}.json"
     started = threading.Event()
     finished = threading.Event()
 
@@ -343,7 +324,8 @@ def test_partition_removal_recheck_avoids_false_degradation(tmp_path: Path) -> N
 
 
 def test_peek_partition_removal_recheck_avoids_false_degradation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "removed"], task_id="removed-task")
@@ -352,16 +334,9 @@ def test_peek_partition_removal_recheck_avoids_false_degradation(
     route_key = f"home.{cfg.machine_name}"
     route_lock = shared_paths(cfg.shared_root)["ready_locks"] / f"{route_key}.lock"
     partition_path = (
-        shared_paths(cfg.shared_root)["ready_home"]
-        / cfg.machine_name
-        / reference.partition
-        / "partition.json"
+        shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / "partition.json"
     )
-    catalog_path = (
-        shared_paths(cfg.shared_root)["ready_catalogs"]
-        / route_key
-        / f"{reference.catalog_page:016d}.json"
-    )
+    catalog_path = shared_paths(cfg.shared_root)["ready_catalogs"] / route_key / f"{reference.catalog_page:016d}.json"
     catalog_read = threading.Event()
     continue_read = threading.Event()
     result = []
@@ -373,11 +348,7 @@ def test_peek_partition_removal_recheck_avoids_false_degradation(
     def pause_after_catalog_read(path):
         nonlocal did_pause
         value = original_read_json(path)
-        if (
-            path == catalog_path
-            and threading.current_thread().name == "peek-reader"
-            and not did_pause
-        ):
+        if path == catalog_path and threading.current_thread().name == "peek-reader" and not did_pause:
             did_pause = True
             catalog_read.set()
             assert continue_read.wait(timeout=5)
@@ -386,13 +357,15 @@ def test_peek_partition_removal_recheck_avoids_false_degradation(
     monkeypatch.setattr(ready, "read_json", pause_after_catalog_read)
 
     def read_candidate() -> None:
-        result.append(peek_ready_marker(
-            cfg,
-            project_id(cfg.shared_root),
-            "home",
-            None,
-            SliceBudget(WorkBudgetPolicy(soft_deadline_ms=60_000)),
-        ))
+        result.append(
+            peek_ready_marker(
+                cfg,
+                project_id(cfg.shared_root),
+                "home",
+                None,
+                SliceBudget(WorkBudgetPolicy(soft_deadline_ms=60_000)),
+            )
+        )
 
     thread = threading.Thread(target=read_candidate, name="peek-reader")
     thread.start()
@@ -434,10 +407,7 @@ def test_recent_incompatible_agent_blocks_cutover(tmp_path: Path) -> None:
     record = _finish_build(cfg)
 
     assert record["state"] == "degraded"
-    assert any(
-        reason == "incompatible_active_writers:gpu-1"
-        for reason in record["degraded_reasons"]
-    )
+    assert any(reason == "incompatible_active_writers:gpu-1" for reason in record["degraded_reasons"])
 
 
 def test_nonqueued_task_needs_no_marker_at_cutover(tmp_path: Path) -> None:

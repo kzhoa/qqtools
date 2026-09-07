@@ -14,9 +14,7 @@ def _case_directory_generator(nodeid: str, name: str) -> Generator[Path, None, N
     return conftest.tmp_path.__wrapped__(request)
 
 
-def test_test_tmp_base_prefers_usable_system_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_test_tmp_base_prefers_usable_system_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     system_root = tmp_path / "system-tmp"
     fallback_root = tmp_path / "repository-tmp"
     monkeypatch.setattr(conftest, "_is_usable_temp_root", lambda root: root == system_root)
@@ -27,9 +25,7 @@ def test_test_tmp_base_prefers_usable_system_root(
     assert not fallback_root.exists()
 
 
-def test_test_tmp_base_falls_back_when_system_root_is_unusable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_test_tmp_base_falls_back_when_system_root_is_unusable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     system_root = tmp_path / "system-tmp"
     fallback_root = tmp_path / "repository-tmp"
     monkeypatch.setattr(conftest, "_is_usable_temp_root", lambda root: root == fallback_root)
@@ -83,9 +79,7 @@ def test_tmp_path_keeps_evidence_when_artifact_retention_is_enabled(
 ) -> None:
     monkeypatch.setattr(conftest, "TMP_ROOT", tmp_path / "artifacts")
     monkeypatch.setenv(conftest.PRESERVE_TEST_ARTIFACTS_ENV, "1")
-    case_directory = _case_directory_generator(
-        "tests/e2e/test_flow.py::test_failure", "test_failure"
-    )
+    case_directory = _case_directory_generator("tests/e2e/test_flow.py::test_failure", "test_failure")
 
     retained_path = next(case_directory)
     (retained_path / "runtime.log").write_text("diagnostic evidence", encoding="utf-8")
@@ -96,14 +90,10 @@ def test_tmp_path_keeps_evidence_when_artifact_retention_is_enabled(
     assert (retained_path / "runtime.log").read_text(encoding="utf-8") == "diagnostic evidence"
 
 
-def test_tmp_path_cleans_evidence_by_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_tmp_path_cleans_evidence_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(conftest, "TMP_ROOT", tmp_path / "artifacts")
     monkeypatch.delenv(conftest.PRESERVE_TEST_ARTIFACTS_ENV, raising=False)
-    case_directory = _case_directory_generator(
-        "tests/e2e/test_flow.py::test_failure", "test_failure"
-    )
+    case_directory = _case_directory_generator("tests/e2e/test_flow.py::test_failure", "test_failure")
 
     cleaned_path = next(case_directory)
     (cleaned_path / "runtime.log").write_text("diagnostic evidence", encoding="utf-8")

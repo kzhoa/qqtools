@@ -1,4 +1,5 @@
 """Shared explicit activation for schema-6 capability protocols."""
+
 # QQTOOLS-COMPAT-0007: restricted legacy dependency normalization is retired in 1.3.17.
 from __future__ import annotations
 
@@ -18,9 +19,7 @@ _JOURNAL = "schema6-upgrade.json"
 _CAPABILITIES = frozenset({CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY})
 
 
-def _runtime_binding(
-    cfg: RootConfig, machine_runtime_root: str | Path | None
-) -> tuple[MachineRuntime, ProjectBinding]:
+def _runtime_binding(cfg: RootConfig, machine_runtime_root: str | Path | None) -> tuple[MachineRuntime, ProjectBinding]:
     """Resolve the caller's verified machine-local binding for this project."""
     runtime = MachineRuntime(machine_runtime_root)
     identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
@@ -30,16 +29,14 @@ def _runtime_binding(
         raise ValueError("project identity is malformed.")
     _revision, bindings = runtime.load_registry()
     matches = [
-        binding
-        for binding in bindings
-        if binding.project_id == project_id and binding.shared_root == cfg.shared_root
+        binding for binding in bindings if binding.project_id == project_id and binding.shared_root == cfg.shared_root
     ]
     if len(matches) != 1:
         raise ValueError("no unique machine runtime binding matches this project.")
     binding = matches[0]
-    record = read_json(
-        shared_paths(cfg.shared_root)["machines"] / binding.machine_name / "machine.json"
-    ).get("machine", {})
+    record = read_json(shared_paths(cfg.shared_root)["machines"] / binding.machine_name / "machine.json").get(
+        "machine", {}
+    )
     if (
         not isinstance(record, dict)
         or record.get("machine_name") != binding.machine_name
@@ -76,21 +73,12 @@ def _validate_attestations(
             or attestation.get("project_id") != project_id
             or attestation.get("shared_root") != str(cfg.shared_root)
         ):
-            raise ValueError(
-                f"schema-6 upgrade attestation does not match machine binding: {machine_name}."
-            )
-        if (
-            machine_name == binding.machine_name
-            and attestation.get("runtime_root") != str(runtime.root)
-        ):
-            raise ValueError(
-                "schema-6 upgrade attestation does not match the local machine runtime."
-            )
+            raise ValueError(f"schema-6 upgrade attestation does not match machine binding: {machine_name}.")
+        if machine_name == binding.machine_name and attestation.get("runtime_root") != str(runtime.root):
+            raise ValueError("schema-6 upgrade attestation does not match the local machine runtime.")
 
 
-def _blockers(
-    cfg: RootConfig, *, machine_runtime_root: str | Path | None = None
-) -> list[str]:
+def _blockers(cfg: RootConfig, *, machine_runtime_root: str | Path | None = None) -> list[str]:
     """Return active shared and local state that prevents a schema-6 activation."""
     blockers: list[str] = []
     for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
@@ -136,9 +124,7 @@ def _requested(capabilities: list[str] | None) -> list[str]:
     if not values:
         raise ValueError("at least one schema-6 capability is required.")
     if set(values) != _CAPABILITIES:
-        raise ValueError(
-            "schema-6 activation requires cpu-lane-v1 and task-dependencies-v1 together."
-        )
+        raise ValueError("schema-6 activation requires cpu-lane-v1 and task-dependencies-v1 together.")
     return values
 
 
@@ -149,20 +135,26 @@ def schema6_upgrade_status(cfg: RootConfig) -> dict[str, Any]:
 
 
 def check_schema6_upgrade(
-    cfg: RootConfig, *, capabilities: list[str] | None = None,
+    cfg: RootConfig,
+    *,
+    capabilities: list[str] | None = None,
     machine_runtime_root: str | Path | None = None,
 ) -> dict[str, Any]:
     status = schema6_upgrade_status(cfg)
     if status["phase"] != "legacy":
         return {"shared_root": str(cfg.shared_root), **status}
     return {
-        "shared_root": str(cfg.shared_root), "capabilities": _requested(capabilities),
-        "phase": "legacy", "blockers": _blockers(cfg, machine_runtime_root=machine_runtime_root),
+        "shared_root": str(cfg.shared_root),
+        "capabilities": _requested(capabilities),
+        "phase": "legacy",
+        "blockers": _blockers(cfg, machine_runtime_root=machine_runtime_root),
     }
 
 
 def start_schema6_upgrade(
-    cfg: RootConfig, *, capabilities: list[str] | None = None,
+    cfg: RootConfig,
+    *,
+    capabilities: list[str] | None = None,
     machine_runtime_root: str | Path | None = None,
 ) -> dict[str, Any]:
     with schema_lock(cfg.shared_root):
@@ -176,17 +168,25 @@ def start_schema6_upgrade(
         if blockers:
             raise RuntimeError("schema-6 upgrade requires a drained root: " + ", ".join(blockers))
         value = {
-            "activation_id": uuid.uuid4().hex, "phase": "awaiting_attestations",
-            "capabilities": requested, "participants": sorted(
+            "activation_id": uuid.uuid4().hex,
+            "phase": "awaiting_attestations",
+            "capabilities": requested,
+            "participants": sorted(
                 path.name for path in shared_paths(cfg.shared_root)["machines"].iterdir() if path.is_dir()
-            ), "attestations": {}, "normalized_tasks": 0, "created_at": utc_now(),
+            ),
+            "attestations": {},
+            "normalized_tasks": 0,
+            "created_at": utc_now(),
         }
         atomic_replace(_path(cfg), {"schema6_upgrade": value})
         return value
 
 
 def attest_schema6_upgrade(
-    cfg: RootConfig, *, activation_id: str, machine_name: str,
+    cfg: RootConfig,
+    *,
+    activation_id: str,
+    machine_name: str,
     machine_runtime_root: str | Path | None = None,
 ) -> dict[str, Any]:
     with schema_lock(cfg.shared_root):
@@ -212,7 +212,9 @@ def attest_schema6_upgrade(
 
 
 def resume_schema6_upgrade(
-    cfg: RootConfig, *, activation_id: str,
+    cfg: RootConfig,
+    *,
+    activation_id: str,
     machine_runtime_root: str | Path | None = None,
 ) -> dict[str, Any]:
     with schema_lock(cfg.shared_root):
@@ -222,11 +224,13 @@ def resume_schema6_upgrade(
         if value["phase"] == "completed":
             return value
         if value["phase"] == "normalizing":
-            value.update({
-                "phase": "awaiting_attestations",
-                "attestations": {},
-                "recovery_required_at": utc_now(),
-            })
+            value.update(
+                {
+                    "phase": "awaiting_attestations",
+                    "attestations": {},
+                    "recovery_required_at": utc_now(),
+                }
+            )
             atomic_replace(_path(cfg), {"schema6_upgrade": value})
             raise RuntimeError(
                 "schema-6 upgrade was interrupted during normalization; collect fresh "

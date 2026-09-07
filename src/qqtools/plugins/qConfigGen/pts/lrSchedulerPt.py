@@ -5,9 +5,10 @@ Key point: Display corresponding parameters dynamically based on scheduler type,
 avoid prompting for irrelevant fields
 """
 
-import qqtools as qt
 from prompt_toolkit import print_formatted_text, prompt
 from prompt_toolkit.completion import WordCompleter
+
+import qqtools as qt
 
 # Supported schedulers in qConfig specification
 LR_SCHEDULER_PARAMS = {
@@ -138,7 +139,7 @@ def prompt_lr_scheduler_params():
 
     params = {}
     param_names = LR_SCHEDULER_PARAMS[scheduler]
-    
+
     for param_name in param_names:
         while True:
             default_value = default_values.get(param_name)
@@ -193,7 +194,7 @@ def prompt_lr_scheduler_params():
 
     if use_warmup:
         warmup_params = {}
-        
+
         # warmup_steps (first priority)
         while True:
             default_val = WARMUP_DEFAULTS["warmup_steps"]
@@ -212,7 +213,7 @@ def prompt_lr_scheduler_params():
         if warmup_params["warmup_steps"] <= 0:
             print_formatted_text("  💡 Tip: warmup_steps > 0 will ignore warmup_epochs. Now using warmup_epochs.")
             while True:
-                value = prompt(f"  warmup_epochs (default: 0, 0=disable): ").strip()
+                value = prompt("  warmup_epochs (default: 0, 0=disable): ").strip()
                 if not value:
                     warmup_params["warmup_epochs"] = 0
                     break

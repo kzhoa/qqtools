@@ -70,7 +70,6 @@ class Timer:
 
 
 if __name__ == "__main__":
-
     print("\n0 ", end="")
     with Timer("hello world", precision=5) as t:
         for _ in range(1000):

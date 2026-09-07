@@ -1,4 +1,5 @@
 import torch
+
 import qqtools as qt
 
 __all__ = ["get_duration", "get_duration_by_sync"]

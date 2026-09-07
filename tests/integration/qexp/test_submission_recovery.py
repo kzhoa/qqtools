@@ -9,11 +9,13 @@ from qqtools.plugins.qexp.runtime.submission import semantic_digest
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 def test_sealed_group_does_not_poison_idempotency_key(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")
     submit(cfg, ["echo", "first"], group="exp")
     from qqtools.plugins.qexp.commands.group import group_control
+
     group_control(cfg, "exp", "seal")
     with pytest.raises(ValueError, match="sealed"):
         submit(cfg, ["echo", "second"], group="exp", idempotency_key="sealed-key")

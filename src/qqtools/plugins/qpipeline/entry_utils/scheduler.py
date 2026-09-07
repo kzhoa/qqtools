@@ -101,7 +101,7 @@ class SchedulerConfig:
     def __post_init__(self) -> None:
         """Validate configuration."""
         if self.name.lower() not in SCHEDULER_GETTERS:
-            raise ValueError(f"Unsupported scheduler: '{self.name}'. " f"Supported: {list(SCHEDULER_GETTERS.keys())}")
+            raise ValueError(f"Unsupported scheduler: '{self.name}'. Supported: {list(SCHEDULER_GETTERS.keys())}")
         if self.params is None:
             self.params = {}
         if self.warmup is None:
@@ -140,8 +140,7 @@ def resolve_scheduler_step_on(scheduler_name: str, step_on: Optional[str]) -> st
         resolved_step_on = SCHEDULER_STEP_ON_VALID_END if step_on is None else step_on
         if resolved_step_on != SCHEDULER_STEP_ON_VALID_END:
             raise ValueError(
-                "scheduler_params.step_on must be 'valid_end' for plateau scheduler, "
-                f"got {resolved_step_on!r}"
+                f"scheduler_params.step_on must be 'valid_end' for plateau scheduler, got {resolved_step_on!r}"
             )
         return resolved_step_on
 
@@ -387,7 +386,7 @@ def prepare_scheduler(args: qt.qDict, optimizer: Optimizer, batches_per_epoch: i
     # Create main scheduler using the corresponding getter function
     scheduler_name_lower = scheduler_name.lower()
     if scheduler_name_lower not in SCHEDULER_GETTERS:
-        raise ValueError(f"Unsupported scheduler: '{scheduler_name}'. " f"Supported: {list(SCHEDULER_GETTERS.keys())}")
+        raise ValueError(f"Unsupported scheduler: '{scheduler_name}'. Supported: {list(SCHEDULER_GETTERS.keys())}")
 
     getter = SCHEDULER_GETTERS[scheduler_name_lower]
     main_scheduler = getter(scheduler_config.params, optimizer)

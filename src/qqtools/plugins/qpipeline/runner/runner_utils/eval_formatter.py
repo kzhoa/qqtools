@@ -59,10 +59,7 @@ class EvalFormatter:
         return [
             "  ".join(headers[index].ljust(widths[index]) for index in range(len(headers))),
             "  ".join("-" * width for width in widths),
-            *(
-                "  ".join(row[index].ljust(widths[index]) for index in range(len(headers)))
-                for row in rows
-            ),
+            *("  ".join(row[index].ljust(widths[index]) for index in range(len(headers))) for row in rows),
         ]
 
     @classmethod
@@ -95,11 +92,7 @@ class EvalFormatter:
                 f"@ epoch {best_epoch}, step {best_step}"
             )
         if is_best:
-            previous = (
-                getattr(previous_best, "metric", None)
-                if previous_best is not None
-                else None
-            )
+            previous = getattr(previous_best, "metric", None) if previous_best is not None else None
             delta = None
             if cls._is_numeric(target_val) and cls._is_numeric(previous):
                 delta = float(target_val) - float(previous)
@@ -128,7 +121,13 @@ class EvalFormatter:
         table_lines = ["\n[Evaluation Metrics]"]
         if rows:
             table_rows = [
-                [label, *(cls._format_metric_value(metrics[name], name) if name in metrics else "-" for name in headers[1:])]
+                [
+                    label,
+                    *(
+                        cls._format_metric_value(metrics[name], name) if name in metrics else "-"
+                        for name in headers[1:]
+                    ),
+                ]
                 for label, metrics in rows
             ]
             table_lines.extend(cls._render_text_table(headers, table_rows))

@@ -25,7 +25,6 @@ def calculate_md5(file_path, chunk_size=8192):
 def verify_md5(file_path, expected_md5):
     actual_md5 = calculate_md5(file_path)
     if actual_md5 == expected_md5:
-
         return True
     else:
         return False

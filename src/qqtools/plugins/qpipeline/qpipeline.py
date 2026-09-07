@@ -227,7 +227,6 @@ class qPipeline:
         log_dir = args.log_dir
         print_freq = args.print_freq or 100
 
-
         run_mode = args.runner.get("run_mode", "epoch")
         eval_interval = args.runner.get("eval_interval", 1)
         save_interval = args.runner.get("save_interval", None)

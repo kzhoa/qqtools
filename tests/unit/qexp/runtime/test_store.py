@@ -4,13 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp.runtime.store import (
-    CASConflict,
-    atomic_replace,
-    cas_update,
-    create_if_absent,
-    read_json,
-)
+from qqtools.plugins.qexp.runtime.store import CASConflict, atomic_replace, cas_update, create_if_absent, read_json
 
 
 def test_create_if_absent_and_cas(tmp_path: Path):

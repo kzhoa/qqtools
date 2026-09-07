@@ -1,12 +1,13 @@
 """Authoritative Task dependency validation and derived scheduling gates."""
+
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Iterable
+from typing import Iterable, Iterator
 
-from .operation_store import operation_exists
 from .locks import group_lock, task_lock
+from .operation_store import operation_exists
 from .paths import shared_paths, submission_path
 from .records import TaskRecord, validate_identifier
 from .store import iter_json, read_json
@@ -75,7 +76,9 @@ def _check_no_cycle(tasks: dict[str, TaskRecord]) -> None:
 
 
 def validate_group_dependencies(
-    cfg: object, group_name: str | None, candidates: Iterable[TaskRecord],
+    cfg: object,
+    group_name: str | None,
+    candidates: Iterable[TaskRecord],
 ) -> None:
     """Validate candidate dependency edges against current authoritative Group truth."""
     candidates = list(candidates)
@@ -96,13 +99,8 @@ def validate_group_dependencies(
                 raise ValueError(f"dependency Task {dependency_id!r} does not exist in Group {group_name!r}.")
             if dependency.group_name != group_name:
                 raise ValueError(f"dependency Task {dependency_id!r} is not in Group {group_name!r}.")
-            if (
-                dependency_id not in candidate_ids
-                and not is_committed_submission_task(cfg, dependency)
-            ):
-                raise ValueError(
-                    f"dependency Task {dependency_id!r} has not been committed by its submission."
-                )
+            if dependency_id not in candidate_ids and not is_committed_submission_task(cfg, dependency):
+                raise ValueError(f"dependency Task {dependency_id!r} has not been committed by its submission.")
             if dependency_id == task.task_id:
                 raise ValueError("task cannot depend on itself.")
             if (
@@ -126,6 +124,7 @@ def dependency_gate(cfg: object, task: TaskRecord) -> DependencyGate:
     for task_id in task.depends_on_task_ids:
         try:
             from .tasks import load_task
+
             dependency = load_task(cfg, task_id)
         except (FileNotFoundError, KeyError, TypeError, ValueError):
             invalid.append({"task_id": task_id, "reason": "missing_or_invalid"})

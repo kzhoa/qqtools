@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import os
 import heapq
+import os
 from pathlib import Path
 from typing import Iterator, Literal
 
+from .locks import schema_lock
 from .paths import local_paths, shared_paths
 from .store import atomic_replace, read_json
-from .locks import schema_lock
 
 ActiveOperationKind = Literal["availability", "group_control", "cleanup"]
 
@@ -19,26 +19,34 @@ def _active_key(kind: ActiveOperationKind) -> str:
 
 
 def active_operation_path(
-    cfg: object, kind: ActiveOperationKind, operation_key: str,
+    cfg: object,
+    kind: ActiveOperationKind,
+    operation_key: str,
 ) -> Path:
     return shared_paths(cfg.shared_root)[_active_key(kind)] / f"{operation_key}.json"
 
 
 def archived_operation_path(
-    cfg: object, kind: ActiveOperationKind, operation_key: str,
+    cfg: object,
+    kind: ActiveOperationKind,
+    operation_key: str,
 ) -> Path:
     return shared_paths(cfg.shared_root)[kind] / f"{operation_key}.json"
 
 
 def locate_operation_path(
-    cfg: object, kind: ActiveOperationKind, operation_key: str,
+    cfg: object,
+    kind: ActiveOperationKind,
+    operation_key: str,
 ) -> Path:
     active = active_operation_path(cfg, kind, operation_key)
     return active if active.exists() else archived_operation_path(cfg, kind, operation_key)
 
 
 def operation_exists(
-    cfg: object, kind: ActiveOperationKind, operation_key: str,
+    cfg: object,
+    kind: ActiveOperationKind,
+    operation_key: str,
 ) -> bool:
     return (
         active_operation_path(cfg, kind, operation_key).exists()
@@ -47,7 +55,10 @@ def operation_exists(
 
 
 def write_active_operation(
-    cfg: object, kind: ActiveOperationKind, operation_key: str, value: dict,
+    cfg: object,
+    kind: ActiveOperationKind,
+    operation_key: str,
+    value: dict,
 ) -> Path:
     path = active_operation_path(cfg, kind, operation_key)
     atomic_replace(path, value)
@@ -61,7 +72,10 @@ def write_active_operation(
 
 
 def archive_operation(
-    cfg: object, kind: ActiveOperationKind, operation_key: str, value: dict,
+    cfg: object,
+    kind: ActiveOperationKind,
+    operation_key: str,
+    value: dict,
 ) -> Path:
     """Publish terminal history before removing the active truth path."""
     archived = archived_operation_path(cfg, kind, operation_key)
@@ -87,9 +101,7 @@ def iter_active_operation_paths(
         after_name = None
         if cursor_path.exists():
             try:
-                after_name = read_json(cursor_path)["active_operation_cursor"].get(
-                    "after_name"
-                )
+                after_name = read_json(cursor_path)["active_operation_cursor"].get("after_name")
             except (OSError, KeyError, TypeError, ValueError):
                 after_name = None
         with os.scandir(active) as entries:
@@ -108,18 +120,19 @@ def iter_active_operation_paths(
             with os.scandir(active) as entries:
                 selected = heapq.nsmallest(
                     limit,
-                    (
-                        Path(entry.path)
-                        for entry in entries
-                        if entry.is_file() and entry.name.endswith(".json")
-                    ),
+                    (Path(entry.path) for entry in entries if entry.is_file() and entry.name.endswith(".json")),
                     key=lambda path: path.name,
                 )
         if selected:
-            atomic_replace(cursor_path, {"active_operation_cursor": {
-                "kind": kind,
-                "after_name": selected[-1].name,
-            }})
+            atomic_replace(
+                cursor_path,
+                {
+                    "active_operation_cursor": {
+                        "kind": kind,
+                        "after_name": selected[-1].name,
+                    }
+                },
+            )
         for path in selected:
             yielded += 1
             yield path
@@ -159,10 +172,7 @@ def _operation_is_terminal(kind: ActiveOperationKind, record: dict) -> bool:
     if state in _terminal_states(kind):
         return True
     if kind == "availability":
-        return (
-            state == "blocked"
-            and bool(record.get("availability_operation", {}).get("blocked_reason"))
-        )
+        return state == "blocked" and bool(record.get("availability_operation", {}).get("blocked_reason"))
     return False
 
 
@@ -178,11 +188,7 @@ def migrate_legacy_active_operations(cfg: object) -> None:
             directory = shared_paths(cfg.shared_root)[kind]
             with os.scandir(directory) as entries:
                 for entry in entries:
-                    if (
-                        entry.is_symlink()
-                        or not entry.is_file()
-                        or not entry.name.endswith(".json")
-                    ):
+                    if entry.is_symlink() or not entry.is_file() or not entry.name.endswith(".json"):
                         continue
                     path = Path(entry.path)
                     try:

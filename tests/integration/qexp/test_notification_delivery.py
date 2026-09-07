@@ -12,6 +12,7 @@ from qqtools.plugins.qexp.notifications import NotificationHook
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 def test_shared_file_credential_source_uses_owner_private_webhook(tmp_path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     update_notifications(

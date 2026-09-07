@@ -8,34 +8,30 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp import init_shared_root, machine_agent, submit
 from qqtools.plugins.qexp.commands import group as group_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import cancel, edit_dependencies, share
 from qqtools.plugins.qexp.machine_agent import dispatch_machine_cycle_locked
-from qqtools.plugins.qexp import machine_agent
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
     ReadyClassificationResult,
     ReadyCursor,
     ReadyPeek,
+    bump_primary_ready_revision,
     delete_stale_ready_marker,
     load_ready_cursor,
     next_ready_marker,
     peek_primary_ready_marker,
+    ready_index_route_revision,
     rebuild_primary_ready_index,
     write_ready_marker,
 )
-from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
-from qqtools.plugins.qexp.runtime.ready import bump_primary_ready_revision, ready_index_route_revision
-from qqtools.plugins.qexp.runtime.resources.reservations import attach, reconcile_snapshot, reserve
 from qqtools.plugins.qexp.runtime.resources.cpu_lane import reserve_cpu, set_cpu_lane_capacity
-from qqtools.plugins.qexp.runtime.work_budget import (
-    AdaptiveBatchSizer,
-    SliceBudget,
-    WorkBudgetPolicy,
-)
+from qqtools.plugins.qexp.runtime.resources.reservations import attach, reconcile_snapshot, reserve
+from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+from qqtools.plugins.qexp.runtime.work_budget import AdaptiveBatchSizer, SliceBudget, WorkBudgetPolicy
 from qqtools.plugins.qexp.scheduler import (
     BorrowAdmissionRequired,
     _BorrowAdmissionGrant,
@@ -46,6 +42,7 @@ from qqtools.plugins.qexp.scheduler import (
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 class _RecordingExecutor:
     def __init__(self) -> None:
         self.launched: list[str] = []
@@ -55,9 +52,7 @@ class _RecordingExecutor:
 
 
 def _borrow_project(tmp_path: Path, work: Path):
-    cfg = init_shared_root(
-        tmp_path / "borrow" / ".qexp", "gpu-1", runtime_root=tmp_path / "borrow-rt"
-    )
+    cfg = init_shared_root(tmp_path / "borrow" / ".qexp", "gpu-1", runtime_root=tmp_path / "borrow-rt")
     create_group(cfg, "borrow-group")
     change_worker(cfg, "borrow-group", "gpu-1", "set", role="borrow")
     task = submit(
@@ -72,7 +67,8 @@ def _borrow_project(tmp_path: Path, work: Path):
 
 
 def test_machine_agent_admits_borrow_only_after_no_primary_demand(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
@@ -97,22 +93,23 @@ def test_machine_agent_admits_borrow_only_after_no_primary_demand(
         publish_snapshots=False,
     )
 
-    assert results == [{
-        "project_id": binding.project_id,
-        "launched": [task.task_id],
-        "status": "dispatched",
-    }]
+    assert results == [
+        {
+            "project_id": binding.project_id,
+            "launched": [task.task_id],
+            "status": "dispatched",
+        }
+    ]
     assert executor.launched == [task.task_id]
 
 
 def test_temporary_primary_dependency_gate_is_rechecked_before_borrowing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     task = submit(cfg, ["echo", "primary"], task_id="primary", working_dir=work)
     _activate_ready(cfg)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
@@ -131,9 +128,10 @@ def test_temporary_primary_dependency_gate_is_rechecked_before_borrowing(
     # Dependency waiting needs revisiting, but is not primary resource demand
     # and therefore must not block a borrow admission.
     assert first.state == "no_primary_demand"
-    assert machine_agent._build_borrow_admission_grant(
-        runtime, {binding.project_id: cfg}, first, {binding.project_id}
-    ) is not None
+    assert (
+        machine_agent._build_borrow_admission_grant(runtime, {binding.project_id: cfg}, first, {binding.project_id})
+        is not None
+    )
 
     claimable = ReadyClassificationResult("claimable", "eligible_truth", task)
     monkeypatch.setattr(machine_agent, "classify_ready_marker", lambda *_args: claimable)
@@ -149,13 +147,12 @@ def test_temporary_primary_dependency_gate_is_rechecked_before_borrowing(
 
 
 def test_primary_probe_retains_dependency_recheck_across_budgeted_batches(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     first_task = submit(cfg, ["echo", "first"], task_id="first", working_dir=work)
     submit(cfg, ["echo", "second"], task_id="second", working_dir=work)
     _activate_ready(cfg)
@@ -166,9 +163,7 @@ def test_primary_probe_retains_dependency_recheck_across_budgeted_batches(
 
     monkeypatch.setattr(machine_agent, "classify_ready_marker", lambda *_args: temporary)
     limited = SliceBudget(
-        WorkBudgetPolicy(
-            record_hard_limit=1, operation_hard_limit=32, initial_batch_size=1
-        ),
+        WorkBudgetPolicy(record_hard_limit=1, operation_hard_limit=32, initial_batch_size=1),
         clock_ns=lambda: 0,
     )
     incomplete = machine_agent._probe_primary_demand(
@@ -203,7 +198,9 @@ def test_primary_probe_retains_dependency_recheck_across_budgeted_batches(
 
 @pytest.mark.parametrize("is_dependency_first", [True, False])
 def test_dependency_rechecks_do_not_starve_later_project_baseline_scans(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, is_dependency_first: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    is_dependency_first: bool,
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
@@ -248,29 +245,19 @@ def test_dependency_rechecks_do_not_starve_later_project_baseline_scans(
     _activate_ready(dependency_cfg)
     _activate_ready(borrow_cfg)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
-    dependency_binding = runtime.add_binding(
-        dependency_cfg.shared_root, dependency_cfg.machine_name
-    )
+    dependency_binding = runtime.add_binding(dependency_cfg.shared_root, dependency_cfg.machine_name)
     borrow_binding = runtime.add_binding(borrow_cfg.shared_root, borrow_cfg.machine_name)
     # Fix the registry ordering; path-derived project IDs otherwise randomize
     # which project's completed routes consume the next slice's budget first.
     generation, _ = runtime.load_registry()
-    dependency_binding = replace(
-        dependency_binding, project_id="a" if is_dependency_first else "b"
-    )
-    borrow_binding = replace(
-        borrow_binding, project_id="b" if is_dependency_first else "a"
-    )
-    monkeypatch.setattr(
-        runtime, "load_registry", lambda: (generation, [dependency_binding, borrow_binding])
-    )
+    dependency_binding = replace(dependency_binding, project_id="a" if is_dependency_first else "b")
+    borrow_binding = replace(borrow_binding, project_id="b" if is_dependency_first else "a")
+    monkeypatch.setattr(runtime, "load_registry", lambda: (generation, [dependency_binding, borrow_binding]))
     readable = {
         dependency_binding.project_id: dependency_cfg,
         borrow_binding.project_id: borrow_cfg,
     }
-    budget_policy = WorkBudgetPolicy(
-        record_hard_limit=3, operation_hard_limit=12, initial_batch_size=1
-    )
+    budget_policy = WorkBudgetPolicy(record_hard_limit=3, operation_hard_limit=12, initial_batch_size=1)
 
     for _round in range(3):
         probe = machine_agent.PrimaryDemandProbe("unresolved")
@@ -287,9 +274,7 @@ def test_dependency_rechecks_do_not_starve_later_project_baseline_scans(
                 break
 
         assert probe.state == "no_primary_demand"
-        grant = machine_agent._build_borrow_admission_grant(
-            runtime, readable, probe, set(readable)
-        )
+        grant = machine_agent._build_borrow_admission_grant(runtime, readable, probe, set(readable))
         assert grant is not None and grant.is_valid(runtime.root)
 
 
@@ -298,9 +283,7 @@ def test_dependency_recheck_advances_past_a_still_blocked_first_candidate(
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "dependencies")
     children = []
     for index in range(3):
@@ -326,9 +309,7 @@ def test_dependency_recheck_advances_past_a_still_blocked_first_candidate(
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     readable = {binding.project_id: cfg}
-    budget_policy = WorkBudgetPolicy(
-        record_hard_limit=16, operation_hard_limit=64, initial_batch_size=1
-    )
+    budget_policy = WorkBudgetPolicy(record_hard_limit=16, operation_hard_limit=64, initial_batch_size=1)
 
     completed = machine_agent._probe_primary_demand(
         runtime,
@@ -360,19 +341,21 @@ def test_dependency_recheck_advances_past_a_still_blocked_first_candidate(
 @pytest.mark.parametrize("ready_index", [0, 2])
 @pytest.mark.parametrize("lane", ["gpu", "cpu"])
 def test_dependency_recheck_retains_aggregation_demand(
-    tmp_path: Path, ready_index: int, lane: str,
+    tmp_path: Path,
+    ready_index: int,
+    lane: str,
 ) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "dependencies")
-    parent = submit(
-        cfg, ["echo", "parent"], task_id="parent", group="dependencies", working_dir=tmp_path
-    )
+    parent = submit(cfg, ["echo", "parent"], task_id="parent", group="dependencies", working_dir=tmp_path)
     for index in range(3):
         submit(
-            cfg, ["echo", "child"], task_id=f"child-{index}", group="dependencies",
-            working_dir=tmp_path, depends_on_task_ids=[parent.task_id],
+            cfg,
+            ["echo", "child"],
+            task_id=f"child-{index}",
+            group="dependencies",
+            working_dir=tmp_path,
+            depends_on_task_ids=[parent.task_id],
             requested_gpus=2 if lane == "gpu" else 0,
             requested_cpus=2 if lane == "cpu" else None,
         )
@@ -384,8 +367,13 @@ def test_dependency_recheck_retains_aggregation_demand(
 
     def probe(free: list[int]) -> machine_agent.PrimaryDemandProbe:
         return machine_agent._probe_primary_demand(
-            runtime, readable, readable, [0, 1], free,
-            SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0), lane=lane,
+            runtime,
+            readable,
+            readable,
+            [0, 1],
+            free,
+            SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+            lane=lane,
         )
 
     assert probe([0]).state == "no_primary_demand"
@@ -398,9 +386,16 @@ def test_dependency_recheck_retains_aggregation_demand(
     for _ in range(8):
         result = probe([0])
         assert result.state == "waiting_for_aggregation"
-        assert machine_agent._build_borrow_admission_grant(
-            runtime, readable, result, set(readable), lane=lane,
-        ) is None
+        assert (
+            machine_agent._build_borrow_admission_grant(
+                runtime,
+                readable,
+                result,
+                set(readable),
+                lane=lane,
+            )
+            is None
+        )
     assert probe([0, 1]).state == "runnable_now"
     cancel(cfg, f"child-{ready_index}")
     for _ in range(8):
@@ -409,7 +404,11 @@ def test_dependency_recheck_retains_aggregation_demand(
             break
     assert result.state == "no_primary_demand"
     grant = machine_agent._build_borrow_admission_grant(
-        runtime, readable, result, set(readable), lane=lane,
+        runtime,
+        readable,
+        result,
+        set(readable),
+        lane=lane,
     )
     assert grant is not None and grant.is_valid(runtime.root)
 
@@ -418,18 +417,23 @@ def test_dependency_recheck_rounds_are_independent_between_lanes(tmp_path: Path)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     readable = {}
     for index in range(2):
-        cfg = init_shared_root(
-            tmp_path / str(index) / ".qexp", "gpu-1", runtime_root=tmp_path / f"rt-{index}"
-        )
+        cfg = init_shared_root(tmp_path / str(index) / ".qexp", "gpu-1", runtime_root=tmp_path / f"rt-{index}")
         create_group(cfg, "dependencies")
         parent = submit(
-            cfg, ["echo", "parent"], task_id="parent", group="dependencies",
+            cfg,
+            ["echo", "parent"],
+            task_id="parent",
+            group="dependencies",
             working_dir=tmp_path,
         )
         for lane in ("gpu", "cpu"):
             submit(
-                cfg, ["echo", lane], task_id=lane, group="dependencies",
-                working_dir=tmp_path, depends_on_task_ids=[parent.task_id],
+                cfg,
+                ["echo", lane],
+                task_id=lane,
+                group="dependencies",
+                working_dir=tmp_path,
+                depends_on_task_ids=[parent.task_id],
                 requested_gpus=1 if lane == "gpu" else 0,
                 requested_cpus=1 if lane == "cpu" else None,
             )
@@ -440,8 +444,13 @@ def test_dependency_recheck_rounds_are_independent_between_lanes(tmp_path: Path)
 
     def probe(lane: str) -> machine_agent.PrimaryDemandProbe:
         return machine_agent._probe_primary_demand(
-            runtime, readable, readable, [0], [0],
-            SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0), lane=lane,
+            runtime,
+            readable,
+            readable,
+            [0],
+            [0],
+            SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+            lane=lane,
         )
 
     for lane in ("gpu", "cpu"):
@@ -482,15 +491,11 @@ def test_regular_dispatch_reports_borrow_admission_requirement(tmp_path: Path) -
     cfg, _task = _borrow_project(tmp_path, work)
 
     with pytest.raises(BorrowAdmissionRequired, match="machine-agent admission grant"):
-        run_dispatch_cycle(
-            cfg, available_gpus=[0], should_recover_starting=False
-        )
+        run_dispatch_cycle(cfg, available_gpus=[0], should_recover_starting=False)
 
 
 def test_primary_projection_cursor_uses_lexicographic_catalog_order(tmp_path: Path) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     # Insert in the reverse lexical order to ensure directory enumeration
     # cannot define cursor progression.
     submit(cfg, ["echo", "z"], task_id="z-task")
@@ -506,13 +511,12 @@ def test_primary_projection_cursor_uses_lexicographic_catalog_order(tmp_path: Pa
 
 
 def test_group_role_sync_closes_every_affected_primary_route(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-a", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-a", runtime_root=tmp_path / "runtime")
     create_group(cfg, "workers", workers=["gpu-a", "gpu-b"])
-    task = submit(cfg, ["echo", "primary"], group="workers", task_id="primary-task")
+    submit(cfg, ["echo", "primary"], group="workers", task_id="primary-task")
     _activate_ready(cfg)
 
     original_sync = group_commands.sync_primary_ready_group
@@ -580,9 +584,9 @@ def test_cpu_primary_revision_does_not_invalidate_a_gpu_borrow_grant(tmp_path: P
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     revisions = tuple(
-        _BorrowAdmissionRevision(binding.project_id, cfg, scope, ready_index_route_revision(
-            cfg, scope, primary_only=True, lane="gpu"
-        ))
+        _BorrowAdmissionRevision(
+            binding.project_id, cfg, scope, ready_index_route_revision(cfg, scope, primary_only=True, lane="gpu")
+        )
         for scope in ("shared", "home")
     )
     grant = _BorrowAdmissionGrant(runtime.root, revisions, lane="gpu")
@@ -593,7 +597,8 @@ def test_cpu_primary_revision_does_not_invalidate_a_gpu_borrow_grant(tmp_path: P
 
 
 def test_primary_probe_uses_primary_projection_without_scanning_borrow_markers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
@@ -621,9 +626,7 @@ def test_primary_probe_uses_primary_projection_without_scanning_borrow_markers(
 def test_primary_probe_accepts_an_unestablished_empty_shared_route(
     tmp_path: Path,
 ) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     _activate_ready(cfg)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
@@ -707,16 +710,12 @@ def test_primary_probe_skips_demand_that_exceeds_remaining_group_gpu_limit(tmp_p
 
 @pytest.mark.parametrize("damage", ["catalog", "partition"])
 def test_established_primary_route_damage_fails_closed(tmp_path: Path, damage: str) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     submit(cfg, ["echo", "primary"], task_id="primary-task")
     _activate_ready(cfg)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    catalog_path = shared_paths(cfg.shared_root)["ready_catalogs"] / "home.gpu-1" / (
-        "0000000000000000.json"
-    )
+    catalog_path = shared_paths(cfg.shared_root)["ready_catalogs"] / "home.gpu-1" / ("0000000000000000.json")
     if damage == "catalog":
         catalog_path.unlink()
     else:
@@ -733,24 +732,24 @@ def test_established_primary_route_damage_fails_closed(tmp_path: Path, damage: s
     )
 
     assert probe.state == "unresolved"
-    assert machine_agent._build_borrow_admission_grant(
-        runtime, {binding.project_id: cfg}, probe, {binding.project_id}
-    ) is None
+    assert (
+        machine_agent._build_borrow_admission_grant(runtime, {binding.project_id: cfg}, probe, {binding.project_id})
+        is None
+    )
 
 
-def test_unprobeable_enabled_project_blocks_borrow_admission(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_unprobeable_enabled_project_blocks_borrow_admission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     work = tmp_path / "work"
     work.mkdir()
     blocked_cfg, _blocked_task = _borrow_project(tmp_path / "blocked", work)
-    allowed_cfg = init_shared_root(
-        tmp_path / "allowed" / ".qexp", "gpu-1", runtime_root=tmp_path / "allowed-rt"
-    )
+    allowed_cfg = init_shared_root(tmp_path / "allowed" / ".qexp", "gpu-1", runtime_root=tmp_path / "allowed-rt")
     create_group(allowed_cfg, "borrow-group")
     change_worker(allowed_cfg, "borrow-group", "gpu-1", "set", role="borrow")
     allowed_task = submit(
-        allowed_cfg, ["echo", "allowed"], group="borrow-group", sharing_mode="spillover",
+        allowed_cfg,
+        ["echo", "allowed"],
+        group="borrow-group",
+        sharing_mode="spillover",
         working_dir=work,
     )
     share(allowed_cfg, allowed_task.task_id)
@@ -779,17 +778,14 @@ def test_unprobeable_enabled_project_blocks_borrow_admission(
 
 
 def test_machine_agent_primary_demand_blocks_new_borrow_claim(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    primary_cfg = init_shared_root(
-        tmp_path / "primary" / ".qexp", "gpu-1", runtime_root=tmp_path / "primary-rt"
-    )
+    primary_cfg = init_shared_root(tmp_path / "primary" / ".qexp", "gpu-1", runtime_root=tmp_path / "primary-rt")
     create_group(primary_cfg, "primary-group")
-    primary_task = submit(
-        primary_cfg, ["echo", "primary"], group="primary-group", working_dir=work
-    )
+    primary_task = submit(primary_cfg, ["echo", "primary"], group="primary-group", working_dir=work)
     borrow_cfg, borrow_task = _borrow_project(tmp_path, work)
     _activate_ready(primary_cfg)
     _activate_ready(borrow_cfg)
@@ -819,9 +815,7 @@ def test_machine_agent_primary_demand_blocks_new_borrow_claim(
 def test_cpu_primary_probe_waits_for_aggregation_with_partial_free_capacity(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    cfg = init_shared_root(
-        tmp_path / "cpu-primary" / ".qexp", "cpu-1", runtime_root=tmp_path / "cpu-project-runtime"
-    )
+    cfg = init_shared_root(tmp_path / "cpu-primary" / ".qexp", "cpu-1", runtime_root=tmp_path / "cpu-project-runtime")
     submit(cfg, ["echo", "primary"], requested_gpus=0, requested_cpus=4, working_dir=work)
     _activate_ready(cfg)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
@@ -843,7 +837,8 @@ def test_cpu_primary_probe_waits_for_aggregation_with_partial_free_capacity(tmp_
 
 
 def test_primary_probe_rechecks_completed_shared_scope_before_borrow(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
@@ -884,11 +879,13 @@ def test_primary_probe_rechecks_completed_shared_scope_before_borrow(
         supervise=False,
         publish_snapshots=False,
     )
-    assert first_results == [{
-        "project_id": binding.project_id,
-        "launched": [],
-        "status": "dispatched",
-    }]
+    assert first_results == [
+        {
+            "project_id": binding.project_id,
+            "launched": [],
+            "status": "dispatched",
+        }
+    ]
 
     primary_task = submit(
         cfg,
@@ -906,11 +903,13 @@ def test_primary_probe_rechecks_completed_shared_scope_before_borrow(
         supervise=False,
         publish_snapshots=False,
     )
-    assert second_results == [{
-        "project_id": binding.project_id,
-        "launched": [],
-        "status": "dispatched",
-    }]
+    assert second_results == [
+        {
+            "project_id": binding.project_id,
+            "launched": [],
+            "status": "dispatched",
+        }
+    ]
     assert executor.launched == []
     assert borrow_task.task_id not in executor.launched
     shared_probe_key = (binding.project_id, "shared")
@@ -921,9 +920,7 @@ def test_primary_probe_rechecks_completed_shared_scope_before_borrow(
 def test_primary_aggregation_waiting_blocks_borrow_admission(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    primary_cfg = init_shared_root(
-        tmp_path / "primary" / ".qexp", "gpu-1", runtime_root=tmp_path / "primary-rt"
-    )
+    primary_cfg = init_shared_root(tmp_path / "primary" / ".qexp", "gpu-1", runtime_root=tmp_path / "primary-rt")
     create_group(primary_cfg, "primary-group")
     primary_task = submit(
         primary_cfg,
@@ -958,9 +955,7 @@ def test_primary_aggregation_waiting_blocks_borrow_admission(tmp_path: Path) -> 
 def test_ungrouped_primary_demand_blocks_borrow_admission(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    primary_cfg = init_shared_root(
-        tmp_path / "primary" / ".qexp", "gpu-1", runtime_root=tmp_path / "primary-rt"
-    )
+    primary_cfg = init_shared_root(tmp_path / "primary" / ".qexp", "gpu-1", runtime_root=tmp_path / "primary-rt")
     create_group(primary_cfg, "borrow-route")
     change_worker(primary_cfg, "borrow-route", "gpu-1", "set", role="borrow")
     shared_task = submit(
@@ -1027,13 +1022,12 @@ def _activate_ready(cfg) -> None:
 
 
 def test_primary_rebuild_keeps_concurrently_published_candidate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     task = submit(cfg, ["echo", "ready"], task_id="task-ready", working_dir=work)
     _activate_ready(cfg)
 
@@ -1041,9 +1035,7 @@ def test_primary_rebuild_keeps_concurrently_published_candidate(
     allow_rebuild = threading.Event()
     writer_reached_sync = threading.Event()
     writer_finished = threading.Event()
-    original_iter_json = __import__(
-            "qqtools.plugins.qexp.runtime.ready.rebuild", fromlist=["iter_json"]
-    ).iter_json
+    original_iter_json = __import__("qqtools.plugins.qexp.runtime.ready.rebuild", fromlist=["iter_json"]).iter_json
     original_sync = __import__(
         "qqtools.plugins.qexp.runtime.ready.primary_candidates", fromlist=["sync_candidate"]
     ).sync_candidate
@@ -1058,12 +1050,8 @@ def test_primary_rebuild_keeps_concurrently_published_candidate(
         writer_reached_sync.set()
         return original_sync(*args, **kwargs)
 
-    monkeypatch.setattr(
-            "qqtools.plugins.qexp.runtime.ready.rebuild.iter_json", pause_after_task_scan
-    )
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.runtime.ready.primary_candidates.sync_candidate", record_writer_sync
-    )
+    monkeypatch.setattr("qqtools.plugins.qexp.runtime.ready.rebuild.iter_json", pause_after_task_scan)
+    monkeypatch.setattr("qqtools.plugins.qexp.runtime.ready.primary_candidates.sync_candidate", record_writer_sync)
     rebuild_thread = threading.Thread(target=rebuild_primary_ready_index, args=(cfg,))
     rebuild_thread.start()
     assert scan_finished.wait(timeout=5)
@@ -1092,36 +1080,28 @@ def test_primary_rebuild_keeps_concurrently_published_candidate(
     assert not rebuild_thread.is_alive()
     assert not writer_thread.is_alive()
     candidate = (
-        shared_paths(cfg.shared_root)["ready_primary"]
-        / "routes"
-        / "home.gpu-1"
-        / f"{task.task_id}.{generation}.json"
+        shared_paths(cfg.shared_root)["ready_primary"] / "routes" / "home.gpu-1" / f"{task.task_id}.{generation}.json"
     )
     assert candidate.exists()
 
 
 def test_active_ready_dispatch_does_not_enumerate_task_truth(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     task = submit(cfg, ["echo", "ready"], task_id="task-ready", working_dir=work)
     _activate_ready(cfg)
     executor = _RecordingExecutor()
-    original_iter_json = __import__(
-        "qqtools.plugins.qexp.scheduler", fromlist=["iter_json"]
-    ).iter_json
+    original_iter_json = __import__("qqtools.plugins.qexp.scheduler", fromlist=["iter_json"]).iter_json
 
     def reject_task_enumeration(directory):
         assert Path(directory) != shared_paths(cfg.shared_root)["tasks"]
         return original_iter_json(directory)
 
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.scheduler.iter_json", reject_task_enumeration
-    )
+    monkeypatch.setattr("qqtools.plugins.qexp.scheduler.iter_json", reject_task_enumeration)
     launched = run_dispatch_cycle(
         cfg,
         available_gpus=[0],
@@ -1136,13 +1116,9 @@ def test_active_ready_dispatch_does_not_enumerate_task_truth(
 def test_ready_cursor_advances_past_temporarily_unavailable_candidate(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "paused")
-    paused = submit(
-        cfg, ["echo", "paused"], task_id="task-a", group="paused", working_dir=work
-    )
+    paused = submit(cfg, ["echo", "paused"], task_id="task-a", group="paused", working_dir=work)
     ready = submit(cfg, ["echo", "ready"], task_id="task-b", working_dir=work)
     group_path = shared_paths(cfg.shared_root)["groups"] / "paused.json"
     group = read_json(group_path)
@@ -1167,9 +1143,7 @@ def test_ready_cursor_advances_past_temporarily_unavailable_candidate(tmp_path: 
 
 
 def test_candidate_cursor_wraps_without_repeating_a_marker_in_one_slice(tmp_path: Path) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     task = submit(cfg, ["echo", "ready"], task_id="task-ready")
     _activate_ready(cfg)
 
@@ -1187,7 +1161,9 @@ def test_candidate_cursor_wraps_without_repeating_a_marker_in_one_slice(tmp_path
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 def test_machine_cycle_fills_available_gpus_when_budget_permits(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, batch_size: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
 ) -> None:
     def make_budget(policy: WorkBudgetPolicy | None = None) -> SliceBudget:
         # Test capacity filling independently of I/O latency, retaining production count limits.
@@ -1195,6 +1171,7 @@ def test_machine_cycle_fills_available_gpus_when_budget_permits(
         return SliceBudget(selected_policy, clock_ns=lambda: 0)
 
     monkeypatch.setattr(machine_agent, "SliceBudget", make_budget)
+
     # Exercise batch boundaries deterministically; adaptation has separate unit coverage.
     def observe_batch(self: AdaptiveBatchSizer, elapsed_ns: int) -> int:
         self.batch_size = batch_size
@@ -1203,13 +1180,8 @@ def test_machine_cycle_fills_available_gpus_when_budget_permits(
     monkeypatch.setattr(AdaptiveBatchSizer, "observe", observe_batch)
     work = tmp_path / "work"
     work.mkdir()
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
-    tasks = [
-        submit(cfg, ["echo", str(index)], task_id=f"task-{index}", working_dir=work)
-        for index in range(3)
-    ]
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    tasks = [submit(cfg, ["echo", str(index)], task_id=f"task-{index}", working_dir=work) for index in range(3)]
     _activate_ready(cfg)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
@@ -1238,25 +1210,20 @@ def test_machine_cycle_fills_available_gpus_when_budget_permits(
 
 
 def test_degraded_ready_index_fails_closed_for_new_claims(tmp_path: Path) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     submit(cfg, ["echo", "ready"], task_id="task-ready")
     state = read_json(ready_state_path(cfg.shared_root))
     state["ready_index"]["state"] = "degraded"
     atomic_replace(ready_state_path(cfg.shared_root), state)
 
-    assert run_dispatch_cycle(
-        cfg, available_gpus=[0], should_recover_starting=False
-    ) == []
+    assert run_dispatch_cycle(cfg, available_gpus=[0], should_recover_starting=False) == []
 
 
 def test_claim_race_does_not_degrade_ready_index_or_block_other_tasks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     raced = submit(cfg, ["echo", "raced"], task_id="task-a-raced")
     unrelated = submit(cfg, ["echo", "unrelated"], task_id="task-b-unrelated")
     _activate_ready(cfg)
@@ -1288,11 +1255,10 @@ def test_claim_race_does_not_degrade_ready_index_or_block_other_tasks(
 
 
 def test_slow_ready_reads_shrink_the_process_local_batch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     submit(cfg, ["echo", "ready"], task_id="task-ready")
     _activate_ready(cfg)
     policy = WorkBudgetPolicy(soft_deadline_ms=50, initial_batch_size=4)
@@ -1322,9 +1288,7 @@ def test_slow_ready_reads_shrink_the_process_local_batch(
 def test_ready_dispatch_stops_when_record_operation_cost_exceeds_budget(
     tmp_path: Path,
 ) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     task = submit(cfg, ["echo", "ready"], task_id="task-ready")
     _activate_ready(cfg)
     budget = SliceBudget(
@@ -1344,17 +1308,17 @@ def test_ready_dispatch_stops_when_record_operation_cost_exceeds_budget(
     assert launched == []
     assert budget.records_used == 0
     assert budget.operations_used == 0
-    assert read_json(shared_paths(cfg.shared_root)["tasks"] / f"{task.task_id}.json")[
-        "task"
-    ]["state"]["projection"] == "queued"
+    assert (
+        read_json(shared_paths(cfg.shared_root)["tasks"] / f"{task.task_id}.json")["task"]["state"]["projection"]
+        == "queued"
+    )
 
 
 def test_full_capacity_machine_cycle_reads_no_ready_candidates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     _activate_ready(cfg)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
@@ -1376,15 +1340,13 @@ def test_full_capacity_machine_cycle_reads_no_ready_candidates(
         ),
     )
 
-    assert dispatch_machine_cycle_locked(
-        runtime, available_gpus=[0], supervise=False, publish_snapshots=False
-    ) == [{"project_id": binding.project_id, "launched": [], "status": "dispatched"}]
+    assert dispatch_machine_cycle_locked(runtime, available_gpus=[0], supervise=False, publish_snapshots=False) == [
+        {"project_id": binding.project_id, "launched": [], "status": "dispatched"}
+    ]
 
 
 def test_stale_generation_cleanup_cannot_delete_current_marker(tmp_path: Path) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     task = submit(cfg, ["echo", "ready"], task_id="task-ready")
     stale_reference, _ = next_ready_marker(cfg, "project-one", "home")
     assert stale_reference is not None
@@ -1395,8 +1357,7 @@ def test_stale_generation_cleanup_cannot_delete_current_marker(tmp_path: Path) -
 
     assert delete_stale_ready_marker(cfg, stale_reference) is True
     assert not (
-        shared_paths(cfg.shared_root)["ready_reservations"]
-        / f"{task.task_id}.{task.ready_generation}.json"
+        shared_paths(cfg.shared_root)["ready_reservations"] / f"{task.task_id}.{task.ready_generation}.json"
     ).exists()
     assert read_json(task_path)["task"]["ready_generation"] == task.ready_generation + 1
 
@@ -1412,9 +1373,7 @@ def test_project_round_robin_fairness_survives_dynamic_binding(tmp_path: Path) -
             "gpu-1",
             runtime_root=tmp_path / f"{name}-runtime",
         )
-        task = submit(
-            cfg, ["echo", name], task_id=f"task-{name}", working_dir=work
-        )
+        task = submit(cfg, ["echo", name], task_id=f"task-{name}", working_dir=work)
         _activate_ready(cfg)
         binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
         projects.append((cfg, task, binding))
@@ -1431,8 +1390,5 @@ def test_project_round_robin_fairness_survives_dynamic_binding(tmp_path: Path) -
 
     result_by_project = {item["project_id"]: item for item in results}
     assert executor.launched == [projects[1][1].task_id, projects[0][1].task_id]
-    assert all(
-        result_by_project[binding.project_id]["launched"] == [task.task_id]
-        for _cfg, task, binding in projects
-    )
+    assert all(result_by_project[binding.project_id]["launched"] == [task.task_id] for _cfg, task, binding in projects)
     assert runtime.load_cursor() == projects[1][2].project_id

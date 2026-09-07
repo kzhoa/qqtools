@@ -45,25 +45,23 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
     def construct_mapping(self, node: MappingNode, deep: bool = False) -> dict[Any, Any]:
         if not isinstance(node, MappingNode):
             raise ConstructorError(
-                None, None,
+                None,
+                None,
                 f"expected a mapping node, but found {node.id}",
                 node.start_mark,
             )
         explicit_keys: set[Hashable] = set()
         for key_node, _ in node.value:
-            key = "<<" if key_node.tag == "tag:yaml.org,2002:merge" else self.construct_object(
-                key_node, deep=deep
-            )
+            key = "<<" if key_node.tag == "tag:yaml.org,2002:merge" else self.construct_object(key_node, deep=deep)
             if not isinstance(key, Hashable):
                 raise ConstructorError(
-                    "while constructing a mapping", node.start_mark,
-                    "found unhashable key", key_node.start_mark,
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found unhashable key",
+                    key_node.start_mark,
                 )
             if key in explicit_keys:
-                raise ValueError(
-                    f"YAML mapping contains duplicate key {key!r} "
-                    f"(line {key_node.start_mark.line + 1})."
-                )
+                raise ValueError(f"YAML mapping contains duplicate key {key!r} (line {key_node.start_mark.line + 1}).")
             explicit_keys.add(key)
         return super().construct_mapping(node, deep=deep)
 
@@ -182,8 +180,7 @@ def _workers(value: Any, path: str) -> dict[str, dict[str, Any]]:
         return {}
     if isinstance(value, list):
         return {
-            machine: {"scheduling_role": "primary", "gpu_limit_gpus": None}
-            for machine in _worker_names(value, path)
+            machine: {"scheduling_role": "primary", "gpu_limit_gpus": None} for machine in _worker_names(value, path)
         }
     if not isinstance(value, dict):
         raise ValueError(f"{path} must be a list or mapping of Worker pools.")

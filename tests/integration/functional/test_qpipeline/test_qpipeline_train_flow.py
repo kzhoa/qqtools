@@ -5,8 +5,8 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from qqtools.plugins.qpipeline import Stage
 import qqtools.plugins.qpipeline.runner.runner as runner_module
+from qqtools.plugins.qpipeline import Stage
 from qqtools.plugins.qpipeline.runner.runner import train_runner
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
 
@@ -287,7 +287,7 @@ def test_train_runner_ckp_file_takes_effect(base_args, tiny_task, tiny_model, tm
     loss_fn = torch.nn.MSELoss()
     optimizer = torch.optim.Adam(tiny_model.parameters(), lr=1.0e-3)
 
-    first = train_runner(
+    train_runner(
         model=tiny_model,
         task=tiny_task,
         loss_fn=loss_fn,
@@ -654,9 +654,7 @@ def test_train_runner_bridges_task_on_early_stop(base_args, tiny_model, monkeypa
         def decide(self, context, *, distributed):  # noqa: ARG002
             from qqtools.plugins.qpipeline.runner.contracts import EarlyStopDecision
 
-            return EarlyStopDecision(
-                should_stop=True, source="test", message="forced stop for lifecycle hook test"
-            )
+            return EarlyStopDecision(should_stop=True, source="test", message="forced stop for lifecycle hook test")
 
     args = base_args.copy()
     args.runner.early_stop.patience = 999

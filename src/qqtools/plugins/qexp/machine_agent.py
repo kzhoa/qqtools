@@ -1,4 +1,5 @@
 """Machine-scoped qexp agent for fair dispatch across registered projects."""
+
 from __future__ import annotations
 
 import os
@@ -13,9 +14,9 @@ from typing import Any
 from .agent import _visible_gpus, get_agent_status
 from .authority import AuthoritySupervisor
 from .config_types import RootConfig
-from .machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from .executor import Executor
-from .machine_runtime import MachineRuntime, ProjectBinding
+from .layout import load_root_config, machine_state_path, runtime_pid_path
+from .machine_config import is_legacy_agent_project, save_machine_config
 from .machine_dispatch_plan import (
     MachineDispatchSnapshot,
     PrimaryCandidateObservation,
@@ -27,19 +28,11 @@ from .machine_dispatch_plan import (
     order_dispatch_project_ids,
     reduce_dispatch_cursor,
 )
-from .machine_config import is_legacy_agent_project, save_machine_config
-from .layout import load_root_config, machine_state_path, runtime_pid_path
+from .machine_runtime import MachineRuntime, ProjectBinding
+from .machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from .project_maintenance import maintain_project, reconcile_reservation
+from .runtime.locks import exclusive
 from .runtime.paths import local_paths
-from .runtime.records import TaskSpec, normalize_group_record, utc_now
-from .runtime.ready.group_members import is_group_ready_member_projection_usable
-from .runtime.resources.reservations import (
-    ReservationIdentity,
-    ReservationSnapshot,
-    reconcile_snapshot,
-    reservation_snapshot,
-)
-from .runtime.resources.cpu_lane import cpu_reservation_snapshot
 from .runtime.ready import (
     ReadyProbeBudgetExhausted,
     advance_ready_index_build,
@@ -48,11 +41,19 @@ from .runtime.ready import (
     read_ready_index_state,
     ready_index_route_revision,
 )
-from .runtime.locks import exclusive
+from .runtime.ready.group_members import is_group_ready_member_projection_usable
+from .runtime.records import TaskSpec, normalize_group_record, utc_now
+from .runtime.resources.cpu_lane import cpu_reservation_snapshot
+from .runtime.resources.reservations import (
+    ReservationIdentity,
+    ReservationSnapshot,
+    reconcile_snapshot,
+    reservation_snapshot,
+)
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.work_budget import (
-    AdaptiveBatchSizer,
     DIAGNOSTIC_PUBLISH_INTERVAL_SECONDS,
+    AdaptiveBatchSizer,
     RuntimeDiagnostics,
     SliceBudget,
     WorkBudgetPolicy,
@@ -95,9 +96,7 @@ def _probe_primary_demand(
         return PrimaryDemandProbe("unresolved", ({"reason": f"registry_unreadable:{exc}"},))
     enabled_ids = {binding.project_id for binding in bindings if binding.enabled}
     unavailable = sorted(
-        project_id
-        for project_id in enabled_ids
-        if project_id not in readable or project_id not in dispatchable
+        project_id for project_id in enabled_ids if project_id not in readable or project_id not in dispatchable
     )
     if unavailable:
         diagnostics.extend(
@@ -109,30 +108,19 @@ def _probe_primary_demand(
         )
         return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
     probe_project_ids = sorted(
-        project_id
-        for project_id in readable
-        if project_id in dispatchable and project_id in enabled_ids
+        project_id for project_id in readable if project_id in dispatchable and project_id in enabled_ids
     )
-    probe_route_keys = [
-        (project_id, scope, lane)
-        for project_id in probe_project_ids
-        for scope in ("shared", "home")
-    ]
+    probe_route_keys = [(project_id, scope, lane) for project_id in probe_project_ids for scope in ("shared", "home")]
     pending_routes = runtime.primary_probe_pending_routes.setdefault(lane, set())
     pending_routes.intersection_update(probe_route_keys)
-    pending_routes.update(
-        key for key in probe_route_keys if not runtime.primary_probe_complete.get(key, False)
-    )
+    pending_routes.update(key for key in probe_route_keys if not runtime.primary_probe_complete.get(key, False))
     if not pending_routes:
         pending_routes.update(probe_route_keys)
     has_incomplete_route = any(
-        not runtime.primary_probe_complete.get(cursor_key, False)
-        for cursor_key in probe_route_keys
+        not runtime.primary_probe_complete.get(cursor_key, False) for cursor_key in probe_route_keys
     )
     pending_recheck_routes = [
-        cursor_key
-        for cursor_key in probe_route_keys
-        if cursor_key in runtime.primary_probe_recheck_cursors
+        cursor_key for cursor_key in probe_route_keys if cursor_key in runtime.primary_probe_recheck_cursors
     ]
     recheck_route_cursor = runtime.primary_probe_recheck_round_cursors.get(lane)
     if has_incomplete_route or not pending_recheck_routes:
@@ -147,8 +135,7 @@ def _probe_primary_demand(
         try:
             ready_state = read_ready_index_state(cfg)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-            diagnostics.append({"project_id": project_id,
-                                "reason": f"ready_index_unreadable:{exc}"})
+            diagnostics.append({"project_id": project_id, "reason": f"ready_index_unreadable:{exc}"})
             return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
         if ready_state != "active":
             diagnostics.append({"project_id": project_id, "reason": "ready_index_unresolved"})
@@ -188,43 +175,31 @@ def _probe_primary_demand(
                 is_rechecking_pending_candidate = True
             elif route_state.is_complete:
                 try:
-                    current_revision = ready_index_route_revision(
-                        cfg, scope, budget, primary_only=True, lane=lane
-                    )
+                    current_revision = ready_index_route_revision(cfg, scope, budget, primary_only=True, lane=lane)
                 except ReadyProbeBudgetExhausted:
-                    diagnostics.append({"project_id": project_id,
-                                        "reason": "probe_budget_exhausted"})
+                    diagnostics.append({"project_id": project_id, "reason": "probe_budget_exhausted"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    diagnostics.append({"project_id": project_id,
-                                        "reason": f"index_unreadable:{exc}"})
+                    diagnostics.append({"project_id": project_id, "reason": f"index_unreadable:{exc}"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 decision = begin_primary_probe_route(route_state, current_revision)
                 runtime.primary_probe_cursors[cursor_key] = decision.state.cursor
                 runtime.primary_probe_revisions[cursor_key] = decision.state.revision
                 runtime.primary_probe_complete[cursor_key] = decision.state.is_complete
                 if decision.has_index_changed:
-                    diagnostics.append({"project_id": project_id,
-                                        "reason": "ready_index_changed"})
+                    diagnostics.append({"project_id": project_id, "reason": "ready_index_changed"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 if not decision.should_scan:
                     pending_routes.discard(cursor_key)
                     continue
-            if (
-                (route_state.cursor is None or route_state.revision is None)
-                and not is_rechecking_pending_candidate
-            ):
+            if (route_state.cursor is None or route_state.revision is None) and not is_rechecking_pending_candidate:
                 try:
-                    start_revision = ready_index_route_revision(
-                        cfg, scope, budget, primary_only=True, lane=lane
-                    )
+                    start_revision = ready_index_route_revision(cfg, scope, budget, primary_only=True, lane=lane)
                 except ReadyProbeBudgetExhausted:
-                    diagnostics.append({"project_id": project_id,
-                                        "reason": "probe_budget_exhausted"})
+                    diagnostics.append({"project_id": project_id, "reason": "probe_budget_exhausted"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    diagnostics.append({"project_id": project_id,
-                                        "reason": f"index_unreadable:{exc}"})
+                    diagnostics.append({"project_id": project_id, "reason": f"index_unreadable:{exc}"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 decision = begin_primary_probe_route(route_state, start_revision)
                 runtime.primary_probe_revisions[cursor_key] = decision.state.revision
@@ -237,15 +212,15 @@ def _probe_primary_demand(
                 try:
                     peek = peek_primary_ready_marker(cfg, project_id, scope, cursor, budget)
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    diagnostics.append({"project_id": project_id,
-                                        "reason": f"index_unreadable:{exc}"})
+                    diagnostics.append({"project_id": project_id, "reason": f"index_unreadable:{exc}"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 if peek.exhausted or peek.unresolved:
-                    diagnostics.append({"project_id": project_id,
-                                        "reason": (
-                                            "probe_budget_exhausted"
-                                            if peek.exhausted else "ready_index_unresolved"
-                                        )})
+                    diagnostics.append(
+                        {
+                            "project_id": project_id,
+                            "reason": ("probe_budget_exhausted" if peek.exhausted else "ready_index_unresolved"),
+                        }
+                    )
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 cursor = peek.cursor
                 runtime.primary_probe_cursors[cursor_key] = cursor
@@ -263,23 +238,25 @@ def _probe_primary_demand(
                 reference = peek.reference
                 if not budget.can_start_record(operations=3):
                     runtime.primary_probe_cursors[cursor_key] = cursor_before
-                    diagnostics.append({"project_id": project_id,
-                                        "reason": "probe_budget_exhausted"})
+                    diagnostics.append({"project_id": project_id, "reason": "probe_budget_exhausted"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 budget.consume_record(operations=3)
                 try:
                     result = classify_ready_marker(cfg, reference)
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                     runtime.primary_probe_cursors[cursor_key] = cursor_before
-                    diagnostics.append({"project_id": project_id, "task_id": reference.task_id,
-                                        "reason": f"marker_unreadable:{exc}"})
+                    diagnostics.append(
+                        {"project_id": project_id, "task_id": reference.task_id, "reason": f"marker_unreadable:{exc}"}
+                    )
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 if result.classification == "corrupt":
-                    diagnostics.append({
-                        "project_id": project_id,
-                        "task_id": reference.task_id,
-                        "reason": result.reason,
-                    })
+                    diagnostics.append(
+                        {
+                            "project_id": project_id,
+                            "task_id": reference.task_id,
+                            "reason": result.reason,
+                        }
+                    )
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 if result.classification == "temporarily_unavailable":
                     if result.reason.startswith("dependency_"):
@@ -309,15 +286,18 @@ def _probe_primary_demand(
                     is_eligible = _eligible(cfg, task)
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                     runtime.primary_probe_cursors[cursor_key] = cursor_before
-                    diagnostics.append({"project_id": project_id, "task_id": task.task_id,
-                                        "reason": f"task_truth_unreadable:{exc}"})
+                    diagnostics.append(
+                        {"project_id": project_id, "task_id": task.task_id, "reason": f"task_truth_unreadable:{exc}"}
+                    )
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 if not is_eligible:
-                    diagnostics.append({
-                        "project_id": project_id,
-                        "task_id": task.task_id,
-                        "reason": "placement_rejected",
-                    })
+                    diagnostics.append(
+                        {
+                            "project_id": project_id,
+                            "task_id": task.task_id,
+                            "reason": "placement_rejected",
+                        }
+                    )
                     continue
                 has_primary_group_worker = True
                 if task.group_name is not None:
@@ -326,8 +306,9 @@ def _probe_primary_demand(
                         normalize_group_record(group)
                     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                         runtime.primary_probe_cursors[cursor_key] = cursor_before
-                        diagnostics.append({"project_id": project_id, "task_id": task.task_id,
-                                            "reason": f"group_unreadable:{exc}"})
+                        diagnostics.append(
+                            {"project_id": project_id, "task_id": task.task_id, "reason": f"group_unreadable:{exc}"}
+                        )
                         return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                     worker = group["group"]["worker_set"].get(cfg.machine_name)
                     if worker is None or worker["scheduling_role"] != "primary":
@@ -362,11 +343,13 @@ def _probe_primary_demand(
                     )
                 )
                 if decision.reason is not None:
-                    diagnostics.append({
-                        "project_id": project_id,
-                        "task_id": task.task_id,
-                        "reason": decision.reason,
-                    })
+                    diagnostics.append(
+                        {
+                            "project_id": project_id,
+                            "task_id": task.task_id,
+                            "reason": decision.reason,
+                        }
+                    )
                 if decision.outcome == "runnable_now":
                     runtime.primary_probe_cursors[cursor_key] = cursor_before
                     return PrimaryDemandProbe("runnable_now", tuple(diagnostics[-32:]))
@@ -380,16 +363,12 @@ def _probe_primary_demand(
                 pending_routes.discard(cursor_key)
                 continue
             try:
-                end_revision = ready_index_route_revision(
-                    cfg, scope, budget, primary_only=True, lane=lane
-                )
+                end_revision = ready_index_route_revision(cfg, scope, budget, primary_only=True, lane=lane)
             except ReadyProbeBudgetExhausted:
-                diagnostics.append({"project_id": project_id,
-                                    "reason": "probe_budget_exhausted"})
+                diagnostics.append({"project_id": project_id, "reason": "probe_budget_exhausted"})
                 return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
             except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                diagnostics.append({"project_id": project_id,
-                                    "reason": f"index_unreadable:{exc}"})
+                diagnostics.append({"project_id": project_id, "reason": f"index_unreadable:{exc}"})
                 return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
             decision = finish_primary_probe_route(
                 PrimaryProbeRouteState(
@@ -403,14 +382,9 @@ def _probe_primary_demand(
             runtime.primary_probe_revisions[cursor_key] = decision.state.revision
             runtime.primary_probe_complete[cursor_key] = decision.state.is_complete
             if decision.has_index_changed:
-                diagnostics.append({"project_id": project_id,
-                                    "reason": "ready_index_changed"})
+                diagnostics.append({"project_id": project_id, "reason": "ready_index_changed"})
                 return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-            if (
-                is_rechecking_pending_candidate
-                and not has_recheck_candidate
-                and not has_completed_selected_recheck
-            ):
+            if is_rechecking_pending_candidate and not has_recheck_candidate and not has_completed_selected_recheck:
                 runtime.primary_probe_recheck_cursors.pop(cursor_key, None)
             if cursor_key == selected_recheck_route:
                 has_completed_selected_recheck = True
@@ -437,9 +411,7 @@ def _build_borrow_admission_grant(
         for scope in ("shared", "home"):
             cursor_key = (project_id, scope, lane)
             revision = runtime.primary_probe_revisions.get(cursor_key)
-            if not runtime.primary_probe_complete.get(cursor_key) or not isinstance(
-                revision, int
-            ):
+            if not runtime.primary_probe_complete.get(cursor_key) or not isinstance(revision, int):
                 return None
             revisions.append(_BorrowAdmissionRevision(project_id, cfg, scope, revision))
     grant = _BorrowAdmissionGrant(runtime.root, tuple(revisions), lane)
@@ -468,12 +440,7 @@ def _pid_start_time_ticks(pid: int | None) -> int | None:
     if not pid:
         return None
     try:
-        fields = (
-            (Path("/proc") / str(pid) / "stat")
-            .read_text(encoding="utf-8")
-            .rsplit(")", 1)[1]
-            .split()
-        )
+        fields = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
         if fields[0] == "Z":
             return None
         return int(fields[19])
@@ -534,14 +501,26 @@ def _record_bad_task_spec(runtime: MachineRuntime, binding: ProjectBinding, task
         return
     atomic_replace(
         runtime.paths["diagnostics"] / f"bad-task-spec-{binding.project_id}-{task_id}.json",
-        {"machine_diagnostic": {"kind": "bad_task_spec_working_directory", "project_id": binding.project_id,
-                                "task_id": task_id, "path": spec.working_directory, "reason": reason}},
+        {
+            "machine_diagnostic": {
+                "kind": "bad_task_spec_working_directory",
+                "project_id": binding.project_id,
+                "task_id": task_id,
+                "path": spec.working_directory,
+                "reason": reason,
+            }
+        },
     )
 
 
 def _publish_project_snapshots(
-    readable: dict[str, RootConfig], *, instance_id: str, pid: int | None, visible: list[int],
-    reservations: list[dict[str, Any]], heartbeat_interval_seconds: float = 5.0,
+    readable: dict[str, RootConfig],
+    *,
+    instance_id: str,
+    pid: int | None,
+    visible: list[int],
+    reservations: list[dict[str, Any]],
+    heartbeat_interval_seconds: float = 5.0,
     started_at: str | None = None,
 ) -> None:
     """Publish each readable project's view of the shared machine reservation state."""
@@ -549,9 +528,7 @@ def _publish_project_snapshots(
     started_at = started_at or utc_now()
     for project_id, cfg in readable.items():
         attempts = [item.get("attempt_id") for item in reservations if item.get("project_id") == project_id]
-        project_reservations = [
-            item for item in reservations if item.get("project_id") == project_id
-        ]
+        project_reservations = [item for item in reservations if item.get("project_id") == project_id]
         agent_path = machine_state_path(cfg, "agent.json")
         idle_since_at = None
         if not reserved:
@@ -567,12 +544,17 @@ def _publish_project_snapshots(
                     pass
         try:
             publish_machine_snapshots(
-                cfg, instance_id=instance_id, pid=pid, agent_mode="machine",
+                cfg,
+                instance_id=instance_id,
+                pid=pid,
+                agent_mode="machine",
                 observed_state="active" if reserved else "idle",
                 active_attempt_ids=[item for item in attempts if isinstance(item, str)],
-                visible_gpu_ids=visible, reserved_gpu_ids=reserved,
+                visible_gpu_ids=visible,
+                reserved_gpu_ids=reserved,
                 reservation_summaries=project_reservations,
-                heartbeat_interval_seconds=heartbeat_interval_seconds, started_at=started_at,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                started_at=started_at,
                 idle_since_at=idle_since_at,
             )
         except OSError:
@@ -665,9 +647,15 @@ class _MachineControlPlane:
     """Run deadline-sensitive heartbeats and authority renewal outside dispatch scans."""
 
     def __init__(
-            self, runtime: MachineRuntime, *, instance_id: str, loop_interval: float,
-            started_at: str, available_gpus: list[int] | None,
-            scheduler_wakeup: threading.Event | None = None) -> None:
+        self,
+        runtime: MachineRuntime,
+        *,
+        instance_id: str,
+        loop_interval: float,
+        started_at: str,
+        available_gpus: list[int] | None,
+        scheduler_wakeup: threading.Event | None = None,
+    ) -> None:
         self._runtime = runtime
         self._instance_id = instance_id
         self._loop_interval = loop_interval
@@ -712,9 +700,7 @@ class _MachineControlPlane:
             self._scheduler_wakeup.set()
         self._registry_revision = revision
         return [
-            binding
-            for binding in registered
-            if binding.enabled or self._runtime.binding_state(binding) == "draining"
+            binding for binding in registered if binding.enabled or self._runtime.binding_state(binding) == "draining"
         ]
 
     def _run_authority_cycle(self) -> float:
@@ -748,10 +734,7 @@ class _MachineControlPlane:
             for item in reservation_snapshot(self._runtime.root).reservations
             for gpu_id in item.get("gpu_ids", [])
         }
-        if (
-            reserved_after < reserved_before
-            and self._scheduler_wakeup is not None
-        ):
+        if reserved_after < reserved_before and self._scheduler_wakeup is not None:
             self._scheduler_wakeup.set()
         return authority_interval
 
@@ -845,8 +828,7 @@ def dispatch_machine_cycle_locked(
     now_ns = time.monotonic_ns()
     publish_interval_ns = DIAGNOSTIC_PUBLISH_INTERVAL_SECONDS * 1_000_000_000
     should_publish_diagnostic = (
-        runtime.last_diagnostic_publish_ns is None
-        or now_ns - runtime.last_diagnostic_publish_ns >= publish_interval_ns
+        runtime.last_diagnostic_publish_ns is None or now_ns - runtime.last_diagnostic_publish_ns >= publish_interval_ns
     )
     if not should_publish_diagnostic:
         return results
@@ -933,9 +915,7 @@ def _dispatch_admission_layer(
                     snapshot = reconcile_snapshot(runtime.root)
                     free = [gpu_id for gpu_id in visible if gpu_id not in snapshot.reserved_gpu_ids]
                     policy, cpu_reservations = cpu_reservation_snapshot(runtime.root)
-                    free_cpu_slots = policy.capacity - sum(
-                        item.get("cpu_slots", 0) for item in cpu_reservations
-                    )
+                    free_cpu_slots = policy.capacity - sum(item.get("cpu_slots", 0) for item in cpu_reservations)
             except (OSError, RuntimeError, ValueError) as exc:
                 item = result_by_project[binding.project_id]
                 item["status"] = "error"
@@ -975,11 +955,7 @@ def _dispatch_machine_cycle_locked(
 ) -> list[dict[str, Any]]:
     executor = executor or Executor()
     _, registered = runtime.load_registry()
-    supervised = [
-        binding
-        for binding in registered
-        if binding.enabled or runtime.binding_state(binding) == "draining"
-    ]
+    supervised = [binding for binding in registered if binding.enabled or runtime.binding_state(binding) == "draining"]
     if supervisors is not None:
         supervised_ids = {binding.project_id for binding in supervised}
         for project_id in set(supervisors) - supervised_ids:
@@ -1045,15 +1021,15 @@ def _dispatch_machine_cycle_locked(
     visible = (
         list(available_gpus)
         if available_gpus is not None
-        else _visible_gpus(next(iter(readable.values()))) if readable else []
+        else _visible_gpus(next(iter(readable.values())))
+        if readable
+        else []
     )
     free = [gpu_id for gpu_id in visible if gpu_id not in snapshot.reserved_gpu_ids]
     cpu_policy, cpu_reservations = cpu_reservation_snapshot(runtime.root)
     free_cpu_slots = cpu_policy.capacity - sum(item.get("cpu_slots", 0) for item in cpu_reservations)
     cursor_project_id = runtime.load_cursor()
-    enabled_by_project = {
-        binding.project_id: binding for binding in registered if binding.enabled
-    }
+    enabled_by_project = {binding.project_id: binding for binding in registered if binding.enabled}
     ordered_project_ids = order_dispatch_project_ids(
         tuple(enabled_by_project),
         cursor_project_id,
@@ -1062,9 +1038,7 @@ def _dispatch_machine_cycle_locked(
     diagnostic_increment("scheduler.capacity.visible_gpus", len(visible))
     diagnostic_increment("scheduler.capacity.reserved_gpus", len(snapshot.reserved_gpu_ids))
     diagnostic_increment("scheduler.capacity.free_gpus", len(free))
-    result_by_project = {
-        item["project_id"]: item for item in results if item.get("project_id") is not None
-    }
+    result_by_project = {item["project_id"]: item for item in results if item.get("project_id") is not None}
     for binding in ordered_enabled:
         if binding.project_id in dispatchable and binding.project_id not in result_by_project:
             item = {
@@ -1107,21 +1081,23 @@ def _dispatch_machine_cycle_locked(
     # CPU and GPU borrowing are separate admission domains.  A busy primary queue in one
     # lane must never turn the other lane's complete no-demand probe into a denial.
     for lane, has_capacity in (("gpu", bool(free)), ("cpu", bool(free_cpu_slots))):
-        probe = _probe_primary_demand(
-            runtime,
-            readable,
-            dispatchable,
-            visible if lane == "gpu" else list(range(cpu_policy.capacity)),
-            free if lane == "gpu" else list(range(free_cpu_slots)),
-            SliceBudget(WorkBudgetPolicy()),
-            snapshot.reservations,
-            lane=lane,
-        ) if has_capacity else PrimaryDemandProbe("unresolved")
+        probe = (
+            _probe_primary_demand(
+                runtime,
+                readable,
+                dispatchable,
+                visible if lane == "gpu" else list(range(cpu_policy.capacity)),
+                free if lane == "gpu" else list(range(free_cpu_slots)),
+                SliceBudget(WorkBudgetPolicy()),
+                snapshot.reservations,
+                lane=lane,
+            )
+            if has_capacity
+            else PrimaryDemandProbe("unresolved")
+        )
         borrow_admission_grant = None
         if probe.state == "no_primary_demand":
-            borrow_admission_grant = _build_borrow_admission_grant(
-                runtime, dispatchable, probe, enabled_ids, lane=lane
-            )
+            borrow_admission_grant = _build_borrow_admission_grant(runtime, dispatchable, probe, enabled_ids, lane=lane)
             if borrow_admission_grant is None:
                 probe = PrimaryDemandProbe("unresolved", probe.diagnostics)
         dispatch_plan = build_machine_dispatch_plan(
@@ -1149,9 +1125,7 @@ def _dispatch_machine_cycle_locked(
                 batch_sizers,
                 budget,
                 admission_role=admission_role,
-                borrow_admission_grant=(
-                    borrow_admission_grant if admission_role == "borrow" else None
-                ),
+                borrow_admission_grant=(borrow_admission_grant if admission_role == "borrow" else None),
                 lane=lane,
             )
             if lane == "gpu":
@@ -1166,8 +1140,13 @@ def _dispatch_machine_cycle_locked(
     if publish_snapshots:
         reservations = list(reservation_snapshot(runtime.root).reservations)
         _publish_project_snapshots(
-            readable, instance_id=instance_id, pid=_read_pid(runtime), visible=visible, reservations=reservations,
-            heartbeat_interval_seconds=heartbeat_interval_seconds, started_at=started_at,
+            readable,
+            instance_id=instance_id,
+            pid=_read_pid(runtime),
+            visible=visible,
+            reservations=reservations,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            started_at=started_at,
         )
     return results
 
@@ -1185,12 +1164,12 @@ def dispatch_machine_cycle(
         with runtime.migration_guard() as is_migration_clear:
             if not is_migration_clear:
                 return []
-            return dispatch_machine_cycle_locked(
-                runtime, available_gpus=available_gpus, executor=executor
-            )
+            return dispatch_machine_cycle_locked(runtime, available_gpus=available_gpus, executor=executor)
 
 
-def get_machine_agent_status(runtime: MachineRuntime | str | Path | None = None, *, probe_local_pid: bool = True) -> dict[str, Any]:
+def get_machine_agent_status(
+    runtime: MachineRuntime | str | Path | None = None, *, probe_local_pid: bool = True
+) -> dict[str, Any]:
     """Return machine-agent process and project-registry status."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     identity = _active_machine_identity(machine_runtime)
@@ -1203,10 +1182,7 @@ def get_machine_agent_status(runtime: MachineRuntime | str | Path | None = None,
         "pid": pid,
         "is_running": running,
         "registry_revision": revision,
-        "projects": [
-            {**binding.to_dict(), "state": machine_runtime.binding_state(binding)}
-            for binding in bindings
-        ],
+        "projects": [{**binding.to_dict(), "state": machine_runtime.binding_state(binding)} for binding in bindings],
     }
 
 
@@ -1269,9 +1245,7 @@ def _stop_verified_legacy_agent(cfg: RootConfig, *, timeout: float = 5.0) -> int
         raise RuntimeError("legacy agent PID cannot be verified; refusing to signal it.")
     start_ticks = _pid_start_time_ticks(pid)
     if start_ticks is None:
-        raise RuntimeError(
-            "legacy agent process identity cannot be verified; refusing to signal it."
-        )
+        raise RuntimeError("legacy agent process identity cannot be verified; refusing to signal it.")
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + timeout
     while _pid_start_time_ticks(pid) == start_ticks and time.monotonic() < deadline:
@@ -1314,16 +1288,12 @@ def _save_migration_state(
     atomic_replace(runtime.migration_path(binding.project_id), value)
 
 
-def _import_legacy_reservations(
-    runtime: MachineRuntime, binding: ProjectBinding, cfg: RootConfig
-) -> None:
+def _import_legacy_reservations(runtime: MachineRuntime, binding: ProjectBinding, cfg: RootConfig) -> None:
     """Move legacy reservations without overwriting a possibly unrelated machine record."""
     source_paths = local_paths(cfg.runtime_root)
     source_lock = source_paths["locks"] / "gpu-reservations.lock"
     if source_lock.resolve() == runtime.paths["reservation_lock"].resolve():
-        raise RuntimeError(
-            "legacy and machine reservation roots must be different during migration."
-        )
+        raise RuntimeError("legacy and machine reservation roots must be different during migration.")
     with exclusive(source_lock):
         records: list[tuple[Path, Path, dict[str, Any]]] = []
         for name in ("active", "provisional"):
@@ -1380,9 +1350,7 @@ def migrate_project(runtime: MachineRuntime | str | Path | None, cfg: RootConfig
             raise ValueError("project already uses the machine-agent runtime; use 'qexp agent add-project'.")
         binding = machine_runtime.add_binding(cfg.shared_root, cfg.machine_name, enabled=False)
         prepared_at = utc_now()
-        _save_migration_state(
-            machine_runtime, binding, cfg, state="prepared", prepared_at=prepared_at
-        )
+        _save_migration_state(machine_runtime, binding, cfg, state="prepared", prepared_at=prepared_at)
     else:
         binding = existing
         migration_path = machine_runtime.migration_path(binding.project_id)
@@ -1402,9 +1370,7 @@ def migrate_project(runtime: MachineRuntime | str | Path | None, cfg: RootConfig
     with machine_runtime.migration_guard():
         try:
             _stop_verified_legacy_agent(cfg)
-            _save_migration_state(
-                machine_runtime, binding, cfg, state="legacy_agent_stopped", prepared_at=prepared_at
-            )
+            _save_migration_state(machine_runtime, binding, cfg, state="legacy_agent_stopped", prepared_at=prepared_at)
             _import_legacy_reservations(machine_runtime, binding, cfg)
             _save_migration_state(
                 machine_runtime,
@@ -1416,9 +1382,7 @@ def migrate_project(runtime: MachineRuntime | str | Path | None, cfg: RootConfig
             machine_runtime.import_legacy_evidence(binding)
             save_machine_config(cfg, agent_mode=None)
             binding = machine_runtime.set_enabled(binding.project_id, True)
-            _save_migration_state(
-                machine_runtime, binding, cfg, state="active", prepared_at=prepared_at
-            )
+            _save_migration_state(machine_runtime, binding, cfg, state="active", prepared_at=prepared_at)
         except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
             if binding.enabled:
                 binding = machine_runtime.set_enabled(binding.project_id, False)
@@ -1439,8 +1403,12 @@ def unregister_project(runtime: MachineRuntime | str | Path | None, identifier: 
     return (runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)).remove_binding(identifier)
 
 
-def set_project_enabled(runtime: MachineRuntime | str | Path | None, identifier: str | Path, enabled: bool) -> ProjectBinding:
-    return (runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)).set_enabled(identifier, enabled)
+def set_project_enabled(
+    runtime: MachineRuntime | str | Path | None, identifier: str | Path, enabled: bool
+) -> ProjectBinding:
+    return (runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)).set_enabled(
+        identifier, enabled
+    )
 
 
 def run_machine_agent_loop(
@@ -1487,12 +1455,17 @@ def run_machine_agent_loop(
             previous_int = signal.signal(signal.SIGINT, request_stop)
             pid_path.write_text(str(os.getpid()), encoding="utf-8")
             is_pid_published = True
-            atomic_replace(machine_runtime.paths["agent"] / "status.json", {
-                "machine_agent": {
-                    "instance_id": instance_id, "pid": os.getpid(),
-                    "pid_start_time_ticks": start_ticks, "state": "active",
-                }
-            })
+            atomic_replace(
+                machine_runtime.paths["agent"] / "status.json",
+                {
+                    "machine_agent": {
+                        "instance_id": instance_id,
+                        "pid": os.getpid(),
+                        "pid_start_time_ticks": start_ticks,
+                        "state": "active",
+                    }
+                },
+            )
             is_status_published = True
             control_plane = _MachineControlPlane(
                 machine_runtime,
@@ -1511,8 +1484,11 @@ def run_machine_agent_loop(
                     with machine_runtime.migration_guard() as is_migration_clear:
                         if is_migration_clear:
                             dispatch_machine_cycle_locked(
-                                machine_runtime, available_gpus=available_gpus, executor=executor,
-                                instance_id=instance_id, heartbeat_interval_seconds=loop_interval,
+                                machine_runtime,
+                                available_gpus=available_gpus,
+                                executor=executor,
+                                instance_id=instance_id,
+                                heartbeat_interval_seconds=loop_interval,
                                 started_at=started_at,
                                 supervise=False,
                                 publish_snapshots=False,
@@ -1526,16 +1502,14 @@ def run_machine_agent_loop(
                 control_plane.stop()
             try:
                 is_active_identity = _active_machine_identity(machine_runtime) == (
-                    os.getpid(), instance_id, start_ticks
+                    os.getpid(),
+                    instance_id,
+                    start_ticks,
                 )
                 if is_active_identity:
                     try:
                         reservations = list(reservation_snapshot(machine_runtime.root).reservations)
-                        reserved = sorted({
-                            gpu_id
-                            for item in reservations
-                            for gpu_id in item.get("gpu_ids", [])
-                        })
+                        reserved = sorted({gpu_id for item in reservations for gpu_id in item.get("gpu_ids", [])})
                     except (KeyError, OSError, ValueError):
                         reserved = []
                     try:
@@ -1562,11 +1536,10 @@ def run_machine_agent_loop(
                 if is_pid_published:
                     pid_path.unlink(missing_ok=True)
                 if is_status_published:
-                    atomic_replace(machine_runtime.paths["agent"] / "status.json", {
-                        "machine_agent": {
-                            "instance_id": instance_id, "pid": None, "state": "stopped"
-                        }
-                    })
+                    atomic_replace(
+                        machine_runtime.paths["agent"] / "status.json",
+                        {"machine_agent": {"instance_id": instance_id, "pid": None, "state": "stopped"}},
+                    )
             finally:
                 try:
                     if previous_int is not None:
@@ -1581,21 +1554,20 @@ def _start_machine_agent_locked(machine_runtime: MachineRuntime, *, stdin=None, 
     if status["is_running"]:
         raise RuntimeError(f"machine agent is already running with pid {status['pid']}.")
     from .machine_agent_process import spawn_machine_agent_process
+
     return spawn_machine_agent_process(machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr)
 
 
-def start_machine_agent(
-        runtime: MachineRuntime | str | Path | None = None, *, stdin=None, stdout=None, stderr=None):
+def start_machine_agent(runtime: MachineRuntime | str | Path | None = None, *, stdin=None, stdout=None, stderr=None):
     """Spawn the unique persistent machine agent."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     with machine_runtime.agent_lifecycle_guard():
-        return _start_machine_agent_locked(
-            machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr
-        )
+        return _start_machine_agent_locked(machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr)
 
 
 def ensure_machine_agent_started(
-        runtime: MachineRuntime | str | Path | None = None, *, stdin=None, stdout=None, stderr=None):
+    runtime: MachineRuntime | str | Path | None = None, *, stdin=None, stdout=None, stderr=None
+):
     """Return the running agent status, starting it atomically when absent."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     with machine_runtime.agent_lifecycle_guard():
@@ -1603,9 +1575,7 @@ def ensure_machine_agent_started(
         if status["is_running"]:
             return None, status
         try:
-            process = _start_machine_agent_locked(
-                machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr
-            )
+            process = _start_machine_agent_locked(machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr)
         except RuntimeError:
             status = get_machine_agent_status(machine_runtime)
             if status["is_running"]:
@@ -1639,16 +1609,13 @@ def stop_machine_agent(runtime: MachineRuntime | str | Path | None = None, *, ti
         return _stop_machine_agent_locked(machine_runtime, timeout=timeout)
 
 
-def restart_machine_agent(
-        runtime: MachineRuntime | str | Path | None = None, *, stdin=None, stdout=None, stderr=None):
+def restart_machine_agent(runtime: MachineRuntime | str | Path | None = None, *, stdin=None, stdout=None, stderr=None):
     """Replace a running machine agent without treating it as a cold start."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     with machine_runtime.agent_lifecycle_guard():
         identity = _active_machine_identity(machine_runtime)
         previous_pid = identity[0] if identity is not None else None
         _stop_machine_agent_locked(machine_runtime, timeout=10.0)
-        process = _start_machine_agent_locked(
-            machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr
-        )
+        process = _start_machine_agent_locked(machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr)
         process.previous_pid = previous_pid
         return process

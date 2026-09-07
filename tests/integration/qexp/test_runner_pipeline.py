@@ -19,6 +19,7 @@ from qqtools.plugins.qexp.scheduler import authorize_launch, cancel_task, claim_
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 @pytest.fixture(autouse=True)
 def _disable_process_group_guardian(monkeypatch):
     monkeypatch.setattr("qqtools.plugins.qexp.runner._configure_process_group_guardian", lambda: None)

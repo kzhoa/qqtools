@@ -143,8 +143,7 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
         attempts = result.get("attempts", ())
         submission = result.get("submission", {})
         execution_machines = [
-            f"#{attempt.get('attempt', {}).get('attempt_number')}:"
-            f"{attempt.get('attempt', {}).get('machine_name')}"
+            f"#{attempt.get('attempt', {}).get('attempt_number')}:{attempt.get('attempt', {}).get('machine_name')}"
             for attempt in attempts
         ]
         return _details(
@@ -229,11 +228,7 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
                     item.get("machine_name"),
                     item.get("scheduling_role"),
                     item.get("gpu_usage"),
-                    (
-                        item.get("gpu_limit_gpus")
-                        if item.get("gpu_limit_gpus") is not None
-                        else "unlimited"
-                    ),
+                    (item.get("gpu_limit_gpus") if item.get("gpu_limit_gpus") is not None else "unlimited"),
                     item.get("state"),
                     item.get("agent"),
                 )

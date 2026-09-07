@@ -4,9 +4,10 @@ Optimizer and loss function configuration interactive module
 Key point: Support single loss function, comboloss multi-target, and complete EMA configuration
 """
 
-import qqtools as qt
 from prompt_toolkit import print_formatted_text, prompt
 from prompt_toolkit.completion import WordCompleter
+
+import qqtools as qt
 
 # Supported loss functions
 LOSS_FUNCTIONS = ["mse", "rmse", "mae", "l1", "l2mae", "bce", "ce", "cross_entropy", "focal", "comboloss"]
@@ -107,7 +108,7 @@ def prompt_loss_params():
                 print_formatted_text("    ❌ Target name cannot be empty.")
 
             # Input loss function for this target
-            target_loss_completer = WordCompleter([l for l in LOSS_FUNCTIONS if l != "comboloss"])
+            target_loss_completer = WordCompleter([loss for loss in LOSS_FUNCTIONS if loss != "comboloss"])
             while True:
                 target_loss = (
                     prompt(f"    Loss for '{target_name}' (default: mse): ", completer=target_loss_completer)
@@ -246,10 +247,11 @@ def prompt_ema_params():
     while True:
         default_val = EMA_DEFAULTS["auto_offload"]
         default_text = "yes" if default_val else "no"
-        value = prompt(
-            "  Automatically offload the main model for EMA evaluation? "
-            f"(yes/no, default: {default_text}): "
-        ).strip().lower()
+        value = (
+            prompt(f"  Automatically offload the main model for EMA evaluation? (yes/no, default: {default_text}): ")
+            .strip()
+            .lower()
+        )
         if value in ("y", "yes"):
             auto_offload = True
             break

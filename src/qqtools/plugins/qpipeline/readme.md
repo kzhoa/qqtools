@@ -26,9 +26,11 @@ example:
 ```python
 from qqtools.pipeline import prepare_cmd_args
 
+
 def patch(parser: argparse.ArgumentParser):
     parser.add_argument("--file", type=str)
     return parser
+
 
 args = prepare_cmd_args(patch=patch)
 file = args.file
@@ -107,7 +109,9 @@ class MyPipeline(QPipeline):
     def prepare_model(args):
         pass
 
+
 # or
+
 
 class MyPipeline(QPipeline):
     prepare_model = staticmethod(prepare_model)
@@ -162,6 +166,7 @@ qpipeline 支持通过约定方法自动发现哪些参数应该免除 weight de
 class MyLayerNorm(nn.LayerNorm):
     def no_decay(self) -> List[str]:
         return ["weight", "bias"]
+
 
 class MyBlock(nn.Module):
     def __init__(self):
@@ -237,8 +242,9 @@ task需要继承qTaskBase，
 
 ```python
 from qqtools.pipeline import qTaskBase
-class MyTask(qTaskBase):
 
+
+class MyTask(qTaskBase):
     def __init__(self, args):
         super().__init__()
         self.train_loader = None

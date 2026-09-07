@@ -19,7 +19,7 @@ def plot_list_histogram(data, bins=10):
 
     for i in range(len(hist)):
         # Bin range
-        bin_range = f"[{edges[i]:.2f}, {edges[i+1]:.2f})"
+        bin_range = f"[{edges[i]:.2f}, {edges[i + 1]:.2f})"
         # Count
         count = hist[i]
         # Create bar
@@ -94,7 +94,7 @@ def plot_dict_distribution(
     if show_percentage:
         header += f" | {'%':>8}"
     if show_bar:
-        header += f" | Distribution"
+        header += " | Distribution"
     print(header)
     print("-" * terminal_width)
 
@@ -145,13 +145,12 @@ def plot_dict_distribution(
 
     # Footer
     print("-" * terminal_width)
-    stats_line = f"Total: {len(keys)} items, Sum: {total:,.2f}, Mean: {total/len(keys):,.2f}"
+    stats_line = f"Total: {len(keys)} items, Sum: {total:,.2f}, Mean: {total / len(keys):,.2f}"
     if len(items) > 1:
-        stats_line += f", Range: {max(values)-min(values):,.2f}"
+        stats_line += f", Range: {max(values) - min(values):,.2f}"
     print(stats_line.center(terminal_width))
 
 
 if __name__ == "__main__":
-
     data = [1.2, 2.3, 1.5, 3.2, 2.8, 2.1, 1.9, 3.5, 2.7, 1.8, 2.2, 3.1]
     plot_list_histogram(data)

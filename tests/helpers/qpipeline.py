@@ -16,9 +16,7 @@ class TinyTask(qTaskBase):
         y = torch.randn(num_samples, 1)
         train_size = int(num_samples * 0.6)
         val_size = int(num_samples * 0.2)
-        self.train_loader = DataLoader(
-            TensorDataset(x[:train_size], y[:train_size]), batch_size=8, shuffle=False
-        )
+        self.train_loader = DataLoader(TensorDataset(x[:train_size], y[:train_size]), batch_size=8, shuffle=False)
         self.val_loader = DataLoader(
             TensorDataset(x[train_size : train_size + val_size], y[train_size : train_size + val_size]),
             batch_size=8,

@@ -1,4 +1,5 @@
 """Retired standalone-agent entrypoint retained for clear upgrade diagnostics."""
+
 from __future__ import annotations
 
 import argparse

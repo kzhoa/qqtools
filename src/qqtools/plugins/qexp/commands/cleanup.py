@@ -1,4 +1,5 @@
 """Cleanup command workflows for qexp."""
+
 from __future__ import annotations
 
 import os
@@ -9,14 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from ..config_types import RootConfig
-from ..runtime.locks import group_lock, schema_writer_lock, task_lock
-from ..runtime.claims import reconcile_claim_archives
-from ..runtime.paths import group_path, local_paths, shared_paths, task_path
-from ..runtime.records import AttemptRecord, SCHEMA_VERSION, TaskRecord, new_id, utc_now
-from ..runtime.store import atomic_replace, iter_json, read_json
-from ..runtime.tasks import load_task, save_task
 from ..runtime.availability import remove_deadline_index
-from ..runtime.ready import assert_ready_writer_compatible, retire_current_ready_generation
+from ..runtime.claims import reconcile_claim_archives
+from ..runtime.locks import group_lock, schema_writer_lock, task_lock
 from ..runtime.operation_store import (
     active_operation_path,
     archive_operation,
@@ -24,6 +20,11 @@ from ..runtime.operation_store import (
     locate_operation_path,
     write_active_operation,
 )
+from ..runtime.paths import group_path, local_paths, shared_paths, task_path
+from ..runtime.ready import assert_ready_writer_compatible, retire_current_ready_generation
+from ..runtime.records import SCHEMA_VERSION, AttemptRecord, TaskRecord, new_id, utc_now
+from ..runtime.store import atomic_replace, iter_json, read_json
+from ..runtime.tasks import load_task, save_task
 
 
 def _machine_project_id(cfg: RootConfig, reservation_runtime_root: Path) -> str | None:
@@ -36,16 +37,13 @@ def _machine_project_id(cfg: RootConfig, reservation_runtime_root: Path) -> str 
     return value if isinstance(value, str) else None
 
 
-def _reservation_matches_task(
-    reservation: dict[str, Any], task_id: str, machine_project_id: str | None
-) -> bool:
-    return (reservation.get("task_id") == task_id
-            and (machine_project_id is None or reservation.get("project_id") == machine_project_id))
+def _reservation_matches_task(reservation: dict[str, Any], task_id: str, machine_project_id: str | None) -> bool:
+    return reservation.get("task_id") == task_id and (
+        machine_project_id is None or reservation.get("project_id") == machine_project_id
+    )
 
 
-def _clean_blockers(
-    cfg: RootConfig, task: TaskRecord, *, reservation_runtime_root: Path | None = None
-) -> list[str]:
+def _clean_blockers(cfg: RootConfig, task: TaskRecord, *, reservation_runtime_root: Path | None = None) -> list[str]:
     reservation_runtime_root = reservation_runtime_root or cfg.runtime_root
     machine_project_id = _machine_project_id(cfg, reservation_runtime_root)
     blockers: list[str] = []
@@ -59,10 +57,8 @@ def _clean_blockers(
             continue
         if control.get("operation_type") == "cancel" and task.group_name:
             group_file = group_path(cfg.shared_root, task.group_name)
-            barriers = (read_json(group_file)["group"].get("cancellation_barriers", [])
-                        if group_file.exists() else [])
-            if not any(item.get("operation_id") == control.get("operation_id")
-                       for item in barriers):
+            barriers = read_json(group_file)["group"].get("cancellation_barriers", []) if group_file.exists() else []
+            if not any(item.get("operation_id") == control.get("operation_id") for item in barriers):
                 blockers.append(f"group_control_barrier_missing:{control.get('operation_id')}")
                 continue
         if control.get("state") == "completed":
@@ -106,11 +102,10 @@ def _dependency_references(cfg: RootConfig, task: TaskRecord) -> list[str]:
 
 def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any]:
     from ..events import write_event
+
     references = _dependency_references(cfg, task)
     if references:
-        raise ValueError(
-            f"Task {task.task_id!r} cannot be cleaned while referenced by: {', '.join(references)}"
-        )
+        raise ValueError(f"Task {task.task_id!r} cannot be cleaned while referenced by: {', '.join(references)}")
     operation_path = locate_operation_path(cfg, "cleanup", task.task_id)
     if operation_path.exists():
         operation = read_json(operation_path)
@@ -123,15 +118,27 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
             save_task(cfg, task)
         return operation
     now = utc_now()
-    operation = {"meta": {"schema_version": SCHEMA_VERSION, "revision": 1, "created_at": now,
-        "updated_at": now, "updated_by": {"actor_type": "cli",
-        "machine_name": cfg.machine_name, "process_id": str(os.getpid())}},
-        "cleanup": {"operation_id": new_id(), "task_id": task.task_id,
-        "state": "preparing", "group_name": task.group_name,
-        "submission_operation_id": task.submission_operation_id,
-        "terminal_state": task.state["projection"], "created_at": now,
-        "required_machines": _cleanup_required_machines(cfg, task), "acknowledgements": {},
-        "completed_at": None}}
+    operation = {
+        "meta": {
+            "schema_version": SCHEMA_VERSION,
+            "revision": 1,
+            "created_at": now,
+            "updated_at": now,
+            "updated_by": {"actor_type": "cli", "machine_name": cfg.machine_name, "process_id": str(os.getpid())},
+        },
+        "cleanup": {
+            "operation_id": new_id(),
+            "task_id": task.task_id,
+            "state": "preparing",
+            "group_name": task.group_name,
+            "submission_operation_id": task.submission_operation_id,
+            "terminal_state": task.state["projection"],
+            "created_at": now,
+            "required_machines": _cleanup_required_machines(cfg, task),
+            "acknowledgements": {},
+            "completed_at": None,
+        },
+    }
     operation_path = active_operation_path(cfg, "cleanup", task.task_id)
     write_active_operation(cfg, "cleanup", task.task_id, operation)
     task.control["cleanup_operation_id"] = operation["cleanup"]["operation_id"]
@@ -140,12 +147,17 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
     task.meta["updated_at"] = now
     save_task(cfg, task)
     retire_current_ready_generation(cfg, task)
-    write_event(cfg, "task_cleanup_started", task_id=task.task_id, details={
-        "operation_id": operation["cleanup"]["operation_id"],
-        "group_name": task.group_name,
-        "submission_operation_id": task.submission_operation_id,
-        "terminal_state": task.state["projection"],
-    })
+    write_event(
+        cfg,
+        "task_cleanup_started",
+        task_id=task.task_id,
+        details={
+            "operation_id": operation["cleanup"]["operation_id"],
+            "group_name": task.group_name,
+            "submission_operation_id": task.submission_operation_id,
+            "terminal_state": task.state["projection"],
+        },
+    )
     return operation
 
 
@@ -155,9 +167,7 @@ def _cleanup_local_resources(
     from ..machine_runtime import resolve_execution_context
     from ..runtime.resources.reservations import release
 
-    reservation_runtime_root = (
-        reservation_runtime_root or resolve_execution_context(cfg).reservation_root
-    )
+    reservation_runtime_root = reservation_runtime_root or resolve_execution_context(cfg).reservation_root
     machine_project_id = _machine_project_id(cfg, reservation_runtime_root)
     removed: list[str] = []
     blockers: list[str] = []
@@ -229,6 +239,7 @@ def _cleanup_local_resources(
 
 def _finalize_cleanup_operation(cfg: RootConfig, operation: dict[str, Any]) -> list[str]:
     from ..events import write_event
+
     cleanup = operation["cleanup"]
     task_id = cleanup["task_id"]
     path = task_path(cfg.shared_root, task_id)
@@ -237,8 +248,7 @@ def _finalize_cleanup_operation(cfg: RootConfig, operation: dict[str, Any]) -> l
         references = _dependency_references(cfg, task)
         if references:
             raise RuntimeError(
-                f"Task {task_id!r} cleanup retained truth because it is referenced by: "
-                f"{', '.join(references)}"
+                f"Task {task_id!r} cleanup retained truth because it is referenced by: {', '.join(references)}"
             )
     if not reconcile_claim_archives(cfg, task_id):
         return []
@@ -259,11 +269,17 @@ def _finalize_cleanup_operation(cfg: RootConfig, operation: dict[str, Any]) -> l
     if logs_dir.exists():
         shutil.rmtree(logs_dir)
         removed.append(str(logs_dir))
-    write_event(cfg, "task_cleaned", task_id=task_id, details={
-        "operation_id": cleanup["operation_id"], "group_name": cleanup.get("group_name"),
-        "submission_operation_id": cleanup.get("submission_operation_id"),
-        "terminal_state": cleanup.get("terminal_state"),
-    })
+    write_event(
+        cfg,
+        "task_cleaned",
+        task_id=task_id,
+        details={
+            "operation_id": cleanup["operation_id"],
+            "group_name": cleanup.get("group_name"),
+            "submission_operation_id": cleanup.get("submission_operation_id"),
+            "terminal_state": cleanup.get("terminal_state"),
+        },
+    )
     cleanup.update({"state": "completed", "completed_at": utc_now()})
     operation["meta"]["revision"] += 1
     operation["meta"]["updated_at"] = utc_now()
@@ -312,14 +328,14 @@ def _finalize_cleanup_if_ready(cfg: RootConfig, operation_path: Path) -> list[st
 
 
 def reconcile_cleanup_operations(
-    cfg: RootConfig, *, reservation_runtime_root: Path | None = None,
+    cfg: RootConfig,
+    *,
+    reservation_runtime_root: Path | None = None,
     include_legacy: bool = True,
 ) -> list[dict[str, Any]]:
     """Clean machine-local resources and finalize fully acknowledged cleanup operations."""
     results: list[dict[str, Any]] = []
-    for operation_path in iter_active_operation_paths(
-        cfg, "cleanup", include_legacy=include_legacy
-    ):
+    for operation_path in iter_active_operation_paths(cfg, "cleanup", include_legacy=include_legacy):
         operation = read_json(operation_path)
         cleanup = operation.get("cleanup", {})
         if cleanup.get("state") not in {"preparing", "waiting_ack"}:
@@ -327,10 +343,14 @@ def reconcile_cleanup_operations(
         task_id = cleanup.get("task_id")
         if not task_id:
             continue
-        result = {"operation_id": cleanup.get("operation_id"), "task_id": task_id,
-                  "state": cleanup.get("state", "waiting_ack"),
-                  "pending_machines": cleanup.get("pending_machines", []),
-                  "removed": [], "blockers": []}
+        result = {
+            "operation_id": cleanup.get("operation_id"),
+            "task_id": task_id,
+            "state": cleanup.get("state", "waiting_ack"),
+            "pending_machines": cleanup.get("pending_machines", []),
+            "removed": [],
+            "blockers": [],
+        }
         with schema_writer_lock(cfg, blocking=False) as has_schema_lock:
             if not has_schema_lock:
                 result["blockers"] = ["schema_lock_busy"]
@@ -340,16 +360,12 @@ def reconcile_cleanup_operations(
             task = load_task(cfg, task_id) if task_file.exists() else None
             with ExitStack() as stack:
                 if task and task.group_name:
-                    has_group_lock = stack.enter_context(
-                        group_lock(cfg.shared_root, task.group_name, blocking=False)
-                    )
+                    has_group_lock = stack.enter_context(group_lock(cfg.shared_root, task.group_name, blocking=False))
                     if not has_group_lock:
                         result["blockers"] = ["group_lock_busy"]
                         results.append(result)
                         continue
-                has_task_lock = stack.enter_context(
-                    task_lock(cfg.shared_root, task_id, blocking=False)
-                )
+                has_task_lock = stack.enter_context(task_lock(cfg.shared_root, task_id, blocking=False))
                 if not has_task_lock:
                     result["blockers"] = ["task_lock_busy"]
                     results.append(result)
@@ -367,8 +383,7 @@ def reconcile_cleanup_operations(
                         cfg, task_id, reservation_runtime_root=reservation_runtime_root
                     )
                     if not blockers:
-                        acknowledgements[cfg.machine_name] = {"acknowledged_at": utc_now(),
-                                                              "removed": removed}
+                        acknowledgements[cfg.machine_name] = {"acknowledged_at": utc_now(), "removed": removed}
                 cleanup["state"] = "waiting_ack"
                 cleanup["pending_machines"] = sorted(required - set(acknowledgements))
                 if task_file.exists():
@@ -381,10 +396,14 @@ def reconcile_cleanup_operations(
                 operation["meta"]["revision"] += 1
                 operation["meta"]["updated_at"] = utc_now()
                 atomic_replace(operation_path, operation)
-                result = {"operation_id": cleanup["operation_id"], "task_id": task_id,
-                          "state": cleanup["state"],
-                          "pending_machines": cleanup.get("pending_machines", []),
-                          "removed": removed, "blockers": blockers}
+                result = {
+                    "operation_id": cleanup["operation_id"],
+                    "task_id": task_id,
+                    "state": cleanup["state"],
+                    "pending_machines": cleanup.get("pending_machines", []),
+                    "removed": removed,
+                    "blockers": blockers,
+                }
         if not result["pending_machines"]:
             result["removed"].extend(_finalize_cleanup_if_ready(cfg, operation_path))
             finalized_path = locate_operation_path(cfg, "cleanup", task_id)
@@ -428,24 +447,28 @@ def clean(
             if group and task.group_name != group:
                 continue
             updated_at = datetime.fromisoformat(task.meta["updated_at"].replace("Z", "+00:00"))
-            if (task.state["projection"] in {"succeeded", "failed", "cancelled"}
-                    and updated_at <= cutoff):
+            if task.state["projection"] in {"succeeded", "failed", "cancelled"} and updated_at <= cutoff:
                 candidates.append(task)
         candidates.sort(key=lambda item: (item.meta["updated_at"], item.task_id))
         candidates = candidates[:limit]
-    result: dict[str, Any] = {"dry_run": dry_run,
-                              "candidates": [task.task_id for task in candidates],
-                              "removed": [], "skipped": {}}
+    result: dict[str, Any] = {
+        "dry_run": dry_run,
+        "candidates": [task.task_id for task in candidates],
+        "removed": [],
+        "skipped": {},
+    }
     from ..scheduler import authority_locks
+
     for candidate in candidates:
         with schema_writer_lock(cfg):
             with authority_locks(cfg, candidate):
                 task = load_task(cfg, candidate.task_id)
-                blockers = _clean_blockers(
-                    cfg, task, reservation_runtime_root=reservation_runtime_root
-                )
-                unsafe_blockers = [item for item in blockers if not item.startswith(
-                    ("local_active_reservation:", "local_provisional_reservation:"))]
+                blockers = _clean_blockers(cfg, task, reservation_runtime_root=reservation_runtime_root)
+                unsafe_blockers = [
+                    item
+                    for item in blockers
+                    if not item.startswith(("local_active_reservation:", "local_provisional_reservation:"))
+                ]
                 if unsafe_blockers:
                     result["skipped"][task.task_id] = unsafe_blockers
                     continue
@@ -453,9 +476,7 @@ def clean(
                     operation = _start_cleanup_operation(cfg, task)
                     result.setdefault("operations", {})[task.task_id] = operation["cleanup"]
     if not dry_run:
-        for reconciliation in reconcile_cleanup_operations(
-                cfg, reservation_runtime_root=reservation_runtime_root
-        ):
+        for reconciliation in reconcile_cleanup_operations(cfg, reservation_runtime_root=reservation_runtime_root):
             if reconciliation["task_id"] in result["candidates"]:
                 result["removed"].extend(reconciliation["removed"])
                 result.setdefault("operations", {})[reconciliation["task_id"]] = reconciliation

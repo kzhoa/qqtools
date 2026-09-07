@@ -1,4 +1,5 @@
 """Task claim and fencing transitions."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -19,9 +20,16 @@ def archive_claim(cfg: RootConfig, task_id: str, claim: dict[str, Any], reason: 
     paths = shared_paths(cfg.shared_root)
     path = paths["claim_archive"] / task_id / f"{token}.json"
     pending_path = paths["claim_pending"] / task_id / f"{token}.json"
-    record = {"claim_archive": {"task_id": task_id, "attempt_id": claim.get("attempt_id"),
-                                 "fencing_token": token, "reason": reason,
-                                 "archived_at": utc_now(), "claim": dict(claim)}}
+    record = {
+        "claim_archive": {
+            "task_id": task_id,
+            "attempt_id": claim.get("attempt_id"),
+            "fencing_token": token,
+            "reason": reason,
+            "archived_at": utc_now(),
+            "claim": dict(claim),
+        }
+    }
     try:
         create_if_absent(path, record)
     except CASConflict:

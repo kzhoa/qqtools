@@ -19,7 +19,7 @@ dependencies = ["torch", "PyYAML", "matplotlib", "pandas", "scipy", "rich"]
 std = ["lmdb", "tqdm", "requests"]
 plugins = ["rich", "scikit-learn", "prompt_toolkit"]
 exp = ["libtmux>=0.62.0", "psutil", "nvidia-ml-py"]
-dev = ["tox", "pytest", "black", "isort", "flake8", "build"]
+dev = ["tox", "pytest", "ruff", "build"]
 full = [
     "qqtools[std]",
     "qqtools[plugins]",
@@ -56,13 +56,23 @@ qqtools = ["py.typed", "*.pyi", "**/*.pyi"]
 version = { attr = "qqtools.version.__version__" }
 
 # === dev settings ===
-[tool.black]
+[tool.ruff]
 line-length = 120
+target-version = "py311"
+src = ["src"]
 
-[tool.isort]
-profile = "black"
-line_length = 120
+[tool.ruff.lint]
+# Keep the lint gate limited to syntax and definite name-resolution errors.
+# Formatting is enforced separately by `ruff format`; other stylistic
+# refactors are intentionally not CI requirements.
+select = ["E713", "E741", "E9", "F541", "F821", "F822", "F823", "F841", "I"]
+# E731 is a stylistic preference; assigned lambdas are allowed in this project.
 
-[tool.flake8]
-max-line-length = 120
-ignore = "F401,E402,E501"
+[tool.ruff.lint.isort]
+# Match the legacy isort project's first-party module grouping.
+known-first-party = ["qqtools", "tests", "scripts"]
+# Legacy isort's Black profile folds a single imported member when it fits.
+split-on-trailing-comma = false
+
+[tool.ruff.format]
+line-ending = "lf"

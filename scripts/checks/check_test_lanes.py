@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import ast
 import re
-from configparser import ConfigParser, Error as ConfigError
+from configparser import ConfigParser
+from configparser import Error as ConfigError
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -62,9 +63,7 @@ def _check_marker_boundaries(repo_root: Path) -> list[str]:
     for lane, test_root, forbidden_marker in boundaries:
         for path in test_root.rglob("test_*.py"):
             if _uses_pytest_marker(path, forbidden_marker):
-                errors.append(
-                    f"{lane} may not use {forbidden_marker}: {path.relative_to(repo_root)}"
-                )
+                errors.append(f"{lane} may not use {forbidden_marker}: {path.relative_to(repo_root)}")
     return errors
 
 
@@ -110,9 +109,7 @@ def _check_ci_boundaries(repo_root: Path) -> list[str]:
         command = match.group(0).strip()
         for environment in match.group(1).split(","):
             if environment in SOURCE_TOX_LANES:
-                errors.append(
-                    f"ordinary CI may not run source-test lane: {command}"
-                )
+                errors.append(f"ordinary CI may not run source-test lane: {command}")
     if "tox run -e artifact-e2e" not in workflow:
         errors.append("ordinary CI must run artifact-e2e")
     return errors

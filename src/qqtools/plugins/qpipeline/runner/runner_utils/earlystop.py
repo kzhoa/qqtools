@@ -287,8 +287,7 @@ class EarlyStopController:
         if errors:
             first = min(errors, key=lambda item: item["rank"])
             message = (
-                f"early-stop control failed on rank {first['rank']}: "
-                f"{first['error_type']}: {first['error_message']}"
+                f"early-stop control failed on rank {first['rank']}: {first['error_type']}: {first['error_message']}"
             )
             if local_error is not None:
                 raise RuntimeError(message) from local_error

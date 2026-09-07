@@ -12,7 +12,7 @@ def _scalar_partition(costs, order, batch_size):
     loads = [0.0] * batch_count
     for layer in range(batch_size):
         targets = sorted(range(batch_count), key=loads.__getitem__)
-        items = order[layer * batch_count:(layer + 1) * batch_count]
+        items = order[layer * batch_count : (layer + 1) * batch_count]
         for item, target in zip(items, targets):
             batches[target].append(item)
             loads[target] += float(costs[item])
@@ -45,7 +45,7 @@ def test_layered_partition_matches_scalar_reference(seed, batch_size, batch_coun
     assert batches.dtype == np.int64
     # Every layer contributes exactly one sample occurrence to each batch.
     for layer in range(batch_size):
-        expected = order[layer * batch_count:(layer + 1) * batch_count]
+        expected = order[layer * batch_count : (layer + 1) * batch_count]
         np.testing.assert_array_equal(np.sort(batches[:, layer]), np.sort(expected))
 
 
@@ -77,7 +77,5 @@ def test_fast_seed_changes_equal_cost_memberships():
 
 def test_fast_pairs_opposite_extremes_for_two_sample_batches():
     costs = np.array([9, 9, 9, 3, 6, 6, 6, 12])
-    plan = _plan_rank_batches(
-        costs, batch_size=2, world_size=2, strategy="lpt_fast", should_shuffle=False
-    )
+    plan = _plan_rank_batches(costs, batch_size=2, world_size=2, strategy="lpt_fast", should_shuffle=False)
     np.testing.assert_array_equal(costs[plan].sum(axis=2), np.full((2, 2), 15))

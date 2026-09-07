@@ -7,11 +7,11 @@ from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.commands.cleanup import clean
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import batch_submit, retry, submit
-from qqtools.plugins.qexp.scheduler import claim_task, fail_attempt
 from qqtools.plugins.qexp.runtime.locks import schema_lock
 from qqtools.plugins.qexp.runtime.paths import group_path, submission_path
-from qqtools.plugins.qexp.runtime.submission import IdempotencyConflict
 from qqtools.plugins.qexp.runtime.store import read_json
+from qqtools.plugins.qexp.runtime.submission import IdempotencyConflict
+from qqtools.plugins.qexp.scheduler import claim_task, fail_attempt
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -22,6 +22,7 @@ def _activate_narrow_submission_protocol(cfg, monkeypatch: pytest.MonkeyPatch) -
     from qqtools.plugins.qexp.runtime.locks import is_schema_narrow_protocol_active
 
     assert is_schema_narrow_protocol_active(cfg)
+
 
 def test_bulk_submission_has_one_operation_and_no_batch_identity(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
@@ -57,7 +58,8 @@ def test_bulk_submission_announces_random_operation_before_task_staging(tmp_path
 
 
 def test_active_protocol_rollback_removes_only_its_operation_owned_group(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     _activate_narrow_submission_protocol(cfg, monkeypatch)
@@ -126,9 +128,7 @@ def test_active_lock_protocol_allows_independent_submission_fences_together(
 
 
 # QQTOOLS-COMPAT-0009: the keyed fence makes concurrent same-key submissions converge.
-def test_active_lock_protocol_serializes_same_idempotency_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_active_lock_protocol_serializes_same_idempotency_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     _activate_narrow_submission_protocol(cfg, monkeypatch)
     entered = Event()
@@ -142,9 +142,7 @@ def test_active_lock_protocol_serializes_same_idempotency_key(
         assert release_first.wait(timeout=2)
 
     def run_first() -> None:
-        results.append(
-            batch_submit(cfg, manifest, idempotency_key="same", on_prepared=first_prepared)
-        )
+        results.append(batch_submit(cfg, manifest, idempotency_key="same", on_prepared=first_prepared))
 
     def run_second() -> None:
         results.append(batch_submit(cfg, manifest, idempotency_key="same"))
@@ -166,7 +164,8 @@ def test_active_lock_protocol_serializes_same_idempotency_key(
 
 # QQTOOLS-COMPAT-0009: same-key conflicting requests preserve the winner's mapping.
 def test_active_lock_protocol_rejects_conflicting_same_key_request(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     _activate_narrow_submission_protocol(cfg, monkeypatch)
@@ -213,16 +212,15 @@ def test_active_lock_protocol_rejects_conflicting_same_key_request(
 
 # QQTOOLS-COMPAT-0009: cleanup tombstones win a Task-identity creation race.
 def test_active_protocol_cleanup_tombstone_blocks_concurrent_task_id_reuse(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     _activate_narrow_submission_protocol(cfg, monkeypatch)
     task = submit(cfg, ["echo", "old"], task_id="tombstoned-task")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
-    assert fail_attempt(
-        cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure"
-    )
+    assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure")
     cleanup_started = Event()
     release_cleanup = Event()
     reuse_rejected = Event()
@@ -265,7 +263,8 @@ def test_active_protocol_cleanup_tombstone_blocks_concurrent_task_id_reuse(
 
 # QQTOOLS-COMPAT-0009: Group addition and retry retain Group -> Task serialization.
 def test_active_protocol_serializes_group_worker_addition_and_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     _activate_narrow_submission_protocol(cfg, monkeypatch)
@@ -273,9 +272,7 @@ def test_active_protocol_serializes_group_worker_addition_and_retry(
     task = submit(cfg, ["echo", "retry"], task_id="retry-task", group="exp")
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
-    assert fail_attempt(
-        cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure"
-    )
+    assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure")
     failures: list[BaseException] = []
 
     def run(callable_) -> None:
@@ -305,7 +302,8 @@ def test_active_protocol_serializes_group_worker_addition_and_retry(
 
 # QQTOOLS-COMPAT-0009: an exclusive activation or migration cannot overtake a narrow writer.
 def test_active_protocol_schema_mutation_waits_for_submission_fence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     _activate_narrow_submission_protocol(cfg, monkeypatch)

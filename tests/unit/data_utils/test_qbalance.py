@@ -1,11 +1,7 @@
 import numpy as np
 import pytest
 
-from qqtools.data import (
-    assign_window_to_ranks,
-    compute_global_even_sort_order,
-    validate_balance_strategy,
-)
+from qqtools.data import assign_window_to_ranks, compute_global_even_sort_order, validate_balance_strategy
 
 
 @pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])

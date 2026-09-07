@@ -1,4 +1,5 @@
 """Schema-5 qexp root initialization and configuration."""
+
 from __future__ import annotations
 
 import hashlib
@@ -9,11 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from .config_types import RootConfig
-from .runtime.paths import local_paths, machine_path, shared_log_path, shared_paths
-from .runtime.locks import exclusive, schema_lock
-from .runtime.records import AttemptRecord, SCHEMA_VERSION, TaskRecord, utc_now
-from .runtime.store import atomic_replace, read_json
 from .lease import default_lease_policy_document
+from .runtime.locks import exclusive, schema_lock
+from .runtime.paths import local_paths, machine_path, shared_log_path, shared_paths
+from .runtime.records import SCHEMA_VERSION, AttemptRecord, TaskRecord, utc_now
+from .runtime.store import atomic_replace, read_json
 
 
 def _schema_path(cfg: RootConfig) -> Path:
@@ -34,7 +35,8 @@ def read_schema_version(cfg: RootConfig) -> int | None:
     base_fields = {"name", "version", "minimum_reader_version", "created_at"}
     schema_fields = frozenset(schema)
     if schema_fields not in {
-        frozenset(base_fields), frozenset({*base_fields, "writer_capabilities"}),
+        frozenset(base_fields),
+        frozenset({*base_fields, "writer_capabilities"}),
         frozenset({*base_fields, "required_capabilities"}),
         frozenset({*base_fields, "writer_capabilities", "required_capabilities"}),
     }:
@@ -52,9 +54,13 @@ def read_schema_version(cfg: RootConfig) -> int | None:
 CPU_LANE_CAPABILITY = "cpu-lane-v1"
 TASK_DEPENDENCIES_CAPABILITY = "task-dependencies-v1"
 GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
-SUPPORTED_REQUIRED_CAPABILITIES = frozenset({
-    CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY, GROUP_READY_MEMBERS_CAPABILITY,
-})
+SUPPORTED_REQUIRED_CAPABILITIES = frozenset(
+    {
+        CPU_LANE_CAPABILITY,
+        TASK_DEPENDENCIES_CAPABILITY,
+        GROUP_READY_MEMBERS_CAPABILITY,
+    }
+)
 
 
 def is_cpu_lane_root(cfg: RootConfig) -> bool:
@@ -64,18 +70,14 @@ def is_cpu_lane_root(cfg: RootConfig) -> bool:
         return False
     capabilities = read_json(path).get("schema", {}).get("required_capabilities")
     if capabilities is None:
-        raise RuntimeError(
-            "qexp root requires cpu-lane-v1; complete its conversion with qqtools 1.3.15."
-        )
+        raise RuntimeError("qexp root requires cpu-lane-v1; complete its conversion with qqtools 1.3.15.")
     if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
         raise RuntimeError("qexp schema/version.json has malformed required capabilities.")
     unknown = sorted(set(capabilities) - SUPPORTED_REQUIRED_CAPABILITIES)
     if unknown:
         raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
     if CPU_LANE_CAPABILITY not in capabilities:
-        raise RuntimeError(
-            "qexp root requires cpu-lane-v1; complete its conversion with qqtools 1.3.15."
-        )
+        raise RuntimeError("qexp root requires cpu-lane-v1; complete its conversion with qqtools 1.3.15.")
     return True
 
 
@@ -121,8 +123,21 @@ def validate_root_contract(cfg: RootConfig) -> None:
     present = forbidden.intersection(path.name for path in cfg.shared_root.iterdir())
     if present:
         raise RuntimeError(f"Mixed qexp schema root contains obsolete paths: {sorted(present)}.")
-    required = {"schema", "project", "clock-observations", "groups", "tasks", "attempts", "operations", "idempotency",
-                "claims", "machines", "locks", "events", "indexes"}
+    required = {
+        "schema",
+        "project",
+        "clock-observations",
+        "groups",
+        "tasks",
+        "attempts",
+        "operations",
+        "idempotency",
+        "claims",
+        "machines",
+        "locks",
+        "events",
+        "indexes",
+    }
     missing = sorted(name for name in required if not (cfg.shared_root / name).exists())
     if missing:
         raise RuntimeError(f"qexp schema-6 root is incomplete; missing {missing}.")
@@ -130,8 +145,7 @@ def validate_root_contract(cfg: RootConfig) -> None:
         shared_paths(cfg.shared_root)["availability"],
         shared_paths(cfg.shared_root)["offer_deadlines"],
     ]
-    missing_subdirs = sorted(str(path.relative_to(cfg.shared_root))
-                             for path in required_subdirs if not path.exists())
+    missing_subdirs = sorted(str(path.relative_to(cfg.shared_root)) for path in required_subdirs if not path.exists())
     if missing_subdirs:
         raise RuntimeError(f"qexp schema-6 root is incomplete; missing {missing_subdirs}.")
 
@@ -140,7 +154,9 @@ def ensure_shared_layout(cfg: RootConfig) -> None:
     paths = shared_paths(cfg.shared_root)
     for name, path in paths.items():
         if name in {
-            "lease_policy", "notifications", "operations_migration",
+            "lease_policy",
+            "notifications",
+            "operations_migration",
             "offer_deadlines_migration",
         }:
             continue
@@ -167,29 +183,28 @@ def ensure_machine_layout(cfg: RootConfig) -> None:
 def initialize_shared_root(cfg: RootConfig) -> None:
     observed = read_schema_version(cfg)
     if observed is not None and observed != SCHEMA_VERSION:
-        raise RuntimeError(
-            f"Unsupported qexp schema {observed!r}; refusing mixed-schema initialization."
-        )
+        raise RuntimeError(f"Unsupported qexp schema {observed!r}; refusing mixed-schema initialization.")
     with schema_lock(cfg.shared_root):
         existing = read_schema_version(cfg)
         if existing is not None and existing != SCHEMA_VERSION:
-            raise RuntimeError(
-                f"Unsupported qexp schema {existing!r}; refusing mixed-schema initialization."
-            )
+            raise RuntimeError(f"Unsupported qexp schema {existing!r}; refusing mixed-schema initialization.")
         if existing == SCHEMA_VERSION:
             validate_root_contract(cfg)
         ensure_shared_layout(cfg)
         if existing is None:
-            schema = {"schema": {
-                "name": "qexp-runtime",
-                "version": SCHEMA_VERSION,
-                "minimum_reader_version": SCHEMA_VERSION,
-                "created_at": utc_now(),
-                "required_capabilities": [
-                    CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY,
-                    GROUP_READY_MEMBERS_CAPABILITY,
-                ],
-            }}
+            schema = {
+                "schema": {
+                    "name": "qexp-runtime",
+                    "version": SCHEMA_VERSION,
+                    "minimum_reader_version": SCHEMA_VERSION,
+                    "created_at": utc_now(),
+                    "required_capabilities": [
+                        CPU_LANE_CAPABILITY,
+                        TASK_DEPENDENCIES_CAPABILITY,
+                        GROUP_READY_MEMBERS_CAPABILITY,
+                    ],
+                }
+            }
             atomic_replace(_schema_path(cfg), schema)
             from .runtime.ready.group_members import initialize_group_ready_members
 
@@ -197,8 +212,9 @@ def initialize_shared_root(cfg: RootConfig) -> None:
     ensure_machine_layout(cfg)
     identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
     if not identity_path.exists():
-        atomic_replace(identity_path, {"project": {"project_id": project_id(cfg.shared_root),
-                                                     "shared_root": str(cfg.shared_root)}})
+        atomic_replace(
+            identity_path, {"project": {"project_id": project_id(cfg.shared_root), "shared_root": str(cfg.shared_root)}}
+        )
     policy_path = shared_paths(cfg.shared_root)["lease_policy"]
     if not policy_path.exists():
         atomic_replace(policy_path, default_lease_policy_document())
@@ -245,8 +261,7 @@ def _migrate_schema5_to_schema6_locked(cfg: RootConfig) -> None:
     blockers = _migration_blockers(cfg)
     if blockers:
         raise RuntimeError(
-            "schema-6 migration requires no active claims or runtime evidence; blockers: "
-            + ", ".join(blockers)
+            "schema-6 migration requires no active claims or runtime evidence; blockers: " + ", ".join(blockers)
         )
     _stage_and_promote_schema6_root(cfg)
 
@@ -275,8 +290,7 @@ def _migration_blockers(cfg: RootConfig) -> list[str]:
         directory = shared_paths(cfg.shared_root)[name]
         if directory.exists() and any(path.is_file() for path in directory.iterdir()):
             blockers.append(f"shared_runtime_evidence:{directory.name}")
-    for name in ("active", "provisional", "processes", "registrations", "launch_intents",
-                 "termination_decisions"):
+    for name in ("active", "provisional", "processes", "registrations", "launch_intents", "termination_decisions"):
         directory = local_paths(cfg.runtime_root)[name]
         if directory.exists() and any(directory.iterdir()):
             blockers.append(f"runtime_evidence:{directory.name}")
@@ -303,8 +317,7 @@ def _tree_manifest(root: Path) -> list[dict[str, Any]]:
         with item.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
-        entries.append({"path": relative, "kind": "file", "sha256": digest.hexdigest(),
-                        "size": item.stat().st_size})
+        entries.append({"path": relative, "kind": "file", "sha256": digest.hexdigest(), "size": item.stat().st_size})
     return entries
 
 
@@ -318,9 +331,18 @@ def _stage_and_promote_schema6_root(cfg: RootConfig) -> None:
     if journal.exists():
         raise RuntimeError(f"schema migration journal already exists: {journal}; recover it before retrying.")
     source_manifest = _tree_manifest(cfg.shared_root)
-    plan = {"migration": {"from_schema": 5, "to_schema": SCHEMA_VERSION,
-            "source_root": str(cfg.shared_root), "stage_root": str(stage), "backup_root": str(backup),
-            "source_manifest": source_manifest, "phase": "staging", "created_at": utc_now()}}
+    plan = {
+        "migration": {
+            "from_schema": 5,
+            "to_schema": SCHEMA_VERSION,
+            "source_root": str(cfg.shared_root),
+            "stage_root": str(stage),
+            "backup_root": str(backup),
+            "source_manifest": source_manifest,
+            "phase": "staging",
+            "created_at": utc_now(),
+        }
+    }
     atomic_replace(journal, plan)
     shutil.copytree(cfg.shared_root, stage)
     _rewrite_staged_root(cfg, stage)
@@ -344,9 +366,11 @@ def _read_migration_plan(cfg: RootConfig) -> dict[str, Any]:
         raise RuntimeError("schema migration journal targets a different root.")
     for field in ("stage_root", "backup_root"):
         candidate = Path(migration[field])
-        is_stage_root = (candidate.name == cfg.shared_root.name
-                         and candidate.parent.parent == cfg.shared_root.parent
-                         and candidate.parent.name.startswith(f"{cfg.shared_root.name}.schema6-stage-"))
+        is_stage_root = (
+            candidate.name == cfg.shared_root.name
+            and candidate.parent.parent == cfg.shared_root.parent
+            and candidate.parent.name.startswith(f"{cfg.shared_root.name}.schema6-stage-")
+        )
         if (candidate.parent != cfg.shared_root.parent and not is_stage_root) or candidate == cfg.shared_root:
             raise RuntimeError("schema migration journal contains an unsafe sibling path.")
     return plan
@@ -406,8 +430,17 @@ def _rewrite_staged_root(cfg: RootConfig, stage: Path) -> None:
     policy_path = shared_paths(stage)["lease_policy"]
     if not policy_path.exists():
         atomic_replace(policy_path, default_lease_policy_document())
-    atomic_replace(_schema_path(staged_cfg), {"schema": {"name": "qexp-runtime", "version": SCHEMA_VERSION,
-        "minimum_reader_version": SCHEMA_VERSION, "created_at": utc_now()}})
+    atomic_replace(
+        _schema_path(staged_cfg),
+        {
+            "schema": {
+                "name": "qexp-runtime",
+                "version": SCHEMA_VERSION,
+                "minimum_reader_version": SCHEMA_VERSION,
+                "created_at": utc_now(),
+            }
+        },
+    )
     validate_root_contract(staged_cfg)
     _validate_staged_records(stage)
 
@@ -472,14 +505,26 @@ def save_machine_record(cfg: RootConfig, record: dict[str, Any]) -> None:
 
 def project_id(shared_root: Path) -> str:
     import hashlib
+
     return hashlib.sha256(str(shared_root).encode()).hexdigest()[:16]
 
 
-def load_root_config(shared_root: str | Path, machine_name: str, runtime_root: str | Path | None = None,
-                     *, require_initialized: bool = False) -> RootConfig:
+def load_root_config(
+    shared_root: str | Path,
+    machine_name: str,
+    runtime_root: str | Path | None = None,
+    *,
+    require_initialized: bool = False,
+) -> RootConfig:
     shared_root = Path(shared_root).expanduser().resolve()
-    cfg = RootConfig(shared_root, shared_root.parent, machine_name,
-                     Path(runtime_root) if runtime_root else Path.home() / ".qqtools" / "qexp-runtime" / project_id(shared_root) / machine_name)
+    cfg = RootConfig(
+        shared_root,
+        shared_root.parent,
+        machine_name,
+        Path(runtime_root)
+        if runtime_root
+        else Path.home() / ".qqtools" / "qexp-runtime" / project_id(shared_root) / machine_name,
+    )
     if require_initialized:
         validate_root_contract(cfg)
     return cfg

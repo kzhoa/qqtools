@@ -6,10 +6,11 @@ from qqtools.plugins.qexp import batch_submit, init_shared_root, submit
 from qqtools.plugins.qexp.commands.group import change_worker, create_group, group_control
 from qqtools.plugins.qexp.observer import list_group_machines, list_groups
 from qqtools.plugins.qexp.runtime.paths import group_path
-from qqtools.plugins.qexp.runtime.store import read_json
 from qqtools.plugins.qexp.runtime.resources.reservations import reserve_admitted
+from qqtools.plugins.qexp.runtime.store import read_json
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
+
 
 def test_group_membership_sequences_and_workers_are_authoritative(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
@@ -49,18 +50,14 @@ def test_group_worker_role_and_limit_change_is_epoch_linearized(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")
 
-    added = change_worker(
-        cfg, "exp", "g2", "add", role="borrow", gpu_limit_gpus=2, has_gpu_limit=True
-    )
+    added = change_worker(cfg, "exp", "g2", "add", role="borrow", gpu_limit_gpus=2, has_gpu_limit=True)
     worker = added["group"]["worker_set"]["g2"]
     assert worker["state"] == "active"
     assert worker["scheduling_role"] == "borrow"
     assert worker["gpu_limit_gpus"] == 2
     epoch = added["group"]["worker_set_epoch"]
 
-    updated = change_worker(
-        cfg, "exp", "g2", "set", gpu_limit_gpus=1, has_gpu_limit=True
-    )
+    updated = change_worker(cfg, "exp", "g2", "set", gpu_limit_gpus=1, has_gpu_limit=True)
     assert updated["group"]["worker_set"]["g2"]["gpu_limit_gpus"] == 1
     assert updated["group"]["worker_set_epoch"] == epoch + 1
 
@@ -73,22 +70,26 @@ def test_group_worker_set_accepts_primary_gpu_limit(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")
 
-    group = change_worker(
-        cfg, "exp", "g2", "add", role="primary", gpu_limit_gpus=1, has_gpu_limit=True
-    )
+    group = change_worker(cfg, "exp", "g2", "add", role="primary", gpu_limit_gpus=1, has_gpu_limit=True)
     assert group["group"]["worker_set"]["g2"]["gpu_limit_gpus"] == 1
 
 
 def test_group_machine_usage_includes_unexpired_provisional_reservation(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")
-    change_worker(cfg, "exp", "g1", "set", role="borrow", gpu_limit_gpus=1,
-                  has_gpu_limit=True)
+    change_worker(cfg, "exp", "g1", "set", role="borrow", gpu_limit_gpus=1, has_gpu_limit=True)
     reserve_admitted(
-        cfg.runtime_root, "task-1", [0], project_id="project", group_name="exp",
-        machine_name="g1", gpu_limit_gpus=1, worker_scheduling_role="borrow",
+        cfg.runtime_root,
+        "task-1",
+        [0],
+        project_id="project",
+        group_name="exp",
+        machine_name="g1",
+        gpu_limit_gpus=1,
+        worker_scheduling_role="borrow",
         shared_root=str(cfg.shared_root),
-        group_worker_set_epoch=1, worker_state_epoch=1,
+        group_worker_set_epoch=1,
+        worker_state_epoch=1,
     )
 
     machine = list_group_machines(cfg, "exp", reservation_runtime_root=cfg.runtime_root)

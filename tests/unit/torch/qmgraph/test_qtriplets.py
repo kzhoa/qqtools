@@ -37,9 +37,7 @@ def canonicalize_result(result):
 def test_qtriplets_returns_expected_triplets_for_manual_graph():
     edge_index, cell_offsets, num_nodes = build_manual_case(keep_periodic_self_loop=False)
 
-    col, row, idx_i, idx_j, idx_k, idx_kj, idx_ji = canonicalize_result(
-        qtriplets(edge_index, cell_offsets, num_nodes)
-    )
+    col, row, idx_i, idx_j, idx_k, idx_kj, idx_ji = canonicalize_result(qtriplets(edge_index, cell_offsets, num_nodes))
 
     assert torch.equal(col, torch.tensor([1, 1, 2, 2, 0, 0, 3]))
     assert torch.equal(row, torch.tensor([0, 2, 1, 0, 1, 2, 3]))
@@ -61,9 +59,7 @@ def test_qtriplets_removes_zero_offset_return_triplets():
 def test_qtriplets_keeps_periodic_return_triplets_with_nonzero_offset():
     edge_index, cell_offsets, num_nodes = build_manual_case(keep_periodic_self_loop=True)
 
-    _, _, idx_i, idx_j, idx_k, idx_kj, idx_ji = canonicalize_result(
-        qtriplets(edge_index, cell_offsets, num_nodes)
-    )
+    _, _, idx_i, idx_j, idx_k, idx_kj, idx_ji = canonicalize_result(qtriplets(edge_index, cell_offsets, num_nodes))
 
     assert torch.any(idx_i == idx_k)
     periodic_mask = idx_i == idx_k

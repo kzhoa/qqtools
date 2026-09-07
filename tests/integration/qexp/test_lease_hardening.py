@@ -15,8 +15,8 @@ from qqtools.plugins.qexp.lease import (
     load_lease_policy,
     save_lease_policy,
 )
-from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.attempt_recovery import recover_running_attempt
+from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.termination import (
     commit_local_unavailable,
@@ -38,6 +38,7 @@ from qqtools.plugins.qexp.scheduler import (
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 def test_renewal_error_is_classified_without_fencing(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
@@ -52,9 +53,13 @@ def test_renewal_error_is_classified_without_fencing(tmp_path: Path, monkeypatch
 def test_local_irreversible_commitment_blocks_recovery(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     decision = create_decision(
-        cfg, task_id="task", attempt_id="attempt", fencing_token=7,
+        cfg,
+        task_id="task",
+        attempt_id="attempt",
+        fencing_token=7,
         process={"process_group_id": 1, "process_group_start_time_ticks": 2},
-        authority_outcome="authority_unavailable", reason="lease_authority_unavailable",
+        authority_outcome="authority_unavailable",
+        reason="lease_authority_unavailable",
     )
     commit_local_unavailable(cfg, "attempt", decision["decision_id"])
     assert is_recovery_blocked(cfg, "attempt")
@@ -65,8 +70,10 @@ def test_local_irreversible_commitment_blocks_recovery(tmp_path: Path):
 def test_unqualified_clock_creates_local_safe_claim_and_blocks_expiry(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler.clock_capability",
-                        lambda *_args: ClockCapability("unavailable", "no_qualified_provider"))
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.clock_capability",
+        lambda *_args: ClockCapability("unavailable", "no_qualified_provider"),
+    )
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert attempt.authority_mode == "holder_bound"
@@ -99,24 +106,30 @@ def test_committed_termination_is_completed_by_agent_and_blocks_recovery(tmp_pat
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     decision = create_decision(
-        cfg, task_id=task.task_id, attempt_id=attempt.attempt_id,
+        cfg,
+        task_id=task.task_id,
+        attempt_id=attempt.attempt_id,
         fencing_token=attempt.current_fencing_token,
         process={"process_group_id": 1, "process_group_start_time_ticks": 2},
-        authority_outcome="termination_required", reason="fenced",
+        authority_outcome="termination_required",
+        reason="fenced",
     )
     assert commit_shared_termination(
         cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, decision["decision_id"]
     )
-    atomic_replace(cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json", {"process": {
-        "task_id": task.task_id,
-        "attempt_id": attempt.attempt_id,
-        "fencing_token": attempt.current_fencing_token,
-        "process_group_id": 1,
-    }})
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state",
-                        lambda *_args: "alive")
-    monkeypatch.setattr("qqtools.plugins.qexp.runtime.termination._matches_process_group",
-                        lambda *_args: False)
+    atomic_replace(
+        cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json",
+        {
+            "process": {
+                "task_id": task.task_id,
+                "attempt_id": attempt.attempt_id,
+                "fencing_token": attempt.current_fencing_token,
+                "process_group_id": 1,
+            }
+        },
+    )
+    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *_args: "alive")
+    monkeypatch.setattr("qqtools.plugins.qexp.runtime.termination._matches_process_group", lambda *_args: False)
     reconcile_running_tasks(cfg)
     stored = read_json(
         cfg.runtime_root / "termination-decisions" / attempt.attempt_id / f"{decision['decision_id']}.json"
@@ -128,32 +141,37 @@ def test_committed_termination_is_completed_by_agent_and_blocks_recovery(tmp_pat
 def test_sigkill_is_not_confirmed_until_process_identity_is_absent(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     decision = create_decision(
-        cfg, task_id="task", attempt_id="attempt", fencing_token=7,
+        cfg,
+        task_id="task",
+        attempt_id="attempt",
+        fencing_token=7,
         process={"process_group_id": 1, "process_group_start_time_ticks": 2},
-        authority_outcome="termination_required", reason="fenced",
+        authority_outcome="termination_required",
+        reason="fenced",
     )
     commit_signal(cfg, "attempt", decision["decision_id"])
-    monkeypatch.setattr("qqtools.plugins.qexp.runtime.termination._matches_process_group",
-                        lambda *_args: True)
+    monkeypatch.setattr("qqtools.plugins.qexp.runtime.termination._matches_process_group", lambda *_args: True)
     monkeypatch.setattr("qqtools.plugins.qexp.runtime.termination.os.killpg", lambda *_args: None)
     current = send_signals(cfg, "attempt", decision["decision_id"], grace_seconds=0)
     assert current["state"] == "sigkill_sent"
-    monkeypatch.setattr("qqtools.plugins.qexp.runtime.termination._matches_process_group",
-                        lambda *_args: False)
+    monkeypatch.setattr("qqtools.plugins.qexp.runtime.termination._matches_process_group", lambda *_args: False)
     assert send_signals(cfg, "attempt", decision["decision_id"], grace_seconds=0)["state"] == "confirmed"
 
 
 def test_termination_decision_rejects_state_rollback_and_wait_confirmation(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     decision = create_decision(
-        cfg, task_id="task", attempt_id="attempt", fencing_token=7,
+        cfg,
+        task_id="task",
+        attempt_id="attempt",
+        fencing_token=7,
         process={"process_group_id": 1, "process_group_start_time_ticks": 2},
-        authority_outcome="termination_required", reason="fenced",
+        authority_outcome="termination_required",
+        reason="fenced",
     )
     commit_signal(cfg, "attempt", decision["decision_id"])
     with pytest.raises(RuntimeError, match="confirmation requires absent process identity"):
-        update_decision(cfg, "attempt", decision["decision_id"], state="confirmed",
-                        confirmation="runner_waited")
+        update_decision(cfg, "attempt", decision["decision_id"], state="confirmed", confirmation="runner_waited")
     with pytest.raises(RuntimeError, match="not monotonic"):
         update_decision(cfg, "attempt", decision["decision_id"], state="pending")
 
@@ -163,10 +181,16 @@ def test_termination_confirmation_uses_real_process_group_identity(tmp_path: Pat
     child = subprocess.Popen(["sleep", "60"], start_new_session=True)
     try:
         decision = create_decision(
-            cfg, task_id="task", attempt_id="attempt", fencing_token=7,
-            process={"process_group_id": child.pid,
-                     "process_group_start_time_ticks": _process_start_time_ticks(child.pid)},
-            authority_outcome="termination_required", reason="fenced",
+            cfg,
+            task_id="task",
+            attempt_id="attempt",
+            fencing_token=7,
+            process={
+                "process_group_id": child.pid,
+                "process_group_start_time_ticks": _process_start_time_ticks(child.pid),
+            },
+            authority_outcome="termination_required",
+            reason="fenced",
         )
         commit_signal(cfg, "attempt", decision["decision_id"])
         state = send_signals(cfg, "attempt", decision["decision_id"], grace_seconds=0)
@@ -189,10 +213,16 @@ def test_recovery_uses_authoritative_policy_ttl(tmp_path: Path):
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     manifest_path = cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json"
-    atomic_replace(manifest_path, {"process": {
-        "task_id": task.task_id, "attempt_id": attempt.attempt_id,
-        "fencing_token": attempt.current_fencing_token,
-    }})
+    atomic_replace(
+        manifest_path,
+        {
+            "process": {
+                "task_id": task.task_id,
+                "attempt_id": attempt.attempt_id,
+                "fencing_token": attempt.current_fencing_token,
+            }
+        },
+    )
     token = recover_running_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     assert token == attempt.current_fencing_token + 1
     recovered = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"]
@@ -200,6 +230,7 @@ def test_recovery_uses_authoritative_policy_ttl(tmp_path: Path):
     from datetime import datetime, timezone
 
     from qqtools.plugins.qexp.lease import parse_utc
+
     remaining = (parse_utc(expires_at) - datetime.now(timezone.utc)).total_seconds()
     assert 175 <= remaining <= 180
 

@@ -5,11 +5,11 @@ import pytest
 import torch
 
 import qqtools as qt
-from qqtools.plugins.qpipeline import Stage
 import qqtools.plugins.qpipeline.qpipeline as qpipeline_module
 import qqtools.plugins.qpipeline.runner.eval_runner as eval_runner_module
 import qqtools.plugins.qpipeline.runner.runner as runner_module
 import qqtools.plugins.qpipeline.runner.runner_utils.progress as progress_module
+from qqtools.plugins.qpipeline import Stage
 from qqtools.plugins.qpipeline.entry import create_pipeline_class
 from qqtools.plugins.qpipeline.qpipeline import prepare_logdir, qPipeline
 from qqtools.plugins.qpipeline.runner.eval_runner import evaluate_runner, infer_runner

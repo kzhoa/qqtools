@@ -1,4 +1,5 @@
 """Explicit resumable activation for group-ready-members-v1."""
+
 # QQTOOLS-COMPAT-0008: legacy roots retain Task-scan Group synchronization through 1.3.16.
 from __future__ import annotations
 
@@ -8,13 +9,10 @@ from typing import Any
 
 from .config_types import RootConfig
 from .layout import GROUP_READY_MEMBERS_CAPABILITY
-from .runtime.ready.group_members import read_group_ready_members_state
-from .runtime.ready.group_members_rebuild import (
-    advance_group_ready_members_build,
-    begin_group_ready_members_build,
-)
 from .runtime.locks import schema_lock
 from .runtime.paths import shared_paths
+from .runtime.ready.group_members import read_group_ready_members_state
+from .runtime.ready.group_members_rebuild import advance_group_ready_members_build, begin_group_ready_members_build
 from .runtime.records import utc_now
 from .runtime.store import atomic_replace, read_json
 
@@ -40,7 +38,9 @@ def _incompatible_agents(cfg: RootConfig) -> list[str]:
         except (KeyError, TypeError, ValueError):
             incompatible.append(machine)
             continue
-        if agent.get("observed_state") in {"active", "idle"} and GROUP_READY_MEMBERS_CAPABILITY not in agent.get("writer_capabilities", []):
+        if agent.get("observed_state") in {"active", "idle"} and GROUP_READY_MEMBERS_CAPABILITY not in agent.get(
+            "writer_capabilities", []
+        ):
             incompatible.append(machine)
     return incompatible
 
@@ -57,7 +57,8 @@ def group_ready_members_upgrade_status(cfg: RootConfig) -> dict[str, Any]:
 
 def check_group_ready_members_upgrade(cfg: RootConfig) -> dict[str, Any]:
     return {
-        "shared_root": str(cfg.shared_root), "capability": GROUP_READY_MEMBERS_CAPABILITY,
+        "shared_root": str(cfg.shared_root),
+        "capability": GROUP_READY_MEMBERS_CAPABILITY,
         "phase": group_ready_members_upgrade_status(cfg)["phase"],
         "incompatible_agents": _incompatible_agents(cfg),
     }
@@ -73,24 +74,29 @@ def start_group_ready_members_upgrade(cfg: RootConfig) -> dict[str, Any]:
         schema_path = shared_paths(cfg.shared_root)["schema"] / "version.json"
         schema = read_json(schema_path)
         required = schema["schema"].setdefault("required_capabilities", [])
-        begin_group_ready_members_build(
-            cfg, is_repair=GROUP_READY_MEMBERS_CAPABILITY not in required
-        )
+        begin_group_ready_members_build(cfg, is_repair=GROUP_READY_MEMBERS_CAPABILITY not in required)
         if GROUP_READY_MEMBERS_CAPABILITY not in required:
             required.append(GROUP_READY_MEMBERS_CAPABILITY)
             required.sort()
             atomic_replace(schema_path, schema)
         value = {
-            "activation_id": uuid.uuid4().hex, "phase": "building",
-            "capability": GROUP_READY_MEMBERS_CAPABILITY, "participants": _participants(cfg),
-            "attestations": {}, "created_at": utc_now(), "updated_at": utc_now(),
+            "activation_id": uuid.uuid4().hex,
+            "phase": "building",
+            "capability": GROUP_READY_MEMBERS_CAPABILITY,
+            "participants": _participants(cfg),
+            "attestations": {},
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
         }
         atomic_replace(_path(cfg), {"group_ready_members_upgrade": value})
         return value
 
 
 def attest_group_ready_members_upgrade(
-    cfg: RootConfig, *, activation_id: str, machine_name: str,
+    cfg: RootConfig,
+    *,
+    activation_id: str,
+    machine_name: str,
 ) -> dict[str, Any]:
     with schema_lock(cfg.shared_root):
         value = read_json(_path(cfg))["group_ready_members_upgrade"]
@@ -107,7 +113,10 @@ def attest_group_ready_members_upgrade(
 
 
 def resume_group_ready_members_upgrade(
-    cfg: RootConfig, *, activation_id: str, max_tasks: int = 64,
+    cfg: RootConfig,
+    *,
+    activation_id: str,
+    max_tasks: int = 64,
 ) -> dict[str, Any]:
     with schema_lock(cfg.shared_root):
         value = read_json(_path(cfg))["group_ready_members_upgrade"]

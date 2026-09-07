@@ -42,17 +42,13 @@ from .contracts import (
     dispatch_protected_boundary,
     freeze_scalar_metrics,
 )
-from .hooks import (
-    OptimizerStepEndContext,
-    RunnerBoundaryContext,
-    RunnerHooks,
-    ValidationHookContext,
-)
+from .hooks import OptimizerStepEndContext, RunnerBoundaryContext, RunnerHooks, ValidationHookContext
 from .runner_utils.avgbank import AvgBank
 from .runner_utils.best_model import BestMetricSnapshot, BestModelTracker
 from .runner_utils.common import _is_periodic_trigger, move_batch_to_device
-from .runner_utils.ema_context import EMAOffloadContext
+from .runner_utils.ddpdeduper import EvalDedupRuntime, prepare_eval_loader_for_ddp, unwrap_eval_batch
 from .runner_utils.earlystop import EarlyStopController
+from .runner_utils.ema_context import EMAOffloadContext
 from .runner_utils.evaluation import (
     EvaluationResult,
     LoaderEvaluation,
@@ -64,11 +60,6 @@ from .runner_utils.evaluation import (
 from .runner_utils.hook_binding import bind_post_metrics_to_value
 from .runner_utils.tensorbank import TensorBank
 from .runner_utils.types import RunConfig, RunMode, RunningState
-from .runner_utils.ddpdeduper import (
-    EvalDedupRuntime,
-    prepare_eval_loader_for_ddp,
-    unwrap_eval_batch,
-)
 
 
 def _get_scalar_metrics(batch_metrics: Dict[str, Any]) -> Dict[str, float]:
@@ -178,7 +169,7 @@ class RunningAgent:
         if self.scheduler.current_step >= self.scheduler.warmup_steps:
             self.train_avg_bank.reset()
             self.logger.info(
-                f"Warmup completed at step {self.scheduler.warmup_steps}. " f"Training metrics have been reset."
+                f"Warmup completed at step {self.scheduler.warmup_steps}. Training metrics have been reset."
             )
             self._should_reset_avg_after_warmup = False
 
@@ -302,11 +293,7 @@ class RunningAgent:
     ) -> tuple[list[tuple[Optional[str], DataLoader]], list[tuple[Optional[str], DataLoader]]]:
         """Resolve one synchronized, pass-local evaluation loader snapshot."""
         groups = ((Stage.VAL, val_loaders), (Stage.TEST, test_loaders))
-        manifest = [
-            (stage.value, loader_name)
-            for stage, loaders in groups
-            for loader_name, _ in loaders
-        ]
+        manifest = [(stage.value, loader_name) for stage, loaders in groups for loader_name, _ in loaders]
         if self.config.distributed and dist.is_available() and dist.is_initialized():
             gathered_manifests = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(gathered_manifests, manifest)
@@ -350,9 +337,7 @@ class RunningAgent:
         grouped_metrics: Dict[str, Dict[str, Any]] = {}
         for loader_name, data_loader in loaders:
             metrics = self._evaluate_loader(model=model, data_loader=data_loader, stage=stage)
-            loader_results.append(
-                LoaderEvaluation(name=loader_name, metrics=metrics)
-            )
+            loader_results.append(LoaderEvaluation(name=loader_name, metrics=metrics))
             if loader_name is not None:
                 grouped_metrics[loader_name] = metrics
 
@@ -383,9 +368,7 @@ class RunningAgent:
     def evaluate(self, model: nn.Module = None, use_ema: bool = False) -> EvaluationResult:
         base_model = model or self.model
         val_loaders, test_loaders = self._resolve_evaluation_loaders()
-        val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(
-            val_loaders, test_loaders
-        )
+        val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(val_loaders, test_loaders)
         with self._ema_offload_ctx(model=base_model, use_ema=use_ema) as eval_model:
             model_result = self._evaluate_model(
                 eval_model,
@@ -402,20 +385,14 @@ class RunningAgent:
     ) -> EvaluationResult:
         if val_loaders is None or test_loaders is None:
             val_loaders, test_loaders = self._resolve_evaluation_loaders()
-            val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(
-                val_loaders, test_loaders
-            )
+            val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(val_loaders, test_loaders)
 
         with self._ema_offload_ctx(model=self.model, use_ema=False) as eval_model:
-            standard_result = self._evaluate_model(
-                eval_model, val_loaders, test_loaders, "standard"
-            )
+            standard_result = self._evaluate_model(eval_model, val_loaders, test_loaders, "standard")
         model_results = [standard_result]
         if self.ema_model is not None:
             with self._ema_offload_ctx(model=self.model, use_ema=True) as eval_model:
-                ema_result = self._evaluate_model(
-                    eval_model, val_loaders, test_loaders, "ema"
-                )
+                ema_result = self._evaluate_model(eval_model, val_loaders, test_loaders, "ema")
             model_results.append(ema_result)
         return EvaluationResult(models=tuple(model_results))
 
@@ -439,9 +416,7 @@ class RunningAgent:
         )
 
         with self._ema_offload_ctx(model=base_model, use_ema=use_ema) as eval_model:
-            stage_result = self._evaluate_loader_group(
-                eval_model, [(loader_name, prepared_loader)], stage
-            )
+            stage_result = self._evaluate_loader_group(eval_model, [(loader_name, prepared_loader)], stage)
             assert stage_result is not None
             return EvaluationResult(
                 models=(ModelEvaluation(variant="ema" if use_ema else "standard", stages=(stage_result,)),)
@@ -462,9 +437,7 @@ class RunningAgent:
         has_epoch_metric = self.task.has_implemented("epoch_metric")
         use_tensor_bank_for_eval = has_batch_cache and has_epoch_metric
         eval_tensor_bank = TensorBank(logger=self.logger) if use_tensor_bank_for_eval else None
-        eval_runtime = getattr(data_loader, "dedup_runtime", None) or EvalDedupRuntime(
-            enabled=False
-        )
+        eval_runtime = getattr(data_loader, "dedup_runtime", None) or EvalDedupRuntime(enabled=False)
 
         has_progress_tick = self.observers.has("progress_tick")
         should_calc_avg = has_progress_tick
@@ -476,11 +449,7 @@ class RunningAgent:
                     batch_data = self._prepare_batch(batch_data)
                     out, batch_data = self._forward_batch(model, batch_data)
 
-                    raw_batch_metrics = (
-                        {}
-                        if control.all_duplicate
-                        else self.task.batch_metric(out, batch_data)
-                    )
+                    raw_batch_metrics = {} if control.all_duplicate else self.task.batch_metric(out, batch_data)
                     if not control.all_duplicate:
                         eval_avg_bank.update_from_dict(raw_batch_metrics)
                         if eval_tensor_bank:
@@ -488,9 +457,7 @@ class RunningAgent:
 
                     scalar_batch_metrics = _get_scalar_metrics(raw_batch_metrics)
                     avg_metrics = (
-                        eval_runtime.gather_avg_bank(
-                            eval_avg_bank, self.config.distributed, self.device
-                        )
+                        eval_runtime.gather_avg_bank(eval_avg_bank, self.config.distributed, self.device)
                         if should_calc_avg
                         else None
                     )
@@ -510,13 +477,9 @@ class RunningAgent:
                             ),
                         )
 
-            avg_metrics = eval_runtime.gather_avg_bank(
-                eval_avg_bank, self.config.distributed, self.device
-            )
+            avg_metrics = eval_runtime.gather_avg_bank(eval_avg_bank, self.config.distributed, self.device)
             if use_tensor_bank_for_eval and eval_tensor_bank:
-                gathered_cache = eval_runtime.gather_tensor_bank(
-                    eval_tensor_bank, self.config.distributed, self.device
-                )
+                gathered_cache = eval_runtime.gather_tensor_bank(eval_tensor_bank, self.config.distributed, self.device)
                 task_epoch_metrics = self.task.epoch_metric(gathered_cache)
                 if task_epoch_metrics:
                     avg_metrics.update(task_epoch_metrics)
@@ -545,8 +508,7 @@ class RunningAgent:
         current_val = evaluation.target_value(target_key)
         if current_val is None:
             self.logger.debug(
-                "BestModelTracker skipped: target=%r default=skip_compare_and_checkpoint "
-                "epoch=%s step=%s.",
+                "BestModelTracker skipped: target=%r default=skip_compare_and_checkpoint epoch=%s step=%s.",
                 target_key,
                 self.state.epoch,
                 self.state.global_step,
@@ -567,9 +529,7 @@ class RunningAgent:
 
     def _run_evaluation_and_update(self) -> EarlyStopDecision:
         val_loaders, test_loaders = self._resolve_evaluation_loaders()
-        val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(
-            val_loaders, test_loaders
-        )
+        val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(val_loaders, test_loaders)
         total_eval_batches = sum(len(loader) for _, loader in (*val_loaders, *test_loaders))
 
         self.observers.dispatch(
@@ -618,7 +578,9 @@ class RunningAgent:
             if self._validation_scheduler_step is not None:
                 self._validation_scheduler_step(context)
 
-        requires_settlement = self.early_stop_controller is not None or self.hooks.has_collective_capable_validation_hook
+        requires_settlement = (
+            self.early_stop_controller is not None or self.hooks.has_collective_capable_validation_hook
+        )
         dispatch_protected_boundary(
             _run_pre_control_phase,
             distributed=self.config.distributed,
@@ -657,35 +619,22 @@ class RunningAgent:
         is_epoch_end: bool,
     ) -> Optional[BoundaryStop]:
         """Finalize one processed training boundary in temporal order."""
-        periodic_boundary = (
-            is_epoch_end if self.config.run_mode == RunMode.EPOCH else did_optimizer_step
-        )
+        periodic_boundary = is_epoch_end if self.config.run_mode == RunMode.EPOCH else did_optimizer_step
         periodic_eval = False
         if periodic_boundary:
             periodic_eval = self._check_run_period(self.config.eval_interval, is_epoch_end)
 
-        reached_max_steps = (
-            self.config.max_steps is not None and self.state.global_step >= self.config.max_steps
-        )
+        reached_max_steps = self.config.max_steps is not None and self.state.global_step >= self.config.max_steps
         reaches_max_epochs = (
-            is_epoch_end
-            and self.config.max_epochs is not None
-            and self.state.epoch + 1 >= self.config.max_epochs
+            is_epoch_end and self.config.max_epochs is not None and self.state.epoch + 1 >= self.config.max_epochs
         )
         hard_limit_reached = reached_max_steps or reaches_max_epochs
 
-        completion_eval_requested = (
-            hard_limit_reached and self.config.completion_eval and not periodic_eval
-        )
-        has_selected_action = (
-            periodic_eval
-            or completion_eval_requested
-        )
+        completion_eval_requested = hard_limit_reached and self.config.completion_eval and not periodic_eval
+        has_selected_action = periodic_eval or completion_eval_requested
 
         if has_selected_action:
-            has_nan_failure = (
-                self._latest_train_loss is not None and math.isnan(self._latest_train_loss)
-            )
+            has_nan_failure = self._latest_train_loss is not None and math.isnan(self._latest_train_loss)
             if self.config.distributed:
                 local_nan = torch.tensor([int(has_nan_failure)], dtype=torch.int64, device=self.device)
                 gathered_nan = [torch.empty_like(local_nan) for _ in range(dist.get_world_size())]
@@ -716,19 +665,13 @@ class RunningAgent:
                     f"eval trigger: run_mode={self.config.run_mode}, global_step={self.state.global_step}, epoch={self.state.epoch}, is_epoch_end={is_epoch_end}"
                     f"\n eval_interval={self.config.eval_interval}"
                 )
-            periodic_decision = (
-                self._run_evaluation_and_update() if periodic_eval else EarlyStopDecision()
-            )
+            periodic_decision = self._run_evaluation_and_update() if periodic_eval else EarlyStopDecision()
         else:
             periodic_decision = EarlyStopDecision()
 
         periodic_early_stop = periodic_decision.should_stop
         terminal_candidate = hard_limit_reached or periodic_early_stop
-        completion_eval_requested = (
-            terminal_candidate
-            and self.config.completion_eval
-            and not periodic_eval
-        )
+        completion_eval_requested = terminal_candidate and self.config.completion_eval and not periodic_eval
 
         if completion_eval_requested:
             if is_epoch_end:

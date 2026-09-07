@@ -1,4 +1,5 @@
 """Legacy-agent inspection helpers and GPU discovery."""
+
 from __future__ import annotations
 
 import os
@@ -19,11 +20,16 @@ def get_agent_status(cfg: RootConfig, probe_local_pid: bool = True) -> dict[str,
         pid = None
     running = bool(pid and (not probe_local_pid or _pid_alive(pid)))
     capability = clock_capability(cfg)
-    return {"machine_name": cfg.machine_name, "agent_state": "active" if running else "stopped",
-            "pid": pid, "is_running": running, "clock_capability": capability.status,
-            "clock_reason": capability.reason,
-            "clock_provider": capability.observation.provider if capability.observation else None,
-            "scheduling_capability": "full" if capability.is_healthy else "local-safe"}
+    return {
+        "machine_name": cfg.machine_name,
+        "agent_state": "active" if running else "stopped",
+        "pid": pid,
+        "is_running": running,
+        "clock_capability": capability.status,
+        "clock_reason": capability.reason,
+        "clock_provider": capability.observation.provider if capability.observation else None,
+        "scheduling_capability": "full" if capability.is_healthy else "local-safe",
+    }
 
 
 def _pid_alive(pid: int) -> bool:
@@ -39,12 +45,14 @@ def _visible_gpus(cfg: RootConfig) -> list[int]:
     if value:
         return [int(item) for item in value.split(",") if item.strip()]
     if shutil.which("nvidia-smi"):
-        result = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-                                check=False, capture_output=True, text=True)
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], check=False, capture_output=True, text=True
+        )
         if result.returncode == 0:
             return [int(item.strip()) for item in result.stdout.splitlines() if item.strip()]
     try:
         import torch
+
         return list(range(torch.cuda.device_count()))
     except Exception:
         return []
@@ -52,9 +60,8 @@ def _visible_gpus(cfg: RootConfig) -> list[int]:
 
 def run_agent_loop(*_args: object, **_kwargs: object) -> None:
     """Reject the removed standalone agent runtime."""
-    raise RuntimeError(
-        "standalone agent runtime was removed; use 'qexp agent add-project' then 'qexp agent start'."
-    )
+    raise RuntimeError("standalone agent runtime was removed; use 'qexp agent add-project' then 'qexp agent start'.")
+
 
 def start_agent(*_args: object, **_kwargs: object) -> None:
     """Reject the removed standalone agent runtime."""

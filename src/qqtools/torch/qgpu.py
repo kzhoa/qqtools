@@ -54,7 +54,7 @@ def gpu(show=True):
     try:
         gpu_stats = gpustat.GPUStatCollection.new_query()
     except Exception as e:
-        sys.stderr.write("Error on querying NVIDIA devices." " Use --debug flag for details\n")
+        sys.stderr.write("Error on querying NVIDIA devices. Use --debug flag for details\n")
         try:
             import traceback
 

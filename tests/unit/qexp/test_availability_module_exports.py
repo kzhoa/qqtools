@@ -3,8 +3,7 @@ from __future__ import annotations
 
 def test_availability_facade_exports_transition_owner_objects() -> None:
     from qqtools.plugins.qexp.runtime import availability
-    from qqtools.plugins.qexp.runtime.availability import offer_deadlines
-    from qqtools.plugins.qexp.runtime.availability import transitions
+    from qqtools.plugins.qexp.runtime.availability import offer_deadlines, transitions
 
     assert availability.AvailabilityTransitionRequest is transitions.AvailabilityTransitionRequest
     assert availability.AvailabilityTransitionResult is transitions.AvailabilityTransitionResult
@@ -23,9 +22,6 @@ def test_availability_facade_exports_transition_owner_objects() -> None:
 def test_offer_deadline_owner_does_not_depend_on_availability_transitions() -> None:
     from pathlib import Path
 
-    source = (
-        Path(__file__).parents[3]
-        / "src/qqtools/plugins/qexp/runtime/availability/offer_deadlines.py"
-    )
+    source = Path(__file__).parents[3] / "src/qqtools/plugins/qexp/runtime/availability/offer_deadlines.py"
 
     assert "transitions" not in source.read_text(encoding="utf-8")

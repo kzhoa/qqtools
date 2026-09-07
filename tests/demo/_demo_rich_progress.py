@@ -1,9 +1,10 @@
-import time
 import logging
+import time
+
+from qqtools.plugins.qpipeline.qlogger import ConsoleLogger
 from qqtools.plugins.qpipeline.runner.contracts import EpochCommittedFact, EpochStartedFact, ProgressTickFact
 from qqtools.plugins.qpipeline.runner.runner_utils.progress import ProgressTracker
 from qqtools.plugins.qpipeline.types import Stage
-from qqtools.plugins.qpipeline.qlogger import ConsoleLogger
 
 
 def main():

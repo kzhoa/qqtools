@@ -19,6 +19,7 @@ from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 class _RecordingExecutor:
     def __init__(self) -> None:
         self.launched: list[tuple[str, str]] = []

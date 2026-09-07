@@ -43,8 +43,7 @@ class _WrappedDataset:
     def __getitem__(self, occurrence_key: OccurrenceKey) -> _SampleEnvelope:
         if not isinstance(occurrence_key, OccurrenceKey):
             raise TypeError(
-                "DDPOutputDeduper wrapped datasets require OccurrenceKey indices. "
-                f"Got {type(occurrence_key).__name__}."
+                f"DDPOutputDeduper wrapped datasets require OccurrenceKey indices. Got {type(occurrence_key).__name__}."
             )
         payload = self._dataset[occurrence_key.logical_sample_id]
         return _SampleEnvelope(
@@ -77,9 +76,7 @@ class _DedupCollate:
         real_items = [item for item in batch_list if item.is_real]
         is_all_duplicate = len(real_items) == 0
         collate_source = (
-            [item.payload for item in batch_list]
-            if is_all_duplicate
-            else [item.payload for item in real_items]
+            [item.payload for item in batch_list] if is_all_duplicate else [item.payload for item in real_items]
         )
         payload = self._collate_fn(collate_source)
         real_logical_ids = tuple(item.occurrence.logical_sample_id for item in real_items)
@@ -195,10 +192,7 @@ class DDPOutputDeduper:
             batch_size = self.loader.batch_size
             if batch_size is None:
                 raise ValueError("Sampler path requires loader.batch_size to be set.")
-            batches = [
-                local_indices[start : start + batch_size]
-                for start in range(0, len(local_indices), batch_size)
-            ]
+            batches = [local_indices[start : start + batch_size] for start in range(0, len(local_indices), batch_size)]
             if self.loader.drop_last and batches and len(batches[-1]) < batch_size:
                 batches = batches[:-1]
             return batches
@@ -233,12 +227,7 @@ class DDPOutputDeduper:
         local_occurrence_batches: list[list[OccurrenceKey]] = []
         local_slot = 0
 
-        target_ids = {
-            logical_id
-            for rank_batches in gathered_batches
-            for batch in rank_batches
-            for logical_id in batch
-        }
+        target_ids = {logical_id for rank_batches in gathered_batches for batch in rank_batches for logical_id in batch}
 
         for step_idx in range(max_steps):
             step_occurrence_batch: Optional[list[OccurrenceKey]] = None

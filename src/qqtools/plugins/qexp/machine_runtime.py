@@ -1,4 +1,5 @@
 """Machine-local runtime ownership for qexp multi-project scheduling."""
+
 from __future__ import annotations
 
 import os
@@ -13,9 +14,9 @@ from .config_types import RootConfig
 from .layout import load_machine_record, load_root_config
 from .runtime.locks import exclusive
 from .runtime.paths import local_paths, machine_project_paths, machine_runtime_paths, shared_paths
+from .runtime.ready import ReadyCursor
 from .runtime.records import utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
-from .runtime.ready import ReadyCursor
 from .runtime.work_budget import AdaptiveBatchSizer
 
 MACHINE_RUNTIME_ENV = "QEXP_MACHINE_RUNTIME_ROOT"
@@ -88,9 +89,7 @@ class ProjectBinding:
             raise RuntimeError(
                 f"machine {self.machine_name!r} has no valid standalone runtime_root in {self.shared_root}."
             )
-        return load_root_config(
-            self.shared_root, self.machine_name, runtime_root, require_initialized=True
-        )
+        return load_root_config(self.shared_root, self.machine_name, runtime_root, require_initialized=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,8 +126,7 @@ class ExecutionContext:
         return self.machine_runtime.root if self.binding else self.cfg.runtime_root
 
 
-def resolve_execution_context(
-        cfg: RootConfig, machine_runtime_root: str | Path | None = None) -> ExecutionContext:
+def resolve_execution_context(cfg: RootConfig, machine_runtime_root: str | Path | None = None) -> ExecutionContext:
     """Resolve the registered machine reservation backend for a project operation."""
     return MachineRuntime(machine_runtime_root).execution_context(cfg)
 
@@ -160,8 +158,16 @@ class MachineRuntime:
         if not os.access(self.root, os.W_OK | os.X_OK):
             raise RuntimeError(f"machine runtime root is not writable: {self.root}")
         for name in (
-            "locks", "agent", "provisional", "active", "released", "cpu_provisional",
-            "cpu_active", "cpu_released", "projects", "diagnostics",
+            "locks",
+            "agent",
+            "provisional",
+            "active",
+            "released",
+            "cpu_provisional",
+            "cpu_active",
+            "cpu_released",
+            "projects",
+            "diagnostics",
         ):
             self.paths[name].mkdir(parents=True, exist_ok=True)
         self.paths["cpu_policy"].parent.mkdir(parents=True, exist_ok=True)
@@ -177,11 +183,7 @@ class MachineRuntime:
     def scheduler_authority(self, *, blocking: bool = False) -> Iterator[bool]:
         self.ensure_layout()
         user_id = os.getuid() if hasattr(os, "getuid") else 0
-        global_lock = (
-            Path(tempfile.gettempdir())
-            / f"qqtools-qexp-machine-{user_id}"
-            / "agent-authority.lock"
-        )
+        global_lock = Path(tempfile.gettempdir()) / f"qqtools-qexp-machine-{user_id}" / "agent-authority.lock"
         global_lock.parent.mkdir(parents=True, exist_ok=True)
         with exclusive(global_lock, blocking=blocking) as has_machine_authority:
             if not has_machine_authority:
@@ -241,7 +243,7 @@ class MachineRuntime:
         )
 
     def ensure_binding(
-            self, shared_root: str | Path, machine_name: str, *, enabled: bool = True
+        self, shared_root: str | Path, machine_name: str, *, enabled: bool = True
     ) -> tuple[ProjectBinding, bool]:
         """Persist one binding, returning whether this call created it."""
         cfg = load_root_config(shared_root, machine_name, require_initialized=True)
@@ -272,9 +274,7 @@ class MachineRuntime:
             raise ValueError(f"project {binding.project_id!r} is already registered.")
         return binding
 
-    def _legacy_evidence_roots(
-        self, binding: ProjectBinding
-    ) -> tuple[dict[str, Path], dict[str, Path]] | None:
+    def _legacy_evidence_roots(self, binding: ProjectBinding) -> tuple[dict[str, Path], dict[str, Path]] | None:
         migration_path = self.migration_path(binding.project_id)
         if not migration_path.exists():
             return None
@@ -305,13 +305,8 @@ class MachineRuntime:
                 destination = destination_paths[name] / path.relative_to(source_root)
                 source_value = read_json(path)
                 if destination.exists():
-                    if (
-                        not is_destination_authoritative
-                        and read_json(destination) != source_value
-                    ):
-                        raise RuntimeError(
-                            f"legacy evidence conflicts during migration: {destination}"
-                        )
+                    if not is_destination_authoritative and read_json(destination) != source_value:
+                        raise RuntimeError(f"legacy evidence conflicts during migration: {destination}")
                 else:
                     atomic_replace(destination, source_value)
                 path.unlink(missing_ok=True)
@@ -354,21 +349,14 @@ class MachineRuntime:
                 revision, bindings = self.load_registry()
                 binding = self._find_binding(bindings, identifier)
                 if binding.enabled:
-                    raise ValueError(
-                        "disable a project before removing it from the machine registry."
-                    )
+                    raise ValueError("disable a project before removing it from the machine registry.")
                 blockers = self.binding_blockers(binding)
                 if blockers:
-                    raise RuntimeError(
-                        "cannot remove project with active local evidence: "
-                        + ", ".join(blockers)
-                    )
+                    raise RuntimeError("cannot remove project with active local evidence: " + ", ".join(blockers))
                 project_root = self.project_paths(binding.project_id)["root"]
                 if project_root.exists():
                     shutil.rmtree(project_root)
-                self._save_registry(
-                    revision + 1, [item for item in bindings if item != binding]
-                )
+                self._save_registry(revision + 1, [item for item in bindings if item != binding])
         return binding
 
     def binding_blockers(self, binding: ProjectBinding) -> list[str]:
@@ -428,11 +416,7 @@ class MachineRuntime:
         _, bindings = self.load_registry()
         project_matches = [binding for binding in bindings if binding.project_id == stable_id]
         root_matches = [binding for binding in bindings if binding.shared_root == root]
-        matches = [
-            binding
-            for binding in project_matches
-            if binding.shared_root == root
-        ]
+        matches = [binding for binding in project_matches if binding.shared_root == root]
         if len(project_matches) > 1 or len(root_matches) > 1:
             candidates = project_matches or root_matches
             machines = ", ".join(sorted(binding.machine_name for binding in candidates))
@@ -447,12 +431,8 @@ class MachineRuntime:
                 except (OSError, TypeError, ValueError):
                     raise ValueError(f"qexp machine record is malformed: {record_path}") from None
                 if not isinstance(machine, dict) or machine.get("agent_runtime") != "machine":
-                    raise ValueError(
-                        "legacy project metadata detected; run 'qexp agent migrate-project'."
-                    )
-            raise ValueError(
-                f"no local project binding exists for {root}; run 'qexp agent add-project'."
-            )
+                    raise ValueError("legacy project metadata detected; run 'qexp agent migrate-project'.")
+            raise ValueError(f"no local project binding exists for {root}; run 'qexp agent add-project'.")
         if len(matches) > 1:
             machines = ", ".join(sorted(binding.machine_name for binding in matches))
             raise RuntimeError(f"local project binding is ambiguous for {root}: {machines}.")
@@ -462,17 +442,13 @@ class MachineRuntime:
         record = load_machine_record(cfg)
         machine = record.get("machine", {}) if isinstance(record, dict) else {}
         if not isinstance(machine, dict):
-            raise ValueError(
-                f"machine record for {binding.machine_name!r} is malformed in {root}."
-            )
+            raise ValueError(f"machine record for {binding.machine_name!r} is malformed in {root}.")
         if (
             machine.get("machine_name") != binding.machine_name
             or machine.get("project_id") != binding.project_id
             or machine.get("shared_root") != str(root)
         ):
-            raise ValueError(
-                f"local binding for machine {binding.machine_name!r} does not match Project truth."
-            )
+            raise ValueError(f"local binding for machine {binding.machine_name!r} does not match Project truth.")
         if machine.get("agent_runtime") != "machine":
             raise ValueError("legacy project metadata detected; run 'qexp agent migrate-project'.")
         return binding

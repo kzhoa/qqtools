@@ -102,8 +102,12 @@ def prompt_runner_params():
                 print_formatted_text("❌ Must be an integer.")
 
     else:  # step mode
-        print_formatted_text("\n📍 Step Mode: Training requires at least one of max_steps or max_epochs, plus early stopping")
-        print_formatted_text("  💡 Leave max_steps empty only if you provide max_epochs and want the runner to infer it.")
+        print_formatted_text(
+            "\n📍 Step Mode: Training requires at least one of max_steps or max_epochs, plus early stopping"
+        )
+        print_formatted_text(
+            "  💡 Leave max_steps empty only if you provide max_epochs and want the runner to infer it."
+        )
 
         # max_steps (optional; can be inferred from max_epochs)
         while True:
@@ -121,7 +125,9 @@ def prompt_runner_params():
                 print_formatted_text("❌ Must be an integer.")
 
         while True:
-            value = prompt("  Max Epochs (optional if max_steps is set; otherwise required for inference, press Enter to skip): ").strip()
+            value = prompt(
+                "  Max Epochs (optional if max_steps is set; otherwise required for inference, press Enter to skip): "
+            ).strip()
             if not value or value.lower() == "none":
                 break
             try:
@@ -216,9 +222,7 @@ def prompt_runner_params():
 
     # Step 6: Keep only latest regular checkpoint
     while True:
-        ans = prompt(
-            "\nKeep only latest regular checkpoint (deletes old ones)? [y/n] (default: y): "
-        ).strip().lower()
+        ans = prompt("\nKeep only latest regular checkpoint (deletes old ones)? [y/n] (default: y): ").strip().lower()
         if not ans or ans in ("y", "yes"):
             params["regular_latest_only"] = True
             break
@@ -231,9 +235,7 @@ def prompt_runner_params():
     params["completion"] = {"eval": False, "save": False}
     for action_name, action_key in (("evaluation", "eval"), ("regular checkpoint", "save")):
         while True:
-            ans = prompt(
-                f"Run {action_name} at successful training completion? [y/n] (default: n): "
-            ).strip().lower()
+            ans = prompt(f"Run {action_name} at successful training completion? [y/n] (default: n): ").strip().lower()
             if not ans or ans in ("n", "no"):
                 break
             if ans in ("y", "yes"):

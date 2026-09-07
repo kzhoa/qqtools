@@ -13,6 +13,7 @@ DATALOADER_DEFAULTS = {
     "pin_memory": True,
 }
 
+
 def prompt_task_params():
     """
     Interactive prompt for task parameters

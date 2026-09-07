@@ -1,21 +1,19 @@
 """Short-lived filesystem locks with the schema-defined lock order."""
+
 from __future__ import annotations
 
 import errno
 import fcntl
-from contextvars import ContextVar
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Iterator
 
 from .paths import lock_path, shared_paths
 from .store import read_json
 
-
 GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
-_schema_writer_roots: ContextVar[frozenset[Path]] = ContextVar(
-    "qexp_schema_writer_roots", default=frozenset()
-)
+_schema_writer_roots: ContextVar[frozenset[Path]] = ContextVar("qexp_schema_writer_roots", default=frozenset())
 
 
 def is_schema_narrow_protocol_active(cfg: object) -> bool:
@@ -165,9 +163,7 @@ def task_writer_lock(
             return
         with ExitStack() as stack:
             if group_name:
-                has_group_lock = stack.enter_context(
-                    group_lock(cfg.shared_root, group_name, blocking=blocking)
-                )
+                has_group_lock = stack.enter_context(group_lock(cfg.shared_root, group_name, blocking=blocking))
                 if not has_group_lock:
                     yield False
                     return

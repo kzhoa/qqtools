@@ -11,19 +11,13 @@ from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.resources.reservations import reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace
 from qqtools.plugins.qexp.runtime.tasks import load_task
-from qqtools.plugins.qexp.scheduler import (
-    authorize_launch,
-    claim_task,
-    resume_starting_attempt,
-)
+from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, resume_starting_attempt
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
 def _offered_task_and_remote_cfg(tmp_path: Path) -> tuple[RootConfig, RootConfig, str]:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "gpu-1"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "gpu-1")
     create_group(cfg, "exp")
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
     change_worker(cfg, "exp", "gpu-2", "add")
@@ -60,9 +54,7 @@ def test_cross_host_claim_lifecycle_does_not_require_qualification_file(tmp_path
 
 
 def test_setup_and_registration_ignore_legacy_qualification_file(tmp_path: Path) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "gpu-1"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "gpu-1")
     atomic_replace(
         shared_paths(cfg.shared_root)["project"] / "filesystem-qualification.json",
         {"filesystem_qualification": {"version": 1}},

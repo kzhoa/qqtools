@@ -25,10 +25,7 @@ def _load_optim_schema():
 
 
 def _load_qconfig_schema():
-    schema_path = (
-        Path(__file__).resolve().parents[4]
-        / "src/qqtools/plugins/qConfigGen/schemas/qConfigSchema.json"
-    )
+    schema_path = Path(__file__).resolve().parents[4] / "src/qqtools/plugins/qConfigGen/schemas/qConfigSchema.json"
     with open(schema_path, "r") as f:
         return json.load(f)
 
@@ -179,7 +176,6 @@ def test_qcgen_cli_entry_point():
         mock.patch("qqtools.plugins.qConfigGen.main.print_formatted_text"),
         mock.patch("qqtools.plugins.qConfigGen.main.pretty.install"),
     ):
-
         # Set return values for all mocks
         mock_global.return_value = {"seed": 42, "log_dir": "./tmp"}
         mock_task.return_value = {"dataset": "test"}

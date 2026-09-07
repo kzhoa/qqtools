@@ -142,5 +142,3 @@ def cleanup_logging_handlers():
         for handler in logger.handlers[:]:
             handler.close()
             logger.removeHandler(handler)
-
-

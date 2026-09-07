@@ -29,9 +29,7 @@ def _common(shared_root: Path, runtime_root: Path, machine_runtime_root: Path) -
     ]
 
 
-def _wait_for_terminal_task(
-    common: list[str], task_id: str, env: dict[str, str]
-) -> dict[str, object]:
+def _wait_for_terminal_task(common: list[str], task_id: str, env: dict[str, str]) -> dict[str, object]:
     def is_done() -> bool:
         task = jrun([*common, "task", "show", task_id], env=env)
         return task["task"]["state"]["projection"] in {"succeeded", "failed", "cancelled"}
@@ -44,9 +42,7 @@ def _wait_for_terminal_task(
     return jrun([*common, "task", "show", task_id], env=env)
 
 
-def _assert_current_project_is_registered(
-    common: list[str], shared_root: Path, env: dict[str, str]
-) -> None:
+def _assert_current_project_is_registered(common: list[str], shared_root: Path, env: dict[str, str]) -> None:
     projects = jrun([*common, "agent", "list-projects"], env=env)["projects"]
     assert any(project["shared_root"] == str(shared_root) for project in projects)
 
@@ -62,7 +58,7 @@ def test_use_rejects_removed_identity_inputs_and_keeps_locator_contract(tmp_path
         check=False,
     )
     assert rejected.returncode == 2
-    selected = run(["qexp", "use", "--shared-root", str(shared_root)], env=env)
+    run(["qexp", "use", "--shared-root", str(shared_root)], env=env)
     assert json.loads((base / "home" / ".qqtools" / "qexp-context.json").read_text()) == {
         "shared_root": str(shared_root)
     }
@@ -88,9 +84,7 @@ def test_new_project_activation_uses_registered_binding_without_add_project(tmp_
         assert status["action"] == "started"
         assert is_machine_agent_running(common, env=env)
 
-        task_id = run(
-            [*common, "submit", "--", "python", "-c", "print('protected start')"], env=env
-        ).stdout.strip()
+        task_id = run([*common, "submit", "--", "python", "-c", "print('protected start')"], env=env).stdout.strip()
         task = _wait_for_terminal_task(common, task_id, env)
 
         assert "site-packages" in ensure_site_packages_import()
@@ -113,9 +107,7 @@ def test_new_project_submit_activates_agent_without_manual_registration(tmp_path
         _assert_current_project_is_registered(common, shared_root, env)
         assert not is_machine_agent_running(common, env=env)
 
-        task_id = run(
-            [*common, "submit", "--", "python", "-c", "print('protected submit')"], env=env
-        ).stdout.strip()
+        task_id = run([*common, "submit", "--", "python", "-c", "print('protected submit')"], env=env).stdout.strip()
         task = _wait_for_terminal_task(common, task_id, env)
 
         assert "site-packages" in ensure_site_packages_import()
@@ -138,9 +130,7 @@ def test_legacy_metadata_requires_migration_without_touching_unrelated_resources
     bootstrap_common = _common(shared_root, runtime_root, bootstrap_runtime_root)
     common = _common(shared_root, runtime_root, machine_runtime_root)
     record_path = shared_root / "machines" / "gpu-1" / "machine.json"
-    legacy_reservation_path = (
-        runtime_root / "reservations" / "provisional" / "legacy-reservation.json"
-    )
+    legacy_reservation_path = runtime_root / "reservations" / "provisional" / "legacy-reservation.json"
     legacy_evidence_path = runtime_root / "processes" / "legacy-attempt.json"
     unrelated_reservation_path = machine_runtime_root / "reservations" / "active" / "unrelated.json"
 
@@ -165,9 +155,7 @@ def test_legacy_metadata_requires_migration_without_touching_unrelated_resources
             encoding="utf-8",
         )
         legacy_evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        legacy_evidence_path.write_text(
-            json.dumps({"process": {"attempt_id": "legacy-attempt"}}), encoding="utf-8"
-        )
+        legacy_evidence_path.write_text(json.dumps({"process": {"attempt_id": "legacy-attempt"}}), encoding="utf-8")
 
         other_root = base / "other-project" / ".qexp"
         other_runtime_root = base / "other-runtime"
@@ -238,15 +226,9 @@ def test_legacy_metadata_requires_migration_without_touching_unrelated_resources
         bindings = registry["registry"]["bindings"]
         target = next(binding for binding in bindings if binding["shared_root"] == str(shared_root))
         assert target["enabled"] is True
-        migrated_reservation = (
-            machine_runtime_root / "reservations" / "provisional" / "legacy-reservation.json"
-        )
+        migrated_reservation = machine_runtime_root / "reservations" / "provisional" / "legacy-reservation.json"
         migrated_evidence = (
-            machine_runtime_root
-            / "projects"
-            / target["project_id"]
-            / "processes"
-            / "legacy-attempt.json"
+            machine_runtime_root / "projects" / target["project_id"] / "processes" / "legacy-attempt.json"
         )
         assert migrated_reservation.exists()
         assert migrated_evidence.exists()

@@ -71,6 +71,7 @@ def test_group_reservation_limit_is_atomic_across_provisionals(tmp_path: Path) -
     assert value["reservation_id"] == first["reservation"]["reservation_id"]
     assert value["admission"]["admitted_as_borrow"] is False
 
+
 def test_resolve_machine_runtime_root_prefers_explicit_override_and_uses_safe_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -143,9 +144,7 @@ def test_registry_add_list_disable_and_remove_project_binding(tmp_path: Path) ->
 
 
 def test_remove_project_deletes_its_disposable_runtime_partition(tmp_path: Path) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     project_root = runtime.project_paths(binding.project_id)["root"]
@@ -179,9 +178,7 @@ def test_migrate_project_imports_legacy_reservation_and_marks_machine_runtime(tm
 def test_migration_moves_agent_evidence_and_drains_only_late_runner_records(
     tmp_path: Path,
 ) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     record_path = cfg.shared_root / "machines" / cfg.machine_name / "machine.json"
     record = read_json(record_path)
     record["machine"].pop("agent_runtime")
@@ -217,9 +214,7 @@ def test_migration_moves_agent_evidence_and_drains_only_late_runner_records(
 
 
 def test_project_snapshots_preserve_agent_start_and_continuous_idle_times(tmp_path: Path) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "project-runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "project-runtime")
     readable = {"project-1": cfg}
     agent_path = cfg.shared_root / "machines" / cfg.machine_name / "state" / "agent.json"
 
@@ -247,9 +242,7 @@ def test_project_snapshots_preserve_agent_start_and_continuous_idle_times(tmp_pa
 
 
 def test_migrate_project_preserves_intentionally_disabled_active_binding(tmp_path: Path) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name, enabled=False)
     atomic_replace(
@@ -273,9 +266,7 @@ def test_migrate_project_preserves_intentionally_disabled_active_binding(tmp_pat
 
 
 def test_migration_waits_for_legacy_reservation_lock_before_import(tmp_path: Path) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     record_path = cfg.shared_root / "machines" / cfg.machine_name / "machine.json"
     record = read_json(record_path)
     record["machine"].pop("agent_runtime")
@@ -306,9 +297,7 @@ def test_migration_waits_for_legacy_reservation_lock_before_import(tmp_path: Pat
         else:
             pytest.fail("migration did not reach the source reservation lock")
         assert not (runtime.paths["provisional"] / f"{reservation_id}.json").exists()
-        source_path = (
-            cfg.runtime_root / "reservations" / "provisional" / f"{reservation_id}.json"
-        )
+        source_path = cfg.runtime_root / "reservations" / "provisional" / f"{reservation_id}.json"
         assert source_path.exists()
     thread.join(timeout=2.0)
 
@@ -322,9 +311,7 @@ def test_migration_disables_binding_when_final_state_write_fails(
 ) -> None:
     import qqtools.plugins.qexp.machine_agent as machine_agent
 
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     record_path = cfg.shared_root / "machines" / cfg.machine_name / "machine.json"
     record = read_json(record_path)
     record["machine"].pop("agent_runtime")
@@ -347,15 +334,11 @@ def test_migration_disables_binding_when_final_state_write_fails(
     assert read_json(runtime.migration_path(binding.project_id))["migration"]["state"] == "blocked"
 
 
-def test_legacy_agent_stop_treats_reused_pid_as_stopped(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_legacy_agent_stop_treats_reused_pid_as_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from qqtools.plugins.qexp.layout import runtime_pid_path
     from qqtools.plugins.qexp.machine_agent import _stop_verified_legacy_agent
 
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     pid_path = runtime_pid_path(cfg)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text("1234", encoding="utf-8")
@@ -417,7 +400,9 @@ def test_migration_gpu_conflict_keeps_source_and_disables_project(tmp_path: Path
 
     binding = runtime.matching_binding(cfg)
     assert binding is not None and not binding.enabled
-    assert (cfg.runtime_root / "reservations" / "provisional" / f"{source['reservation']['reservation_id']}.json").exists()
+    assert (
+        cfg.runtime_root / "reservations" / "provisional" / f"{source['reservation']['reservation_id']}.json"
+    ).exists()
 
 
 def test_machine_recovery_retags_global_reservation(tmp_path: Path) -> None:
@@ -445,13 +430,18 @@ def test_machine_recovery_retags_global_reservation(tmp_path: Path) -> None:
         reservation_runtime_root=runtime.root,
     )
     process_path = context.local_cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json"
-    atomic_replace(process_path, {"process": {
-        "task_id": task.task_id,
-        "attempt_id": attempt.attempt_id,
-        "fencing_token": attempt.current_fencing_token,
-            "process_group_id": 9876,
-            "observed_state": "running",
-        }})
+    atomic_replace(
+        process_path,
+        {
+            "process": {
+                "task_id": task.task_id,
+                "attempt_id": attempt.attempt_id,
+                "fencing_token": attempt.current_fencing_token,
+                "process_group_id": 9876,
+                "observed_state": "running",
+            }
+        },
+    )
     attempt_path = cfg.shared_root / "attempts" / task.task_id / "1.json"
     attempt_value = read_json(attempt_path)
     attempt_value["attempt"]["phase"] = "orphaned"
@@ -480,13 +470,17 @@ def test_registry_rejects_duplicate_project_id_and_shared_root(tmp_path: Path) -
     binding = runtime.add_binding(first.shared_root, first.machine_name)
 
     identity_path = second.shared_root / "project" / "identity.json"
-    atomic_replace(identity_path, {"project": {"project_id": binding.project_id, "shared_root": str(second.shared_root)}})
+    atomic_replace(
+        identity_path, {"project": {"project_id": binding.project_id, "shared_root": str(second.shared_root)}}
+    )
     with pytest.raises(ValueError, match="already registered"):
         runtime.add_binding(second.shared_root, second.machine_name)
 
     atomic_replace(identity_path, {"project": {"project_id": "other-project", "shared_root": str(second.shared_root)}})
     first_identity_path = first.shared_root / "project" / "identity.json"
-    atomic_replace(first_identity_path, {"project": {"project_id": "other-project", "shared_root": str(first.shared_root)}})
+    atomic_replace(
+        first_identity_path, {"project": {"project_id": "other-project", "shared_root": str(first.shared_root)}}
+    )
     with pytest.raises(ValueError, match="project root.*already registered"):
         runtime.add_binding(first.shared_root, first.machine_name)
 
@@ -506,9 +500,7 @@ def test_disabled_binding_is_draining_while_project_evidence_exists(tmp_path: Pa
 
     process_path.unlink()
     decision_path = (
-        runtime.project_paths(disabled.project_id)["termination_decisions"]
-        / "attempt-1"
-        / "decision-1.json"
+        runtime.project_paths(disabled.project_id)["termination_decisions"] / "attempt-1" / "decision-1.json"
     )
     atomic_replace(decision_path, {"termination_decision": {"state": "signal_committed"}})
     assert runtime.binding_state(disabled) == "draining"
@@ -550,23 +542,22 @@ def test_machine_dispatch_uses_one_reservation_root_and_each_task_preflight(tmp_
     first_results = dispatch_machine_cycle(runtime, available_gpus=[0, 1], executor=executor)
 
     assert {item["project_id"] for item in first_results} == {
-        first_binding.project_id, second_binding.project_id,
+        first_binding.project_id,
+        second_binding.project_id,
     }
     assert {task_id for task_id, _ in executor.launched} == {first_task.task_id, second_task.task_id}
     assert reserved_gpu_ids(runtime.root) == {0, 1}
     assert reserved_gpu_ids(runtime.project_paths(first_binding.project_id)["root"]) == set()
     assert reserved_gpu_ids(runtime.project_paths(second_binding.project_id)["root"]) == set()
     reservations = active_reservations(runtime.root)
-    assert {(item["project_id"], item["shared_root"], item["machine_name"])
-            for item in reservations} == {
+    assert {(item["project_id"], item["shared_root"], item["machine_name"]) for item in reservations} == {
         (first_binding.project_id, str(first.shared_root), first.machine_name),
         (second_binding.project_id, str(second.shared_root), second.machine_name),
     }
 
     missing_task = submit(first, ["echo", "missing"], working_dir=tmp_path / "missing")
     diagnostic_path = (
-        runtime.paths["diagnostics"]
-        / f"bad-task-spec-{first_binding.project_id}-{missing_task.task_id}.json"
+        runtime.paths["diagnostics"] / f"bad-task-spec-{first_binding.project_id}-{missing_task.task_id}.json"
     )
     for _ in range(4):
         dispatch_machine_cycle(runtime, available_gpus=[2], executor=executor)
@@ -575,13 +566,15 @@ def test_machine_dispatch_uses_one_reservation_root_and_each_task_preflight(tmp_
     assert diagnostic_path.exists(), "bounded dispatch slices did not preflight the queued Task"
     diagnostic = read_json(diagnostic_path)
     assert diagnostic["machine_diagnostic"] == {
-        "kind": "bad_task_spec_working_directory", "project_id": first_binding.project_id,
-        "task_id": missing_task.task_id, "path": str(tmp_path / "missing"), "reason": "missing",
+        "kind": "bad_task_spec_working_directory",
+        "project_id": first_binding.project_id,
+        "task_id": missing_task.task_id,
+        "path": str(tmp_path / "missing"),
+        "reason": "missing",
     }
 
 
-def test_managed_task_cancel_releases_machine_reservation(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_managed_task_cancel_releases_machine_reservation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     task = submit(cfg, ["echo", "ok"])
     runtime = MachineRuntime(tmp_path / "machine-runtime")
@@ -615,7 +608,8 @@ def test_managed_launch_failure_releases_machine_reservation(tmp_path: Path) -> 
 
 
 def test_machine_dispatch_isolates_unreadable_roots_and_publishes_project_views(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     work_dir = tmp_path / "work"
     work_dir.mkdir()
     first = init_shared_root(tmp_path / "first" / ".qexp", "gpu-1", runtime_root=tmp_path / "first-runtime")
@@ -648,9 +642,7 @@ def test_machine_dispatch_isolates_unreadable_roots_and_publishes_project_views(
 def test_machine_dispatch_does_not_claim_after_project_precondition_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
 ) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
-    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     task = submit(cfg, ["echo", "queued"], working_dir=tmp_path)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
@@ -668,19 +660,22 @@ def test_machine_dispatch_does_not_claim_after_project_precondition_failure(
 
     results = dispatch_machine_cycle(runtime, available_gpus=[0], executor=executor)
 
-    assert results == [{
-        "project_id": binding.project_id,
-        "launched": [],
-        "status": "error",
-        "error": f"{failure_stage} failed",
-    }]
+    assert results == [
+        {
+            "project_id": binding.project_id,
+            "launched": [],
+            "status": "error",
+            "error": f"{failure_stage} failed",
+        }
+    ]
     assert load_task(cfg, task.task_id).state["projection"] == "queued"
     assert executor.launched == []
     assert active_reservations(runtime.root) == []
 
 
 def test_machine_dispatch_supervises_draining_but_revalidates_enabled_claims(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     work_dir = tmp_path / "work"
     work_dir.mkdir()
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
@@ -701,6 +696,7 @@ def test_machine_dispatch_supervises_draining_but_revalidates_enabled_claims(
     assert not active_reservations(runtime.root)
 
     runtime.set_enabled(disabled.project_id, True)
+
     @contextmanager
     def deny_claim(_binding):
         yield False
@@ -711,12 +707,8 @@ def test_machine_dispatch_supervises_draining_but_revalidates_enabled_claims(
     assert read_json(cfg.shared_root / "tasks" / f"{task.task_id}.json")["task"]["state"]["projection"] == "queued"
 
 
-def test_machine_dispatch_reuses_supervisor_for_each_binding(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
-    )
+def test_machine_dispatch_reuses_supervisor_for_each_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     created: list[object] = []
@@ -759,7 +751,8 @@ def test_project_binding_rejects_non_boolean_enabled(tmp_path: Path) -> None:
 
 
 def test_machine_dispatch_continues_after_a_project_dispatch_error(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     first = init_shared_root(tmp_path / "first" / ".qexp", "gpu-1", runtime_root=tmp_path / "first-runtime")
     second = init_shared_root(tmp_path / "second" / ".qexp", "gpu-1", runtime_root=tmp_path / "second-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
@@ -869,13 +862,16 @@ def test_managed_clean_checks_project_local_process_blockers(tmp_path: Path) -> 
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     context = runtime.execution_context(cfg)
     process_path = runtime.project_paths(binding.project_id)["processes"] / "active.json"
-    atomic_replace(process_path, {
-        "process": {
-            "task_id": task.task_id,
-            "attempt_id": "active-attempt",
-            "observed_state": "running",
-        }
-    })
+    atomic_replace(
+        process_path,
+        {
+            "process": {
+                "task_id": task.task_id,
+                "attempt_id": "active-attempt",
+                "observed_state": "running",
+            }
+        },
+    )
 
     result = clean(
         context.local_cfg,
@@ -887,11 +883,12 @@ def test_managed_clean_checks_project_local_process_blockers(tmp_path: Path) -> 
     assert result["skipped"][task.task_id] == ["local_process:active-attempt"]
 
 
-def test_reserved_gpu_ids_reads_each_provisional_record_once(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reserved_gpu_ids_reads_each_provisional_record_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runtime_root = tmp_path / "runtime"
     reservation = reserve(runtime_root, "task-1", [0])
-    reservation_path = runtime_root / "reservations" / "provisional" / f"{reservation['reservation']['reservation_id']}.json"
+    reservation_path = (
+        runtime_root / "reservations" / "provisional" / f"{reservation['reservation']['reservation_id']}.json"
+    )
     from qqtools.plugins.qexp.runtime.resources import reservations
 
     original_read_json = reservations.read_json
@@ -910,7 +907,8 @@ def test_reserved_gpu_ids_reads_each_provisional_record_once(
 
 
 def test_background_machine_agent_publishes_pid_only_after_acquiring_authority(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     source_root = Path(__file__).parents[3] / "src"
@@ -953,10 +951,9 @@ def test_machine_agent_loop_rejects_non_main_thread_without_publishing_identity(
 
 
 def test_machine_control_heartbeat_is_not_blocked_by_slow_maintenance(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = init_shared_root(
-        tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime"
-    )
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     control_plane = _MachineControlPlane(
@@ -1000,18 +997,16 @@ def test_machine_control_heartbeat_is_not_blocked_by_slow_maintenance(
 
 
 def test_machine_control_authority_is_not_blocked_by_slow_project_maintenance(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    first = init_shared_root(
-        tmp_path / "first" / ".qexp", "gpu-1", runtime_root=tmp_path / "first-runtime"
-    )
-    second = init_shared_root(
-        tmp_path / "second" / ".qexp", "gpu-1", runtime_root=tmp_path / "second-runtime"
-    )
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = init_shared_root(tmp_path / "first" / ".qexp", "gpu-1", runtime_root=tmp_path / "first-runtime")
+    second = init_shared_root(tmp_path / "second" / ".qexp", "gpu-1", runtime_root=tmp_path / "second-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.add_binding(first.shared_root, first.machine_name)
     runtime.add_binding(second.shared_root, second.machine_name)
     second_tick = Event()
     maintenance_started = Event()
+
     class RecordingSupervisor:
         def __init__(self, cfg, *, reservation_runtime_root) -> None:
             del reservation_runtime_root
@@ -1062,9 +1057,7 @@ def test_machine_control_authority_is_not_blocked_by_slow_project_maintenance(
         control_plane.stop()
 
 
-def test_restart_and_activation_share_one_lifecycle_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_restart_and_activation_share_one_lifecycle_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     barrier = Barrier(3)
     state = {"is_running": False, "active_calls": 0, "max_active_calls": 0, "next_pid": 1000}
@@ -1208,14 +1201,17 @@ def test_machine_agent_ignores_a_reused_or_stale_pid_record(tmp_path: Path) -> N
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.ensure_layout()
     runtime.paths["pid"].write_text(str(os.getpid()), encoding="utf-8")
-    atomic_replace(runtime.paths["agent"] / "status.json", {
-        "machine_agent": {
-            "instance_id": "old-agent",
-            "pid": os.getpid(),
-            "pid_start_time_ticks": -1,
-            "state": "active",
-        }
-    })
+    atomic_replace(
+        runtime.paths["agent"] / "status.json",
+        {
+            "machine_agent": {
+                "instance_id": "old-agent",
+                "pid": os.getpid(),
+                "pid_start_time_ticks": -1,
+                "state": "active",
+            }
+        },
+    )
 
     assert get_machine_agent_status(runtime)["is_running"] is False
     assert stop_machine_agent(runtime) is False

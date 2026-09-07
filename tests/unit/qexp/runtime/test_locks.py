@@ -6,8 +6,8 @@ from qqtools.plugins.qexp.runtime.locks import (
     schema_lock,
     schema_reader_lock,
     schema_writer_lock,
-    task_writer_lock,
     task_locks,
+    task_writer_lock,
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace
 

@@ -376,10 +376,7 @@ def test_rewrite_preserves_source_order_asset_and_aligns_effective_costs(tmp_pat
     )
     try:
         with source_environment.begin(write=False) as transaction:
-            source_blobs = [
-                transaction.get(str(idx).encode("ascii"))
-                for idx in range(len(samples))
-            ]
+            source_blobs = [transaction.get(str(idx).encode("ascii")) for idx in range(len(samples))]
     finally:
         source_environment.close()
 
@@ -450,9 +447,7 @@ def test_sequential_staged_rewrite_matches_direct_across_shards(tmp_path: Path):
         balance_seed=17,
     )
 
-    assert [direct.get_raw_blob(i) for i in range(len(direct))] == [
-        staged.get_raw_blob(i) for i in range(len(staged))
-    ]
+    assert [direct.get_raw_blob(i) for i in range(len(direct))] == [staged.get_raw_blob(i) for i in range(len(staged))]
     assert pickle.loads(staged.get_raw_blob(-1))
     assert staged.rewrite_path.exists()
     assert list((staged_root / "scratch").glob("**/staging-*.lmdb")) == []
@@ -719,9 +714,7 @@ def test_file_lock_write_guard_serializes_processes(
     if start_method not in multiprocessing.get_all_start_methods():
         pytest.skip(f"{start_method} is not available on this platform")
 
-    probe_path = (
-        Path(__file__).parents[3] / "fixtures" / "qlmdbdataset_file_lock_probe.py"
-    )
+    probe_path = Path(__file__).parents[3] / "fixtures" / "qlmdbdataset_file_lock_probe.py"
     worker_env = checkout_subprocess_env
     if os.name != "nt":
         worker_env.update({"TMPDIR": "/tmp", "TEMP": "/tmp", "TMP": "/tmp"})

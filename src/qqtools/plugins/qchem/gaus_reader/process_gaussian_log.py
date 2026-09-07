@@ -61,7 +61,7 @@ def process_gaussian_log(input_file, output_file=None):
     if not input_path.exists():
         raise FileNotFoundError(f"Input file does not exist: {input_file}")
 
-    if not input_path.suffix.lower() in [".log", ".out"]:
+    if input_path.suffix.lower() not in [".log", ".out"]:
         print(f"Warning: Input file extension is not .log or .out, but will attempt to process anyway: {input_file}")
 
     print(f"Processing file: {input_file}")
@@ -99,7 +99,7 @@ def process_gaussian_log(input_file, output_file=None):
         print(f"File size: {output_path.stat().st_size} bytes")
 
     except Exception as e:
-        print(f"Error saving results")
+        print("Error saving results")
         raise e
 
     return results
@@ -131,7 +131,7 @@ Examples:
 
     try:
         # Process file
-        results = process_gaussian_log(args.input_file, args.output_file)
+        process_gaussian_log(args.input_file, args.output_file)
         print("\nProcessing complete!")
 
     except Exception as e:

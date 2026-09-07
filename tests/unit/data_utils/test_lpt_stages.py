@@ -20,7 +20,7 @@ def test_base_partition_covers_all_samples_without_padding(strategy, total):
     assert not batches.flags.writeable and not remainder.flags.writeable
     np.testing.assert_array_equal(np.sort(np.r_[batches.ravel(), remainder]), np.arange(total))
     # Selection occurs before sorting and is independent of algorithm tier.
-    np.testing.assert_array_equal(remainder, np.random.default_rng(7).permutation(total)[total // 4 * 4:])
+    np.testing.assert_array_equal(remainder, np.random.default_rng(7).permutation(total)[total // 4 * 4 :])
     np.testing.assert_array_equal(costs, before)
 
 
@@ -52,7 +52,10 @@ def test_all_tiers_keep_identical_base_batches_across_world_sizes(strategy, seed
 @pytest.mark.parametrize("world_size", [1, 4, 8])
 @pytest.mark.parametrize("should_drop", [False, True])
 def test_tail_repair_is_bounded_reproducible_and_does_not_mutate_base(
-    strategy, total, world_size, should_drop,
+    strategy,
+    total,
+    world_size,
+    should_drop,
 ):
     costs = np.random.default_rng(42).integers(0, 100, total)
     base = balance._partition_rank_batches(costs, batch_size=4, seed=7, strategy=strategy)
@@ -60,7 +63,7 @@ def test_tail_repair_is_bounded_reproducible_and_does_not_mutate_base(
     actual = balance._complete_rank_batch_tail(costs, base, world_size, 7, should_drop, strategy)
     count = len(before)
     global_size = 4 * world_size
-    target = (total // global_size if should_drop else (total + global_size - 1) // global_size)
+    target = total // global_size if should_drop else (total + global_size - 1) // global_size
     assert actual.shape == (target * world_size, 4)
     np.testing.assert_array_equal(base.full_batches, before)
     np.testing.assert_array_equal(base.remainder, remainder)
@@ -73,12 +76,12 @@ def test_tail_repair_is_bounded_reproducible_and_does_not_mutate_base(
     kept_ids = sorted(set(range(count)) - set(pool_ids))
     kept = before[kept_ids]
     assert count - len(kept) <= 2 * world_size - 1
-    np.testing.assert_array_equal(actual[:len(kept)], kept)
+    np.testing.assert_array_equal(actual[: len(kept)], kept)
     pool = np.r_[before[pool_ids].ravel(), remainder]
     rng.shuffle(pool)
     needed = actual.size - kept.size
     expected = pool[:needed] if should_drop else np.resize(pool, needed)
-    np.testing.assert_array_equal(np.sort(actual[len(kept):].ravel()), np.sort(expected))
+    np.testing.assert_array_equal(np.sort(actual[len(kept) :].ravel()), np.sort(expected))
     again = balance._complete_rank_batch_tail(costs, base, world_size, 7, should_drop, strategy)
     np.testing.assert_array_equal(actual, again)
 
@@ -104,6 +107,9 @@ def test_dropping_entire_dataset_skips_grouping(monkeypatch):
 
     monkeypatch.setattr(balance, "_partition_rank_batches", unexpected)
     plan = balance._plan_rank_batches(
-        [1e308, 1e308], batch_size=2, world_size=2, should_drop_last=True,
+        [1e308, 1e308],
+        batch_size=2,
+        world_size=2,
+        should_drop_last=True,
     )
     assert plan.shape == (0, 2, 2)

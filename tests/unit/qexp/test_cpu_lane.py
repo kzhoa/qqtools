@@ -3,6 +3,8 @@ from pathlib import Path
 import pytest
 
 import qqtools.plugins.qexp as qexp
+from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.runtime.records import TaskSpec
 from qqtools.plugins.qexp.runtime.resources.cpu_lane import (
     CpuLanePolicy,
     attach_cpu,
@@ -13,8 +15,6 @@ from qqtools.plugins.qexp.runtime.resources.cpu_lane import (
     reserve_cpu,
     set_cpu_lane_capacity,
 )
-from qqtools.plugins.qexp.runtime.records import TaskSpec
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 
 
 def test_cpu_lane_public_api_reexports_resource_owner_objects():

@@ -31,9 +31,7 @@ class _BalancedDatasetProvider:
         iter_sample_costs: Callable[[], Iterable[tuple[int, int | float]]] | None = None,
     ) -> None:
         if not isinstance(host, qDictDataset):
-            raise TypeError(
-                f"Balanced dataset host must be a qDictDataset, got {type(host).__name__}"
-            )
+            raise TypeError(f"Balanced dataset host must be a qDictDataset, got {type(host).__name__}")
 
         self.host = host
         self.enabled = bool(enabled)
@@ -162,9 +160,7 @@ class _BalancedDatasetProvider:
                 raise TypeError(f"Sample cost index must be an integer, got {idx!r}")
             idx = int(idx)
             if idx < 0 or idx >= total:
-                raise RuntimeError(
-                    f"Sample cost iterator returned out-of-range index {idx} for total {total}"
-                )
+                raise RuntimeError(f"Sample cost iterator returned out-of-range index {idx} for total {total}")
             if seen[idx]:
                 raise RuntimeError(f"Sample cost iterator returned duplicate index {idx}")
             costs[idx] = self._normalize_cost(value, idx)
@@ -198,15 +194,10 @@ class _BalancedDatasetProvider:
         self._validate_costs(costs)
         expected_indices = np.arange(costs.shape[0], dtype=np.int64)
         if not np.array_equal(sample_indices, expected_indices):
-            raise RuntimeError(
-                f"Invalid sample_indices in balance metadata: {self.meta_path}"
-            )
+            raise RuntimeError(f"Invalid sample_indices in balance metadata: {self.meta_path}")
         host_total = self.host.len()
         if costs.shape[0] != host_total:
-            raise RuntimeError(
-                "Balance metadata length does not match the dataset: "
-                f"{costs.shape[0]} != {host_total}"
-            )
+            raise RuntimeError(f"Balance metadata length does not match the dataset: {costs.shape[0]} != {host_total}")
         costs = np.ascontiguousarray(costs)
         costs.setflags(write=False)
         return costs
@@ -221,16 +212,12 @@ class _BalancedDatasetProvider:
 
         total = int(self.sample_costs().shape[0])
         if order.shape != (total,):
-            raise RuntimeError(
-                f"Balance order has shape {order.shape}, expected {(total,)}: {self.order_path}"
-            )
+            raise RuntimeError(f"Balance order has shape {order.shape}, expected {(total,)}: {self.order_path}")
         if total > 0:
             if len(np.unique(order)) != total:
                 raise RuntimeError(f"Balance order contains duplicates: {self.order_path}")
             if order.min(initial=0) != 0 or order.max(initial=-1) != total - 1:
-                raise RuntimeError(
-                    f"Balance order does not cover [0, {total}): {self.order_path}"
-                )
+                raise RuntimeError(f"Balance order does not cover [0, {total}): {self.order_path}")
         order = np.ascontiguousarray(order)
         order.setflags(write=False)
         return order
@@ -242,9 +229,7 @@ class _BalancedDatasetProvider:
         try:
             cost = float(value)
         except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"Sample cost at index {idx} must be a real number, got {value!r}"
-            ) from exc
+            raise TypeError(f"Sample cost at index {idx} must be a real number, got {value!r}") from exc
         if not np.isfinite(cost):
             raise ValueError(f"Sample cost at index {idx} must be finite, got {cost}")
         if cost < 0:

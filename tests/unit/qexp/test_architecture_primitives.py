@@ -139,11 +139,7 @@ def test_simulated_runtime_records_durable_write_and_process_boundaries() -> Non
     runtime.remove_index("task", participant="machine-a")
 
     assert committed is not None and committed.revision == 1
-    points = [
-        event.payload["point"]
-        for event in runtime.trace.events
-        if event.kind == "protocol.yield"
-    ]
+    points = [event.payload["point"] for event in runtime.trace.events if event.kind == "protocol.yield"]
     assert points == [
         ProtocolPoint.TEMP_WRITE,
         ProtocolPoint.FILE_FSYNC,

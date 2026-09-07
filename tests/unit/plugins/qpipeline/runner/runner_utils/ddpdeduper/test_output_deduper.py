@@ -4,7 +4,6 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from qqtools.torch.ddp import BalancedDistributedSampler
 from qqtools.plugins.qpipeline.runner.runner_utils.avgbank import AvgBank
 from qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.eval_contract import EvalBatch, EvalDedupRuntime
 from qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper import (
@@ -12,6 +11,7 @@ from qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper imp
     prepare_eval_loader_for_ddp,
 )
 from qqtools.plugins.qpipeline.runner.runner_utils.tensorbank import TensorBank
+from qqtools.torch.ddp import BalancedDistributedSampler
 
 
 class DictDataset(Dataset):

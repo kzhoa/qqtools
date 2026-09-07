@@ -108,4 +108,3 @@ class AvgBank(object):
     def toDict(self, ddp) -> dict:
         """For compatibility"""
         return self.to_dict(ddp)
-

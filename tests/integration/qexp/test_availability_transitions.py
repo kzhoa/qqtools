@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
 
@@ -12,25 +12,33 @@ from qqtools.plugins.qexp.cli import _split_machine_list, main
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
+from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
-from qqtools.plugins.qexp.runtime.operation_store import active_operation_path, write_active_operation
-from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime
 from qqtools.plugins.qexp.runtime.availability import offer_deadlines
+from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime
 from qqtools.plugins.qexp.runtime.availability.offer_deadlines import rebuild_deadline_indexes
+from qqtools.plugins.qexp.runtime.operation_store import active_operation_path, write_active_operation
 from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.scheduler import claim_task, fail_attempt
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 def _base_args(cfg) -> list[str]:
     machine_runtime_root = cfg.runtime_root.parent / "machine-runtime"
     MachineRuntime(machine_runtime_root).ensure_binding(cfg.shared_root, cfg.machine_name)
-    return ["--shared-root", str(cfg.shared_root), "--machine", cfg.machine_name,
-            "--runtime-root", str(cfg.runtime_root), "--machine-runtime-root",
-            str(machine_runtime_root)]
+    return [
+        "--shared-root",
+        str(cfg.shared_root),
+        "--machine",
+        cfg.machine_name,
+        "--runtime-root",
+        str(cfg.runtime_root),
+        "--machine-runtime-root",
+        str(machine_runtime_root),
+    ]
 
 
 def _existing_group(cfg, name: str = "exp") -> None:
@@ -40,8 +48,7 @@ def _existing_group(cfg, name: str = "exp") -> None:
 def test_share_now_persists_journal_audit_and_keeps_home_eligible(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
-    task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="private",
-                  fallback_machines="group")
+    task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="private", fallback_machines="group")
 
     result = task_commands.share(cfg, task.task_id)
 
@@ -59,8 +66,7 @@ def test_share_now_persists_journal_audit_and_keeps_home_eligible(tmp_path: Path
 def test_share_without_helpers_replaces_stale_private_fallback_with_group(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
-    task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="private",
-                  fallback_machines=["legacy-helper"])
+    task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="private", fallback_machines=["legacy-helper"])
 
     task_commands.share(cfg, task.task_id)
 
@@ -83,7 +89,8 @@ def test_repeated_same_share_is_idempotent_without_revision_change(tmp_path: Pat
 
 
 def test_concurrent_availability_replay_reuses_completed_operation_without_reserving(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp")
@@ -101,9 +108,7 @@ def test_concurrent_availability_replay_reuses_completed_operation_without_reser
             assert release_reservation.wait(timeout=5)
         return reference
 
-    monkeypatch.setattr(
-        availability_runtime, "reserve_ready_generation", reserve_while_holding_task_lock
-    )
+    monkeypatch.setattr(availability_runtime, "reserve_ready_generation", reserve_while_holding_task_lock)
     request = availability_runtime.AvailabilityTransitionRequest(
         action="share_now", task_id=task.task_id, operation_id="concurrent-share"
     )
@@ -120,7 +125,8 @@ def test_concurrent_availability_replay_reuses_completed_operation_without_reser
 
 
 def test_availability_replay_reads_archived_operation_after_active_path_disappears(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp")
@@ -153,7 +159,8 @@ def test_availability_replay_reads_archived_operation_after_active_path_disappea
 
 
 def test_replay_does_not_recreate_archived_operation_after_later_transition(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp")
@@ -180,9 +187,7 @@ def test_replay_does_not_recreate_archived_operation_after_later_transition(
         if path == active_path:
             active_exists_calls += 1
             if active_exists_calls == 2:
-                availability_runtime.archive_operation(
-                    cfg, "availability", request.operation_id, archived_operation
-                )
+                availability_runtime.archive_operation(cfg, "availability", request.operation_id, archived_operation)
                 return False
         return original_exists(path)
 
@@ -200,7 +205,8 @@ def test_replay_does_not_recreate_archived_operation_after_later_transition(
 
 
 def test_reconcile_continues_when_enumerated_operation_is_archived_before_read(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     completed_task = submit(cfg, ["echo", "completed"], group="exp")
@@ -209,12 +215,8 @@ def test_reconcile_continues_when_enumerated_operation_is_archived_before_read(
     )
     availability_runtime.apply_availability_transition(cfg, completed_request)
     completed_active = active_operation_path(cfg, "availability", completed_request.operation_id)
-    completed_archive = (
-        shared_paths(cfg.shared_root)["availability"] / f"{completed_request.operation_id}.json"
-    )
-    write_active_operation(
-        cfg, "availability", completed_request.operation_id, read_json(completed_archive)
-    )
+    completed_archive = shared_paths(cfg.shared_root)["availability"] / f"{completed_request.operation_id}.json"
+    write_active_operation(cfg, "availability", completed_request.operation_id, read_json(completed_archive))
     pending_task = submit(cfg, ["echo", "pending"], group="exp")
     pending_request = availability_runtime.AvailabilityTransitionRequest(
         action="share_now", task_id=pending_task.task_id, operation_id="z-pending"
@@ -276,14 +278,35 @@ def test_doctor_replays_prepared_availability_operation(tmp_path: Path):
     task = submit(cfg, ["echo", "ok"], group="exp")
     operation_id = "repair-share"
     operation_path = shared_paths(cfg.shared_root)["availability"] / f"{operation_id}.json"
-    atomic_replace(operation_path, {"meta": {"schema_version": 6, "revision": 1,
-        "created_at": "2026-08-06T00:00:00Z", "updated_at": "2026-08-06T00:00:00Z",
-        "updated_by": {"actor_type": "cli", "machine_name": "g1", "process_id": "test"}},
-        "availability_operation": {"operation_id": operation_id, "operation_type": "share_now",
-        "task_id": task.task_id, "state": "prepared", "requested_by": "g1", "reason": "manual",
-        "helper_machines": None, "after_seconds": None, "created_at": "2026-08-06T00:00:00Z",
-        "updated_at": "2026-08-06T00:00:00Z", "completed_at": None, "blocked_reason": None,
-        "task_revision_before": None, "task_revision_after": None, "result": None}})
+    atomic_replace(
+        operation_path,
+        {
+            "meta": {
+                "schema_version": 6,
+                "revision": 1,
+                "created_at": "2026-08-06T00:00:00Z",
+                "updated_at": "2026-08-06T00:00:00Z",
+                "updated_by": {"actor_type": "cli", "machine_name": "g1", "process_id": "test"},
+            },
+            "availability_operation": {
+                "operation_id": operation_id,
+                "operation_type": "share_now",
+                "task_id": task.task_id,
+                "state": "prepared",
+                "requested_by": "g1",
+                "reason": "manual",
+                "helper_machines": None,
+                "after_seconds": None,
+                "created_at": "2026-08-06T00:00:00Z",
+                "updated_at": "2026-08-06T00:00:00Z",
+                "completed_at": None,
+                "blocked_reason": None,
+                "task_revision_before": None,
+                "task_revision_after": None,
+                "result": None,
+            },
+        },
+    )
 
     repair_metadata(cfg)
 
@@ -299,15 +322,37 @@ def test_doctor_archives_blocked_availability_operation_with_reason(tmp_path: Pa
     task = submit(cfg, ["echo", "ok"], group="exp")
     operation_id = "blocked-share"
     operation_path = active_operation_path(cfg, "availability", operation_id)
-    write_active_operation(cfg, "availability", operation_id, {"meta": {"schema_version": 6, "revision": 1,
-        "created_at": "2026-08-06T00:00:00Z", "updated_at": "2026-08-06T00:00:00Z",
-        "updated_by": {"actor_type": "cli", "machine_name": "g1", "process_id": "test"}},
-        "availability_operation": {"operation_id": operation_id, "operation_type": "share_now",
-        "task_id": task.task_id, "state": "blocked", "requested_by": "g1", "reason": "manual",
-        "helper_machines": None, "after_seconds": None, "created_at": "2026-08-06T00:00:00Z",
-        "updated_at": "2026-08-06T00:00:00Z", "completed_at": None,
-        "blocked_reason": "placement can only change while a Task is queued and unclaimed.",
-        "task_revision_before": None, "task_revision_after": None, "result": None}})
+    write_active_operation(
+        cfg,
+        "availability",
+        operation_id,
+        {
+            "meta": {
+                "schema_version": 6,
+                "revision": 1,
+                "created_at": "2026-08-06T00:00:00Z",
+                "updated_at": "2026-08-06T00:00:00Z",
+                "updated_by": {"actor_type": "cli", "machine_name": "g1", "process_id": "test"},
+            },
+            "availability_operation": {
+                "operation_id": operation_id,
+                "operation_type": "share_now",
+                "task_id": task.task_id,
+                "state": "blocked",
+                "requested_by": "g1",
+                "reason": "manual",
+                "helper_machines": None,
+                "after_seconds": None,
+                "created_at": "2026-08-06T00:00:00Z",
+                "updated_at": "2026-08-06T00:00:00Z",
+                "completed_at": None,
+                "blocked_reason": "placement can only change while a Task is queued and unclaimed.",
+                "task_revision_before": None,
+                "task_revision_after": None,
+                "result": None,
+            },
+        },
+    )
 
     archived_path = shared_paths(cfg.shared_root)["availability"] / f"{operation_id}.json"
     assert archived_path.is_symlink()
@@ -320,8 +365,7 @@ def test_doctor_archives_blocked_availability_operation_with_reason(tmp_path: Pa
     assert read_json(archived_path)["availability_operation"]["state"] == "blocked"
 
 
-def test_doctor_completes_operation_after_post_task_side_effect_failure(
-        tmp_path: Path, monkeypatch):
+def test_doctor_completes_operation_after_post_task_side_effect_failure(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp")
@@ -404,9 +448,19 @@ def test_cli_share_accepts_comma_separated_helper_machines(tmp_path: Path, monke
         lambda cfg, *, reason, **kwargs: True,
     )
 
-    assert main([
-        *_base_args(cfg), "task", "share", task.task_id, "--with", "g2,g3",
-    ]) == 0
+    assert (
+        main(
+            [
+                *_base_args(cfg),
+                "task",
+                "share",
+                task.task_id,
+                "--with",
+                "g2,g3",
+            ]
+        )
+        == 0
+    )
 
     assert load_task(cfg, task.task_id).placement_policy["fallback_constraint"] == ["g2", "g3"]
 
@@ -445,8 +499,7 @@ def test_agent_removes_stale_deadline_index_without_skipping_remaining_work(
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
 
 
-def test_offer_due_tasks_skips_stale_deadline_for_claimed_task(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_offer_due_tasks_skips_stale_deadline_for_claimed_task(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     task = submit(
@@ -473,8 +526,7 @@ def test_offer_due_tasks_skips_stale_deadline_for_claimed_task(
     assert not list(shared_paths(cfg.shared_root)["availability_active"].glob("*.json"))
 
 
-def test_offer_due_tasks_skips_stale_deadline_for_terminal_task(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_offer_due_tasks_skips_stale_deadline_for_terminal_task(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     task = submit(

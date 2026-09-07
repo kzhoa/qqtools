@@ -1,9 +1,9 @@
 """Pure planning rules for one machine dispatch cycle."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
-
 
 AdmissionRole = Literal["primary", "borrow"]
 PrimaryDemandState = Literal[
@@ -58,13 +58,10 @@ def evaluate_primary_candidate(
     if not observation.has_primary_group_worker:
         return PrimaryCandidateDecision("skip")
     if observation.working_directory_reason is not None:
-        return PrimaryCandidateDecision(
-            "skip", f"working_directory:{observation.working_directory_reason}"
-        )
+        return PrimaryCandidateDecision("skip", f"working_directory:{observation.working_directory_reason}")
     if (
         observation.group_gpu_limit is not None
-        and observation.requested_gpus
-        > observation.group_gpu_limit - observation.group_gpu_usage
+        and observation.requested_gpus > observation.group_gpu_limit - observation.group_gpu_usage
     ):
         return PrimaryCandidateDecision("skip", "group_gpu_limit_reached")
     if observation.requested_gpus > observation.visible_gpu_count:

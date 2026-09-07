@@ -2,15 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp.schema6_upgrade import (
-    attest_schema6_upgrade,
-    resume_schema6_upgrade,
-    start_schema6_upgrade,
-)
 from qqtools.plugins.qexp.layout import validate_root_contract
 from qqtools.plugins.qexp.machine_config import init_shared_root
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+from qqtools.plugins.qexp.schema6_upgrade import attest_schema6_upgrade, resume_schema6_upgrade, start_schema6_upgrade
 
 
 def _legacy_root(tmp_path: Path):
@@ -45,9 +41,7 @@ def test_schema6_interruption_requires_fresh_bound_attestations(tmp_path: Path) 
     atomic_replace(journal_path, journal)
 
     with pytest.raises(RuntimeError, match="collect fresh"):
-        resume_schema6_upgrade(
-            cfg, activation_id=session["activation_id"], machine_runtime_root=cfg.runtime_root
-        )
+        resume_schema6_upgrade(cfg, activation_id=session["activation_id"], machine_runtime_root=cfg.runtime_root)
 
     recovered = read_json(journal_path)["schema6_upgrade"]
     assert recovered["phase"] == "awaiting_attestations"
@@ -55,12 +49,8 @@ def test_schema6_interruption_requires_fresh_bound_attestations(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("capabilities", [["cpu-lane-v1"], ["task-dependencies-v1"]])
-def test_schema6_rejects_partial_capability_activation(
-    tmp_path: Path, capabilities: list[str]
-) -> None:
+def test_schema6_rejects_partial_capability_activation(tmp_path: Path, capabilities: list[str]) -> None:
     cfg = _legacy_root(tmp_path)
 
     with pytest.raises(ValueError, match="requires cpu-lane-v1 and task-dependencies-v1 together"):
-        start_schema6_upgrade(
-            cfg, capabilities=capabilities, machine_runtime_root=cfg.runtime_root
-        )
+        start_schema6_upgrade(cfg, capabilities=capabilities, machine_runtime_root=cfg.runtime_root)

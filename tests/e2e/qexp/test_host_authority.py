@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from qexp_e2e import ensure_site_packages_import, make_env, run, stop_agent
-
 import pytest
-
+from qexp_e2e import ensure_site_packages_import, make_env, run, stop_agent
 
 pytestmark = [pytest.mark.e2e, pytest.mark.host_exclusive]
 

@@ -60,7 +60,7 @@ def is_inf(x) -> bool:
 
 def str2number(inpt) -> Union[int, float]:
     if inpt is None or inpt == "":
-        return ValueError(f"input should not be None or empty")
+        return ValueError("input should not be None or empty")
     if not isinstance(inpt, str):
         raise TypeError(f"expect string input, got {type(inpt)}")
     if not is_number(inpt):

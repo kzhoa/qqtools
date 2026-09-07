@@ -22,9 +22,7 @@ def test_lpt_builds_once_and_epoch_changes_only_step_and_rank_traversal(monkeypa
     monkeypatch.setattr(qbs, "compute_global_even_sort_order", unexpected_assignment)
     costs = np.arange(128, dtype=float)
     samplers = [
-        BalancedBatchSampler(
-            costs, batch_size=4, world_size=4, rank=rank, strategy=strategy, seed=7
-        )
+        BalancedBatchSampler(costs, batch_size=4, world_size=4, rank=rank, strategy=strategy, seed=7)
         for rank in range(4)
     ]
     static = samplers[0]._plan_cache._lpt_plan.copy()
@@ -50,12 +48,8 @@ def test_non_shuffled_lpt_still_balances_and_matches_training_static_groups(stra
     costs = np.asarray([9.0, 6.0, 3.0, 2.0, 8.0, 7.0, 4.0, 1.0])
     plans = []
     for rank in range(2):
-        sampler = BalancedBatchSampler(
-            costs, batch_size=2, world_size=2, rank=rank, strategy=strategy, shuffle=False
-        )
-        training = BalancedBatchSampler(
-            costs, batch_size=2, world_size=2, rank=rank, strategy=strategy, shuffle=True
-        )
+        sampler = BalancedBatchSampler(costs, batch_size=2, world_size=2, rank=rank, strategy=strategy, shuffle=False)
+        training = BalancedBatchSampler(costs, batch_size=2, world_size=2, rank=rank, strategy=strategy, shuffle=True)
         before = list(sampler)
         sampler.set_epoch(123)
         assert list(sampler) == before
@@ -73,8 +67,13 @@ def test_non_shuffled_lpt_still_balances_and_matches_training_static_groups(stra
 @pytest.mark.parametrize("should_drop", [True, False])
 def test_lpt_tail_contract(total, world_size, should_shuffle, should_drop, strategy):
     kwargs = dict(
-        sample_costs=np.arange(total), batch_size=2, world_size=world_size,
-        shuffle=should_shuffle, drop_last=should_drop, strategy=strategy, seed=7,
+        sample_costs=np.arange(total),
+        batch_size=2,
+        world_size=world_size,
+        shuffle=should_shuffle,
+        drop_last=should_drop,
+        strategy=strategy,
+        seed=7,
     )
     global_size = 2 * world_size
     if total % global_size and not should_shuffle and not should_drop:
@@ -104,8 +103,13 @@ def test_lpt_tail_contract(total, world_size, should_shuffle, should_drop, strat
 def test_lpt_rejects_sample_order_instead_of_ignoring_it(should_shuffle, strategy):
     with pytest.raises(ValueError, match="sample_order"):
         BalancedDistributedSampler(
-            [1, 2], batch_size=1, rank=0, world_size=1, strategy=strategy,
-            shuffle=should_shuffle, sample_order=[1, 0],
+            [1, 2],
+            batch_size=1,
+            rank=0,
+            world_size=1,
+            strategy=strategy,
+            shuffle=should_shuffle,
+            sample_order=[1, 0],
         )
 
 

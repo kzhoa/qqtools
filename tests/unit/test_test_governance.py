@@ -77,9 +77,7 @@ def test_integration():
 """,
     )
 
-    assert check_test_lanes(tmp_path) == [
-        "Integration may not use host_exclusive: tests/integration/test_example.py"
-    ]
+    assert check_test_lanes(tmp_path) == ["Integration may not use host_exclusive: tests/integration/test_example.py"]
 
 
 def test_lane_check_rejects_e2e_collection_from_preflight(tmp_path: Path) -> None:
@@ -111,9 +109,7 @@ jobs:
 """,
     )
 
-    assert check_test_lanes(tmp_path) == [
-        "ordinary CI may not run source-test lane: tox run -e unit"
-    ]
+    assert check_test_lanes(tmp_path) == ["ordinary CI may not run source-test lane: tox run -e unit"]
 
 
 def test_lane_check_rejects_equivalent_tox_source_test_syntax(tmp_path: Path) -> None:
@@ -130,9 +126,7 @@ jobs:
 """,
     )
 
-    assert check_test_lanes(tmp_path) == [
-        "ordinary CI may not run source-test lane: tox -eunit"
-    ]
+    assert check_test_lanes(tmp_path) == ["ordinary CI may not run source-test lane: tox -eunit"]
 
 
 def test_contract_matrix_rejects_missing_test_link(tmp_path: Path) -> None:
@@ -142,15 +136,11 @@ def test_contract_matrix_rejects_missing_test_link(tmp_path: Path) -> None:
         "[missing evidence](unit/test_missing.py)\n",
     )
 
-    assert check_contract_matrix(tmp_path) == [
-        "contract matrix links to a missing test: unit/test_missing.py"
-    ]
+    assert check_contract_matrix(tmp_path) == ["contract matrix links to a missing test: unit/test_missing.py"]
 
 
 def test_contract_matrix_rejects_retired_lane_term(tmp_path: Path) -> None:
     _write_valid_repository(tmp_path)
     _write(tmp_path / "tests/CONTRACT_MATRIX.md", "qexp-fast\n")
 
-    assert check_contract_matrix(tmp_path) == [
-        "contract matrix contains retired lane term: qexp-fast"
-    ]
+    assert check_contract_matrix(tmp_path) == ["contract matrix contains retired lane term: qexp-fast"]

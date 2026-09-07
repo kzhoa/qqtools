@@ -9,14 +9,14 @@ from typing import Any
 from ..config_types import RootConfig
 from ..layout import is_group_ready_members_root
 from ..lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
+from ..runtime.claims import archive_claim
+from ..runtime.locks import group_writer_lock, task_lock
 from ..runtime.operation_store import (
     active_operation_path,
     archive_operation,
     iter_active_operation_paths,
     write_active_operation,
 )
-from ..runtime.claims import archive_claim
-from ..runtime.locks import group_writer_lock, task_lock
 from ..runtime.paths import attempt_path, group_path, shared_paths, submission_path
 from ..runtime.ready import (
     primary_projection_routes_for_group,

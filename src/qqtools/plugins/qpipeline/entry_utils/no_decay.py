@@ -59,10 +59,7 @@ def build_param_groups(model: nn.Module, optimizer_params: dict, no_decay_names:
     all_param_names = dict(model.named_parameters())
     for name in no_decay_names:
         if name not in all_param_names:
-            warnings.warn(
-                f"[qPipeline] no_decay name '{name}' does not correspond to "
-                f"any model parameter — skipping."
-            )
+            warnings.warn(f"[qPipeline] no_decay name '{name}' does not correspond to any model parameter — skipping.")
         elif not all_param_names[name].requires_grad:
             pass
         else:

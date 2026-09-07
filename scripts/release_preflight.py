@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Validate a committed release candidate before creating a release commit."""
+
 from __future__ import annotations
 
 import argparse
@@ -41,8 +42,7 @@ def _lazy_exported_names(module: ast.Module) -> set[str]:
         for argument in node.value.args[1:]:
             if not isinstance(argument, ast.Constant) or not isinstance(argument.value, str):
                 raise RuntimeError(
-                    f"{node.value.func.id} arguments must be literal export names "
-                    "for preflight validation."
+                    f"{node.value.func.id} arguments must be literal export names for preflight validation."
                 )
             names.add(argument.value)
 
@@ -73,11 +73,7 @@ def _runtime_exported_names(module: ast.Module) -> set[str]:
     """Return public names made available by the package initializer."""
     names = _imported_names(module) | _lazy_exported_names(module) | _lazy_imported_names(module)
 
-    getattr_nodes = [
-        node
-        for node in module.body
-        if isinstance(node, ast.FunctionDef) and node.name == "__getattr__"
-    ]
+    getattr_nodes = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "__getattr__"]
     for getattr_node in getattr_nodes:
         for node in ast.walk(getattr_node):
             if not isinstance(node, ast.Compare) or len(node.ops) != 1:
@@ -159,9 +155,7 @@ def _current_version() -> Version:
 def _check_target_version(target: Version) -> None:
     current = _current_version()
     if target <= current:
-        raise RuntimeError(
-            f"Release target {target} must be later than current source version {current}."
-        )
+        raise RuntimeError(f"Release target {target} must be later than current source version {current}.")
 
 
 def _check_compatibility(target: Version) -> None:

@@ -86,9 +86,7 @@ def test_validation_listener_cannot_mutate_control_and_runs_before_checkpoint():
 
 
 def test_early_stop_uses_typed_controller_and_terminal_observer():
-    stopper = EarlyStopper(
-        patiences={"val_metric": 1}, mode={"val_metric": "min"}, min_delta={"val_metric": 0.0}
-    )
+    stopper = EarlyStopper(patiences={"val_metric": 1}, mode={"val_metric": "min"}, min_delta={"val_metric": 0.0})
     controller = EarlyStopController(stopper, target="val_metric")
     received = []
     observers = ObserverBindings()

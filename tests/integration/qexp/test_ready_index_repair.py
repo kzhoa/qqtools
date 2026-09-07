@@ -12,13 +12,11 @@ from qqtools.plugins.qexp.runtime.tasks import load_task
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 def _ready_reference(cfg, task: TaskRecord):
     from qqtools.plugins.qexp.runtime.ready import ReadyMarkerRef
 
-    path = (
-        shared_paths(cfg.shared_root)["ready_reservations"]
-        / f"{task.task_id}.{task.ready_generation}.json"
-    )
+    path = shared_paths(cfg.shared_root)["ready_reservations"] / f"{task.task_id}.{task.ready_generation}.json"
     record = read_json(path)["ready_reservation"]
     return ReadyMarkerRef(
         task.task_id,
@@ -55,10 +53,7 @@ def test_doctor_reports_and_repairs_missing_active_marker(tmp_path: Path) -> Non
     repaired = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root)
     current = load_task(cfg, task.task_id)
 
-    assert any(
-        issue["code"] == "ready_projection_inconsistent"
-        for issue in verification["issues"]
-    )
+    assert any(issue["code"] == "ready_projection_inconsistent" for issue in verification["issues"])
     assert repaired["ready_index"]["state"] == "active"
     assert current.ready_generation > task.ready_generation
     assert classify_ready_marker(cfg, _ready_reference(cfg, current)).classification == "claimable"

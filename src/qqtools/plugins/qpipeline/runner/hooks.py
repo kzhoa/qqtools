@@ -101,9 +101,7 @@ class RunnerHooks:
                 raise ValueError(f"Unknown runner hook slot: {slot_name!r}.")
             if slot_name in self._registrations:
                 existing = self._registrations[slot_name]
-                raise RuntimeError(
-                    f"Runner hook slot {slot_name!r} is already owned by {existing.provider_id!r}."
-                )
+                raise RuntimeError(f"Runner hook slot {slot_name!r} is already owned by {existing.provider_id!r}.")
 
         self._registrations.update(
             {
@@ -117,19 +115,13 @@ class RunnerHooks:
             }
         )
 
-    def set_after_validation_hook(
-        self, hook: Callable[[ValidationHookContext], None], *, provider_id: str
-    ) -> None:
+    def set_after_validation_hook(self, hook: Callable[[ValidationHookContext], None], *, provider_id: str) -> None:
         self._set("after_validation", hook, provider_id)
 
-    def set_boundary_cursor_hook(
-        self, hook: Callable[[RunnerBoundaryContext], None], *, provider_id: str
-    ) -> None:
+    def set_boundary_cursor_hook(self, hook: Callable[[RunnerBoundaryContext], None], *, provider_id: str) -> None:
         self._set("boundary_cursor", hook, provider_id)
 
-    def set_after_epoch_commit_hook(
-        self, hook: Callable[[RunnerBoundaryContext], None], *, provider_id: str
-    ) -> None:
+    def set_after_epoch_commit_hook(self, hook: Callable[[RunnerBoundaryContext], None], *, provider_id: str) -> None:
         self._set("after_epoch_commit", hook, provider_id)
 
     def set_optimizer_step_end_hook(
@@ -173,9 +165,7 @@ class RunnerHooks:
         if registration is not None:
             result = registration.callback(context)
             if result is not None:
-                raise TypeError(
-                    f"Runner hook {slot_name!r} must return None, got {type(result).__name__}."
-                )
+                raise TypeError(f"Runner hook {slot_name!r} must return None, got {type(result).__name__}.")
 
     def dispatch_after_validation(self, context: ValidationHookContext) -> None:
         self._dispatch("after_validation", context)

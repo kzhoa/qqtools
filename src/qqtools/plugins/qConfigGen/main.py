@@ -29,7 +29,6 @@ from .pts import (
     prompt_task_params,
 )
 
-
 RUNNER_CHECKPOINT_KEYS = {"regular_latest_only"}
 
 
@@ -149,9 +148,7 @@ def main():
     print_formatted_text("\n📌 Step 5/6: Training Runner Configuration")
     runner_config = prompt_runner_params()
     runner_checkpoint_config = {
-        key: runner_config.pop(key)
-        for key in list(runner_config.keys())
-        if key in RUNNER_CHECKPOINT_KEYS
+        key: runner_config.pop(key) for key in list(runner_config.keys()) if key in RUNNER_CHECKPOINT_KEYS
     }
     if runner_checkpoint_config:
         checkpoint_config = runner_config.get("checkpoint", {})
@@ -174,7 +171,7 @@ def main():
     print_formatted_text("✅ Configuration saved successfully!")
     print_formatted_text("=" * 60)
     print_formatted_text(f"\n📂 File: {file_path}")
-    print_formatted_text(f"\n📋 Configuration Summary:")
+    print_formatted_text("\n📋 Configuration Summary:")
     print_formatted_text(f"  - Seed: {config.get('seed', 'N/A')}")
     print_formatted_text(f"  - Log Dir: {config.get('log_dir', 'N/A')}")
     print_formatted_text(f"  - Render Type: {config.get('render_type', 'N/A')}")

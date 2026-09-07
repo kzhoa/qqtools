@@ -1,4 +1,5 @@
 """Shared subprocess helpers for installed-wheel qexp E2E tests."""
+
 from __future__ import annotations
 
 import json
@@ -6,7 +7,6 @@ import os
 import subprocess
 import time
 from pathlib import Path
-
 
 # A release-wheel task starts an agent and a runner in fresh Python interpreters.
 TASK_TERMINAL_TIMEOUT_SECONDS = 90.0
@@ -52,9 +52,7 @@ def make_layout(base: Path) -> tuple[Path, Path, Path]:
     return base, shared_root, runtime_root
 
 
-def run(
-    args: list[str], *, env: dict[str, str], check: bool = True
-) -> subprocess.CompletedProcess[str]:
+def run(args: list[str], *, env: dict[str, str], check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(args, text=True, capture_output=True, env=env)
     if check and result.returncode != 0:
         raise RuntimeError(

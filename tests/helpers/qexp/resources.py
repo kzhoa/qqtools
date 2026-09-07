@@ -3,6 +3,7 @@
 These helpers deliberately live in the test tree: production qexp must not expose a
 configuration switch that weakens its machine-authority semantics.
 """
+
 from __future__ import annotations
 
 import json
@@ -14,7 +15,6 @@ import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-
 
 TEST_TMUX_BASE_ENV = "QQTOOLS_TEST_TMUX_BASE"
 

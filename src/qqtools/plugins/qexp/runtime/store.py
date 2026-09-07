@@ -1,4 +1,5 @@
 """Atomic JSON and revisioned persistence primitives."""
+
 from __future__ import annotations
 
 import json

@@ -166,10 +166,7 @@ def _settle_error(
     if not errors:
         return
     first = min(errors, key=lambda item: item["rank"])
-    message = (
-        f"{boundary_name} failed on rank {first['rank']}: "
-        f"{first['error_type']}: {first['error_message']}"
-    )
+    message = f"{boundary_name} failed on rank {first['rank']}: {first['error_type']}: {first['error_message']}"
     if local_error is not None:
         raise error_type(message) from local_error
     raise error_type(message)
@@ -240,8 +237,14 @@ class ObserverBindings:
     """Static committed-fact observer bindings with fixed failure policy."""
 
     _NAMES = (
-        "epoch_started", "progress_tick", "table_update", "train_boundary", "evaluation_started",
-        "evaluation_committed", "epoch_committed", "early_stop",
+        "epoch_started",
+        "progress_tick",
+        "table_update",
+        "train_boundary",
+        "evaluation_started",
+        "evaluation_committed",
+        "epoch_committed",
+        "early_stop",
     )
 
     def __init__(self, logger: Optional[Any] = None) -> None:

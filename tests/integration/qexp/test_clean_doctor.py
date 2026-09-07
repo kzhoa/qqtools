@@ -8,11 +8,7 @@ import pytest
 from qqtools.plugins.qexp import batch_submit, init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.cleanup import clean, reconcile_cleanup_operations
-from qqtools.plugins.qexp.commands.group import (
-    create_group,
-    group_control,
-    reconcile_group_cancel_operations,
-)
+from qqtools.plugins.qexp.commands.group import create_group, group_control, reconcile_group_cancel_operations
 from qqtools.plugins.qexp.commands.task import offer, retry
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.doctor import repair_metadata, repair_orphans, verify_integrity
@@ -37,9 +33,10 @@ from qqtools.plugins.qexp.scheduler import (
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 def _run_cleanup_reconcile(
-        shared_root: str, project_root: str, runtime_root: str, machine_name: str,
-        connection) -> None:
+    shared_root: str, project_root: str, runtime_root: str, machine_name: str, connection
+) -> None:
     cfg = RootConfig(Path(shared_root), Path(project_root), machine_name, Path(runtime_root))
     try:
         connection.send({"ok": True, "result": reconcile_cleanup_operations(cfg)})
@@ -70,14 +67,11 @@ def _failed_task(cfg, command: str = "failed", group: str | None = None):
     task = submit(cfg, ["echo", command], group=group)
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
-    assert fail_attempt(
-        cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure"
-    )
+    assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure")
     return task
 
 
-def test_verify_integrity_accepts_valid_holder_bound_claim(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_verify_integrity_accepts_valid_holder_bound_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     monkeypatch.setattr(
@@ -116,9 +110,7 @@ def test_clean_exact_terminal_task_supports_dry_run_and_audit(tmp_path: Path):
     assert result["removed"]
     assert not task_path(cfg.shared_root, task.task_id).exists()
     assert not (cfg.shared_root / "attempts" / task.task_id).exists()
-    cleanup_operation = read_json(
-        cfg.shared_root / "operations" / "cleanup" / f"{task.task_id}.json"
-    )["cleanup"]
+    cleanup_operation = read_json(cfg.shared_root / "operations" / "cleanup" / f"{task.task_id}.json")["cleanup"]
     assert cleanup_operation["state"] == "completed"
     events = [read_json(path) for path in (cfg.shared_root / "events").glob("*/*.json")]
     assert any(event.get("event_type") == "task_cleaned" for event in events)
@@ -134,9 +126,7 @@ def test_clean_removes_timed_offer_deadline_index(tmp_path: Path):
     assert index_path.exists()
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
-    assert fail_attempt(
-        cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure"
-    )
+    assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure")
 
     clean(cfg, task_id=task.task_id)
 
@@ -144,9 +134,7 @@ def test_clean_removes_timed_offer_deadline_index(tmp_path: Path):
     assert not index_path.exists()
 
 
-def test_submission_finalizer_failure_preserves_task_and_deadline_index(
-    tmp_path: Path, monkeypatch
-):
+def test_submission_finalizer_failure_preserves_task_and_deadline_index(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")
     task_id = "rollback-index-task"
@@ -156,9 +144,12 @@ def test_submission_finalizer_failure_preserves_task_and_deadline_index(
     def fail_after_task_and_index_are_staged(path, value):
         nonlocal has_failed
         task_file = task_path(cfg.shared_root, task_id)
-        if (not has_failed and path == group_path(cfg.shared_root, "exp")
-                and task_file.exists()
-                and value.get("group", {}).get("pending_submission_commit") is None):
+        if (
+            not has_failed
+            and path == group_path(cfg.shared_root, "exp")
+            and task_file.exists()
+            and value.get("group", {}).get("pending_submission_commit") is None
+        ):
             has_failed = True
             raise OSError("injected final group commit failure")
         return original_atomic_replace(path, value)
@@ -166,8 +157,7 @@ def test_submission_finalizer_failure_preserves_task_and_deadline_index(
     monkeypatch.setattr(submission_runtime, "atomic_replace", fail_after_task_and_index_are_staged)
 
     with pytest.raises(OSError, match="injected final group commit failure"):
-        submit(cfg, ["echo", "ok"], task_id=task_id, group="exp", sharing_mode="spillover",
-               offer_after_seconds=3600)
+        submit(cfg, ["echo", "ok"], task_id=task_id, group="exp", sharing_mode="spillover", offer_after_seconds=3600)
 
     assert task_path(cfg.shared_root, task_id).exists()
     assert (shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task_id}.json").exists()
@@ -179,15 +169,11 @@ def test_doctor_finalizes_committed_submission_group(tmp_path: Path, monkeypatch
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp", workers=["gpu-1"])
     manifest = tmp_path / "runs.yaml"
-    manifest.write_text(
-        "tasks:\n  - task_id: repair-task\n    command: [echo, ok]\n", encoding="utf-8"
-    )
+    manifest.write_text("tasks:\n  - task_id: repair-task\n    command: [echo, ok]\n", encoding="utf-8")
     original_atomic_replace = submission_runtime.atomic_replace
 
     def fail_group_finalizer(path, value):
-        if path == group_path(cfg.shared_root, "exp") and value["group"].get(
-            "pending_submission_commit"
-        ) is None:
+        if path == group_path(cfg.shared_root, "exp") and value["group"].get("pending_submission_commit") is None:
             raise OSError("simulated Group finalizer failure")
         original_atomic_replace(path, value)
 
@@ -204,7 +190,8 @@ def test_doctor_finalizes_committed_submission_group(tmp_path: Path, monkeypatch
 
 
 def test_doctor_does_not_clear_pending_group_commit_from_a_stale_snapshot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Terminal-operation repair must reread Group truth after taking its fence."""
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
@@ -239,9 +226,7 @@ def test_doctor_does_not_clear_pending_group_commit_from_a_stale_snapshot(
             atomic_replace(path, current)
             yield acquired
 
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.doctor.group_writer_lock", replace_pending_before_doctor_read
-    )
+    monkeypatch.setattr("qqtools.plugins.qexp.doctor.group_writer_lock", replace_pending_before_doctor_read)
     repaired = repair_metadata(cfg)
 
     assert operation_id not in repaired["repaired"]
@@ -297,9 +282,9 @@ def test_clean_waits_for_remote_machine_local_cleanup(tmp_path: Path):
     cfg2 = init_shared_root(shared_root, "gpu-2", runtime_root=tmp_path / "rt-2")
     task = _failed_task(cfg1)
     manifest = cfg1.runtime_root / "processes" / "old-attempt.json"
-    atomic_replace(manifest, {"process": {"task_id": task.task_id,
-                                           "attempt_id": "old-attempt",
-                                           "observed_state": "exited"}})
+    atomic_replace(
+        manifest, {"process": {"task_id": task.task_id, "attempt_id": "old-attempt", "observed_state": "exited"}}
+    )
     log = shared_root / "logs" / task.task_id / "old-attempt.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("finished", encoding="utf-8")
@@ -337,8 +322,7 @@ def test_cleanup_waiting_ack_blocks_retry_and_late_attempt_deletion(tmp_path: Pa
     assert not (shared_root / "attempts" / task.task_id).exists()
 
 
-def test_cleanup_waiting_ack_blocks_cancel_offer_and_claim_even_if_task_is_queued(
-        tmp_path: Path):
+def test_cleanup_waiting_ack_blocks_cancel_offer_and_claim_even_if_task_is_queued(tmp_path: Path):
     shared_root = tmp_path / ".qexp"
     cfg1 = init_shared_root(shared_root, "gpu-1", runtime_root=tmp_path / "rt-1")
     cfg2 = init_shared_root(shared_root, "gpu-2", runtime_root=tmp_path / "rt-2")
@@ -346,9 +330,7 @@ def test_cleanup_waiting_ack_blocks_cancel_offer_and_claim_even_if_task_is_queue
     task = submit(cfg1, ["echo", "ok"], group="exp", sharing_mode="spillover")
     attempt = claim_task(cfg1, task.task_id, [0])
     assert attempt is not None
-    assert fail_attempt(
-        cfg1, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure"
-    )
+    assert fail_attempt(cfg1, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure")
     clean(cfg2, task_id=task.task_id)
     task_data = read_json(task_path(shared_root, task.task_id))
     task_data["task"]["state"] = {"projection": "queued", "reason": None}
@@ -371,8 +353,7 @@ def test_cleaned_task_id_cannot_be_submitted_again(tmp_path: Path):
         submit(cfg, ["echo", "new"], task_id=task.task_id)
 
 
-def test_submission_rechecks_cleanup_tombstone_before_task_creation(
-        tmp_path: Path, monkeypatch):
+def test_submission_rechecks_cleanup_tombstone_before_task_creation(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task_id = "race-task"
     original = submission_runtime._reject_cleanup_tombstones
@@ -385,17 +366,28 @@ def test_submission_rechecks_cleanup_tombstone_before_task_creation(
             now = utc_now()
             atomic_replace(
                 cfg.shared_root / "operations" / "cleanup" / f"{task_id}.json",
-                {"meta": {"schema_version": SCHEMA_VERSION, "revision": 1, "created_at": now,
-                          "updated_at": now, "updated_by": {"actor_type": "test",
-                          "machine_name": cfg.machine_name, "process_id": "0"}},
-                 "cleanup": {"operation_id": new_id(), "task_id": task_id,
-                             "state": "completed", "group_name": None,
-                             "submission_operation_id": None,
-                             "terminal_state": "failed", "created_at": now,
-                             "required_machines": [cfg.machine_name],
-                             "acknowledgements": {cfg.machine_name:
-                                 {"acknowledged_at": now, "removed": []}},
-                             "pending_machines": [], "completed_at": now}},
+                {
+                    "meta": {
+                        "schema_version": SCHEMA_VERSION,
+                        "revision": 1,
+                        "created_at": now,
+                        "updated_at": now,
+                        "updated_by": {"actor_type": "test", "machine_name": cfg.machine_name, "process_id": "0"},
+                    },
+                    "cleanup": {
+                        "operation_id": new_id(),
+                        "task_id": task_id,
+                        "state": "completed",
+                        "group_name": None,
+                        "submission_operation_id": None,
+                        "terminal_state": "failed",
+                        "created_at": now,
+                        "required_machines": [cfg.machine_name],
+                        "acknowledgements": {cfg.machine_name: {"acknowledged_at": now, "removed": []}},
+                        "pending_machines": [],
+                        "completed_at": now,
+                    },
+                },
             )
         original(cfg_value, resolved)
 
@@ -405,9 +397,7 @@ def test_submission_rechecks_cleanup_tombstone_before_task_creation(
         submit(cfg, ["echo", "new"], task_id=task_id)
 
     assert not task_path(cfg.shared_root, task_id).exists()
-    tombstone = read_json(
-        cfg.shared_root / "operations" / "cleanup" / f"{task_id}.json"
-    )["cleanup"]
+    tombstone = read_json(cfg.shared_root / "operations" / "cleanup" / f"{task_id}.json")["cleanup"]
     assert tombstone["state"] == "completed"
 
 
@@ -435,9 +425,7 @@ def test_public_cleanup_finalization_does_not_block_on_group_lock(tmp_path: Path
     task = submit(cfg1, ["echo", "ok"], group="exp")
     attempt = claim_task(cfg1, task.task_id, [0])
     assert attempt is not None
-    assert fail_attempt(
-        cfg1, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure"
-    )
+    assert fail_attempt(cfg1, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure")
     clean(cfg2, task_id=task.task_id)
     cleanup_path = shared_root / "operations" / "cleanup" / f"{task.task_id}.json"
     assert read_json(cleanup_path)["cleanup"]["state"] == "waiting_ack"
@@ -447,8 +435,13 @@ def test_public_cleanup_finalization_does_not_block_on_group_lock(tmp_path: Path
     with group_lock(shared_root, "exp"):
         process = context.Process(
             target=_run_cleanup_reconcile,
-            args=(str(cfg1.shared_root), str(cfg1.project_root), str(cfg1.runtime_root),
-                  cfg1.machine_name, child_connection),
+            args=(
+                str(cfg1.shared_root),
+                str(cfg1.project_root),
+                str(cfg1.runtime_root),
+                cfg1.machine_name,
+                child_connection,
+            ),
         )
         process.start()
         child_connection.close()
@@ -483,8 +476,13 @@ def test_public_cleanup_ack_does_not_block_on_task_lock(tmp_path: Path):
     with task_lock(shared_root, task.task_id):
         process = context.Process(
             target=_run_cleanup_reconcile,
-            args=(str(cfg1.shared_root), str(cfg1.project_root), str(cfg1.runtime_root),
-                  cfg1.machine_name, child_connection),
+            args=(
+                str(cfg1.shared_root),
+                str(cfg1.project_root),
+                str(cfg1.runtime_root),
+                cfg1.machine_name,
+                child_connection,
+            ),
         )
         process.start()
         child_connection.close()
@@ -496,8 +494,7 @@ def test_public_cleanup_ack_does_not_block_on_task_lock(tmp_path: Path):
     assert reconcile_cleanup_operations(cfg1)[0]["state"] == "completed"
 
 
-def test_cleaned_event_is_written_only_after_shared_deletion_succeeds(
-        tmp_path: Path, monkeypatch):
+def test_cleaned_event_is_written_only_after_shared_deletion_succeeds(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = _failed_task(cfg)
     target = task_path(cfg.shared_root, task.task_id)
@@ -567,6 +564,7 @@ def test_claim_archive_io_failure_does_not_block_terminal_task(tmp_path: Path, m
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     from qqtools.plugins.qexp.runtime import claims
+
     original_create_if_absent = claims.create_if_absent
 
     def fail_archive_once(path, value):
@@ -641,20 +639,27 @@ def test_repair_orphan_keeps_blocked_on_identity_mismatch(tmp_path: Path):
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
     attempt_data = read_json(path)
-    attempt_data["attempt"]["process"].update({"process_group_id": 111,
-        "process_group_start_time_ticks": 10})
+    attempt_data["attempt"]["process"].update({"process_group_id": 111, "process_group_start_time_ticks": 10})
     atomic_replace(path, attempt_data)
     manifest_path = cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json"
-    atomic_replace(manifest_path, {"process": {"task_id": task.task_id,
-        "attempt_id": attempt.attempt_id, "fencing_token": attempt.current_fencing_token,
-        "process_group_id": 222, "process_group_start_time_ticks": 20}})
+    atomic_replace(
+        manifest_path,
+        {
+            "process": {
+                "task_id": task.task_id,
+                "attempt_id": attempt.attempt_id,
+                "fencing_token": attempt.current_fencing_token,
+                "process_group_id": 222,
+                "process_group_start_time_ticks": 20,
+            }
+        },
+    )
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     reconcile_running_tasks(cfg)
     assert load_task(cfg, task.task_id).state["projection"] == "blocked"
     assert reserved_gpu_ids(cfg.runtime_root) == {0}
     result = repair_orphans(cfg)
-    assert result["blocked"] == [{"task_id": task.task_id,
-                                  "reason": "process_identity_mismatch"}]
+    assert result["blocked"] == [{"task_id": task.task_id, "reason": "process_identity_mismatch"}]
     assert load_task(cfg, task.task_id).state["projection"] == "blocked"
     assert reserved_gpu_ids(cfg.runtime_root) == {0}
 
@@ -667,19 +672,25 @@ def test_repair_orphan_finalizes_identity_matched_absent_process(tmp_path: Path,
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
     attempt_data = read_json(path)
-    attempt_data["attempt"]["process"].update({"process_group_id": 111,
-        "process_group_start_time_ticks": 10})
+    attempt_data["attempt"]["process"].update({"process_group_id": 111, "process_group_start_time_ticks": 10})
     atomic_replace(path, attempt_data)
     manifest_path = cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json"
-    atomic_replace(manifest_path, {"process": {"task_id": task.task_id,
-        "attempt_id": attempt.attempt_id, "fencing_token": attempt.current_fencing_token,
-        "process_group_id": 111, "process_group_start_time_ticks": 10,
-        "exit_code": None}})
+    atomic_replace(
+        manifest_path,
+        {
+            "process": {
+                "task_id": task.task_id,
+                "attempt_id": attempt.attempt_id,
+                "fencing_token": attempt.current_fencing_token,
+                "process_group_id": 111,
+                "process_group_start_time_ticks": 10,
+                "exit_code": None,
+            }
+        },
+    )
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_start_time_ticks",
-                        lambda pid: None)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._is_process_group_alive",
-                        lambda pid: False)
+    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_start_time_ticks", lambda pid: None)
+    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._is_process_group_alive", lambda pid: False)
     result = repair_orphans(cfg)
     assert result["repaired"] == [task.task_id]
     assert load_task(cfg, task.task_id).state["projection"] == "failed"
