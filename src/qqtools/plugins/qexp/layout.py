@@ -55,7 +55,6 @@ GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
 SUPPORTED_REQUIRED_CAPABILITIES = frozenset({
     CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY, GROUP_READY_MEMBERS_CAPABILITY,
 })
-# QQTOOLS-COMPAT-0005: legacy GPU-only roots remain readable and writable through 1.3.17.
 
 
 def is_cpu_lane_root(cfg: RootConfig) -> bool:
@@ -65,14 +64,18 @@ def is_cpu_lane_root(cfg: RootConfig) -> bool:
         return False
     capabilities = read_json(path).get("schema", {}).get("required_capabilities")
     if capabilities is None:
-        return False
+        raise RuntimeError(
+            "qexp root requires cpu-lane-v1; complete its conversion with qqtools 1.3.15."
+        )
     if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
         raise RuntimeError("qexp schema/version.json has malformed required capabilities.")
     unknown = sorted(set(capabilities) - SUPPORTED_REQUIRED_CAPABILITIES)
     if unknown:
         raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
     if CPU_LANE_CAPABILITY not in capabilities:
-        raise RuntimeError("qexp schema/version.json has unsupported required capabilities.")
+        raise RuntimeError(
+            "qexp root requires cpu-lane-v1; complete its conversion with qqtools 1.3.15."
+        )
     return True
 
 
@@ -109,12 +112,6 @@ def validate_root_contract(cfg: RootConfig) -> None:
             raise RuntimeError("qexp root is uninitialized; run qexp init first.")
         raise RuntimeError(f"Unsupported qexp schema {version!r}; expected schema {SCHEMA_VERSION}.")
     is_cpu_lane_root(cfg)
-    # QQTOOLS-COMPAT-0005: only the explicit upgrader may inspect a preparing root.
-    upgrade_journal = shared_paths(cfg.shared_root)["schema"] / "cpu-lane-upgrade.json"
-    if upgrade_journal.exists():
-        upgrade = read_json(upgrade_journal).get("cpu_lane_upgrade", {})
-        if upgrade.get("phase") != "completed":
-            raise RuntimeError("CPU lane upgrade is preparing; run 'qexp upgrade cpu-lane status'.")
     shared_upgrade_journal = shared_paths(cfg.shared_root)["schema"] / "schema6-upgrade.json"
     if shared_upgrade_journal.exists():
         upgrade = read_json(shared_upgrade_journal).get("schema6_upgrade", {})

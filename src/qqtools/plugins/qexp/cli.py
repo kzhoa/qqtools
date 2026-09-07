@@ -44,13 +44,6 @@ from .runtime.resources.cpu_lane import (
     initialize_cpu_lane_capacity,
     set_cpu_lane_capacity,
 )
-from .cpu_lane_upgrade import (
-    attest_cpu_lane_upgrade,
-    check_cpu_lane_upgrade,
-    cpu_lane_upgrade_status,
-    resume_cpu_lane_upgrade,
-    start_cpu_lane_upgrade,
-)
 from .schema6_upgrade import (
     attest_schema6_upgrade,
     check_schema6_upgrade,
@@ -226,18 +219,6 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--to-schema", type=int, required=True)
     upgrade = commands.add_parser("upgrade")
     upgrade_sub = upgrade.add_subparsers(dest="upgrade_feature", required=True)
-    cpu_lane_upgrade = upgrade_sub.add_parser("cpu-lane")
-    cpu_lane_upgrade_sub = cpu_lane_upgrade.add_subparsers(dest="cpu_lane_upgrade_action", required=True)
-    for name in ("check", "start", "status"):
-        action = cpu_lane_upgrade_sub.add_parser(name)
-        _add_output_format(action)
-    attest = cpu_lane_upgrade_sub.add_parser("attest")
-    _add_output_format(attest)
-    attest.add_argument("--activation-id", required=True)
-    attest.add_argument("--confirm-clients-stopped", action="store_true")
-    resume = cpu_lane_upgrade_sub.add_parser("resume")
-    _add_output_format(resume)
-    resume.add_argument("--activation-id", required=True)
     schema6_upgrade = upgrade_sub.add_parser("schema6")
     schema6_upgrade_sub = schema6_upgrade.add_subparsers(dest="schema6_upgrade_action", required=True)
     for name in ("check", "start", "status"):
@@ -624,49 +605,6 @@ def main(argv: list[str] | None = None) -> int:
                     machine_runtime_root=args.machine_runtime_root,
                 ), args.format)
                 return 0
-            if args.cpu_lane_upgrade_action == "check":
-                _emit(
-                    "cpu-lane-upgrade",
-                    check_cpu_lane_upgrade(cfg, machine_runtime_root=args.machine_runtime_root),
-                    args.format,
-                )
-                return 0
-            if args.cpu_lane_upgrade_action == "status":
-                _emit("cpu-lane-upgrade", cpu_lane_upgrade_status(cfg), args.format)
-                return 0
-            if args.cpu_lane_upgrade_action == "start":
-                _emit(
-                    "cpu-lane-upgrade",
-                    start_cpu_lane_upgrade(cfg, machine_runtime_root=args.machine_runtime_root),
-                    args.format,
-                )
-                return 0
-            if args.cpu_lane_upgrade_action == "resume":
-                _emit(
-                    "cpu-lane-upgrade",
-                    resume_cpu_lane_upgrade(
-                        cfg,
-                        activation_id=args.activation_id,
-                        machine_runtime_root=args.machine_runtime_root,
-                    ),
-                    args.format,
-                )
-                return 0
-            if not args.confirm_clients_stopped:
-                raise ValueError("attest requires --confirm-clients-stopped.")
-            if not args.machine:
-                raise ValueError("attest requires --machine.")
-            _emit(
-                "cpu-lane-upgrade",
-                attest_cpu_lane_upgrade(
-                    cfg,
-                    activation_id=args.activation_id,
-                    machine_name=args.machine,
-                    machine_runtime_root=args.machine_runtime_root,
-                ),
-                args.format,
-            )
-            return 0
         if args.command == "use":
             is_selecting = args.use_shared_root is not None
             if sum((is_selecting, args.show, args.clear)) != 1:

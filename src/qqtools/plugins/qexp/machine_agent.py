@@ -415,13 +415,6 @@ def _probe_primary_demand(
             if cursor_key == selected_recheck_route:
                 has_completed_selected_recheck = True
             pending_routes.discard(cursor_key)
-    if lane == "gpu":
-        # QQTOOLS-COMPAT-0005: retain read-only legacy diagnostic keys during the transition.
-        for key, value in list(runtime.primary_probe_cursors.items()):
-            if len(key) == 3 and key[2] == "gpu":
-                runtime.primary_probe_cursors[key[:2]] = value
-                runtime.primary_probe_revisions[key[:2]] = runtime.primary_probe_revisions.get(key)
-                runtime.primary_probe_complete[key[:2]] = runtime.primary_probe_complete.get(key, False)
     return PrimaryDemandProbe("no_primary_demand", tuple(diagnostics[-32:]))
 
 
@@ -458,11 +451,6 @@ def _build_borrow_admission_grant(
             runtime.primary_probe_cursors[key] = None
             runtime.primary_probe_complete[key] = False
             runtime.primary_probe_revisions.pop(key, None)
-            # QQTOOLS-COMPAT-0005: mirror invalidation in legacy diagnostic keys.
-            if lane == "gpu":
-                runtime.primary_probe_cursors[key[:2]] = None
-                runtime.primary_probe_complete[key[:2]] = False
-                runtime.primary_probe_revisions.pop(key[:2], None)
         return None
     return grant
 
@@ -1136,13 +1124,6 @@ def _dispatch_machine_cycle_locked(
             )
             if borrow_admission_grant is None:
                 probe = PrimaryDemandProbe("unresolved", probe.diagnostics)
-        if lane == "gpu":
-            # QQTOOLS-COMPAT-0005: retain legacy diagnostic keys; dispatch only reads lane keys.
-            for key in tuple(runtime.primary_probe_cursors):
-                if len(key) == 3 and key[2] == "gpu":
-                    runtime.primary_probe_cursors[key[:2]] = runtime.primary_probe_cursors[key]
-                    runtime.primary_probe_revisions[key[:2]] = runtime.primary_probe_revisions.get(key)
-                    runtime.primary_probe_complete[key[:2]] = runtime.primary_probe_complete.get(key, False)
         dispatch_plan = build_machine_dispatch_plan(
             MachineDispatchSnapshot(
                 enabled_project_ids=ordered_project_ids,

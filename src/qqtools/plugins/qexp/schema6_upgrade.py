@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from .config_types import RootConfig
-from .cpu_lane_upgrade import _blockers, _runtime_binding, _validate_attestations
 from .layout import CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY
+from .machine_runtime import MachineRuntime, ProjectBinding
 from .runtime.locks import schema_lock
 from .runtime.paths import shared_paths
 from .runtime.records import TaskRecord, utc_now
@@ -16,6 +16,112 @@ from .runtime.store import atomic_replace, iter_json, read_json
 
 _JOURNAL = "schema6-upgrade.json"
 _CAPABILITIES = frozenset({CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY})
+
+
+def _runtime_binding(
+    cfg: RootConfig, machine_runtime_root: str | Path | None
+) -> tuple[MachineRuntime, ProjectBinding]:
+    """Resolve the caller's verified machine-local binding for this project."""
+    runtime = MachineRuntime(machine_runtime_root)
+    identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
+    identity = read_json(identity_path).get("project", {})
+    project_id = identity.get("project_id")
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError("project identity is malformed.")
+    _revision, bindings = runtime.load_registry()
+    matches = [
+        binding
+        for binding in bindings
+        if binding.project_id == project_id and binding.shared_root == cfg.shared_root
+    ]
+    if len(matches) != 1:
+        raise ValueError("no unique machine runtime binding matches this project.")
+    binding = matches[0]
+    record = read_json(
+        shared_paths(cfg.shared_root)["machines"] / binding.machine_name / "machine.json"
+    ).get("machine", {})
+    if (
+        not isinstance(record, dict)
+        or record.get("machine_name") != binding.machine_name
+        or record.get("project_id") != binding.project_id
+        or record.get("shared_root") != str(cfg.shared_root)
+        or record.get("agent_runtime") != "machine"
+    ):
+        raise ValueError("local machine runtime binding does not match Project truth.")
+    return runtime, binding
+
+
+def _validate_attestations(
+    cfg: RootConfig,
+    journal: dict[str, Any],
+    *,
+    runtime: MachineRuntime,
+    binding: ProjectBinding,
+) -> None:
+    """Ensure attestations retain their binding and the resumer's runtime identity."""
+    identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
+    identity = read_json(identity_path).get("project", {})
+    project_id = identity.get("project_id")
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError("project identity is malformed.")
+    attestations = journal.get("attestations")
+    if not isinstance(attestations, dict):
+        raise ValueError("schema-6 upgrade attestations are malformed.")
+    for machine_name, attestation in attestations.items():
+        if machine_name not in journal["participants"] or not isinstance(attestation, dict):
+            raise ValueError("schema-6 upgrade attestation is not a declared participant.")
+        if (
+            attestation.get("machine_name") != machine_name
+            or attestation.get("binding_machine_name") != machine_name
+            or attestation.get("project_id") != project_id
+            or attestation.get("shared_root") != str(cfg.shared_root)
+        ):
+            raise ValueError(
+                f"schema-6 upgrade attestation does not match machine binding: {machine_name}."
+            )
+        if (
+            machine_name == binding.machine_name
+            and attestation.get("runtime_root") != str(runtime.root)
+        ):
+            raise ValueError(
+                "schema-6 upgrade attestation does not match the local machine runtime."
+            )
+
+
+def _blockers(
+    cfg: RootConfig, *, machine_runtime_root: str | Path | None = None
+) -> list[str]:
+    """Return active shared and local state that prevents a schema-6 activation."""
+    blockers: list[str] = []
+    for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
+        task = read_json(path).get("task", {})
+        phase = task.get("state", {}).get("projection")
+        if task.get("claim_control", {}).get("active_claim") or phase in {"running", "blocked"}:
+            blockers.append(f"task:{path.stem}:{phase}")
+    for path in iter_json(shared_paths(cfg.shared_root)["submissions"]):
+        if read_json(path).get("submission", {}).get("state") not in {"committed", "aborted"}:
+            blockers.append(f"operation:submission:{path.stem}")
+    for directory in ("availability_active", "group_control_active", "cleanup_active"):
+        if iter_json(shared_paths(cfg.shared_root)[directory]):
+            blockers.append(f"operation:{directory.removesuffix('_active')}")
+    pending_claims = shared_paths(cfg.shared_root)["claim_pending"]
+    if pending_claims.exists() and any(path.is_file() for path in pending_claims.rglob("*.json")):
+        blockers.append("operation:claim_pending")
+    try:
+        runtime, binding = _runtime_binding(cfg, machine_runtime_root)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        blockers.append(f"runtime:binding_unresolved:{exc}")
+        return blockers
+    for directory in ("active", "provisional", "cpu_active", "cpu_provisional"):
+        for path in iter_json(runtime.paths[directory]):
+            if read_json(path).get("reservation", {}).get("project_id") == binding.project_id:
+                blockers.append(f"runtime:{directory}")
+                break
+    project_paths = runtime.project_paths(binding.project_id)
+    for directory in ("processes", "registrations", "launch_intents", "termination_decisions"):
+        if iter_json(project_paths[directory]):
+            blockers.append(f"runtime:{directory}")
+    return blockers
 
 
 def _path(cfg: RootConfig) -> Path:
@@ -66,9 +172,6 @@ def start_schema6_upgrade(
             if value.get("capabilities") != requested:
                 raise ValueError("schema-6 activation capabilities do not match the existing session.")
             return value
-        cpu_journal = shared_paths(cfg.shared_root)["schema"] / "cpu-lane-upgrade.json"
-        if cpu_journal.exists() and read_json(cpu_journal).get("cpu_lane_upgrade", {}).get("phase") != "completed":
-            raise RuntimeError("schema-6 upgrade conflicts with an unfinished CPU lane upgrade.")
         blockers = _blockers(cfg, machine_runtime_root=machine_runtime_root)
         if blockers:
             raise RuntimeError("schema-6 upgrade requires a drained root: " + ", ".join(blockers))
