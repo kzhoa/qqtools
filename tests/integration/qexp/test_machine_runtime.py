@@ -34,7 +34,7 @@ from qqtools.plugins.qexp.machine_runtime import (
 from qqtools.plugins.qexp.project_maintenance import maintain_project
 from qqtools.plugins.qexp.runtime.locks import exclusive
 from qqtools.plugins.qexp.runtime.paths import machine_project_paths, machine_runtime_paths
-from qqtools.plugins.qexp.runtime.reservations import (
+from qqtools.plugins.qexp.runtime.resources.reservations import (
     active_reservations,
     attach,
     reserve,
@@ -892,7 +892,7 @@ def test_reserved_gpu_ids_reads_each_provisional_record_once(
     runtime_root = tmp_path / "runtime"
     reservation = reserve(runtime_root, "task-1", [0])
     reservation_path = runtime_root / "reservations" / "provisional" / f"{reservation['reservation']['reservation_id']}.json"
-    from qqtools.plugins.qexp.runtime import reservations
+    from qqtools.plugins.qexp.runtime.resources import reservations
 
     original_read_json = reservations.read_json
     reads = 0

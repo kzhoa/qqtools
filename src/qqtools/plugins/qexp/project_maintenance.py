@@ -21,7 +21,7 @@ from .runtime.claims import reconcile_claim_archives
 from .runtime.paths import attempt_path, shared_paths
 from .runtime.placement import offer_due
 from .runtime.records import AttemptRecord
-from .runtime.reservations import (
+from .runtime.resources.reservations import (
     ReservationIdentity,
     active_reservations,
     release_if_matches,

@@ -8,7 +8,7 @@ from qqtools.plugins.qexp.commands.task import offer
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 from qqtools.plugins.qexp.runtime.paths import shared_paths
-from qqtools.plugins.qexp.runtime.reservations import reserved_gpu_ids
+from qqtools.plugins.qexp.runtime.resources.reservations import reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import (

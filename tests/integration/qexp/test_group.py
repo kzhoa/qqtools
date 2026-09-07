@@ -7,7 +7,7 @@ from qqtools.plugins.qexp.commands.group import change_worker, create_group, gro
 from qqtools.plugins.qexp.observer import list_group_machines, list_groups
 from qqtools.plugins.qexp.runtime.paths import group_path
 from qqtools.plugins.qexp.runtime.store import read_json
-from qqtools.plugins.qexp.runtime.reservations import reserve_admitted
+from qqtools.plugins.qexp.runtime.resources.reservations import reserve_admitted
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 

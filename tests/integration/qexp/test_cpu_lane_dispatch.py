@@ -3,7 +3,7 @@ from pathlib import Path
 from qqtools.plugins.qexp.commands.task import submit
 from qqtools.plugins.qexp.executor import Executor
 from qqtools.plugins.qexp.machine_config import init_shared_root
-from qqtools.plugins.qexp.runtime.cpu_lane import (
+from qqtools.plugins.qexp.runtime.resources.cpu_lane import (
     cpu_reservation_snapshot,
     release_cpu,
     set_cpu_lane_capacity,

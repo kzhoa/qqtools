@@ -33,13 +33,13 @@ from .project_maintenance import maintain_project, reconcile_reservation
 from .runtime.paths import local_paths
 from .runtime.records import TaskSpec, normalize_group_record, utc_now
 from .runtime.ready.group_members import is_group_ready_member_projection_usable
-from .runtime.reservations import (
+from .runtime.resources.reservations import (
     ReservationIdentity,
     ReservationSnapshot,
     reconcile_snapshot,
     reservation_snapshot,
 )
-from .runtime.cpu_lane import cpu_reservation_snapshot
+from .runtime.resources.cpu_lane import cpu_reservation_snapshot
 from .runtime.ready import (
     ReadyProbeBudgetExhausted,
     advance_ready_index_build,

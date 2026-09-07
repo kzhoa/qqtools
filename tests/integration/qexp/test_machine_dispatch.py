@@ -5,7 +5,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.machine_agent import dispatch_machine_cycle_locked
 from qqtools.plugins.qexp.machine_runtime import MachineRuntime
-from qqtools.plugins.qexp.runtime.reservations import (
+from qqtools.plugins.qexp.runtime.resources.reservations import (
     ReservationIdentity,
     active_reservations,
     attach,

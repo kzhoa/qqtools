@@ -238,7 +238,7 @@ def group_control(
         result_data = data
     for result in post_commit_results:
         if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
-            from ..runtime.reservations import release
+            from ..runtime.resources.reservations import release
 
             release(reservation_runtime_root, result.reservation_id, "group_cancelled_before_launch")
         if result.event:

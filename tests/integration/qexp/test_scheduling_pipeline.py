@@ -8,7 +8,7 @@ from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import cancel, retry
 from qqtools.plugins.qexp.runtime.paths import attempt_path, shared_paths
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
-from qqtools.plugins.qexp.runtime.reservations import reserved_gpu_ids
+from qqtools.plugins.qexp.runtime.resources.reservations import reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import (

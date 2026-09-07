@@ -9,7 +9,7 @@ from ..lease import clock_capability, lease_expiry, load_lease_policy, persist_c
 from ..scheduler import authority_locks, _manifest_supervisor
 from .paths import attempt_path, group_path
 from .records import AttemptRecord, normalize_group_record, utc_now
-from .reservations import retag
+from .resources.reservations import retag
 from .store import atomic_replace, read_json
 from .tasks import load_task, save_task
 from .termination import attempt_control_lock, is_recovery_blocked
