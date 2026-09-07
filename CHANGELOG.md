@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- breaking: retire the qexp CPU-lane compatibility transition. The `upgrade cpu-lane` CLI,
+  temporary upgrader, legacy diagnostic cursor aliases, and compatibility registry item are removed;
+  ordinary access now rejects roots that have not been converted to the permanent `cpu-lane-v1`
+  capability.
 - feat: add the qexp Group live-ready membership projection with resumable activation, bounded
   rebuild audits, exact primary-candidate updates, and the three-release schema compatibility
   transition required before narrow schema writers become active.

@@ -1,11 +1,14 @@
 ---
 doc_type: spec
-status: drafting
-updated_at: 2026-09-05
-archived_at:
+status: archived
+updated_at: 2026-09-07
+archived_at: 2026-09-07
 ---
 
 # qexp CPU Lane Compatibility Transition
+
+Archived on 2026-09-07 after the 1.3.16 retirement of `QQTOOLS-COMPAT-0005`. This document
+preserves the 1.3.15 transition contract only; current releases provide no CPU-lane upgrader.
 
 This is the CPU transition contract. Global qexp schema
 remains 6. QQTOOLS-COMPAT-0005 tracks temporary compatibility; the
