@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pytest
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 SYSTEM_TEST_TMP_ROOT = Path("/tmp")
@@ -52,8 +51,7 @@ def _select_test_tmp_base(
     if _is_usable_temp_root(fallback_root):
         return fallback_root
     raise RuntimeError(
-        "No usable test temporary root: both "
-        f"{system_root} and {fallback_root} failed a create/write/delete probe."
+        f"No usable test temporary root: both {system_root} and {fallback_root} failed a create/write/delete probe."
     )
 
 
@@ -182,10 +180,7 @@ def _configure_temp_root_for_session():
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
     previous_tempdir = tempfile.tempdir
-    previous_env = {
-        key: os.environ.get(key)
-        for key in ("TMPDIR", "TMP", "TEMP", TEST_TMUX_BASE_ENV)
-    }
+    previous_env = {key: os.environ.get(key) for key in ("TMPDIR", "TMP", "TEMP", TEST_TMUX_BASE_ENV)}
     original_mkdtemp = tempfile.mkdtemp
     original_temporary_directory = tempfile.TemporaryDirectory
     tmp_root_str = str(TMP_ROOT)

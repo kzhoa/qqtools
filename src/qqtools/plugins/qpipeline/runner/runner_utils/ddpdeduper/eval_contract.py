@@ -103,10 +103,7 @@ class EvalDedupRuntime:
             reference = schema_candidates[0]
             for candidate in schema_candidates[1:]:
                 if candidate != reference:
-                    raise ValueError(
-                        f"Dedup gather schema mismatch for key '{key}': "
-                        f"{reference} vs {candidate}"
-                    )
+                    raise ValueError(f"Dedup gather schema mismatch for key '{key}': {reference} vs {candidate}")
 
             if key in local_cat_map:
                 local_tensor = local_cat_map[key]

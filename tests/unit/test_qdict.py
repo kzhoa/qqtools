@@ -173,7 +173,9 @@ def test_default_function_setter_works_via_attr():
     """Test default_function assignment via property setter."""
     d = qDict(default_function=lambda: 1)
 
-    new_default = lambda: 2
+    def new_default():
+        return 2
+
     d.default_function = new_default
 
     assert d.default_function is new_default
@@ -225,8 +227,8 @@ def test_to_dict():
     d = qDict({"a": {"b": 1}})
     plain = d.to_dict()
 
-    assert type(plain) == dict
-    assert type(plain["a"]) == dict
+    assert type(plain) is dict
+    assert type(plain["a"]) is dict
     assert plain["a"]["b"] == 1
 
 
@@ -295,7 +297,10 @@ def test_copy_is_shallow_and_deepcopy_is_deep():
 
 def test_deepcopy_preserves_config_flags():
     """Test deepcopy keeps allow_notexist and default_function settings."""
-    default_factory = lambda: []
+
+    def default_factory():
+        return []
+
     d = qDict({"a": 1}, default_function=default_factory, allow_notexist=False)
 
     copied = copy.deepcopy(d)
@@ -325,7 +330,10 @@ def test_default_function_setter_none_then_respects_allow_notexist_false():
 
 def test_getitem_special_key_default_function():
     """Test special-key access for internal _default_function."""
-    fn = lambda: 1
+
+    def fn():
+        return 1
+
     d = qDict(default_function=fn)
     assert d["_default_function"] is fn
 

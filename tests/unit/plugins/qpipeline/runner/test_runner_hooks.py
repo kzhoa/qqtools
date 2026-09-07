@@ -47,9 +47,7 @@ def test_empty_optimizer_dispatch_is_not_valid_without_registered_hook():
     hooks = RunnerHooks()
     hooks.freeze()
     with pytest.raises(RuntimeError, match="not installed"):
-        hooks.dispatch_optimizer_step_end(
-            OptimizerStepEndContext(epoch=0, global_step=1, is_natural_epoch_end=False)
-        )
+        hooks.dispatch_optimizer_step_end(OptimizerStepEndContext(epoch=0, global_step=1, is_natural_epoch_end=False))
 
 
 @pytest.mark.parametrize(
@@ -81,7 +79,10 @@ def test_hook_dispatch_requires_frozen_composition(dispatch, context):
 @pytest.mark.parametrize("slot_name", ("after_validation", "boundary_cursor", "after_epoch_commit"))
 def test_none_returning_hooks_reject_control_values(slot_name):
     hooks = RunnerHooks()
-    callback = lambda context: {"unexpected": "control"}
+
+    def callback(context):
+        return {"unexpected": "control"}
+
     if slot_name == "after_validation":
         hooks.set_after_validation_hook(callback, provider_id="test.v1")
         context = ValidationHookContext(
@@ -94,9 +95,7 @@ def test_none_returning_hooks_reject_control_values(slot_name):
         dispatch = hooks.dispatch_after_validation
     else:
         callback_setter = (
-            hooks.set_boundary_cursor_hook
-            if slot_name == "boundary_cursor"
-            else hooks.set_after_epoch_commit_hook
+            hooks.set_boundary_cursor_hook if slot_name == "boundary_cursor" else hooks.set_after_epoch_commit_hook
         )
         callback_setter(callback, provider_id="test.v1")
         context = RunnerBoundaryContext(
@@ -109,9 +108,7 @@ def test_none_returning_hooks_reject_control_values(slot_name):
             latest_train_loss=None,
         )
         dispatch = (
-            hooks.dispatch_at_boundary_cursor
-            if slot_name == "boundary_cursor"
-            else hooks.dispatch_after_epoch_commit
+            hooks.dispatch_at_boundary_cursor if slot_name == "boundary_cursor" else hooks.dispatch_after_epoch_commit
         )
     hooks.freeze()
 

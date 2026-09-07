@@ -13,7 +13,6 @@ from tests.helpers.qexp.architecture import (
     plan_crash_window_recovery,
 )
 
-
 pytestmark = pytest.mark.slow
 
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Small local qualification probe for qexp atomic JSON and exclusive create."""
+
 from __future__ import annotations
 
 import argparse

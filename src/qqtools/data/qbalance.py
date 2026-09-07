@@ -176,9 +176,7 @@ _LPT_REPAIR_CANDIDATES = 2
 _LPT_REPAIR_SLOTS = 3
 
 
-def _partition_layered_batches(
-    costs: np.ndarray, order: np.ndarray, batch_size: int
-) -> np.ndarray:
+def _partition_layered_batches(costs: np.ndarray, order: np.ndarray, batch_size: int) -> np.ndarray:
     """Give each batch one item per layer, largest item to the lightest batch."""
     batch_count = len(order) // batch_size
     layers = np.empty((batch_size, batch_count), dtype=np.int64)
@@ -192,7 +190,9 @@ def _partition_layered_batches(
 
 
 def _best_rank_batch_swaps(
-    high_costs: np.ndarray, low_costs: np.ndarray, gaps: np.ndarray,
+    high_costs: np.ndarray,
+    low_costs: np.ndarray,
+    gaps: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Prevalidated descending rows; at most 2*B-1 visits per pair, no B-by-B grid."""
     pair_count, batch_size = high_costs.shape
@@ -216,13 +216,14 @@ def _best_rank_batch_swaps(
         should_advance_high = bounded_delta > gaps[active] - bounded_delta
         high_pos[active] += should_advance_high
         low_pos[active] += ~should_advance_high
-        active = active[(high_pos[active] < batch_size) & (low_pos[active] < batch_size)
-                        & (best_gap[active] > 0)]
+        active = active[(high_pos[active] < batch_size) & (low_pos[active] < batch_size) & (best_gap[active] > 0)]
     return best_high, best_low
 
 
 def _swap_layered_rank_batches(
-    costs: np.ndarray, batches: np.ndarray, world_size: int | None,
+    costs: np.ndarray,
+    batches: np.ndarray,
+    world_size: int | None,
 ) -> np.ndarray:
     """Input rows come from layered LPT and are already descending by cost."""
     batch_count, batch_size = batches.shape
@@ -235,7 +236,9 @@ def _swap_layered_rank_batches(
     pair_count = batch_count // 2
     low, high = order[:pair_count], order[-pair_count:][::-1]
     high_slot, low_slot = _best_rank_batch_swaps(
-        costs[batches[high]], costs[batches[low]], loads[high] - loads[low],
+        costs[batches[high]],
+        costs[batches[low]],
+        loads[high] - loads[low],
     )
     should_swap = high_slot >= 0
     if not np.any(should_swap):
@@ -244,22 +247,20 @@ def _swap_layered_rank_batches(
     high_slot, low_slot = high_slot[should_swap], low_slot[should_swap]
     trial = batches.copy()
     trial[high, high_slot], trial[low, low_slot] = (
-        trial[low, low_slot], trial[high, high_slot],
+        trial[low, low_slot],
+        trial[high, high_slot],
     )
     trial_loads = _rank_batch_loads(costs, trial)
     before = _rank_batch_quality(loads, world_size)
     after = _rank_batch_quality(trial_loads, world_size)
     if after >= before:
         return batches
-    if (world_size is not None and after[:2] == before[:2]
-            and _has_worse_raw_step_sum(loads, trial_loads, world_size)):
+    if world_size is not None and after[:2] == before[:2] and _has_worse_raw_step_sum(loads, trial_loads, world_size):
         return batches
     return trial
 
 
-def _partition_capacity_batches(
-    costs: np.ndarray, order: np.ndarray, batch_size: int
-) -> np.ndarray:
+def _partition_capacity_batches(costs: np.ndarray, order: np.ndarray, batch_size: int) -> np.ndarray:
     """Assign descending items to the least-loaded batch with remaining capacity."""
     batch_count = len(order) // batch_size
     batches = np.empty((batch_count, batch_size), dtype=np.int64)
@@ -283,7 +284,8 @@ def _rank_batch_loads(costs: np.ndarray, batches: np.ndarray) -> np.ndarray:
 
 
 def _rank_batch_quality(
-    loads: np.ndarray, world_size: int | None = None,
+    loads: np.ndarray,
+    world_size: int | None = None,
 ) -> tuple[float, float, float]:
     """Peak, P99, normalized squared loads; explicit world size scores step maxima."""
     if not np.all(np.isfinite(loads)):
@@ -302,13 +304,11 @@ def _rank_batch_quality(
         return peak, p99, squared_sum
     # When the first two keys tie, dividing by their common peak preserves ordering
     # without overflowing on a large epoch whose individual batch costs are finite.
-    step_max_sum = float((ordered[world_size - 1::world_size] / peak).sum()) if peak else 0.0
+    step_max_sum = float((ordered[world_size - 1 :: world_size] / peak).sum()) if peak else 0.0
     return peak, p99, step_max_sum
 
 
-def _swap_rank_batch_pair(
-    costs: np.ndarray, batches: np.ndarray, loads: np.ndarray, first: int, second: int
-) -> None:
+def _swap_rank_batch_pair(costs: np.ndarray, batches: np.ndarray, loads: np.ndarray, first: int, second: int) -> None:
     """Find a one-for-one exchange near half the load gap in O(B log B) time."""
     hi, lo = (first, second) if loads[first] >= loads[second] else (second, first)
     gap = float(loads[hi] - loads[lo])
@@ -331,14 +331,16 @@ def _swap_rank_batch_pair(
                 best_swap = high_position, int(low_positions[candidate])
     if best_swap is not None:
         high_position, low_position = best_swap
-        batches[hi, high_position], batches[lo, low_position] = (
-            batches[lo, low_position], batches[hi, high_position]
-        )
+        batches[hi, high_position], batches[lo, low_position] = (batches[lo, low_position], batches[hi, high_position])
 
 
 def _refine_rank_batches(
-    costs: np.ndarray, batches: np.ndarray, world_size: int | None, seed: int,
-    *, passes: int = _LPT_REFINEMENT_PASSES,
+    costs: np.ndarray,
+    batches: np.ndarray,
+    world_size: int | None,
+    seed: int,
+    *,
+    passes: int = _LPT_REFINEMENT_PASSES,
 ) -> np.ndarray:
     """Bounded paired swaps; retain the incumbent under the full tier objective."""
     trial = batches.copy()
@@ -350,8 +352,7 @@ def _refine_rank_batches(
     for pass_index in range(passes):
         if not pair_count or np.all(loads == loads[0]):
             break
-        order = (np.argsort(loads, kind="stable") if pass_index % 2 == 0
-                 else rng.permutation(len(trial)))
+        order = np.argsort(loads, kind="stable") if pass_index % 2 == 0 else rng.permutation(len(trial))
         for first, second in zip(order[:pair_count], order[-pair_count:][::-1]):
             _swap_rank_batch_pair(costs, trial, loads, int(first), int(second))
         loads = _rank_batch_loads(costs, trial)
@@ -361,9 +362,7 @@ def _refine_rank_batches(
     return best
 
 
-def _rank_batch_peak_lower_bound(
-    costs: np.ndarray, order: np.ndarray, batch_size: int
-) -> float:
+def _rank_batch_peak_lower_bound(costs: np.ndarray, order: np.ndarray, batch_size: int) -> float:
     """Conservative float bound using the actual selected occurrences, sorted descending."""
     largest = float(costs[order[0]])
     batch_count = len(order) // batch_size
@@ -375,7 +374,7 @@ def _rank_batch_peak_lower_bound(
     except OverflowError:
         mean = 0.0
     try:
-        companions = costs[order[-(batch_size - 1):]] if batch_size > 1 else ()
+        companions = costs[order[-(batch_size - 1) :]] if batch_size > 1 else ()
         paired = fsum((largest, *companions))
         paired = nextafter(nextafter(paired, 0.0), 0.0)
     except OverflowError:
@@ -401,9 +400,7 @@ def _small_batch_assignments(group_count: int, slots: int) -> np.ndarray:
     return result
 
 
-def _rank_batch_repair_candidates(
-    costs: np.ndarray, rows: np.ndarray, window: int
-) -> list[np.ndarray]:
+def _rank_batch_repair_candidates(costs: np.ndarray, rows: np.ndarray, window: int) -> list[np.ndarray]:
     """Reassign at most nine occurrences; shortlist distinct locally balanced load vectors."""
     group_count, batch_size = rows.shape
     slots = min(batch_size, _LPT_REPAIR_SLOTS)
@@ -438,14 +435,13 @@ def _rank_batch_repair_candidates(
 def _has_worse_raw_step_sum(loads: np.ndarray, trial: np.ndarray, world_size: int) -> bool:
     """Guard rounding disagreements between normalized and raw step-max sums."""
     with np.errstate(over="ignore"):
-        before = np.sort(loads)[world_size - 1::world_size].sum()
-        after = np.sort(trial)[world_size - 1::world_size].sum()
+        before = np.sort(loads)[world_size - 1 :: world_size].sum()
+        after = np.sort(trial)[world_size - 1 :: world_size].sum()
     return bool(after > before)
 
 
 def _repair_rank_batches(
-    costs: np.ndarray, batches: np.ndarray, world_size: int | None,
-    seed: int, peak_lower_bound: float
+    costs: np.ndarray, batches: np.ndarray, world_size: int | None, seed: int, peak_lower_bound: float
 ) -> np.ndarray:
     """Bounded three-batch repair; retain the existing best under the full epoch objective."""
     if len(batches) < 2 or batches.shape[1] == 1:
@@ -481,8 +477,10 @@ def _repair_rank_batches(
             quality = _rank_batch_quality(trial_loads, world_size)
             if quality >= best_quality:
                 continue
-            if world_size is not None and quality[:2] == best_quality[:2] and _has_worse_raw_step_sum(
-                loads, trial_loads, world_size
+            if (
+                world_size is not None
+                and quality[:2] == best_quality[:2]
+                and _has_worse_raw_step_sum(loads, trial_loads, world_size)
             ):
                 continue
             best[groups] = candidate
@@ -499,7 +497,11 @@ class _RankBatchPartition:
 
 
 def _partition_selected_batches(
-    costs: np.ndarray, selected: np.ndarray, batch_size: int, seed: int, strategy: str,
+    costs: np.ndarray,
+    selected: np.ndarray,
+    batch_size: int,
+    seed: int,
+    strategy: str,
 ) -> np.ndarray:
     """Balance prevalidated occurrences divisible by B, without step-level objectives."""
     if not len(selected):
@@ -508,10 +510,7 @@ def _partition_selected_batches(
     batches = _partition_layered_batches(costs, order, batch_size)
     batches = _swap_layered_rank_batches(costs, batches, None)
     loads = _rank_batch_loads(costs, batches)
-    has_fixed_loads = (
-        batch_size == 1 or len(batches) == 1
-        or (np.all(np.isfinite(loads)) and np.all(loads == loads[0]))
-    )
+    has_fixed_loads = batch_size == 1 or len(batches) == 1 or (np.all(np.isfinite(loads)) and np.all(loads == loads[0]))
     if strategy != "lpt_fast" and not has_fixed_loads:
         candidate = _partition_capacity_batches(costs, order, batch_size)
         candidate_loads = _rank_batch_loads(costs, candidate)
@@ -530,9 +529,7 @@ def _partition_selected_batches(
 
 def _validate_rank_batch_settings(batch_size: int, strategy: str) -> int:
     if strategy not in _LPT_STRATEGIES:
-        raise ValueError(
-            f"Unsupported rank-batch strategy {strategy!r}; expected {_LPT_STRATEGIES}"
-        )
+        raise ValueError(f"Unsupported rank-batch strategy {strategy!r}; expected {_LPT_STRATEGIES}")
     if isinstance(batch_size, (bool, np.bool_)) or not isinstance(batch_size, (int, np.integer)):
         raise TypeError(f"batch_size must be an integer, got {batch_size!r}")
     if batch_size <= 0:
@@ -555,7 +552,11 @@ def _partition_rank_batches(
     selected = rng.permutation(len(costs))
     full_size = len(costs) // batch_size * batch_size
     batches = _partition_selected_batches(
-        costs, selected[:full_size], batch_size, seed, strategy,
+        costs,
+        selected[:full_size],
+        batch_size,
+        seed,
+        strategy,
     )
     remainder = selected[full_size:].copy()
     batches.setflags(write=False)
@@ -595,14 +596,21 @@ def compute_balanced_batch_indices(
             batch costs overflow float64.
     """
     partition = _partition_rank_batches(
-        sample_costs, batch_size=batch_size, seed=seed, strategy=strategy,
+        sample_costs,
+        batch_size=batch_size,
+        seed=seed,
+        strategy=strategy,
     )
     return partition.full_batches, partition.remainder
 
 
 def _complete_rank_batch_tail(
-    costs: np.ndarray, partition: _RankBatchPartition, world_size: int,
-    seed: int, should_drop_last: bool, strategy: str,
+    costs: np.ndarray,
+    partition: _RankBatchPartition,
+    world_size: int,
+    seed: int,
+    should_drop_last: bool,
+    strategy: str,
 ) -> np.ndarray:
     """Repair at most 2R-1 base rows plus remainder; leave all other rows intact."""
     batches, remainder = partition.full_batches, partition.remainder
@@ -619,15 +627,18 @@ def _complete_rank_batch_tail(
     pool = np.concatenate((batches[pool_ids].ravel(), remainder))
     rng.shuffle(pool)
     global_size = batch_size * world_size
-    target = ((len(pool) // global_size) if should_drop_last
-              else ((len(pool) + global_size - 1) // global_size)) * global_size
+    target = (
+        (len(pool) // global_size) if should_drop_last else ((len(pool) + global_size - 1) // global_size)
+    ) * global_size
     selected = pool[:target] if should_drop_last else np.resize(pool, target)
     repaired = _partition_selected_batches(costs, selected, batch_size, seed, strategy)
     return np.ascontiguousarray(np.concatenate((batches[is_kept], repaired)))
 
 
 def _optimize_fast_step_batches(
-    costs: np.ndarray, batches: np.ndarray, world_size: int,
+    costs: np.ndarray,
+    batches: np.ndarray,
+    world_size: int,
 ) -> np.ndarray:
     """One sorted-row two-pointer pass on a derived copy; protect all three metrics."""
     if world_size == 1 or len(batches) < 2 or batches.shape[1] == 1:
@@ -641,15 +652,23 @@ def _optimize_fast_step_batches(
     candidate_loads = _rank_batch_loads(costs, candidate)
     before = _rank_batch_quality(loads, world_size)
     after = _rank_batch_quality(candidate_loads, world_size)
-    if (after < before and after[0] <= before[0] and after[1] <= before[1]
-            and not _has_worse_raw_step_sum(loads, candidate_loads, world_size)):
+    if (
+        after < before
+        and after[0] <= before[0]
+        and after[1] <= before[1]
+        and not _has_worse_raw_step_sum(loads, candidate_loads, world_size)
+    ):
         return candidate
     return batches
 
 
 def _optimize_step_batches(
-    costs: np.ndarray, batches: np.ndarray, world_size: int, seed: int,
-    *, should_use_best: bool = True,
+    costs: np.ndarray,
+    batches: np.ndarray,
+    world_size: int,
+    seed: int,
+    *,
+    should_use_best: bool = True,
 ) -> np.ndarray:
     """Refine a derived plan without mutating base batches or worsening peak/P99/step sum."""
     if world_size == 1 or len(batches) < 2 or batches.shape[1] == 1:
@@ -659,19 +678,25 @@ def _optimize_step_batches(
         return batches
     best = batches
     quality = _rank_batch_quality(loads, world_size)
-    for should_repair in ((False, True) if should_use_best else (False,)):
+    for should_repair in (False, True) if should_use_best else (False,):
         if should_repair:
             candidate = _repair_rank_batches(costs, best, world_size, seed, 0.0)
         else:
             candidate = _refine_rank_batches(
-                costs, best, world_size, seed,
+                costs,
+                best,
+                world_size,
+                seed,
                 passes=_LPT_REFINEMENT_PASSES if should_use_best else 1,
             )
         candidate_loads = _rank_batch_loads(costs, candidate)
         candidate_quality = _rank_batch_quality(candidate_loads, world_size)
-        if (candidate_quality < quality and candidate_quality[0] <= quality[0]
-                and candidate_quality[1] <= quality[1]
-                and not _has_worse_raw_step_sum(loads, candidate_loads, world_size)):
+        if (
+            candidate_quality < quality
+            and candidate_quality[0] <= quality[0]
+            and candidate_quality[1] <= quality[1]
+            and not _has_worse_raw_step_sum(loads, candidate_loads, world_size)
+        ):
             best, loads, quality = candidate, candidate_loads, candidate_quality
     return best
 
@@ -711,25 +736,46 @@ def _plan_rank_batches(
     if should_drop_last and len(costs) < batch_size * world_size:
         return np.empty((0, world_size, batch_size), dtype=np.int64)
     partition = _partition_rank_batches(
-        costs, batch_size=batch_size, seed=seed, strategy=strategy,
+        costs,
+        batch_size=batch_size,
+        seed=seed,
+        strategy=strategy,
     )
     batches = _complete_rank_batch_tail(
-        costs, partition, world_size, seed, should_drop_last, strategy,
+        costs,
+        partition,
+        world_size,
+        seed,
+        should_drop_last,
+        strategy,
     )
     if strategy == "lpt_fast":
         batches = _optimize_fast_step_batches(costs, batches, world_size)
     else:
         batches = _optimize_step_batches(
-            costs, batches, world_size, seed, should_use_best=strategy == "lpt_best",
+            costs,
+            batches,
+            world_size,
+            seed,
+            should_use_best=strategy == "lpt_best",
         )
     # With identical occurrences, retain the actual lower-tier derived candidate.
     # Tail pools differ by tier; do not compare plans that may drop different samples.
-    if (strategy != "lpt_fast" and world_size > 1 and batch_size > 1
-            and len(costs) % (batch_size * world_size) == 0 and len(batches) > 1
-            and np.ptp(_rank_batch_loads(costs, batches)) > 0):
+    if (
+        strategy != "lpt_fast"
+        and world_size > 1
+        and batch_size > 1
+        and len(costs) % (batch_size * world_size) == 0
+        and len(batches) > 1
+        and np.ptp(_rank_batch_loads(costs, batches)) > 0
+    ):
         middle = _plan_rank_batches(
-            costs, batch_size=batch_size, world_size=world_size, seed=seed,
-            should_drop_last=should_drop_last, should_shuffle=False,
+            costs,
+            batch_size=batch_size,
+            world_size=world_size,
+            seed=seed,
+            should_drop_last=should_drop_last,
+            should_shuffle=False,
             strategy="lpt-medium" if strategy == "lpt_best" else "lpt_fast",
         ).reshape(-1, batch_size)
         if _rank_batch_quality(_rank_batch_loads(costs, middle), world_size) < (

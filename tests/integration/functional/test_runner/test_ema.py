@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
-
 from qqtools.plugins.qpipeline.entry_utils.qema import qEMA
 from qqtools.plugins.qpipeline.runner import runner as runner_module
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
@@ -199,6 +198,7 @@ def test_direct_ema_evaluation_preserves_standard_metric_keys(setup_agent_with_e
     assert ema_results.models[0].variant == "ema"
     assert ema_results.target_value("ema_val_metric") is not None
     assert aggregated_results.target_value("ema_val_metric") is not None
+
 
 def test_enabled_auto_offload_always_offloads_for_ema_evaluation():
     agent, model, _, _ = _build_agent_for_offload_tests(auto_offload=True)

@@ -74,16 +74,12 @@ def _resolve_rank_and_world_size(
 
     if runtime_ready:
         if resolved_rank != runtime_rank or resolved_world_size != runtime_world_size:
-            raise ValueError(
-                "Explicit rank/world_size does not match initialized torch.distributed runtime"
-            )
+            raise ValueError("Explicit rank/world_size does not match initialized torch.distributed runtime")
 
     if resolved_world_size <= 0:
         raise ValueError(f"world_size must be positive, got {resolved_world_size}")
     if resolved_rank < 0 or resolved_rank >= resolved_world_size:
-        raise ValueError(
-            f"rank must be in [0, {resolved_world_size}), got {resolved_rank}"
-        )
+        raise ValueError(f"rank must be in [0, {resolved_world_size}), got {resolved_rank}")
     return resolved_rank, resolved_world_size
 
 
@@ -99,9 +95,7 @@ class _BalancedPlanCache:
     sample_order: np.ndarray | None
     strategy: str
     epoch: int = 0
-    rank_local_plan: np.ndarray = field(
-        default_factory=lambda: np.empty(0, dtype=np.int64)
-    )
+    rank_local_plan: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
     _lpt_plan: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -146,9 +140,7 @@ class _BalancedPlanCache:
             steps = rng.permutation(len(self._lpt_plan))
             ranks = np.broadcast_to(np.arange(self.world_size), (len(steps), self.world_size))
             ranks = rng.permuted(ranks, axis=1)
-            return np.ascontiguousarray(
-                self._lpt_plan[steps, ranks[:, self.rank], :].reshape(-1)
-            )
+            return np.ascontiguousarray(self._lpt_plan[steps, ranks[:, self.rank], :].reshape(-1))
         total = int(self.sample_costs.shape[0])
         global_chunk_size = self.world_size * self.batch_size
         if self.shuffle:
@@ -248,6 +240,7 @@ class BalancedDistributedSampler(Sampler[int]):
     Legacy sampler strategies ``v1`` through ``v3`` are deprecated and will be removed
     in v1.4.0. The default is ``lpt``, normalized internally to ``lpt-medium``.
     """
+
     def __init__(
         self,
         sample_costs: Sequence[float] | np.ndarray,
@@ -270,15 +263,11 @@ class BalancedDistributedSampler(Sampler[int]):
             raise ValueError(f"seed must be non-negative, got {seed}")
         costs = _normalize_sample_costs(sample_costs)
         strategy = _normalize_lpt_strategy(strategy)
-        validated_strategy = strategy if strategy in _LPT_STRATEGIES else validate_balance_strategy(
-            strategy
-        )
+        validated_strategy = strategy if strategy in _LPT_STRATEGIES else validate_balance_strategy(strategy)
         if validated_strategy in _LPT_STRATEGIES:
-            for name, value in (("batch_size", batch_size), ("rank", rank),
-                                ("world_size", world_size)):
+            for name, value in (("batch_size", batch_size), ("rank", rank), ("world_size", world_size)):
                 if value is not None and (
-                    isinstance(value, (bool, np.bool_))
-                    or not isinstance(value, (int, np.integer))
+                    isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
                 ):
                     raise TypeError(f"{name} must be an integer, got {value!r}")
             # Cached grouping must not depend on subsequent caller-side array mutations.
@@ -348,6 +337,7 @@ class BalancedBatchSampler(BatchSampler):
         ValueError: Costs, settings, or combinations are invalid. See
             BalancedDistributedSampler for the full planning contract.
     """
+
     def __init__(
         self,
         sample_costs: Sequence[float] | np.ndarray,

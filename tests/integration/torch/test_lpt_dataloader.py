@@ -9,16 +9,19 @@ from qqtools.torch.ddp import BalancedBatchSampler, BalancedDistributedSampler
 @pytest.mark.parametrize("strategy", ["lpt_fast", "lpt", "lpt_best"])
 @pytest.mark.parametrize("should_shuffle", [True, False])
 @pytest.mark.parametrize("should_use_batch_sampler", [True, False])
-def test_lpt_dataloaders_preserve_batches_and_epoch_coverage(
-    should_shuffle, should_use_batch_sampler, strategy
-):
+def test_lpt_dataloaders_preserve_batches_and_epoch_coverage(should_shuffle, should_use_batch_sampler, strategy):
     costs = np.random.default_rng(42).lognormal(size=48)
     dataset = list(range(len(costs)))
     sampler_class = BalancedBatchSampler if should_use_batch_sampler else BalancedDistributedSampler
     samplers = [
         sampler_class(
-            costs, batch_size=3, rank=rank, world_size=4,
-            strategy=strategy, shuffle=should_shuffle, seed=7,
+            costs,
+            batch_size=3,
+            rank=rank,
+            world_size=4,
+            strategy=strategy,
+            shuffle=should_shuffle,
+            seed=7,
         )
         for rank in range(4)
     ]
@@ -36,7 +39,7 @@ def test_lpt_dataloaders_preserve_batches_and_epoch_coverage(
         for sampler, batches in zip(samplers, loaded):
             expected = list(sampler)
             if not should_use_batch_sampler:
-                expected = [expected[start:start + 3] for start in range(0, len(expected), 3)]
+                expected = [expected[start : start + 3] for start in range(0, len(expected), 3)]
             assert batches == expected
         if first is None:
             first = loaded
@@ -51,18 +54,31 @@ def test_lpt_dataloaders_preserve_batches_and_epoch_coverage(
 @pytest.mark.parametrize("should_drop", [False, True])
 @pytest.mark.parametrize("should_use_batch_sampler", [False, True])
 def test_lpt_tail_repair_reaches_dataloaders_with_equal_steps(
-    strategy, should_drop, should_use_batch_sampler,
+    strategy,
+    should_drop,
+    should_use_batch_sampler,
 ):
     dataset = list(range(49))
     costs = np.random.default_rng(42).lognormal(size=len(dataset))
     sampler_class = BalancedBatchSampler if should_use_batch_sampler else BalancedDistributedSampler
-    samplers = [sampler_class(
-        costs, batch_size=3, world_size=4, rank=rank, strategy=strategy,
-        shuffle=True, drop_last=should_drop, seed=7,
-    ) for rank in range(4)]
-    loaders = ([DataLoader(dataset, batch_sampler=sampler) for sampler in samplers]
-               if should_use_batch_sampler else
-               [DataLoader(dataset, batch_size=3, sampler=sampler) for sampler in samplers])
+    samplers = [
+        sampler_class(
+            costs,
+            batch_size=3,
+            world_size=4,
+            rank=rank,
+            strategy=strategy,
+            shuffle=True,
+            drop_last=should_drop,
+            seed=7,
+        )
+        for rank in range(4)
+    ]
+    loaders = (
+        [DataLoader(dataset, batch_sampler=sampler) for sampler in samplers]
+        if should_use_batch_sampler
+        else [DataLoader(dataset, batch_size=3, sampler=sampler) for sampler in samplers]
+    )
     first_counts = None
     for epoch in (0, 1, 2):
         for sampler in samplers:

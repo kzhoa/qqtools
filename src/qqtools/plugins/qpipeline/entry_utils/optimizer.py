@@ -1,5 +1,6 @@
-import qqtools as qt
 import torch
+
+import qqtools as qt
 
 from .no_decay import build_param_groups, collect_no_decay_params
 
@@ -44,10 +45,7 @@ def prepare_optimizer(args: qt.qDict, model, logger=None):
     if len(param_groups) > 1:
         nd_count = len(param_groups[1]["params"])
         total = sum(len(g["params"]) for g in param_groups)
-        msg = (
-            f"[Optimizer] {nd_count}/{total} trainable parameters "
-            f"assigned to no-weight-decay group"
-        )
+        msg = f"[Optimizer] {nd_count}/{total} trainable parameters assigned to no-weight-decay group"
         if logger is not None:
             logger.info(msg)
         elif qt.qdist.get_rank() == 0:

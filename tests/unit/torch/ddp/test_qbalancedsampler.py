@@ -53,11 +53,7 @@ def test_sampler_covers_each_sample_once_across_ranks_without_padding(
     assert [len(plan) for plan in plans] == [4, 4]
     assert sorted(index for plan in plans for index in plan) == list(range(len(costs)))
     for batch_start in range(0, 4, 2):
-        global_window = [
-            index
-            for plan in plans
-            for index in plan[batch_start : batch_start + 2]
-        ]
+        global_window = [index for plan in plans for index in plan[batch_start : batch_start + 2]]
         assert len(global_window) == len(set(global_window)) == 4
 
 

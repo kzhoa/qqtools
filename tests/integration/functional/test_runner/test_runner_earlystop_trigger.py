@@ -3,13 +3,16 @@ Test cases for early stopping trigger timing in train_runner
 """
 
 import argparse
-import tempfile
 import logging
+import tempfile
+
 import pytest
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
 from qqtools.plugins.qpipeline.runner.runner import train_runner
+
 from .conftest import SimpleModel, SimpleTask
 
 

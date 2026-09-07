@@ -9,6 +9,7 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 def test_old_schema_fails_before_mutation(tmp_path: Path):
     root = tmp_path / ".qexp"
     root.mkdir()

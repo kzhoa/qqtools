@@ -1,4 +1,5 @@
 """Validated records for the schema-6 qexp runtime."""
+
 from __future__ import annotations
 
 import hashlib
@@ -141,7 +142,9 @@ class TaskRecord:
         normalized_dependencies = sorted(
             validate_identifier(item, "depends_on_task_ids") for item in self.depends_on_task_ids
         )
-        if normalized_dependencies != self.depends_on_task_ids or len(set(normalized_dependencies)) != len(normalized_dependencies):
+        if normalized_dependencies != self.depends_on_task_ids or len(set(normalized_dependencies)) != len(
+            normalized_dependencies
+        ):
             raise ValueError("task depends_on_task_ids must contain unique sorted task IDs.")
         if self.group_name is None and self.depends_on_task_ids:
             raise ValueError("ungrouped tasks cannot declare dependencies.")
@@ -160,34 +163,56 @@ class TaskRecord:
         if proof is not None:
             required = {"creator_observation", "deadline_monotonic_at"}
             observation_fields = {
-                "observation_id", "provider", "observed_at", "monotonic_observed_at", "boot_id",
-                "lower_error_seconds", "upper_error_seconds", "max_drift_rate", "provider_margin_seconds",
+                "observation_id",
+                "provider",
+                "observed_at",
+                "monotonic_observed_at",
+                "boot_id",
+                "lower_error_seconds",
+                "upper_error_seconds",
+                "max_drift_rate",
+                "provider_margin_seconds",
             }
             observation = proof.get("creator_observation") if isinstance(proof, dict) else None
-            if (not isinstance(proof, dict) or set(proof) != required or not isinstance(observation, dict)
-                    or set(observation) != observation_fields
-                    or not isinstance(proof["deadline_monotonic_at"], (int, float))):
+            if (
+                not isinstance(proof, dict)
+                or set(proof) != required
+                or not isinstance(observation, dict)
+                or set(observation) != observation_fields
+                or not isinstance(proof["deadline_monotonic_at"], (int, float))
+            ):
                 raise ValueError("timed offer clock proof is invalid.")
         claim = self.claim_control.get("active_claim")
         if claim is not None:
-            if not isinstance(claim, dict) or claim.get("authority_mode") not in {
-                    "bounded_lease", "holder_bound"}:
+            if not isinstance(claim, dict) or claim.get("authority_mode") not in {"bounded_lease", "holder_bound"}:
                 raise ValueError("active claim authority mode is invalid.")
             if claim["authority_mode"] == "bounded_lease":
                 required = {"clock_error_bound_seconds", "clock_provider", "clock_observation_id", "lease_expires_at"}
                 if not required.issubset(claim):
                     raise ValueError("bounded lease claim lacks clock evidence.")
-            elif any(claim.get(key) is not None for key in (
-                    "clock_error_bound_seconds", "clock_provider", "clock_observation_id", "lease_expires_at")):
+            elif any(
+                claim.get(key) is not None
+                for key in ("clock_error_bound_seconds", "clock_provider", "clock_observation_id", "lease_expires_at")
+            ):
                 raise ValueError("holder-bound claim cannot contain lease evidence.")
 
     @classmethod
-    def new(cls, *, task_id: str, machine: str, spec: TaskSpec, group_name: str | None = None,
-            name: str | None = None, sharing_mode: str = "private",
-            fallback_machines: str | list[str] = "group", offer_after_seconds: int | None = None,
-            offer_eligible_at: str | None = None, offer_clock_evidence: dict[str, Any] | None = None,
-            operation_id: str | None = None,
-            depends_on_task_ids: list[str] | None = None) -> "TaskRecord":
+    def new(
+        cls,
+        *,
+        task_id: str,
+        machine: str,
+        spec: TaskSpec,
+        group_name: str | None = None,
+        name: str | None = None,
+        sharing_mode: str = "private",
+        fallback_machines: str | list[str] = "group",
+        offer_after_seconds: int | None = None,
+        offer_eligible_at: str | None = None,
+        offer_clock_evidence: dict[str, Any] | None = None,
+        operation_id: str | None = None,
+        depends_on_task_ids: list[str] | None = None,
+    ) -> "TaskRecord":
         validate_identifier(task_id, "task_id")
         validate_identifier(machine, "machine_name")
         validate_group_name(group_name)
@@ -206,32 +231,65 @@ class TaskRecord:
         elif offer_eligible_at is not None or offer_clock_evidence is not None:
             raise ValueError("only timed offers may contain clock proof data.")
         return cls(
-            task_id=task_id, group_name=group_name, group_membership_sequence=None,
-            submission_operation_id=operation_id, name=name,
-            depends_on_task_ids=sorted(depends_on_task_ids or []), ready_generation=0, spec=spec,
-            placement_policy={"home_machine": machine, "sharing_mode": sharing_mode,
-                              "fallback_constraint": fallback_machines, "offer_after_seconds": offer_after_seconds},
-            placement_runtime={"queue_scope": "home", "queued_home_at": now,
-                               "offer_eligible_at": offer_eligible_at, "offer_clock_evidence": offer_clock_evidence,
-                               "offered_at": None, "offer_reason": None, "offered_by": None},
+            task_id=task_id,
+            group_name=group_name,
+            group_membership_sequence=None,
+            submission_operation_id=operation_id,
+            name=name,
+            depends_on_task_ids=sorted(depends_on_task_ids or []),
+            ready_generation=0,
+            spec=spec,
+            placement_policy={
+                "home_machine": machine,
+                "sharing_mode": sharing_mode,
+                "fallback_constraint": fallback_machines,
+                "offer_after_seconds": offer_after_seconds,
+            },
+            placement_runtime={
+                "queue_scope": "home",
+                "queued_home_at": now,
+                "offer_eligible_at": offer_eligible_at,
+                "offer_clock_evidence": offer_clock_evidence,
+                "offered_at": None,
+                "offer_reason": None,
+                "offered_by": None,
+            },
             state={"projection": "queued", "reason": None},
-            control={"cancellation_requested_at": None, "cancellation_operation_id": None,
-                     "terminate_running": False, "requested_by": None, "termination_acknowledged_at": None,
-                     "termination_result": None, "cleanup_operation_id": None,
-                     "cleanup_state": None},
+            control={
+                "cancellation_requested_at": None,
+                "cancellation_operation_id": None,
+                "terminate_running": False,
+                "requested_by": None,
+                "termination_acknowledged_at": None,
+                "termination_result": None,
+                "cleanup_operation_id": None,
+                "cleanup_state": None,
+            },
             attempt_control={"next_attempt_number": 1, "current_attempt_id": None, "current_attempt_number": None},
-            claim_control={"fencing_epoch": 0, "active_claim": None}, meta=_meta(machine),
+            claim_control={"fencing_epoch": 0, "active_claim": None},
+            meta=_meta(machine),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {"meta": self.meta, "task": {"task_id": self.task_id, "group_name": self.group_name,
+        return {
+            "meta": self.meta,
+            "task": {
+                "task_id": self.task_id,
+                "group_name": self.group_name,
                 "group_membership_sequence": self.group_membership_sequence,
-                "submission_operation_id": self.submission_operation_id, "name": self.name,
+                "submission_operation_id": self.submission_operation_id,
+                "name": self.name,
                 "depends_on_task_ids": list(self.depends_on_task_ids),
                 "ready_generation": self.ready_generation,
-                "spec": self.spec.to_dict(), "placement_policy": self.placement_policy,
-                "placement_runtime": self.placement_runtime, "state": self.state, "control": self.control,
-                "attempt_control": self.attempt_control, "claim_control": self.claim_control}}
+                "spec": self.spec.to_dict(),
+                "placement_policy": self.placement_policy,
+                "placement_runtime": self.placement_runtime,
+                "state": self.state,
+                "control": self.control,
+                "attempt_control": self.attempt_control,
+                "claim_control": self.claim_control,
+            },
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskRecord":
@@ -239,14 +297,23 @@ class TaskRecord:
         spec_value = dict(task["spec"])
         if spec_value.get("lane") == "cpu":
             spec_value.setdefault("requested_gpus", 0)
-        return cls(meta=data["meta"], task_id=task["task_id"], group_name=task.get("group_name"),
-                   group_membership_sequence=task.get("group_membership_sequence"),
-                   submission_operation_id=task.get("submission_operation_id"), name=task.get("name"),
-                   depends_on_task_ids=task.get("depends_on_task_ids", []),
-                   ready_generation=task.get("ready_generation", 0),
-                   spec=TaskSpec(**spec_value), placement_policy=task["placement_policy"],
-                   placement_runtime=task["placement_runtime"], state=task["state"], control=task["control"],
-                   attempt_control=task["attempt_control"], claim_control=task["claim_control"])
+        return cls(
+            meta=data["meta"],
+            task_id=task["task_id"],
+            group_name=task.get("group_name"),
+            group_membership_sequence=task.get("group_membership_sequence"),
+            submission_operation_id=task.get("submission_operation_id"),
+            name=task.get("name"),
+            depends_on_task_ids=task.get("depends_on_task_ids", []),
+            ready_generation=task.get("ready_generation", 0),
+            spec=TaskSpec(**spec_value),
+            placement_policy=task["placement_policy"],
+            placement_runtime=task["placement_runtime"],
+            state=task["state"],
+            control=task["control"],
+            attempt_control=task["attempt_control"],
+            claim_control=task["claim_control"],
+        )
 
 
 @dataclass(slots=True)
@@ -277,35 +344,91 @@ class AttemptRecord:
             raise ValueError("attempt phase is invalid.")
         if self.authority_mode not in AUTHORITY_MODES:
             raise ValueError("attempt authority mode is invalid.")
-        if self.authority_mode == "legacy_migrated" and self.phase in {
-                "claimed", "starting", "running", "orphaned"}:
+        if self.authority_mode == "legacy_migrated" and self.phase in {"claimed", "starting", "running", "orphaned"}:
             raise ValueError("legacy-migrated attempts cannot retain execution authority.")
         _check_meta(self.meta)
 
     @classmethod
-    def claimed(cls, task: TaskRecord, machine: str, gpus: list[int], reservation_id: str, token: int,
-                *, authority_mode: str, clock_evidence: dict[str, Any] | None,
-                lease_seconds: int = 60, attempt_id: str | None = None) -> "AttemptRecord":
+    def claimed(
+        cls,
+        task: TaskRecord,
+        machine: str,
+        gpus: list[int],
+        reservation_id: str,
+        token: int,
+        *,
+        authority_mode: str,
+        clock_evidence: dict[str, Any] | None,
+        lease_seconds: int = 60,
+        attempt_id: str | None = None,
+    ) -> "AttemptRecord":
         attempt_id = attempt_id or new_id()
         now = utc_now()
-        expires = None if authority_mode == "holder_bound" else (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        return cls(attempt_id, task.task_id, task.attempt_control["next_attempt_number"], "claimed", machine,
-                   list(gpus), reservation_id, token, [token], {"claimed_at": now, "renewed_at": now,
-                   "expires_at": expires, "clock_evidence": clock_evidence}, authority_mode,
-                   {"group_name": task.group_name, "group_dispatch_epoch": None,
-                   "group_worker_set_epoch": None}, {"wrapper_pid": None, "wrapper_start_time_ticks": None,
-                   "process_group_id": None, "process_group_start_time_ticks": None,
-                   "tmux_reference": None, "local_process_manifest": "", "log_references": []},
-                   {"requested_by_operation_id": None, "requested_at": None, "acknowledged_at": None,
-                    "result": None}, {"launch_authorized_at": None, "process_created_at": None,
-                    "running_at": None, "orphaned_at": None, "recovered_at": None,
-                    "finished_at": None}, {"exit_code": None, "signal": None,
-                    "category": None, "reason": None}, _meta(machine))
+        expires = (
+            None
+            if authority_mode == "holder_bound"
+            else (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        return cls(
+            attempt_id,
+            task.task_id,
+            task.attempt_control["next_attempt_number"],
+            "claimed",
+            machine,
+            list(gpus),
+            reservation_id,
+            token,
+            [token],
+            {"claimed_at": now, "renewed_at": now, "expires_at": expires, "clock_evidence": clock_evidence},
+            authority_mode,
+            {"group_name": task.group_name, "group_dispatch_epoch": None, "group_worker_set_epoch": None},
+            {
+                "wrapper_pid": None,
+                "wrapper_start_time_ticks": None,
+                "process_group_id": None,
+                "process_group_start_time_ticks": None,
+                "tmux_reference": None,
+                "local_process_manifest": "",
+                "log_references": [],
+            },
+            {"requested_by_operation_id": None, "requested_at": None, "acknowledged_at": None, "result": None},
+            {
+                "launch_authorized_at": None,
+                "process_created_at": None,
+                "running_at": None,
+                "orphaned_at": None,
+                "recovered_at": None,
+                "finished_at": None,
+            },
+            {"exit_code": None, "signal": None, "category": None, "reason": None},
+            _meta(machine),
+        )
 
     def to_dict(self) -> dict[str, Any]:
-        values = {key: getattr(self, key) for key in ("attempt_id", "task_id", "attempt_number", "phase",
-                 "machine_name", "assigned_gpus", "reservation_id", "current_fencing_token", "token_history",
-                 "lease", "authority_mode", "authorization", "process", "termination", "timestamps", "result")}
+        values = {
+            key: getattr(self, key)
+            for key in (
+                "attempt_id",
+                "task_id",
+                "attempt_number",
+                "phase",
+                "machine_name",
+                "assigned_gpus",
+                "reservation_id",
+                "current_fencing_token",
+                "token_history",
+                "lease",
+                "authority_mode",
+                "authorization",
+                "process",
+                "termination",
+                "timestamps",
+                "result",
+            )
+        }
         return {"meta": self.meta, "attempt": values}
 
     @classmethod
@@ -339,9 +462,7 @@ def normalize_worker_member(worker: dict[str, Any], *, machine: str = "worker") 
         raise ValueError(f"{machine!r} Worker state is invalid.")
     if "borrow_limit_gpus" in worker:
         raise ValueError(f"{machine!r} Worker has obsolete borrow_limit_gpus.")
-    worker["gpu_limit_gpus"] = validate_gpu_limit(
-        worker["gpu_limit_gpus"], f"{machine}.gpu_limit_gpus"
-    )
+    worker["gpu_limit_gpus"] = validate_gpu_limit(worker["gpu_limit_gpus"], f"{machine}.gpu_limit_gpus")
     return worker
 
 
@@ -357,30 +478,68 @@ def normalize_group_record(data: dict[str, Any]) -> dict[str, Any]:
 
 def new_group(name: str, machine: str) -> dict[str, Any]:
     validate_group_name(name)
-    return {"meta": _meta(machine), "group": {"name": name, "admission_state": "open",
-        "dispatch_state": "active", "dispatch_epoch": 0, "worker_set_epoch": 0,
-        "next_membership_sequence": 1, "pending_submission_commit": None, "worker_set": {},
-        "cancellation_barriers": []}}
+    return {
+        "meta": _meta(machine),
+        "group": {
+            "name": name,
+            "admission_state": "open",
+            "dispatch_state": "active",
+            "dispatch_epoch": 0,
+            "worker_set_epoch": 0,
+            "next_membership_sequence": 1,
+            "pending_submission_commit": None,
+            "worker_set": {},
+            "cancellation_barriers": [],
+        },
+    }
 
 
-def new_worker_member(*, scheduling_role: str = "primary", gpu_limit_gpus: int | None = None,
-                      added_by_operation: str | None = None) -> dict[str, Any]:
+def new_worker_member(
+    *, scheduling_role: str = "primary", gpu_limit_gpus: int | None = None, added_by_operation: str | None = None
+) -> dict[str, Any]:
     if scheduling_role not in WORKER_ROLES:
         raise ValueError("scheduling_role must be 'primary' or 'borrow'.")
     gpu_limit_gpus = validate_gpu_limit(gpu_limit_gpus)
-    return {"state": "active",
-            "scheduling_role": scheduling_role, "gpu_limit_gpus": gpu_limit_gpus,
-            "state_epoch": 0, "added_at": utc_now(),
-            "added_by_operation": added_by_operation, "drain_requested_at": None,
-            "remove_requested_at": None, "terminate_running": False}
+    return {
+        "state": "active",
+        "scheduling_role": scheduling_role,
+        "gpu_limit_gpus": gpu_limit_gpus,
+        "state_epoch": 0,
+        "added_at": utc_now(),
+        "added_by_operation": added_by_operation,
+        "drain_requested_at": None,
+        "remove_requested_at": None,
+        "terminate_running": False,
+    }
 
 
-def new_submission(*, operation_id: str, kind: str, key: str, raw_digest: str, machine: str,
-                   target_group: str | None, resolved_context: dict[str, Any]) -> dict[str, Any]:
-    return {"meta": _meta(machine), "submission": {"operation_id": operation_id, "kind": kind,
-        "idempotency_key": key, "raw_request_digest": raw_digest,
-        "resolved_context_digest": hashlib.sha256(json.dumps(resolved_context, sort_keys=True).encode()).hexdigest(),
-        "original_submitting_machine": machine, "target_group": target_group, "state": "preparing",
-        "resolved_context": resolved_context, "commit_plan": {"group_membership_sequences": None,
-        "pending_group_revision": None}, "staged_task_count": len(resolved_context["task_ids"]),
-        "committed_at": None, "failure_reason": None}}
+def new_submission(
+    *,
+    operation_id: str,
+    kind: str,
+    key: str,
+    raw_digest: str,
+    machine: str,
+    target_group: str | None,
+    resolved_context: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "meta": _meta(machine),
+        "submission": {
+            "operation_id": operation_id,
+            "kind": kind,
+            "idempotency_key": key,
+            "raw_request_digest": raw_digest,
+            "resolved_context_digest": hashlib.sha256(
+                json.dumps(resolved_context, sort_keys=True).encode()
+            ).hexdigest(),
+            "original_submitting_machine": machine,
+            "target_group": target_group,
+            "state": "preparing",
+            "resolved_context": resolved_context,
+            "commit_plan": {"group_membership_sequences": None, "pending_group_revision": None},
+            "staged_task_count": len(resolved_context["task_ids"]),
+            "committed_at": None,
+            "failure_reason": None,
+        },
+    }

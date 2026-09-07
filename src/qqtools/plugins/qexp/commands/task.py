@@ -6,36 +6,27 @@ from pathlib import Path
 from typing import Callable
 
 from ..config_types import RootConfig
-from ..layout import (
-    ensure_machine_layout,
-    ensure_shared_layout,
-    is_task_dependencies_root,
-    validate_root_contract,
-)
+from ..layout import ensure_machine_layout, ensure_shared_layout, is_task_dependencies_root, validate_root_contract
 from ..manifest import parse_batch_manifest
 from ..runtime.availability import (
     AvailabilityTransitionRequest,
     AvailabilityTransitionResult,
     apply_availability_transition,
 )
+from ..runtime.dependencies import is_committed_submission_task, normalize_dependency_ids, validate_group_dependencies
+from ..runtime.locks import group_writer_lock, task_lock
+from ..runtime.operation_store import operation_exists
 from ..runtime.paths import attempt_path, shared_paths
-from ..runtime.records import AttemptRecord, TaskRecord, utc_now, validate_group_name
-from ..runtime.store import read_json
-from ..runtime.submission import SubmissionResult, submit_specs
-from ..runtime.tasks import load_task, save_task
 from ..runtime.ready import (
     discard_ready_generation,
     prepare_ready_transition,
     reserve_ready_generation,
     retire_previous_ready_generation,
 )
-from ..runtime.operation_store import operation_exists
-from ..runtime.dependencies import (
-    is_committed_submission_task,
-    normalize_dependency_ids,
-    validate_group_dependencies,
-)
-from ..runtime.locks import group_writer_lock, task_lock
+from ..runtime.records import AttemptRecord, TaskRecord, utc_now, validate_group_name
+from ..runtime.store import read_json
+from ..runtime.submission import SubmissionResult, submit_specs
+from ..runtime.tasks import load_task, save_task
 
 
 def is_cleanup_blocked(task: TaskRecord) -> bool:
@@ -175,8 +166,7 @@ def retry(cfg: RootConfig, task_id: str, *, acknowledge_duplicate_risk: bool = F
                 task.state = {"projection": "queued", "reason": "orphan_superseded_by_retry"}
             else:
                 raise ValueError(
-                    "only a failed Task or a blocked Task with an orphaned current Attempt "
-                    "can be retried."
+                    "only a failed Task or a blocked Task with an orphaned current Attempt can be retried."
                 )
             task.control.update(
                 {
@@ -198,9 +188,7 @@ def retry(cfg: RootConfig, task_id: str, *, acknowledge_duplicate_risk: bool = F
                 }
             )
             task.attempt_control["current_attempt_id"] = None
-            old_generation, _ = prepare_ready_transition(
-                cfg, task, "retry", reference=reference
-            )
+            old_generation, _ = prepare_ready_transition(cfg, task, "retry", reference=reference)
             task.meta["revision"] += 1
             task.meta["updated_at"] = utc_now()
             save_task(cfg, task)
@@ -222,9 +210,7 @@ def edit_dependencies(
     """Atomically replace, add, or remove dependencies from an unstarted Task."""
     validate_root_contract(cfg)
     if not is_task_dependencies_root(cfg):
-        raise ValueError(
-            "Task dependencies require an activated task-dependencies-v1 root."
-        )
+        raise ValueError("Task dependencies require an activated task-dependencies-v1 root.")
     initial = load_task(cfg, task_id)
     if initial.group_name is None:
         raise ValueError("ungrouped tasks cannot declare dependencies.")
@@ -234,9 +220,7 @@ def edit_dependencies(
             task = load_task(cfg, task_id)
             reject_cleanup_blocked(cfg, task, "have dependencies edited")
             if not is_committed_submission_task(cfg, task):
-                raise ValueError(
-                    "a Task whose submission is not committed cannot have dependencies edited."
-                )
+                raise ValueError("a Task whose submission is not committed cannot have dependencies edited.")
             if task.group_name != initial.group_name:
                 raise RuntimeError("Task Group changed while editing dependencies.")
             if task.state["projection"] in {"succeeded", "failed", "cancelled"}:

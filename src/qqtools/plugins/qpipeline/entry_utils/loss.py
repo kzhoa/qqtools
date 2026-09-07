@@ -157,11 +157,7 @@ LOSS_SPECS = (
     FocalLossSpec(),
 )
 
-LOSS_REGISTRY: Dict[str, LossSpec] = {
-    name: spec
-    for spec in LOSS_SPECS
-    for name in spec.names
-}
+LOSS_REGISTRY: Dict[str, LossSpec] = {name: spec for spec in LOSS_SPECS for name in spec.names}
 
 
 def parse_loss_name(loss_name, dpp=False):

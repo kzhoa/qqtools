@@ -4,14 +4,14 @@ from pathlib import Path
 
 import pytest
 
+from scripts import release_preflight
 from scripts.checks.check_compatibility_registry import (
     RegistryError,
     Version,
-    check_release,
     check_registry_transition,
+    check_release,
     load_registry,
 )
-from scripts import release_preflight
 
 
 def _write_registry(

@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]

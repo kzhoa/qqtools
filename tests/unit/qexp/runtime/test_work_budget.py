@@ -1,11 +1,6 @@
 import pytest
 
-from qqtools.plugins.qexp.runtime.work_budget import (
-    AdaptiveBatchSizer,
-    SliceBudget,
-    WorkBudgetPolicy,
-    bounded_records,
-)
+from qqtools.plugins.qexp.runtime.work_budget import AdaptiveBatchSizer, SliceBudget, WorkBudgetPolicy, bounded_records
 
 
 class _Clock:

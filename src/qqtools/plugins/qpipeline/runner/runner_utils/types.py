@@ -7,8 +7,14 @@ from typing import Any, Dict, Literal, NotRequired, Optional, TypedDict, Union
 import torch
 
 TerminalReason = Literal[
-    "max_steps", "max_epochs", "early_stop", "user_interrupt", "oom", "exception",
-    "nan_detected", "logger_failure",
+    "max_steps",
+    "max_epochs",
+    "early_stop",
+    "user_interrupt",
+    "oom",
+    "exception",
+    "nan_detected",
+    "logger_failure",
 ]
 EpochResultMetricSource = Literal["current_eval", "latest_eval_reuse", "missing"]
 
@@ -53,7 +59,6 @@ class TrainRunnerResult(TypedDict):
 
 @dataclass(frozen=True)
 class RunConfig:
-
     # main loop
     run_mode: RunMode = RunMode.EPOCH
     eval_interval: int = 1  # depending on run_mode, this is either epoch interval or step interval

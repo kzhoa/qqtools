@@ -1,4 +1,5 @@
 """Machine-scoped notification configuration without persisted credentials."""
+
 from __future__ import annotations
 
 import os
@@ -83,9 +84,7 @@ def validate_notifications(value: Any, *, allow_unknown: bool = False) -> dict[s
         provider["enabled"] = provider.get("enabled", False)
         if not isinstance(provider["enabled"], bool):
             raise ValueError("feishu.enabled must be boolean")
-        provider["credential_source"] = _validate_credential_source(
-            provider.get("credential_source", "env")
-        )
+        provider["credential_source"] = _validate_credential_source(provider.get("credential_source", "env"))
         provider["webhook_env"] = _validate_env(provider.get("webhook_env", DEFAULT_WEBHOOK_ENV))
         provider["secret_env"] = _validate_env(provider.get("secret_env"), nullable=True)
         timeout = provider.get("timeout_seconds", 5)

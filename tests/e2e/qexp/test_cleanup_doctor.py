@@ -5,8 +5,8 @@ import subprocess
 from qexp_e2e import (
     TASK_TERMINAL_TIMEOUT_SECONDS,
     ensure_site_packages_import,
-    jrun,
     is_machine_agent_running,
+    jrun,
     make_env,
     make_layout,
     run,
@@ -77,9 +77,7 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
                 if marker not in message:
                     raise
                 blockers = message.rsplit(marker, 1)[1].splitlines()[0].split(", ")
-                if not blockers or any(
-                    not blocker.startswith("local_process:") for blocker in blockers
-                ):
+                if not blockers or any(not blocker.startswith("local_process:") for blocker in blockers):
                     raise
                 return False
             return True

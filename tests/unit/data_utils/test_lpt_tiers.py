@@ -3,7 +3,6 @@ import pytest
 
 import qqtools.data.qbalance as balance
 
-
 STRATEGIES = ("lpt_fast", "lpt", "lpt_best")
 
 
@@ -20,9 +19,7 @@ def _quality(costs, plan):
 @pytest.mark.parametrize("batch_size,world_size", [(1, 1), (4, 1), (4, 4), (16, 4)])
 @pytest.mark.parametrize("should_drop", [True, False])
 @pytest.mark.parametrize("seed", [0, 7])
-def test_tiers_preserve_tail_counts_and_base_quality_order(
-    total, batch_size, world_size, should_drop, seed
-):
+def test_tiers_preserve_tail_counts_and_base_quality_order(total, batch_size, world_size, should_drop, seed):
     costs = np.random.default_rng(42).lognormal(3, 1.5, total)
     costs.setflags(write=False)
     group_size = batch_size * world_size
@@ -30,8 +27,14 @@ def test_tiers_preserve_tail_counts_and_base_quality_order(
     target = steps * group_size
     scores = []
     for strategy in STRATEGIES:
-        kwargs = dict(batch_size=batch_size, world_size=world_size, seed=seed,
-                      strategy=strategy, should_drop_last=should_drop, should_shuffle=False)
+        kwargs = dict(
+            batch_size=batch_size,
+            world_size=world_size,
+            seed=seed,
+            strategy=strategy,
+            should_drop_last=should_drop,
+            should_shuffle=False,
+        )
         plan = balance._plan_rank_batches(costs, **kwargs)
         assert plan.shape == (steps, world_size, batch_size)
         assert plan.dtype == np.int64 and plan.flags.c_contiguous
@@ -42,7 +45,10 @@ def test_tiers_preserve_tail_counts_and_base_quality_order(
             np.testing.assert_array_equal(np.unique(plan), np.arange(total))
         np.testing.assert_array_equal(plan, balance._plan_rank_batches(costs, **kwargs))
         partition = balance._partition_rank_batches(
-            costs, batch_size=batch_size, seed=seed, strategy=strategy,
+            costs,
+            batch_size=batch_size,
+            seed=seed,
+            strategy=strategy,
         )
         scores.append(_quality(costs, partition.full_batches[:, None, :]))
     assert scores[2] <= scores[1] <= scores[0]
@@ -60,25 +66,28 @@ def test_tier_quality_on_representative_distributions(distribution):
     else:
         costs = np.ones(4096)
         costs[0] = 100_000
-    scores = [_quality(costs, balance._plan_rank_batches(
-        costs, batch_size=16, world_size=4, strategy=strategy, should_shuffle=False
-    )) for strategy in STRATEGIES]
+    scores = [
+        _quality(
+            costs,
+            balance._plan_rank_batches(costs, batch_size=16, world_size=4, strategy=strategy, should_shuffle=False),
+        )
+        for strategy in STRATEGIES
+    ]
     assert scores[2][:2] <= scores[1][:2] <= scores[0][:2]
 
 
 def test_best_can_strictly_improve_peak():
     costs = np.random.default_rng(0).integers(1, 100, 48)
-    medium = balance._plan_rank_batches(costs, batch_size=4, world_size=2,
-                                       strategy="lpt", seed=7, should_shuffle=False)
-    best = balance._plan_rank_batches(costs, batch_size=4, world_size=2,
-                                     strategy="lpt_best", seed=7, should_shuffle=False)
+    medium = balance._plan_rank_batches(costs, batch_size=4, world_size=2, strategy="lpt", seed=7, should_shuffle=False)
+    best = balance._plan_rank_batches(
+        costs, batch_size=4, world_size=2, strategy="lpt_best", seed=7, should_shuffle=False
+    )
     assert _quality(costs, best)[0] == 185 < _quality(costs, medium)[0] == 187
 
 
 def test_medium_retains_fast_candidate_if_capacity_is_worse(monkeypatch):
     costs = np.array([9, 7, 2, 1], dtype=float)
-    monkeypatch.setattr(balance, "_partition_capacity_batches",
-                        lambda *args: np.array([[0, 1], [2, 3]]))
+    monkeypatch.setattr(balance, "_partition_capacity_batches", lambda *args: np.array([[0, 1], [2, 3]]))
     plan = balance._plan_rank_batches(costs, batch_size=2, strategy="lpt", should_shuffle=False)
     assert _quality(costs, plan)[0] == 10
 
@@ -115,8 +124,9 @@ def test_binary_swap_search_matches_exhaustive_pair_search(seed):
     batches = np.arange(16).reshape(2, 8)
     loads = costs[batches].sum(1)
     gap = abs(loads[0] - loads[1])
-    expected = min([gap] + [abs(loads[0] - loads[1] - 2 * (costs[x] - costs[y]))
-                           for x in batches[0] for y in batches[1]])
+    expected = min(
+        [gap] + [abs(loads[0] - loads[1] - 2 * (costs[x] - costs[y])) for x in batches[0] for y in batches[1]]
+    )
     balance._swap_rank_batch_pair(costs, batches, loads, 0, 1)
     actual = costs[batches].sum(1)
     assert abs(actual[0] - actual[1]) == expected

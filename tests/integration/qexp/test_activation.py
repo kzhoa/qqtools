@@ -11,6 +11,7 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 def test_unregistered_current_project_requires_explicit_add(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
@@ -30,7 +31,9 @@ def test_legacy_project_requires_explicit_migration(tmp_path: Path) -> None:
         ensure_local_agent_active(cfg, reason="submit", machine_runtime=MachineRuntime(tmp_path / "machine-runtime"))
 
 
-def test_registered_project_does_not_start_a_second_machine_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_registered_project_does_not_start_a_second_machine_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
@@ -42,9 +45,7 @@ def test_registered_project_does_not_start_a_second_machine_agent(tmp_path: Path
     assert ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime) is False
 
 
-def test_concurrent_activation_starts_only_one_machine_agent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_concurrent_activation_starts_only_one_machine_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
@@ -80,9 +81,7 @@ def test_concurrent_activation_starts_only_one_machine_agent(
     assert sorted(results) == [False, True]
 
 
-def test_activation_accepts_an_agent_that_wins_during_startup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_activation_accepts_an_agent_that_wins_during_startup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)

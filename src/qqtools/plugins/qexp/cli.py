@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
-import re
 from dataclasses import asdict
 from pathlib import Path
 
+from . import observer
 from .activation import (
     ensure_local_agent_active,
     managed_project_agent_status,
@@ -20,13 +21,22 @@ from .activation import (
     stop_local_agent,
 )
 from .agent import get_agent_status
-from .commands import cleanup, group as group_commands, logs as log_commands, task as task_commands
-from .doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
-from .layout import clear_context, load_context, load_root_config, migrate_schema5_to_schema6, save_context
+from .commands import cleanup
+from .commands import group as group_commands
+from .commands import logs as log_commands
+from .commands import task as task_commands
 from .config_types import RootConfig
+from .doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
+from .formatter import render
+from .group_ready_members_upgrade import (
+    attest_group_ready_members_upgrade,
+    check_group_ready_members_upgrade,
+    group_ready_members_upgrade_status,
+    resume_group_ready_members_upgrade,
+    start_group_ready_members_upgrade,
+)
+from .layout import clear_context, load_context, load_root_config, migrate_schema5_to_schema6, save_context
 from .lease import LeasePolicy, load_lease_policy, save_lease_policy
-from .runtime.paths import shared_paths
-from .runtime.store import iter_json, read_json
 from .machine_agent import (
     ensure_machine_agent_started,
     get_machine_agent_status,
@@ -39,11 +49,15 @@ from .machine_agent import (
 )
 from .machine_config import init_shared_root, load_machine_policy
 from .machine_runtime import ExecutionContext, MachineRuntime
-from .runtime.resources.cpu_lane import (
-    get_cpu_lane_policy,
-    initialize_cpu_lane_capacity,
-    set_cpu_lane_capacity,
+from .notification_config import (
+    DEFAULT_WEBHOOK_ENV,
+    load_notifications,
+    update_notifications,
+    write_shared_feishu_webhook,
 )
+from .runtime.paths import shared_paths
+from .runtime.resources.cpu_lane import get_cpu_lane_policy, initialize_cpu_lane_capacity, set_cpu_lane_capacity
+from .runtime.store import iter_json, read_json
 from .schema6_upgrade import (
     attest_schema6_upgrade,
     check_schema6_upgrade,
@@ -51,21 +65,6 @@ from .schema6_upgrade import (
     schema6_upgrade_status,
     start_schema6_upgrade,
 )
-from .group_ready_members_upgrade import (
-    attest_group_ready_members_upgrade,
-    check_group_ready_members_upgrade,
-    group_ready_members_upgrade_status,
-    resume_group_ready_members_upgrade,
-    start_group_ready_members_upgrade,
-)
-from .notification_config import (
-    DEFAULT_WEBHOOK_ENV,
-    load_notifications,
-    update_notifications,
-    write_shared_feishu_webhook,
-)
-from . import observer
-from .formatter import render
 
 
 def _add_output_format(parser: argparse.ArgumentParser) -> None:
@@ -83,9 +82,7 @@ def _machine_assertion(args: argparse.Namespace) -> str | None:
     flag_value = getattr(args, "machine", None)
     environment_value = os.environ.get("QEXP_MACHINE")
     if flag_value is not None and environment_value is not None and flag_value != environment_value:
-        raise ValueError(
-            f"--machine {flag_value!r} conflicts with QEXP_MACHINE {environment_value!r}."
-        )
+        raise ValueError(f"--machine {flag_value!r} conflicts with QEXP_MACHINE {environment_value!r}.")
     return flag_value if flag_value is not None else environment_value
 
 
@@ -103,19 +100,13 @@ def _requires_verified_binding(args: argparse.Namespace) -> bool:
     if args.command in {"submit", "batch-submit", "clean"}:
         return True
     if args.command == "config":
-        return (
-            getattr(args, "notifications_action", None) == "set"
-            or getattr(args, "provider_action", None) == "set"
-        )
+        return getattr(args, "notifications_action", None) == "set" or getattr(args, "provider_action", None) == "set"
     if args.command == "lease-policy":
         return args.lease_policy_action == "set"
     if args.command == "task":
         return not (
             args.task_action in {"list", "show", "logs"}
-            or (
-                args.task_action == "dependencies"
-                and args.dependencies_action == "show"
-            )
+            or (args.task_action == "dependencies" and args.dependencies_action == "show")
         )
     if args.command == "group":
         return args.group_action not in {"list", "show"}
@@ -124,9 +115,7 @@ def _requires_verified_binding(args: argparse.Namespace) -> bool:
     return args.command == "doctor" and args.action == "repair"
 
 
-def _resolve_cfg(
-    args: argparse.Namespace, *, require_binding: bool
-) -> tuple[object, ExecutionContext]:
+def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[object, ExecutionContext]:
     shared, _saved_context = _shared_root_input(args)
     if not shared:
         raise ValueError("--shared-root is required or must be saved with qexp use.")
@@ -226,7 +215,9 @@ def build_parser() -> argparse.ArgumentParser:
         _add_output_format(action)
         if name != "status":
             action.add_argument(
-                "--capability", action="append", dest="capabilities",
+                "--capability",
+                action="append",
+                dest="capabilities",
                 choices=("cpu-lane-v1", "task-dependencies-v1"),
             )
     schema6_attest = schema6_upgrade_sub.add_parser("attest")
@@ -398,8 +389,16 @@ def build_parser() -> argparse.ArgumentParser:
     agent = commands.add_parser("agent")
     agent_sub = agent.add_subparsers(dest="agent_action", required=True)
     for name in (
-        "start", "run", "restart", "status", "stop", "add-project", "list-projects",
-        "disable-project", "remove-project", "migrate-project",
+        "start",
+        "run",
+        "restart",
+        "status",
+        "stop",
+        "add-project",
+        "list-projects",
+        "disable-project",
+        "remove-project",
+        "migrate-project",
     ):
         action = agent_sub.add_parser(name)
         _add_output_format(action)
@@ -431,10 +430,12 @@ def build_parser() -> argparse.ArgumentParser:
     clean_scope = clean.add_mutually_exclusive_group()
     clean_scope.add_argument("--task-id", help="Clean one terminal task, regardless of its age.")
     clean_scope.add_argument("--group", help="Clean terminal tasks in one group subject to retention and limit.")
-    clean.add_argument("--older-than-days", type=int, default=30,
-                       help="Minimum task age for bulk cleanup (default: 30).")
-    clean.add_argument("--limit", type=int, default=100,
-                       help="Maximum number of bulk-cleanup candidates (default: 100).")
+    clean.add_argument(
+        "--older-than-days", type=int, default=30, help="Minimum task age for bulk cleanup (default: 30)."
+    )
+    clean.add_argument(
+        "--limit", type=int, default=100, help="Maximum number of bulk-cleanup candidates (default: 100)."
+    )
     clean.add_argument("--dry-run", action="store_true", help="Show candidates without cleaning them.")
     use = commands.add_parser(
         "use",
@@ -445,9 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
             "or register the project with the local machine agent."
         ),
     )
-    use.add_argument(
-        "--shared-root", dest="use_shared_root", help="Shared project control root to save."
-    )
+    use.add_argument("--shared-root", dest="use_shared_root", help="Shared project control root to save.")
     use.add_argument("--show", action="store_true")
     use.add_argument("--clear", action="store_true")
     use.add_argument("--format", choices=("human", "json"))
@@ -476,13 +475,9 @@ def _gpu_limit_gpus(value: str) -> int | str:
     try:
         parsed = int(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "gpu-limit-gpus must be a positive integer or 'unlimited'."
-        ) from exc
+        raise argparse.ArgumentTypeError("gpu-limit-gpus must be a positive integer or 'unlimited'.") from exc
     if parsed <= 0:
-        raise argparse.ArgumentTypeError(
-            "gpu-limit-gpus must be a positive integer or 'unlimited'."
-        )
+        raise argparse.ArgumentTypeError("gpu-limit-gpus must be a positive integer or 'unlimited'.")
     return parsed
 
 
@@ -566,7 +561,9 @@ def main(argv: list[str] | None = None) -> int:
                     _emit(
                         "group-ready-members-upgrade",
                         attest_group_ready_members_upgrade(
-                            cfg, activation_id=args.activation_id, machine_name=args.machine,
+                            cfg,
+                            activation_id=args.activation_id,
+                            machine_name=args.machine,
                         ),
                         args.format,
                     )
@@ -574,36 +571,62 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(
                     "group-ready-members-upgrade",
                     resume_group_ready_members_upgrade(
-                        cfg, activation_id=args.activation_id, max_tasks=args.max_tasks,
+                        cfg,
+                        activation_id=args.activation_id,
+                        max_tasks=args.max_tasks,
                     ),
                     args.format,
                 )
                 return 0
             if args.upgrade_feature == "schema6":
                 if args.schema6_upgrade_action == "check":
-                    _emit("schema6-upgrade", check_schema6_upgrade(
-                        cfg, capabilities=args.capabilities, machine_runtime_root=args.machine_runtime_root,
-                    ), args.format)
+                    _emit(
+                        "schema6-upgrade",
+                        check_schema6_upgrade(
+                            cfg,
+                            capabilities=args.capabilities,
+                            machine_runtime_root=args.machine_runtime_root,
+                        ),
+                        args.format,
+                    )
                     return 0
                 if args.schema6_upgrade_action == "status":
                     _emit("schema6-upgrade", schema6_upgrade_status(cfg), args.format)
                     return 0
                 if args.schema6_upgrade_action == "start":
-                    _emit("schema6-upgrade", start_schema6_upgrade(
-                        cfg, capabilities=args.capabilities, machine_runtime_root=args.machine_runtime_root,
-                    ), args.format)
+                    _emit(
+                        "schema6-upgrade",
+                        start_schema6_upgrade(
+                            cfg,
+                            capabilities=args.capabilities,
+                            machine_runtime_root=args.machine_runtime_root,
+                        ),
+                        args.format,
+                    )
                     return 0
                 if args.schema6_upgrade_action == "resume":
-                    _emit("schema6-upgrade", resume_schema6_upgrade(
-                        cfg, activation_id=args.activation_id, machine_runtime_root=args.machine_runtime_root,
-                    ), args.format)
+                    _emit(
+                        "schema6-upgrade",
+                        resume_schema6_upgrade(
+                            cfg,
+                            activation_id=args.activation_id,
+                            machine_runtime_root=args.machine_runtime_root,
+                        ),
+                        args.format,
+                    )
                     return 0
                 if not args.confirm_clients_stopped or not args.machine:
                     raise ValueError("attest requires --machine and --confirm-clients-stopped.")
-                _emit("schema6-upgrade", attest_schema6_upgrade(
-                    cfg, activation_id=args.activation_id, machine_name=args.machine,
-                    machine_runtime_root=args.machine_runtime_root,
-                ), args.format)
+                _emit(
+                    "schema6-upgrade",
+                    attest_schema6_upgrade(
+                        cfg,
+                        activation_id=args.activation_id,
+                        machine_name=args.machine,
+                        machine_runtime_root=args.machine_runtime_root,
+                    ),
+                    args.format,
+                )
                 return 0
         if args.command == "use":
             is_selecting = args.use_shared_root is not None
@@ -629,13 +652,22 @@ def main(argv: list[str] | None = None) -> int:
             save_context(args.use_shared_root)
             return 0
         if args.command == "agent" and args.agent_action in {
-            "status", "list-projects", "disable-project", "remove-project", "stop", "restart"
+            "status",
+            "list-projects",
+            "disable-project",
+            "remove-project",
+            "stop",
+            "restart",
         }:
             runtime = MachineRuntime(args.machine_runtime_root)
             if args.agent_action == "status":
                 _emit("agent", {"action": "status", **get_machine_agent_status(runtime)}, args.format)
             elif args.agent_action == "list-projects":
-                _emit("agent", {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]}, args.format)
+                _emit(
+                    "agent",
+                    {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]},
+                    args.format,
+                )
             elif args.agent_action == "disable-project":
                 binding = set_project_enabled(runtime, args.project, False)
                 _emit("agent", {"action": "project_disabled", **binding.to_dict()}, args.format)
@@ -644,7 +676,11 @@ def main(argv: list[str] | None = None) -> int:
                 _emit("agent", {"action": "project_removed", **binding.to_dict()}, args.format)
             elif args.agent_action == "stop":
                 stopped = stop_machine_agent(runtime)
-                _emit("agent", {"action": "stopped" if stopped else "already_stopped", **get_machine_agent_status(runtime)}, args.format)
+                _emit(
+                    "agent",
+                    {"action": "stopped" if stopped else "already_stopped", **get_machine_agent_status(runtime)},
+                    args.format,
+                )
             else:
                 process = restart_machine_agent(runtime)
                 _emit(
@@ -667,9 +703,7 @@ def main(argv: list[str] | None = None) -> int:
                 policy = get_cpu_lane_policy(runtime.root)
             _emit("agent", {"cpu_lane": policy.to_dict}, args.format)
             return 0
-        cfg, execution_context = _resolve_cfg(
-            args, require_binding=_requires_verified_binding(args)
-        )
+        cfg, execution_context = _resolve_cfg(args, require_binding=_requires_verified_binding(args))
 
         def get_execution_context() -> ExecutionContext:
             return execution_context
@@ -802,7 +836,6 @@ def main(argv: list[str] | None = None) -> int:
             print(task_value.task_id)
             return 0
         if args.command == "batch-submit":
-
             ensure_local_agent_active(cfg, reason="batch-submit", **get_lifecycle_kwargs())
 
             def print_prepared(operation_id: str, idempotency_key: str) -> None:
@@ -842,9 +875,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.task_action == "cancel":
                 context = get_execution_context()
-                task_value = task_commands.cancel(
-                    cfg, args.task_id, reservation_runtime_root=context.reservation_root
-                )
+                task_value = task_commands.cancel(cfg, args.task_id, reservation_runtime_root=context.reservation_root)
                 claim = task_value.claim_control.get("active_claim") or {}
                 is_pending = bool(
                     task_value.state["projection"] == "running"
@@ -864,9 +895,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.format,
                 )
             elif args.task_action == "retry":
-                ensure_local_agent_active(
-                    cfg, reason="task-retry", **get_lifecycle_kwargs()
-                )
+                ensure_local_agent_active(cfg, reason="task-retry", **get_lifecycle_kwargs())
                 task_value = task_commands.retry(
                     cfg,
                     args.task_id,
@@ -874,16 +903,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(task_value.task_id)
             elif args.task_action == "offer":
-                ensure_local_agent_active(
-                    cfg, reason="task-offer", **get_lifecycle_kwargs()
-                )
+                ensure_local_agent_active(cfg, reason="task-offer", **get_lifecycle_kwargs())
                 result = task_commands.offer(cfg, args.task_id)
                 _emit("availability", result.to_dict(), args.format)
             elif args.task_action == "share":
                 after_seconds = _duration_seconds(args.after) if args.after is not None else None
-                ensure_local_agent_active(
-                    cfg, reason="task-share", **get_lifecycle_kwargs()
-                )
+                ensure_local_agent_active(cfg, reason="task-share", **get_lifecycle_kwargs())
                 result = task_commands.share(
                     cfg,
                     args.task_id,
@@ -892,9 +917,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 _emit("availability", result.to_dict(), args.format)
             elif args.task_action == "keep-local":
-                ensure_local_agent_active(
-                    cfg, reason="task-keep-local", **get_lifecycle_kwargs()
-                )
+                ensure_local_agent_active(cfg, reason="task-keep-local", **get_lifecycle_kwargs())
                 result = task_commands.keep_local(cfg, args.task_id)
                 _emit("availability", result.to_dict(), args.format)
             elif args.task_action == "list":
@@ -921,9 +944,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = group_commands.show_group(cfg, args.name)
                 kind = "group-show"
             elif args.group_action == "retry-failed":
-                ensure_local_agent_active(
-                    cfg, reason="group-retry-failed", **get_lifecycle_kwargs()
-                )
+                ensure_local_agent_active(cfg, reason="group-retry-failed", **get_lifecycle_kwargs())
                 result = {
                     "task_ids": [task_value.task_id for task_value in group_commands.group_retry_failed(cfg, args.name)]
                 }
@@ -958,9 +979,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 context = get_execution_context()
                 if args.group_action == "resume":
-                    ensure_local_agent_active(
-                        cfg, reason="group-resume", **get_lifecycle_kwargs()
-                    )
+                    ensure_local_agent_active(cfg, reason="group-resume", **get_lifecycle_kwargs())
                 result = group_commands.group_control(
                     cfg,
                     args.name,
@@ -1000,7 +1019,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 0
             if args.agent_action == "list-projects":
-                _emit("agent", {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]}, args.format)
+                _emit(
+                    "agent",
+                    {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]},
+                    args.format,
+                )
                 return 0
             if args.agent_action == "disable-project":
                 binding = set_project_enabled(runtime, args.project, False)
@@ -1014,7 +1037,9 @@ def main(argv: list[str] | None = None) -> int:
                 _emit("agent", {"action": "status", **get_machine_agent_status(runtime)}, args.format)
                 return 0
             if args.agent_action == "start":
-                action, status = start_local_agent(cfg, reason="manual_start", require_eligible_work=False, machine_runtime=runtime)
+                action, status = start_local_agent(
+                    cfg, reason="manual_start", require_eligible_work=False, machine_runtime=runtime
+                )
                 _emit("agent", {"action": action, **status}, args.format)
             elif args.agent_action == "run":
                 run_local_agent_foreground(

@@ -1,13 +1,15 @@
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import Mock
 
 from qqtools.plugins.qpipeline import Stage
 from qqtools.plugins.qpipeline.runner import agent as agent_module
 from qqtools.plugins.qpipeline.runner.agent import RunningAgent
 from qqtools.plugins.qpipeline.runner.contracts import EvaluationCommittedFact
 from qqtools.plugins.qpipeline.runner.runner_utils.best_model import BestMetricSnapshot
+from qqtools.plugins.qpipeline.runner.runner_utils.eval_formatter import EvalFormatter, EvalSummaryObserver
 from qqtools.plugins.qpipeline.runner.runner_utils.evaluation import (
     EvaluationResult,
     LoaderEvaluation,
@@ -17,7 +19,6 @@ from qqtools.plugins.qpipeline.runner.runner_utils.evaluation import (
     TrainingResult,
     resolve_loader_group,
 )
-from qqtools.plugins.qpipeline.runner.runner_utils.eval_formatter import EvalFormatter, EvalSummaryObserver
 from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunningState
 
 from .conftest import SimpleModel, SimpleTask

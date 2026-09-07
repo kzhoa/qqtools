@@ -8,10 +8,7 @@ from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
-from qqtools.plugins.qexp.runtime.operation_store import (
-    iter_active_operation_paths,
-    write_active_operation,
-)
+from qqtools.plugins.qexp.runtime.operation_store import iter_active_operation_paths, write_active_operation
 from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
     ReadyMarkerRef,
@@ -26,6 +23,7 @@ from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import claim_task
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
+
 
 def _ready_reference(cfg, task_id: str, generation: int) -> ReadyMarkerRef:
     path = shared_paths(cfg.shared_root)["ready_reservations"] / f"{task_id}.{generation}.json"
@@ -59,8 +57,7 @@ def test_claim_commits_truth_before_retiring_ready_marker(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     reservation_path = (
-        shared_paths(cfg.shared_root)["ready_reservations"]
-        / f"{task.task_id}.{task.ready_generation}.json"
+        shared_paths(cfg.shared_root)["ready_reservations"] / f"{task.task_id}.{task.ready_generation}.json"
     )
 
     attempt = claim_task(cfg, task.task_id, [0])
@@ -113,10 +110,7 @@ def test_missing_queued_marker_and_slot_is_corrupt(tmp_path: Path):
         / reference.marker_name
     )
     partition_path = (
-        shared_paths(cfg.shared_root)["ready_home"]
-        / reference.home_machine
-        / reference.partition
-        / "partition.json"
+        shared_paths(cfg.shared_root)["ready_home"] / reference.home_machine / reference.partition / "partition.json"
     )
     marker_path.unlink()
     partition = read_json(partition_path)
@@ -130,13 +124,13 @@ def test_missing_queued_marker_and_slot_is_corrupt(tmp_path: Path):
 
 
 def test_ready_deletion_tolerates_concurrent_reservation_removal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     reservation_path = (
-        shared_paths(cfg.shared_root)["ready_reservations"]
-        / f"{task.task_id}.{task.ready_generation}.json"
+        shared_paths(cfg.shared_root)["ready_reservations"] / f"{task.task_id}.{task.ready_generation}.json"
     )
     from qqtools.plugins.qexp.runtime.ready import index as ready
 
@@ -164,10 +158,7 @@ def test_ready_generation_publication_is_not_cleaned_as_stale(tmp_path: Path):
         stored.placement_runtime["queue_scope"],
         stored.placement_policy["home_machine"],
     )
-    reservation_path = (
-        shared_paths(cfg.shared_root)["ready_reservations"]
-        / f"{stored.task_id}.{generation}.json"
-    )
+    reservation_path = shared_paths(cfg.shared_root)["ready_reservations"] / f"{stored.task_id}.{generation}.json"
 
     before_marker = classify_ready_marker(cfg, reference)
 
@@ -195,7 +186,8 @@ def test_ready_generation_publication_is_not_cleaned_as_stale(tmp_path: Path):
 
 
 def test_ready_delete_failure_does_not_roll_back_authoritative_claim(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
@@ -216,8 +208,7 @@ def test_scope_change_writes_new_generation_before_retiring_old(tmp_path: Path):
     create_group(cfg, "exp")
     original = submit(cfg, ["echo", "ok"], group="exp")
     old_reservation = (
-        shared_paths(cfg.shared_root)["ready_reservations"]
-        / f"{original.task_id}.{original.ready_generation}.json"
+        shared_paths(cfg.shared_root)["ready_reservations"] / f"{original.task_id}.{original.ready_generation}.json"
     )
 
     task_commands.share(cfg, original.task_id)
@@ -231,7 +222,8 @@ def test_scope_change_writes_new_generation_before_retiring_old(tmp_path: Path):
 
 
 def test_offer_due_tasks_never_enumerates_task_truth(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")

@@ -13,7 +13,6 @@ skip_when_meet:  how many lines to skip, the pattern line stands for 1;
 # TODO
 # support functional pattern check, to be implemented
 
-
 import inspect
 import io
 import pathlib
@@ -108,9 +107,9 @@ class ReadRule(object):
             return
 
         if isinstance(self.nlines, int):
-            assert (
-                self.nlines >= 0
-            ), f"expect non-negative value, but found {self.nlines} in {self.name}"  # 0 means some temp Transit Station
+            assert self.nlines >= 0, (
+                f"expect non-negative value, but found {self.nlines} in {self.name}"
+            )  # 0 means some temp Transit Station
 
     @classmethod
     def from_dict(cls, d):

@@ -1,31 +1,25 @@
 """Durable Task availability transitions for queued placement controls."""
+
 from __future__ import annotations
 
 import os
+import time
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import time
 from typing import Any, Literal
 
 from ...config_types import RootConfig
 from ...events import write_diagnostic_event
-from ...lease import (ClockObservation, clock_capability, new_timed_offer_proof,
-                     persist_clock_observation, timed_offer_deadline_upper)
-from ..locks import group_lock, task_lock
-from ..locks import schema_writer_lock
-from ..paths import group_path, shared_paths, submission_path
-from ..records import SCHEMA_VERSION, TaskRecord, new_id, normalize_group_record, utc_now
-from ..ready import (
-    discard_ready_generation,
-    prepare_ready_transition,
-    ready_task_projection_issue,
-    reserve_ready_generation,
-    retire_previous_ready_generation,
+from ...lease import (
+    ClockObservation,
+    clock_capability,
+    new_timed_offer_proof,
+    persist_clock_observation,
+    timed_offer_deadline_upper,
 )
-from ..store import atomic_replace, read_json
-from ..tasks import load_task, save_task
+from ..locks import group_lock, schema_writer_lock, task_lock
 from ..operation_store import (
     active_operation_path,
     archive_operation,
@@ -34,6 +28,17 @@ from ..operation_store import (
     operation_exists,
     write_active_operation,
 )
+from ..paths import group_path, shared_paths, submission_path
+from ..ready import (
+    discard_ready_generation,
+    prepare_ready_transition,
+    ready_task_projection_issue,
+    reserve_ready_generation,
+    retire_previous_ready_generation,
+)
+from ..records import SCHEMA_VERSION, TaskRecord, new_id, normalize_group_record, utc_now
+from ..store import atomic_replace, read_json
+from ..tasks import load_task, save_task
 from . import offer_deadlines
 
 AvailabilityAction = Literal["share_now", "share_after", "keep_local", "manual_offer", "elapsed_offer"]
@@ -87,37 +92,57 @@ def _read_operation(cfg: RootConfig, operation_id: str) -> dict[str, Any]:
 
 def _operation_meta(cfg: RootConfig) -> dict[str, Any]:
     now = utc_now()
-    return {"schema_version": SCHEMA_VERSION, "revision": 1, "created_at": now,
-            "updated_at": now, "updated_by": {"actor_type": "cli",
-            "machine_name": cfg.machine_name, "process_id": str(os.getpid())}}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "revision": 1,
+        "created_at": now,
+        "updated_at": now,
+        "updated_by": {"actor_type": "cli", "machine_name": cfg.machine_name, "process_id": str(os.getpid())},
+    }
 
 
 def _create_operation(
-        cfg: RootConfig, request: AvailabilityTransitionRequest, *,
-        operation_id: str | None = None) -> tuple[str, dict[str, Any]]:
+    cfg: RootConfig, request: AvailabilityTransitionRequest, *, operation_id: str | None = None
+) -> tuple[str, dict[str, Any]]:
     """Load an existing operation or create it while its Task is locked."""
     operation_id = operation_id or request.operation_id or new_id()
     if operation_exists(cfg, "availability", operation_id):
         return operation_id, _read_operation(cfg, operation_id)
     now = utc_now()
-    operation = {"meta": _operation_meta(cfg), "availability_operation": {
-        "operation_id": operation_id, "operation_type": request.action,
-        "task_id": request.task_id, "state": "prepared",
-        "requested_by": cfg.machine_name, "reason": request.reason,
-        "helper_machines": list(request.helper_machines) if request.helper_machines is not None else None,
-        "after_seconds": request.after_seconds, "created_at": now, "updated_at": now,
-        "completed_at": None, "blocked_reason": None, "task_revision_before": None,
-        "task_revision_after": None, "result": None}}
+    operation = {
+        "meta": _operation_meta(cfg),
+        "availability_operation": {
+            "operation_id": operation_id,
+            "operation_type": request.action,
+            "task_id": request.task_id,
+            "state": "prepared",
+            "requested_by": cfg.machine_name,
+            "reason": request.reason,
+            "helper_machines": list(request.helper_machines) if request.helper_machines is not None else None,
+            "after_seconds": request.after_seconds,
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": None,
+            "blocked_reason": None,
+            "task_revision_before": None,
+            "task_revision_after": None,
+            "result": None,
+        },
+    }
     write_active_operation(cfg, "availability", operation_id, operation)
     return operation_id, operation
 
 
 def _update_operation(
-        cfg: RootConfig, operation: dict[str, Any], *, state: str,
-        blocked_reason: str | None = None,
-        result: AvailabilityTransitionResult | None = None,
-        revision_before: int | None = None,
-        revision_after: int | None = None) -> None:
+    cfg: RootConfig,
+    operation: dict[str, Any],
+    *,
+    state: str,
+    blocked_reason: str | None = None,
+    result: AvailabilityTransitionResult | None = None,
+    revision_before: int | None = None,
+    revision_after: int | None = None,
+) -> None:
     control = operation["availability_operation"]
     control["state"] = state
     control["updated_at"] = utc_now()
@@ -141,9 +166,7 @@ def _update_operation(
 def clock_evidence(cfg: RootConfig) -> tuple[ClockObservation, datetime, float]:
     capability = clock_capability(cfg)
     if not capability.is_healthy or capability.observation is None:
-        raise ValueError(
-            "timed sharing requires a healthy clock capability; use immediate share instead."
-        )
+        raise ValueError("timed sharing requires a healthy clock capability; use immediate share instead.")
     persist_clock_observation(cfg, capability.observation)
     return capability.observation, datetime.now(timezone.utc), time.monotonic()
 
@@ -166,9 +189,11 @@ def elapsed_offer_is_proven(cfg: RootConfig, task: TaskRecord) -> bool:
 
 
 def _cleanup_blocked(cfg: RootConfig, task: TaskRecord) -> bool:
-    return bool(task.control.get("cleanup_operation_id")
-                or task.control.get("cleanup_state")
-                or operation_exists(cfg, "cleanup", task.task_id))
+    return bool(
+        task.control.get("cleanup_operation_id")
+        or task.control.get("cleanup_state")
+        or operation_exists(cfg, "cleanup", task.task_id)
+    )
 
 
 def _submission_committed(cfg: RootConfig, task: TaskRecord) -> bool:
@@ -217,8 +242,8 @@ def _validate_common(cfg: RootConfig, task: TaskRecord, group: dict[str, Any] | 
 
 
 def _normalize_helpers(
-        task: TaskRecord, group: dict[str, Any] | None,
-        helper_machines: list[str] | None) -> str | list[str]:
+    task: TaskRecord, group: dict[str, Any] | None, helper_machines: list[str] | None
+) -> str | list[str]:
     if helper_machines is None:
         return "group"
     if len(set(helper_machines)) != len(helper_machines):
@@ -232,11 +257,7 @@ def _normalize_helpers(
             "Submit the work to a Group to let other machines help."
         )
     workers = group["group"]["worker_set"]
-    invalid = [
-        machine
-        for machine in helper_machines
-        if workers.get(machine, {}).get("state") != "active"
-    ]
+    invalid = [machine for machine in helper_machines if workers.get(machine, {}).get("state") != "active"]
     if invalid:
         raise ValueError(f"shared helpers are not active Group workers: {invalid}")
     return list(helper_machines) if helper_machines else "group"
@@ -249,32 +270,33 @@ def _eligible_helpers(task: TaskRecord, group: dict[str, Any] | None) -> list[st
     fallback = task.placement_policy.get("fallback_constraint", "group")
     workers = group["group"]["worker_set"]
     if fallback == "group":
-        return sorted(machine for machine, worker in workers.items()
-                      if machine != home and worker.get("state") == "active")
+        return sorted(
+            machine for machine, worker in workers.items() if machine != home and worker.get("state") == "active"
+        )
     return sorted(
-        machine
-        for machine in fallback
-        if machine != home and workers.get(machine, {}).get("state") == "active"
+        machine for machine in fallback if machine != home and workers.get(machine, {}).get("state") == "active"
     )
 
 
-def _is_same_immediate_share(
-        task: TaskRecord, group: dict[str, Any] | None,
-        helper_machines: list[str] | None) -> bool:
+def _is_same_immediate_share(task: TaskRecord, group: dict[str, Any] | None, helper_machines: list[str] | None) -> bool:
     fallback = _normalize_helpers(task, group, helper_machines)
-    return (task.placement_policy.get("sharing_mode") == "spillover"
-            and task.placement_policy.get("fallback_constraint") == fallback
-            and task.placement_runtime.get("queue_scope") == "shared")
+    return (
+        task.placement_policy.get("sharing_mode") == "spillover"
+        and task.placement_policy.get("fallback_constraint") == fallback
+        and task.placement_runtime.get("queue_scope") == "shared"
+    )
 
 
-def _result_message(action: AvailabilityAction, task: TaskRecord, group: dict[str, Any] | None,
-                    effective_at: str | None) -> str:
+def _result_message(
+    action: AvailabilityAction, task: TaskRecord, group: dict[str, Any] | None, effective_at: str | None
+) -> str:
     if action == "keep_local":
-        return (f"Task {task.task_id} is now restricted to its home machine "
-                f"{task.placement_policy['home_machine']}.")
+        return f"Task {task.task_id} is now restricted to its home machine {task.placement_policy['home_machine']}."
     if action == "share_after":
-        return (f"Task {task.task_id} will stay on {task.placement_policy['home_machine']} until "
-                f"{effective_at}, then become available to eligible Group workers.")
+        return (
+            f"Task {task.task_id} will stay on {task.placement_policy['home_machine']} until "
+            f"{effective_at}, then become available to eligible Group workers."
+        )
     group_name = task.group_name or ""
     suffix = ""
     if group is not None and group["group"].get("dispatch_state") == "paused":
@@ -282,26 +304,39 @@ def _result_message(action: AvailabilityAction, task: TaskRecord, group: dict[st
     return f"Task {task.task_id} is now available to eligible workers in Group {group_name}.{suffix}"
 
 
-def _make_result(action: AvailabilityAction, task: TaskRecord, group: dict[str, Any] | None,
-                 operation_id: str, *, idempotent: bool) -> AvailabilityTransitionResult:
-    effective_at = (task.placement_runtime.get("offer_eligible_at")
-                    if action == "share_after" else task.placement_runtime.get("offered_at"))
+def _make_result(
+    action: AvailabilityAction, task: TaskRecord, group: dict[str, Any] | None, operation_id: str, *, idempotent: bool
+) -> AvailabilityTransitionResult:
+    effective_at = (
+        task.placement_runtime.get("offer_eligible_at")
+        if action == "share_after"
+        else task.placement_runtime.get("offered_at")
+    )
     if action == "keep_local":
         effective_at = task.placement_runtime.get("queued_home_at")
     return AvailabilityTransitionResult(
-        action=action, task_id=task.task_id, group=task.group_name,
+        action=action,
+        task_id=task.task_id,
+        group=task.group_name,
         home_machine=task.placement_policy["home_machine"],
         eligible_helper_machines=_eligible_helpers(task, group),
-        effective_at=effective_at, resulting_state=task.placement_runtime["queue_scope"],
-        idempotent=idempotent, operation_id=operation_id,
-        message=_result_message(action, task, group, effective_at), task=task,
+        effective_at=effective_at,
+        resulting_state=task.placement_runtime["queue_scope"],
+        idempotent=idempotent,
+        operation_id=operation_id,
+        message=_result_message(action, task, group, effective_at),
+        task=task,
     )
 
 
 def _completed_operation_result(
-        cfg: RootConfig, request: AvailabilityTransitionRequest, operation_id: str,
-        operation: dict[str, Any], task: TaskRecord,
-        group: dict[str, Any] | None) -> AvailabilityTransitionResult | None:
+    cfg: RootConfig,
+    request: AvailabilityTransitionRequest,
+    operation_id: str,
+    operation: dict[str, Any],
+    task: TaskRecord,
+    group: dict[str, Any] | None,
+) -> AvailabilityTransitionResult | None:
     """Return a verified idempotent result for an operation another writer completed."""
     control = operation.get("availability_operation", {})
     if control.get("state") != "completed":
@@ -313,17 +348,11 @@ def _completed_operation_result(
     ):
         raise ValueError("availability operation identity does not match the request.")
     result = control.get("result")
-    if (
-        not isinstance(result, dict)
-        or result.get("action") != request.action
-        or result.get("task_id") != task.task_id
-    ):
+    if not isinstance(result, dict) or result.get("action") != request.action or result.get("task_id") != task.task_id:
         raise RuntimeError("completed availability operation does not match Task truth.")
     projection_issue = ready_task_projection_issue(cfg, task.task_id)
     if projection_issue is not None:
-        raise RuntimeError(
-            "completed availability operation has an invalid ready marker: " + projection_issue
-        )
+        raise RuntimeError("completed availability operation has an invalid ready marker: " + projection_issue)
     if result.get("resulting_state") != task.placement_runtime.get("queue_scope"):
         revision_after = control.get("task_revision_after")
         group_name = result.get("group")
@@ -336,11 +365,13 @@ def _completed_operation_result(
             not isinstance(revision_after, int)
             or task.meta["revision"] <= revision_after
             or task.placement_runtime.get("availability_operation_id") == operation_id
-            or group_name is not None and not isinstance(group_name, str)
+            or group_name is not None
+            and not isinstance(group_name, str)
             or not isinstance(home_machine, str)
             or not isinstance(helper_machines, list)
             or not all(isinstance(machine, str) for machine in helper_machines)
-            or effective_at is not None and not isinstance(effective_at, str)
+            or effective_at is not None
+            and not isinstance(effective_at, str)
             or not isinstance(resulting_state, str)
             or not isinstance(message, str)
         ):
@@ -364,41 +395,51 @@ def _completed_operation_result(
     return _make_result(request.action, task, group, operation_id, idempotent=True)
 
 
-def _write_audit_event(cfg: RootConfig, result: AvailabilityTransitionResult,
-                       before: dict[str, Any], clock_proof: dict[str, Any] | None) -> None:
+def _write_audit_event(
+    cfg: RootConfig, result: AvailabilityTransitionResult, before: dict[str, Any], clock_proof: dict[str, Any] | None
+) -> None:
     timestamp = utc_now()
     day = timestamp[:10]
-    event = {"event_id": result.operation_id, "event_type": "task_availability_changed",
-             "task_id": result.task_id, "machine_name": cfg.machine_name,
-             "timestamp": timestamp, "details": {"action": result.action,
-             "operation_id": result.operation_id, "before": before,
-             "after": {"placement_policy": result.task.placement_policy,
-                       "placement_runtime": result.task.placement_runtime},
-             "clock_evidence": clock_proof}}
+    event = {
+        "event_id": result.operation_id,
+        "event_type": "task_availability_changed",
+        "task_id": result.task_id,
+        "machine_name": cfg.machine_name,
+        "timestamp": timestamp,
+        "details": {
+            "action": result.action,
+            "operation_id": result.operation_id,
+            "before": before,
+            "after": {
+                "placement_policy": result.task.placement_policy,
+                "placement_runtime": result.task.placement_runtime,
+            },
+            "clock_evidence": clock_proof,
+        },
+    }
     atomic_replace(shared_paths(cfg.shared_root)["events"] / day / f"{result.operation_id}.json", event)
 
 
-def _same_delayed_share(task: TaskRecord, fallback: str | list[str],
-                        after_seconds: int | None) -> bool:
-    return (task.placement_policy.get("sharing_mode") == "spillover"
-            and task.placement_policy.get("fallback_constraint") == fallback
-            and task.placement_policy.get("offer_after_seconds") == after_seconds
-            and task.placement_runtime.get("queue_scope") == "home"
-            and bool(task.placement_runtime.get("offer_eligible_at"))
-            and bool(task.placement_runtime.get("offer_clock_evidence")))
+def _same_delayed_share(task: TaskRecord, fallback: str | list[str], after_seconds: int | None) -> bool:
+    return (
+        task.placement_policy.get("sharing_mode") == "spillover"
+        and task.placement_policy.get("fallback_constraint") == fallback
+        and task.placement_policy.get("offer_after_seconds") == after_seconds
+        and task.placement_runtime.get("queue_scope") == "home"
+        and bool(task.placement_runtime.get("offer_eligible_at"))
+        and bool(task.placement_runtime.get("offer_clock_evidence"))
+    )
 
 
 def apply_availability_transition(
-        cfg: RootConfig, request: AvailabilityTransitionRequest) -> AvailabilityTransitionResult:
+    cfg: RootConfig, request: AvailabilityTransitionRequest
+) -> AvailabilityTransitionResult:
     if request.after_seconds is not None and request.after_seconds < 0:
         raise ValueError("share --after must be non-negative.")
     operation_id = request.operation_id or new_id()
     initial = load_task(cfg, request.task_id)
     lock_group = initial.group_name
-    target_scope = (
-        "shared" if request.action in {"share_now", "manual_offer", "elapsed_offer"}
-        else "home"
-    )
+    target_scope = "shared" if request.action in {"share_now", "manual_offer", "elapsed_offer"} else "home"
     ready_reference = None
     is_ready_committed = False
     operation: dict[str, Any] | None = None
@@ -411,9 +452,7 @@ def apply_availability_transition(
             task = load_task(cfg, request.task_id)
             group = _group_data(cfg, task)
             operation_id, operation = _create_operation(cfg, request, operation_id=operation_id)
-            completed = _completed_operation_result(
-                cfg, request, operation_id, operation, task, group
-            )
+            completed = _completed_operation_result(cfg, request, operation_id, operation, task, group)
             if completed is not None:
                 return completed
             if request.action == "elapsed_offer":
@@ -434,22 +473,35 @@ def apply_availability_transition(
             if request.action == "manual_offer" and task.placement_policy["sharing_mode"] != "spillover":
                 raise ValueError("private Tasks cannot be offered to shared workers; use task share.")
             _validate_common(cfg, task, group)
-            before = {"placement_policy": dict(task.placement_policy),
-                      "placement_runtime": dict(task.placement_runtime)}
+            before = {
+                "placement_policy": dict(task.placement_policy),
+                "placement_runtime": dict(task.placement_runtime),
+            }
             revision_before = task.meta["revision"]
             idempotent = False
             clock_proof = None
             if request.action == "keep_local":
-                idempotent = (task.placement_policy["sharing_mode"] == "private"
-                              and task.placement_runtime["queue_scope"] == "home"
-                              and not task.placement_runtime.get("offer_eligible_at"))
+                idempotent = (
+                    task.placement_policy["sharing_mode"] == "private"
+                    and task.placement_runtime["queue_scope"] == "home"
+                    and not task.placement_runtime.get("offer_eligible_at")
+                )
                 if not idempotent:
-                    task.placement_policy.update({"sharing_mode": "private",
-                        "fallback_constraint": "group", "offer_after_seconds": None})
-                    task.placement_runtime.update({"queue_scope": "home", "queued_home_at": utc_now(),
-                        "offer_eligible_at": None, "offer_clock_evidence": None,
-                        "offered_at": None, "offer_reason": None, "offered_by": cfg.machine_name,
-                        "availability_operation_id": operation_id})
+                    task.placement_policy.update(
+                        {"sharing_mode": "private", "fallback_constraint": "group", "offer_after_seconds": None}
+                    )
+                    task.placement_runtime.update(
+                        {
+                            "queue_scope": "home",
+                            "queued_home_at": utc_now(),
+                            "offer_eligible_at": None,
+                            "offer_clock_evidence": None,
+                            "offered_at": None,
+                            "offer_reason": None,
+                            "offered_by": cfg.machine_name,
+                            "availability_operation_id": operation_id,
+                        }
+                    )
             elif request.action == "share_after":
                 if task.group_name is None:
                     raise ValueError(
@@ -463,16 +515,30 @@ def apply_availability_transition(
                 if not idempotent:
                     observation, wall_now, monotonic_now = clock_evidence(cfg)
                     deadline, clock_proof = new_timed_offer_proof(
-                        observation, request.after_seconds or 0,
-                        wall_now=wall_now, monotonic_now=monotonic_now,
+                        observation,
+                        request.after_seconds or 0,
+                        wall_now=wall_now,
+                        monotonic_now=monotonic_now,
                     )
-                    task.placement_policy.update({"sharing_mode": "spillover",
-                        "fallback_constraint": fallback,
-                        "offer_after_seconds": request.after_seconds})
-                    task.placement_runtime.update({"queue_scope": "home", "queued_home_at": utc_now(),
-                        "offer_eligible_at": deadline, "offer_clock_evidence": clock_proof,
-                        "offered_at": None, "offer_reason": None, "offered_by": cfg.machine_name,
-                        "availability_operation_id": operation_id})
+                    task.placement_policy.update(
+                        {
+                            "sharing_mode": "spillover",
+                            "fallback_constraint": fallback,
+                            "offer_after_seconds": request.after_seconds,
+                        }
+                    )
+                    task.placement_runtime.update(
+                        {
+                            "queue_scope": "home",
+                            "queued_home_at": utc_now(),
+                            "offer_eligible_at": deadline,
+                            "offer_clock_evidence": clock_proof,
+                            "offered_at": None,
+                            "offer_reason": None,
+                            "offered_by": cfg.machine_name,
+                            "availability_operation_id": operation_id,
+                        }
+                    )
             else:
                 if request.action == "share_now":
                     idempotent = _is_same_immediate_share(task, group, request.helper_machines)
@@ -480,15 +546,23 @@ def apply_availability_transition(
                     task.placement_policy["sharing_mode"] = "spillover"
                     task.placement_policy["fallback_constraint"] = fallback
                 else:
-                    idempotent = (task.placement_runtime["queue_scope"] == "shared"
-                                  and task.placement_policy["sharing_mode"] == "spillover")
+                    idempotent = (
+                        task.placement_runtime["queue_scope"] == "shared"
+                        and task.placement_policy["sharing_mode"] == "spillover"
+                    )
                 if not idempotent:
                     task.placement_policy["offer_after_seconds"] = None
-                    task.placement_runtime.update({"queue_scope": "shared",
-                        "offer_eligible_at": None, "offer_clock_evidence": None,
-                        "offered_at": utc_now(), "offer_reason": request.reason,
-                        "offered_by": cfg.machine_name,
-                        "availability_operation_id": operation_id})
+                    task.placement_runtime.update(
+                        {
+                            "queue_scope": "shared",
+                            "offer_eligible_at": None,
+                            "offer_clock_evidence": None,
+                            "offered_at": utc_now(),
+                            "offer_reason": request.reason,
+                            "offered_by": cfg.machine_name,
+                            "availability_operation_id": operation_id,
+                        }
+                    )
             if not idempotent:
                 try:
                     ready_reference = reserve_ready_generation(
@@ -504,9 +578,7 @@ def apply_availability_transition(
                     task = load_task(cfg, request.task_id)
                     group = _group_data(cfg, task)
                     operation = _read_operation(cfg, operation_id)
-                    completed = _completed_operation_result(
-                        cfg, request, operation_id, operation, task, group
-                    )
+                    completed = _completed_operation_result(cfg, request, operation_id, operation, task, group)
                     if completed is None:
                         raise
                     return completed
@@ -524,9 +596,14 @@ def apply_availability_transition(
             offer_deadlines.sync_deadline_index(cfg, task)
             result = _make_result(request.action, task, group, operation_id, idempotent=idempotent)
             _write_audit_event(cfg, result, before, clock_proof)
-            _update_operation(cfg, operation, state="completed", result=result,
-                              revision_before=revision_before,
-                              revision_after=task.meta["revision"])
+            _update_operation(
+                cfg,
+                operation,
+                state="completed",
+                result=result,
+                revision_before=revision_before,
+                revision_after=task.meta["revision"],
+            )
             return result
     except Exception as exc:
         if operation is None:
@@ -554,12 +631,12 @@ def apply_availability_transition(
 
 
 def reconcile_availability_operations(
-    cfg: RootConfig, *, include_legacy: bool = True,
+    cfg: RootConfig,
+    *,
+    include_legacy: bool = True,
 ) -> list[dict[str, Any]]:
     reconciled: list[dict[str, Any]] = []
-    for path in iter_active_operation_paths(
-        cfg, "availability", include_legacy=include_legacy
-    ):
+    for path in iter_active_operation_paths(cfg, "availability", include_legacy=include_legacy):
         control: dict[str, Any] = {}
         try:
             operation = read_json(path)
@@ -570,16 +647,19 @@ def reconcile_availability_operations(
                 archive_operation(cfg, "availability", control["operation_id"], operation)
                 continue
             request = AvailabilityTransitionRequest(
-                action=control["operation_type"], task_id=control["task_id"],
+                action=control["operation_type"],
+                task_id=control["task_id"],
                 helper_machines=control.get("helper_machines"),
-                after_seconds=control.get("after_seconds"), reason=control.get("reason") or "manual",
+                after_seconds=control.get("after_seconds"),
+                reason=control.get("reason") or "manual",
                 operation_id=control["operation_id"],
             )
             result = apply_availability_transition(cfg, request)
             reconciled.append(result.to_dict())
         except Exception as exc:
             write_diagnostic_event(
-                cfg, "availability_operation_reconcile_failed",
+                cfg,
+                "availability_operation_reconcile_failed",
                 task_id=control.get("task_id"),
                 details={
                     "operation_id": control.get("operation_id") or path.stem,

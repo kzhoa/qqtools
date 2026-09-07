@@ -1,4 +1,5 @@
 """Background entrypoint for the qexp machine agent."""
+
 from __future__ import annotations
 
 import argparse
@@ -30,9 +31,7 @@ def spawn_machine_agent_process(
 ) -> subprocess.Popen:
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     machine_runtime.ensure_layout()
-    startup_log = (
-        tempfile.TemporaryFile(mode="w+", encoding="utf-8") if stderr is None else None
-    )
+    startup_log = tempfile.TemporaryFile(mode="w+", encoding="utf-8") if stderr is None else None
     process = subprocess.Popen(
         [
             sys.executable,
@@ -65,9 +64,7 @@ def spawn_machine_agent_process(
                     startup_log.seek(0)
                     lines = startup_log.read().strip().splitlines()
                     details = f": {lines[-1]}" if lines else ""
-                raise RuntimeError(
-                    f"machine agent exited during startup with exit code {exit_code}{details}."
-                )
+                raise RuntimeError(f"machine agent exited during startup with exit code {exit_code}{details}.")
             time.sleep(0.02)
         process.terminate()
         try:

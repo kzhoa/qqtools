@@ -55,7 +55,6 @@ class qDict(dict):
                     v = self._build_recursive_value(v, default_function, allow_notexist)
                 self.__setitem__(k, v)
         else:
-
             import argparse
 
             if isinstance(d, argparse.Namespace):

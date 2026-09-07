@@ -1,4 +1,5 @@
 """Global qexp agent lifecycle helpers."""
+
 from __future__ import annotations
 
 import os
@@ -26,12 +27,16 @@ def managed_project_agent_status(
     if binding is None:
         return None
     status = get_machine_agent_status(runtime)
-    return runtime, binding, {
-        **status,
-        "managed_by_machine": True,
-        "project_id": binding.project_id,
-        "project_state": runtime.binding_state(binding),
-    }
+    return (
+        runtime,
+        binding,
+        {
+            **status,
+            "managed_by_machine": True,
+            "project_id": binding.project_id,
+            "project_state": runtime.binding_state(binding),
+        },
+    )
 
 
 def _registration_error(cfg: RootConfig) -> RuntimeError:
@@ -61,9 +66,7 @@ def ensure_managed_project_agent_active(
     return ("started" if is_started else "already_running"), status
 
 
-def ensure_local_agent_active(
-    cfg: RootConfig, *, reason: str, machine_runtime: MachineRuntime | None = None
-) -> bool:
+def ensure_local_agent_active(cfg: RootConfig, *, reason: str, machine_runtime: MachineRuntime | None = None) -> bool:
     """Ensure the current project is served by the sole machine agent."""
     del reason
     runtime = machine_runtime or MachineRuntime()
@@ -74,7 +77,10 @@ def ensure_local_agent_active(
 
 
 def start_local_agent(
-    cfg: RootConfig, *, reason: str, require_eligible_work: bool,
+    cfg: RootConfig,
+    *,
+    reason: str,
+    require_eligible_work: bool,
     machine_runtime: MachineRuntime | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Compatibility wrapper that starts the unique machine agent."""
@@ -94,7 +100,10 @@ def start_local_agent(
 
 
 def run_local_agent_foreground(
-    cfg: RootConfig, *, reason: str, on_started: Callable[[dict[str, object]], None],
+    cfg: RootConfig,
+    *,
+    reason: str,
+    on_started: Callable[[dict[str, object]], None],
     machine_runtime: MachineRuntime | None = None,
 ) -> None:
     """Run the unique machine agent in the foreground."""

@@ -1,4 +1,5 @@
 """Feishu Incoming Webhook notifier implemented with Python standard library."""
+
 from __future__ import annotations
 
 import base64
@@ -12,8 +13,14 @@ from typing import Any, Callable
 
 
 class NotificationTransportError(RuntimeError):
-    def __init__(self, reason_code: str, *, http_status: int | None = None,
-                 business_code: str | None = None, error_type: str | None = None):
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        http_status: int | None = None,
+        business_code: str | None = None,
+        error_type: str | None = None,
+    ):
         super().__init__(reason_code)
         self.reason_code = reason_code
         self.http_status = http_status
@@ -24,13 +31,11 @@ class NotificationTransportError(RuntimeError):
 class FeishuNotifier:
     name = "feishu"
 
-    def __init__(self, *, clock: Callable[[], float] = time.time,
-                 urlopen: Callable[..., Any] | None = None):
+    def __init__(self, *, clock: Callable[[], float] = time.time, urlopen: Callable[..., Any] | None = None):
         self._clock = clock
         self._urlopen = urlopen or urllib.request.urlopen
 
-    def send(self, event: Any, *, webhook: str, secret: str | None,
-             timeout_seconds: float) -> dict[str, Any]:
+    def send(self, event: Any, *, webhook: str, secret: str | None, timeout_seconds: float) -> dict[str, Any]:
         timestamp = str(int(self._clock()))
         payload: dict[str, Any] = {
             "msg_type": "interactive",
@@ -50,8 +55,12 @@ class FeishuNotifier:
             string_to_sign = timestamp + "\n" + secret
             digest = hmac.new(string_to_sign.encode("utf-8"), b"", hashlib.sha256).digest()
             payload.update({"timestamp": timestamp, "sign": base64.b64encode(digest).decode("ascii")})
-        request = urllib.request.Request(webhook, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                                         headers={"Content-Type": "application/json"}, method="POST")
+        request = urllib.request.Request(
+            webhook,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         try:
             response = self._urlopen(request, timeout=timeout_seconds)
             status = getattr(response, "status", getattr(response, "code", None))
@@ -59,40 +68,37 @@ class FeishuNotifier:
         except TimeoutError as exc:
             raise NotificationTransportError("timeout", error_type="timeout") from exc
         except urllib.error.HTTPError as exc:
-            raise NotificationTransportError("http_error", http_status=exc.code,
-                                             error_type="http_error") from exc
+            raise NotificationTransportError("http_error", http_status=exc.code, error_type="http_error") from exc
         except (urllib.error.URLError, OSError) as exc:
             raise NotificationTransportError("network_error", error_type="network_error") from exc
         if not isinstance(status, int) or not 200 <= status < 300:
-            raise NotificationTransportError("http_error", http_status=status if isinstance(status, int) else None,
-                                             error_type="http_error")
+            raise NotificationTransportError(
+                "http_error", http_status=status if isinstance(status, int) else None, error_type="http_error"
+            )
         try:
             result = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise NotificationTransportError("invalid_response", http_status=status,
-                                             error_type="invalid_response") from exc
+            raise NotificationTransportError(
+                "invalid_response", http_status=status, error_type="invalid_response"
+            ) from exc
         if not isinstance(result, dict):
-            raise NotificationTransportError("invalid_response", http_status=status,
-                                             error_type="invalid_response")
+            raise NotificationTransportError("invalid_response", http_status=status, error_type="invalid_response")
         present = [result[key] for key in ("code", "StatusCode") if key in result]
         if not present or any(isinstance(value, bool) or not isinstance(value, int) for value in present):
-            raise NotificationTransportError("invalid_response", http_status=status,
-                                             error_type="invalid_response")
+            raise NotificationTransportError("invalid_response", http_status=status, error_type="invalid_response")
         if len(present) == 2 and present[0] != present[1]:
-            raise NotificationTransportError("invalid_response", http_status=status,
-                                             business_code=str(present[0]),
-                                             error_type="invalid_response")
+            raise NotificationTransportError(
+                "invalid_response", http_status=status, business_code=str(present[0]), error_type="invalid_response"
+            )
         if any(value != 0 for value in present):
-            raise NotificationTransportError("business_error", http_status=status,
-                                             business_code=str(present[0]),
-                                             error_type="business_error")
+            raise NotificationTransportError(
+                "business_error", http_status=status, business_code=str(present[0]), error_type="business_error"
+            )
         return {"http_status": status, "business_code": "0"}
 
 
 def _phase_label(phase: Any) -> str:
-    return {"succeeded": "成功", "failed": "失败", "cancelled": "已取消"}.get(
-        phase, str(phase)
-    )
+    return {"succeeded": "成功", "failed": "失败", "cancelled": "已取消"}.get(phase, str(phase))
 
 
 def _phase_template(phase: Any) -> str:
@@ -100,17 +106,19 @@ def _phase_template(phase: Any) -> str:
 
 
 def _card_markdown(event: Any) -> str:
-    return "\n".join((
-        f"- **Task ID**: `{_markdown_code(event.task_id)}`",
-        f"- **Attempt ID**: `{_markdown_code(event.attempt_id)}`",
-        f"- **原因**: `{_markdown_code(event.reason)}`",
-        f"- **退出码**: `{_markdown_code(event.exit_code)}`",
-        f"- **执行机器**: `{_markdown_code(event.execution_machine_name)}`",
-        f"- **通知机器**: `{_markdown_code(event.dispatching_machine_name)}`",
-        f"- **开始时间**: `{_markdown_code(getattr(event, 'execution_started_at', None))}`",
-        f"- **执行时长**: `{_markdown_code(_duration_text(getattr(event, 'duration_ms', None)))}`",
-        f"- **通知机器时间**: `{_markdown_code(event.finished_at)}`",
-    ))
+    return "\n".join(
+        (
+            f"- **Task ID**: `{_markdown_code(event.task_id)}`",
+            f"- **Attempt ID**: `{_markdown_code(event.attempt_id)}`",
+            f"- **原因**: `{_markdown_code(event.reason)}`",
+            f"- **退出码**: `{_markdown_code(event.exit_code)}`",
+            f"- **执行机器**: `{_markdown_code(event.execution_machine_name)}`",
+            f"- **通知机器**: `{_markdown_code(event.dispatching_machine_name)}`",
+            f"- **开始时间**: `{_markdown_code(getattr(event, 'execution_started_at', None))}`",
+            f"- **执行时长**: `{_markdown_code(_duration_text(getattr(event, 'duration_ms', None)))}`",
+            f"- **通知机器时间**: `{_markdown_code(event.finished_at)}`",
+        )
+    )
 
 
 def _duration_text(duration_ms: Any) -> str | None:
@@ -125,8 +133,4 @@ def _markdown_code(value: Any) -> str:
     text = str(value)
     if not text.strip():
         return "（未记录）"
-    return (text.replace("\\", "\\\\")
-            .replace("`", "\\`")
-            .replace("\r", "\\r")
-            .replace("\n", "\\n")
-            .replace("\t", "\\t"))
+    return text.replace("\\", "\\\\").replace("`", "\\`").replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")

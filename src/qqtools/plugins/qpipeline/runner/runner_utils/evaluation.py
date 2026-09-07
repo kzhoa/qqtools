@@ -11,7 +11,6 @@ from torch.utils.data import DataLoader
 
 from ...types import Stage
 
-
 LoaderGroup = Optional[Union[DataLoader, Dict[str, DataLoader]]]
 
 
@@ -130,8 +129,7 @@ def resolve_loader_group(loader: LoaderGroup, *, group_name: str) -> list[tuple[
         return [(None, loader)]
     if not isinstance(loader, dict):
         raise TypeError(
-            f"{group_name} loader must be None, DataLoader, or dict[str, DataLoader]; "
-            f"got {type(loader).__name__}."
+            f"{group_name} loader must be None, DataLoader, or dict[str, DataLoader]; got {type(loader).__name__}."
         )
     if not loader:
         raise ValueError(f"{group_name} loader mapping must be non-empty; use None to disable the stage.")
@@ -141,8 +139,6 @@ def resolve_loader_group(loader: LoaderGroup, *, group_name: str) -> list[tuple[
         if not isinstance(name, str) or not name:
             raise ValueError(f"{group_name} loader name must be a non-empty string; got {name!r}.")
         if not isinstance(data_loader, DataLoader):
-            raise TypeError(
-                f"{group_name} loader {name!r} must be a DataLoader; got {type(data_loader).__name__}."
-            )
+            raise TypeError(f"{group_name} loader {name!r} must be a DataLoader; got {type(data_loader).__name__}.")
         resolved.append((name, data_loader))
     return resolved

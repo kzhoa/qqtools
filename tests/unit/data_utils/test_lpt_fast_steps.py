@@ -20,12 +20,16 @@ def test_fast_step_production_contract(total, world_size, seed):
     if len(old):
         assert new[-1] <= old[-1]
         assert np.percentile(new, 99) <= np.percentile(old, 99)
-        assert new[world_size - 1::world_size].sum() <= old[world_size - 1::world_size].sum()
+        assert new[world_size - 1 :: world_size].sum() <= old[world_size - 1 :: world_size].sum()
     np.testing.assert_array_equal(np.sort(actual.ravel()), np.sort(before.ravel()))
     np.testing.assert_array_equal(batches, before)
     plan = balance._plan_rank_batches(
-        costs, batch_size=4, world_size=world_size, seed=seed,
-        strategy="lpt_fast", should_shuffle=False,
+        costs,
+        batch_size=4,
+        world_size=world_size,
+        seed=seed,
+        strategy="lpt_fast",
+        should_shuffle=False,
     )
     expected = actual[np.argsort(costs[actual].sum(1), kind="stable")]
     np.testing.assert_array_equal(plan.reshape(-1, 4), expected)

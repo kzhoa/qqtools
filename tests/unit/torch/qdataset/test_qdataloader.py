@@ -190,9 +190,7 @@ def test_qdictdataloader_graph_collate_with_pickle_based_worker(
     if start_method not in multiprocessing.get_all_start_methods():
         pytest.skip(f"{start_method} is not available on this platform")
 
-    probe_path = (
-        Path(__file__).parents[3] / "fixtures" / "qdataset_graph_worker_probe.py"
-    )
+    probe_path = Path(__file__).parents[3] / "fixtures" / "qdataset_graph_worker_probe.py"
     worker_env = checkout_subprocess_env
     if os.name != "nt":
         worker_env.update({"TMPDIR": "/tmp", "TEMP": "/tmp", "TMP": "/tmp"})

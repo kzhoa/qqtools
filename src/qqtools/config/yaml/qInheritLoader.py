@@ -1,7 +1,8 @@
 from pathlib import Path
 
-import qqtools as qt
 import yaml
+
+import qqtools as qt
 
 
 def python_tuple_constructor(loader, node):

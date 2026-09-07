@@ -1,4 +1,5 @@
 """Machine-global CPU-only lane policy and reservations."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -31,9 +32,7 @@ def _runtime_root(value: Path | Any) -> Path:
 
 def _is_expired(value: dict[str, Any]) -> bool:
     expires_at = value["reservation"].get("expires_at")
-    return bool(expires_at) and datetime.fromisoformat(
-        expires_at.replace("Z", "+00:00")
-    ) <= datetime.now(timezone.utc)
+    return bool(expires_at) and datetime.fromisoformat(expires_at.replace("Z", "+00:00")) <= datetime.now(timezone.utc)
 
 
 def _values(directory: Path) -> list[tuple[Path, dict[str, Any]]]:
@@ -43,8 +42,9 @@ def _values(directory: Path) -> list[tuple[Path, dict[str, Any]]]:
 def _release_expired(paths: dict[str, Path]) -> None:
     for path, value in _values(paths["cpu_provisional"]):
         if _is_expired(value):
-            value["reservation"].update({"state": "released", "released_at": utc_now(),
-                                         "release_reason": "provisional_expired"})
+            value["reservation"].update(
+                {"state": "released", "released_at": utc_now(), "release_reason": "provisional_expired"}
+            )
             atomic_replace(paths["cpu_released"] / path.name, value)
             path.unlink(missing_ok=True)
 
@@ -70,8 +70,7 @@ def get_cpu_lane_policy(runtime_root: Path | Any) -> CpuLanePolicy:
 
 def _reservations(paths: dict[str, Path]) -> list[dict[str, Any]]:
     return [value["reservation"] for _, value in _values(paths["cpu_active"])] + [
-        value["reservation"] for _, value in _values(paths["cpu_provisional"])
-        if not _is_expired(value)
+        value["reservation"] for _, value in _values(paths["cpu_provisional"]) if not _is_expired(value)
     ]
 
 
@@ -96,9 +95,7 @@ def set_cpu_lane_capacity(runtime_root: Path | Any, *, capacity: int) -> CpuLane
         current = _policy(paths)
         reserved = sum(item.get("cpu_slots", 0) for item in _reservations(paths))
         if capacity < reserved:
-            raise ValueError(
-                f"CPU lane capacity {capacity} is below reserved CPU slots {reserved}."
-            )
+            raise ValueError(f"CPU lane capacity {capacity} is below reserved CPU slots {reserved}.")
         if capacity == current.capacity and paths["cpu_policy"].exists():
             return current
         updated = CpuLanePolicy(capacity, current.revision + 1)
@@ -138,9 +135,15 @@ def cpu_reservation_snapshot(runtime_root: Path) -> tuple[CpuLanePolicy, tuple[d
 
 
 def reserve_cpu(
-    runtime_root: Path, task_id: str, cpu_slots: int, *, attempt_id: str | None = None,
-    fencing_token: int | None = None, project_id: str | None = None,
-    shared_root: str | None = None, machine_name: str | None = None,
+    runtime_root: Path,
+    task_id: str,
+    cpu_slots: int,
+    *,
+    attempt_id: str | None = None,
+    fencing_token: int | None = None,
+    project_id: str | None = None,
+    shared_root: str | None = None,
+    machine_name: str | None = None,
     group_name: str | None = None,
 ) -> dict[str, Any]:
     """Reserve CPU slots provisionally after checking machine-global capacity."""
@@ -154,15 +157,28 @@ def reserve_cpu(
         if reserved + cpu_slots > policy.capacity:
             raise ValueError("CPU lane has insufficient free slots.")
         reservation_id = new_id()
-        value = {"reservation": {
-            "reservation_id": reservation_id, "acquisition_id": new_id(), "project_id": project_id,
-            "shared_root": shared_root, "group_name": group_name, "machine_name": machine_name,
-            "task_id": task_id, "attempt_id": attempt_id, "fencing_token": fencing_token,
-            "cpu_slots": cpu_slots, "state": "provisional", "created_at": utc_now(),
-            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=PROVISIONAL_TTL_SECONDS))
-            .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-            "released_at": None, "release_reason": None,
-        }}
+        value = {
+            "reservation": {
+                "reservation_id": reservation_id,
+                "acquisition_id": new_id(),
+                "project_id": project_id,
+                "shared_root": shared_root,
+                "group_name": group_name,
+                "machine_name": machine_name,
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "fencing_token": fencing_token,
+                "cpu_slots": cpu_slots,
+                "state": "provisional",
+                "created_at": utc_now(),
+                "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=PROVISIONAL_TTL_SECONDS))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "released_at": None,
+                "release_reason": None,
+            }
+        }
         atomic_replace(paths["cpu_provisional"] / f"{reservation_id}.json", value)
         return value
 
@@ -222,8 +238,7 @@ def release_cpu(runtime_root: Path, reservation_id: str, reason: str = "complete
             if not source.exists():
                 continue
             value = read_json(source)
-            value["reservation"].update({"state": "released", "released_at": utc_now(),
-                                         "release_reason": reason})
+            value["reservation"].update({"state": "released", "released_at": utc_now(), "release_reason": reason})
             atomic_replace(paths["cpu_released"] / source.name, value)
             source.unlink(missing_ok=True)
             return True

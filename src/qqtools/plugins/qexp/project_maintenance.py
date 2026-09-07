@@ -1,4 +1,5 @@
 """Project-scoped durable maintenance shared by qexp agents."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,14 +11,15 @@ from .config_types import RootConfig
 from .events import flush_local_events
 from .runtime.availability import (
     elapsed_offer_is_proven,
+    iter_due_deadline_paths,
+    iter_flat_deadline_paths,
+    migrate_legacy_deadline_indexes,
     reconcile_availability_operations,
     remove_deadline_index,
     sync_deadline_index,
-    iter_flat_deadline_paths,
-    iter_due_deadline_paths,
-    migrate_legacy_deadline_indexes,
 )
 from .runtime.claims import reconcile_claim_archives
+from .runtime.operation_store import migrate_legacy_active_operations
 from .runtime.paths import attempt_path, shared_paths
 from .runtime.placement import offer_due
 from .runtime.records import AttemptRecord
@@ -30,7 +32,6 @@ from .runtime.resources.reservations import (
 from .runtime.store import iter_json, read_json
 from .runtime.tasks import load_task
 from .runtime.work_budget import diagnostic_span
-from .runtime.operation_store import migrate_legacy_active_operations
 
 
 def maintain_project(

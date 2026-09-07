@@ -12,8 +12,8 @@ from qqtools.plugins.qpipeline.entry_utils.type_qconfig import EarlyStopConfig, 
 from qqtools.plugins.qpipeline.runner.agent import RunningAgent
 from qqtools.plugins.qpipeline.runner.contracts import EarlyStopDecision, EventListenerBindings, ObserverBindings
 from qqtools.plugins.qpipeline.runner.hooks import RunnerHooks
-from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointPlugin, CheckpointPolicy
 from qqtools.plugins.qpipeline.runner.runner import train_runner
+from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointPlugin, CheckpointPolicy
 from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMode
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
 

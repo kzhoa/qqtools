@@ -19,9 +19,7 @@ from qqtools.plugins.qexp.scheduler import claim_task
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
-def _setup_project(
-    tmp_path: Path, machines: tuple[str, ...] = ("g3", "g4")
-) -> tuple[Path, MachineRuntime]:
+def _setup_project(tmp_path: Path, machines: tuple[str, ...] = ("g3", "g4")) -> tuple[Path, MachineRuntime]:
     shared_root = tmp_path / ".qexp"
     for machine in machines:
         init_shared_root(shared_root, machine, runtime_root=tmp_path / f"{machine}-legacy")
@@ -40,22 +38,23 @@ def _args(shared_root: Path, runtime: MachineRuntime, *values: str) -> list[str]
     ]
 
 
-def _submit_remote_task(
-    shared_root: Path, runtime: MachineRuntime, capsys: pytest.CaptureFixture[str]
-) -> str:
-    assert main(
-        _args(
-            shared_root,
-            runtime,
-            "submit",
-            "--no-activate",
-            "--home-machine",
-            "g4",
-            "--",
-            "echo",
-            "ok",
+def _submit_remote_task(shared_root: Path, runtime: MachineRuntime, capsys: pytest.CaptureFixture[str]) -> str:
+    assert (
+        main(
+            _args(
+                shared_root,
+                runtime,
+                "submit",
+                "--no-activate",
+                "--home-machine",
+                "g4",
+                "--",
+                "echo",
+                "ok",
+            )
         )
-    ) == 0
+        == 0
+    )
     return capsys.readouterr().out.strip()
 
 
@@ -83,13 +82,16 @@ def test_remote_private_home_is_not_claimable_by_origin_but_is_claimable_by_home
     task_id = _submit_remote_task(shared_root, g3_runtime, capsys)
     g3_context = g3_runtime.verified_execution_context(shared_root)
 
-    assert claim_task(
-        g3_context.cfg,
-        task_id,
-        [0],
-        reservation_runtime_root=g3_runtime.root,
-        project_id=g3_context.project_id,
-    ) is None
+    assert (
+        claim_task(
+            g3_context.cfg,
+            task_id,
+            [0],
+            reservation_runtime_root=g3_runtime.root,
+            project_id=g3_context.project_id,
+        )
+        is None
+    )
 
     g4_runtime = MachineRuntime(tmp_path / "g4-machine-runtime")
     g4_runtime.add_binding(shared_root, "g4")
@@ -113,19 +115,22 @@ def test_remote_home_requires_a_current_generation_machine_record(
 ) -> None:
     shared_root, runtime = _setup_project(tmp_path, machines=("g3",))
 
-    assert main(
-        _args(
-            shared_root,
-            runtime,
-            "submit",
-            "--no-activate",
-            "--home-machine",
-            "g4",
-            "--",
-            "echo",
-            "missing",
+    assert (
+        main(
+            _args(
+                shared_root,
+                runtime,
+                "submit",
+                "--no-activate",
+                "--home-machine",
+                "g4",
+                "--",
+                "echo",
+                "missing",
+            )
         )
-    ) == 2
+        == 2
+    )
     assert "no current-generation Project machine record" in capsys.readouterr().err
     assert not list((shared_root / "tasks").glob("*.json"))
 
@@ -135,19 +140,22 @@ def test_empty_home_machine_is_rejected_instead_of_defaulting_to_current(
 ) -> None:
     shared_root, runtime = _setup_project(tmp_path)
 
-    assert main(
-        _args(
-            shared_root,
-            runtime,
-            "submit",
-            "--no-activate",
-            "--home-machine",
-            "",
-            "--",
-            "echo",
-            "invalid",
+    assert (
+        main(
+            _args(
+                shared_root,
+                runtime,
+                "submit",
+                "--no-activate",
+                "--home-machine",
+                "",
+                "--",
+                "echo",
+                "invalid",
+            )
         )
-    ) == 2
+        == 2
+    )
     assert "home_machine must contain only" in capsys.readouterr().err
     assert not list((shared_root / "tasks").glob("*.json"))
 
@@ -167,19 +175,22 @@ def test_remote_home_rejects_inconsistent_machine_record(
         record["machine"].pop(field)
     record_path.write_text(json.dumps(record), encoding="utf-8")
 
-    assert main(
-        _args(
-            shared_root,
-            runtime,
-            "submit",
-            "--no-activate",
-            "--home-machine",
-            "g4",
-            "--",
-            "echo",
-            "invalid",
+    assert (
+        main(
+            _args(
+                shared_root,
+                runtime,
+                "submit",
+                "--no-activate",
+                "--home-machine",
+                "g4",
+                "--",
+                "echo",
+                "invalid",
+            )
         )
-    ) == 2
+        == 2
+    )
     assert "current-generation Project machine record" in capsys.readouterr().err
     assert not list((shared_root / "tasks").glob("*.json"))
 
@@ -195,9 +206,7 @@ def test_remote_home_does_not_activate_the_target_agent(
         return True
 
     monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", activate)
-    assert main(
-        _args(shared_root, runtime, "submit", "--home-machine", "g4", "--", "echo", "ok")
-    ) == 0
+    assert main(_args(shared_root, runtime, "submit", "--home-machine", "g4", "--", "echo", "ok")) == 0
     capsys.readouterr()
     assert calls == [("g3", runtime.root)]
     assert not (tmp_path / "g4-machine-runtime").exists()
@@ -234,19 +243,22 @@ def test_machine_assertion_conflict_fails_before_mutation_even_without_activatio
 ) -> None:
     shared_root, runtime = _setup_project(tmp_path)
 
-    assert main(
-        _args(
-            shared_root,
-            runtime,
-            "--machine",
-            "g4",
-            "submit",
-            "--no-activate",
-            "--",
-            "echo",
-            "bad",
+    assert (
+        main(
+            _args(
+                shared_root,
+                runtime,
+                "--machine",
+                "g4",
+                "submit",
+                "--no-activate",
+                "--",
+                "echo",
+                "bad",
+            )
         )
-    ) == 2
+        == 2
+    )
     assert "Local project binding is 'g3', but --machine asserted 'g4'." in capsys.readouterr().err
     assert not list((shared_root / "tasks").glob("*.json"))
     assert not list((shared_root / "operations" / "submissions").glob("*.json"))
@@ -258,19 +270,22 @@ def test_flag_and_environment_machine_assertions_cannot_conflict(
     shared_root, runtime = _setup_project(tmp_path)
     monkeypatch.setenv("QEXP_MACHINE", "g4")
 
-    assert main(
-        _args(
-            shared_root,
-            runtime,
-            "--machine",
-            "g3",
-            "submit",
-            "--no-activate",
-            "--",
-            "echo",
-            "bad",
+    assert (
+        main(
+            _args(
+                shared_root,
+                runtime,
+                "--machine",
+                "g3",
+                "submit",
+                "--no-activate",
+                "--",
+                "echo",
+                "bad",
+            )
         )
-    ) == 2
+        == 2
+    )
     assert "conflicts with QEXP_MACHINE" in capsys.readouterr().err
     assert not list((shared_root / "tasks").glob("*.json"))
 
@@ -292,19 +307,22 @@ def test_saved_machine_and_legacy_runtime_do_not_override_verified_context(
         encoding="utf-8",
     )
 
-    assert main(
-        [
-            "--machine-runtime-root",
-            str(runtime.root),
-            "--runtime-root",
-            str(tmp_path / "another-wrong-runtime"),
-            "submit",
-            "--no-activate",
-            "--",
-            "echo",
-            "ok",
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                "--machine-runtime-root",
+                str(runtime.root),
+                "--runtime-root",
+                str(tmp_path / "another-wrong-runtime"),
+                "submit",
+                "--no-activate",
+                "--",
+                "echo",
+                "ok",
+            ]
+        )
+        == 0
+    )
     task_id = capsys.readouterr().out.strip()
     context = runtime.verified_execution_context(shared_root)
     assert load_task(context.cfg, task_id).placement_policy["home_machine"] == "g3"
@@ -322,44 +340,50 @@ def test_single_submit_does_not_create_missing_group_or_add_origin_worker(
 ) -> None:
     shared_root, runtime = _setup_project(tmp_path)
 
-    assert main(
-        _args(
-            shared_root,
-            runtime,
-            "submit",
-            "--no-activate",
-            "--group",
-            "missing",
-            "--home-machine",
-            "g4",
-            "--",
-            "echo",
-            "bad",
+    assert (
+        main(
+            _args(
+                shared_root,
+                runtime,
+                "submit",
+                "--no-activate",
+                "--group",
+                "missing",
+                "--home-machine",
+                "g4",
+                "--",
+                "echo",
+                "bad",
+            )
         )
-    ) == 2
+        == 2
+    )
     assert "does not exist" in capsys.readouterr().err
     assert not (shared_root / "groups" / "missing.json").exists()
     assert not list((shared_root / "tasks").glob("*.json"))
 
     assert main(_args(shared_root, runtime, "group", "create", "exp", "--workers", "g4")) == 0
     capsys.readouterr()
-    assert main(
-        _args(
-            shared_root,
-            runtime,
-            "submit",
-            "--no-activate",
-            "--group",
-            "exp",
-            "--home-machine",
-            "g4",
-            "--sharing",
-            "spillover",
-            "--",
-            "echo",
-            "ok",
+    assert (
+        main(
+            _args(
+                shared_root,
+                runtime,
+                "submit",
+                "--no-activate",
+                "--group",
+                "exp",
+                "--home-machine",
+                "g4",
+                "--sharing",
+                "spillover",
+                "--",
+                "echo",
+                "ok",
+            )
         )
-    ) == 0
+        == 0
+    )
     capsys.readouterr()
     assert set(read_json(group_path(shared_root, "exp"))["group"]["worker_set"]) == {"g4"}
 
@@ -388,9 +412,10 @@ def test_batch_manifest_can_atomically_create_exact_worker_set(
     )
     monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", lambda *args, **kwargs: True)
 
-    assert main(
-        _args(shared_root, runtime, "batch-submit", "--file", str(manifest), "--group", "exp", "--format=json")
-    ) == 0
+    assert (
+        main(_args(shared_root, runtime, "batch-submit", "--file", str(manifest), "--group", "exp", "--format=json"))
+        == 0
+    )
     result = json.loads(capsys.readouterr().out)
     assert result["state"] == "committed"
     assert set(read_json(group_path(shared_root, "exp"))["group"]["worker_set"]) == {"g4"}

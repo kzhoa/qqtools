@@ -1,4 +1,5 @@
 """Machine-local GPU reservation truth."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,10 +7,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from ..paths import local_paths
 from ..locks import exclusive
-from ..store import atomic_replace, iter_json, read_json
+from ..paths import local_paths
 from ..records import new_id, utc_now
+from ..store import atomic_replace, iter_json, read_json
 from ..work_budget import diagnostic_increment, diagnostic_span
 
 PROVISIONAL_TTL_SECONDS = 30
@@ -42,9 +43,10 @@ class ReservationIdentity:
             or not acquisition_id
             or not isinstance(task_id, str)
             or not task_id
-            or (gpu_ids is not None and (
-                not isinstance(gpu_ids, list) or any(type(gpu_id) is not int for gpu_id in gpu_ids)
-            ))
+            or (
+                gpu_ids is not None
+                and (not isinstance(gpu_ids, list) or any(type(gpu_id) is not int for gpu_id in gpu_ids))
+            )
             or (cpu_slots is not None and (type(cpu_slots) is not int or cpu_slots < 1))
             or ((gpu_ids is None) == (cpu_slots is None))
         ):
@@ -113,32 +115,39 @@ def _expire_provisionals(paths: dict[str, Path]) -> None:
     for path, value in _reservation_entries(paths["provisional"]):
         if not _is_expired(value):
             continue
-        value["reservation"].update({
-            "state": "released",
-            "released_at": utc_now(),
-            "release_reason": "provisional_expired",
-        })
+        value["reservation"].update(
+            {
+                "state": "released",
+                "released_at": utc_now(),
+                "release_reason": "provisional_expired",
+            }
+        )
         atomic_replace(paths["released"] / path.name, value)
         path.unlink(missing_ok=True)
 
 
 def _reserve_locked(
-    paths: dict[str, Path], task_id: str, gpu_ids: list[int], *, attempt_id: str | None,
-    fencing_token: int | None, project_id: str | None, shared_root: str | None,
-    machine_name: str | None, group_name: str | None,
-    worker_scheduling_role: str | None, gpu_limit_gpus: int | None,
-    group_worker_set_epoch: int | None, worker_state_epoch: int | None,
-    admitted_as_borrow: bool, enforce_gpu_limit: bool,
+    paths: dict[str, Path],
+    task_id: str,
+    gpu_ids: list[int],
+    *,
+    attempt_id: str | None,
+    fencing_token: int | None,
+    project_id: str | None,
+    shared_root: str | None,
+    machine_name: str | None,
+    group_name: str | None,
+    worker_scheduling_role: str | None,
+    gpu_limit_gpus: int | None,
+    group_worker_set_epoch: int | None,
+    worker_state_epoch: int | None,
+    admitted_as_borrow: bool,
+    enforce_gpu_limit: bool,
 ) -> dict[str, Any]:
     _expire_provisionals(paths)
     active = _reservation_values(paths["active"])
-    provisional = [
-        value for value in _reservation_values(paths["provisional"])
-        if not _is_expired(value)
-    ]
-    if {
-        gpu for value in active + provisional for gpu in value["reservation"]["gpu_ids"]
-    }.intersection(gpu_ids):
+    provisional = [value for value in _reservation_values(paths["provisional"]) if not _is_expired(value)]
+    if {gpu for value in active + provisional for gpu in value["reservation"]["gpu_ids"]}.intersection(gpu_ids):
         raise ValueError("requested GPU is already reserved by qexp.")
     if enforce_gpu_limit and gpu_limit_gpus is not None:
         usage = sum(
@@ -149,76 +158,115 @@ def _reserve_locked(
             and value["reservation"].get("machine_name") == machine_name
         )
         if usage + len(gpu_ids) > gpu_limit_gpus:
-            raise ValueError(
-                f"Group {group_name!r} GPU limit on machine {machine_name!r} would be exceeded."
-            )
+            raise ValueError(f"Group {group_name!r} GPU limit on machine {machine_name!r} would be exceeded.")
     reservation_id = new_id()
-    value = {"reservation": {
-        "reservation_id": reservation_id,
-        "acquisition_id": new_id(),
-        "project_id": project_id,
-        "shared_root": shared_root,
-        "group_name": group_name,
-        "machine_name": machine_name,
-        "task_id": task_id,
-        "attempt_id": attempt_id,
-        "fencing_token": fencing_token,
-        "gpu_ids": list(gpu_ids),
-        "admission": {
-            "worker_scheduling_role": worker_scheduling_role,
-            "gpu_limit_gpus": gpu_limit_gpus,
-            "group_worker_set_epoch": group_worker_set_epoch,
-            "worker_state_epoch": worker_state_epoch,
-            "admitted_as_borrow": admitted_as_borrow,
-        },
-        "state": "provisional",
-        "created_at": utc_now(),
-        "expires_at": (
-            datetime.now(timezone.utc) + timedelta(seconds=PROVISIONAL_TTL_SECONDS)
-        ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        "released_at": None,
-        "release_reason": None,
-    }}
+    value = {
+        "reservation": {
+            "reservation_id": reservation_id,
+            "acquisition_id": new_id(),
+            "project_id": project_id,
+            "shared_root": shared_root,
+            "group_name": group_name,
+            "machine_name": machine_name,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "fencing_token": fencing_token,
+            "gpu_ids": list(gpu_ids),
+            "admission": {
+                "worker_scheduling_role": worker_scheduling_role,
+                "gpu_limit_gpus": gpu_limit_gpus,
+                "group_worker_set_epoch": group_worker_set_epoch,
+                "worker_state_epoch": worker_state_epoch,
+                "admitted_as_borrow": admitted_as_borrow,
+            },
+            "state": "provisional",
+            "created_at": utc_now(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=PROVISIONAL_TTL_SECONDS))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "released_at": None,
+            "release_reason": None,
+        }
+    }
     atomic_replace(paths["provisional"] / f"{reservation_id}.json", value)
     return value
 
 
-def reserve(runtime_root: Path, task_id: str, gpu_ids: list[int], *, attempt_id: str | None = None,
-            fencing_token: int | None = None, project_id: str | None = None,
-            shared_root: str | None = None, machine_name: str | None = None,
-            group_name: str | None = None, worker_scheduling_role: str | None = None,
-            gpu_limit_gpus: int | None = None, group_worker_set_epoch: int | None = None,
-            worker_state_epoch: int | None = None,
-            admitted_as_borrow: bool = False) -> dict[str, Any]:
+def reserve(
+    runtime_root: Path,
+    task_id: str,
+    gpu_ids: list[int],
+    *,
+    attempt_id: str | None = None,
+    fencing_token: int | None = None,
+    project_id: str | None = None,
+    shared_root: str | None = None,
+    machine_name: str | None = None,
+    group_name: str | None = None,
+    worker_scheduling_role: str | None = None,
+    gpu_limit_gpus: int | None = None,
+    group_worker_set_epoch: int | None = None,
+    worker_state_epoch: int | None = None,
+    admitted_as_borrow: bool = False,
+) -> dict[str, Any]:
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
         return _reserve_locked(
-            paths, task_id, gpu_ids, attempt_id=attempt_id, fencing_token=fencing_token,
-            project_id=project_id, shared_root=shared_root, machine_name=machine_name,
-            group_name=group_name, worker_scheduling_role=worker_scheduling_role,
+            paths,
+            task_id,
+            gpu_ids,
+            attempt_id=attempt_id,
+            fencing_token=fencing_token,
+            project_id=project_id,
+            shared_root=shared_root,
+            machine_name=machine_name,
+            group_name=group_name,
+            worker_scheduling_role=worker_scheduling_role,
             gpu_limit_gpus=gpu_limit_gpus,
-            group_worker_set_epoch=group_worker_set_epoch, worker_state_epoch=worker_state_epoch,
-            admitted_as_borrow=admitted_as_borrow, enforce_gpu_limit=False,
+            group_worker_set_epoch=group_worker_set_epoch,
+            worker_state_epoch=worker_state_epoch,
+            admitted_as_borrow=admitted_as_borrow,
+            enforce_gpu_limit=False,
         )
 
 
 def reserve_admitted(
-    runtime_root: Path, task_id: str, gpu_ids: list[int], *, project_id: str,
-    group_name: str, machine_name: str, gpu_limit_gpus: int | None,
-    worker_scheduling_role: str, group_worker_set_epoch: int, worker_state_epoch: int,
-    attempt_id: str | None = None, fencing_token: int | None = None,
-    shared_root: str | None = None, admitted_as_borrow: bool = True,
+    runtime_root: Path,
+    task_id: str,
+    gpu_ids: list[int],
+    *,
+    project_id: str,
+    group_name: str,
+    machine_name: str,
+    gpu_limit_gpus: int | None,
+    worker_scheduling_role: str,
+    group_worker_set_epoch: int,
+    worker_state_epoch: int,
+    attempt_id: str | None = None,
+    fencing_token: int | None = None,
+    shared_root: str | None = None,
+    admitted_as_borrow: bool = True,
 ) -> dict[str, Any]:
     """Atomically reserve GPUs after Group/Task admission authorization."""
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
         return _reserve_locked(
-            paths, task_id, gpu_ids, attempt_id=attempt_id, fencing_token=fencing_token,
-            project_id=project_id, shared_root=shared_root, machine_name=machine_name,
-            group_name=group_name, worker_scheduling_role=worker_scheduling_role,
+            paths,
+            task_id,
+            gpu_ids,
+            attempt_id=attempt_id,
+            fencing_token=fencing_token,
+            project_id=project_id,
+            shared_root=shared_root,
+            machine_name=machine_name,
+            group_name=group_name,
+            worker_scheduling_role=worker_scheduling_role,
             gpu_limit_gpus=gpu_limit_gpus,
-            group_worker_set_epoch=group_worker_set_epoch, worker_state_epoch=worker_state_epoch,
-            admitted_as_borrow=admitted_as_borrow, enforce_gpu_limit=True,
+            group_worker_set_epoch=group_worker_set_epoch,
+            worker_state_epoch=worker_state_epoch,
+            admitted_as_borrow=admitted_as_borrow,
+            enforce_gpu_limit=True,
         )
 
 
@@ -282,8 +330,10 @@ def retag_if_matches(
 def release(runtime_root: Path, reservation_id: str, reason: str = "completed") -> None:
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
-        source = next((path for path in (paths["active"], paths["provisional"])
-                       if (path / f"{reservation_id}.json").exists()), None)
+        source = next(
+            (path for path in (paths["active"], paths["provisional"]) if (path / f"{reservation_id}.json").exists()),
+            None,
+        )
         if source is not None:
             source_file = source / f"{reservation_id}.json"
             value = read_json(source_file)
@@ -292,6 +342,7 @@ def release(runtime_root: Path, reservation_id: str, reason: str = "completed") 
             source_file.unlink(missing_ok=True)
             return
     from .cpu_lane import release_cpu
+
     release_cpu(runtime_root, reservation_id, reason)
 
 
@@ -303,6 +354,7 @@ def release_if_matches(
     """Release an active reservation only if its full identity is unchanged."""
     if identity.cpu_slots is not None:
         from .cpu_lane import release_cpu_if_matches
+
         return release_cpu_if_matches(runtime_root, identity, reason)
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
@@ -327,8 +379,7 @@ def release_if_matches(
 
 def reserved_gpu_ids(runtime_root: Path) -> set[int]:
     paths = local_paths(runtime_root)
-    active = {gpu for value in _reservation_values(paths["active"])
-              for gpu in value["reservation"]["gpu_ids"]}
+    active = {gpu for value in _reservation_values(paths["active"]) for gpu in value["reservation"]["gpu_ids"]}
     provisional = {
         gpu
         for value in _reservation_values(paths["provisional"])
@@ -348,9 +399,7 @@ def reservation_snapshot(runtime_root: Path) -> ReservationSnapshot:
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
         active = [value["reservation"] for value in _reservation_values(paths["active"])]
         provisional = [
-            value["reservation"]
-            for value in _reservation_values(paths["provisional"])
-            if not _is_expired(value)
+            value["reservation"] for value in _reservation_values(paths["provisional"]) if not _is_expired(value)
         ]
         reserved = {
             gpu_id
@@ -366,13 +415,9 @@ def reservation_snapshot(runtime_root: Path) -> ReservationSnapshot:
 
     _policy, cpu_reservations = cpu_reservation_snapshot(runtime_root)
     return ReservationSnapshot(
-        gpu_snapshot.active + tuple(
-            item for item in cpu_reservations if item.get("state") == "active"
-        ),
+        gpu_snapshot.active + tuple(item for item in cpu_reservations if item.get("state") == "active"),
         gpu_snapshot.reserved_gpu_ids,
-        gpu_snapshot.provisional + tuple(
-            item for item in cpu_reservations if item.get("state") == "provisional"
-        ),
+        gpu_snapshot.provisional + tuple(item for item in cpu_reservations if item.get("state") == "provisional"),
     )
 
 
@@ -392,14 +437,9 @@ def reconcile_snapshot(runtime_root: Path) -> ReservationSnapshot:
             )
             atomic_replace(paths["released"] / path.name, value)
             path.unlink(missing_ok=True)
-        active = [
-            value["reservation"]
-            for value in _reservation_values(paths["active"])
-        ]
+        active = [value["reservation"] for value in _reservation_values(paths["active"])]
         provisional = [
-            value["reservation"]
-            for value in _reservation_values(paths["provisional"])
-            if not _is_expired(value)
+            value["reservation"] for value in _reservation_values(paths["provisional"]) if not _is_expired(value)
         ]
         reserved = {
             gpu_id
@@ -412,13 +452,9 @@ def reconcile_snapshot(runtime_root: Path) -> ReservationSnapshot:
 
     _policy, cpu_reservations = cpu_reservation_snapshot(runtime_root)
     return ReservationSnapshot(
-        gpu_snapshot.active + tuple(
-            item for item in cpu_reservations if item.get("state") == "active"
-        ),
+        gpu_snapshot.active + tuple(item for item in cpu_reservations if item.get("state") == "active"),
         gpu_snapshot.reserved_gpu_ids,
-        gpu_snapshot.provisional + tuple(
-            item for item in cpu_reservations if item.get("state") == "provisional"
-        ),
+        gpu_snapshot.provisional + tuple(item for item in cpu_reservations if item.get("state") == "provisional"),
     )
 
 
@@ -429,8 +465,9 @@ def release_expired_provisionals(runtime_root: Path) -> list[str]:
         for path, value in _reservation_entries(paths["provisional"]):
             if _is_expired(value):
                 reservation_id = value["reservation"]["reservation_id"]
-                value["reservation"].update({"state": "released", "released_at": utc_now(),
-                                               "release_reason": "provisional_expired"})
+                value["reservation"].update(
+                    {"state": "released", "released_at": utc_now(), "release_reason": "provisional_expired"}
+                )
                 atomic_replace(paths["released"] / path.name, value)
                 path.unlink(missing_ok=True)
                 released.append(reservation_id)

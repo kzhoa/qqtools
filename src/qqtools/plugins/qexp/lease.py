@@ -1,4 +1,5 @@
 """Clock-capability evidence and fenced lease policy for qexp schema 6."""
+
 from __future__ import annotations
 
 import ctypes
@@ -18,7 +19,6 @@ from .config_types import RootConfig
 from .runtime.paths import local_paths, shared_paths
 from .runtime.records import utc_now
 from .runtime.store import atomic_replace, read_json
-
 
 AUTHORITY_MODES = ("bounded_lease", "holder_bound")
 
@@ -95,7 +95,9 @@ class LeasePolicy:
             raise ValueError("clock skew and renewal commit margin must be positive.")
         if self.clock_observation_max_age_seconds <= 0 or self.clock_provider_margin_seconds < 0:
             raise ValueError("clock observation age and provider margin are invalid.")
-        if not self.clock_provider_priority or len(set(self.clock_provider_priority)) != len(self.clock_provider_priority):
+        if not self.clock_provider_priority or len(set(self.clock_provider_priority)) != len(
+            self.clock_provider_priority
+        ):
             raise ValueError("clock provider priority must contain unique providers.")
         if set(self.clock_provider_priority) - {"chrony", "linux_adjtimex"}:
             raise ValueError("clock provider priority contains an unsupported provider.")
@@ -183,9 +185,12 @@ def save_lease_policy(cfg: RootConfig, policy: LeasePolicy) -> None:
 
 
 def lease_expiry(policy: LeasePolicy) -> str:
-    return (datetime.now(timezone.utc) + timedelta(seconds=policy.ttl_seconds)).replace(
-        microsecond=0
-    ).isoformat().replace("+00:00", "Z")
+    return (
+        (datetime.now(timezone.utc) + timedelta(seconds=policy.ttl_seconds))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def parse_utc(value: str) -> datetime:
@@ -196,16 +201,17 @@ def holder_safe_deadline(expires_at: str, holder_bound_seconds: float) -> dateti
     return parse_utc(expires_at) - timedelta(seconds=holder_bound_seconds)
 
 
-def reclaim_allowed_at(expires_at: str, holder_bound_seconds: float,
-                       reclaimer_bound_seconds: float) -> datetime:
-    return parse_utc(expires_at) + timedelta(
-        seconds=holder_bound_seconds + reclaimer_bound_seconds
-    )
+def reclaim_allowed_at(expires_at: str, holder_bound_seconds: float, reclaimer_bound_seconds: float) -> datetime:
+    return parse_utc(expires_at) + timedelta(seconds=holder_bound_seconds + reclaimer_bound_seconds)
 
 
-def new_timed_offer_proof(observation: ClockObservation, after_seconds: int, *,
-                          wall_now: datetime | None = None,
-                          monotonic_now: float | None = None) -> tuple[str, dict[str, Any]]:
+def new_timed_offer_proof(
+    observation: ClockObservation,
+    after_seconds: int,
+    *,
+    wall_now: datetime | None = None,
+    monotonic_now: float | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Create the immutable creator-side proof for a timed sharing deadline."""
     if not isinstance(after_seconds, int) or after_seconds < 0:
         raise ValueError("timed offer delay must be a non-negative integer.")
@@ -234,12 +240,20 @@ def timed_offer_deadline_upper(deadline: str, proof: dict[str, Any]) -> datetime
         deadline_at = parse_utc(deadline)
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ValueError("timed offer proof is malformed.") from exc
-    numeric = (observation.monotonic_observed_at, observation.lower_error_seconds,
-               observation.upper_error_seconds, observation.max_drift_rate,
-               observation.provider_margin_seconds, deadline_monotonic_at)
-    if (any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in numeric)
-            or observation.max_drift_rate < 0 or observation.provider_margin_seconds < 0
-            or deadline_monotonic_at < observation.monotonic_observed_at):
+    numeric = (
+        observation.monotonic_observed_at,
+        observation.lower_error_seconds,
+        observation.upper_error_seconds,
+        observation.max_drift_rate,
+        observation.provider_margin_seconds,
+        deadline_monotonic_at,
+    )
+    if (
+        any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in numeric)
+        or observation.max_drift_rate < 0
+        or observation.provider_margin_seconds < 0
+        or deadline_monotonic_at < observation.monotonic_observed_at
+    ):
         raise ValueError("timed offer deadline monotonic time is invalid.")
     try:
         return deadline_at + timedelta(seconds=observation.bound_at(deadline_monotonic_at))
@@ -263,8 +277,7 @@ def _boot_id() -> str:
 
 def _chrony_observation(policy: LeasePolicy, *, run: Callable[..., Any] = subprocess.run) -> ClockObservation:
     try:
-        completed = run(["chronyc", "tracking", "-n"], check=False, capture_output=True,
-                        text=True, timeout=5)
+        completed = run(["chronyc", "tracking", "-n"], check=False, capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"chrony_unavailable:{type(exc).__name__}") from exc
     if completed.returncode:
@@ -279,20 +292,42 @@ def _chrony_observation(policy: LeasePolicy, *, run: Callable[..., Any] = subpro
     # chrony reports remaining system correction plus the NTP root distance components.
     # Root delay contributes half its round-trip delay to one-way UTC uncertainty.
     observed = abs(float(offset.group(1))) + abs(float(root_delay.group(1))) / 2 + float(dispersion.group(1))
-    return ClockObservation(uuid.uuid4().hex, "chrony", utc_now(), time.monotonic(), _boot_id(),
-                            -observed, observed, float(skew.group(1)) / 1_000_000,
-                            policy.clock_provider_margin_seconds)
+    return ClockObservation(
+        uuid.uuid4().hex,
+        "chrony",
+        utc_now(),
+        time.monotonic(),
+        _boot_id(),
+        -observed,
+        observed,
+        float(skew.group(1)) / 1_000_000,
+        policy.clock_provider_margin_seconds,
+    )
 
 
 class _Timex(ctypes.Structure):
     _fields_ = [
-        ("modes", ctypes.c_uint), ("offset", ctypes.c_long), ("freq", ctypes.c_long),
-        ("maxerror", ctypes.c_long), ("esterror", ctypes.c_long), ("status", ctypes.c_int),
-        ("constant", ctypes.c_long), ("precision", ctypes.c_long), ("tolerance", ctypes.c_long),
-        ("time_sec", ctypes.c_long), ("time_usec", ctypes.c_long), ("tick", ctypes.c_long),
-        ("ppsfreq", ctypes.c_long), ("jitter", ctypes.c_long), ("shift", ctypes.c_int),
-        ("stabil", ctypes.c_long), ("jitcnt", ctypes.c_long), ("calcnt", ctypes.c_long),
-        ("errcnt", ctypes.c_long), ("stbcnt", ctypes.c_long), ("tai", ctypes.c_int),
+        ("modes", ctypes.c_uint),
+        ("offset", ctypes.c_long),
+        ("freq", ctypes.c_long),
+        ("maxerror", ctypes.c_long),
+        ("esterror", ctypes.c_long),
+        ("status", ctypes.c_int),
+        ("constant", ctypes.c_long),
+        ("precision", ctypes.c_long),
+        ("tolerance", ctypes.c_long),
+        ("time_sec", ctypes.c_long),
+        ("time_usec", ctypes.c_long),
+        ("tick", ctypes.c_long),
+        ("ppsfreq", ctypes.c_long),
+        ("jitter", ctypes.c_long),
+        ("shift", ctypes.c_int),
+        ("stabil", ctypes.c_long),
+        ("jitcnt", ctypes.c_long),
+        ("calcnt", ctypes.c_long),
+        ("errcnt", ctypes.c_long),
+        ("stbcnt", ctypes.c_long),
+        ("tai", ctypes.c_int),
     ]
 
 
@@ -320,9 +355,17 @@ def _adjtimex_observation(policy: LeasePolicy) -> ClockObservation:
     # clock precision is included as a second independent conservative lower bound.
     observed = max(value.maxerror / 1_000_000, (value.esterror + value.precision) / 1_000_000)
     # Linux stores tolerance in the same 16.16 ppm representation as frequency.
-    return ClockObservation(uuid.uuid4().hex, "linux_adjtimex", utc_now(), time.monotonic(), _boot_id(),
-                            -observed, observed, value.tolerance / (65_536 * 1_000_000),
-                            policy.clock_provider_margin_seconds)
+    return ClockObservation(
+        uuid.uuid4().hex,
+        "linux_adjtimex",
+        utc_now(),
+        time.monotonic(),
+        _boot_id(),
+        -observed,
+        observed,
+        value.tolerance / (65_536 * 1_000_000),
+        policy.clock_provider_margin_seconds,
+    )
 
 
 def chrony_health(policy: LeasePolicy, *, run: Callable[..., Any] = subprocess.run) -> tuple[bool, str]:
@@ -359,9 +402,12 @@ def clock_capability(cfg: RootConfig, policy: LeasePolicy | None = None) -> Cloc
     try:
         cached = read_json(path).get("clock_capability", {})
         observation = ClockObservation.from_dict(cached["observation"])
-        if (cached.get("status") == "healthy" and observation.boot_id == _boot_id()
-                and now_mono - observation.monotonic_observed_at <= policy.clock_observation_max_age_seconds
-                and observation.bound_at(now_mono) <= policy.max_clock_skew_seconds):
+        if (
+            cached.get("status") == "healthy"
+            and observation.boot_id == _boot_id()
+            and now_mono - observation.monotonic_observed_at <= policy.clock_observation_max_age_seconds
+            and observation.bound_at(now_mono) <= policy.max_clock_skew_seconds
+        ):
             return ClockCapability("healthy", "healthy", observation, tuple(cached.get("providers", [])))
     except (KeyError, OSError, TypeError, ValueError):
         pass
@@ -369,23 +415,32 @@ def clock_capability(cfg: RootConfig, policy: LeasePolicy | None = None) -> Cloc
     qualifying = [item for item in observations if item.bound_at(now_mono) <= policy.max_clock_skew_seconds]
     if not qualifying:
         status = "unavailable" if not observations else "unhealthy"
-        capability = ClockCapability(status, ";".join(reasons) or "clock_error_bound_exceeds_policy", None,
-                                      tuple(item.provider for item in observations))
+        capability = ClockCapability(
+            status,
+            ";".join(reasons) or "clock_error_bound_exceeds_policy",
+            None,
+            tuple(item.provider for item in observations),
+        )
     else:
         intervals = [item.interval_at(now_mono) for item in qualifying]
         lower = max(item[0] for item in intervals)
         upper = min(item[1] for item in intervals)
         if lower > upper:
-            capability = ClockCapability("unhealthy", "provider_conflict", None,
-                                          tuple(item.provider for item in qualifying))
+            capability = ClockCapability(
+                "unhealthy", "provider_conflict", None, tuple(item.provider for item in qualifying)
+            )
         else:
-            selected = next(item for name in policy.clock_provider_priority for item in qualifying
-                            if item.provider == name)
-            capability = ClockCapability("healthy", "healthy", selected,
-                                          tuple(item.provider for item in qualifying))
+            selected = next(
+                item for name in policy.clock_provider_priority for item in qualifying if item.provider == name
+            )
+            capability = ClockCapability("healthy", "healthy", selected, tuple(item.provider for item in qualifying))
     try:
-        payload: dict[str, Any] = {"status": capability.status, "reason": capability.reason,
-                                   "providers": list(capability.providers), "checked_at": utc_now()}
+        payload: dict[str, Any] = {
+            "status": capability.status,
+            "reason": capability.reason,
+            "providers": list(capability.providers),
+            "checked_at": utc_now(),
+        }
         if capability.observation:
             payload["observation"] = capability.observation.to_dict()
         atomic_replace(path, {"clock_capability": payload})

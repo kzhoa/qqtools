@@ -61,8 +61,7 @@ class _FileLockWriteGuard:
             writer()
             if not self.is_ready():
                 raise RuntimeError(
-                    "Guarded writer completed, but the readiness check is still false: "
-                    f"{self.lock_path}"
+                    f"Guarded writer completed, but the readiness check is still false: {self.lock_path}"
                 )
         return True
 
@@ -97,9 +96,7 @@ class qLmdbDatasetBase(qDictDataset):
     @property
     def lmdb_files(self) -> list[str | Path]:
         """Return dataset-local LMDB paths relative to ``root``."""
-        raise NotImplementedError(
-            "`lmdb_files` is not defined. Override `lmdb_files` or `lmdb_paths()`."
-        )
+        raise NotImplementedError("`lmdb_files` is not defined. Override `lmdb_files` or `lmdb_paths()`.")
 
     def lmdb_paths(self) -> list[Path]:
         """Resolve and optionally sort :attr:`lmdb_files` under ``root``."""
@@ -158,9 +155,7 @@ class qLmdbDatasetBase(qDictDataset):
         blob = self._transactions[shard_idx].get(key)
         if blob is None:
             path = self._lmdb_paths[shard_idx]
-            raise IndexError(
-                f"Missing LMDB sample key {key!r} at local index {local_idx} in {path}"
-            )
+            raise IndexError(f"Missing LMDB sample key {key!r} at local index {local_idx} in {path}")
         return blob
 
     def len(self) -> int:
@@ -252,24 +247,15 @@ class qLmdbDatasetBase(qDictDataset):
                     try:
                         decoded_length = pickle.loads(raw_length)
                     except Exception as exc:
-                        raise RuntimeError(
-                            f"Failed to decode LMDB length metadata in {path}"
-                        ) from exc
+                        raise RuntimeError(f"Failed to decode LMDB length metadata in {path}") from exc
                     if isinstance(decoded_length, (bool, np.bool_)) or not isinstance(
                         decoded_length,
                         (int, np.integer),
                     ):
-                        raise RuntimeError(
-                            f"LMDB length metadata must be an integer in {path}, "
-                            f"got {decoded_length!r}"
-                        )
+                        raise RuntimeError(f"LMDB length metadata must be an integer in {path}, got {decoded_length!r}")
                     length = int(decoded_length)
                 else:
-                    length = sum(
-                        1
-                        for key in transaction.cursor().iternext(keys=True, values=False)
-                        if key.isdigit()
-                    )
+                    length = sum(1 for key in transaction.cursor().iternext(keys=True, values=False) if key.isdigit())
         finally:
             environment.close()
 
@@ -390,10 +376,7 @@ class qLmdbDataset(qLmdbDatasetBase):
         self.is_graph = bool(is_graph)
         self.balance_mode = str(balance_mode)
         if self.balance_mode not in {"none", "runtime", "rewrite"}:
-            raise ValueError(
-                "balance_mode must be 'none', 'runtime', or 'rewrite', "
-                f"got {balance_mode!r}"
-            )
+            raise ValueError(f"balance_mode must be 'none', 'runtime', or 'rewrite', got {balance_mode!r}")
         self._has_balance = self.balance_mode != "none"
         self._has_rewrite = self.balance_mode == "rewrite"
         self.balance_seed = int(balance_seed)
@@ -406,11 +389,7 @@ class qLmdbDataset(qLmdbDatasetBase):
         self._uses_staged_rewrite = self._has_rewrite and rewrite_staging_dir is not None
         self._effective_costs_cache: np.ndarray | None = None
         self._effective_order_cache: np.ndarray | None = None
-        iter_sample_costs = (
-            self._iter_sample_costs_sequential
-            if self._uses_staged_rewrite
-            else None
-        )
+        iter_sample_costs = self._iter_sample_costs_sequential if self._uses_staged_rewrite else None
         self._balance = _BalancedDatasetProvider(
             host=self,
             enabled=self._has_balance,
@@ -506,9 +485,7 @@ class qLmdbDataset(qLmdbDatasetBase):
         self._ensure_layout_loaded()
         shard_lengths = self._shard_lengths or ()
         source_start = 0
-        for shard_idx, (path, shard_length) in enumerate(
-            zip(self._source_lmdb_paths, shard_lengths, strict=True)
-        ):
+        for shard_idx, (path, shard_length) in enumerate(zip(self._source_lmdb_paths, shard_lengths, strict=True)):
             environment = self._open_sequential_environment(path)
             sample_count = 0
             try:
@@ -523,23 +500,18 @@ class qLmdbDataset(qLmdbDatasetBase):
                         canonical_key = str(local_idx).encode("ascii")
                         if key != canonical_key:
                             raise RuntimeError(
-                                "Sequential rewrite requires canonical ASCII sample keys; "
-                                f"found {key!r} in {path}"
+                                f"Sequential rewrite requires canonical ASCII sample keys; found {key!r} in {path}"
                             )
                         if local_idx < 0 or local_idx >= shard_length:
                             raise RuntimeError(
-                                f"Sample key {key!r} is outside shard {shard_idx} range "
-                                f"[0, {shard_length}) in {path}"
+                                f"Sample key {key!r} is outside shard {shard_idx} range [0, {shard_length}) in {path}"
                             )
                         sample_count += 1
                         yield source_start + local_idx, bytes(blob)
             finally:
                 environment.close()
             if sample_count != shard_length:
-                raise RuntimeError(
-                    f"Shard {path} contains {sample_count} canonical samples, "
-                    f"expected {shard_length}"
-                )
+                raise RuntimeError(f"Shard {path} contains {sample_count} canonical samples, expected {shard_length}")
             source_start += shard_length
 
     def _iter_sample_costs_sequential(self) -> Iterator[tuple[int, int | float]]:
@@ -644,9 +616,7 @@ class qLmdbDataset(qLmdbDatasetBase):
     ) -> str | BaseContext | None:
         if num_workers == 0:
             if context is not None:
-                raise ValueError(
-                    "multiprocessing_context requires num_workers > 0"
-                )
+                raise ValueError("multiprocessing_context requires num_workers > 0")
             return None
         if context is not None:
             return context
@@ -674,9 +644,7 @@ class qLmdbDataset(qLmdbDatasetBase):
 
         target_path = self.rewrite_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = target_path.with_name(
-            f".{target_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
+        temporary_path = target_path.with_name(f".{target_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         temporary_lock_path = Path(f"{temporary_path}-lock")
         map_size = self._estimate_rewrite_map_size()
         environment = None
@@ -773,10 +741,7 @@ class qLmdbDataset(qLmdbDatasetBase):
 
         if residuals:
             formatted = ", ".join(str(path) for path in residuals)
-            raise RuntimeError(
-                "Unable to clean stale staged rewrite assets before building: "
-                f"{formatted}"
-            )
+            raise RuntimeError(f"Unable to clean stale staged rewrite assets before building: {formatted}")
         self._ensure_layout_loaded()
         if not self._cumulative_sizes or self._cumulative_sizes[-1] == 0:
             return
@@ -889,9 +854,7 @@ class qLmdbDataset(qLmdbDatasetBase):
                 transaction.commit()
                 transaction = None
             if staged_count != total:
-                raise RuntimeError(
-                    f"Staging contains {staged_count} samples, expected {total}"
-                )
+                raise RuntimeError(f"Staging contains {staged_count} samples, expected {total}")
             environment.sync()
             environment.close()
             environment = None
@@ -899,9 +862,7 @@ class qLmdbDataset(qLmdbDatasetBase):
             return staging_path, staged_count
         except Exception as exc:
             if exc.__class__.__name__ == "MapFullError":
-                raise RuntimeError(
-                    f"Staging LMDB map is full (estimated map_size={map_size})"
-                ) from exc
+                raise RuntimeError(f"Staging LMDB map is full (estimated map_size={map_size})") from exc
             raise
         finally:
             if transaction is not None:
@@ -916,9 +877,7 @@ class qLmdbDataset(qLmdbDatasetBase):
         """Validate staging continuity and stream it into the public LMDB format."""
         target_path = self.rewrite_path
         digest = self._staged_workspace.name.removeprefix("qlmdbdataset-")
-        temporary_path = target_path.with_name(
-            f".{target_path.name}.{digest}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
+        temporary_path = target_path.with_name(f".{target_path.name}.{digest}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         temporary_lock_path = Path(f"{temporary_path}-lock")
         source_environment = None
         final_environment = None
@@ -947,8 +906,7 @@ class qLmdbDataset(qLmdbDatasetBase):
                     actual_idx = int.from_bytes(key, "big")
                     if actual_idx != expected_idx:
                         raise RuntimeError(
-                            f"Staging key continuity violation: expected {expected_idx}, "
-                            f"found {actual_idx}"
+                            f"Staging key continuity violation: expected {expected_idx}, found {actual_idx}"
                         )
                     transaction.put(str(expected_idx).encode("ascii"), bytes(blob))
                     expected_idx += 1
@@ -956,9 +914,7 @@ class qLmdbDataset(qLmdbDatasetBase):
                         transaction.commit()
                         transaction = final_environment.begin(write=True)
             if expected_idx != total:
-                raise RuntimeError(
-                    f"Staging contains {expected_idx} samples, expected {total}"
-                )
+                raise RuntimeError(f"Staging contains {expected_idx} samples, expected {total}")
             transaction.put(b"length", pickle.dumps(total))
             transaction.commit()
             transaction = None
@@ -973,10 +929,7 @@ class qLmdbDataset(qLmdbDatasetBase):
             return temporary_path
         except Exception as exc:
             if exc.__class__.__name__ == "MapFullError":
-                raise RuntimeError(
-                    "Final rewrite LMDB map is full "
-                    f"(estimated map_size={final_map_size})"
-                ) from exc
+                raise RuntimeError(f"Final rewrite LMDB map is full (estimated map_size={final_map_size})") from exc
             raise
         finally:
             if transaction is not None:
@@ -993,9 +946,7 @@ class qLmdbDataset(qLmdbDatasetBase):
         target_path = self.rewrite_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
         digest = self._staged_workspace.name.removeprefix("qlmdbdataset-")
-        temporary_path = target_path.with_name(
-            f".{target_path.name}.{digest}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
+        temporary_path = target_path.with_name(f".{target_path.name}.{digest}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         environment = None
         transaction = None
         try:
@@ -1048,9 +999,7 @@ class qLmdbDataset(qLmdbDatasetBase):
                 raise RuntimeError(f"Staging count {staged_count} != expected {total}")
             self._write_final_from_staging(staging_path, total)
         except Exception as exc:
-            build_error = RuntimeError(
-                f"Failed to materialize staged rewritten LMDB at {self.rewrite_path}"
-            )
+            build_error = RuntimeError(f"Failed to materialize staged rewritten LMDB at {self.rewrite_path}")
             build_error.__cause__ = exc
         finally:
             cleanup_errors: list[str] = []
@@ -1072,9 +1021,7 @@ class qLmdbDataset(qLmdbDatasetBase):
                 except Exception as exc:
                     cleanup_errors.append(f"{path}: {exc}")
             if cleanup_errors:
-                message = "Staged rewrite cleanup left residual assets: " + "; ".join(
-                    cleanup_errors
-                )
+                message = "Staged rewrite cleanup left residual assets: " + "; ".join(cleanup_errors)
                 if build_error is None:
                     build_error = RuntimeError(message)
                 else:

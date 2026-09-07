@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).parents[3]
 RUNTIME_ROOT = PROJECT_ROOT / "src/qqtools/plugins/qexp/runtime"
 OLD_RUNTIME_MODULES = {

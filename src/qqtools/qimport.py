@@ -1,7 +1,7 @@
 import sys
 from importlib import import_module
 
-__all__ = ["LazyImport", "LazyImportErrorProxy" "is_imported", "import_common"]
+__all__ = ["LazyImport", "LazyImportErrorProxy", "is_imported", "import_common"]
 
 
 def _try_import(pkg):
@@ -14,7 +14,7 @@ def _try_import(pkg):
 
 def is_imported(module_name: str):
     ans = module_name in sys.modules
-    print(f"{module_name}{''if ans else ' not'} in sys.modules")
+    print(f"{module_name}{'' if ans else ' not'} in sys.modules")
     return ans
 
 

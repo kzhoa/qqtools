@@ -135,18 +135,16 @@ class SliceBudget:
     def can_start_record(self, *, operations: int = 1, check_deadline: bool = True) -> bool:
         if type(operations) is not int or operations <= 0:
             raise ValueError("record operations must be a positive integer.")
-        return (
-            self.records_used < self.policy.record_hard_limit
-            and self.can_start_operation(operations=operations, check_deadline=check_deadline)
+        return self.records_used < self.policy.record_hard_limit and self.can_start_operation(
+            operations=operations, check_deadline=check_deadline
         )
 
     def can_start_operation(self, *, operations: int = 1, check_deadline: bool = True) -> bool:
         """Return whether more bounded I/O may begin in this slice."""
         if type(operations) is not int or operations <= 0:
             raise ValueError("operation count must be a positive integer.")
-        return (
-            self.operations_used + operations <= self.policy.operation_hard_limit
-            and (not check_deadline or self.clock_ns() < self._deadline_ns)
+        return self.operations_used + operations <= self.policy.operation_hard_limit and (
+            not check_deadline or self.clock_ns() < self._deadline_ns
         )
 
     def consume_operation(self, *, operations: int = 1) -> None:

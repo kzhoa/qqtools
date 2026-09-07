@@ -9,11 +9,18 @@ from qqtools.plugins.qexp.notifications.feishu import FeishuNotifier, Notificati
 
 
 def _event(**overrides):
-    values = {"phase": "failed", "task_id": "task-a", "attempt_id": "attempt-a",
-              "reason": "nonzero_exit", "exit_code": None,
-              "execution_machine_name": "gpu-a", "dispatching_machine_name": "gpu-b",
-              "finished_at": "2026-08-07T00:00:00Z", "execution_started_at": None,
-              "duration_ms": None}
+    values = {
+        "phase": "failed",
+        "task_id": "task-a",
+        "attempt_id": "attempt-a",
+        "reason": "nonzero_exit",
+        "exit_code": None,
+        "execution_machine_name": "gpu-a",
+        "dispatching_machine_name": "gpu-b",
+        "finished_at": "2026-08-07T00:00:00Z",
+        "execution_started_at": None,
+        "duration_ms": None,
+    }
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -56,27 +63,34 @@ def test_feishu_payload_and_business_success():
         "template": "red",
         "title": {"tag": "plain_text", "content": "qexp 任务失败"},
     }
-    assert payload["card"]["elements"] == [{
-        "tag": "markdown",
-        "content": "\n".join((
-            "- **Task ID**: `task-a`",
-            "- **Attempt ID**: `attempt-a`",
-            "- **原因**: `nonzero_exit`",
-            "- **退出码**: `（未记录）`",
-            "- **执行机器**: `gpu-a`",
-            "- **通知机器**: `gpu-b`",
-            "- **开始时间**: `（未记录）`",
-            "- **执行时长**: `（未记录）`",
-            "- **通知机器时间**: `2026-08-07T00:00:00Z`",
-        )),
-    }]
+    assert payload["card"]["elements"] == [
+        {
+            "tag": "markdown",
+            "content": "\n".join(
+                (
+                    "- **Task ID**: `task-a`",
+                    "- **Attempt ID**: `attempt-a`",
+                    "- **原因**: `nonzero_exit`",
+                    "- **退出码**: `（未记录）`",
+                    "- **执行机器**: `gpu-a`",
+                    "- **通知机器**: `gpu-b`",
+                    "- **开始时间**: `（未记录）`",
+                    "- **执行时长**: `（未记录）`",
+                    "- **通知机器时间**: `2026-08-07T00:00:00Z`",
+                )
+            ),
+        }
+    ]
     assert b"secret" not in seen["data"]
 
 
-@pytest.mark.parametrize(("phase", "template", "title"), [
-    ("succeeded", "green", "qexp 任务成功"),
-    ("cancelled", "orange", "qexp 任务已取消"),
-])
+@pytest.mark.parametrize(
+    ("phase", "template", "title"),
+    [
+        ("succeeded", "green", "qexp 任务成功"),
+        ("cancelled", "orange", "qexp 任务已取消"),
+    ],
+)
 def test_feishu_card_uses_phase_status_colours(phase, template, title):
     seen = {}
 
@@ -100,11 +114,14 @@ def test_feishu_card_uses_phase_status_colours(phase, template, title):
     }
 
 
-@pytest.mark.parametrize(("machine_name", "expected"), [
-    (None, "（未记录）"),
-    (" \t ", "（未记录）"),
-    ("gpu`a\\b\nnext\rrow\tcell", "gpu\\`a\\\\b\\nnext\\rrow\\tcell"),
-])
+@pytest.mark.parametrize(
+    ("machine_name", "expected"),
+    [
+        (None, "（未记录）"),
+        (" \t ", "（未记录）"),
+        ("gpu`a\\b\nnext\rrow\tcell", "gpu\\`a\\\\b\\nnext\\rrow\\tcell"),
+    ],
+)
 def test_feishu_card_safely_displays_machine_name(machine_name, expected):
     seen = {}
 
@@ -165,22 +182,30 @@ def test_malformed_unknown_provider_does_not_abort_dispatch(monkeypatch):
 
     monkeypatch.setattr(
         "qqtools.plugins.qexp.layout.load_machine_record",
-        lambda _cfg: {"notifications": {"enabled": True, "providers": {
-            "future_provider": "malformed",
-            "feishu": {"enabled": False},
-        }}},
+        lambda _cfg: {
+            "notifications": {
+                "enabled": True,
+                "providers": {
+                    "future_provider": "malformed",
+                    "feishu": {"enabled": False},
+                },
+            }
+        },
     )
     monkeypatch.setattr(
         "qqtools.plugins.qexp.notifications._safe_diagnostic",
-        lambda _cfg, event_type, _event, key, reason, outcome, **_kwargs:
-            diagnostics.append((event_type, key, reason, outcome)),
+        lambda _cfg, event_type, _event, key, reason, outcome, **_kwargs: diagnostics.append(
+            (event_type, key, reason, outcome)
+        ),
     )
 
     NotificationHook(registry={}).handle(cfg, _event())
 
-    assert diagnostics == [(
-        "notification_skipped",
-        notification_key("future_provider", _event()),
-        "unknown_provider",
-        "skipped",
-    )]
+    assert diagnostics == [
+        (
+            "notification_skipped",
+            notification_key("future_provider", _event()),
+            "unknown_provider",
+            "skipped",
+        )
+    ]

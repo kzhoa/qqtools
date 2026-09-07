@@ -10,6 +10,7 @@ from qqtools.plugins.qexp.runtime.work_budget import RuntimeDiagnostics, activat
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 def test_runtime_diagnostics_count_task_reads_and_machine_stages(tmp_path: Path) -> None:
     work_dir = tmp_path / "work"
     work_dir.mkdir()

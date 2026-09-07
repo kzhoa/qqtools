@@ -1,5 +1,6 @@
-from typing import Dict, List, Any, Union
 import warnings
+from typing import Any, Dict, List, Union
+
 import torch
 
 from qqtools.torch import qdist

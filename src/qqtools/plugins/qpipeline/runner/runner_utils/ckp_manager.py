@@ -127,8 +127,7 @@ class CheckpointManager:
             if owner_error is not None:
                 raise owner_error
             raise RuntimeError(
-                "Checkpoint persistence failed on owner: "
-                f"{outcome['error_type']}: {outcome['error_message']}"
+                f"Checkpoint persistence failed on owner: {outcome['error_type']}: {outcome['error_message']}"
             )
         checkpoint_path = outcome["path"]
         if not isinstance(checkpoint_path, str) or not checkpoint_path:
@@ -358,9 +357,7 @@ class CheckpointPlugin:
         else:
             source_ranks = [0] if local_nan else []
         if source_ranks:
-            raise RuntimeError(
-                f"NaN detected before checkpoint persistence on ranks={source_ranks}."
-            )
+            raise RuntimeError(f"NaN detected before checkpoint persistence on ranks={source_ranks}.")
 
     def _save(self, checkpoint_type: str) -> None:
         checkpoint_path = self.checkpoint_manager.save(

@@ -6,11 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from qqtools.plugins.qpipeline.entry_utils.no_decay import (
-    build_param_groups,
-    collect_no_decay_params,
-)
-
+from qqtools.plugins.qpipeline.entry_utils.no_decay import build_param_groups, collect_no_decay_params
 
 # ---------------------------------------------------------------------------
 # Test Models

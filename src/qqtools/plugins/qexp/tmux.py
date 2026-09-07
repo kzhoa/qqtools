@@ -31,8 +31,7 @@ def require_libtmux():
         return importlib.import_module("libtmux")
     except Exception as exc:
         raise RuntimeError(
-            "libtmux is required for qexp. Install optional dependencies with "
-            "'pip install qqtools[exp]'."
+            "libtmux is required for qexp. Install optional dependencies with 'pip install qqtools[exp]'."
         ) from exc
 
 

@@ -13,6 +13,7 @@ from qqtools.plugins.qexp.runtime.store import read_json
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 def _manifest(tmp_path: Path, body: str) -> Path:
     path = tmp_path / "runs.yaml"
     path.write_text(body, encoding="utf-8")
@@ -112,12 +113,14 @@ tasks:
 
 def test_submission_rejects_obsolete_worker_limit_field():
     with pytest.raises(ValueError, match="obsolete borrow_limit_gpus"):
-        submission_runtime._worker_additions({
-            "gpu-1": {
-                "scheduling_role": "borrow",
-                "borrow_limit_gpus": 2,
+        submission_runtime._worker_additions(
+            {
+                "gpu-1": {
+                    "scheduling_role": "borrow",
+                    "borrow_limit_gpus": 2,
+                }
             }
-        })
+        )
 
 
 def test_manifest_rejects_duplicate_yaml_machine_keys(tmp_path: Path):
@@ -190,9 +193,7 @@ tasks:
         "primary: [g1]\n  borrow:\n    g2: nope",
     ],
 )
-def test_manifest_rejects_invalid_worker_pool_before_group_creation(
-    tmp_path: Path, workers: str
-):
+def test_manifest_rejects_invalid_worker_pool_before_group_creation(tmp_path: Path, workers: str):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     manifest = _manifest(
         tmp_path,
@@ -452,9 +453,7 @@ tasks:
     assert not list((cfg.shared_root / "tasks").glob("*.json"))
 
 
-def test_failed_operation_commit_removes_operation_owned_group(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_failed_operation_commit_removes_operation_owned_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
     manifest = _manifest(
@@ -488,9 +487,7 @@ tasks:
     assert read_json(operation_files[0])["submission"]["state"] == "aborted"
 
 
-def test_committed_operation_keeps_group_pending_when_finalizer_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_committed_operation_keeps_group_pending_when_finalizer_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
     manifest = _manifest(
@@ -508,9 +505,7 @@ tasks:
     original_atomic_replace = submission_runtime.atomic_replace
 
     def fail_group_finalizer(path: Path, value: dict) -> None:
-        if path == group_path(cfg.shared_root, "exp") and value["group"].get(
-            "pending_submission_commit"
-        ) is None:
+        if path == group_path(cfg.shared_root, "exp") and value["group"].get("pending_submission_commit") is None:
             raise OSError("simulated Group finalizer failure")
         original_atomic_replace(path, value)
 
@@ -536,9 +531,7 @@ tasks:
     assert group["group"]["next_membership_sequence"] == 2
 
 
-def test_group_cancel_finalizes_committed_submission_before_watermark(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_group_cancel_finalizes_committed_submission_before_watermark(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
     manifest = _manifest(
@@ -555,9 +548,7 @@ tasks:
     original_atomic_replace = submission_runtime.atomic_replace
 
     def fail_group_finalizer(path: Path, value: dict) -> None:
-        if path == group_path(cfg.shared_root, "exp") and value["group"].get(
-            "pending_submission_commit"
-        ) is None:
+        if path == group_path(cfg.shared_root, "exp") and value["group"].get("pending_submission_commit") is None:
             raise OSError("simulated Group finalizer failure")
         original_atomic_replace(path, value)
 

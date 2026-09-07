@@ -66,10 +66,7 @@ def main(start_method: str, root: str) -> None:
     root_path = Path(root)
     _prepare_lmdb(root_path)
     barrier = context.Barrier(2)
-    processes = [
-        context.Process(target=_write_artifact, args=(root, barrier))
-        for _ in range(2)
-    ]
+    processes = [context.Process(target=_write_artifact, args=(root, barrier)) for _ in range(2)]
     for process in processes:
         process.start()
     for process in processes:
@@ -79,11 +76,7 @@ def main(start_method: str, root: str) -> None:
     assert root_path.joinpath("artifact.ready").read_text(encoding="utf-8") == "ready"
     writer_lines = root_path.joinpath("writers.log").read_text(encoding="utf-8").splitlines()
     assert len(writer_lines) == 1
-    rewrite_writer_lines = (
-        root_path.joinpath("rewrite_writers.log")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    )
+    rewrite_writer_lines = root_path.joinpath("rewrite_writers.log").read_text(encoding="utf-8").splitlines()
     assert len(rewrite_writer_lines) == 1
 
 

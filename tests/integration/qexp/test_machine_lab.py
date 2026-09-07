@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import offer

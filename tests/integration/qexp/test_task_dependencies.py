@@ -1,5 +1,5 @@
-from pathlib import Path
 from multiprocessing import get_context
+from pathlib import Path
 
 import pytest
 
@@ -7,13 +7,12 @@ from qqtools.plugins.qexp.commands.cleanup import clean
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import cancel, edit_dependencies, submit
 from qqtools.plugins.qexp.machine_config import init_shared_root
+from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.dependencies import dependency_gate
 from qqtools.plugins.qexp.runtime.locks import group_lock
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import claim_task
-from qqtools.plugins.qexp.runtime import submission as submission_runtime
-
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -32,11 +31,13 @@ def _probe_group_lock(root: Path, group_name: str, connection) -> None:
 
 def test_dependency_gate_blocks_claim_and_reports_cancelled_parent(tmp_path: Path) -> None:
     cfg = _group_config(tmp_path)
-    parent = submit(
-        cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path
-    )
+    parent = submit(cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path)
     child = submit(
-        cfg, ["echo", "child"], task_id="child", group="experiment", working_dir=tmp_path,
+        cfg,
+        ["echo", "child"],
+        task_id="child",
+        group="experiment",
+        working_dir=tmp_path,
         depends_on_task_ids=[parent.task_id],
     )
 
@@ -52,12 +53,8 @@ def test_dependency_gate_blocks_claim_and_reports_cancelled_parent(tmp_path: Pat
 
 def test_batch_dependencies_are_checked_as_one_graph_and_edits_are_guarded(tmp_path: Path) -> None:
     cfg = _group_config(tmp_path)
-    parent = submit(
-        cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path
-    )
-    child = submit(
-        cfg, ["echo", "child"], task_id="child", group="experiment", working_dir=tmp_path
-    )
+    parent = submit(cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path)
+    child = submit(cfg, ["echo", "child"], task_id="child", group="experiment", working_dir=tmp_path)
 
     updated = edit_dependencies(cfg, child.task_id, [parent.task_id], action="add")
     assert updated.depends_on_task_ids == [parent.task_id]
@@ -69,11 +66,13 @@ def test_batch_dependencies_are_checked_as_one_graph_and_edits_are_guarded(tmp_p
 
 def test_cleanup_refuses_task_retained_by_a_downstream_dependency(tmp_path: Path) -> None:
     cfg = _group_config(tmp_path)
-    parent = submit(
-        cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path
-    )
+    parent = submit(cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path)
     submit(
-        cfg, ["echo", "child"], task_id="child", group="experiment", working_dir=tmp_path,
+        cfg,
+        ["echo", "child"],
+        task_id="child",
+        group="experiment",
+        working_dir=tmp_path,
         depends_on_task_ids=[parent.task_id],
     )
     cancel(cfg, parent.task_id)
@@ -83,12 +82,11 @@ def test_cleanup_refuses_task_retained_by_a_downstream_dependency(tmp_path: Path
 
 
 def test_dependency_submission_holds_group_lock_through_task_publication(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = _group_config(tmp_path)
-    parent = submit(
-        cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path
-    )
+    parent = submit(cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path)
     original_save = submission_runtime.save_task
     observed_locks: list[bool] = []
 
@@ -110,7 +108,11 @@ def test_dependency_submission_holds_group_lock_through_task_publication(
 
     monkeypatch.setattr(submission_runtime, "save_task", observe_save)
     submit(
-        cfg, ["echo", "child"], task_id="child", group="experiment", working_dir=tmp_path,
+        cfg,
+        ["echo", "child"],
+        task_id="child",
+        group="experiment",
+        working_dir=tmp_path,
         depends_on_task_ids=[parent.task_id],
     )
 
@@ -119,12 +121,8 @@ def test_dependency_submission_holds_group_lock_through_task_publication(
 
 def test_dependency_edits_require_activated_dependency_capability(tmp_path: Path) -> None:
     cfg = _group_config(tmp_path)
-    parent = submit(
-        cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path
-    )
-    child = submit(
-        cfg, ["echo", "child"], task_id="child", group="experiment", working_dir=tmp_path
-    )
+    parent = submit(cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path)
+    child = submit(cfg, ["echo", "child"], task_id="child", group="experiment", working_dir=tmp_path)
     schema_path = cfg.shared_root / "schema" / "version.json"
     schema = read_json(schema_path)
     schema["schema"]["required_capabilities"].remove("task-dependencies-v1")
@@ -136,12 +134,8 @@ def test_dependency_edits_require_activated_dependency_capability(tmp_path: Path
 
 def test_uncommitted_task_cannot_be_referenced_or_edited(tmp_path: Path) -> None:
     cfg = _group_config(tmp_path)
-    parent = submit(
-        cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path
-    )
-    operation_path = cfg.shared_root / "operations" / "submissions" / (
-        f"{parent.submission_operation_id}.json"
-    )
+    parent = submit(cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path)
+    operation_path = cfg.shared_root / "operations" / "submissions" / (f"{parent.submission_operation_id}.json")
     operation = read_json(operation_path)
     operation["submission"]["state"] = "committing"
     atomic_replace(operation_path, operation)
@@ -162,40 +156,30 @@ def test_uncommitted_task_cannot_be_referenced_or_edited(tmp_path: Path) -> None
 def test_legacy_dependency_submission_replay_is_rejected(tmp_path: Path) -> None:
     cfg = _group_config(tmp_path)
     specs = [{"task_id": "legacy", "command": ["echo", "legacy"], "depends_on_task_ids": []}]
-    first = submission_runtime.submit_specs(
-        cfg, specs, group_name="experiment", idempotency_key="legacy-key"
-    )
+    first = submission_runtime.submit_specs(cfg, specs, group_name="experiment", idempotency_key="legacy-key")
     operation_path = cfg.shared_root / "operations" / "submissions" / f"{first.operation_id}.json"
     operation = read_json(operation_path)
     del operation["submission"]["resolved_context"]["task_specs"][0]["depends_on_task_ids"]
     atomic_replace(operation_path, operation)
 
     with pytest.raises(RuntimeError, match="predates the canonical task-dependencies-v1 protocol"):
-        submission_runtime.submit_specs(
-            cfg, specs, group_name="experiment", idempotency_key="legacy-key"
-        )
+        submission_runtime.submit_specs(cfg, specs, group_name="experiment", idempotency_key="legacy-key")
 
 
 def test_legacy_dependency_idempotency_digest_is_rejected(tmp_path: Path) -> None:
     cfg = _group_config(tmp_path)
     specs = [{"task_id": "legacy", "command": ["echo", "legacy"], "depends_on_task_ids": []}]
-    first = submission_runtime.submit_specs(
-        cfg, specs, group_name="experiment", idempotency_key="legacy-key"
-    )
+    first = submission_runtime.submit_specs(cfg, specs, group_name="experiment", idempotency_key="legacy-key")
     operation_path = cfg.shared_root / "operations" / "submissions" / f"{first.operation_id}.json"
     operation = read_json(operation_path)
     operation["submission"]["raw_request_digest"] = submission_runtime.semantic_digest(
         {
             "group": "experiment",
-            "tasks": [
-                {"task_id": "legacy", "command": ["echo", "legacy"], "home_machine": "current"}
-            ],
+            "tasks": [{"task_id": "legacy", "command": ["echo", "legacy"], "home_machine": "current"}],
             "worker_set": {},
         }
     )
     atomic_replace(operation_path, operation)
 
     with pytest.raises(submission_runtime.IdempotencyConflict, match="different semantic input"):
-        submission_runtime.submit_specs(
-            cfg, specs, group_name="experiment", idempotency_key="legacy-key"
-        )
+        submission_runtime.submit_specs(cfg, specs, group_name="experiment", idempotency_key="legacy-key")

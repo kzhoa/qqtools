@@ -33,23 +33,21 @@ from .runner_utils.ckp_manager import CheckpointManager, CheckpointPlugin, Check
 from .runner_utils.common import _getattr_or_default, _is_periodic_trigger, move_batch_to_device
 from .runner_utils.earlystop import EarlyStopController, EarlyStopper
 from .runner_utils.epoch_suffix import standardize_epoch_suffixes
-from .runner_utils.evaluation import EvaluationResult
 from .runner_utils.eval_formatter import EvalSummaryObserver
-from .runner_utils.progress import ProgressTracker
+from .runner_utils.evaluation import EvaluationResult
 from .runner_utils.metrics_jsonl import MetricsJsonlLogger, MetricsJsonlObserver
-from .runner_utils.types import (
-    RunConfig,
-    RunMode,
-    RunningState,
-    TerminalEvent,
-    TerminalReason,
-    TrainRunnerResult,
-)
+from .runner_utils.progress import ProgressTracker
+from .runner_utils.types import RunConfig, RunMode, RunningState, TerminalEvent, TerminalReason, TrainRunnerResult
 
 __all__ = ["train_runner", "MetricsJsonlObserver"]
 
 TerminalCause = Literal[
-    "normal_finish", "early_stop", "user_interrupt", "exception", "nan_detected", "logger_failure",
+    "normal_finish",
+    "early_stop",
+    "user_interrupt",
+    "exception",
+    "nan_detected",
+    "logger_failure",
 ]
 
 
@@ -224,7 +222,6 @@ def _finalize_train_runner(
         )
 
 
-
 def _close_runner_logger(logger: qLogger, owns_logger: bool) -> None:
     if owns_logger:
         logger.close()
@@ -334,13 +331,13 @@ def _resolve_step_mode_max_steps(
 
     if not _is_positive_int(max_epochs):
         raise ValueError(
-            f"max_epochs={max_epochs!r} is not a positive integer; " "cannot infer max_steps when run_mode='step'."
+            f"max_epochs={max_epochs!r} is not a positive integer; cannot infer max_steps when run_mode='step'."
         )
 
     effective_accum_grad = 1 if accum_grad is None else accum_grad
     if not _is_positive_int(effective_accum_grad):
         raise ValueError(
-            f"accum_grad={accum_grad!r} is not a positive integer; " "cannot infer max_steps when run_mode='step'."
+            f"accum_grad={accum_grad!r} is not a positive integer; cannot infer max_steps when run_mode='step'."
         )
 
     try:
@@ -365,7 +362,6 @@ def _resolve_step_mode_max_steps(
             f"and max_epochs={max_epochs}."
         ],
     )
-
 
 
 # Design Rationale: Boundary Policy Ownership
@@ -441,8 +437,7 @@ def train_runner(
         raise ValueError("The 'args' parameter is required to configure the runner.")
     if scheduler is not None and optimizer is None:
         raise ValueError(
-            "Cannot pass scheduler without optimizer. A scheduler must be bound to "
-            "the optimizer it was created with."
+            "Cannot pass scheduler without optimizer. A scheduler must be bound to the optimizer it was created with."
         )
     if accum_grad is not None:
         if isinstance(accum_grad, bool) or not isinstance(accum_grad, int):
@@ -527,9 +522,7 @@ def train_runner(
     checkpoint_target = _qconfig_get(checkpoint_config, "target", "val_metric")
     checkpoint_mode = _qconfig_get(checkpoint_config, "mode", "min")
     checkpoint_min_delta = _qconfig_get(checkpoint_config, "min_delta", 0.0)
-    checkpoint_keep_only_latest_regular = _qconfig_get(
-        checkpoint_config, "regular_latest_only", True
-    )
+    checkpoint_keep_only_latest_regular = _qconfig_get(checkpoint_config, "regular_latest_only", True)
     if not isinstance(checkpoint_keep_only_latest_regular, bool):
         raise ValueError("runner.checkpoint.regular_latest_only must be a boolean")
     checkpoint_policy = CheckpointPolicy(
@@ -561,9 +554,10 @@ def train_runner(
         device=device,
         ddp_eval_dedup=ddp_eval_dedup,
     )
-    scheduler_target = _qconfig_get(
-        _qconfig_get(getattr(args, "optim", None), "scheduler_params", None), "target", "val_metric"
-    ) or "val_metric"
+    scheduler_target = (
+        _qconfig_get(_qconfig_get(getattr(args, "optim", None), "scheduler_params", None), "target", "val_metric")
+        or "val_metric"
+    )
     targets = (
         checkpoint_target,
         _qconfig_get(early_stop_config, "target", "val_metric"),
@@ -640,9 +634,7 @@ def train_runner(
     if task.has_implemented("on_early_stop"):
         observers.bind("early_stop", task.on_early_stop, policy="settled_fatal")
 
-    progress_tracker = ProgressTracker(
-        logger, config.print_freq, render_type=config.render_type, rank=config.rank
-    )
+    progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type, rank=config.rank)
     observers.bind("epoch_started", progress_tracker.on_epoch_start)
     observers.bind("progress_tick", progress_tracker.on_progress_tick)
     observers.bind("table_update", progress_tracker.on_table_update)

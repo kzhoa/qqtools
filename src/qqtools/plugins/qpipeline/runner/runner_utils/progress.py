@@ -30,12 +30,11 @@ from ..contracts import (
 try:
     import rich
     from rich import box
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.live import Live
     from rich.progress import BarColumn, Progress, ProgressColumn, SpinnerColumn, TextColumn
     from rich.table import Table
     from rich.text import Text
-    from rich.console import Group
 
     HAS_RICH = True
 except ImportError:
@@ -87,11 +86,7 @@ if HAS_RICH:
             completed = int(task.completed / (task.total or 1) * self.bar_width)
             remaining = self.bar_width - completed - 1
 
-            bar_str = (
-                "[#1BBAE9]" + ("😼" * completed) +
-                "[#ff00d7]😸" +
-                "[white]" + ("🐟" * max(0, remaining))
-            )
+            bar_str = "[#1BBAE9]" + ("😼" * completed) + "[#ff00d7]😸" + "[white]" + ("🐟" * max(0, remaining))
             return Text.from_markup(bar_str)
 
     class CustomETAColumn(ProgressColumn):
@@ -453,10 +448,7 @@ if HAS_TQDM:
         def on_eval_end(self, context: EvaluationCommittedFact):
             state = getattr(self, "_saved_state", None)
             if state and state.get("total") is not None:
-                desc = (
-                    state.get("desc")
-                    or f"[{(self.current_stage or 'train').capitalize()}] Epoch {context.epoch}"
-                )
+                desc = state.get("desc") or f"[{(self.current_stage or 'train').capitalize()}] Epoch {context.epoch}"
                 # Use `initial` to restore completed count
                 self.pbar = tqdm(total=state["total"], desc=desc, leave=False, dynamic_ncols=True, initial=state["n"])
 

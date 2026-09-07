@@ -1,4 +1,5 @@
 """Value types shared by qexp configuration modules."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

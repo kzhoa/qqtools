@@ -3,15 +3,11 @@ from pathlib import Path
 from qqtools.plugins.qexp.commands.task import submit
 from qqtools.plugins.qexp.executor import Executor
 from qqtools.plugins.qexp.machine_config import init_shared_root
-from qqtools.plugins.qexp.runtime.resources.cpu_lane import (
-    cpu_reservation_snapshot,
-    release_cpu,
-    set_cpu_lane_capacity,
-)
-from qqtools.plugins.qexp.runtime.paths import task_path
 from qqtools.plugins.qexp.project_maintenance import reconcile_project_reservations
-from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, run_dispatch_cycle
+from qqtools.plugins.qexp.runtime.paths import task_path
+from qqtools.plugins.qexp.runtime.resources.cpu_lane import cpu_reservation_snapshot, release_cpu, set_cpu_lane_capacity
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, run_dispatch_cycle
 
 
 class _RecordingExecutor(Executor):
@@ -57,7 +53,10 @@ def test_legacy_root_rejects_cpu_only_submission_without_task_write(tmp_path: Pa
 
     try:
         submit(
-            cfg, ["echo", "no"], requested_gpus=0, requested_cpus=1,
+            cfg,
+            ["echo", "no"],
+            requested_gpus=0,
+            requested_cpus=1,
             working_dir=working_directory,
         )
     except ValueError as exc:
@@ -67,9 +66,7 @@ def test_legacy_root_rejects_cpu_only_submission_without_task_write(tmp_path: Pa
     assert not list((cfg.shared_root / "tasks").glob("*.json"))
 
 
-def test_cpu_claim_race_does_not_consume_the_next_task_slot(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_cpu_claim_race_does_not_consume_the_next_task_slot(tmp_path: Path, monkeypatch) -> None:
     working_directory = tmp_path / "work"
     working_directory.mkdir()
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "cpu-host")

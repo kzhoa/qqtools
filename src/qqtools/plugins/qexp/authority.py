@@ -1,4 +1,5 @@
 """Agent-owned runtime authority for locally registered qexp processes."""
+
 from __future__ import annotations
 
 import shutil
@@ -6,21 +7,25 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+
 from .config_types import RootConfig
-from .lifecycle import (TerminalTransition, commit_terminal_transition_locked,
-                         dispatch_task_lifecycle_hooks_noexcept)
-from .lease import (AuthorityResolutionOutcome, LeasePolicy, LeaseRenewalOutcome,
-                    holder_safe_deadline, load_lease_policy)
+from .lease import AuthorityResolutionOutcome, LeasePolicy, LeaseRenewalOutcome, holder_safe_deadline, load_lease_policy
+from .lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
 from .runtime.claims import archive_claim
 from .runtime.paths import attempt_path, local_paths
 from .runtime.records import AttemptRecord, utc_now
 from .runtime.resources.reservations import release
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.tasks import load_task, save_task
-from .runtime.termination import (attempt_control_lock, commit_local_unavailable, commit_signal,
-                                  create_decision, send_signals, update_decision)
-from .scheduler import (authority_locks, commit_shared_termination, renew_attempt_lease,
-                        resolve_execution_authority)
+from .runtime.termination import (
+    attempt_control_lock,
+    commit_local_unavailable,
+    commit_signal,
+    create_decision,
+    send_signals,
+    update_decision,
+)
+from .scheduler import authority_locks, commit_shared_termination, renew_attempt_lease, resolve_execution_authority
 
 
 class AuthoritySupervisor:
@@ -70,9 +75,12 @@ class AuthoritySupervisor:
         try:
             self._policy = load_lease_policy(self.cfg)
             self._policy_load_failed = False
-            atomic_replace(local_paths(self.cfg.runtime_root)["lease_policy_cache"], {
-                "lease_policy": asdict(self._policy),
-            })
+            atomic_replace(
+                local_paths(self.cfg.runtime_root)["lease_policy_cache"],
+                {
+                    "lease_policy": asdict(self._policy),
+                },
+            )
         except (OSError, RuntimeError, ValueError):
             self._policy_load_failed = True
             try:
@@ -91,8 +99,10 @@ class AuthoritySupervisor:
             value["error_type"] = type(error).__name__
             value["error"] = str(error)
         try:
-            atomic_replace(local_paths(self.cfg.runtime_root)["authority_diagnostics"] / f"{attempt_id}.json",
-                           {"authority_diagnostic": value})
+            atomic_replace(
+                local_paths(self.cfg.runtime_root)["authority_diagnostics"] / f"{attempt_id}.json",
+                {"authority_diagnostic": value},
+            )
         except OSError:
             pass
 
@@ -103,8 +113,7 @@ class AuthoritySupervisor:
         self._states[attempt_id] = state
         process["authority_state"] = state
         try:
-            atomic_replace(local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json",
-                           {"process": process})
+            atomic_replace(local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json", {"process": process})
         except OSError:
             pass
 
@@ -118,8 +127,12 @@ class AuthoritySupervisor:
         policy = self._policy
         expires = self._lease_expiries.get(attempt_id) or process.get("lease_expires_at")
         holder_bound = process.get("clock_error_bound_seconds")
-        if (policy and isinstance(expires, str) and isinstance(holder_bound, (int, float))
-                and datetime.now(timezone.utc) >= holder_safe_deadline(expires, holder_bound)):
+        if (
+            policy
+            and isinstance(expires, str)
+            and isinstance(holder_bound, (int, float))
+            and datetime.now(timezone.utc) >= holder_safe_deadline(expires, holder_bound)
+        ):
             self._set_authority_state(process, "isolated")
         else:
             self._set_authority_state(process, "suspect")
@@ -142,14 +155,26 @@ class AuthoritySupervisor:
                     attempt = AttemptRecord.from_dict(read_json(attempt_path(self.cfg.shared_root, task_id, number)))
                 except (FileNotFoundError, KeyError, ValueError):
                     return
-                if (claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != token
-                        or claim.get("machine_name") != self.cfg.machine_name
-                        or attempt.attempt_id != attempt_id or attempt.current_fencing_token != token
-                        or attempt.machine_name != self.cfg.machine_name):
+                if (
+                    claim.get("attempt_id") != attempt_id
+                    or claim.get("fencing_token") != token
+                    or claim.get("machine_name") != self.cfg.machine_name
+                    or attempt.attempt_id != attempt_id
+                    or attempt.current_fencing_token != token
+                    or attempt.machine_name != self.cfg.machine_name
+                ):
                     return
-                if claim.get("launch_state") not in {"starting", "running"} or attempt.phase not in {"starting", "running"}:
+                if claim.get("launch_state") not in {"starting", "running"} or attempt.phase not in {
+                    "starting",
+                    "running",
+                }:
                     return
-                for key in ("wrapper_pid", "wrapper_start_time_ticks", "process_group_id", "process_group_start_time_ticks"):
+                for key in (
+                    "wrapper_pid",
+                    "wrapper_start_time_ticks",
+                    "process_group_id",
+                    "process_group_start_time_ticks",
+                ):
                     value = registration.get(key)
                     if value is not None:
                         existing = attempt.process.get(key)
@@ -186,8 +211,14 @@ class AuthoritySupervisor:
             manifest = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
             if not manifest.exists():
                 value = dict(registration)
-                value.update({"observed_state": "running", "supervisor": "agent",
-                              "authority_state": "healthy", "created_by": "agent"})
+                value.update(
+                    {
+                        "observed_state": "running",
+                        "supervisor": "agent",
+                        "authority_state": "healthy",
+                        "created_by": "agent",
+                    }
+                )
                 atomic_replace(manifest, {"process": value})
             self._publish_running(registration, manifest)
 
@@ -206,8 +237,14 @@ class AuthoritySupervisor:
             if self._wrapper_matches(intent):
                 continue
             value = dict(intent)
-            value.update({"observed_state": "launch_unverifiable", "supervisor": "agent",
-                          "authority_state": "isolated", "created_by": "agent"})
+            value.update(
+                {
+                    "observed_state": "launch_unverifiable",
+                    "supervisor": "agent",
+                    "authority_state": "isolated",
+                    "created_by": "agent",
+                }
+            )
             atomic_replace(manifest, {"process": value})
             self._record_diagnostic(value, "launch_registration_missing")
 
@@ -219,6 +256,7 @@ class AuthoritySupervisor:
             return False
         try:
             from .scheduler import _process_start_time_ticks
+
             return _process_start_time_ticks(pid) == start
         except (FileNotFoundError, OSError, ValueError):
             return False
@@ -312,9 +350,7 @@ class AuthoritySupervisor:
         ):
             attempt_ids.update(path.stem for path in iter_json(paths[name]))
         if paths["termination_decisions"].is_dir():
-            attempt_ids.update(
-                path.name for path in paths["termination_decisions"].iterdir() if path.is_dir()
-            )
+            attempt_ids.update(path.name for path in paths["termination_decisions"].iterdir() if path.is_dir())
         for attempt_id in attempt_ids:
             task_id = None
             for name, record_key in (
@@ -359,10 +395,15 @@ class AuthoritySupervisor:
             return
         if renewal.outcome is LeaseRenewalOutcome.RETRYABLE_ERROR:
             self._failures[attempt_id] = self._failures.get(attempt_id, 0) + 1
-            expires = renewal.lease_expires_at or self._lease_expiries.get(attempt_id) or process.get("lease_expires_at")
+            expires = (
+                renewal.lease_expires_at or self._lease_expiries.get(attempt_id) or process.get("lease_expires_at")
+            )
             holder_bound = process.get("clock_error_bound_seconds")
-            if (isinstance(expires, str) and isinstance(holder_bound, (int, float))
-                    and datetime.now(timezone.utc) >= holder_safe_deadline(expires, holder_bound)):
+            if (
+                isinstance(expires, str)
+                and isinstance(holder_bound, (int, float))
+                and datetime.now(timezone.utc) >= holder_safe_deadline(expires, holder_bound)
+            ):
                 self._set_authority_state(process, "isolated")
             else:
                 self._set_authority_state(process, "suspect")
@@ -382,15 +423,27 @@ class AuthoritySupervisor:
             self._set_authority_state(process, "isolated")
             return
         self._terminate(
-            task_id, attempt_id, token, process, resolution.outcome.value,
+            task_id,
+            attempt_id,
+            token,
+            process,
+            resolution.outcome.value,
             resolution.reason or "authority_changed",
         )
 
-    def _terminate(self, task_id: str, attempt_id: str, token: int, process: dict[str, object], outcome: str,
-                   reason: str) -> None:
+    def _terminate(
+        self, task_id: str, attempt_id: str, token: int, process: dict[str, object], outcome: str, reason: str
+    ) -> None:
         with attempt_control_lock(self.cfg, attempt_id):
-            decision = create_decision(self.cfg, task_id=task_id, attempt_id=attempt_id, fencing_token=token,
-                                       process=process, authority_outcome=outcome, reason=reason)
+            decision = create_decision(
+                self.cfg,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                fencing_token=token,
+                process=process,
+                authority_outcome=outcome,
+                reason=reason,
+            )
             decision_id = decision["decision_id"]
             if commit_shared_termination(self.cfg, task_id, attempt_id, token, decision_id):
                 update_decision(self.cfg, attempt_id, decision_id, shared_commitment="committed")
@@ -399,8 +452,7 @@ class AuthoritySupervisor:
             commit_signal(self.cfg, attempt_id, decision_id)
             send_signals(self.cfg, attempt_id, decision_id)
 
-    def _finalize(self, task_id: str, attempt_id: str, token: int, exit_code: object,
-                  *, was_terminated: bool) -> None:
+    def _finalize(self, task_id: str, attempt_id: str, token: int, exit_code: object, *, was_terminated: bool) -> None:
         task = load_task(self.cfg, task_id)
         result = None
         with authority_locks(self.cfg, task):
@@ -414,25 +466,39 @@ class AuthoritySupervisor:
             code = exit_code if isinstance(exit_code, int) else None
             was_cancel_requested = bool(task.control.get("terminate_running"))
             phase = "cancelled" if was_terminated else ("succeeded" if code == 0 else "failed")
-            reason = ("terminated_by_agent" if was_terminated else
-                      ("completed" if code == 0 else "nonzero_exit"))
-            termination_result = ("terminated" if was_terminated else
-                                  ("already_exited" if was_cancel_requested else None))
+            reason = "terminated_by_agent" if was_terminated else ("completed" if code == 0 else "nonzero_exit")
+            termination_result = (
+                "terminated" if was_terminated else ("already_exited" if was_cancel_requested else None)
+            )
             result = commit_terminal_transition_locked(
-                self.cfg, task, TerminalTransition(task_id, attempt_id, number, token, phase, reason,
-                    code, frozenset({"running", "starting", "claimed"}),
-                    frozenset({"claimed", "starting", "running"}), "active",
-                    termination_result))
+                self.cfg,
+                task,
+                TerminalTransition(
+                    task_id,
+                    attempt_id,
+                    number,
+                    token,
+                    phase,
+                    reason,
+                    code,
+                    frozenset({"running", "starting", "claimed"}),
+                    frozenset({"claimed", "starting", "running"}),
+                    "active",
+                    termination_result,
+                ),
+            )
         if result.outcome != "committed":
             return
         if result.reservation_id and result.reservation_machine_name == self.cfg.machine_name:
             release(self.reservation_runtime_root, result.reservation_id, reason)
         manifest_path = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
         process = read_json(manifest_path).get("process", {})
-        if (process.get("task_id") == task_id and process.get("attempt_id") == attempt_id
-                and process.get("fencing_token") == token):
-            process.update({"observed_state": "exited", "observed_exit_code": code,
-                            "observed_exited_at": utc_now()})
+        if (
+            process.get("task_id") == task_id
+            and process.get("attempt_id") == attempt_id
+            and process.get("fencing_token") == token
+        ):
+            process.update({"observed_state": "exited", "observed_exit_code": code, "observed_exited_at": utc_now()})
             atomic_replace(manifest_path, {"process": process})
         if result.event:
             dispatch_task_lifecycle_hooks_noexcept(self.cfg, result.event)

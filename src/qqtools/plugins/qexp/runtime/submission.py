@@ -10,7 +10,6 @@ from typing import Any, Callable, Iterable, Iterator
 
 from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_task_dependencies_root
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
-from .operation_store import operation_exists
 from .availability import remove_deadline_index, sync_deadline_index
 from .dependencies import normalize_dependency_ids, validate_group_dependencies
 from .locks import (
@@ -22,6 +21,7 @@ from .locks import (
     task_lock,
     task_locks,
 )
+from .operation_store import operation_exists
 from .paths import group_path, idempotency_path, machine_path, shared_paths, submission_path, task_path
 from .ready import (
     assert_ready_writer_compatible,
@@ -201,12 +201,8 @@ def _canonical_resolved_specs(operation: dict[str, Any]) -> list[dict[str, Any]]
         resolved = operation["submission"]["resolved_context"]["task_specs"]
     except (KeyError, TypeError) as exc:
         raise RuntimeError("submission operation has an invalid canonical task context.") from exc
-    if (
-        not isinstance(resolved, list)
-        or any(
-            not isinstance(item, dict) or "depends_on_task_ids" not in item
-            for item in resolved
-        )
+    if not isinstance(resolved, list) or any(
+        not isinstance(item, dict) or "depends_on_task_ids" not in item for item in resolved
     ):
         raise RuntimeError(
             "submission operation predates the canonical task-dependencies-v1 protocol; "
@@ -414,7 +410,7 @@ def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
         group_file = group_path(cfg.shared_root, group_name)
         if not group_file.exists():
             raise RuntimeError(
-                f"committed submission {submission['operation_id']!r} has a missing Group " f"{group_name!r}."
+                f"committed submission {submission['operation_id']!r} has a missing Group {group_name!r}."
             )
         group = read_json(group_file)
         normalize_group_record(group)
@@ -422,9 +418,7 @@ def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
         if not pending:
             return
         if pending.get("operation_id") != submission["operation_id"]:
-            raise RuntimeError(
-                f"Group {group_name!r} has pending submission commit " f"{pending.get('operation_id')!r}."
-            )
+            raise RuntimeError(f"Group {group_name!r} has pending submission commit {pending.get('operation_id')!r}.")
         sequences = pending.get("membership_sequences")
         if sequences is None:
             sequences = submission["commit_plan"].get("group_membership_sequences")

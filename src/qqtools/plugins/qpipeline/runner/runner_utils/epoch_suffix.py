@@ -146,12 +146,12 @@ class EpochSuffixResolver:
 
         lengths = [int(t.item()) for t in gathered]
         if len(set(lengths)) > 1:
-            rank_details = "\n".join(f"  rank {i}: len(train_loader) = {l}" for i, l in enumerate(lengths))
+            rank_details = "\n".join(f"  rank {i}: len(train_loader) = {length}" for i, length in enumerate(lengths))
             raise RuntimeError(
                 f"[qpipeline] epoch-suffix auto-compute requires all ranks to have "
                 f"identical len(train_loader), but detected inconsistency:\n"
                 f"{rank_details}\n"
-                f"Because epoch-suffix syntax (e.g. \"T_max: 0.5epoch\") converts to optimizer steps "
+                f'Because epoch-suffix syntax (e.g. "T_max: 0.5epoch") converts to optimizer steps '
                 f"based on len(train_loader), inconsistent values across ranks would cause each rank "
                 f"to compute different step counts, leading to divergent training behavior.\n"
                 f"To fix: ensure your dataset + sampler produce equal batch counts on all ranks, "
@@ -287,9 +287,7 @@ class EpochSuffixResolver:
     @staticmethod
     def _validate_coeff(coeff: float, field_path: str) -> None:
         if coeff <= 0:
-            raise ValueError(
-                f"epoch-suffix coefficient must be positive for {field_path}, got {coeff}."
-            )
+            raise ValueError(f"epoch-suffix coefficient must be positive for {field_path}, got {coeff}.")
 
     def _record(self, field_path: str, raw: Any, resolved: int) -> None:
         self._resolved[field_path] = (str(raw), resolved)
@@ -387,8 +385,7 @@ def standardize_epoch_suffixes(
 
     if train_loader_length is None or train_loader_length <= 0:
         has_interval_suffix = (
-            _parse_epoch_suffix(eval_interval) is not None
-            or _parse_epoch_suffix(save_interval) is not None
+            _parse_epoch_suffix(eval_interval) is not None or _parse_epoch_suffix(save_interval) is not None
         )
         if has_interval_suffix:
             raise ValueError(

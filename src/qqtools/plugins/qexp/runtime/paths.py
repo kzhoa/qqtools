@@ -1,4 +1,5 @@
 """Schema-5 shared and machine-local paths."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -106,9 +107,7 @@ def lock_path(root: Path, kind: str, identifier: str | None = None) -> Path:
     if kind == "schema":
         return base / "schema.lock"
     if kind not in {"groups", "tasks", "machines", "idempotency"} or identifier is None:
-        raise ValueError(
-            "kind must be schema, groups, tasks, machines, or idempotency with an identifier."
-        )
+        raise ValueError("kind must be schema, groups, tasks, machines, or idempotency with an identifier.")
     return base / kind / f"{identifier}.lock"
 
 

@@ -10,6 +10,7 @@ from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+
 def _base_args(cfg) -> list[str]:
     machine_runtime_root = cfg.runtime_root.parent / "machine-runtime"
     MachineRuntime(machine_runtime_root).ensure_binding(cfg.shared_root, cfg.machine_name)
@@ -76,9 +77,7 @@ def test_task_list_json_reports_dependency_gate(tmp_path: Path, capsys):
     assert tasks[parent.task_id]["dependency_reasons"] == []
     assert tasks[child.task_id]["depends_on_task_ids"] == [parent.task_id]
     assert tasks[child.task_id]["dependency_state"] == "waiting"
-    assert tasks[child.task_id]["dependency_reasons"] == [
-        {"task_id": parent.task_id, "reason": "queued"}
-    ]
+    assert tasks[child.task_id]["dependency_reasons"] == [{"task_id": parent.task_id, "reason": "queued"}]
 
 
 def test_empty_task_list_uses_fixed_message(tmp_path: Path, capsys):
@@ -162,29 +161,67 @@ def test_group_machines_cli_exposes_normalized_role_and_limit(tmp_path: Path, ca
     assert main([*_base_args(cfg), "group", "create", "demo", "--format=json"]) == 0
     capsys.readouterr()
 
-    assert main([
-        *_base_args(cfg), "group", "machines", "add", "demo", "gpu-2",
-        "--role", "borrow", "--gpu-limit-gpus", "2", "--format=json",
-    ]) == 0
+    assert (
+        main(
+            [
+                *_base_args(cfg),
+                "group",
+                "machines",
+                "add",
+                "demo",
+                "gpu-2",
+                "--role",
+                "borrow",
+                "--gpu-limit-gpus",
+                "2",
+                "--format=json",
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
-    assert main([
-        *_base_args(cfg), "group", "machines", "list", "demo", "--format=json"
-    ]) == 0
+    assert main([*_base_args(cfg), "group", "machines", "list", "demo", "--format=json"]) == 0
     machines = json.loads(capsys.readouterr().out)["machines"]
     assert machines[-1]["scheduling_role"] == "borrow"
     assert machines[-1]["gpu_limit_gpus"] == 2
 
-    assert main([
-        *_base_args(cfg), "group", "machines", "set", "demo", "gpu-2",
-        "--gpu-limit-gpus", "unlimited", "--format=json",
-    ]) == 0
+    assert (
+        main(
+            [
+                *_base_args(cfg),
+                "group",
+                "machines",
+                "set",
+                "demo",
+                "gpu-2",
+                "--gpu-limit-gpus",
+                "unlimited",
+                "--format=json",
+            ]
+        )
+        == 0
+    )
     updated = json.loads(capsys.readouterr().out)
     assert updated["group"]["worker_set"]["gpu-2"]["gpu_limit_gpus"] is None
 
-    assert main([
-        *_base_args(cfg), "group", "machines", "add", "demo", "gpu-3",
-        "--role", "primary", "--gpu-limit-gpus", "1", "--format=json",
-    ]) == 0
+    assert (
+        main(
+            [
+                *_base_args(cfg),
+                "group",
+                "machines",
+                "add",
+                "demo",
+                "gpu-3",
+                "--role",
+                "primary",
+                "--gpu-limit-gpus",
+                "1",
+                "--format=json",
+            ]
+        )
+        == 0
+    )
     primary = json.loads(capsys.readouterr().out)
     assert primary["group"]["worker_set"]["gpu-3"]["gpu_limit_gpus"] == 1
 
@@ -195,10 +232,18 @@ def test_group_machines_cli_rejects_removed_max_gpus_alias(tmp_path: Path, capsy
     capsys.readouterr()
 
     with pytest.raises(SystemExit) as exc_info:
-        main([
-            *_base_args(cfg), "group", "machines", "set", "demo", "gpu-2",
-            "--max-gpus", "1",
-        ])
+        main(
+            [
+                *_base_args(cfg),
+                "group",
+                "machines",
+                "set",
+                "demo",
+                "gpu-2",
+                "--max-gpus",
+                "1",
+            ]
+        )
     assert exc_info.value.code == 2
     assert "unrecognized arguments: --max-gpus" in capsys.readouterr().err
 

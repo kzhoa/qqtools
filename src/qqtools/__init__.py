@@ -92,7 +92,6 @@ from .config.fetch.gdown import download_from_gdrive_sharelink
 # plugins
 def __getattr__(name):
     if name == "plugins":
-
         return importlib.import_module(".plugins", __name__)
 
     try:

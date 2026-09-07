@@ -223,7 +223,7 @@ def _apply_extensions(
             )
         if deadlines[field] != old_version:
             raise RegistryError(
-                f"{prefix}.from must equal the previous effective {field} " f"({deadlines[field]}), got {old_version}."
+                f"{prefix}.from must equal the previous effective {field} ({deadlines[field]}), got {old_version}."
             )
         if new_version <= old_version:
             raise RegistryError(f"{prefix}.to must be later than {prefix}.from.")
@@ -493,7 +493,7 @@ def release_plan(
     lines = [f"Compatibility plan for release {target}:"]
     for item in items:
         expected = item.expected_status(target)
-        lines.append(f"- {item.item_id} ({item.component}): {item.status} -> expected " f"{_expected_label(expected)}")
+        lines.append(f"- {item.item_id} ({item.component}): {item.status} -> expected {_expected_label(expected)}")
     current_ids = {item.item_id for item in items}
     if previous is not None:
         for item in previous:
@@ -511,12 +511,10 @@ def check_release(items: Iterable[CompatibilityItem], target: Version) -> None:
         expected = item.expected_status(target)
         if expected is None:
             mismatches.append(
-                f"{item.item_id} ({item.component}) remains in the registry but must be removed " f"for {target}"
+                f"{item.item_id} ({item.component}) remains in the registry but must be removed for {target}"
             )
         elif item.status != expected:
-            mismatches.append(
-                f"{item.item_id} ({item.component}) is {item.status}, expected {expected} " f"for {target}"
-            )
+            mismatches.append(f"{item.item_id} ({item.component}) is {item.status}, expected {expected} for {target}")
     if mismatches:
         details = "\n".join(f"- {mismatch}" for mismatch in mismatches)
         raise RegistryError(f"compatibility release gate failed:\n{details}")
@@ -547,8 +545,7 @@ def check_registry_transition(
     if premature:
         item = premature[0]
         raise RegistryError(
-            f"{item.item_id} was removed before transition_purged_in "
-            f"{item.transition_purged_in}; target is {target}."
+            f"{item.item_id} was removed before transition_purged_in {item.transition_purged_in}; target is {target}."
         )
     marker_matches = _marker_files(repo_root, (item.marker for item in removed))
     for item in removed:

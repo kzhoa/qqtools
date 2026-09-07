@@ -1,22 +1,22 @@
 import json
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from unittest.mock import MagicMock
 
-from qqtools.plugins.qpipeline.runner.runner import RunningAgent
-from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMode
 from qqtools.plugins.qpipeline.runner.hooks import RunnerBoundaryContext, RunnerHooks
+from qqtools.plugins.qpipeline.runner.runner import RunningAgent
 from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import (
     CheckpointManager,
     CheckpointPlugin,
     CheckpointPolicy,
 )
 from qqtools.plugins.qpipeline.runner.runner_utils.metrics_jsonl import MetricsJsonlLogger
+from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMode
 
 # Re-using components from conftest for consistency
 from .conftest import SimpleModel, SimpleTask

@@ -3,6 +3,7 @@
 This module is test-only on purpose.  It models protocol decisions without adding a
 test switch to the production qexp authority implementation.
 """
+
 from __future__ import annotations
 
 import json
@@ -91,15 +92,11 @@ class CrashWindowRecoveryPlan:
 
 
 _CRASH_WINDOW_RECOVERY_PLANS: dict[CrashWindow, CrashWindowRecoveryPlan] = {
-    CrashWindow.SUBMISSION_BEFORE_OPERATION: CrashWindowRecoveryPlan(
-        "preserve_absence", "no_operation_or_task"
-    ),
+    CrashWindow.SUBMISSION_BEFORE_OPERATION: CrashWindowRecoveryPlan("preserve_absence", "no_operation_or_task"),
     CrashWindow.OPERATION_BEFORE_TASK_STAGING: CrashWindowRecoveryPlan(
         "abort_or_resume_preparing_submission", "no_claimable_task"
     ),
-    CrashWindow.PARTIAL_TASK_STAGING: CrashWindowRecoveryPlan(
-        "complete_or_abort_submission", "no_partial_visibility"
-    ),
+    CrashWindow.PARTIAL_TASK_STAGING: CrashWindowRecoveryPlan("complete_or_abort_submission", "no_partial_visibility"),
     CrashWindow.WORKER_BEFORE_COMMIT: CrashWindowRecoveryPlan(
         "remove_inactive_worker_addition", "worker_inactive_until_commit"
     ),
@@ -130,15 +127,9 @@ _CRASH_WINDOW_RECOVERY_PLANS: dict[CrashWindow, CrashWindowRecoveryPlan] = {
     CrashWindow.ORPHAN_TOKEN_RECOVERY: CrashWindowRecoveryPlan(
         "issue_successor_for_same_attempt", "attempt_identity_preserved"
     ),
-    CrashWindow.SUCCESSOR_FENCING: CrashWindowRecoveryPlan(
-        "reject_stale_writer", "stale_token_cannot_mutate_truth"
-    ),
-    CrashWindow.WORKER_REMOVAL_RACE: CrashWindowRecoveryPlan(
-        "serialize_under_group_lock", "queued_work_not_stranded"
-    ),
-    CrashWindow.CANCEL_LAUNCH_RACE: CrashWindowRecoveryPlan(
-        "serialize_final_launch_gate", "one_group_lock_order_wins"
-    ),
+    CrashWindow.SUCCESSOR_FENCING: CrashWindowRecoveryPlan("reject_stale_writer", "stale_token_cannot_mutate_truth"),
+    CrashWindow.WORKER_REMOVAL_RACE: CrashWindowRecoveryPlan("serialize_under_group_lock", "queued_work_not_stranded"),
+    CrashWindow.CANCEL_LAUNCH_RACE: CrashWindowRecoveryPlan("serialize_final_launch_gate", "one_group_lock_order_wins"),
     CrashWindow.RECOVERY_DRAIN_RACE: CrashWindowRecoveryPlan(
         "serialize_group_then_task_recovery", "forbidden_recovery_is_quarantined"
     ),
@@ -182,9 +173,7 @@ class TraceEnvelope:
         logical_time: float,
         participant: str | None = None,
     ) -> None:
-        self.events.append(
-            TraceEvent(len(self.events), kind, _redact_payload(payload), logical_time, participant)
-        )
+        self.events.append(TraceEvent(len(self.events), kind, _redact_payload(payload), logical_time, participant))
 
     def to_json(self) -> str:
         return json.dumps(
@@ -218,10 +207,7 @@ def _redact_payload(value: Mapping[str, Any]) -> dict[str, Any]:
     """Avoid persisting secret-bearing environment and command values in traces."""
     return {
         key: "<redacted>"
-        if any(
-            part in key.lower()
-            for part in ("secret", "password", "credential", "api_key", "authorization")
-        )
+        if any(part in key.lower() for part in ("secret", "password", "credential", "api_key", "authorization"))
         else _redact_value(item)
         for key, item in value.items()
     }
@@ -362,11 +348,7 @@ class QexpReferenceModel:
 
     def authorize_launch(self, task_id: str, fencing_token: int) -> ModelEffectPlan | None:
         task = self._task(task_id)
-        if (
-            task.state != "claimed"
-            or task.has_cancellation_requested
-            or task.fencing_token != fencing_token
-        ):
+        if task.state != "claimed" or task.has_cancellation_requested or task.fencing_token != fencing_token:
             return None
         task.state = "starting"
         self.assert_invariants()
@@ -406,10 +388,7 @@ class QexpReferenceModel:
                     if task.submission_id == submission_id and task.state == "queued":
                         commands.append(ReferenceCommand("cancel", task_id=task_id))
         for task_id, task in sorted(self._tasks.items()):
-            if (
-                task.state == "queued"
-                and self._submission_states[task.submission_id] == "committed"
-            ):
+            if task.state == "queued" and self._submission_states[task.submission_id] == "committed":
                 commands.extend(
                     (
                         ReferenceCommand("claim", task_id=task_id),
@@ -561,9 +540,7 @@ class ReferenceScenarioRunner:
         if trace.scenario_version != "qexp-reference-model/v1":
             raise ValueError("trace does not contain a reference-model scenario")
         commands = [
-            ReferenceCommand.from_payload(event.payload)
-            for event in trace.events
-            if event.kind == "model.command"
+            ReferenceCommand.from_payload(event.payload) for event in trace.events if event.kind == "model.command"
         ]
         return cls(seed=trace.seed).run(commands)
 
@@ -733,9 +710,7 @@ class ScenarioRunner:
 
     def run(self, actions: Iterable[Action]) -> None:
         for index, action in enumerate(actions):
-            self.runtime.trace.record(
-                "action", {"index": index, "name": action.__name__}, self.runtime.clock
-            )
+            self.runtime.trace.record("action", {"index": index, "name": action.__name__}, self.runtime.clock)
             action(self.runtime)
 
     @staticmethod
@@ -791,14 +766,10 @@ class MachineParticipant:
             ) from exc
         ready, _, _ = select.select([self.process.stdout], [], [], timeout_seconds)
         if not ready:
-            raise RuntimeError(
-                f"participant {self.name} did not respond within {timeout_seconds} seconds"
-            )
+            raise RuntimeError(f"participant {self.name} did not respond within {timeout_seconds} seconds")
         response = self.process.stdout.readline()
         if not response:
-            raise RuntimeError(
-                f"participant {self.name} exited before responding: {self._stderr_diagnostics()}"
-            )
+            raise RuntimeError(f"participant {self.name} exited before responding: {self._stderr_diagnostics()}")
         result = json.loads(response)
         self.trace.record("participant.response", result, 0.0, self.name)
         return result

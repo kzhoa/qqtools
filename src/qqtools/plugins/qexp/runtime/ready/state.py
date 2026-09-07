@@ -19,23 +19,33 @@ def ensure_ready_layout(cfg: object) -> None:
     """Create the additive ready layout without activating ready-only scheduling."""
     paths = shared_paths(cfg.shared_root)
     for name in (
-        "ready", "ready_home", "ready_shared", "ready_catalogs", "ready_reservations",
-        "ready_cursors", "ready_builds", "ready_locks", "ready_primary",
+        "ready",
+        "ready_home",
+        "ready_shared",
+        "ready_catalogs",
+        "ready_reservations",
+        "ready_cursors",
+        "ready_builds",
+        "ready_locks",
+        "ready_primary",
     ):
         paths[name].mkdir(parents=True, exist_ok=True)
     path = ready_state_path(cfg.shared_root)
     if not path.exists():
-        atomic_replace(path, {
-            "ready_index": {
-                "schema_version": READY_PROTOCOL_VERSION,
-                "state": "absent",
-                "writer_capability": None,
-                "revision": 0,
-                "build": None,
-                "updated_at": utc_now(),
-                "degraded_reasons": [],
-            }
-        })
+        atomic_replace(
+            path,
+            {
+                "ready_index": {
+                    "schema_version": READY_PROTOCOL_VERSION,
+                    "state": "absent",
+                    "writer_capability": None,
+                    "revision": 0,
+                    "build": None,
+                    "updated_at": utc_now(),
+                    "degraded_reasons": [],
+                }
+            },
+        )
 
 
 def read_ready_index_state(cfg: object) -> ReadyIndexState:
@@ -50,10 +60,7 @@ def read_ready_index_state(cfg: object) -> ReadyIndexState:
             return "degraded"
         if current_state not in {"absent", "building", "active", "degraded"}:
             return "degraded"
-        if (
-            current_state in {"building", "active"}
-            and record.get("writer_capability") != READY_WRITER_CAPABILITY
-        ):
+        if current_state in {"building", "active"} and record.get("writer_capability") != READY_WRITER_CAPABILITY:
             return "degraded"
         return current_state
     except (KeyError, TypeError, ValueError):
@@ -133,7 +140,8 @@ def install_writer_capability_gate(cfg: object) -> None:
 
 
 def assert_ready_writer_compatible(
-    cfg: object, writer_capability: str | None = READY_WRITER_CAPABILITY,
+    cfg: object,
+    writer_capability: str | None = READY_WRITER_CAPABILITY,
 ) -> None:
     """Reject an incompatible writer before authoritative Task mutation."""
     current_state = read_ready_index_state(cfg)
@@ -146,8 +154,7 @@ def assert_ready_writer_compatible(
     required = record.get("writer_capability")
     if required != READY_WRITER_CAPABILITY or writer_capability != required:
         raise RuntimeError(
-            f"ready index requires writer capability {required!r}; "
-            f"writer declared {writer_capability!r}."
+            f"ready index requires writer capability {required!r}; writer declared {writer_capability!r}."
         )
     try:
         schema = read_json(schema_capability_path(cfg))["schema"]

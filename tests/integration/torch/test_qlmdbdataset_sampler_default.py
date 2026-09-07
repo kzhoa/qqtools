@@ -56,9 +56,14 @@ def test_loader_delegates_strategy_and_order(dataset, monkeypatch, should_shuffl
     assert len(calls) == 1
     assert observed == ([0, 1, 3, 4] if should_subset else list(range(6)))
     assert not any(issubclass(item.category, FutureWarning) for item in caught)
-    assert list(loader.batch_sampler) == list(BalancedBatchSampler(
-        selected.sample_costs, batch_size=2, shuffle=should_shuffle, seed=selected.balance_seed,
-    ))
+    assert list(loader.batch_sampler) == list(
+        BalancedBatchSampler(
+            selected.sample_costs,
+            batch_size=2,
+            shuffle=should_shuffle,
+            seed=selected.balance_seed,
+        )
+    )
 
 
 @pytest.mark.integration

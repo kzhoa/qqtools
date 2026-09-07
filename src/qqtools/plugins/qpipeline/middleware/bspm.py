@@ -1,5 +1,6 @@
-import qqtools as qt
 import torch
+
+import qqtools as qt
 
 from ..qpipeline import qPipeline
 

@@ -35,12 +35,22 @@ def test_seed_rejects_negative_values(sampler_type, seed):
 @pytest.mark.parametrize("should_drop", [False, True])
 def test_numpy_scalar_settings_match_python_settings(sampler_type, should_shuffle, should_drop):
     numpy_sampler = sampler_type(
-        [9, 1, 8, 2], batch_size=np.int64(2), rank=np.int64(0), world_size=np.int64(1),
-        shuffle=np.bool_(should_shuffle), drop_last=np.bool_(should_drop), seed=np.uint64(7),
+        [9, 1, 8, 2],
+        batch_size=np.int64(2),
+        rank=np.int64(0),
+        world_size=np.int64(1),
+        shuffle=np.bool_(should_shuffle),
+        drop_last=np.bool_(should_drop),
+        seed=np.uint64(7),
     )
     python_sampler = sampler_type(
-        [9, 1, 8, 2], batch_size=2, rank=0, world_size=1,
-        shuffle=should_shuffle, drop_last=should_drop, seed=7,
+        [9, 1, 8, 2],
+        batch_size=2,
+        rank=0,
+        world_size=1,
+        shuffle=should_shuffle,
+        drop_last=should_drop,
+        seed=7,
     )
     for epoch in (0, 1, 3):
         numpy_sampler.set_epoch(epoch)

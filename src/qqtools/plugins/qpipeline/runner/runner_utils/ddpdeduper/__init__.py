@@ -1,9 +1,4 @@
-from .eval_contract import (
-    EvalBatch,
-    EvalBatchControl,
-    EvalDedupRuntime,
-    unwrap_eval_batch,
-)
+from .eval_contract import EvalBatch, EvalBatchControl, EvalDedupRuntime, unwrap_eval_batch
 from .output_deduper import (
     DDPOutputDeduper,
     prepare_eval_loader_for_ddp,

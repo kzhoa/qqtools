@@ -322,7 +322,6 @@ class HyperConnectionLayer(torch.nn.Module):
 
 
 class HyperConnectFactory:
-
     def __init__(self, expansion=2, dynamic=False, d=None, agg=None, feature_dim=None):
         self.n = expansion
         self.dynamic = dynamic

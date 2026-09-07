@@ -1,4 +1,5 @@
 """Durable offer-deadline projection maintenance."""
+
 from __future__ import annotations
 
 import heapq
@@ -57,15 +58,22 @@ def remove_deadline_index(cfg: RootConfig, task_id: str) -> None:
 
 def sync_deadline_index(cfg: RootConfig, task: TaskRecord) -> None:
     path = _deadline_index_path(cfg, task.task_id)
-    if (task.placement_runtime.get("queue_scope") == "home"
-            and task.placement_policy.get("sharing_mode") == "spillover"
-            and task.placement_runtime.get("offer_eligible_at")
-            and task.placement_runtime.get("offer_clock_evidence")):
-        desired = {"offer_deadline": {"task_id": task.task_id,
-            "group_name": task.group_name, "home_machine": task.placement_policy["home_machine"],
-            "offer_eligible_at": task.placement_runtime["offer_eligible_at"],
-            "operation_id": task.placement_runtime.get("availability_operation_id"),
-            "updated_at": task.meta["updated_at"]}}
+    if (
+        task.placement_runtime.get("queue_scope") == "home"
+        and task.placement_policy.get("sharing_mode") == "spillover"
+        and task.placement_runtime.get("offer_eligible_at")
+        and task.placement_runtime.get("offer_clock_evidence")
+    ):
+        desired = {
+            "offer_deadline": {
+                "task_id": task.task_id,
+                "group_name": task.group_name,
+                "home_machine": task.placement_policy["home_machine"],
+                "offer_eligible_at": task.placement_runtime["offer_eligible_at"],
+                "operation_id": task.placement_runtime.get("availability_operation_id"),
+                "updated_at": task.meta["updated_at"],
+            }
+        }
         active = _active_deadline_path(cfg, task)
         if path.exists():
             try:
@@ -94,11 +102,7 @@ def iter_due_deadline_paths(cfg: RootConfig, *, limit: int = 64) -> Iterator[Pat
     yielded = 0
     due_buckets = heapq.nsmallest(
         limit,
-        (
-            Path(entry.path)
-            for entry in os.scandir(home)
-            if entry.is_dir() and entry.name <= current_bucket
-        ),
+        (Path(entry.path) for entry in os.scandir(home) if entry.is_dir() and entry.name <= current_bucket),
         key=lambda path: path.name,
     )
     for bucket in due_buckets:
@@ -153,12 +157,7 @@ def migrate_legacy_deadline_indexes(cfg: RootConfig) -> None:
             except (KeyError, TypeError, ValueError):
                 path.unlink(missing_ok=True)
                 continue
-            active = (
-                shared_paths(cfg.shared_root)["offer_deadlines_active"]
-                / home_machine
-                / bucket
-                / path.name
-            )
+            active = shared_paths(cfg.shared_root)["offer_deadlines_active"] / home_machine / bucket / path.name
             atomic_replace(active, {"offer_deadline": record})
             path.unlink(missing_ok=True)
             path.symlink_to(active.relative_to(path.parent))

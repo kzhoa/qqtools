@@ -17,31 +17,27 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
+from qqtools.plugins.qpipeline.entry_utils.scheduler import qWarmupScheduler
 from qqtools.plugins.qpipeline.qlogger import qLogger
 from qqtools.plugins.qpipeline.runner import runner as runner_module
-from qqtools.plugins.qpipeline.entry_utils.scheduler import qWarmupScheduler
 from qqtools.plugins.qpipeline.runner.contracts import (
     EventListenerBindings,
     ObserverBindings,
     ProgressTickFact,
     TrainBoundaryCommittedFact,
 )
+from qqtools.plugins.qpipeline.runner.hooks import RunnerHooks
 from qqtools.plugins.qpipeline.runner.runner import (
-    RunningAgent,
     MetricsJsonlObserver,
+    RunningAgent,
     _is_periodic_trigger,
     _resolve_step_mode_max_steps,
     _resolve_train_runner_policy,
     train_runner,
 )
-from qqtools.plugins.qpipeline.runner.hooks import RunnerHooks
 from qqtools.plugins.qpipeline.runner.runner_utils.ckp_manager import CheckpointPlugin, CheckpointPolicy
 from qqtools.plugins.qpipeline.runner.runner_utils.evaluation import EvaluationResult, ModelEvaluation, StageEvaluation
-from qqtools.plugins.qpipeline.runner.runner_utils.types import (
-    RunConfig,
-    RunMode,
-    RunningState,
-)
+from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, RunMode, RunningState
 from qqtools.torch.ddp import BalancedBatchSampler
 
 from .conftest import SimpleModel, SimpleTask
@@ -79,6 +75,7 @@ class NaNLossTask(SimpleTask):
             nan_loss = pred.sum() * float("nan")
             return {"loss": (nan_loss, pred.shape[0])}
         return super().batch_loss(out, batch_data, loss_fn=loss_fn)
+
 
 # ============================================================================
 # Unit Tests for RunningState
@@ -257,7 +254,6 @@ class TestEventContracts:
         assert recorder.epochs == [3]
 
 
-
 # ============================================================================
 # Unit Tests for TrainingAgent
 # ============================================================================
@@ -390,6 +386,7 @@ class TestTrainingAgent:
         with pytest.raises(RuntimeError, match="already owned"):
             hooks.set_after_validation_hook(lambda context: None, provider_id="second")
 
+
 # ============================================================================
 # Integration Tests for train_runner
 # ============================================================================
@@ -436,9 +433,7 @@ class TestTrainRunner:
     @staticmethod
     def _assert_single_terminal_line(log_text: str, expected_text: str) -> None:
         terminal_lines = [
-            line
-            for line in log_text.splitlines()
-            if any(prefix in line for prefix in TERMINAL_LINE_PREFIXES)
+            line for line in log_text.splitlines() if any(prefix in line for prefix in TERMINAL_LINE_PREFIXES)
         ]
         assert len(terminal_lines) == 1
         assert expected_text in terminal_lines[0]
@@ -1179,8 +1174,7 @@ class TestTrainRunner:
 
         expected_boundary = ("val_metric", 0, len(task.train_loader))
         assert (
-            "BestModelTracker skipped: target=%r default=skip_compare_and_checkpoint "
-            "epoch=%s step=%s.",
+            "BestModelTracker skipped: target=%r default=skip_compare_and_checkpoint epoch=%s step=%s.",
             *expected_boundary,
         ) in [call.args for call in logger.debug.call_args_list]
         assert (
@@ -1202,7 +1196,7 @@ class TestTrainRunner:
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=1)
 
             max_epochs = 5
-            result = train_runner(
+            train_runner(
                 model=model,
                 task=task,
                 loss_fn=loss_fn,
@@ -1252,8 +1246,9 @@ class TestTrainRunner:
         self.args.runner.ddp_eval_dedup = "false"
         task, model, loss_fn, optimizer = self._create_training_components()
 
-        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(
-            ValueError, match="runner.ddp_eval_dedup must be a boolean"
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="runner.ddp_eval_dedup must be a boolean"),
         ):
             train_runner(
                 model=model,

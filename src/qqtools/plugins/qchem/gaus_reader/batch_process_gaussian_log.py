@@ -149,7 +149,7 @@ def process_directory(input_dir, output_base_dir=None, verbose=False):
 
         # Process single file
         try:
-            result = process_single_log_file(log_file, output_file, verbose)
+            process_single_log_file(log_file, output_file, verbose)
 
             stats["processed_files"] += 1
         except Exception as e:
@@ -252,7 +252,7 @@ Usage examples:
             )
             # Show detailed information for failed files
             if result["failed_files"] > 0:
-                print(f"\nFailed file details:")
+                print("\nFailed file details:")
                 for i, failed_file in enumerate(result["failed_file_list"], 1):
                     print(f"  {i}. {failed_file['file_path']}")
                     print(f"     Error: {failed_file['error_message']}")

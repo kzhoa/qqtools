@@ -52,7 +52,7 @@ def init_distributed_mode(args, verbose=True):
         args.local_rank = args.rank % torch.cuda.device_count()
     else:
         if verbose:
-            print(f"{ '*' * 40}\nNot using distributed mode\n{'*' * 40}")
+            print(f"{'*' * 40}\nNot using distributed mode\n{'*' * 40}")
         args.distributed = False
         args.rank = 0
         args.local_rank = 0

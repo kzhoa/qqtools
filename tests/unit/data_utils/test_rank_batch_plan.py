@@ -12,9 +12,7 @@ def _batch_memberships(plan):
 @pytest.mark.parametrize("batch_size", [1, 2, 16])
 @pytest.mark.parametrize("world_size", [1, 2, 4])
 @pytest.mark.parametrize("should_drop_last", [False, True])
-def test_rank_plan_has_full_equal_batches_and_exact_tail_counts(
-    total, batch_size, world_size, should_drop_last
-):
+def test_rank_plan_has_full_equal_batches_and_exact_tail_counts(total, batch_size, world_size, should_drop_last):
     costs = np.random.default_rng(42).lognormal(size=total)
     costs.setflags(write=False)
     plan = _plan_rank_batches(

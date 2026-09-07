@@ -1,15 +1,17 @@
 import argparse
+
 import pytest
 import torch
 
 import qqtools as qt
-from qqtools.plugins.qpipeline.cmd_args import (
-    apply_dotted_overrides,
-    merge_basic_args,
-    prepare_cmd_args,
-    str2bool,
+from qqtools.plugins.qpipeline.cmd_args import apply_dotted_overrides, merge_basic_args, prepare_cmd_args, str2bool
+from qqtools.plugins.qpipeline.entry_utils.loss import (
+    DDPMeanReducedLoss,
+    FocalLoss,
+    RMSELoss,
+    parse_loss_name,
+    prepare_loss,
 )
-from qqtools.plugins.qpipeline.entry_utils.loss import DDPMeanReducedLoss, FocalLoss, RMSELoss, parse_loss_name, prepare_loss
 from qqtools.plugins.qpipeline.entry_utils.optimizer import getCanonicalName, prepare_optimizer
 from qqtools.plugins.qpipeline.entry_utils.scheduler import (
     SchedulerConfig,
@@ -619,4 +621,3 @@ def test_prepare_scheduler_does_not_pass_step_on_to_scheduler_getter(base_args, 
     assert scheduler.step_on == "valid_end"
     assert captured["optimizer"] is optimizer
     assert "step_on" not in captured["scheduler_params"]
-

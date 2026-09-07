@@ -189,7 +189,6 @@ def collate_dict_samples(batch_list: List[dict]):
     merged = qt.qData()
     for key in batch_list[0].keys():
         values = [sample[key] for sample in batch_list]
-        v = values[0]
 
         try:
             # Handle different data types
@@ -636,14 +635,12 @@ def collate_graph_samples(batch_list, key_types=None):
                 if num_nodes is None:
                     num_nodes = value.shape[0]
                 else:
-                    assert (
-                        num_nodes == value.shape[0]
-                    ), f"Node count of key `{k}` mismatch for sample {i}, got {num_nodes} and {value.shape[0]}"
+                    assert num_nodes == value.shape[0], (
+                        f"Node count of key `{k}` mismatch for sample {i}, got {num_nodes} and {value.shape[0]}"
+                    )
 
-        num_edges = None
         if has_edge_index:
             edge_index = sample["edge_index"]
-            num_edges = edge_index.shape[1]
             if num_nodes is None:
                 # infer num_nodes from edge_index if no node attributes
                 num_nodes = edge_index.max().item() + 1

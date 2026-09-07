@@ -1,4 +1,5 @@
 """Shared terminal transition and lifecycle hook primitives for qexp."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,10 +10,10 @@ from .config_types import RootConfig
 from .events import write_notification_diagnostic
 from .runtime.claims import archive_claim
 from .runtime.paths import attempt_path
+from .runtime.ready import retire_current_ready_generation
 from .runtime.records import AttemptRecord, TaskRecord, utc_now
 from .runtime.store import atomic_replace, read_json
 from .runtime.tasks import save_task
-from .runtime.ready import retire_current_ready_generation
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,12 +73,13 @@ class TerminalCommitResult:
 class TaskLifecycleHook(Protocol):
     name: str
 
-    def handle(self, cfg: RootConfig, event: TaskLifecycleEvent) -> None:
-        ...
+    def handle(self, cfg: RootConfig, event: TaskLifecycleEvent) -> None: ...
 
 
 def commit_terminal_transition_locked(
-    cfg: RootConfig, task: TaskRecord, transition: TerminalTransition,
+    cfg: RootConfig,
+    task: TaskRecord,
+    transition: TerminalTransition,
 ) -> TerminalCommitResult:
     """Commit an attempt-backed terminal projection while caller holds authority locks."""
     if task.task_id != transition.task_id:
@@ -88,8 +90,10 @@ def commit_terminal_transition_locked(
         return TerminalCommitResult("rejected", reason="invalid_task_source_phase")
     active_claim = task.claim_control.get("active_claim") or {}
     if transition.claim_mode == "active":
-        if (active_claim.get("attempt_id") != transition.attempt_id
-                or active_claim.get("fencing_token") != transition.fencing_token):
+        if (
+            active_claim.get("attempt_id") != transition.attempt_id
+            or active_claim.get("fencing_token") != transition.fencing_token
+        ):
             return TerminalCommitResult("rejected", reason="stale_claim")
         reservation_id = active_claim.get("reservation_id")
         reservation_machine = active_claim.get("machine_name")
@@ -110,9 +114,11 @@ def commit_terminal_transition_locked(
         )
     except (KeyError, ValueError):
         return TerminalCommitResult("rejected", reason="attempt_missing")
-    if (attempt.attempt_id != transition.attempt_id
-            or attempt.attempt_number != transition.attempt_number
-            or attempt.current_fencing_token != transition.fencing_token):
+    if (
+        attempt.attempt_id != transition.attempt_id
+        or attempt.attempt_number != transition.attempt_number
+        or attempt.current_fencing_token != transition.fencing_token
+    ):
         if attempt.phase == transition.phase and task.state["projection"] == transition.phase:
             return TerminalCommitResult("already_committed", reason="already_terminal")
         return TerminalCommitResult("rejected", reason="invalid_attempt_identity_or_phase")
@@ -128,33 +134,37 @@ def commit_terminal_transition_locked(
     attempt.result.update({"exit_code": transition.exit_code, "reason": transition.reason})
     attempt.timestamps["finished_at"] = finished_at
     if transition.termination_result is not None:
-        attempt.termination.update({"acknowledged_at": finished_at,
-                                    "result": transition.termination_result})
+        attempt.termination.update({"acknowledged_at": finished_at, "result": transition.termination_result})
     atomic_replace(path, attempt.to_dict())
     if transition.claim_mode == "active" and active_claim:
         archive_claim(cfg, task.task_id, active_claim, transition.reason)
     task.claim_control["active_claim"] = None
-    task.claim_control["fencing_epoch"] = max(
-        task.claim_control.get("fencing_epoch", 0), transition.fencing_token
-    )
+    task.claim_control["fencing_epoch"] = max(task.claim_control.get("fencing_epoch", 0), transition.fencing_token)
     task.attempt_control["current_attempt_id"] = None
     task.attempt_control["current_attempt_number"] = transition.attempt_number
     task.state.update({"projection": transition.phase, "reason": transition.reason})
     if transition.termination_result is not None:
-        task.control.update({"termination_acknowledged_at": finished_at,
-                             "termination_result": transition.termination_result})
+        task.control.update(
+            {"termination_acknowledged_at": finished_at, "termination_result": transition.termination_result}
+        )
     task.meta["revision"] += 1
     task.meta["updated_at"] = finished_at
     save_task(cfg, task)
     retire_current_ready_generation(cfg, task)
-    execution_started_at = (attempt.timestamps.get("process_created_at")
-                            or attempt.timestamps.get("running_at"))
+    execution_started_at = attempt.timestamps.get("process_created_at") or attempt.timestamps.get("running_at")
     event = TaskLifecycleEvent(
-        event_type="task_terminal", task_id=task.task_id, attempt_id=attempt.attempt_id,
-        attempt_number=attempt.attempt_number, previous_task_phase=previous_phase,
-        phase=transition.phase, reason=transition.reason, exit_code=transition.exit_code,
-        execution_machine_name=attempt.machine_name, dispatching_machine_name=cfg.machine_name,
-        finished_at=finished_at, task_revision=task.meta["revision"],
+        event_type="task_terminal",
+        task_id=task.task_id,
+        attempt_id=attempt.attempt_id,
+        attempt_number=attempt.attempt_number,
+        previous_task_phase=previous_phase,
+        phase=transition.phase,
+        reason=transition.reason,
+        exit_code=transition.exit_code,
+        execution_machine_name=attempt.machine_name,
+        dispatching_machine_name=cfg.machine_name,
+        finished_at=finished_at,
+        task_revision=task.meta["revision"],
         execution_started_at=execution_started_at,
         duration_ms=_duration_ms(execution_started_at, finished_at),
     )
@@ -162,24 +172,22 @@ def commit_terminal_transition_locked(
 
 
 def _can_commit_missing_attempt(transition: TerminalTransition) -> bool:
-    return (
-        transition.allow_missing_attempt
-        and transition.claim_mode == "active"
-        and transition.phase == "cancelled"
-    )
+    return transition.allow_missing_attempt and transition.claim_mode == "active" and transition.phase == "cancelled"
 
 
 def _commit_missing_attempt_transition(
-        cfg: RootConfig, task: TaskRecord, transition: TerminalTransition,
-        active_claim: dict, reservation_id: str | None,
-        reservation_machine: str | None) -> TerminalCommitResult:
+    cfg: RootConfig,
+    task: TaskRecord,
+    transition: TerminalTransition,
+    active_claim: dict,
+    reservation_id: str | None,
+    reservation_machine: str | None,
+) -> TerminalCommitResult:
     finished_at = utc_now()
     if active_claim:
         archive_claim(cfg, task.task_id, active_claim, transition.reason)
     task.claim_control["active_claim"] = None
-    task.claim_control["fencing_epoch"] = max(
-        task.claim_control.get("fencing_epoch", 0), transition.fencing_token
-    )
+    task.claim_control["fencing_epoch"] = max(task.claim_control.get("fencing_epoch", 0), transition.fencing_token)
     task.attempt_control["current_attempt_id"] = None
     task.attempt_control["current_attempt_number"] = transition.attempt_number
     task.state.update({"projection": transition.phase, "reason": transition.reason})
@@ -193,6 +201,7 @@ def _commit_missing_attempt_transition(
 def _hooks() -> list[TaskLifecycleHook]:
     try:
         from .notifications import NotificationHook
+
         return [NotificationHook()]
     except Exception:
         return []
@@ -205,7 +214,8 @@ def dispatch_task_lifecycle_hooks_noexcept(cfg: RootConfig, event: TaskLifecycle
             hook.handle(cfg, event)
         except Exception:
             try:
-                write_notification_diagnostic(cfg, "notification_failed", event,
-                                              reason_code="hook_error", error_type="hook_error")
+                write_notification_diagnostic(
+                    cfg, "notification_failed", event, reason_code="hook_error", error_type="hook_error"
+                )
             except Exception:
                 pass

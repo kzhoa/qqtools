@@ -1,11 +1,11 @@
 """Machine metadata lifecycle, including compatibility normalization."""
+
 from __future__ import annotations
 
 from pathlib import Path
 
 from .config_types import MachinePolicy, RootConfig
-from .layout import (initialize_shared_root, load_machine_record, project_id,
-                     save_machine_record)
+from .layout import initialize_shared_root, load_machine_record, project_id, save_machine_record
 from .policy import normalize_agent_mode, resolve_machine_policy
 from .runtime.locks import machine_lock
 from .runtime.store import read_json
@@ -51,12 +51,11 @@ def is_legacy_agent_project(cfg: RootConfig) -> bool:
     return record.get("machine", {}).get("agent_runtime") != MACHINE_AGENT_RUNTIME
 
 
-def init_shared_root(shared_root: Path, machine_name: str, *, agent_mode: str = "on_demand",
-                     runtime_root: Path | None = None) -> RootConfig:
+def init_shared_root(
+    shared_root: Path, machine_name: str, *, agent_mode: str = "on_demand", runtime_root: Path | None = None
+) -> RootConfig:
     shared_root = Path(shared_root).expanduser().resolve()
-    runtime_root = runtime_root or (
-        Path.home() / ".qqtools" / "qexp-runtime" / project_id(shared_root) / machine_name
-    )
+    runtime_root = runtime_root or (Path.home() / ".qqtools" / "qexp-runtime" / project_id(shared_root) / machine_name)
     cfg = RootConfig(shared_root, shared_root.parent, machine_name, runtime_root)
     if has_legacy_agent_metadata(cfg):
         raise ValueError("legacy project metadata requires 'qexp agent migrate-project'.")

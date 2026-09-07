@@ -23,7 +23,10 @@ def test_public_partition_covers_input_once(strategy, total):
     np.testing.assert_array_equal(np.sort(np.r_[batches.ravel(), remainder]), np.arange(total))
     np.testing.assert_array_equal(costs, original)
     repeated = compute_balanced_batch_indices(
-        costs.tolist(), batch_size=4, seed=7, strategy=strategy,
+        costs.tolist(),
+        batch_size=4,
+        seed=7,
+        strategy=strategy,
     )
     for actual, expected in zip(result, repeated):
         np.testing.assert_array_equal(actual, expected)
@@ -58,12 +61,16 @@ def test_noninteger_batch_size_rejected(batch_size):
         compute_balanced_batch_indices([1, 2], batch_size=batch_size)
 
 
-@pytest.mark.parametrize("kwargs", [
-    {"batch_size": 0}, {"batch_size": -1},
-    {"batch_size": 2, "seed": -1},
-    {"batch_size": 2, "strategy": "v3"},
-    {"batch_size": 2, "strategy": "unknown"},
-])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"batch_size": 0},
+        {"batch_size": -1},
+        {"batch_size": 2, "seed": -1},
+        {"batch_size": 2, "strategy": "v3"},
+        {"batch_size": 2, "strategy": "unknown"},
+    ],
+)
 def test_invalid_settings_rejected(kwargs):
     with pytest.raises(ValueError):
         compute_balanced_batch_indices([1, 2], **kwargs)

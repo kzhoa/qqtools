@@ -1,4 +1,5 @@
 """Typed Task record persistence helpers."""
+
 from __future__ import annotations
 
 from .paths import task_path
