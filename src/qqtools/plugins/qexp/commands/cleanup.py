@@ -422,6 +422,7 @@ def clean(
     older_than_days: int = 30,
     limit: int = 100,
     dry_run: bool = False,
+    max_work_items: int = 64,
     reservation_runtime_root: Path | None = None,
 ) -> dict[str, Any]:
     """Remove terminal Task truth exactly or under a bounded retention policy."""
@@ -437,6 +438,8 @@ def clean(
         raise ValueError("older_than_days must be non-negative.")
     if limit <= 0:
         raise ValueError("limit must be positive.")
+    if type(max_work_items) is not int or not 1 <= max_work_items <= 64:
+        raise ValueError("max_work_items must be between 1 and 64.")
     if task_id:
         candidates = [load_task(cfg, task_id)]
     else:
@@ -457,6 +460,12 @@ def clean(
         "removed": [],
         "skipped": {},
     }
+    from ..runtime.ready.group_members_rebuild import cleanup_group_ready_member_archives
+
+    if not dry_run:
+        result["group_ready_member_archive_cleanup"] = cleanup_group_ready_member_archives(
+            cfg, max_work_items=max_work_items
+        )
     from ..scheduler import authority_locks
 
     for candidate in candidates:

@@ -43,6 +43,31 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def read_json_limited(path: Path, *, max_bytes: int) -> dict[str, Any]:
+    """Read one JSON object after enforcing a durable record-size limit."""
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer.")
+    with path.open("rb") as handle:
+        encoded = handle.read(max_bytes + 1)
+    if len(encoded) > max_bytes:
+        raise ValueError(f"JSON record exceeds its {max_bytes}-byte limit: {path}.")
+    value = json.loads(encoded.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected JSON object at {path}.")
+    return value
+
+
+def json_encoded_size(value: dict[str, Any]) -> int:
+    """Return the exact byte size used by atomic JSON persistence."""
+    return len(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"))
+
+
+def require_json_size(value: dict[str, Any], *, max_bytes: int, record_type: str) -> None:
+    """Reject a record that cannot fit its documented persistence budget."""
+    if json_encoded_size(value) > max_bytes:
+        raise ValueError(f"projection_encoding_unsupported:{record_type}")
+
+
 def create_if_absent(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL

@@ -142,7 +142,7 @@ def test_group_members_are_paged_without_historical_task_scan(tmp_path: Path) ->
     assert {item["task_id"] for item in members} == {f"member-{index}" for index in range(65)}
 
 
-def test_retired_empty_pages_are_reused_without_historical_catalog_growth(tmp_path: Path) -> None:
+def test_retired_empty_pages_reuse_a_bounded_directory_slot(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
     tasks = [submit(cfg, ["echo", str(index)], task_id=f"member-{index}", group="exp") for index in range(65)]
@@ -151,14 +151,79 @@ def test_retired_empty_pages_are_reused_without_historical_catalog_growth(tmp_pa
     for task in tasks:
         assert retire_group_ready_member(cfg, "exp", task.task_id, task.ready_generation)
     state = read_json(group_members._group_state_path(cfg, "exp"))["group_ready_members"]
-    assert state["catalog_pages"] == []
-    assert state["catalog_tail"] == 0
-    assert state["free_catalog_page"] == 0
+    assert state["directory_page_count"] == 1
+    assert state["next_member_page"] == 2
+    assert state["writable_member_page"] in {0, 1}
 
     submit(cfg, ["echo", "reused"], task_id="member-reused", group="exp")
     state = read_json(group_members._group_state_path(cfg, "exp"))["group_ready_members"]
-    assert state["catalog_pages"] == [0]
-    assert state["catalog_tail"] == 0
+    assert state["directory_page_count"] == 1
+    assert state["next_member_page"] == 2
+
+
+def test_writable_page_index_reuses_every_retired_page_across_churn(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    from qqtools.plugins.qexp.runtime.ready import group_members
+
+    for cycle in range(4):
+        tasks = [
+            submit(cfg, ["echo", str(index)], task_id=f"cycle-{cycle}-{index}", group="exp")
+            for index in range(65)
+        ]
+        for task in tasks:
+            assert retire_group_ready_member(cfg, "exp", task.task_id, task.ready_generation)
+        state = read_json(group_members._group_state_path(cfg, "exp"))["group_ready_members"]
+        assert state["member_count"] == 0
+        assert state["next_member_page"] == 2
+        assert state["directory_page_count"] == 1
+        assert state["writable_index_count"] <= 1
+
+
+def test_archive_cleanup_reclaims_writable_index_pages(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    tasks = [
+        submit(cfg, ["echo", str(index)], task_id=f"archive-{index}", group="exp")
+        for index in range(129)
+    ]
+    for task in tasks[:128]:
+        assert retire_group_ready_member(cfg, "exp", task.task_id, task.ready_generation)
+    from qqtools.plugins.qexp.runtime.ready import group_members
+
+    writable_root = group_members._group_root(cfg, "exp") / "writable-pages"
+    assert len(list(writable_root.glob("*.json"))) >= 1
+    mark_group_ready_members_degraded(cfg, "test")
+    repair_metadata(cfg, max_work_items=64)
+    for _ in range(200):
+        result = clean(cfg, dry_run=False, max_work_items=64)
+        cleanup = result["group_ready_member_archive_cleanup"]
+        if cleanup["state"] == "completed" and cleanup["archive_count"] == 0:
+            break
+    else:
+        raise AssertionError("archive cleanup did not converge")
+
+
+def test_verify_detects_missing_writable_index_page(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    tasks = [
+        submit(cfg, ["echo", str(index)], task_id=f"audit-index-{index}", group="exp")
+        for index in range(129)
+    ]
+    for task in tasks[:128]:
+        assert retire_group_ready_member(cfg, "exp", task.task_id, task.ready_generation)
+    from qqtools.plugins.qexp.runtime.ready import group_members
+
+    writable_root = group_members._group_root(cfg, "exp") / "writable-pages"
+    index_path = next(writable_root.glob("*.json"))
+    index_path.unlink()
+    result = verify_integrity(cfg, max_work_items=64)
+    while not result["complete"]:
+        result = verify_integrity(cfg, max_work_items=64)
+    assert result["healthy"] is False
+    assert "group_ready_members_inconsistent" in {item["code"] for item in result["issues"]}
+    assert group_ready_members_state(cfg) == "degraded"
 
 
 def test_locator_damage_degrades_then_doctor_rebuilds_active_projection(tmp_path: Path) -> None:
@@ -214,10 +279,154 @@ def test_doctor_verify_degrades_when_a_group_member_directory_is_missing(tmp_pat
 
     shutil.rmtree(group_members._group_root(cfg, "exp"))
 
-    result = verify_integrity(cfg)
+    result = verify_integrity(cfg, max_work_items=64)
+    assert result["complete"] is False
+    result = verify_integrity(cfg, max_work_items=64)
 
     assert "group_ready_members_inconsistent" in {item["code"] for item in result["issues"]}
     assert group_ready_members_state(cfg) == "degraded"
+
+
+def test_verify_reports_bounded_progress(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
+
+    first = verify_integrity(cfg, max_work_items=1)
+
+    assert first["complete"] is False
+    assert first["healthy"] is False
+    assert first["group_ready_members"]["verification"]["state"] == "building"
+
+
+def test_completed_audit_starts_a_new_audit_without_degrading_projection(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
+
+    result = verify_integrity(cfg, max_work_items=64)
+    while not result["complete"]:
+        result = verify_integrity(cfg, max_work_items=64)
+    first_audit = result["group_ready_members"]["verification"]["audit_id"]
+    assert result["healthy"] is True
+    assert group_ready_members_state(cfg) == "active"
+
+    result = verify_integrity(cfg, max_work_items=1)
+    verification = result["group_ready_members"]["verification"]
+    assert verification["state"] == "building"
+    assert verification["audit_id"] != first_audit
+    assert "group_ready_members_inconsistent" not in {item["code"] for item in result["issues"]}
+    assert group_ready_members_state(cfg) == "active"
+
+    while not result["complete"]:
+        result = verify_integrity(cfg, max_work_items=64)
+    assert result["healthy"] is True
+    assert group_ready_members_state(cfg) == "active"
+    second_audit = result["group_ready_members"]["verification"]["audit_id"]
+
+    from qqtools.plugins.qexp.runtime.ready.group_members_rebuild import cleanup_group_ready_member_archives
+
+    builds = shared_paths(cfg.shared_root)["ready_group_members"] / "builds"
+    for _ in range(20):
+        cleanup_group_ready_member_archives(cfg, max_work_items=1)
+        if not (builds / first_audit).exists() and not (builds / second_audit).exists():
+            break
+    assert not (builds / first_audit).exists()
+    assert not (builds / second_audit).exists()
+
+
+def test_clean_reclaims_parked_member_archive_in_bounded_slices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
+    mark_group_ready_members_degraded(cfg, "test")
+
+    repair_metadata(cfg, max_work_items=1)
+    state = read_json(shared_paths(cfg.shared_root)["ready_group_members"] / "state.json")["group_ready_members"]
+    assert state["archive_count"] == 1
+
+    from qqtools.plugins.qexp.runtime.ready import group_members_rebuild
+
+    monkeypatch.setattr(
+        group_members_rebuild.os,
+        "walk",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("archive cleanup must not recurse")),
+        raising=False,
+    )
+
+    result = clean(cfg, dry_run=False, max_work_items=1)
+    while result["group_ready_member_archive_cleanup"]["state"] == "building":
+        result = clean(cfg, dry_run=False, max_work_items=1)
+
+    assert result["group_ready_member_archive_cleanup"]["archive_count"] == 0
+
+
+def test_concurrent_archive_cleaners_share_one_owner_without_errors(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
+    mark_group_ready_members_degraded(cfg, "test")
+    repair_metadata(cfg, max_work_items=1)
+
+    from qqtools.plugins.qexp.runtime.ready.group_members_rebuild import cleanup_group_ready_member_archives
+
+    barrier = Barrier(2)
+    errors: list[Exception] = []
+
+    def run_cleaner() -> None:
+        try:
+            barrier.wait()
+            cleanup_group_ready_member_archives(cfg, max_work_items=1)
+        except Exception as exc:
+            errors.append(exc)
+
+    first = Thread(target=run_cleaner)
+    second = Thread(target=run_cleaner)
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+    assert errors == []
+
+    result = cleanup_group_ready_member_archives(cfg, max_work_items=1)
+    while result["state"] == "building":
+        result = cleanup_group_ready_member_archives(cfg, max_work_items=1)
+    assert result["archive_count"] == 0
+
+
+def test_member_audit_does_not_start_a_member_page_after_spending_the_directory_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    submit(cfg, ["echo", "one"], task_id="member-task", group="exp")
+    from qqtools.plugins.qexp.runtime.ready import group_members_rebuild
+
+    cursor = {
+        "group_page": 0,
+        "group_offset": 0,
+        "group_page_count": 0,
+        "group_name": "exp",
+        "directory_page": 0,
+        "directory_offset": 0,
+        "member_page": None,
+        "entry_offset": 0,
+        "seen_count": 0,
+        "seen_digest": "0" * 64,
+        "membership_revision": 1,
+    }
+
+    monkeypatch.setattr(
+        group_members_rebuild,
+        "load_group_ready_member_page",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("member page exceeded N=1")),
+    )
+    _cursor, processed, complete = group_members_rebuild._advance_member_audit(cfg, "unused", cursor, 1)
+
+    assert processed == 1
+    assert complete is False
 
 
 def test_degraded_projection_blocks_group_worker_truth_mutation(tmp_path: Path) -> None:
@@ -933,11 +1142,16 @@ def test_member_audit_restarts_a_group_after_a_legal_retirement(tmp_path: Path) 
         activation_id=session["activation_id"],
         max_tasks=1,
     )
-
     attempt = claim_task(cfg, "audit-one", [0])
     assert attempt is not None
     from qqtools.plugins.qexp.runtime.ready import group_members
 
+    while state["projection"]["build"]["audit_member_cursor"]["seen_count"] != 1:
+        state = resume_group_ready_members_upgrade(
+            cfg,
+            activation_id=session["activation_id"],
+            max_tasks=1,
+        )
     cursor = state["projection"]["build"]["audit_member_cursor"]
     revision = read_json(group_members._group_state_path(cfg, "exp"))["group_ready_members"]
     assert cursor["seen_count"] == 1

@@ -421,6 +421,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_format(doctor)
     doctor.add_argument("action", choices=["verify", "repair"], default="verify", nargs="?")
     doctor.add_argument("--strict", action="store_true")
+    doctor.add_argument("--max-work-items", type=int, default=64)
     clean = commands.add_parser(
         "clean",
         help="Remove terminal qexp metadata while preserving experiment work directories.",
@@ -435,6 +436,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     clean.add_argument(
         "--limit", type=int, default=100, help="Maximum number of bulk-cleanup candidates (default: 100)."
+    )
+    clean.add_argument(
+        "--max-work-items", type=int, default=64, help="Maximum group-member archive entries per cleanup slice."
     )
     clean.add_argument("--dry-run", action="store_true", help="Show candidates without cleaning them.")
     use = commands.add_parser(
@@ -1074,11 +1078,13 @@ def main(argv: list[str] | None = None) -> int:
                     context.local_cfg,
                     reservation_runtime_root=context.reservation_root,
                     project_id=context.project_id,
+                    max_work_items=args.max_work_items,
                 )
                 if args.action == "verify"
                 else repair_metadata(
                     context.local_cfg,
                     reservation_runtime_root=context.reservation_root,
+                    max_work_items=args.max_work_items,
                 )
             )
             _emit("doctor", result, args.format)
@@ -1092,6 +1098,7 @@ def main(argv: list[str] | None = None) -> int:
                 older_than_days=args.older_than_days,
                 limit=args.limit,
                 dry_run=args.dry_run,
+                max_work_items=args.max_work_items,
                 reservation_runtime_root=context.reservation_root,
             )
             _emit("clean", result, args.format)

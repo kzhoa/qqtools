@@ -29,6 +29,7 @@ from .runtime.ready.group_members import (
     GROUP_MEMBER_PAGE_SIZE,
     group_ready_members_state,
     mark_group_ready_members_degraded,
+    read_group_ready_members_state,
 )
 from .runtime.ready.group_members_rebuild import audit_group_ready_members, repair_group_ready_members
 from .runtime.records import AttemptRecord, TaskRecord, normalize_group_record, utc_now
@@ -78,6 +79,7 @@ def verify_integrity(
     *,
     reservation_runtime_root: Path | None = None,
     project_id: str | None = None,
+    max_work_items: int = GROUP_MEMBER_PAGE_SIZE,
 ) -> dict[str, Any]:
     """Verify shared truth and the selected project's local execution evidence.
 
@@ -89,6 +91,8 @@ def verify_integrity(
     Returns:
         Integrity summary and discovered issues.
     """
+    if type(max_work_items) is not int or not 1 <= max_work_items <= GROUP_MEMBER_PAGE_SIZE:
+        raise ValueError(f"max_work_items must be between 1 and {GROUP_MEMBER_PAGE_SIZE}.")
     if reservation_runtime_root is None:
         from .machine_runtime import resolve_execution_context
 
@@ -107,6 +111,7 @@ def verify_integrity(
             "high",
         )
     member_state = group_ready_members_state(cfg)
+    member_verification: dict[str, Any] = {"state": "degraded" if member_state == "degraded" else "building"}
     if member_state == "degraded":
         _issue(
             issues,
@@ -130,10 +135,18 @@ def verify_integrity(
                 str(exc),
             )
     groups = {name: {"group": group} for name, group in group_records.items()}
-    if member_state in {"building", "active"}:
+    if member_state == "active":
         try:
             with schema_lock(cfg.shared_root):
-                audit_group_ready_members(cfg)
+                member_record = audit_group_ready_members(cfg, max_work_items=max_work_items)
+            audit = member_record.get("audit") or {}
+            member_verification = {
+                "state": audit.get("state", "building"),
+                "audit_id": audit.get("audit_id"),
+                "projection_id": member_record.get("projection_id"),
+                "phase": audit.get("phase"),
+                "processed": audit.get("processed", 0),
+            }
         except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
             # A verify finding is itself an admission-safety event.  Do not
             # leave an incomplete derived projection eligible for borrow.
@@ -146,6 +159,9 @@ def verify_integrity(
                 "high",
                 str(exc),
             )
+            member_verification = {"state": "degraded", "reason": "audit_failed"}
+    elif member_state == "building":
+        member_verification = {"state": "building", "reason": "projection_rebuild"}
     deadline_task_ids: set[str] = set()
     for deadline_path in iter_json(paths["offer_deadlines"]):
         if deadline_path == paths["offer_deadlines_migration"]:
@@ -420,13 +436,26 @@ def verify_integrity(
                 _issue(issues, "termination_decision_incomplete", decision_path, "high")
         except (OSError, ValueError):
             _issue(issues, "termination_decision_invalid", decision_path, "high")
+    is_complete = member_verification["state"] != "building"
+    is_healthy = not issues and member_verification["state"] == "completed"
+    try:
+        member_status = read_group_ready_members_state(cfg)
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+        member_status = {}
     return {
         "schema_version": 6,
         "tasks_checked": checked,
         "issues": issues,
-        "healthy": not issues,
+        "complete": is_complete,
+        "healthy": is_healthy,
         "ready_index": read_ready_index_status(cfg),
-        "group_ready_members": {"state": group_ready_members_state(cfg)},
+        "group_ready_members": {
+            "state": group_ready_members_state(cfg),
+            "verification": member_verification,
+            "projection_id": member_status.get("projection_id"),
+            "archive_count": member_status.get("archive_count", 0),
+            "archive_cleanup": member_status.get("archive_cleanup"),
+        },
         "clock_capability": {
             "status": capability.status,
             "reason": capability.reason,
@@ -437,7 +466,14 @@ def verify_integrity(
     }
 
 
-def repair_metadata(cfg: RootConfig, *, reservation_runtime_root: Path | None = None) -> dict[str, Any]:
+def repair_metadata(
+    cfg: RootConfig,
+    *,
+    reservation_runtime_root: Path | None = None,
+    max_work_items: int = GROUP_MEMBER_PAGE_SIZE,
+) -> dict[str, Any]:
+    if type(max_work_items) is not int or not 1 <= max_work_items <= GROUP_MEMBER_PAGE_SIZE:
+        raise ValueError(f"max_work_items must be between 1 and {GROUP_MEMBER_PAGE_SIZE}.")
     if reservation_runtime_root is None:
         from .machine_runtime import resolve_execution_context
 
@@ -620,13 +656,14 @@ def repair_metadata(cfg: RootConfig, *, reservation_runtime_root: Path | None = 
     elif ready_record.get("state") == "degraded":
         blocked.append("ready_index")
     with schema_lock(cfg.shared_root):
-        member_record = repair_group_ready_members(cfg, max_tasks=GROUP_MEMBER_PAGE_SIZE)
+        member_record = repair_group_ready_members(cfg, max_work_items=max_work_items)
     if member_record.get("state") == "active" and initial_member_state != "active":
         repaired.append("group_ready_members")
     elif member_record.get("state") == "degraded":
         blocked.append("group_ready_members")
     message = "Submission, Group control, and ready-index operations reconciled."
-    if member_record.get("state") == "building":
+    audit = member_record.get("audit") if isinstance(member_record.get("audit"), dict) else {}
+    if member_record.get("state") == "building" or audit.get("state") == "building":
         message = (
             "Member projection repair slice completed; rerun doctor repair while group_ready_members.state is building."
         )
@@ -638,7 +675,16 @@ def repair_metadata(cfg: RootConfig, *, reservation_runtime_root: Path | None = 
             "build": ready_build,
             "degraded_reasons": ready_record.get("degraded_reasons", []),
         },
-        "group_ready_members": member_record,
+        "group_ready_members": {
+            **member_record,
+            "verification": {
+                "state": "building" if member_record.get("state") == "building" else audit.get("state", "degraded"),
+                "audit_id": audit.get("audit_id"),
+                "projection_id": member_record.get("projection_id"),
+                "phase": audit.get("phase"),
+                "processed": audit.get("processed", 0),
+            },
+        },
         "message": message,
     }
 
@@ -735,4 +781,6 @@ def normalize_verify_severity(value: str) -> str:
 
 
 def resolve_verify_exit_code(result: dict[str, Any], *, strict: bool = False, fail_on: str | None = None) -> int:
+    if strict and (not result.get("complete", True) or not result.get("healthy", False)):
+        return 1
     return 1 if result.get("issues") and (strict or fail_on) else 0

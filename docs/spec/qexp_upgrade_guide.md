@@ -40,9 +40,10 @@ stops new claims intentionally rather than scheduling potentially wrong work.
    qexp --shared-root PROJECT_ROOT doctor repair --format json
    ```
 
-   If `group_ready_members.state` is `building`, repeat the same repair command. Restart the
-   machine agent only after repair reports both projections as `active` (or reports the member
-   projection as `legacy` on a root where that capability is not installed).
+   A member audit can return `verification.state: building` while its projection remains active.
+   Repeat the same command until verification is `completed` and healthy, or repair reports a
+   degraded gate. Restart the machine agent only after repair reports both projections as active
+   (or reports the member projection as legacy on a root where that capability is not installed).
 
 4. Restart the machine agent:
 
@@ -107,8 +108,9 @@ machine runtime is not at qexp's default location.
    qexp --shared-root PROJECT_ROOT doctor repair --format json
    ```
 
-   Repeat `doctor repair` while `group_ready_members.state` is `building`. Continue only after it
-   returns `active`; treat `degraded` as a blocker that requires diagnosis.
+   Repeat verify or repair while `group_ready_members.verification.state` is `building`. Continue
+   only after verification is `completed` and healthy; treat `degraded` as a blocker that requires
+   diagnosis. Use `--max-work-items 1` when a deliberately small maintenance slice is required.
 
 8. Restart agents and clients after the activation is complete and the ready index is active.
 
