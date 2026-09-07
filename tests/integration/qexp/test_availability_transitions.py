@@ -15,7 +15,8 @@ from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
 from qqtools.plugins.qexp.runtime.active_operations import active_operation_path, write_active_operation
 from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime
-from qqtools.plugins.qexp.runtime.availability.transitions import rebuild_deadline_indexes
+from qqtools.plugins.qexp.runtime.availability import offer_deadlines
+from qqtools.plugins.qexp.runtime.availability.offer_deadlines import rebuild_deadline_indexes
 from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -324,7 +325,7 @@ def test_doctor_completes_operation_after_post_task_side_effect_failure(
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp")
-    original = availability_runtime.sync_deadline_index
+    original = offer_deadlines.sync_deadline_index
     calls = 0
 
     def fail_once(cfg, task):
@@ -334,7 +335,7 @@ def test_doctor_completes_operation_after_post_task_side_effect_failure(
             raise OSError("index unavailable")
         return original(cfg, task)
 
-    monkeypatch.setattr(availability_runtime, "sync_deadline_index", fail_once)
+    monkeypatch.setattr(offer_deadlines, "sync_deadline_index", fail_once)
     with pytest.raises(OSError, match="index unavailable"):
         task_commands.share(cfg, task.task_id)
 

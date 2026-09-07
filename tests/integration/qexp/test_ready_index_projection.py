@@ -243,16 +243,16 @@ def test_offer_due_tasks_never_enumerates_task_truth(
         offer_after_seconds=0,
     )
     seen = []
-    from qqtools.plugins.qexp.runtime.availability import transitions as availability
+    from qqtools.plugins.qexp.runtime.availability import offer_deadlines
 
-    original_scandir = availability.os.scandir
+    original_scandir = offer_deadlines.os.scandir
 
     def record_directory(directory):
         seen.append(directory)
         assert directory != shared_paths(cfg.shared_root)["tasks"]
         return original_scandir(directory)
 
-    monkeypatch.setattr(availability.os, "scandir", record_directory)
+    monkeypatch.setattr(offer_deadlines.os, "scandir", record_directory)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.project_maintenance.elapsed_offer_is_proven",
         lambda *_args: True,
