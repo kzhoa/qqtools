@@ -159,7 +159,7 @@ def test_uncommitted_task_cannot_be_referenced_or_edited(tmp_path: Path) -> None
         edit_dependencies(cfg, parent.task_id, [])
 
 
-def test_empty_dependency_field_replays_a_legacy_idempotency_digest(tmp_path: Path) -> None:
+def test_legacy_dependency_submission_replay_is_rejected(tmp_path: Path) -> None:
     cfg = _group_config(tmp_path)
     specs = [{"task_id": "legacy", "command": ["echo", "legacy"], "depends_on_task_ids": []}]
     first = submission_runtime.submit_specs(
@@ -167,22 +167,35 @@ def test_empty_dependency_field_replays_a_legacy_idempotency_digest(tmp_path: Pa
     )
     operation_path = cfg.shared_root / "operations" / "submissions" / f"{first.operation_id}.json"
     operation = read_json(operation_path)
-    normalized = {
-        "group": "experiment",
-        "tasks": submission_runtime._canonical_specs(specs),
-        "worker_set": {},
-    }
-    operation["submission"]["raw_request_digest"] = (
-        submission_runtime._legacy_empty_dependencies_digest(normalized)
-    )
     del operation["submission"]["resolved_context"]["task_specs"][0]["depends_on_task_ids"]
     atomic_replace(operation_path, operation)
 
-    replay = submission_runtime.submit_specs(
+    with pytest.raises(RuntimeError, match="predates the canonical task-dependencies-v1 protocol"):
+        submission_runtime.submit_specs(
+            cfg, specs, group_name="experiment", idempotency_key="legacy-key"
+        )
+
+
+def test_legacy_dependency_idempotency_digest_is_rejected(tmp_path: Path) -> None:
+    cfg = _group_config(tmp_path)
+    specs = [{"task_id": "legacy", "command": ["echo", "legacy"], "depends_on_task_ids": []}]
+    first = submission_runtime.submit_specs(
         cfg, specs, group_name="experiment", idempotency_key="legacy-key"
     )
+    operation_path = cfg.shared_root / "operations" / "submissions" / f"{first.operation_id}.json"
+    operation = read_json(operation_path)
+    operation["submission"]["raw_request_digest"] = submission_runtime.semantic_digest(
+        {
+            "group": "experiment",
+            "tasks": [
+                {"task_id": "legacy", "command": ["echo", "legacy"], "home_machine": "current"}
+            ],
+            "worker_set": {},
+        }
+    )
+    atomic_replace(operation_path, operation)
 
-    assert replay.operation_id == first.operation_id
-    assert read_json(operation_path)["submission"]["resolved_context"]["task_specs"][0][
-        "depends_on_task_ids"
-    ] == []
+    with pytest.raises(submission_runtime.IdempotencyConflict, match="different semantic input"):
+        submission_runtime.submit_specs(
+            cfg, specs, group_name="experiment", idempotency_key="legacy-key"
+        )
