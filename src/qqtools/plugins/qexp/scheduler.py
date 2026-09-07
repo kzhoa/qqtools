@@ -45,7 +45,7 @@ from .runtime.ready import (
     retire_current_ready_generation,
     retire_previous_ready_generation,
 )
-from .runtime.active_operations import operation_exists
+from .runtime.operation_store import operation_exists
 from .runtime.resources.reservations import ReservationIdentity, attach, release, reserve, reserve_admitted
 from .runtime.resources.cpu_lane import attach_cpu, has_active_cpu_reservation, release_cpu, reserve_cpu
 from .runtime.store import atomic_replace, iter_json, read_json

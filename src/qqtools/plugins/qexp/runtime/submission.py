@@ -10,7 +10,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_task_dependencies_root
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
-from .active_operations import operation_exists
+from .operation_store import operation_exists
 from .availability import remove_deadline_index, sync_deadline_index
 from .dependencies import normalize_dependency_ids, validate_group_dependencies
 from .locks import (

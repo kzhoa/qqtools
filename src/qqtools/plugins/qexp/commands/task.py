@@ -29,7 +29,7 @@ from ..runtime.ready import (
     reserve_ready_generation,
     retire_previous_ready_generation,
 )
-from ..runtime.active_operations import operation_exists
+from ..runtime.operation_store import operation_exists
 from ..runtime.dependencies import (
     is_committed_submission_task,
     normalize_dependency_ids,
