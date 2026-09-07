@@ -456,6 +456,8 @@ def test_member_audit_does_not_start_a_member_page_after_spending_the_directory_
         "group_name": "exp",
         "directory_page": 0,
         "directory_offset": 0,
+        "directory_pages_seen": 0,
+        "directory_page_count": 1,
         "member_page": None,
         "entry_offset": 0,
         "seen_count": 0,
