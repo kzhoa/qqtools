@@ -1,3 +1,4 @@
+from collections import Counter
 from pathlib import Path
 from threading import Barrier, Thread
 
@@ -26,6 +27,110 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.scheduler import claim_task, fail_attempt
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
+
+
+def _instrument_member_maintenance_io(
+    monkeypatch: pytest.MonkeyPatch,
+    shared_root: Path,
+) -> Counter[str]:
+    """Count durable-record and filesystem-metadata operations during one slice."""
+    from qqtools.plugins.qexp import layout
+    from qqtools.plugins.qexp.runtime.ready import group_members, group_members_rebuild, routes
+
+    counts: Counter[str] = Counter()
+
+    def wrap(module: object, name: str, kind: str) -> None:
+        original = getattr(module, name)
+
+        def counted(*args, **kwargs):
+            counts[kind] += 1
+            counts[f"{kind}:{getattr(module, '__name__', type(module).__name__)}.{name}"] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, counted)
+
+    for module, name in (
+        (group_members_rebuild, "read_json"),
+        (group_members_rebuild, "read_json_limited"),
+        (group_members, "read_json_limited"),
+        (layout, "read_json"),
+        (routes, "read_json"),
+    ):
+        wrap(module, name, "read")
+    for module in (group_members_rebuild, group_members):
+        wrap(module, "atomic_replace", "write")
+
+    for name in ("stat", "mkdir", "unlink", "rmdir", "rename", "replace", "iterdir"):
+        original = getattr(Path, name)
+
+        def counted_metadata(*args, __original=original, **kwargs):
+            path = args[0]
+            try:
+                path.relative_to(shared_root)
+            except ValueError:
+                pass
+            else:
+                counts["metadata"] += 1
+            return __original(*args, **kwargs)
+
+        monkeypatch.setattr(Path, name, counted_metadata)
+
+    for name in ("fdopendir", "closedir", "readdir", "seekdir", "telldir"):
+        original = getattr(group_members_rebuild._LIBC, name)
+
+        def counted_directory_metadata(*args, __original=original):
+            counts["metadata"] += 1
+            return __original(*args)
+
+        monkeypatch.setattr(group_members_rebuild._LIBC, name, counted_directory_metadata)
+    return counts
+
+
+def _assert_member_maintenance_io_bound(
+    phase: str,
+    max_work_items: int,
+    counts: Counter[str],
+) -> None:
+    from qqtools.plugins.qexp.runtime.ready.group_members_rebuild import PHASE_IO_BOUNDS
+
+    bound = PHASE_IO_BOUNDS[phase]
+    for kind in ("read", "write", "metadata"):
+        maximum = bound[kind] * max_work_items + bound["constant"]
+        assert counts[kind] <= maximum, (phase, kind, counts[kind], maximum)
+
+
+def _advance_member_audit_to_phase(cfg: object, phase: str) -> dict:
+    from qqtools.plugins.qexp.runtime.ready.group_members_rebuild import advance_group_ready_members_audit
+
+    for _ in range(1024):
+        record = advance_group_ready_members_audit(cfg, max_work_items=64)
+        audit = record.get("audit") or {}
+        if audit.get("phase") == phase:
+            return record
+    raise AssertionError(f"member audit did not reach {phase!r}")
+
+
+def _install_member_audit_phase(cfg: object, phase: str) -> None:
+    state_path = shared_paths(cfg.shared_root)["ready_group_members"] / "state.json"
+    value = read_json(state_path)
+    record = value["group_ready_members"]
+    audit_id = f"instrument-{phase}"
+    audit = {
+        "audit_id": audit_id,
+        "projection_id": record["projection_id"],
+        "state": "building",
+        "phase": phase,
+        "processed": 0,
+        "updated_at": record["updated_at"],
+    }
+    if phase == "capture-tasks":
+        audit["task_watermark"] = {"is_complete": False}
+    elif phase == "capture-groups":
+        audit["group_watermark"] = {"is_complete": False}
+    else:
+        raise ValueError(f"unsupported instrumentation phase: {phase}")
+    record["audit"] = audit
+    atomic_replace(state_path, value)
 
 
 def test_group_ready_members_upgrade_cli_exposes_status(tmp_path: Path) -> None:
@@ -344,6 +449,159 @@ def test_verify_reports_bounded_progress(tmp_path: Path) -> None:
     assert first["group_ready_members"]["verification"]["state"] == "building"
 
 
+@pytest.mark.parametrize(
+    ("phase", "max_work_items", "item_count"),
+    [
+        ("capture-tasks", 1, 0),
+        ("capture-tasks", 1, 1),
+        ("capture-tasks", 64, 64),
+        ("capture-groups", 1, 0),
+        ("capture-groups", 1, 1),
+        ("capture-groups", 64, 64),
+    ],
+)
+def test_capture_storage_io_stays_within_published_phase_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    max_work_items: int,
+    item_count: int,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    for index in range(item_count):
+        if phase == "capture-tasks":
+            submit(cfg, ["echo", str(index)], task_id=f"capture-bound-{index}")
+        else:
+            create_group(cfg, f"capture-bound-{index}")
+            submit(
+                cfg,
+                ["echo", str(index)],
+                task_id=f"capture-group-task-{index}",
+                group=f"capture-bound-{index}",
+            )
+    _install_member_audit_phase(cfg, phase)
+
+    from qqtools.plugins.qexp.runtime.ready.group_members_rebuild import advance_group_ready_members_audit
+
+    counts = _instrument_member_maintenance_io(monkeypatch, cfg.shared_root)
+    advance_group_ready_members_audit(cfg, max_work_items=max_work_items)
+
+    assert counts["metadata"] >= max(1, item_count)
+    _assert_member_maintenance_io_bound(phase, max_work_items, counts)
+
+
+@pytest.mark.parametrize("max_work_items", [1, 64])
+def test_task_audit_storage_io_stays_within_published_phase_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_work_items: int,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    for index in range(max_work_items):
+        submit(cfg, ["echo", str(index)], task_id=f"audit-bound-{index}", group="exp")
+    _advance_member_audit_to_phase(cfg, "audit-tasks")
+
+    from qqtools.plugins.qexp.runtime.ready.group_members_rebuild import advance_group_ready_members_audit
+
+    counts = _instrument_member_maintenance_io(monkeypatch, cfg.shared_root)
+    advance_group_ready_members_audit(cfg, max_work_items=max_work_items)
+
+    assert counts["read"] >= max_work_items
+    _assert_member_maintenance_io_bound("audit-tasks", max_work_items, counts)
+
+
+def test_damaged_task_audit_storage_io_stays_within_published_phase_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    submit(cfg, ["echo", "damaged"], task_id="audit-damaged", group="exp")
+    _advance_member_audit_to_phase(cfg, "audit-tasks")
+
+    from qqtools.plugins.qexp.runtime.ready import group_members
+    from qqtools.plugins.qexp.runtime.ready.group_members_rebuild import advance_group_ready_members_audit
+
+    entry = read_group_ready_members(cfg, "exp")[0]
+    group_members._locator_path(cfg, "exp", entry["identity"]).unlink()
+    counts = _instrument_member_maintenance_io(monkeypatch, cfg.shared_root)
+
+    with pytest.raises(RuntimeError, match="audit failed"):
+        advance_group_ready_members_audit(cfg, max_work_items=1)
+
+    assert group_ready_members_state(cfg) == "degraded"
+    _assert_member_maintenance_io_bound("audit-tasks", 1, counts)
+
+
+@pytest.mark.parametrize("max_work_items", [1, 64])
+def test_member_entry_audit_storage_io_stays_within_published_phase_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_work_items: int,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    for index in range(max_work_items):
+        submit(cfg, ["echo", str(index)], task_id=f"member-bound-{index}", group="exp")
+    record = _advance_member_audit_to_phase(cfg, "audit-members")
+
+    from qqtools.plugins.qexp.runtime.ready.group_members_rebuild import advance_group_ready_members_audit
+
+    for _ in range(16):
+        cursor = record["audit"]["member_cursor"]
+        if cursor.get("pending_entry") is not None:
+            break
+        record = advance_group_ready_members_audit(cfg, max_work_items=1)
+    else:
+        raise AssertionError("member audit did not persist a pending entry")
+
+    counts = _instrument_member_maintenance_io(monkeypatch, cfg.shared_root)
+    record = advance_group_ready_members_audit(cfg, max_work_items=max_work_items)
+
+    assert record["audit"]["member_cursor"]["seen_count"] > 0
+    _assert_member_maintenance_io_bound("audit-members", max_work_items, counts)
+
+
+def test_member_revision_restart_storage_io_stays_within_published_phase_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    for task_id in ("restart-one", "restart-two"):
+        submit(cfg, ["echo", task_id], task_id=task_id, group="exp")
+    record = _advance_member_audit_to_phase(cfg, "audit-members")
+
+    from qqtools.plugins.qexp.runtime.ready import group_members
+    from qqtools.plugins.qexp.runtime.ready.group_members_rebuild import advance_group_ready_members_audit
+
+    for _ in range(16):
+        record = advance_group_ready_members_audit(cfg, max_work_items=1)
+        if record["audit"]["member_cursor"]["seen_count"] == 1:
+            break
+    else:
+        raise AssertionError("member audit did not validate its first entry")
+    previous_revision = record["audit"]["member_cursor"]["membership_revision"]
+    entry = read_group_ready_members(cfg, "exp")[0]
+    assert retire_group_ready_member(cfg, "exp", entry["task_id"], entry["generation"])
+    current_revision = read_json(group_members._group_state_path(cfg, "exp"))["group_ready_members"][
+        "membership_revision"
+    ]
+    assert current_revision > previous_revision
+
+    counts = _instrument_member_maintenance_io(monkeypatch, cfg.shared_root)
+    for _ in range(4):
+        record = advance_group_ready_members_audit(cfg, max_work_items=1)
+        _assert_member_maintenance_io_bound("audit-members", 1, counts)
+        cursor = record["audit"]["member_cursor"]
+        if cursor["membership_revision"] == current_revision:
+            break
+        counts.clear()
+    else:
+        raise AssertionError("member audit did not restart at the current revision")
+
+
 def test_completed_audit_starts_a_new_audit_without_degrading_projection(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
@@ -406,6 +664,31 @@ def test_clean_reclaims_parked_member_archive_in_bounded_slices(
         result = clean(cfg, dry_run=False, max_work_items=1)
 
     assert result["group_ready_member_archive_cleanup"]["archive_count"] == 0
+
+
+@pytest.mark.parametrize("max_work_items", [1, 64])
+def test_archive_cleanup_storage_io_stays_within_published_phase_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_work_items: int,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    for index in range(max_work_items):
+        submit(cfg, ["echo", str(index)], task_id=f"cleanup-bound-{index}", group="exp")
+    mark_group_ready_members_degraded(cfg, "instrument archive cleanup")
+
+    from qqtools.plugins.qexp.runtime.ready.group_members_rebuild import (
+        cleanup_group_ready_member_archives,
+        repair_group_ready_members,
+    )
+
+    repair_group_ready_members(cfg, max_work_items=1)
+    counts = _instrument_member_maintenance_io(monkeypatch, cfg.shared_root)
+    cleanup_group_ready_member_archives(cfg, max_work_items=max_work_items)
+
+    assert counts["metadata"] >= 1
+    _assert_member_maintenance_io_bound("archive-cleanup", max_work_items, counts)
 
 
 def test_concurrent_archive_cleaners_share_one_owner_without_errors(tmp_path: Path) -> None:
