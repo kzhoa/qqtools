@@ -25,7 +25,6 @@ from .group_members import (
 )
 from .records import ReadyMarkerRef, ReadyScope
 
-READY_BUILD_PAGE_SIZE = 64
 ReadyClassification = Literal["claimable", "temporarily_unavailable", "permanently_stale", "corrupt"]
 
 
