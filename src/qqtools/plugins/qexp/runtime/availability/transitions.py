@@ -10,24 +10,24 @@ from pathlib import Path
 import time
 from typing import Any, Literal
 
-from ..config_types import RootConfig
-from ..events import write_diagnostic_event
-from ..lease import (ClockObservation, clock_capability, new_timed_offer_proof,
+from ...config_types import RootConfig
+from ...events import write_diagnostic_event
+from ...lease import (ClockObservation, clock_capability, new_timed_offer_proof,
                      persist_clock_observation, timed_offer_deadline_upper)
-from .locks import group_lock, task_lock
-from .locks import schema_lock, schema_writer_lock
-from .paths import group_path, shared_paths, submission_path
-from .records import SCHEMA_VERSION, TaskRecord, new_id, normalize_group_record, utc_now
-from .ready import (
+from ..locks import group_lock, task_lock
+from ..locks import schema_lock, schema_writer_lock
+from ..paths import group_path, shared_paths, submission_path
+from ..records import SCHEMA_VERSION, TaskRecord, new_id, normalize_group_record, utc_now
+from ..ready import (
     discard_ready_generation,
     prepare_ready_transition,
     ready_task_projection_issue,
     reserve_ready_generation,
     retire_previous_ready_generation,
 )
-from .store import atomic_replace, iter_json, read_json
-from .tasks import load_task, save_task
-from .active_operations import (
+from ..store import atomic_replace, iter_json, read_json
+from ..tasks import load_task, save_task
+from ..active_operations import (
     active_operation_path,
     archive_operation,
     iter_active_operation_paths,

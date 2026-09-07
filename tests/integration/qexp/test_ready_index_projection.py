@@ -243,7 +243,7 @@ def test_offer_due_tasks_never_enumerates_task_truth(
         offer_after_seconds=0,
     )
     seen = []
-    from qqtools.plugins.qexp.runtime import availability
+    from qqtools.plugins.qexp.runtime.availability import transitions as availability
 
     original_scandir = availability.os.scandir
 

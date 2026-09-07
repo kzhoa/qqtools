@@ -9,7 +9,7 @@ from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.lease import ClockCapability, ClockObservation, LeasePolicy, clock_capability
-from qqtools.plugins.qexp.runtime import availability as availability_runtime
+from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task

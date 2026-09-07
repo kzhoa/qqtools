@@ -14,8 +14,8 @@ from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
 from qqtools.plugins.qexp.runtime.active_operations import active_operation_path, write_active_operation
-from qqtools.plugins.qexp.runtime import availability as availability_runtime
-from qqtools.plugins.qexp.runtime.availability import rebuild_deadline_indexes
+from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime
+from qqtools.plugins.qexp.runtime.availability.transitions import rebuild_deadline_indexes
 from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
