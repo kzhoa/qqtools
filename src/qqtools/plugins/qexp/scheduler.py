@@ -1307,7 +1307,7 @@ def resolve_execution_authority(
             result.lease_expires_at,
         )
     if result.outcome is LeaseRenewalOutcome.ORPHANED_RECOVERY_REQUIRED:
-        from .runtime.recovery import recover_running_attempt
+        from .runtime.attempt_recovery import recover_running_attempt
 
         token = recover_running_attempt(
             cfg,
@@ -1672,7 +1672,7 @@ def reconcile_running_tasks(
                     attempt = AttemptRecord.from_dict(read_json(path))
             evidence_state = _process_evidence_state(attempt, data) if attempt is not None else "unverifiable"
             if task.state["projection"] == "blocked" and evidence_state == "alive":
-                from .runtime.recovery import recover_running_attempt
+                from .runtime.attempt_recovery import recover_running_attempt
 
                 recovered = recover_running_attempt(
                     cfg,

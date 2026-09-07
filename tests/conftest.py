@@ -81,7 +81,7 @@ def qexp_healthy_clock(monkeypatch):
     monkeypatch.setattr("qqtools.plugins.qexp.lease.clock_capability", lambda *_args: capability)
     monkeypatch.setattr("qqtools.plugins.qexp.scheduler.clock_capability", lambda *_args: capability)
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.runtime.recovery.clock_capability",
+        "qqtools.plugins.qexp.runtime.attempt_recovery.clock_capability",
         lambda *_args: capability,
     )
     monkeypatch.setattr(
