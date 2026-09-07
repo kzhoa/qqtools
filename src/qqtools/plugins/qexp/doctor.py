@@ -31,9 +31,11 @@ from .runtime.ready import (
 )
 from .runtime.ready.group_members import (
     GROUP_MEMBER_PAGE_SIZE,
-    audit_group_ready_members,
     group_ready_members_state,
     mark_group_ready_members_degraded,
+)
+from .runtime.ready.group_members_rebuild import (
+    audit_group_ready_members,
     repair_group_ready_members,
 )
 from .lease import clock_capability

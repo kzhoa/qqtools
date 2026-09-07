@@ -1,5 +1,11 @@
 """Public aggregation for the durable ready liveness projection."""
 
+from .group_members_rebuild import (
+    advance_group_ready_members_build,
+    audit_group_ready_members,
+    begin_group_ready_members_build,
+    repair_group_ready_members,
+)
 from .index import (
     ReadyClassification,
     ReadyClassificationResult,
@@ -76,7 +82,10 @@ __all__ = [
     "ReadyProbeBudgetExhausted",
     "ReadyScope",
     "advance_ready_index_build",
+    "advance_group_ready_members_build",
     "assert_ready_writer_compatible",
+    "audit_group_ready_members",
+    "begin_group_ready_members_build",
     "begin_primary_ready_index_rebuild",
     "begin_ready_index_build",
     "bump_primary_ready_revision",
@@ -104,6 +113,7 @@ __all__ = [
     "rebuild_primary_ready_candidate",
     "rebuild_primary_ready_index",
     "repair_ready_index",
+    "repair_group_ready_members",
     "reserve_ready_generation",
     "retire_current_ready_generation",
     "retire_previous_ready_generation",

@@ -421,11 +421,11 @@ def test_upgrade_capture_commit_and_activation_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
-    from qqtools.plugins.qexp.runtime.ready import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members_rebuild
 
     (cfg.shared_root / "indexes" / "ready" / "group-members" / "state.json").unlink()
-    group_members.begin_group_ready_members_build(cfg)
-    original_atomic_replace = group_members.atomic_replace
+    group_members_rebuild.begin_group_ready_members_build(cfg)
+    original_atomic_replace = group_members_rebuild.atomic_replace
     has_failed = False
 
     def fail_capture_commit(path, value):
@@ -441,8 +441,8 @@ def test_upgrade_capture_commit_and_activation_fail_closed(
             raise OSError("injected watermark commit failure")
         return original_atomic_replace(path, value)
 
-    monkeypatch.setattr(group_members, "atomic_replace", fail_capture_commit)
-    assert group_members.advance_group_ready_members_build(cfg, max_tasks=1)["state"] == "degraded"
+    monkeypatch.setattr(group_members_rebuild, "atomic_replace", fail_capture_commit)
+    assert group_members_rebuild.advance_group_ready_members_build(cfg, max_tasks=1)["state"] == "degraded"
     assert has_failed
 
     cfg = init_shared_root(
@@ -453,15 +453,15 @@ def test_upgrade_capture_commit_and_activation_fail_closed(
     create_group(cfg, "exp")
     submit(cfg, ["echo", "audit"], task_id="audit-task", group="exp")
     (cfg.shared_root / "indexes" / "ready" / "group-members" / "state.json").unlink()
-    group_members.begin_group_ready_members_build(cfg)
-    assert group_members.advance_group_ready_members_build(cfg, max_tasks=1)["state"] == "building"
+    group_members_rebuild.begin_group_ready_members_build(cfg)
+    assert group_members_rebuild.advance_group_ready_members_build(cfg, max_tasks=1)["state"] == "building"
     monkeypatch.setattr(
-        group_members,
+        group_members_rebuild,
         "_audit_task_member",
         lambda *_args: (_ for _ in ()).throw(OSError("injected activation audit failure")),
     )
     for _ in range(16):
-        result = group_members.advance_group_ready_members_build(cfg, max_tasks=1)
+        result = group_members_rebuild.advance_group_ready_members_build(cfg, max_tasks=1)
         if result["state"] == "degraded":
             break
     assert result["state"] == "degraded"
@@ -472,10 +472,10 @@ def test_doctor_repair_crash_preserves_the_degraded_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
-    from qqtools.plugins.qexp.runtime.ready import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members_rebuild
 
     mark_group_ready_members_degraded(cfg, "injected projection damage")
-    original_atomic_replace = group_members.atomic_replace
+    original_atomic_replace = group_members_rebuild.atomic_replace
 
     def fail_repair_start(path, value):
         record = value.get("group_ready_members") if isinstance(value, dict) else None
@@ -487,10 +487,10 @@ def test_doctor_repair_crash_preserves_the_degraded_gate(
             raise OSError("injected doctor repair start failure")
         return original_atomic_replace(path, value)
 
-    monkeypatch.setattr(group_members, "atomic_replace", fail_repair_start)
+    monkeypatch.setattr(group_members_rebuild, "atomic_replace", fail_repair_start)
 
     with pytest.raises(OSError, match="doctor repair start failure"):
-        group_members.repair_group_ready_members(cfg, max_tasks=1)
+        group_members_rebuild.repair_group_ready_members(cfg, max_tasks=1)
 
     assert group_ready_members_state(cfg) == "degraded"
 
@@ -560,16 +560,16 @@ def test_resume_consumes_durable_watermark_without_reenumerating_tasks(
     )
     assert first["phase"] == "building"
 
-    from qqtools.plugins.qexp.runtime.ready import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members_rebuild
 
-    original_scandir = group_members.os.scandir
+    original_scandir = group_members_rebuild.os.scandir
 
     def fail_task_directory_scan(path):
         if isinstance(path, (str, Path)) and Path(path) == cfg.shared_root / "tasks":
             raise AssertionError("resume must consume its watermark instead of re-enumerating Tasks")
         return original_scandir(path)
 
-    monkeypatch.setattr(group_members.os, "scandir", fail_task_directory_scan)
+    monkeypatch.setattr(group_members_rebuild.os, "scandir", fail_task_directory_scan)
     completed = resume_group_ready_members_upgrade(
         cfg,
         activation_id=session["activation_id"],
@@ -642,19 +642,19 @@ def test_primary_rebuild_crash_before_member_activation_resumes_safely(
             activation_id=session["activation_id"],
             max_tasks=1,
         )
-    from qqtools.plugins.qexp.runtime.ready import group_members
+    from qqtools.plugins.qexp.runtime.ready import group_members_rebuild
 
-    original_commit = group_members._commit_build_record
+    original_commit = group_members_rebuild._commit_build_record
 
     def crash_after_primary(*args, **kwargs):
         if kwargs.get("should_activate"):
             raise KeyboardInterrupt("simulated process exit")
         return original_commit(*args, **kwargs)
 
-    monkeypatch.setattr(group_members, "_commit_build_record", crash_after_primary)
+    monkeypatch.setattr(group_members_rebuild, "_commit_build_record", crash_after_primary)
     with pytest.raises(KeyboardInterrupt, match="simulated process exit"):
         resume_group_ready_members_upgrade(cfg, activation_id=session["activation_id"], max_tasks=1)
-    monkeypatch.setattr(group_members, "_commit_build_record", original_commit)
+    monkeypatch.setattr(group_members_rebuild, "_commit_build_record", original_commit)
 
     result = resume_group_ready_members_upgrade(cfg, activation_id=session["activation_id"], max_tasks=1)
     assert result["phase"] == "completed"

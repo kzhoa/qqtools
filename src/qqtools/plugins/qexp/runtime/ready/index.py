@@ -46,6 +46,21 @@ def begin_primary_ready_index_rebuild(cfg: object, build_id: str) -> None:
     primary_candidates.begin_primary_ready_index_rebuild(cfg, build_id)
 
 
+def rebuild_primary_ready_candidate(
+    cfg: object,
+    build_id: str,
+    task: TaskRecord,
+    reference: ReadyMarkerRef,
+) -> None:
+    """Publish one owner-fenced primary candidate during an incremental rebuild."""
+    primary_candidates.rebuild_primary_ready_candidate(cfg, build_id, task, reference)
+
+
+def complete_primary_ready_index_rebuild(cfg: object, build_id: str) -> None:
+    """Activate one fully populated owner-fenced primary candidate rebuild."""
+    primary_candidates.complete_primary_ready_index_rebuild(cfg, build_id)
+
+
 def delete_stale_ready_marker(cfg: object, reference: ReadyMarkerRef) -> bool:
     """Recheck authoritative generation immediately before exact stale deletion."""
     result = classify_ready_marker(cfg, reference)
@@ -92,7 +107,7 @@ def sync_primary_ready_group(
             return
         for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
             task = TaskRecord.from_dict(read_json(path))
-            if task.group_name != group_name or not _task_should_have_ready_marker(task):
+            if task.group_name != group_name or not task_should_have_ready_marker(task):
                 continue
             reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
             if reference is not None:
@@ -111,7 +126,7 @@ def primary_projection_routes_for_group(
         return sorted(primary_routes)
     for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
         task = TaskRecord.from_dict(read_json(path))
-        if task.group_name != group_name or not _task_should_have_ready_marker(task):
+        if task.group_name != group_name or not task_should_have_ready_marker(task):
             continue
         reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
         if reference is not None:
@@ -494,7 +509,7 @@ def classify_ready_marker(
     return ReadyClassificationResult("claimable", "eligible_truth", task)
 
 
-def _task_should_have_ready_marker(task: TaskRecord) -> bool:
+def task_should_have_ready_marker(task: TaskRecord) -> bool:
     return (
         task.state.get("projection") == "queued"
         and not task.claim_control.get("active_claim")
