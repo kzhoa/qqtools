@@ -8,7 +8,7 @@ from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
-from qqtools.plugins.qexp.runtime.active_operations import (
+from qqtools.plugins.qexp.runtime.operation_store import (
     iter_active_operation_paths,
     write_active_operation,
 )

@@ -17,7 +17,7 @@ from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.tasks import load_task, save_task
 from ..runtime.availability import remove_deadline_index
 from ..runtime.ready import assert_ready_writer_compatible, retire_current_ready_generation
-from ..runtime.active_operations import (
+from ..runtime.operation_store import (
     active_operation_path,
     archive_operation,
     iter_active_operation_paths,

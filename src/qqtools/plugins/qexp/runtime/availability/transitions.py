@@ -26,7 +26,7 @@ from ..ready import (
 )
 from ..store import atomic_replace, read_json
 from ..tasks import load_task, save_task
-from ..active_operations import (
+from ..operation_store import (
     active_operation_path,
     archive_operation,
     iter_active_operation_paths,

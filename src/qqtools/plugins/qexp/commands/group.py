@@ -9,7 +9,7 @@ from typing import Any
 from ..config_types import RootConfig
 from ..layout import is_group_ready_members_root
 from ..lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
-from ..runtime.active_operations import (
+from ..runtime.operation_store import (
     active_operation_path,
     archive_operation,
     iter_active_operation_paths,

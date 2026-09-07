@@ -14,7 +14,7 @@ from qqtools.plugins.qexp.commands.group import (
 from qqtools.plugins.qexp.doctor import repair_metadata
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks, reconcile_project_reservations
 from qqtools.plugins.qexp.runner import run_attempt
-from qqtools.plugins.qexp.runtime.active_operations import active_operation_path, write_active_operation
+from qqtools.plugins.qexp.runtime.operation_store import active_operation_path, write_active_operation
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
 from qqtools.plugins.qexp.runtime.recovery import recover_running_attempt

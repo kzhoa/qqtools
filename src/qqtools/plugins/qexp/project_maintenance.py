@@ -30,7 +30,7 @@ from .runtime.resources.reservations import (
 from .runtime.store import iter_json, read_json
 from .runtime.tasks import load_task
 from .runtime.work_budget import diagnostic_span
-from .runtime.active_operations import migrate_legacy_active_operations
+from .runtime.operation_store import migrate_legacy_active_operations
 
 
 def maintain_project(

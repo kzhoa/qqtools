@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator, Iterable
 
-from .active_operations import operation_exists
+from .operation_store import operation_exists
 from .locks import group_lock, task_lock
 from .paths import shared_paths, submission_path
 from .records import TaskRecord, validate_identifier
