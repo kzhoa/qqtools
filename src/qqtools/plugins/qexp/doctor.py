@@ -605,7 +605,7 @@ def repair_metadata(
 def repair_orphans(
     cfg: RootConfig, *, reservation_runtime_root: Path | None = None
 ) -> dict[str, Any]:
-    from .runtime.recovery import recover_running_attempt
+    from .runtime.attempt_recovery import recover_running_attempt
     from .scheduler import (_process_evidence_state, finalize_orphaned_attempt)
     repaired: list[str] = []
     blocked: list[dict[str, str]] = []

@@ -17,7 +17,7 @@ from qqtools.plugins.qexp.runner import run_attempt
 from qqtools.plugins.qexp.runtime.operation_store import active_operation_path, write_active_operation
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
-from qqtools.plugins.qexp.runtime.recovery import recover_running_attempt
+from qqtools.plugins.qexp.runtime.attempt_recovery import recover_running_attempt
 from qqtools.plugins.qexp.runtime.resources.reservations import reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task

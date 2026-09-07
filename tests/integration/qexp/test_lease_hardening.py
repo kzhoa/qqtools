@@ -16,7 +16,7 @@ from qqtools.plugins.qexp.lease import (
     save_lease_policy,
 )
 from qqtools.plugins.qexp.runtime.paths import attempt_path
-from qqtools.plugins.qexp.runtime.recovery import recover_running_attempt
+from qqtools.plugins.qexp.runtime.attempt_recovery import recover_running_attempt
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.termination import (
     commit_local_unavailable,

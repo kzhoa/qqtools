@@ -421,7 +421,7 @@ def test_migration_gpu_conflict_keeps_source_and_disables_project(tmp_path: Path
 
 
 def test_machine_recovery_retags_global_reservation(tmp_path: Path) -> None:
-    from qqtools.plugins.qexp.runtime.recovery import recover_running_attempt
+    from qqtools.plugins.qexp.runtime.attempt_recovery import recover_running_attempt
     from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
 
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
