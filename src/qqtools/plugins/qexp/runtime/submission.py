@@ -168,16 +168,6 @@ def _canonical_specs(specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return canonical
 
 
-def _legacy_empty_dependencies_digest(normalized: dict[str, Any]) -> str | None:
-    """Return the pre-dependency digest when every dependency declaration is empty."""
-    legacy = json.loads(json.dumps(normalized))
-    for task in legacy["tasks"]:
-        dependencies = task.pop("depends_on_task_ids", None)
-        if dependencies not in (None, []):
-            return None
-    return semantic_digest(legacy)
-
-
 def _resolved_specs(specs: list[dict[str, Any]], submitting_machine: str) -> list[dict[str, Any]]:
     result = []
     seen: set[str] = set()
@@ -205,22 +195,24 @@ def _resolved_specs(specs: list[dict[str, Any]], submitting_machine: str) -> lis
     return result
 
 
-def _normalize_resolved_dependencies(operation: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
-    """Normalize legacy omitted dependency fields in a durable submission context."""
-    resolved = operation["submission"]["resolved_context"]["task_specs"]
-    changed = False
-    normalized: list[dict[str, Any]] = []
-    for item in resolved:
-        candidate = dict(item)
-        dependencies = normalize_dependency_ids(candidate.get("depends_on_task_ids"))
-        if candidate.get("depends_on_task_ids") != dependencies:
-            candidate["depends_on_task_ids"] = dependencies
-            changed = True
-        normalized.append(candidate)
-    if changed:
-        # QQTOOLS-COMPAT-0007: migrate durable legacy submission copies during replay.
-        operation["submission"]["resolved_context"]["task_specs"] = normalized
-    return normalized, changed
+def _canonical_resolved_specs(operation: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return a submission's canonical resolved Task specifications."""
+    try:
+        resolved = operation["submission"]["resolved_context"]["task_specs"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("submission operation has an invalid canonical task context.") from exc
+    if (
+        not isinstance(resolved, list)
+        or any(
+            not isinstance(item, dict) or "depends_on_task_ids" not in item
+            for item in resolved
+        )
+    ):
+        raise RuntimeError(
+            "submission operation predates the canonical task-dependencies-v1 protocol; "
+            "recovery requires qqtools 1.3.15."
+        )
+    return resolved
 
 
 def _validate_target_machine_record(cfg: Any, machine_name: str) -> None:
@@ -476,12 +468,9 @@ def submit_specs(
             operation_id = read_json(mapping_path)["operation_id"]
             operation = read_json(submission_path(cfg.shared_root, operation_id))
             submission = operation["submission"]
-            legacy_digest = _legacy_empty_dependencies_digest(normalized)
-            if submission["raw_request_digest"] not in {raw_digest, legacy_digest}:
+            if submission["raw_request_digest"] != raw_digest:
                 raise IdempotencyConflict("idempotency key was already used with different semantic input.")
-            resolved, normalized_legacy_copy = _normalize_resolved_dependencies(operation)
-            if normalized_legacy_copy:
-                atomic_replace(submission_path(cfg.shared_root, operation_id), operation)
+            resolved = _canonical_resolved_specs(operation)
             submission = operation["submission"]
             if submission["state"] == "committed":
                 try:
