@@ -559,17 +559,19 @@ def test_resume_consumes_durable_watermark_without_reenumerating_tasks(
         max_tasks=1,
     )
     assert first["phase"] == "building"
+    capture = first["projection"]["build"]["watermark"]["capture"]
+    assert capture["offset"] > 0
 
     from qqtools.plugins.qexp.runtime.ready import group_members_rebuild
 
-    original_scandir = group_members_rebuild.os.scandir
+    original_seekdir = group_members_rebuild._LIBC.seekdir
+    resumed_offsets: list[int] = []
 
-    def fail_task_directory_scan(path):
-        if isinstance(path, (str, Path)) and Path(path) == cfg.shared_root / "tasks":
-            raise AssertionError("resume must consume its watermark instead of re-enumerating Tasks")
-        return original_scandir(path)
+    def track_capture_resume(directory_handle, offset):
+        resumed_offsets.append(offset)
+        original_seekdir(directory_handle, offset)
 
-    monkeypatch.setattr(group_members_rebuild.os, "scandir", fail_task_directory_scan)
+    monkeypatch.setattr(group_members_rebuild._LIBC, "seekdir", track_capture_resume)
     completed = resume_group_ready_members_upgrade(
         cfg,
         activation_id=session["activation_id"],
@@ -583,6 +585,7 @@ def test_resume_consumes_durable_watermark_without_reenumerating_tasks(
         )
 
     assert completed["phase"] == "completed"
+    assert capture["offset"] in resumed_offsets
 
 
 def test_upgrade_treats_a_normally_cleaned_watermark_task_as_a_tombstone(tmp_path: Path) -> None:
