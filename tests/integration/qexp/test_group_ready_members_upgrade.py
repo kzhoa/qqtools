@@ -226,6 +226,51 @@ def test_verify_detects_missing_writable_index_page(tmp_path: Path) -> None:
     assert group_ready_members_state(cfg) == "degraded"
 
 
+def test_verify_detects_full_current_writable_page_pointer(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    for index in range(64):
+        submit(cfg, ["echo", str(index)], task_id=f"full-pointer-{index}", group="exp")
+
+    from qqtools.plugins.qexp.runtime.ready import group_members
+
+    state_path = group_members._group_state_path(cfg, "exp")
+    state = read_json(state_path)
+    state["group_ready_members"]["writable_member_page"] = 0
+    atomic_replace(state_path, state)
+
+    result = verify_integrity(cfg, max_work_items=64)
+    while not result["complete"]:
+        result = verify_integrity(cfg, max_work_items=64)
+    assert result["healthy"] is False
+    assert "group_ready_members_inconsistent" in {item["code"] for item in result["issues"]}
+    assert group_ready_members_state(cfg) == "degraded"
+
+
+def test_verify_detects_directory_page_cycle(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "exp")
+    for index in range(65):
+        submit(cfg, ["echo", str(index)], task_id=f"directory-cycle-{index}", group="exp")
+
+    from qqtools.plugins.qexp.runtime.ready import group_members
+
+    directory_path = group_members._directory_path(cfg, "exp", 0)
+    directory = read_json(directory_path)
+    directory["group_ready_member_directory"]["next_page"] = 0
+    atomic_replace(directory_path, directory)
+
+    result = verify_integrity(cfg, max_work_items=64)
+    for _ in range(20):
+        if result["complete"]:
+            break
+        result = verify_integrity(cfg, max_work_items=64)
+    assert result["complete"] is True
+    assert result["healthy"] is False
+    assert "group_ready_members_inconsistent" in {item["code"] for item in result["issues"]}
+    assert group_ready_members_state(cfg) == "degraded"
+
+
 def test_locator_damage_degrades_then_doctor_rebuilds_active_projection(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
