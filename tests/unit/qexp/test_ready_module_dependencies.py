@@ -27,9 +27,15 @@ def _ready_dependencies() -> dict[str, set[str]]:
 def test_ready_implementation_dependencies_are_acyclic_and_layered() -> None:
     dependencies = _ready_dependencies()
 
-    assert "index" not in dependencies["group_members"]
-    assert "group_members_rebuild" not in dependencies["group_members"]
-    assert "group_members_rebuild" not in dependencies["index"]
+    assert not dependencies["index"] & {"traversal", "rebuild", "group_members_rebuild"}
+    assert not dependencies["routes"] & {"index", "primary_candidates"}
+    assert "index" not in dependencies["traversal"]
+    assert not dependencies["group_members"] & {
+        "index",
+        "primary_candidates",
+        "rebuild",
+        "group_members_rebuild",
+    }
     assert dependencies["group_members_rebuild"] >= {"group_members", "index", "routes"}
 
     remaining = {module: set(imports) for module, imports in dependencies.items()}
@@ -50,6 +56,17 @@ def test_group_member_rebuild_uses_no_private_online_imports() -> None:
         if alias.name.startswith("_")
     ]
     assert private_imports == []
+
+
+def test_ready_routes_do_not_depend_on_group_models() -> None:
+    module = ast.parse((READY_ROOT / "routes.py").read_text(encoding="utf-8"))
+    imported_names = {
+        alias.name
+        for node in ast.walk(module)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    assert "Group" not in imported_names
 
 
 def test_ready_facade_exports_group_rebuild_owner_objects() -> None:
