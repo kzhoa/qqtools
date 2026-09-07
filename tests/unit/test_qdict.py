@@ -134,6 +134,15 @@ def test_allow_notexist_false():
         _ = d["non_existent_key"]
 
 
+@pytest.mark.parametrize("allow_notexist", [True, False])
+def test_unhashable_key_preserves_type_error(allow_notexist):
+    """Unhashable keys are invalid inputs, not missing keys."""
+    d = qDict(allow_notexist=allow_notexist)
+
+    with pytest.raises(TypeError, match="unhashable type: 'list'"):
+        _ = d[[]]
+
+
 def test_default_function():
     """Test default value generation via default_function."""
     d = qDict(default_function=lambda: "default_value")
