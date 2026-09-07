@@ -14,12 +14,12 @@ from ..records import TaskRecord, utc_now, validate_identifier
 from ..store import atomic_replace, iter_json, read_json
 from . import primary_candidates, routes, state
 from .index import (
-    _task_should_have_ready_marker,
     begin_primary_ready_index_rebuild,
     classify_ready_marker,
     delete_ready_marker,
     prepare_ready_transition,
     retire_previous_ready_generation,
+    task_should_have_ready_marker,
 )
 
 READY_BUILD_PAGE_SIZE = 64
@@ -192,7 +192,7 @@ def rebuild_primary_ready_index(cfg: object) -> None:
         )
         for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
             task = TaskRecord.from_dict(read_json(path))
-            if not _task_should_have_ready_marker(task):
+            if not task_should_have_ready_marker(task):
                 continue
             reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
             if reference is not None:
@@ -232,7 +232,7 @@ def _repair_task_ready_projection(cfg: object, task_id: str) -> tuple[int, int]:
             if reference is not None and routes.is_reference_indexed(cfg, reference)
             else None
         )
-        if _task_should_have_ready_marker(task):
+        if task_should_have_ready_marker(task):
             if classification in {"claimable", "temporarily_unavailable"}:
                 return repaired, stale_removed
             old_generation, _new_generation = prepare_ready_transition(cfg, task, "ready_index_rebuild")
@@ -312,7 +312,7 @@ def _audit_task_ready_projection(cfg: object, task_id: str) -> str | None:
     except (KeyError, TypeError, ValueError):
         return f"task_invalid:{task_id}"
     reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
-    if _task_should_have_ready_marker(task):
+    if task_should_have_ready_marker(task):
         if reference is None:
             return f"marker_missing:{task_id}"
         if not routes.is_reference_indexed(cfg, reference):
@@ -399,7 +399,7 @@ def advance_ready_index_build(
                             task = TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id)))
                         except FileNotFoundError:
                             task = None
-                        if task is not None and _task_should_have_ready_marker(task):
+                        if task is not None and task_should_have_ready_marker(task):
                             reference = routes.reference_for_generation(
                                 cfg,
                                 task.task_id,

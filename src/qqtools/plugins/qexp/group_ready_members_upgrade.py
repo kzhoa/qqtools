@@ -8,10 +8,10 @@ from typing import Any
 
 from .config_types import RootConfig
 from .layout import GROUP_READY_MEMBERS_CAPABILITY
-from .runtime.ready.group_members import (
+from .runtime.ready.group_members import read_group_ready_members_state
+from .runtime.ready.group_members_rebuild import (
     advance_group_ready_members_build,
     begin_group_ready_members_build,
-    read_group_ready_members_state,
 )
 from .runtime.locks import schema_lock
 from .runtime.paths import shared_paths
