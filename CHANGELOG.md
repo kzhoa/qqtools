@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- feat: add structured, bounded qexp ready-index degradation diagnostics across scheduling,
+  traversal, rebuild, and doctor flows, including safe legacy-reason display and preservation of
+  pre-repair evidence.
+- fix: allow schema-5 roots to complete schema-6 migration and interrupted-migration recovery
+  before `cpu-lane-v1` activation, while continuing to reject normal runtime access until the
+  capability is active.
 - breaking: retire the qexp CPU-lane compatibility transition. The `upgrade cpu-lane` CLI,
   temporary upgrader, legacy diagnostic cursor aliases, and compatibility registry item are removed;
   ordinary access now rejects roots that have not been converted to the permanent `cpu-lane-v1`

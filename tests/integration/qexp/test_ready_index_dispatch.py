@@ -912,7 +912,7 @@ def test_primary_probe_rechecks_completed_shared_scope_before_borrow(
     ]
     assert executor.launched == []
     assert borrow_task.task_id not in executor.launched
-    shared_probe_key = (binding.project_id, "shared")
+    shared_probe_key = (binding.project_id, "shared", "gpu")
     assert runtime.primary_probe_complete[shared_probe_key] is False
     assert runtime.primary_probe_cursors[shared_probe_key] is None
 
