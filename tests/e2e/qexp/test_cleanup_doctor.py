@@ -87,9 +87,21 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
             timeout=TASK_TERMINAL_TIMEOUT_SECONDS,
             label="local process cleanup eligibility",
         )
-        verify = jrun([*common, "doctor", "verify"], env=env)
+        verify = None
+
+        def is_verification_complete() -> bool:
+            nonlocal verify
+            verify = jrun([*common, "doctor", "verify"], env=env)
+            return verify["complete"]
+
+        wait_for(
+            is_verification_complete,
+            timeout=TASK_TERMINAL_TIMEOUT_SECONDS,
+            label="doctor verification",
+        )
 
         assert clean is not None
+        assert verify is not None
         assert "site-packages" in imported_from
         assert task["task"]["state"]["projection"] == "failed"
         assert "fail ok" in logs
