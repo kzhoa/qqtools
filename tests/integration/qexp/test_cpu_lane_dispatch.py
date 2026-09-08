@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from qqtools.plugins.qexp.commands.task import submit
 from qqtools.plugins.qexp.executor import Executor
 from qqtools.plugins.qexp.machine_config import init_shared_root
@@ -51,7 +53,7 @@ def test_legacy_root_rejects_cpu_only_submission_without_task_write(tmp_path: Pa
     del schema["schema"]["required_capabilities"]
     atomic_replace(schema_path, schema)
 
-    try:
+    with pytest.raises(RuntimeError, match="requires cpu-lane-v1"):
         submit(
             cfg,
             ["echo", "no"],
@@ -59,10 +61,6 @@ def test_legacy_root_rejects_cpu_only_submission_without_task_write(tmp_path: Pa
             requested_cpus=1,
             working_dir=working_directory,
         )
-    except ValueError as exc:
-        assert "canonical CPU-lane root" in str(exc)
-    else:
-        raise AssertionError("legacy root accepted a CPU-only Task")
     assert not list((cfg.shared_root / "tasks").glob("*.json"))
 
 

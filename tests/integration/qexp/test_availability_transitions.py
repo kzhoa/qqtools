@@ -415,7 +415,10 @@ def test_failed_availability_operation_does_not_make_doctor_unhealthy(tmp_path: 
     with pytest.raises(ValueError, match="does not belong to a Group"):
         task_commands.share(cfg, task.task_id)
 
-    assert verify_integrity(cfg)["healthy"] is True
+    verification = verify_integrity(cfg)
+    while not verification["complete"]:
+        verification = verify_integrity(cfg)
+    assert verification["healthy"] is True
 
 
 def test_cli_availability_json_and_human_outputs(tmp_path: Path, monkeypatch, capsys):
