@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.16
+
 - feat: add structured, bounded qexp ready-index degradation diagnostics across scheduling,
   traversal, rebuild, and doctor flows, including safe legacy-reason display and preservation of
   pre-repair evidence.
