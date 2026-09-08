@@ -71,7 +71,7 @@ transition_purged_in = "1.3.17"
 marker = "QQTOOLS-COMPAT-0007"
 owner = "qexp.runtime"
 decision_refs = ["docs/spec/qexp_task_dependencies_compatibility.md"]
-pitch_refs = ["docs/pitch/qexp-task-dependencies.md"]
+pitch_refs = ["docs/pitch/arxiv/058-qexp-task-dependencies.md"]
 verification = [
     "tests/integration/qexp/test_schema_compatibility.py",
     "tests/integration/qexp/test_machine_runtime.py",

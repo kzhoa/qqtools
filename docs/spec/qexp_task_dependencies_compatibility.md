@@ -10,7 +10,7 @@ archived_at:
 This is the planned transition contract for Task dependencies in 1.3.15. Global schema
 `version` and `minimum_reader_version` remain 6. `QQTOOLS-COMPAT-0007` independently tracks
 temporary compatibility; the [registry](compatibility-registry.toml) owns exact deadlines.
-The [dependency pitch](../pitch/qexp-task-dependencies.md) defines the proposed feature semantics.
+The [dependency pitch](../pitch/arxiv/058-qexp-task-dependencies.md) defines the proposed feature semantics.
 
 ## Release contract
 
