@@ -326,7 +326,11 @@ def advance_group_ready_members_audit(
             raise ValueError("Group ready-member audit state is invalid.")
         if phase == "capture-tasks":
             watermark = _capture_build_watermark(
-                cfg, build_id=audit_id, watermark=audit["task_watermark"], max_entries=max_work_items, collection="audit-tasks"
+                cfg,
+                build_id=audit_id,
+                watermark=audit["task_watermark"],
+                max_entries=max_work_items,
+                collection="audit-tasks",
             )
             audit["task_watermark"] = watermark
             if watermark.get("is_complete"):
@@ -464,10 +468,10 @@ def _write_build_page(
         raise ValueError("projection_encoding_unsupported:build_page_identifier")
     value = {
         "group_ready_member_build_page": {
-                "schema_version": GROUP_READY_MEMBERS_VERSION,
-                "build_id": build_id,
-                "page": page,
-                "task_ids": list(task_ids),
+            "schema_version": GROUP_READY_MEMBERS_VERSION,
+            "build_id": build_id,
+            "page": page,
+            "task_ids": list(task_ids),
         }
     }
     require_json_size(value, max_bytes=_MAX_BUILD_PAGE_BYTES, record_type="build_page")
@@ -647,12 +651,7 @@ def _advance_writable_index_audit(
     work = WorkBudget(budget)
     next_index_page = cursor.get("next_writable_index_page")
     index_count = cursor.get("writable_index_count")
-    if (
-        type(next_index_page) is not int
-        or next_index_page < 0
-        or type(index_count) is not int
-        or index_count < 0
-    ):
+    if type(next_index_page) is not int or next_index_page < 0 or type(index_count) is not int or index_count < 0:
         raise ValueError("Group ready-member writable index state is invalid.")
     processed = 0
     while work.remaining:
@@ -699,9 +698,7 @@ def _advance_writable_index_audit(
             ):
                 raise ValueError("Group ready-member writable index coverage is invalid.")
             cursor["writable_seen_count"] += 1
-            cursor["writable_seen_digest"] = _update_writable_page_digest(
-                cursor["writable_seen_digest"], member_page
-            )
+            cursor["writable_seen_digest"] = _update_writable_page_digest(cursor["writable_seen_digest"], member_page)
             cursor["writable_index_offset"] = offset + 1
             work.consume("writable-member-page")
             processed = work.consumed
@@ -881,9 +878,7 @@ def _advance_member_audit(
                 raise ValueError(f"Group {group_name!r} ready-member count or digest is invalid.")
             if cursor.get("directory_pages_seen") != group.get("directory_page_count"):
                 raise ValueError(f"Group {group_name!r} directory chain is incomplete.")
-            if cursor.get("writable_current_page") is not None and not cursor.get(
-                "writable_current_seen", False
-            ):
+            if cursor.get("writable_current_page") is not None and not cursor.get("writable_current_seen", False):
                 raise ValueError(f"Group {group_name!r} writable page pointer is invalid.")
             cursor.update(
                 {
@@ -940,9 +935,8 @@ def _advance_member_audit(
             is_indexed = catalog_record.get("writable_indexed")
             if not isinstance(is_indexed, bool):
                 raise ValueError("Group ready-member writable-index flag is invalid.")
-            should_be_indexed = (
-                len(entries) < GROUP_MEMBER_PAGE_SIZE
-                and member_page != cursor.get("writable_current_page")
+            should_be_indexed = len(entries) < GROUP_MEMBER_PAGE_SIZE and member_page != cursor.get(
+                "writable_current_page"
             )
             if member_page == cursor.get("writable_current_page"):
                 if len(entries) >= GROUP_MEMBER_PAGE_SIZE:
@@ -1307,9 +1301,7 @@ def _complete_empty_archive_cleanup(cfg: object) -> dict[str, Any]:
         return {"state": "completed", "archive_count": record["archive_count"], "processed": 0}
 
 
-def _cleanup_completed_audit_scratch(
-    cfg: object, max_work_items: int
-) -> dict[str, Any] | None:
+def _cleanup_completed_audit_scratch(cfg: object, max_work_items: int) -> dict[str, Any] | None:
     """Reclaim one completed audit's fixed-layout capture pages in bounded slices."""
     with exclusive(_archive_cleanup_lock_path(cfg)):
         with exclusive(group_ready_members_state_lock_path(cfg)):
@@ -1447,9 +1439,7 @@ def _advance_archive_cleanup(
     }
     if phase not in allowed_phases:
         raise ValueError("Group ready-member archive cleanup state is invalid.")
-    if group_key is not None and (
-        not isinstance(group_key, str) or "/" in group_key or group_key in {"", ".", ".."}
-    ):
+    if group_key is not None and (not isinstance(group_key, str) or "/" in group_key or group_key in {"", ".", ".."}):
         raise ValueError("Group ready-member archive cleanup group is invalid.")
     processed = 0
     while processed < max_work_items:

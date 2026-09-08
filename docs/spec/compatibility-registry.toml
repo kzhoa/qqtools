@@ -12,7 +12,7 @@ transition_purged_in = "1.3.18"
 marker = "QQTOOLS-COMPAT-0010"
 owner = "qexp.runtime"
 decision_refs = ["docs/spec/qexp_runtime_spec.md"]
-pitch_refs = ["docs/pitch/qexp-ready-index-degradation-diagnostics.md"]
+pitch_refs = ["docs/pitch/arxiv/059-qexp-ready-index-degradation-diagnostics.md"]
 verification = [
     "tests/unit/qexp/runtime/test_ready_diagnostics.py",
     "tests/integration/qexp/test_ready_index_activation.py",
