@@ -443,8 +443,18 @@ def _append_member_page(cfg: object, group_name: str, group: dict[str, Any], mem
     tail = group["directory_tail"]
     if tail is None:
         directory_page = group["next_directory_page"]
-        atomic_replace(_directory_path(cfg, group_name, directory_page), _directory_record(group_name, directory_page, [member_page], None))
-        group.update({"directory_head": directory_page, "directory_tail": directory_page, "directory_page_count": 1, "next_directory_page": directory_page + 1})
+        atomic_replace(
+            _directory_path(cfg, group_name, directory_page),
+            _directory_record(group_name, directory_page, [member_page], None),
+        )
+        group.update(
+            {
+                "directory_head": directory_page,
+                "directory_tail": directory_page,
+                "directory_page_count": 1,
+                "next_directory_page": directory_page + 1,
+            }
+        )
         return
     directory = _read_directory(cfg, group_name, tail)
     pages = list(directory["member_pages"])
@@ -453,9 +463,18 @@ def _append_member_page(cfg: object, group_name: str, group: dict[str, Any], mem
         atomic_replace(_directory_path(cfg, group_name, tail), _directory_record(group_name, tail, pages, None))
         return
     directory_page = group["next_directory_page"]
-    atomic_replace(_directory_path(cfg, group_name, directory_page), _directory_record(group_name, directory_page, [member_page], None))
+    atomic_replace(
+        _directory_path(cfg, group_name, directory_page),
+        _directory_record(group_name, directory_page, [member_page], None),
+    )
     atomic_replace(_directory_path(cfg, group_name, tail), _directory_record(group_name, tail, pages, directory_page))
-    group.update({"directory_tail": directory_page, "directory_page_count": group["directory_page_count"] + 1, "next_directory_page": directory_page + 1})
+    group.update(
+        {
+            "directory_tail": directory_page,
+            "directory_page_count": group["directory_page_count"] + 1,
+            "next_directory_page": directory_page + 1,
+        }
+    )
 
 
 def _load_group(
@@ -598,11 +617,7 @@ def _validate_writable_index(
     free_index_pages: set[int] = set()
     index_page = group.get("writable_index_free_head")
     while index_page is not None:
-        if (
-            index_page >= next_index_page
-            or index_page in active_index_pages
-            or index_page in free_index_pages
-        ):
+        if index_page >= next_index_page or index_page in active_index_pages or index_page in free_index_pages:
             raise ValueError("Group ready-member writable index free chain is invalid.")
         free_index_pages.add(index_page)
         record = _read_writable_index(cfg, group_name, index_page)
@@ -660,9 +675,9 @@ def _validate_entry_locator(
     entry: dict[str, Any],
 ) -> tuple[dict[str, Any], int]:
     """Return the exact page entry identified by one validated locator."""
-    locator = read_json_limited(
-        _locator_path(cfg, group_name, entry["identity"]), max_bytes=_MAX_LOCATOR_BYTES
-    )["group_ready_member_locator"]
+    locator = read_json_limited(_locator_path(cfg, group_name, entry["identity"]), max_bytes=_MAX_LOCATOR_BYTES)[
+        "group_ready_member_locator"
+    ]
     if not isinstance(locator, dict):
         raise ValueError("Group ready-member locator is invalid.")
     page = locator.get("page")
@@ -727,12 +742,12 @@ def _rewrite_page_locators(
     for slot, entry in enumerate(entries):
         value = {
             "group_ready_member_locator": {
-                    "schema_version": GROUP_READY_MEMBERS_VERSION,
-                    "identity": entry["identity"],
-                    "group_name": group_name,
-                    "page": page,
-                    "slot": slot,
-                    "member_revision": entry["member_revision"],
+                "schema_version": GROUP_READY_MEMBERS_VERSION,
+                "identity": entry["identity"],
+                "group_name": group_name,
+                "page": page,
+                "slot": slot,
+                "member_revision": entry["member_revision"],
             }
         }
         require_json_size(value, max_bytes=_MAX_LOCATOR_BYTES, record_type="member_locator")
@@ -827,9 +842,7 @@ def publish_group_ready_member(cfg: object, task: TaskRecord, reference: ReadyMa
             raise ValueError("Group ready-member state is invalid.")
         locator_path = _locator_path(cfg, group_name, identity)
         if locator_path.exists():
-            locator = read_json_limited(
-                locator_path, max_bytes=_MAX_LOCATOR_BYTES
-            )["group_ready_member_locator"]
+            locator = read_json_limited(locator_path, max_bytes=_MAX_LOCATOR_BYTES)["group_ready_member_locator"]
             if not isinstance(locator, dict):
                 raise ValueError("Group ready-member locator is invalid.")
             located, _page = _validate_entry_locator(
@@ -894,12 +907,12 @@ def publish_group_ready_member(cfg: object, task: TaskRecord, reference: ReadyMa
         record["updated_at"] = utc_now()
         locator_value = {
             "group_ready_member_locator": {
-                    "schema_version": GROUP_READY_MEMBERS_VERSION,
-                    "identity": identity,
-                    "group_name": group_name,
-                    "page": page,
-                    "slot": len(page_entries) - 1,
-                    "member_revision": entry["member_revision"],
+                "schema_version": GROUP_READY_MEMBERS_VERSION,
+                "identity": identity,
+                "group_name": group_name,
+                "page": page,
+                "slot": len(page_entries) - 1,
+                "member_revision": entry["member_revision"],
             }
         }
         require_json_size(locator_value, max_bytes=_MAX_LOCATOR_BYTES, record_type="member_locator")

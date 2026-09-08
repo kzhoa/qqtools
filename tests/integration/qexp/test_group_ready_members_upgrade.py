@@ -273,8 +273,7 @@ def test_writable_page_index_reuses_every_retired_page_across_churn(tmp_path: Pa
 
     for cycle in range(4):
         tasks = [
-            submit(cfg, ["echo", str(index)], task_id=f"cycle-{cycle}-{index}", group="exp")
-            for index in range(65)
+            submit(cfg, ["echo", str(index)], task_id=f"cycle-{cycle}-{index}", group="exp") for index in range(65)
         ]
         for task in tasks:
             assert retire_group_ready_member(cfg, "exp", task.task_id, task.ready_generation)
@@ -288,10 +287,7 @@ def test_writable_page_index_reuses_every_retired_page_across_churn(tmp_path: Pa
 def test_archive_cleanup_reclaims_writable_index_pages(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
-    tasks = [
-        submit(cfg, ["echo", str(index)], task_id=f"archive-{index}", group="exp")
-        for index in range(129)
-    ]
+    tasks = [submit(cfg, ["echo", str(index)], task_id=f"archive-{index}", group="exp") for index in range(129)]
     for task in tasks[:128]:
         assert retire_group_ready_member(cfg, "exp", task.task_id, task.ready_generation)
     from qqtools.plugins.qexp.runtime.ready import group_members
@@ -312,10 +308,7 @@ def test_archive_cleanup_reclaims_writable_index_pages(tmp_path: Path) -> None:
 def test_verify_detects_missing_writable_index_page(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "exp")
-    tasks = [
-        submit(cfg, ["echo", str(index)], task_id=f"audit-index-{index}", group="exp")
-        for index in range(129)
-    ]
+    tasks = [submit(cfg, ["echo", str(index)], task_id=f"audit-index-{index}", group="exp") for index in range(129)]
     for task in tasks[:128]:
         assert retire_group_ready_member(cfg, "exp", task.task_id, task.ready_generation)
     from qqtools.plugins.qexp.runtime.ready import group_members
@@ -866,9 +859,7 @@ def test_degraded_diagnostics_remain_within_fixed_state_bounds(tmp_path: Path) -
     for index in range(20):
         mark_group_ready_members_degraded(cfg, f"failure-{index}:" + "é" * 600)
 
-    state = read_json(shared_paths(cfg.shared_root)["ready_group_members"] / "state.json")[
-        "group_ready_members"
-    ]
+    state = read_json(shared_paths(cfg.shared_root)["ready_group_members"] / "state.json")["group_ready_members"]
     reasons = state["degraded_reasons"]
     assert len(reasons) == 16
     assert all(len(reason.encode("utf-8")) <= 512 for reason in reasons)
