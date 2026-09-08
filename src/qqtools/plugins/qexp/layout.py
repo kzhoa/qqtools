@@ -54,6 +54,7 @@ def read_schema_version(cfg: RootConfig) -> int | None:
 CPU_LANE_CAPABILITY = "cpu-lane-v1"
 TASK_DEPENDENCIES_CAPABILITY = "task-dependencies-v1"
 GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
+_CPU_LANE_REQUIRED_ERROR = "qexp root requires cpu-lane-v1; complete conversion with qqtools 1.3.15."
 SUPPORTED_REQUIRED_CAPABILITIES = frozenset(
     {
         CPU_LANE_CAPABILITY,
@@ -63,22 +64,28 @@ SUPPORTED_REQUIRED_CAPABILITIES = frozenset(
 )
 
 
-def is_cpu_lane_root(cfg: RootConfig) -> bool:
-    """Return whether this root uses the canonical CPU-lane record protocol."""
+def _read_cpu_lane_capability(cfg: RootConfig, *, is_required: bool) -> bool:
     path = _schema_path(cfg)
     if not path.exists():
         return False
     capabilities = read_json(path).get("schema", {}).get("required_capabilities")
     if capabilities is None:
-        raise RuntimeError("qexp root requires cpu-lane-v1; complete its conversion with qqtools 1.3.15.")
+        if is_required:
+            raise RuntimeError(_CPU_LANE_REQUIRED_ERROR)
+        return False
     if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
         raise RuntimeError("qexp schema/version.json has malformed required capabilities.")
     unknown = sorted(set(capabilities) - SUPPORTED_REQUIRED_CAPABILITIES)
     if unknown:
         raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
-    if CPU_LANE_CAPABILITY not in capabilities:
-        raise RuntimeError("qexp root requires cpu-lane-v1; complete its conversion with qqtools 1.3.15.")
-    return True
+    if is_required and CPU_LANE_CAPABILITY not in capabilities:
+        raise RuntimeError(_CPU_LANE_REQUIRED_ERROR)
+    return CPU_LANE_CAPABILITY in capabilities
+
+
+def is_cpu_lane_root(cfg: RootConfig) -> bool:
+    """Return whether this root uses the canonical CPU-lane record protocol."""
+    return _read_cpu_lane_capability(cfg, is_required=True)
 
 
 def is_task_dependencies_root(cfg: RootConfig) -> bool:
@@ -107,13 +114,13 @@ def is_group_ready_members_root(cfg: RootConfig) -> bool:
     return GROUP_READY_MEMBERS_CAPABILITY in capabilities
 
 
-def validate_root_contract(cfg: RootConfig) -> None:
+def _validate_root_contract(cfg: RootConfig, *, should_require_cpu_lane: bool) -> None:
     version = read_schema_version(cfg)
     if version != SCHEMA_VERSION:
         if version is None:
             raise RuntimeError("qexp root is uninitialized; run qexp init first.")
         raise RuntimeError(f"Unsupported qexp schema {version!r}; expected schema {SCHEMA_VERSION}.")
-    is_cpu_lane_root(cfg)
+    _read_cpu_lane_capability(cfg, is_required=should_require_cpu_lane)
     shared_upgrade_journal = shared_paths(cfg.shared_root)["schema"] / "schema6-upgrade.json"
     if shared_upgrade_journal.exists():
         upgrade = read_json(shared_upgrade_journal).get("schema6_upgrade", {})
@@ -148,6 +155,10 @@ def validate_root_contract(cfg: RootConfig) -> None:
     missing_subdirs = sorted(str(path.relative_to(cfg.shared_root)) for path in required_subdirs if not path.exists())
     if missing_subdirs:
         raise RuntimeError(f"qexp schema-6 root is incomplete; missing {missing_subdirs}.")
+
+
+def validate_root_contract(cfg: RootConfig) -> None:
+    _validate_root_contract(cfg, should_require_cpu_lane=True)
 
 
 def ensure_shared_layout(cfg: RootConfig) -> None:
@@ -245,7 +256,7 @@ def _migrate_schema5_to_schema6_locked(cfg: RootConfig) -> None:
             _promote_staged_root(cfg, plan)
             return
         elif phase == "committed":
-            validate_root_contract(cfg)
+            _validate_root_contract(cfg, should_require_cpu_lane=False)
             return
         else:
             raise RuntimeError(f"schema migration cannot resume journal phase {phase!r}.")
@@ -254,7 +265,7 @@ def _migrate_schema5_to_schema6_locked(cfg: RootConfig) -> None:
         raise RuntimeError("qexp root is uninitialized; cannot migrate.")
     version = read_json(path).get("schema", {}).get("version")
     if version == SCHEMA_VERSION:
-        validate_root_contract(cfg)
+        _validate_root_contract(cfg, should_require_cpu_lane=False)
         return
     if version != 5:
         raise RuntimeError(f"schema migration supports only schema 5, got {version!r}.")
@@ -392,7 +403,7 @@ def _recover_parked_schema5_root(cfg: RootConfig) -> bool:
     _fsync_directory(cfg.shared_root.parent)
     plan["migration"]["phase"] = "committed"
     atomic_replace(journal, plan)
-    validate_root_contract(cfg)
+    _validate_root_contract(cfg, should_require_cpu_lane=False)
     return True
 
 
@@ -441,7 +452,7 @@ def _rewrite_staged_root(cfg: RootConfig, stage: Path) -> None:
             }
         },
     )
-    validate_root_contract(staged_cfg)
+    _validate_root_contract(staged_cfg, should_require_cpu_lane=False)
     _validate_staged_records(stage)
 
 

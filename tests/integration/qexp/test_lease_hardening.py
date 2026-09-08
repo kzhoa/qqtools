@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp import layout as qexp_layout
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.layout import load_root_config, migrate_schema5_to_schema6
 from qqtools.plugins.qexp.lease import (
@@ -243,7 +244,9 @@ def test_schema5_migration_requires_drain_then_writes_policy(tmp_path: Path):
     value["schema"]["minimum_reader_version"] = 5
     atomic_replace(schema, value)
     migrate_schema5_to_schema6(cfg)
-    upgraded = load_root_config(cfg.shared_root, "g1", cfg.runtime_root, require_initialized=True)
+    upgraded = load_root_config(cfg.shared_root, "g1", cfg.runtime_root, require_initialized=False)
+    with pytest.raises(RuntimeError, match="requires cpu-lane-v1"):
+        qexp_layout.validate_root_contract(upgraded)
     assert load_lease_policy(upgraded).ttl_seconds == 120
 
 
@@ -295,7 +298,9 @@ def test_schema5_migration_recovers_after_source_is_parked(tmp_path: Path, monke
 
     monkeypatch.setattr(layout.os, "rename", original_rename)
     migrate_schema5_to_schema6(cfg)
-    upgraded = load_root_config(cfg.shared_root, "g1", cfg.runtime_root, require_initialized=True)
+    upgraded = load_root_config(cfg.shared_root, "g1", cfg.runtime_root, require_initialized=False)
+    with pytest.raises(RuntimeError, match="requires cpu-lane-v1"):
+        qexp_layout.validate_root_contract(upgraded)
     restored = read_json(upgraded.shared_root / "tasks" / f"{task.task_id}.json")
     assert restored["meta"]["schema_version"] == 6
     assert restored["task"]["control"]["cleanup_operation_id"] is None
