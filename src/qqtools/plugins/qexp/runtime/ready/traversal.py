@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from ..locks import exclusive
 from ..paths import shared_paths
@@ -12,6 +11,7 @@ from ..records import validate_identifier
 from ..store import atomic_replace, read_json
 from ..work_budget import SliceBudget
 from . import primary_candidates, routes, state
+from .diagnostics import ReadyDiagnostic, storage_diagnostic
 from .records import ReadyMarkerRef, ReadyScope
 
 
@@ -35,6 +35,229 @@ class ReadyPeek:
     wrapped: bool = False
     exhausted: bool = False
     unresolved: bool = False
+
+
+_CATALOG_FIELDS = frozenset({"schema_version", "route", "page", "partitions", "successor", "revision"})
+_PARTITION_FIELDS = frozenset(
+    {"schema_version", "route", "partition", "catalog_page", "slots", "sealed", "successor", "revision"}
+)
+_NO_INVALID_PARTITION = object()
+
+
+class _CatalogValidationError(ValueError):
+    """Carry field-level catalog differences to the persisted diagnostic."""
+
+    def __init__(
+        self,
+        *,
+        missing_fields: list[str] | None = None,
+        unexpected_fields: list[str] | None = None,
+        mismatch_fields: list[str] | None = None,
+        invalid_partition: object = _NO_INVALID_PARTITION,
+    ) -> None:
+        self.missing_fields = sorted(set(missing_fields or []))
+        self.unexpected_fields = sorted(set(unexpected_fields or []))
+        self.mismatch_fields = sorted(set(mismatch_fields or []))
+        self.invalid_partition = invalid_partition
+        super().__init__("ready catalog validation failed")
+
+
+class _PartitionValidationError(ValueError):
+    """Carry field-level partition differences to the persisted diagnostic."""
+
+    def __init__(
+        self,
+        *,
+        missing_fields: list[str] | None = None,
+        unexpected_fields: list[str] | None = None,
+        mismatch_fields: list[str] | None = None,
+    ) -> None:
+        self.missing_fields = sorted(set(missing_fields or []))
+        self.unexpected_fields = sorted(set(unexpected_fields or []))
+        self.mismatch_fields = sorted(set(mismatch_fields or []))
+        super().__init__("ready partition validation failed")
+
+
+def _read_and_validate_catalog(
+    page_path: Path,
+    route_key: str,
+    page_number: int,
+) -> tuple[list[str], int | None]:
+    """Read one catalog and return its validated partition names and successor."""
+    value = read_json(page_path)
+    if not isinstance(value, dict):
+        raise _CatalogValidationError(mismatch_fields=["ready_catalog"])
+    if "ready_catalog" not in value:
+        raise _CatalogValidationError(
+            missing_fields=["ready_catalog"],
+            unexpected_fields=sorted(set(value)),
+        )
+    catalog = value["ready_catalog"]
+    if not isinstance(catalog, dict):
+        raise _CatalogValidationError(mismatch_fields=["ready_catalog"])
+
+    missing_fields = sorted(_CATALOG_FIELDS - set(catalog))
+    unexpected_fields = sorted((set(value) - {"ready_catalog"}) | (set(catalog) - _CATALOG_FIELDS))
+    mismatch_fields: list[str] = []
+    invalid_partition: object = _NO_INVALID_PARTITION
+    if "schema_version" in catalog and (
+        type(catalog["schema_version"]) is not int or catalog["schema_version"] != state.READY_PROTOCOL_VERSION
+    ):
+        mismatch_fields.append("schema_version")
+    if "route" in catalog and catalog["route"] != route_key:
+        mismatch_fields.append("route")
+    if "page" in catalog and (type(catalog["page"]) is not int or catalog["page"] != page_number):
+        mismatch_fields.append("page")
+    if "revision" in catalog and (type(catalog["revision"]) is not int or catalog["revision"] < 0):
+        mismatch_fields.append("revision")
+
+    partitions = catalog.get("partitions")
+    if "partitions" in catalog:
+        if not isinstance(partitions, list):
+            mismatch_fields.append("partitions")
+        elif len(partitions) > routes.READY_CATALOG_PAGE_SIZE:
+            mismatch_fields.append("partitions")
+        elif any(not isinstance(partition, str) or _invalid_identifier(partition) for partition in partitions):
+            mismatch_fields.append("partition")
+            invalid_partition = next(
+                partition
+                for partition in partitions
+                if not isinstance(partition, str) or _invalid_identifier(partition)
+            )
+
+    successor = catalog.get("successor")
+    if "successor" in catalog and successor is not None and (type(successor) is not int or successor < 0):
+        mismatch_fields.append("successor")
+
+    if missing_fields or unexpected_fields or mismatch_fields:
+        raise _CatalogValidationError(
+            missing_fields=missing_fields,
+            unexpected_fields=unexpected_fields,
+            mismatch_fields=mismatch_fields,
+            invalid_partition=invalid_partition,
+        )
+    return partitions, successor
+
+
+def _invalid_identifier(value: str) -> bool:
+    try:
+        validate_identifier(value, "ready partition")
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
+def _catalog_diagnostic(
+    route_key: str,
+    page_number: int,
+    stage: str,
+    exception: BaseException,
+) -> ReadyDiagnostic:
+    """Build a catalog diagnostic without exposing validation exception text."""
+    invalid_partition = getattr(exception, "invalid_partition", _NO_INVALID_PARTITION)
+    protocol_exception = ValueError() if isinstance(exception, _CatalogValidationError) else exception
+    if invalid_partition is not _NO_INVALID_PARTITION:
+        return storage_diagnostic(
+            "partition_invalid",
+            route=route_key,
+            location=invalid_partition,
+            stage=stage,
+            exception=protocol_exception,
+            unexpected_fields=getattr(exception, "unexpected_fields", None),
+            missing_fields=getattr(exception, "missing_fields", None),
+            mismatch_fields=getattr(exception, "mismatch_fields", None),
+        )
+    return storage_diagnostic(
+        "catalog_invalid",
+        route=route_key,
+        location=page_number,
+        stage=stage,
+        exception=protocol_exception,
+        unexpected_fields=getattr(exception, "unexpected_fields", None),
+        missing_fields=getattr(exception, "missing_fields", None),
+        mismatch_fields=getattr(exception, "mismatch_fields", None),
+    )
+
+
+def _read_and_validate_partition(
+    partition_path: Path,
+    route_key: str,
+    page_number: int,
+    partition_name: str,
+) -> list[str]:
+    """Read one partition and return its validated marker slots."""
+    value = read_json(partition_path)
+    if not isinstance(value, dict):
+        raise _PartitionValidationError(mismatch_fields=["ready_partition"])
+    if "ready_partition" not in value:
+        raise _PartitionValidationError(
+            missing_fields=["ready_partition"],
+            unexpected_fields=sorted(set(value)),
+        )
+    partition = value["ready_partition"]
+    if not isinstance(partition, dict):
+        raise _PartitionValidationError(mismatch_fields=["ready_partition"])
+
+    missing_fields = sorted(_PARTITION_FIELDS - set(partition))
+    unexpected_fields = sorted((set(value) - {"ready_partition"}) | (set(partition) - _PARTITION_FIELDS))
+    mismatch_fields: list[str] = []
+    if "schema_version" in partition and (
+        type(partition["schema_version"]) is not int or partition["schema_version"] != state.READY_PROTOCOL_VERSION
+    ):
+        mismatch_fields.append("schema_version")
+    if "route" in partition and partition["route"] != route_key:
+        mismatch_fields.append("route")
+    if "partition" in partition and partition["partition"] != partition_name:
+        mismatch_fields.append("partition")
+    if "catalog_page" in partition and (
+        type(partition["catalog_page"]) is not int or partition["catalog_page"] != page_number
+    ):
+        mismatch_fields.append("catalog_page")
+    slots = partition.get("slots")
+    if "slots" in partition and (
+        not isinstance(slots, list)
+        or len(slots) > routes.READY_PARTITION_SLOTS
+        or not all(isinstance(name, str) for name in slots)
+    ):
+        mismatch_fields.append("slots")
+    if "sealed" in partition and type(partition["sealed"]) is not bool:
+        mismatch_fields.append("sealed")
+    successor = partition.get("successor")
+    if (
+        "successor" in partition
+        and successor is not None
+        and (not isinstance(successor, str) or _invalid_identifier(successor))
+    ):
+        mismatch_fields.append("successor")
+    if "revision" in partition and (type(partition["revision"]) is not int or partition["revision"] < 0):
+        mismatch_fields.append("revision")
+
+    if missing_fields or unexpected_fields or mismatch_fields:
+        raise _PartitionValidationError(
+            missing_fields=missing_fields,
+            unexpected_fields=unexpected_fields,
+            mismatch_fields=mismatch_fields,
+        )
+    return slots
+
+
+def _partition_diagnostic(
+    route_key: str,
+    partition_name: str,
+    exception: BaseException,
+) -> ReadyDiagnostic:
+    """Build a partition diagnostic without exposing validation exception text."""
+    protocol_exception = ValueError() if isinstance(exception, _PartitionValidationError) else exception
+    return storage_diagnostic(
+        "partition_invalid",
+        route=route_key,
+        location=partition_name,
+        stage="partition_schema",
+        exception=protocol_exception,
+        unexpected_fields=getattr(exception, "unexpected_fields", None),
+        missing_fields=getattr(exception, "missing_fields", None),
+        mismatch_fields=getattr(exception, "mismatch_fields", None),
+    )
 
 
 def _cursor_path(root: Path, project_id: str, machine_name: str, scope: ReadyScope) -> Path:
@@ -118,18 +341,24 @@ def _reference_from_slot(
     catalog_page: int,
     partition: str,
     marker_name: str,
-) -> ReadyMarkerRef:
+) -> ReadyMarkerRef | None:
     stem = marker_name[:-5] if marker_name.endswith(".json") else marker_name
     task_id, separator, generation_value = stem.rpartition(".")
-    generation = int(generation_value) if separator else -1
+    try:
+        validate_identifier(task_id, "slot task_id")
+        generation = int(generation_value) if separator else -1
+    except (TypeError, ValueError):
+        return None
+    if generation <= 0 or marker_name != f"{task_id}.{generation}.json":
+        return None
     home_machine = cfg.machine_name
     if scope == "shared":
         provisional = ReadyMarkerRef(task_id, generation, scope, home_machine, partition, catalog_page, marker_name)
         try:
             marker = read_json(routes.marker_path(cfg.shared_root, provisional))["ready_marker"]
             if isinstance(marker.get("home_machine"), str):
-                home_machine = marker["home_machine"]
-        except (FileNotFoundError, KeyError, TypeError, ValueError):
+                home_machine = validate_identifier(marker["home_machine"], "marker home_machine")
+        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
             pass
     return ReadyMarkerRef(task_id, generation, scope, home_machine, partition, catalog_page, marker_name)
 
@@ -145,18 +374,9 @@ def _is_partition_referenced_under_route_lock(
     lock_path = shared_paths(cfg.shared_root)["ready_locks"] / f"{route_key}.lock"
     with exclusive(lock_path):
         try:
-            catalog = read_json(page_path)["ready_catalog"]
-            partitions = catalog["partitions"]
-            if (
-                catalog.get("schema_version") != state.READY_PROTOCOL_VERSION
-                or catalog.get("route") != route_key
-                or catalog.get("page") != page_number
-                or not isinstance(partitions, list)
-                or not all(isinstance(item, str) for item in partitions)
-            ):
-                raise ValueError("ready catalog is invalid.")
+            partitions, _successor = _read_and_validate_catalog(page_path, route_key, page_number)
             return partition_name in partitions
-        except (FileNotFoundError, KeyError, TypeError, ValueError):
+        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
             return True
 
 
@@ -171,7 +391,9 @@ def next_ready_marker(
     route_key = routes.route_key(queue_scope, cfg.machine_name)
     page_number = cursor.catalog_page or 0
     page_path = routes.catalog_path(cfg.shared_root, route_key, page_number)
-    if not page_path.exists():
+    try:
+        page_path.stat()
+    except FileNotFoundError:
         if page_number == 0:
             return None, False
         _save_ready_cursor(
@@ -187,16 +409,25 @@ def next_ready_marker(
             ),
         )
         return None, True
+    except OSError as exc:
+        state.mark_ready_index_degraded(
+            cfg,
+            storage_diagnostic(
+                "catalog_invalid",
+                route=route_key,
+                location=page_number,
+                stage="catalog_read",
+                exception=exc,
+            ),
+        )
+        return None, False
     try:
-        catalog = read_json(page_path)["ready_catalog"]
-        partitions = catalog["partitions"]
-        successor = catalog.get("successor")
-        if not isinstance(partitions, list) or not all(isinstance(item, str) for item in partitions):
-            raise ValueError("ready catalog partitions are invalid.")
-        if successor is not None and (not isinstance(successor, int) or successor < 0):
-            raise ValueError("ready catalog successor is invalid.")
-    except (KeyError, TypeError, ValueError):
-        state.mark_ready_index_degraded(cfg, f"catalog_invalid:{route_key}:{page_number}")
+        partitions, successor = _read_and_validate_catalog(page_path, route_key, page_number)
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        state.mark_ready_index_degraded(
+            cfg,
+            _catalog_diagnostic(route_key, page_number, "catalog_schema", exc),
+        )
         return None, False
     if cursor.partition in partitions:
         partition_index = partitions.index(cursor.partition)
@@ -224,23 +455,40 @@ def next_ready_marker(
         return None, has_wrapped
     partition_path = routes.partition_record_path(cfg.shared_root, queue_scope, cfg.machine_name, partition_name)
     try:
-        partition = read_json(partition_path)["ready_partition"]
-        slots = partition["slots"]
-        if not isinstance(slots, list) or not all(isinstance(name, str) for name in slots):
-            raise ValueError("ready partition slots are invalid.")
-        names = sorted(slots)
-    except FileNotFoundError:
+        names = sorted(_read_and_validate_partition(partition_path, route_key, page_number, partition_name))
+    except FileNotFoundError as exc:
         if _is_partition_referenced_under_route_lock(cfg, route_key, page_path, page_number, partition_name):
-            state.mark_ready_index_degraded(cfg, f"partition_missing:{route_key}:{partition_name}")
+            state.mark_ready_index_degraded(
+                cfg,
+                storage_diagnostic(
+                    "partition_missing",
+                    route=route_key,
+                    location=partition_name,
+                    stage="partition_read",
+                    exception=exc,
+                ),
+            )
             return None, False
         names = []
-    except (KeyError, TypeError, ValueError):
-        state.mark_ready_index_degraded(cfg, f"partition_invalid:{route_key}:{partition_name}")
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        state.mark_ready_index_degraded(cfg, _partition_diagnostic(route_key, partition_name, exc))
         return None, False
     for marker_name in names:
         if after_name is not None and marker_name <= after_name:
             continue
         reference = _reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name)
+        if reference is None:
+            state.mark_ready_index_degraded(
+                cfg,
+                storage_diagnostic(
+                    "partition_invalid",
+                    route=route_key,
+                    location=partition_name,
+                    stage="slot_identity",
+                    mismatch_fields=["marker_name"],
+                ),
+            )
+            return None, False
         if excluded_identities is not None and reference.identity in excluded_identities:
             _save_ready_cursor(
                 cfg,
@@ -319,32 +567,49 @@ def peek_ready_marker(
         if not budget.can_start_operation():
             return ReadyPeek(None, progress_cursor, exhausted=True)
         budget.consume_operation()
-        if not page_path.exists():
+        try:
+            page_path.stat()
+        except FileNotFoundError:
             if page_number != 0:
                 page_number = 0
                 partition_name = None
                 after_name = None
                 continue
             return ReadyPeek(None, current)
+        except OSError as exc:
+            state.mark_ready_index_degraded(
+                cfg,
+                storage_diagnostic(
+                    "catalog_invalid",
+                    route=route_key,
+                    location=page_number,
+                    stage="catalog_read",
+                    exception=exc,
+                ),
+            )
+            return ReadyPeek(None, current, unresolved=True)
         if not budget.can_start_operation():
             return ReadyPeek(None, progress_cursor, exhausted=True)
         budget.consume_operation()
         try:
-            catalog = read_json(page_path)["ready_catalog"]
-            partitions = catalog["partitions"]
-            successor = catalog.get("successor")
-            if (
-                catalog.get("schema_version") != state.READY_PROTOCOL_VERSION
-                or catalog.get("route") != route_key
-                or catalog.get("page") != page_number
-                or not isinstance(partitions, list)
-                or len(partitions) > routes.READY_CATALOG_PAGE_SIZE
-                or not all(isinstance(item, str) for item in partitions)
-                or (successor is not None and (not isinstance(successor, int) or successor < 0))
-            ):
-                raise ValueError("ready catalog is invalid.")
-        except (FileNotFoundError, KeyError, TypeError, ValueError):
-            state.mark_ready_index_degraded(cfg, f"catalog_invalid:{route_key}:{page_number}")
+            partitions, successor = _read_and_validate_catalog(page_path, route_key, page_number)
+        except FileNotFoundError as exc:
+            state.mark_ready_index_degraded(
+                cfg,
+                storage_diagnostic(
+                    "catalog_invalid",
+                    route=route_key,
+                    location=page_number,
+                    stage="catalog_read",
+                    exception=exc,
+                ),
+            )
+            return ReadyPeek(None, current, unresolved=True)
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            state.mark_ready_index_degraded(
+                cfg,
+                _catalog_diagnostic(route_key, page_number, "catalog_schema", exc),
+            )
             return ReadyPeek(None, current, unresolved=True)
 
         if partition_name in partitions:
@@ -362,28 +627,26 @@ def peek_ready_marker(
                 return ReadyPeek(None, progress_cursor, exhausted=True)
             budget.consume_operation()
             try:
-                partition = read_json(partition_path)["ready_partition"]
-                slots = partition["slots"]
-                if (
-                    partition.get("schema_version") != state.READY_PROTOCOL_VERSION
-                    or partition.get("route") != route_key
-                    or partition.get("partition") != partition_name
-                    or not isinstance(slots, list)
-                    or len(slots) > routes.READY_PARTITION_SLOTS
-                    or not all(isinstance(name, str) for name in slots)
-                ):
-                    raise ValueError("ready partition is invalid.")
-                names = sorted(slots)
-            except FileNotFoundError:
+                names = sorted(_read_and_validate_partition(partition_path, route_key, page_number, partition_name))
+            except FileNotFoundError as exc:
                 if not budget.can_start_operation():
                     return ReadyPeek(None, progress_cursor, exhausted=True)
                 budget.consume_operation()
                 if _is_partition_referenced_under_route_lock(cfg, route_key, page_path, page_number, partition_name):
-                    state.mark_ready_index_degraded(cfg, f"partition_missing:{route_key}:{partition_name}")
+                    state.mark_ready_index_degraded(
+                        cfg,
+                        storage_diagnostic(
+                            "partition_missing",
+                            route=route_key,
+                            location=partition_name,
+                            stage="partition_read",
+                            exception=exc,
+                        ),
+                    )
                     return ReadyPeek(None, current, unresolved=True)
                 names = []
-            except (KeyError, TypeError, ValueError):
-                state.mark_ready_index_degraded(cfg, f"partition_invalid:{route_key}:{partition_name}")
+            except (KeyError, OSError, TypeError, ValueError) as exc:
+                state.mark_ready_index_degraded(cfg, _partition_diagnostic(route_key, partition_name, exc))
                 return ReadyPeek(None, current, unresolved=True)
             for marker_name in names:
                 if after_name is not None and marker_name <= after_name:
@@ -392,6 +655,18 @@ def peek_ready_marker(
                     return ReadyPeek(None, progress_cursor, exhausted=True)
                 budget.consume_operation()
                 reference = _reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name)
+                if reference is None:
+                    state.mark_ready_index_degraded(
+                        cfg,
+                        storage_diagnostic(
+                            "partition_invalid",
+                            route=route_key,
+                            location=partition_name,
+                            stage="slot_identity",
+                            mismatch_fields=["marker_name"],
+                        ),
+                    )
+                    return ReadyPeek(None, current, unresolved=True)
                 next_cursor = ReadyCursor(
                     project_id,
                     cfg.machine_name,
@@ -594,5 +869,18 @@ def iter_ready_marker_refs(cfg: object, queue_scope: ReadyScope) -> list[ReadyMa
             )
             partition = read_json(partition_path)["ready_partition"]
             for marker_name in sorted(partition["slots"]):
-                references.append(_reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name))
+                reference = _reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name)
+                if reference is None:
+                    state.mark_ready_index_degraded(
+                        cfg,
+                        storage_diagnostic(
+                            "partition_invalid",
+                            route=route_key,
+                            location=partition_name,
+                            stage="slot_identity",
+                            mismatch_fields=["marker_name"],
+                        ),
+                    )
+                    continue
+                references.append(reference)
     return references
