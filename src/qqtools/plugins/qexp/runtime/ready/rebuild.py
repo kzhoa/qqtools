@@ -13,6 +13,14 @@ from ..paths import ready_state_path, shared_paths, task_path
 from ..records import TaskRecord, utc_now, validate_identifier
 from ..store import atomic_replace, iter_json, read_json
 from . import primary_candidates, routes, state
+from .diagnostics import (
+    ReadyDiagnostic,
+    build_diagnostic,
+    diagnostic,
+    doctor_diagnostic,
+    serialize_reason,
+    writer_diagnostic,
+)
 from .index import (
     begin_primary_ready_index_rebuild,
     classify_ready_marker,
@@ -304,30 +312,72 @@ def _active_incompatible_writers(cfg: object) -> list[str]:
     return sorted(incompatible)
 
 
-def _audit_task_ready_projection(cfg: object, task_id: str) -> str | None:
+def _audit_task_ready_projection(cfg: object, task_id: str) -> ReadyDiagnostic | None:
     try:
         task = TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id)))
     except FileNotFoundError:
         return None
-    except (KeyError, TypeError, ValueError):
-        return f"task_invalid:{task_id}"
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        return build_diagnostic(
+            "build_invalid", stage="build_audit", object_name="task", task_id=task_id, exception=exc
+        )
     reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
     if task_should_have_ready_marker(task):
         if reference is None:
-            return f"marker_missing:{task_id}"
+            return diagnostic(
+                "marker_missing",
+                stage="build_audit",
+                task_id=task_id,
+                generation=task.ready_generation,
+                indexed=False,
+                task_projection=task.state.get("projection", "unobserved"),
+                active_claim=bool(task.claim_control.get("active_claim")),
+            )
         if not routes.is_reference_indexed(cfg, reference):
-            return f"marker_unindexed:{task_id}"
+            return diagnostic(
+                "marker_missing",
+                stage="build_audit",
+                task_id=task_id,
+                generation=task.ready_generation,
+                indexed=False,
+                task_projection=task.state.get("projection", "unobserved"),
+                active_claim=bool(task.claim_control.get("active_claim")),
+            )
         result = classify_ready_marker(cfg, reference)
         if result.classification not in {"claimable", "temporarily_unavailable"}:
-            return f"marker_{result.classification}:{task_id}:{result.reason}"
+            if result.diagnostic is not None:
+                return result.diagnostic
+            return doctor_diagnostic(task_id, result.reason, generation=task.ready_generation)
     elif reference is not None:
-        return f"marker_stale:{task_id}"
+        return diagnostic(
+            "record_invalid",
+            object="marker",
+            stage="build_audit",
+            issue_code="marker_stale",
+            task_id=task_id,
+            generation=task.ready_generation,
+        )
     return None
 
 
 def ready_task_projection_issue(cfg: object, task_id: str) -> str | None:
     """Return the ready projection defect for one authoritative Task, if any."""
-    return _audit_task_ready_projection(cfg, task_id)
+    issue = _audit_task_ready_projection(cfg, task_id)
+    if issue is None:
+        return None
+    issue_code = issue.as_dict().get("issue_code") or issue.reason_code
+    if issue.reason_code == "build_invalid" and issue.as_dict().get("object") == "task":
+        issue_code = "task_invalid"
+    if issue_code not in {
+        "marker_invalid",
+        "marker_missing",
+        "marker_unindexed",
+        "marker_stale",
+        "task_invalid",
+    }:
+        issue_code = "marker_invalid"
+    generation = issue.as_dict().get("generation")
+    return serialize_reason(cfg, "doctor_repair", doctor_diagnostic(task_id, issue_code, generation=generation))
 
 
 def advance_ready_index_build(
@@ -349,13 +399,21 @@ def advance_ready_index_build(
                 return record
             build = record.get("build")
             if not isinstance(build, dict):
-                state.degrade_state_record(record, "build_state_missing")
+                state.degrade_state_record(
+                    record,
+                    build_diagnostic("build_invalid", stage="build_state", object_name="build"),
+                    cfg=cfg,
+                )
                 state.commit_state_under_lock(path, value, record)
                 return record
             watermark = build.get("watermark", {})
             page_count = watermark.get("page_count")
             if type(page_count) is not int or page_count < 0 or not watermark.get("is_complete"):
-                state.degrade_state_record(record, "build_watermark_invalid")
+                state.degrade_state_record(
+                    record,
+                    build_diagnostic("build_invalid", stage="build_watermark", object_name="watermark"),
+                    cfg=cfg,
+                )
                 state.commit_state_under_lock(path, value, record)
                 return record
             phase = build.get("phase")
@@ -365,12 +423,20 @@ def advance_ready_index_build(
                 "primary-rebuild": "primary_cursor",
             }.get(phase)
             if cursor_name is None:
-                state.degrade_state_record(record, f"build_phase_invalid:{phase}")
+                state.degrade_state_record(
+                    record,
+                    build_diagnostic("build_invalid", stage="build_phase", object_name="build"),
+                    cfg=cfg,
+                )
                 state.commit_state_under_lock(path, value, record)
                 return record
             cursor = build.get(cursor_name)
             if not isinstance(cursor, dict):
-                state.degrade_state_record(record, f"build_cursor_invalid:{cursor_name}")
+                state.degrade_state_record(
+                    record,
+                    build_diagnostic("build_invalid", stage="build_cursor", object_name="cursor"),
+                    cfg=cfg,
+                )
                 state.commit_state_under_lock(path, value, record)
                 return record
             processed_now = 0
@@ -392,7 +458,7 @@ def advance_ready_index_build(
                     elif phase == "audit":
                         issue = _audit_task_ready_projection(cfg, task_id)
                         if issue is not None:
-                            state.degrade_state_record(record, issue)
+                            state.degrade_state_record(record, issue, cfg=cfg)
                             break
                     else:
                         try:
@@ -406,7 +472,19 @@ def advance_ready_index_build(
                                 task.ready_generation,
                             )
                             if reference is None:
-                                state.degrade_state_record(record, f"marker_missing:{task.task_id}")
+                                state.degrade_state_record(
+                                    record,
+                                    diagnostic(
+                                        "marker_missing",
+                                        stage="primary_rebuild",
+                                        task_id=task.task_id,
+                                        generation=task.ready_generation,
+                                        indexed=False,
+                                        task_projection=task.state.get("projection", "unobserved"),
+                                        active_claim=bool(task.claim_control.get("active_claim")),
+                                    ),
+                                    cfg=cfg,
+                                )
                                 break
                             primary_candidates.rebuild_primary_ready_candidate(cfg, build["build_id"], task, reference)
                     processed_now += 1
@@ -424,7 +502,8 @@ def advance_ready_index_build(
                         if incompatible:
                             state.degrade_state_record(
                                 record,
-                                "incompatible_active_writers:" + ",".join(incompatible),
+                                writer_diagnostic(incompatible, stage="completion_writer_gate"),
+                                cfg=cfg,
                             )
                         else:
                             record["state"] = "active"
@@ -432,7 +511,19 @@ def advance_ready_index_build(
                             build["phase"] = "completed"
                             build["completed_at"] = utc_now()
             except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-                state.degrade_state_record(record, f"build_failed:{type(exc).__name__}:{exc}")
+                state.degrade_state_record(
+                    record,
+                    build_diagnostic(
+                        "build_failed",
+                        stage={
+                            "backfill": "build_backfill",
+                            "audit": "build_audit",
+                            "primary-rebuild": "primary_rebuild",
+                        }.get(phase, "build_state"),
+                        exception=exc,
+                    ),
+                    cfg=cfg,
+                )
             state.commit_state_under_lock(path, value, record)
             return record
 

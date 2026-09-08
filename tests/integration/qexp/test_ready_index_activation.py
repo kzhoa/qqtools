@@ -13,6 +13,7 @@ from qqtools.plugins.qexp.machine_state import publish_machine_snapshots
 from qqtools.plugins.qexp.runtime.locks import exclusive, schema_lock
 from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
+    READY_PARTITION_SLOTS,
     READY_WRITER_CAPABILITY,
     advance_ready_index_build,
     assert_ready_writer_compatible,
@@ -24,6 +25,7 @@ from qqtools.plugins.qexp.runtime.ready import (
     read_ready_index_state,
 )
 from qqtools.plugins.qexp.runtime.ready import state as ready_state
+from qqtools.plugins.qexp.runtime.ready.diagnostics import parse_ready_reason
 from qqtools.plugins.qexp.runtime.records import TaskRecord
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -249,7 +251,183 @@ def test_final_audit_rejects_non_list_catalog_partitions(tmp_path: Path) -> None
     record = advance_ready_index_build(cfg, max_tasks=1)
 
     assert record["state"] == "degraded"
-    assert f"marker_unindexed:{task.task_id}" in record["degraded_reasons"]
+    assert any(
+        "reason=marker_missing" in reason and f"task_id={task.task_id}" in reason and "stage=build_audit" in reason
+        for reason in record["degraded_reasons"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_mismatch"),
+    [
+        ("schema_version", 99, "schema_version"),
+        ("route", "home.other-machine", "route"),
+        ("page", 99, "page"),
+        ("partitions", [f"partition-{index}" for index in range(65)], "partitions"),
+    ],
+)
+def test_next_marker_fail_closes_on_catalog_identity_and_capacity_corruption(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    expected_mismatch: str,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "catalog-corrupt"], task_id="catalog-corrupt-task")
+    _finish_build(cfg)
+    reference = _ready_reference(cfg, load_task(cfg, task.task_id))
+    catalog_path = (
+        shared_paths(cfg.shared_root)["ready_catalogs"]
+        / f"home.{cfg.machine_name}"
+        / (f"{reference.catalog_page:016d}.json")
+    )
+    catalog = read_json(catalog_path)
+    catalog["ready_catalog"][field] = value
+    atomic_replace(catalog_path, catalog)
+
+    marker, _progressed = next_ready_marker(cfg, project_id(cfg.shared_root), "home")
+
+    assert marker is None
+    assert read_ready_index_state(cfg) == "degraded"
+    diagnostic = parse_ready_reason(
+        read_json(ready_state_path(cfg.shared_root))["ready_index"]["degraded_reasons"][0]
+    ).diagnostic.as_dict()
+    assert expected_mismatch in diagnostic["mismatch_fields"]
+
+
+def test_next_marker_catalog_diagnostic_reports_missing_and_unexpected_fields(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "catalog-fields"], task_id="catalog-fields-task")
+    _finish_build(cfg)
+    reference = _ready_reference(cfg, load_task(cfg, task.task_id))
+    catalog_path = (
+        shared_paths(cfg.shared_root)["ready_catalogs"]
+        / f"home.{cfg.machine_name}"
+        / (f"{reference.catalog_page:016d}.json")
+    )
+    catalog = read_json(catalog_path)
+    del catalog["ready_catalog"]["route"]
+    catalog["ready_catalog"]["unexpected"] = True
+    atomic_replace(catalog_path, catalog)
+
+    marker, _progressed = next_ready_marker(cfg, project_id(cfg.shared_root), "home")
+
+    assert marker is None
+    diagnostic = parse_ready_reason(
+        read_json(ready_state_path(cfg.shared_root))["ready_index"]["degraded_reasons"][0]
+    ).diagnostic.as_dict()
+    assert diagnostic["missing_fields"] == ["route"]
+    assert diagnostic["unexpected_fields"] == ["unexpected"]
+    assert diagnostic["mismatch_fields"] == []
+
+
+@pytest.mark.parametrize("partition", ["bad/name", "bad name"])
+def test_catalog_invalid_partition_is_safe_during_next_marker_degradation(
+    tmp_path: Path,
+    partition: str,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "partition-corrupt"], task_id="partition-corrupt-task")
+    _finish_build(cfg)
+    reference = _ready_reference(cfg, load_task(cfg, task.task_id))
+    catalog_path = (
+        shared_paths(cfg.shared_root)["ready_catalogs"]
+        / f"home.{cfg.machine_name}"
+        / (f"{reference.catalog_page:016d}.json")
+    )
+    catalog = read_json(catalog_path)
+    catalog["ready_catalog"]["partitions"] = [partition]
+    atomic_replace(catalog_path, catalog)
+
+    marker, _progressed = next_ready_marker(cfg, project_id(cfg.shared_root), "home")
+
+    assert marker is None
+    assert read_ready_index_state(cfg) == "degraded"
+    reason = read_json(ready_state_path(cfg.shared_root))["ready_index"]["degraded_reasons"][0]
+    diagnostic = parse_ready_reason(reason).diagnostic.as_dict()
+    assert parse_ready_reason(reason).prefix == "partition_invalid"
+    assert diagnostic["partition"] == "invalid_field"
+    assert diagnostic["mismatch_fields"] == ["partition"]
+    assert partition not in reason
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_mismatch"),
+    [
+        ("schema_version", 99, "schema_version"),
+        ("route", "home.other-machine", "route"),
+        ("partition", "0000000000000099", "partition"),
+        ("catalog_page", 99, "catalog_page"),
+        ("slots", [f"task-{index}.1.json" for index in range(READY_PARTITION_SLOTS + 1)], "slots"),
+    ],
+)
+def test_next_marker_fail_closes_on_partition_identity_and_capacity_corruption(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    expected_mismatch: str,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "partition-record-corrupt"], task_id="partition-record-corrupt-task")
+    _finish_build(cfg)
+    reference = _ready_reference(cfg, load_task(cfg, task.task_id))
+    partition_path = (
+        shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / "partition.json"
+    )
+    partition = read_json(partition_path)
+    partition["ready_partition"][field] = value
+    atomic_replace(partition_path, partition)
+
+    marker, _progressed = next_ready_marker(cfg, project_id(cfg.shared_root), "home")
+
+    assert marker is None
+    assert read_ready_index_state(cfg) == "degraded"
+    reason = read_json(ready_state_path(cfg.shared_root))["ready_index"]["degraded_reasons"][0]
+    parsed = parse_ready_reason(reason)
+    assert parsed.prefix == "partition_invalid"
+    assert parsed.diagnostic.as_dict()["mismatch_fields"] == [expected_mismatch]
+
+
+def test_marker_identity_diagnostic_reports_only_observed_mismatches(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "identity-corrupt"], task_id="identity-corrupt-task")
+    reference = _ready_reference(cfg, load_task(cfg, task.task_id))
+    marker_path = (
+        shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / reference.marker_name
+    )
+    marker = read_json(marker_path)
+    marker["ready_marker"]["task_id"] = "different-task"
+    atomic_replace(marker_path, marker)
+
+    result = classify_ready_marker(cfg, reference)
+
+    assert result.classification == "corrupt"
+    assert result.diagnostic is not None
+    fields = result.diagnostic.as_dict()
+    assert fields["mismatch_fields"] == ["task_id"]
+    assert fields["expected_task_id"] == task.task_id
+    assert fields["observed_task_id"] == "different-task"
+    assert "expected_generation" not in fields
+    assert "observed_generation" not in fields
+
+
+def test_marker_identity_diagnostic_omits_unsafe_observed_value(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "identity-unsafe"], task_id="identity-unsafe-task")
+    reference = _ready_reference(cfg, load_task(cfg, task.task_id))
+    marker_path = (
+        shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / reference.marker_name
+    )
+    marker = read_json(marker_path)
+    marker["ready_marker"]["home_machine"] = "/private/runtime/path"
+    atomic_replace(marker_path, marker)
+
+    result = classify_ready_marker(cfg, reference)
+
+    assert result.diagnostic is not None
+    fields = result.diagnostic.as_dict()
+    assert fields["mismatch_fields"] == ["home_machine"]
+    assert "observed_home_machine" not in fields
 
 
 def test_final_audit_rechecks_schema_writer_gate(tmp_path: Path) -> None:
@@ -267,7 +445,10 @@ def test_final_audit_rechecks_schema_writer_gate(tmp_path: Path) -> None:
     record = advance_ready_index_build(cfg, max_tasks=1)
 
     assert record["state"] == "degraded"
-    assert any("capability gate is missing" in reason for reason in record["degraded_reasons"])
+    assert any(
+        "reason=build_failed" in reason and "exception_type=RuntimeError" in reason
+        for reason in record["degraded_reasons"]
+    )
 
 
 def test_missing_referenced_partition_degrades_active_index(tmp_path: Path) -> None:
@@ -407,7 +588,10 @@ def test_recent_incompatible_agent_blocks_cutover(tmp_path: Path) -> None:
     record = _finish_build(cfg)
 
     assert record["state"] == "degraded"
-    assert any(reason == "incompatible_active_writers:gpu-1" for reason in record["degraded_reasons"])
+    assert any(
+        "reason=incompatible_active_writers" in reason and "incompatible_writers=gpu-1" in reason
+        for reason in record["degraded_reasons"]
+    )
 
 
 def test_nonqueued_task_needs_no_marker_at_cutover(tmp_path: Path) -> None:

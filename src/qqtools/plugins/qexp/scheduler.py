@@ -37,6 +37,7 @@ from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, 
 from .runtime.ready import (
     ReadyMarkerRef,
     advance_ready_index_build,
+    classification_diagnostic,
     classify_ready_marker,
     delete_stale_ready_marker,
     mark_ready_index_degraded,
@@ -921,7 +922,10 @@ def _run_dispatch_cycle(
             result = classify_ready_marker(cfg, reference)
             if result.classification == "corrupt":
                 diagnostic_increment("scheduler.ready.corrupt")
-                mark_ready_index_degraded(cfg, f"marker_corrupt:{reference.identity}")
+                mark_ready_index_degraded(
+                    cfg,
+                    result.diagnostic or classification_diagnostic(result.reason, reference, task=result.task),
+                )
                 break
             if result.classification == "permanently_stale":
                 diagnostic_increment("scheduler.ready.stale")

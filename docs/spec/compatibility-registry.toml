@@ -1,5 +1,24 @@
 schema_version = 1
-next_id = 10
+next_id = 11
+
+[[items]]
+id = "QQTOOLS-COMPAT-0010"
+component = "qexp.ready-index-degradation-diagnostics"
+kind = "runtime_protocol"
+status = "compatibility_active"
+introduced_in = "1.3.16"
+legacy_removed_in = "1.3.17"
+transition_purged_in = "1.3.18"
+marker = "QQTOOLS-COMPAT-0010"
+owner = "qexp.runtime"
+decision_refs = ["docs/spec/qexp_runtime_spec.md"]
+pitch_refs = ["docs/pitch/qexp-ready-index-degradation-diagnostics.md"]
+verification = [
+    "tests/unit/qexp/runtime/test_ready_diagnostics.py",
+    "tests/integration/qexp/test_ready_index_activation.py",
+    "tests/integration/qexp/test_ready_index_repair.py",
+    "tests/integration/qexp/test_clean_doctor.py",
+]
 
 [[items]]
 id = "QQTOOLS-COMPAT-0008"

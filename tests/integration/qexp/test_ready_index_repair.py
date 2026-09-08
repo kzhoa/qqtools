@@ -5,7 +5,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
 from qqtools.plugins.qexp.runtime.paths import shared_paths
-from qqtools.plugins.qexp.runtime.ready import advance_ready_index_build, classify_ready_marker
+from qqtools.plugins.qexp.runtime.ready import advance_ready_index_build, classify_ready_marker, read_ready_index_status
 from qqtools.plugins.qexp.runtime.records import TaskRecord
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -55,6 +55,7 @@ def test_doctor_reports_and_repairs_missing_active_marker(tmp_path: Path) -> Non
 
     assert any(issue["code"] == "ready_projection_inconsistent" for issue in verification["issues"])
     assert repaired["ready_index"]["state"] == "active"
+    assert repaired["prior_degraded_reasons"]
     assert current.ready_generation > task.ready_generation
     assert classify_ready_marker(cfg, _ready_reference(cfg, current)).classification == "claimable"
 
@@ -77,3 +78,20 @@ def test_doctor_rebuilds_corrupt_catalog_from_task_truth(tmp_path: Path) -> None
     assert repaired["ready_index"]["state"] == "active"
     assert current.ready_generation > task.ready_generation
     assert classify_ready_marker(cfg, _ready_reference(cfg, current)).classification == "claimable"
+
+
+def test_invalid_ready_reason_list_is_visible_but_not_repaired(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    state_path = shared_paths(cfg.shared_root)["ready"] / "state.json"
+    original = read_json(state_path)
+    original["ready_index"]["degraded_reasons"] = ["valid", 7]
+    atomic_replace(state_path, original)
+
+    status = read_ready_index_status(cfg)
+    assert status["state"] == "degraded"
+    assert status["degraded_reasons"][0].startswith("ready_state_invalid;v=1;reason=state_invalid")
+
+    repaired = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root)
+
+    assert "ready_index" in repaired["blocked"]
+    assert read_json(state_path)["ready_index"]["degraded_reasons"] == ["valid", 7]

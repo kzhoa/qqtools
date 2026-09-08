@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-06
+updated_at: 2026-09-08
 archived_at:
 ---
 
@@ -1431,6 +1431,28 @@ ready_index:
   degraded_reasons: [str]
   updated_at: str
 ```
+
+`degraded_reasons` keeps its list shape. Writers introduced in 1.3.16 persist only the bounded
+v1 diagnostic form:
+`<prefix>;v=1;reason=<reason-code>(;<key>=<value>)*`. `v` and `reason` are fixed first; all
+other keys are unique and sorted, and values use RFC 3986 percent-encoding. Every new reason has
+`reader_machine` and `reader_version`, is at most 1024 UTF-8 bytes, and state records retain at
+most 32 distinct reasons. Dynamic values are allowlisted, length bounded, and may carry a
+`truncated_fields` marker; arbitrary exception messages, paths, commands, environment values, and
+payloads are never persisted.
+
+Status and doctor display canonical v1 reasons and a bounded allowlist of the pre-v1 reason forms.
+Unknown v1 or historical values are represented only by a SHA-256 digest placeholder. A malformed
+or unreadable state record is fail-closed as `degraded` and is reported with a synthetic
+`ready_state_invalid` diagnostic using only the allowlisted exception type, errno, or JSON line and
+column. Strict mutation and repair reads reject a non-list or non-string `degraded_reasons` field
+and do not overwrite that state.
+
+`doctor repair` captures `prior_degraded_reasons` after its active projection audit has persisted
+new findings and before starting ready-index rebuild. The active state may clear its durable
+reasons after a successful repair, while the returned evidence snapshot remains available to the
+caller. During the 1.3.16 to 1.3.18 compatibility transition, older free-text values remain
+read-only display input; they are never rewritten or appended to.
 
 The first current-generation dispatch cycle with free GPU capacity installs the schema writer gate,
 commits `building`, and streams the legacy Task-name watermark into immutable pages of at most 64 IDs.

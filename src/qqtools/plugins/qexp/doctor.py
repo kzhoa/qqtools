@@ -19,6 +19,7 @@ from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, 
 from .runtime.ready import (
     READY_BUILD_PAGE_SIZE,
     mark_ready_index_degraded,
+    parse_ready_reason,
     read_ready_index_state,
     read_ready_index_status,
     ready_task_projection_issue,
@@ -104,11 +105,13 @@ def verify_integrity(
     issues: list[dict[str, Any]] = []
     ready_state = read_ready_index_state(cfg)
     if ready_state == "degraded":
+        ready_status = read_ready_index_status(cfg)
         _issue(
             issues,
             "ready_index_degraded",
             shared_paths(cfg.shared_root)["ready"] / "state.json",
             "high",
+            ";".join(ready_status.get("degraded_reasons", [])),
         )
     member_state = group_ready_members_state(cfg)
     member_verification: dict[str, Any] = {"state": "degraded" if member_state == "degraded" else "building"}
@@ -644,12 +647,29 @@ def repair_metadata(
         for ready_task_path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
             issue = ready_task_projection_issue(cfg, ready_task_path.stem)
             if issue is not None:
-                mark_ready_index_degraded(cfg, f"doctor_repair:{issue}")
+                try:
+                    diagnostic = parse_ready_reason(issue).diagnostic
+                except ValueError:
+                    diagnostic = None
+                if diagnostic is not None:
+                    mark_ready_index_degraded(cfg, diagnostic)
                 break
-    ready_record = repair_ready_index(cfg, max_tasks=READY_BUILD_PAGE_SIZE)
-    while ready_record.get("state") == "building":
-        time.sleep(0)
+    prior_status = read_ready_index_status(cfg)
+    prior_degraded_reasons = list(prior_status.get("degraded_reasons", []))
+    try:
+        # An unreadable state file is itself a fail-closed repair boundary. It
+        # must not be replaced by a newly initialized build state.
+        if read_ready_index_state(cfg) == "degraded":
+            from .runtime.ready.state import read_state_record
+
+            read_state_record(cfg)
         ready_record = repair_ready_index(cfg, max_tasks=READY_BUILD_PAGE_SIZE)
+        while ready_record.get("state") == "building":
+            time.sleep(0)
+            ready_record = repair_ready_index(cfg, max_tasks=READY_BUILD_PAGE_SIZE)
+    except (AttributeError, FileNotFoundError, KeyError, OSError, TypeError, ValueError, RuntimeError):
+        ready_record = prior_status
+        blocked.append("ready_index")
     ready_build = ready_record.get("build") or {}
     if ready_record.get("state") == "active" and initial_ready_state != "active":
         repaired.append(f"ready_index:{ready_build.get('repaired', 0)}:{ready_build.get('stale_removed', 0)}")
@@ -673,7 +693,7 @@ def repair_metadata(
         "ready_index": {
             "state": ready_record.get("state"),
             "build": ready_build,
-            "degraded_reasons": ready_record.get("degraded_reasons", []),
+            "degraded_reasons": read_ready_index_status(cfg).get("degraded_reasons", []),
         },
         "group_ready_members": {
             **member_record,
@@ -685,6 +705,7 @@ def repair_metadata(
                 "processed": audit.get("processed", 0),
             },
         },
+        "prior_degraded_reasons": prior_degraded_reasons,
         "message": message,
     }
 

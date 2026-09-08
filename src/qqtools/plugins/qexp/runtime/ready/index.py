@@ -16,6 +16,7 @@ from ..records import TaskRecord, normalize_group_record, utc_now, validate_iden
 from ..store import atomic_replace, iter_json, read_json
 from ..work_budget import SliceBudget
 from . import primary_candidates, routes, state
+from .diagnostics import ReadyDiagnostic, classification_diagnostic, diagnostic, exception_fields, safe_identifier
 from .group_members import (
     group_ready_members_state,
     is_group_ready_member_projection_usable,
@@ -33,6 +34,32 @@ class ReadyClassificationResult:
     classification: ReadyClassification
     reason: str
     task: TaskRecord | None = None
+    diagnostic: ReadyDiagnostic | None = None
+
+
+def _classification_result(
+    cfg: object,
+    reference: ReadyMarkerRef | None,
+    classification: ReadyClassification,
+    reason: str,
+    task: TaskRecord | None = None,
+    *,
+    marker: dict[str, Any] | None = None,
+    exception: BaseException | None = None,
+    diagnostic_value: ReadyDiagnostic | None = None,
+) -> ReadyClassificationResult:
+    """Build a classification while retaining a typed degradation observation."""
+    if classification != "corrupt":
+        return ReadyClassificationResult(classification, reason, task, diagnostic_value)
+    if diagnostic_value is None:
+        diagnostic_value = classification_diagnostic(
+            reason,
+            reference,
+            task=task,
+            marker=marker,
+            exception=exception,
+        )
+    return ReadyClassificationResult(classification, reason, task, diagnostic_value)
 
 
 def is_primary_ready_index_active(cfg: object) -> bool:
@@ -366,27 +393,27 @@ def _recheck_missing_ready_marker(
     with exclusive(lock_path):
         task_file = task_path(cfg.shared_root, reference.task_id)
         if not task_file.exists():
-            return ReadyClassificationResult("permanently_stale", "task_missing")
+            return _classification_result(cfg, reference, "permanently_stale", "task_missing")
         try:
             task = TaskRecord.from_dict(read_json(task_file))
-        except (KeyError, TypeError, ValueError):
-            return ReadyClassificationResult("corrupt", "task_invalid")
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            return _classification_result(cfg, reference, "corrupt", "task_invalid", exception=exc)
         if _is_ready_publication_pending(cfg, reference, task):
-            return ReadyClassificationResult("temporarily_unavailable", "marker_publication_pending", task)
+            return _classification_result(cfg, reference, "temporarily_unavailable", "marker_publication_pending", task)
         if reference.generation != task.ready_generation:
-            return ReadyClassificationResult("permanently_stale", "generation_superseded", task)
+            return _classification_result(cfg, reference, "permanently_stale", "generation_superseded", task)
         if reference.queue_scope != task.placement_runtime.get(
             "queue_scope"
         ) or reference.home_machine != task.placement_policy.get("home_machine"):
-            return ReadyClassificationResult("corrupt", "route_mismatch", task)
+            return _classification_result(cfg, reference, "corrupt", "route_mismatch", task)
         if task.state.get("projection") != "queued" or task.claim_control.get("active_claim"):
-            return ReadyClassificationResult("permanently_stale", "task_not_queued", task)
+            return _classification_result(cfg, reference, "permanently_stale", "task_not_queued", task)
         if (
             task.control.get("cleanup_operation_id")
             or task.control.get("cleanup_state")
             or task.control.get("cancellation_requested_at")
         ):
-            return ReadyClassificationResult("permanently_stale", "task_controlled", task)
+            return _classification_result(cfg, reference, "permanently_stale", "task_controlled", task)
         try:
             return read_json(routes.marker_path(cfg.shared_root, reference))["ready_marker"]
         except FileNotFoundError:
@@ -398,13 +425,60 @@ def _recheck_missing_ready_marker(
             )
             try:
                 slots = read_json(partition_path)["ready_partition"]["slots"]
-            except (FileNotFoundError, KeyError, TypeError, ValueError):
-                return ReadyClassificationResult("corrupt", "marker_missing_unindexed", task)
+            except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+                if isinstance(exc, OSError) and not isinstance(exc, FileNotFoundError):
+                    return _classification_result(cfg, reference, "corrupt", "marker_invalid", task, exception=exc)
+                return _classification_result(
+                    cfg,
+                    reference,
+                    "corrupt",
+                    "marker_missing_unindexed",
+                    task,
+                    diagnostic_value=diagnostic(
+                        "marker_missing",
+                        stage="marker_truth",
+                        task_id=reference.task_id,
+                        generation=reference.generation,
+                        indexed=False,
+                        task_projection=task.state.get("projection", "unobserved"),
+                        active_claim=bool(task.claim_control.get("active_claim")),
+                    ),
+                )
             if isinstance(slots, list) and reference.marker_name in slots:
-                return ReadyClassificationResult("corrupt", "marker_missing_indexed", task)
-            return ReadyClassificationResult("corrupt", "marker_missing_unindexed", task)
-        except (KeyError, TypeError, ValueError):
-            return ReadyClassificationResult("corrupt", "marker_invalid", task)
+                return _classification_result(
+                    cfg,
+                    reference,
+                    "corrupt",
+                    "marker_missing_indexed",
+                    task,
+                    diagnostic_value=diagnostic(
+                        "marker_missing",
+                        stage="marker_truth",
+                        task_id=reference.task_id,
+                        generation=reference.generation,
+                        indexed=True,
+                        task_projection=task.state.get("projection", "unobserved"),
+                        active_claim=bool(task.claim_control.get("active_claim")),
+                    ),
+                )
+            return _classification_result(
+                cfg,
+                reference,
+                "corrupt",
+                "marker_missing_unindexed",
+                task,
+                diagnostic_value=diagnostic(
+                    "marker_missing",
+                    stage="marker_truth",
+                    task_id=reference.task_id,
+                    generation=reference.generation,
+                    indexed=False,
+                    task_projection=task.state.get("projection", "unobserved"),
+                    active_claim=bool(task.claim_control.get("active_claim")),
+                ),
+            )
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            return _classification_result(cfg, reference, "corrupt", "marker_invalid", task, exception=exc)
 
 
 def classify_ready_marker(
@@ -413,15 +487,32 @@ def classify_ready_marker(
 ) -> ReadyClassificationResult:
     """Classify one advisory marker against authoritative Task and Submission truth."""
     if reference.generation <= 0 or not reference.task_id:
-        return ReadyClassificationResult("corrupt", "marker_identity_invalid")
+        return _classification_result(cfg, reference, "corrupt", "marker_identity_invalid")
     try:
-        marker = read_json(routes.marker_path(cfg.shared_root, reference))["ready_marker"]
+        envelope = read_json(routes.marker_path(cfg.shared_root, reference))
+        marker = envelope["ready_marker"]
+        if not isinstance(marker, dict):
+            raise TypeError("ready marker envelope is invalid")
     except FileNotFoundError:
         marker = _recheck_missing_ready_marker(cfg, reference)
         if isinstance(marker, ReadyClassificationResult):
             return marker
-    except (KeyError, TypeError, ValueError):
-        return ReadyClassificationResult("corrupt", "marker_invalid")
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        return _classification_result(
+            cfg,
+            reference,
+            "corrupt",
+            "marker_invalid",
+            diagnostic_value=diagnostic(
+                "record_invalid",
+                object="marker",
+                stage="marker_parse",
+                issue_code="marker_invalid",
+                **({"task_id": reference.task_id} if reference.task_id else {}),
+                **({"generation": reference.generation} if reference.generation >= 0 else {}),
+                **exception_fields(exc),
+            ),
+        )
     try:
         common = {
             "schema_version",
@@ -447,66 +538,107 @@ def classify_ready_marker(
             or marker["queue_scope"] != reference.queue_scope
             or marker["home_machine"] != reference.home_machine
         ):
-            raise ValueError("ready marker identity is inconsistent.")
-    except (KeyError, TypeError, ValueError):
-        return ReadyClassificationResult("corrupt", "marker_invalid")
+            raise LookupError("ready marker identity is inconsistent.")
+    except LookupError:
+        expected_identity = {
+            "task_id": reference.task_id,
+            "generation": reference.generation,
+            "queue_scope": reference.queue_scope,
+            "home_machine": reference.home_machine,
+        }
+        mismatch_fields = [key for key, expected in expected_identity.items() if marker.get(key) != expected]
+        identity_fields: dict[str, Any] = {}
+        for key in mismatch_fields:
+            identity_fields[f"expected_{key}"] = expected_identity[key]
+            observed = marker.get(key)
+            if key == "task_id" and isinstance(observed, str):
+                safe_task_id = safe_identifier(observed)
+                if safe_task_id != "unobserved":
+                    identity_fields["observed_task_id"] = safe_task_id
+            elif key == "generation" and type(observed) is int and observed >= 0:
+                identity_fields["observed_generation"] = observed
+            elif key == "queue_scope" and observed in {"home", "shared"}:
+                identity_fields["observed_queue_scope"] = observed
+            elif key == "home_machine" and isinstance(observed, str) and observed:
+                safe_home_machine = safe_identifier(observed)
+                if safe_home_machine != "unobserved":
+                    identity_fields["observed_home_machine"] = safe_home_machine
+        return _classification_result(
+            cfg,
+            reference,
+            "corrupt",
+            "marker_invalid",
+            diagnostic_value=diagnostic(
+                "identity_mismatch",
+                stage="marker_identity",
+                task_id=reference.task_id,
+                generation=reference.generation,
+                mismatch_fields=mismatch_fields,
+                **identity_fields,
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return _classification_result(cfg, reference, "corrupt", "marker_invalid", marker=marker, exception=exc)
     task_file = task_path(cfg.shared_root, reference.task_id)
     if not task_file.exists():
-        return ReadyClassificationResult("permanently_stale", "task_missing")
+        return _classification_result(cfg, reference, "permanently_stale", "task_missing")
     try:
         task = TaskRecord.from_dict(read_json(task_file))
-    except (KeyError, TypeError, ValueError):
-        return ReadyClassificationResult("corrupt", "task_invalid")
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        return _classification_result(cfg, reference, "corrupt", "task_invalid", exception=exc)
     if _is_ready_publication_pending(cfg, reference, task):
-        return ReadyClassificationResult("temporarily_unavailable", "marker_publication_pending", task)
+        return _classification_result(cfg, reference, "temporarily_unavailable", "marker_publication_pending", task)
     if reference.generation != task.ready_generation:
-        return ReadyClassificationResult("permanently_stale", "generation_superseded", task)
+        return _classification_result(cfg, reference, "permanently_stale", "generation_superseded", task)
     if reference.queue_scope != task.placement_runtime.get(
         "queue_scope"
     ) or reference.home_machine != task.placement_policy.get("home_machine"):
-        return ReadyClassificationResult("corrupt", "route_mismatch", task)
+        return _classification_result(cfg, reference, "corrupt", "route_mismatch", task, marker=marker)
     if task.state.get("projection") != "queued" or task.claim_control.get("active_claim"):
-        return ReadyClassificationResult("permanently_stale", "task_not_queued", task)
+        return _classification_result(cfg, reference, "permanently_stale", "task_not_queued", task)
     if (
         task.control.get("cleanup_operation_id")
         or task.control.get("cleanup_state")
         or task.control.get("cancellation_requested_at")
     ):
-        return ReadyClassificationResult("permanently_stale", "task_controlled", task)
+        return _classification_result(cfg, reference, "permanently_stale", "task_controlled", task)
     operation_id = task.submission_operation_id
     if not operation_id:
-        return ReadyClassificationResult("corrupt", "submission_identity_missing", task)
+        return _classification_result(cfg, reference, "corrupt", "submission_identity_missing", task)
     operation_file = submission_path(cfg.shared_root, operation_id)
     if not operation_file.exists():
-        return ReadyClassificationResult("corrupt", "submission_missing", task)
+        return _classification_result(cfg, reference, "corrupt", "submission_missing", task)
     try:
         submission_state = read_json(operation_file)["submission"]["state"]
-    except (KeyError, TypeError, ValueError):
-        return ReadyClassificationResult("corrupt", "submission_invalid", task)
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        return _classification_result(cfg, reference, "corrupt", "submission_invalid", task, exception=exc)
     if submission_state in {"preparing", "committing", "blocked"}:
-        return ReadyClassificationResult("temporarily_unavailable", f"submission_{submission_state}", task)
+        return _classification_result(cfg, reference, "temporarily_unavailable", f"submission_{submission_state}", task)
     if submission_state == "aborted":
-        return ReadyClassificationResult("permanently_stale", "submission_aborted", task)
+        return _classification_result(cfg, reference, "permanently_stale", "submission_aborted", task)
     if submission_state != "committed":
-        return ReadyClassificationResult("corrupt", "submission_state_invalid", task)
+        return _classification_result(cfg, reference, "corrupt", "submission_state_invalid", task)
     if task.group_name:
         path = group_path(cfg.shared_root, task.group_name)
         if not path.exists():
-            return ReadyClassificationResult("corrupt", "group_missing", task)
+            return _classification_result(cfg, reference, "corrupt", "group_missing", task)
         try:
             group = read_json(path)["group"]
-        except (KeyError, TypeError, ValueError):
-            return ReadyClassificationResult("corrupt", "group_invalid", task)
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            return _classification_result(cfg, reference, "corrupt", "group_invalid", task, exception=exc)
         if group.get("dispatch_state") != "active":
-            return ReadyClassificationResult("temporarily_unavailable", "group_paused", task)
+            return _classification_result(cfg, reference, "temporarily_unavailable", "group_paused", task)
     from ..dependencies import dependency_gate
 
-    gate = dependency_gate(cfg, task)
+    try:
+        gate = dependency_gate(cfg, task)
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        return _classification_result(cfg, reference, "corrupt", "dependency_invalid", task, exception=exc)
     if gate.state == "invalid":
-        return ReadyClassificationResult("corrupt", "dependency_invalid", task)
+        return _classification_result(cfg, reference, "corrupt", "dependency_invalid", task)
     if gate.state != "ready":
-        return ReadyClassificationResult("temporarily_unavailable", f"dependency_{gate.state}", task)
-    return ReadyClassificationResult("claimable", "eligible_truth", task)
+        return _classification_result(cfg, reference, "temporarily_unavailable", f"dependency_{gate.state}", task)
+    return _classification_result(cfg, reference, "claimable", "eligible_truth", task)
 
 
 def task_should_have_ready_marker(task: TaskRecord) -> bool:

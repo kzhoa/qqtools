@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Literal
 
@@ -9,10 +10,20 @@ from ..locks import exclusive
 from ..paths import ready_state_path, shared_paths
 from ..records import utc_now
 from ..store import atomic_replace, read_json
+from .diagnostics import (
+    MAX_REASONS,
+    InvalidReasonList,
+    ReadyDiagnostic,
+    diagnostic,
+    exception_fields,
+    safe_reason_view,
+    serialize_reason,
+)
 
 READY_PROTOCOL_VERSION = 1
 READY_WRITER_CAPABILITY = "ready-v1"
 ReadyIndexState = Literal["absent", "building", "active", "degraded"]
+_LOGGER = logging.getLogger(__name__)
 
 
 def ensure_ready_layout(cfg: object) -> None:
@@ -51,8 +62,12 @@ def ensure_ready_layout(cfg: object) -> None:
 def read_ready_index_state(cfg: object) -> ReadyIndexState:
     """Return the scheduling gate for this project's ready projection."""
     path = ready_state_path(cfg.shared_root)
-    if not path.exists():
+    try:
+        path.stat()
+    except FileNotFoundError:
         return "absent"
+    except OSError:
+        return "degraded"
     try:
         record = read_json(path)["ready_index"]
         current_state = record["state"]
@@ -62,8 +77,12 @@ def read_ready_index_state(cfg: object) -> ReadyIndexState:
             return "degraded"
         if current_state in {"building", "active"} and record.get("writer_capability") != READY_WRITER_CAPABILITY:
             return "degraded"
+        if not isinstance(record.get("degraded_reasons"), list) or not all(
+            isinstance(reason, str) for reason in record["degraded_reasons"]
+        ):
+            return "degraded"
         return current_state
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, OSError, TypeError, ValueError):
         return "degraded"
 
 
@@ -84,6 +103,10 @@ def read_state_record(cfg: object) -> tuple[dict[str, Any], dict[str, Any]]:
     record.setdefault("revision", 0)
     record.setdefault("build", None)
     record.setdefault("degraded_reasons", [])
+    if not isinstance(record["degraded_reasons"], list) or not all(
+        isinstance(reason, str) for reason in record["degraded_reasons"]
+    ):
+        raise InvalidReasonList("ready index degraded reasons are invalid.")
     if type(record["revision"]) is not int or record["revision"] < 0:
         raise ValueError("ready index revision is invalid.")
     return value, record
@@ -93,17 +116,33 @@ def read_ready_index_status(cfg: object) -> dict[str, Any]:
     """Return the durable build, cursor, watermark, and degradation status."""
     try:
         _value, record = read_state_record(cfg)
-        return record
-    except (FileNotFoundError, KeyError, TypeError, ValueError):
-        return {
-            "schema_version": READY_PROTOCOL_VERSION,
-            "state": "degraded",
-            "writer_capability": None,
-            "revision": 0,
-            "build": None,
-            "degraded_reasons": ["state_invalid"],
-            "updated_at": None,
-        }
+        result = dict(record)
+        result["degraded_reasons"] = safe_reason_view(record["degraded_reasons"])
+        return result
+    except (AttributeError, FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+        return _invalid_status(exc)
+
+
+def _invalid_status(exc: BaseException) -> dict[str, Any]:
+    fields = {
+        "stage": "reason_list" if isinstance(exc, InvalidReasonList) else "state_record",
+        **exception_fields(exc),
+    }
+    reason = serialize_reason(_UnobservedConfig(), "ready_state_invalid", diagnostic("state_invalid", **fields))
+    return {
+        "schema_version": READY_PROTOCOL_VERSION,
+        "state": "degraded",
+        "writer_capability": None,
+        "revision": 0,
+        "build": None,
+        "degraded_reasons": [reason],
+        "updated_at": None,
+    }
+
+
+class _UnobservedConfig:
+    machine_name = "unobserved"
+    reader_version = "unobserved"
 
 
 def commit_state_under_lock(path: Path, value: dict[str, Any], record: dict[str, Any]) -> None:
@@ -149,7 +188,7 @@ def assert_ready_writer_compatible(
         return
     try:
         _value, record = read_state_record(cfg)
-    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+    except (AttributeError, FileNotFoundError, KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("ready index state is invalid; Task mutation is disabled.") from exc
     required = record.get("writer_capability")
     if required != READY_WRITER_CAPABILITY or writer_capability != required:
@@ -159,7 +198,7 @@ def assert_ready_writer_compatible(
     try:
         schema = read_json(schema_capability_path(cfg))["schema"]
         capabilities = schema["writer_capabilities"]
-    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+    except (AttributeError, FileNotFoundError, KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("ready writer schema capability gate is missing.") from exc
     if (
         not isinstance(capabilities, list)
@@ -169,24 +208,42 @@ def assert_ready_writer_compatible(
         raise RuntimeError("ready writer schema capability gate is incompatible.")
 
 
-def mark_ready_index_degraded(cfg: object, reason: str) -> None:
+def mark_ready_index_degraded(cfg: object, reason: ReadyDiagnostic) -> None:
     """Fail closed after detecting a corrupt active projection."""
+    if not isinstance(reason, ReadyDiagnostic):
+        raise TypeError("ready-index degradation requires a typed diagnostic")
     path = ready_state_path(cfg.shared_root)
     try:
         with exclusive(state_lock_path(cfg)):
             value, record = read_state_record(cfg)
-            degrade_state_record(record, reason)
+            degrade_state_record(record, reason, cfg=cfg)
             commit_state_under_lock(path, value, record)
-    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+    except (AttributeError, FileNotFoundError, KeyError, OSError, TypeError, ValueError):
         return
 
 
-def degrade_state_record(record: dict[str, Any], reason: str) -> None:
+def degrade_state_record(record: dict[str, Any], reason: ReadyDiagnostic, *, cfg: object) -> None:
     """Set a state record to degraded without writing it."""
+    if not isinstance(reason, ReadyDiagnostic):
+        raise TypeError("ready-index degradation requires a typed diagnostic")
     reasons = record.get("degraded_reasons", [])
-    if not isinstance(reasons, list):
-        reasons = []
-    if reason not in reasons:
-        reasons.append(reason)
+    if not isinstance(reasons, list) or not all(isinstance(item, str) for item in reasons):
+        raise ValueError("ready index degraded reasons are invalid.")
+    encoded_reason = serialize_reason(cfg, _prefix_for(reason), reason)
+    if encoded_reason in reasons:
+        pass
+    elif len(reasons) < MAX_REASONS:
+        reasons.append(encoded_reason)
+    else:
+        _LOGGER.warning("reason_limit_reached omitted_count=1")
     record["state"] = "degraded"
     record["degraded_reasons"] = reasons
+
+
+def _prefix_for(reason: ReadyDiagnostic) -> str:
+    from .diagnostics import _PREFIX_REASONS
+
+    for prefix, codes in _PREFIX_REASONS.items():
+        if reason.reason_code in codes:
+            return prefix
+    raise ValueError(f"no ready diagnostic prefix for {reason.reason_code!r}")
