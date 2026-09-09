@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import os
+import shlex
 import signal
 import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, ContextManager
 
 from .agent import _visible_gpus, get_agent_status
 from .authority import AuthoritySupervisor
 from .config_types import RootConfig
 from .executor import Executor
-from .layout import load_root_config, machine_state_path, runtime_pid_path
+from .layout import load_machine_record, load_root_config, machine_state_path, runtime_pid_path
 from .machine_config import is_legacy_agent_project, load_machine_policy, save_machine_config
 from .machine_dispatch_plan import (
     MachineDispatchSnapshot,
@@ -28,7 +29,7 @@ from .machine_dispatch_plan import (
     order_dispatch_project_ids,
     reduce_dispatch_cursor,
 )
-from .machine_runtime import MachineRuntime, ProjectBinding
+from .machine_runtime import MachineRuntime, ProjectBinding, default_machine_runtime_root
 from .machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from .project_maintenance import maintain_project, reconcile_reservation
 from .runtime.locks import exclusive
@@ -482,8 +483,8 @@ def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool
         _revision, bindings = runtime.load_registry()
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         return False
-    if not bindings and not has_consumed_binding:
-        # Empty startup waits for the first successfully published binding.
+    if not has_consumed_binding:
+        # Startup waits until the current process has validated and consumed a binding.
         return False
     for binding in bindings:
         if _has_local_lifecycle_evidence(runtime, binding.project_id):
@@ -532,10 +533,51 @@ def _active_machine_identity(runtime: MachineRuntime) -> tuple[int, str, int] | 
     return pid, instance_id, start_ticks
 
 
+def _publish_process_status(
+    runtime: MachineRuntime,
+    *,
+    instance_id: str,
+    pid: int,
+    start_ticks: int,
+    waiting_for_first_registration: bool,
+    state: str = "active",
+) -> None:
+    """Publish live process identity and its process-local registration wait state."""
+    atomic_replace(
+        runtime.paths["agent"] / "status.json",
+        {
+            "machine_agent": {
+                "instance_id": instance_id,
+                "pid": pid if state == "active" else None,
+                "pid_start_time_ticks": start_ticks,
+                "state": state,
+                "waiting_for_first_registration": waiting_for_first_registration if state == "active" else False,
+            }
+        },
+    )
+
+
 def _binding_config(runtime: MachineRuntime, binding: ProjectBinding) -> RootConfig:
     """Build the binding's isolated local runtime configuration."""
     cfg = binding.root_config()
     return replace(cfg, runtime_root=runtime.project_paths(binding.project_id)["root"])
+
+
+def _consume_first_registered_binding(runtime: MachineRuntime) -> bool:
+    """Validate one current binding so the process can leave its first-registration wait."""
+    try:
+        _revision, bindings = runtime.load_registry()
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return False
+    for binding in bindings:
+        try:
+            if not runtime.binding_write_eligible(binding, renew=True):
+                continue
+            _binding_config(runtime, binding)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            continue
+        return True
+    return False
 
 
 def _working_directory_reason(spec: TaskSpec) -> str | None:
@@ -577,43 +619,85 @@ def _publish_project_snapshots(
     reservations: list[dict[str, Any]],
     heartbeat_interval_seconds: float = 5.0,
     started_at: str | None = None,
+    write_guard: Callable[[str], ContextManager[bool]] | None = None,
 ) -> None:
     """Publish each readable project's view of the shared machine reservation state."""
     reserved = sorted({gpu_id for item in reservations for gpu_id in item.get("gpu_ids", [])})
     started_at = started_at or utc_now()
     for project_id, cfg in readable.items():
-        attempts = [item.get("attempt_id") for item in reservations if item.get("project_id") == project_id]
-        project_reservations = [item for item in reservations if item.get("project_id") == project_id]
-        agent_path = machine_state_path(cfg, "agent.json")
-        idle_since_at = None
-        if not reserved:
-            idle_since_at = utc_now()
-            if agent_path.exists():
-                try:
-                    previous = read_json(agent_path).get("agent", {})
-                    if previous.get("instance_id") == instance_id and previous.get("observed_state") == "idle":
-                        previous_idle_since = previous.get("idle_since_at")
-                        if isinstance(previous_idle_since, str):
-                            idle_since_at = previous_idle_since
-                except (OSError, ValueError):
-                    pass
-        try:
-            publish_machine_snapshots(
+        if write_guard is None:
+            _publish_project_snapshot(
                 cfg,
                 instance_id=instance_id,
                 pid=pid,
-                agent_mode="machine",
-                observed_state="active" if reserved else "idle",
-                active_attempt_ids=[item for item in attempts if isinstance(item, str)],
-                visible_gpu_ids=visible,
-                reserved_gpu_ids=reserved,
-                reservation_summaries=project_reservations,
+                visible=visible,
+                reserved=reserved,
+                reservations=reservations,
+                project_id=project_id,
                 heartbeat_interval_seconds=heartbeat_interval_seconds,
                 started_at=started_at,
-                idle_since_at=idle_since_at,
             )
-        except OSError:
             continue
+        with write_guard(project_id) as is_eligible:
+            if is_eligible:
+                _publish_project_snapshot(
+                    cfg,
+                    instance_id=instance_id,
+                    pid=pid,
+                    visible=visible,
+                    reserved=reserved,
+                    reservations=reservations,
+                    project_id=project_id,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                    started_at=started_at,
+                )
+
+
+def _publish_project_snapshot(
+    cfg: RootConfig,
+    *,
+    instance_id: str,
+    pid: int | None,
+    visible: list[int],
+    reserved: list[int],
+    reservations: list[dict[str, Any]],
+    project_id: str,
+    heartbeat_interval_seconds: float,
+    started_at: str,
+) -> None:
+    """Publish one project snapshot while the caller holds any required write fence."""
+    attempts = [item.get("attempt_id") for item in reservations if item.get("project_id") == project_id]
+    project_reservations = [item for item in reservations if item.get("project_id") == project_id]
+    agent_path = machine_state_path(cfg, "agent.json")
+    idle_since_at = None
+    if not reserved:
+        idle_since_at = utc_now()
+        if agent_path.exists():
+            try:
+                previous = read_json(agent_path).get("agent", {})
+                if previous.get("instance_id") == instance_id and previous.get("observed_state") == "idle":
+                    previous_idle_since = previous.get("idle_since_at")
+                    if isinstance(previous_idle_since, str):
+                        idle_since_at = previous_idle_since
+            except (OSError, ValueError):
+                pass
+    try:
+        publish_machine_snapshots(
+            cfg,
+            instance_id=instance_id,
+            pid=pid,
+            agent_mode="machine",
+            observed_state="active" if reserved else "idle",
+            active_attempt_ids=[item for item in attempts if isinstance(item, str)],
+            visible_gpu_ids=visible,
+            reserved_gpu_ids=reserved,
+            reservation_summaries=project_reservations,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            started_at=started_at,
+            idle_since_at=idle_since_at,
+        )
+    except OSError:
+        return
 
 
 def _reconcile_machine_reservations(
@@ -720,6 +804,7 @@ class _MachineControlPlane:
         self._registry_revision: int | None = None
         self._stop_event = threading.Event()
         self._supervisors: dict[str, AuthoritySupervisor] = {}
+        self._supervisor_generations: dict[str, str | None] = {}
         self._authority_thread = threading.Thread(
             target=self._run_authority_loop,
             name="qexp-machine-authority",
@@ -755,7 +840,10 @@ class _MachineControlPlane:
             self._scheduler_wakeup.set()
         self._registry_revision = revision
         return [
-            binding for binding in registered if binding.enabled or self._runtime.binding_state(binding) == "draining"
+            binding
+            for binding in registered
+            if (binding.enabled or self._runtime.binding_state(binding) == "draining")
+            and self._runtime.registration_status(binding)["state"] != "superseded"
         ]
 
     def _run_authority_cycle(self) -> float:
@@ -772,14 +860,23 @@ class _MachineControlPlane:
         supervised_ids = {binding.project_id for binding in bindings}
         for project_id in set(self._supervisors) - supervised_ids:
             del self._supervisors[project_id]
+            self._supervisor_generations.pop(project_id, None)
         for binding in bindings:
             try:
+                if not self._runtime.binding_write_eligible(binding, renew=True):
+                    continue
                 cfg = _binding_config(self._runtime, binding)
                 supervisor = self._supervisors.get(binding.project_id)
+                if supervisor is not None and self._supervisor_generations.get(binding.project_id) != (
+                    binding.registration_generation
+                ):
+                    del self._supervisors[binding.project_id]
+                    supervisor = None
                 if supervisor is None:
                     supervisor = AuthoritySupervisor(cfg, reservation_runtime_root=self._runtime.root)
                     supervisor.recover_startup()
                     self._supervisors[binding.project_id] = supervisor
+                    self._supervisor_generations[binding.project_id] = binding.registration_generation
                 supervisor.tick()
                 authority_interval = min(authority_interval, supervisor.renewal_interval_seconds)
             except OSError:
@@ -822,9 +919,13 @@ class _MachineControlPlane:
         except (OSError, RuntimeError, ValueError):
             return
         readable: dict[str, RootConfig] = {}
+        readable_bindings: dict[str, ProjectBinding] = {}
         for binding in bindings:
             try:
+                if not self._runtime.binding_write_eligible(binding, renew=True):
+                    continue
                 readable[binding.project_id] = _binding_config(self._runtime, binding)
+                readable_bindings[binding.project_id] = binding
             except (OSError, RuntimeError, ValueError):
                 continue
         try:
@@ -836,6 +937,7 @@ class _MachineControlPlane:
                 reservations=list(reservation_snapshot(self._runtime.root).reservations),
                 heartbeat_interval_seconds=self._loop_interval,
                 started_at=self._started_at,
+                write_guard=lambda project_id: self._runtime.binding_write_guard(readable_bindings[project_id]),
             )
         except (OSError, RuntimeError, ValueError):
             return
@@ -1025,23 +1127,56 @@ def _dispatch_machine_cycle_locked(
 ) -> list[dict[str, Any]]:
     executor = executor or Executor()
     runtime.last_cycle_had_demand = False
+    runtime.last_cycle_consumed_binding = False
     _, registered = runtime.load_registry()
-    supervised = [binding for binding in registered if binding.enabled or runtime.binding_state(binding) == "draining"]
+    supervised = [
+        binding
+        for binding in registered
+        if (binding.enabled or runtime.binding_state(binding) == "draining")
+        and runtime.registration_status(binding)["state"] != "superseded"
+    ]
     if supervisors is not None:
         supervised_ids = {binding.project_id for binding in supervised}
         for project_id in set(supervisors) - supervised_ids:
             del supervisors[project_id]
+            getattr(runtime, "supervisor_generations", {}).pop(project_id, None)
     if not supervised:
+        for binding in registered:
+            if runtime.registration_status(binding)["state"] == "superseded":
+                continue
+            try:
+                if runtime.binding_write_eligible(binding, renew=True):
+                    _binding_config(runtime, binding)
+                    runtime.last_cycle_consumed_binding = True
+                    break
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                continue
         return []
     readable: dict[str, RootConfig] = {}
+    readable_bindings: dict[str, ProjectBinding] = {}
     dispatchable: dict[str, RootConfig] = {}
     results: list[dict[str, Any]] = []
     upgrade_blocked: dict[str, dict[str, Any]] = {}
     for binding in supervised:
+        if not runtime.binding_write_eligible(binding, renew=True):
+            results.append(
+                {
+                    "project_id": binding.project_id,
+                    "launched": [],
+                    "status": "registration_ineligible",
+                    "error": (
+                        "current registration generation or machine write eligibility is unavailable; "
+                        "new admission is blocked while retained execution evidence is reconciled."
+                    ),
+                }
+            )
+            continue
         try:
             cfg = _binding_config(runtime, binding)
             runtime.drain_legacy_runner_evidence(binding)
             readable[binding.project_id] = cfg
+            readable_bindings[binding.project_id] = binding
+            runtime.last_cycle_consumed_binding = True
         except (OSError, RuntimeError, ValueError) as exc:
             results.append(
                 {
@@ -1066,10 +1201,18 @@ def _dispatch_machine_cycle_locked(
                 )
             if supervise:
                 supervisor = None if supervisors is None else supervisors.get(binding.project_id)
+                supervisor_generations = getattr(runtime, "supervisor_generations", {})
+                if supervisor is not None and supervisor_generations.get(binding.project_id) != (
+                    binding.registration_generation
+                ):
+                    del supervisors[binding.project_id]
+                    supervisor_generations.pop(binding.project_id, None)
+                    supervisor = None
                 if supervisor is None:
                     supervisor = AuthoritySupervisor(cfg, reservation_runtime_root=runtime.root)
                     if supervisors is not None:
                         supervisors[binding.project_id] = supervisor
+                        supervisor_generations[binding.project_id] = binding.registration_generation
                 supervisor.tick()
             dispatchable[binding.project_id] = cfg
             if binding.project_id in runtime.upgrade_admission_blocked_projects:
@@ -1104,7 +1247,7 @@ def _dispatch_machine_cycle_locked(
     cpu_policy, cpu_reservations = cpu_reservation_snapshot(runtime.root)
     free_cpu_slots = cpu_policy.capacity - sum(item.get("cpu_slots", 0) for item in cpu_reservations)
     cursor_project_id = runtime.load_cursor()
-    enabled_by_project = {binding.project_id: binding for binding in registered if binding.enabled}
+    enabled_by_project = {binding.project_id: binding for binding in supervised if binding.enabled}
     ordered_project_ids = order_dispatch_project_ids(
         tuple(enabled_by_project),
         cursor_project_id,
@@ -1240,6 +1383,7 @@ def _dispatch_machine_cycle_locked(
             reservations=reservations,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
             started_at=started_at,
+            write_guard=lambda project_id: runtime.binding_write_guard(readable_bindings[project_id]),
         )
     return results
 
@@ -1270,27 +1414,56 @@ def get_machine_agent_status(
     running = bool(identity or (pid and not probe_local_pid))
     revision, bindings = machine_runtime.load_registry()
     upgrade = inspect_registered_upgrades(machine_runtime)
+    waiting_for_first_registration = False
+    if running:
+        try:
+            status = read_json(machine_runtime.paths["agent"] / "status.json").get("machine_agent", {})
+            waiting_for_first_registration = bool(status.get("waiting_for_first_registration"))
+        except (OSError, TypeError, ValueError):
+            waiting_for_first_registration = False
+    projects = []
+    for binding in bindings:
+        try:
+            eligibility = machine_runtime.registration_status(binding)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            eligibility = {"state": "invalid", "write_eligible": False, "error": str(exc)}
+        project = {
+            **binding.to_dict(),
+            "state": machine_runtime.binding_state(binding),
+            "eligibility": eligibility,
+            "write_eligible": eligibility.get("write_eligible", False),
+            "upgrade": next(
+                (
+                    project.get("upgrade", {})
+                    for project in upgrade["projects"]
+                    if project.get("project_id") == binding.project_id
+                ),
+                {},
+            ),
+        }
+        if eligibility.get("state") == "superseded":
+            replacement_name = f"{binding.machine_name}-replacement"
+            project["blocker"] = (
+                f"registration generation {eligibility.get('generation')!r} superseded this environment; "
+                "explicit takeover is required before this binding can dispatch or publish authoritative state."
+            )
+            project["recovery_command"] = (
+                f"qexp --shared-root {shlex.quote(str(binding.shared_root))} "
+                f"--machine {shlex.quote(replacement_name)} "
+                f"--machine-runtime-root {shlex.quote(str(machine_runtime.root))} agent add-project"
+            )
+            project["recovery_note"] = (
+                f"The example logical name {replacement_name!r} is illustrative; verify its availability before use."
+            )
+        projects.append(project)
     return {
         "machine_runtime_root": str(machine_runtime.root),
         "agent_state": "active" if running else "stopped",
         "pid": pid,
         "is_running": running,
+        "waiting_for_first_registration": waiting_for_first_registration if running else False,
         "registry_revision": revision,
-        "projects": [
-            {
-                **binding.to_dict(),
-                "state": machine_runtime.binding_state(binding),
-                "upgrade": next(
-                    (
-                        project.get("upgrade", {})
-                        for project in upgrade["projects"]
-                        if project.get("project_id") == binding.project_id
-                    ),
-                    {},
-                ),
-            }
-            for binding in bindings
-        ],
+        "projects": projects,
         "upgrade": upgrade,
     }
 
@@ -1301,12 +1474,26 @@ class ProjectRegistration:
 
     binding: ProjectBinding
     is_added: bool
+    is_adopted: bool = False
+
+    @property
+    def message(self) -> str:
+        """Return the stable operator-facing registration result."""
+        if self.binding.enabled:
+            return (
+                "Project registration checks passed; new task admission is enabled."
+                if self.is_added
+                else "Project is already registered and remains enabled. Registration checks passed."
+            )
+        return "Project is already registered and remains disabled. Registration checks passed; new task admission is disabled."
 
 
 def register_project(
     runtime: MachineRuntime | str | Path | None,
     shared_root: str | Path,
     machine_name: str,
+    *,
+    adopt_existing: bool = False,
 ) -> ProjectRegistration:
     """Register a current-generation project with the machine agent.
 
@@ -1322,11 +1509,19 @@ def register_project(
         ValueError: If the project still requires explicit legacy migration.
     """
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
-    cfg = load_root_config(shared_root, machine_name, require_initialized=True)
-    if is_legacy_agent_project(cfg):
+    try:
+        cfg = load_root_config(shared_root, machine_name, require_initialized=True)
+    except RuntimeError as exc:
+        from qqtools.version import __version__
+
+        raise RuntimeError(
+            f"qexp registration preflight failed for installed qqtools {__version__}: {exc} "
+            "Install a supported qqtools version before registering this project."
+        ) from exc
+    if load_machine_record(cfg) is not None and is_legacy_agent_project(cfg):
         raise ValueError("legacy project metadata requires 'qexp agent migrate-project'.")
-    binding, is_added = machine_runtime.ensure_binding(shared_root, machine_name)
-    return ProjectRegistration(binding, is_added)
+    binding, is_added = machine_runtime.ensure_binding(shared_root, machine_name, adopt_existing=adopt_existing)
+    return ProjectRegistration(binding, is_added, adopt_existing and is_added)
 
 
 def _legacy_pid_matches(cfg: RootConfig, pid: int) -> bool:
@@ -1457,7 +1652,12 @@ def migrate_project(runtime: MachineRuntime | str | Path | None, cfg: RootConfig
     if existing is None:
         if not is_legacy_agent_project(cfg):
             raise ValueError("project already uses the machine-agent runtime; use 'qexp agent add-project'.")
-        binding = machine_runtime.add_binding(cfg.shared_root, cfg.machine_name, enabled=False)
+        binding = machine_runtime.add_binding(
+            cfg.shared_root,
+            cfg.machine_name,
+            enabled=False,
+            adopt_existing=True,
+        )
         prepared_at = utc_now()
         _save_migration_state(machine_runtime, binding, cfg, state="prepared", prepared_at=prepared_at)
     else:
@@ -1520,6 +1720,31 @@ def set_project_enabled(
     )
 
 
+def _enable_command(machine_runtime: MachineRuntime, binding: ProjectBinding) -> str:
+    """Build a copyable command using the actual runtime selected by the caller."""
+    project = shlex.quote(binding.project_id)
+    if machine_runtime.root == default_machine_runtime_root():
+        return f"qexp agent enable-project {project}"
+    return f"qexp --machine-runtime-root {shlex.quote(str(machine_runtime.root))} agent enable-project {project}"
+
+
+def enable_project(runtime: MachineRuntime | str | Path | None, identifier: str | Path) -> ProjectBinding:
+    """Revalidate a binding's current generation and enable new admission."""
+    machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
+    with machine_runtime.registry_guard():
+        revision, bindings = machine_runtime.load_registry()
+        current = machine_runtime._find_binding(bindings, identifier)
+        if not machine_runtime.binding_write_eligible(current, renew=True):
+            status = machine_runtime.registration_status(current)
+            raise RuntimeError(
+                f"cannot enable project {current.project_id!r}: registration is "
+                f"{status.get('state', 'unavailable')}; resolve registration authority first."
+            )
+        updated = replace(current, enabled=True)
+        machine_runtime._save_registry(revision + 1, [updated if item == current else item for item in bindings])
+    return updated
+
+
 def run_machine_agent_loop(
     runtime: MachineRuntime | str | Path | None = None,
     *,
@@ -1569,16 +1794,12 @@ def run_machine_agent_loop(
             previous_int = signal.signal(signal.SIGINT, request_stop)
             pid_path.write_text(str(os.getpid()), encoding="utf-8")
             is_pid_published = True
-            atomic_replace(
-                machine_runtime.paths["agent"] / "status.json",
-                {
-                    "machine_agent": {
-                        "instance_id": instance_id,
-                        "pid": os.getpid(),
-                        "pid_start_time_ticks": start_ticks,
-                        "state": "active",
-                    }
-                },
+            _publish_process_status(
+                machine_runtime,
+                instance_id=instance_id,
+                pid=os.getpid(),
+                start_ticks=start_ticks,
+                waiting_for_first_registration=True,
             )
             is_status_published = True
             control_plane = _MachineControlPlane(
@@ -1608,7 +1829,7 @@ def run_machine_agent_loop(
                 try:
                     with machine_runtime.migration_guard() as is_migration_clear:
                         if is_migration_clear:
-                            cycle_results = dispatch_machine_cycle_locked(
+                            dispatch_machine_cycle_locked(
                                 machine_runtime,
                                 available_gpus=available_gpus,
                                 executor=executor,
@@ -1618,10 +1839,23 @@ def run_machine_agent_loop(
                                 supervise=False,
                                 publish_snapshots=False,
                             )
-                            if any(item.get("status") == "dispatched" for item in cycle_results):
+                            if machine_runtime.last_cycle_consumed_binding or _consume_first_registered_binding(
+                                machine_runtime
+                            ):
                                 has_consumed_binding = True
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     # A transient shared-root failure must not stop supervision of other projects.
+                    pass
+                try:
+                    if has_consumed_binding:
+                        _publish_process_status(
+                            machine_runtime,
+                            instance_id=instance_id,
+                            pid=os.getpid(),
+                            start_ticks=start_ticks,
+                            waiting_for_first_registration=False,
+                        )
+                except OSError:
                     pass
                 if _machine_is_true_idle(machine_runtime, has_consumed_binding=has_consumed_binding):
                     if idle_since is None:
@@ -1657,18 +1891,20 @@ def run_machine_agent_loop(
                     for binding in registered:
                         try:
                             cfg = _binding_config(machine_runtime, binding)
-                            publish_machine_stop_snapshot(
-                                cfg,
-                                instance_id=instance_id,
-                                pid=None,
-                                agent_mode="machine",
-                                visible_gpu_ids=_visible_gpus(cfg),
-                                reserved_gpu_ids=reserved,
-                                heartbeat_interval_seconds=loop_interval,
-                                started_at=started_at,
-                                idle_since_at=None if reserved else utc_now(),
-                                stop_reason=stop_reason or "stopped",
-                            )
+                            with machine_runtime.binding_write_guard(binding) as is_eligible:
+                                if is_eligible:
+                                    publish_machine_stop_snapshot(
+                                        cfg,
+                                        instance_id=instance_id,
+                                        pid=None,
+                                        agent_mode="machine",
+                                        visible_gpu_ids=_visible_gpus(cfg),
+                                        reserved_gpu_ids=reserved,
+                                        heartbeat_interval_seconds=loop_interval,
+                                        started_at=started_at,
+                                        idle_since_at=None if reserved else utc_now(),
+                                        stop_reason=stop_reason or "stopped",
+                                    )
                         except (OSError, RuntimeError, ValueError):
                             continue
                 if is_pid_published:
@@ -1676,7 +1912,15 @@ def run_machine_agent_loop(
                 if is_status_published:
                     atomic_replace(
                         machine_runtime.paths["agent"] / "status.json",
-                        {"machine_agent": {"instance_id": instance_id, "pid": None, "state": "stopped"}},
+                        {
+                            "machine_agent": {
+                                "instance_id": instance_id,
+                                "pid": None,
+                                "pid_start_time_ticks": start_ticks,
+                                "state": "stopped",
+                                "waiting_for_first_registration": False,
+                            }
+                        },
                     )
             finally:
                 try:

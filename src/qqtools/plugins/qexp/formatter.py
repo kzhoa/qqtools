@@ -271,6 +271,9 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
                 ("Machine", result.get("machine_name")),
                 ("PID", result.get("pid")),
                 ("Previous PID", result.get("previous_pid")),
+                ("Message", result.get("message")),
+                ("Shared root", result.get("shared_root")),
+                ("Enable command", result.get("enable_command")),
                 ("Reason", result.get("reason")),
             ),
         )

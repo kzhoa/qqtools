@@ -101,8 +101,11 @@ and submitted work eventually converges through its normal scheduling lifecycle.
 is an explicit non-activation exception, not an additional prerequisite for the main workflow.
 
 `migrate-project` handles only a project carrying legacy metadata. It verifies and stops the old
-agent, imports that project's local evidence, and enables its binding. A failed migration must not
-mark the project migrated or release or overwrite resources belonging to another project.
+agent, imports that project's local evidence, and enables its binding. If a prior registration from
+another machine runtime remains, migration may replace it only after that registration's shared
+write eligibility expires; local PID or runtime-path observations cannot shorten this interval. A
+failed migration must not mark the project migrated or release or overwrite resources belonging to
+another project.
 
 `add-project` is an operations command for restoring a missing or removed current-generation
 binding; it is not part of new-project setup.
@@ -1332,6 +1335,7 @@ Global-agent operations are local to the qexp Machine:
 ```bash
 qexp agent add-project
 qexp agent list-projects
+qexp agent enable-project <project-id-or-root>
 qexp agent disable-project <project-id-or-root>
 qexp agent remove-project <project-id-or-root>
 qexp agent start
@@ -1341,8 +1345,13 @@ qexp agent status
 `qexp init` initializes and registers every new Project before it returns successfully. Ordinary
 `qexp agent start` never initializes or registers the current directory. `qexp agent add-project`
 is an idempotent operations command for restoring a removed or lost current-generation binding and
-may run while the global agent is active. An existing Project without the global-agent machine-record
-marker must use the one-time
+may run while the global agent is active. It preserves an existing binding's enabled/disabled state
+and reports the actual project ID and shared path. It can replace a superseded local binding with an
+available logical name. Runtime identity is bound to both its local random identity and the current
+Linux host, so copying only the runtime directory cannot renew authority on another host. Reusing a
+retained logical name from an uncertain runtime requires explicit `--adopt-existing` after old write eligibility is invalid;
+`qexp agent enable-project <project-id-or-root>` revalidates registration authority before enabling
+new admission. An existing Project without the global-agent machine-record marker must use the one-time
 `qexp agent migrate-project` command. It stops only a verified old agent process, imports local
 execution evidence, registers the Project, and then starts or wakes the global agent without
 terminating already running training processes. Late immutable runner evidence is drained from

@@ -14,6 +14,7 @@ from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import cancel, submit
 from qqtools.plugins.qexp.machine_agent import (
     _MachineControlPlane,
+    _pid_start_time_ticks,
     _publish_project_snapshots,
     dispatch_machine_cycle,
     dispatch_machine_cycle_locked,
@@ -141,6 +142,146 @@ def test_registry_add_list_disable_and_remove_project_binding(tmp_path: Path) ->
     removed = runtime.remove_binding(disabled.shared_root)
     assert removed == disabled
     assert runtime.load_registry() == (3, [])
+
+
+def test_replaying_disabled_binding_preserves_generation_and_disabled_state(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    original = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    disabled = runtime.set_enabled(original.project_id, False)
+
+    replayed, is_added = runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
+
+    assert is_added is False
+    assert replayed.enabled is False
+    assert replayed.registration_generation == disabled.registration_generation
+    assert replayed.runtime_instance_id == disabled.runtime_instance_id
+    assert runtime.binding_state(replayed) == "disabled"
+
+
+def test_expired_logical_name_requires_adoption_and_replaces_generation(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    first_runtime = MachineRuntime(tmp_path / "machine-runtime-a")
+    first = first_runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    registration = read_json(registration_path)["registration"]
+    registration["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(registration_path, {"registration": registration})
+
+    second_runtime = MachineRuntime(tmp_path / "machine-runtime-b")
+    with pytest.raises(ValueError, match="explicit --adopt-existing"):
+        second_runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
+
+    adopted, is_added = second_runtime.ensure_binding(cfg.shared_root, cfg.machine_name, adopt_existing=True)
+
+    assert is_added is True
+    assert adopted.registration_generation != first.registration_generation
+    assert second_runtime.binding_write_eligible(adopted)
+    assert not first_runtime.binding_write_eligible(first)
+
+
+def test_migration_adoption_rejects_an_eligible_registration_even_if_owner_looks_stopped(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    owner_runtime = MachineRuntime(tmp_path / "owner-machine-runtime")
+    owner_runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    replacement_runtime = MachineRuntime(tmp_path / "replacement-machine-runtime")
+    with pytest.raises(ValueError, match="active competing authority"):
+        replacement_runtime.add_binding(
+            cfg.shared_root,
+            cfg.machine_name,
+            adopt_existing=True,
+        )
+
+
+def test_runtime_copy_cannot_renew_registration_on_another_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host_identity = ["host-a"]
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.machine_runtime._host_instance_id",
+        lambda: host_identity[0],
+    )
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+
+    host_identity[0] = "host-b"
+    copied_runtime = MachineRuntime(runtime.root)
+
+    assert copied_runtime.instance_id != binding.runtime_instance_id
+    assert not copied_runtime.binding_write_eligible(binding, renew=True)
+    with pytest.raises(ValueError, match="active write eligibility"):
+        copied_runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
+
+
+def test_superseded_binding_can_be_replaced_with_an_available_logical_name(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    original_runtime = MachineRuntime(tmp_path / "original-runtime")
+    original = original_runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    registration = read_json(registration_path)["registration"]
+    registration["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(registration_path, {"registration": registration})
+    replacement_runtime = MachineRuntime(tmp_path / "replacement-runtime")
+    replacement_runtime.add_binding(cfg.shared_root, cfg.machine_name, adopt_existing=True)
+    assert original_runtime.registration_status(original)["state"] == "superseded"
+
+    renamed = original_runtime.add_binding(cfg.shared_root, "gpu-1-replacement")
+
+    assert renamed.machine_name == "gpu-1-replacement"
+    assert renamed.registration_generation != original.registration_generation
+    assert original_runtime.load_registry()[1] == [renamed]
+    assert original_runtime.binding_write_eligible(renamed)
+
+
+def test_enabled_claim_guard_blocks_generation_adoption_until_claim_commit(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    owner_runtime = MachineRuntime(tmp_path / "owner-machine-runtime")
+    binding = owner_runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    entered = Event()
+    release = Event()
+    adopted = Event()
+    errors: list[Exception] = []
+
+    def hold_claim_commit() -> None:
+        try:
+            with owner_runtime.enabled_claim_guard(binding) as is_eligible:
+                assert is_eligible
+                entered.set()
+                assert release.wait(timeout=5)
+        except Exception as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    holder = Thread(target=hold_claim_commit)
+    holder.start()
+    assert entered.wait(timeout=5)
+    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    registration = read_json(registration_path)["registration"]
+    registration["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(registration_path, {"registration": registration})
+
+    def adopt_generation() -> None:
+        try:
+            MachineRuntime(tmp_path / "replacement-machine-runtime").ensure_binding(
+                cfg.shared_root,
+                cfg.machine_name,
+                adopt_existing=True,
+            )
+            adopted.set()
+        except Exception as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    adopter = Thread(target=adopt_generation)
+    adopter.start()
+    assert not adopted.wait(timeout=0.1)
+    release.set()
+    holder.join(timeout=5)
+    adopter.join(timeout=5)
+
+    assert not holder.is_alive()
+    assert not adopter.is_alive()
+    assert not errors
+    assert adopted.is_set()
 
 
 def test_remove_project_deletes_its_disposable_runtime_partition(tmp_path: Path) -> None:
@@ -925,6 +1066,134 @@ def test_background_machine_agent_publishes_pid_only_after_acquiring_authority(
         stop_machine_agent(runtime)
         assert time.monotonic() - started_at < 2.0
         process.wait(timeout=1.0)
+
+
+def test_first_registration_wait_is_consumed_without_dispatching_work(tmp_path: Path) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    script = """
+import sys
+from qqtools.plugins.qexp.machine_agent import run_machine_agent_loop
+run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[3] / "src")
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(runtime.root)],
+        env=environment,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while not (runtime.paths["agent"] / "status.json").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert process.poll() is None
+        assert get_machine_agent_status(runtime)["waiting_for_first_registration"] is True
+
+        cfg = init_shared_root(
+            tmp_path / "project" / ".qexp",
+            "gpu-1",
+            agent_mode="daemon",
+            runtime_root=tmp_path / "legacy",
+        )
+        runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
+
+        deadline = time.monotonic() + 5.0
+        while get_machine_agent_status(runtime)["waiting_for_first_registration"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        status = get_machine_agent_status(runtime)
+        assert status["waiting_for_first_registration"] is False
+        assert process.poll() is None
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5.0)
+
+
+def test_first_registration_wait_survives_stale_binding_until_adoption(tmp_path: Path) -> None:
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp",
+        "gpu-1",
+        runtime_root=tmp_path / "legacy",
+    )
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name, enabled=False)
+    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    registration = read_json(registration_path)["registration"]
+    registration["runtime_instance_id"] = "replaced-runtime"
+    registration["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(registration_path, {"registration": registration})
+    script = """
+import sys
+from qqtools.plugins.qexp.machine_agent import run_machine_agent_loop
+run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[3] / "src")
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(runtime.root)],
+        env=environment,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while not (runtime.paths["agent"] / "status.json").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)
+        assert process.poll() is None
+        assert get_machine_agent_status(runtime)["waiting_for_first_registration"] is True
+
+        adopted, is_added = runtime.ensure_binding(cfg.shared_root, cfg.machine_name, adopt_existing=True)
+        assert is_added is False
+        assert adopted.registration_generation != binding.registration_generation
+
+        deadline = time.monotonic() + 5.0
+        while get_machine_agent_status(runtime)["waiting_for_first_registration"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert get_machine_agent_status(runtime)["waiting_for_first_registration"] is False
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5.0)
+
+
+def test_machine_control_heartbeat_skips_binding_without_write_eligibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    eligibility_checks: list[tuple[ProjectBinding, bool]] = []
+
+    def deny_write(_binding: ProjectBinding, *, renew: bool = False) -> bool:
+        eligibility_checks.append((_binding, renew))
+        return True
+
+    @contextmanager
+    def deny_commit(_binding: ProjectBinding):
+        yield False
+
+    monkeypatch.setattr(runtime, "binding_write_eligible", deny_write)
+    monkeypatch.setattr(runtime, "binding_write_guard", deny_commit)
+    control_plane = _MachineControlPlane(
+        runtime,
+        instance_id="test-agent",
+        loop_interval=0.02,
+        started_at="2026-01-01T00:00:00Z",
+        available_gpus=[],
+    )
+
+    control_plane._publish_heartbeat()
+
+    assert eligibility_checks == [(binding, True)]
+    assert not (cfg.shared_root / "machines" / cfg.machine_name / "state" / "agent.json").exists()
 
 
 def test_machine_agent_loop_rejects_non_main_thread_without_publishing_identity(
