@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import pickle
 import shutil
+import threading
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -29,6 +30,67 @@ lmdb = LazyImport("lmdb")
 tqdm = LazyImport("tqdm", "tqdm")
 
 __all__ = ["qLmdbDataset", "qLmdbDatasetBase"]
+
+
+_environment_lock = threading.Lock()
+_environment_pid = os.getpid()
+_environments: dict[Path, tuple[Any, int]] = {}
+
+
+def _reset_environment_registry_after_fork() -> None:
+    global _environment_lock, _environment_pid, _environments
+    _environment_lock = threading.Lock()
+    # Do not close inherited native handles in the child: forked transactions may
+    # still reference them. The child registry is discarded and readers reopen lazily.
+    _environments = {}
+    _environment_pid = os.getpid()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_environment_registry_after_fork)
+
+
+class _ReadonlyEnvironmentLease:
+    """Own one reference to a process-local LMDB reader with compatible read options."""
+
+    def __init__(self, path: Path, *, readahead: bool = False) -> None:
+        global _environment_pid, _environments
+        self._path = path.resolve()
+        self._pid = os.getpid()
+        self._is_closed = False
+        with _environment_lock:
+            if _environment_pid != self._pid:
+                _environments = {}
+                _environment_pid = self._pid
+            entry = _environments.get(self._path)
+            if entry is None:
+                environment = lmdb.open(
+                    str(self._path),
+                    subdir=self._path.is_dir(),
+                    readonly=True,
+                    lock=False,
+                    readahead=readahead,
+                    meminit=False,
+                    max_readers=128,
+                )
+                entry = (environment, 0)
+            self._environment, references = entry
+            _environments[self._path] = (self._environment, references + 1)
+
+    def begin(self, *, write: bool = False):
+        return self._environment.begin(write=write)
+
+    def close(self) -> None:
+        with _environment_lock:
+            if self._is_closed or self._pid != os.getpid():
+                return
+            self._is_closed = True
+            environment, references = _environments[self._path]
+            if references == 1:
+                del _environments[self._path]
+                environment.close()
+            else:
+                _environments[self._path] = (environment, references - 1)
 
 
 class _FileLockWriteGuard:
@@ -73,6 +135,10 @@ class qLmdbDatasetBase(qDictDataset):
     samples use contiguous ASCII integer keys (``b"0"``, ``b"1"``, ...), and an optional
     pickled integer at ``b"length"`` records the shard length. Subclasses normally only declare
     :attr:`lmdb_files`; custom payload formats can override :meth:`parse_value`.
+
+    Readers in one process share environments but own separate transactions. Close all readers
+    before opening their files directly with ``lmdb.open`` or modifying them. Worker processes
+    reopen storage independently. The first reader chooses the shared readahead hint.
     """
 
     def __init__(
@@ -164,13 +230,16 @@ class qLmdbDatasetBase(qDictDataset):
         return self._cumulative_sizes[-1] if self._cumulative_sizes else 0
 
     def close(self) -> None:
-        """Release runtime LMDB transactions and environments owned by this process."""
+        """Release this reader; close shared storage only after its last reader is closed."""
         transactions = self._transactions or []
         environments = self._environments or []
+        is_local = self._storage_pid == os.getpid()
         self._transactions = None
         self._environments = None
         self._storage_pid = None
 
+        if not is_local:
+            return
         for transaction in transactions:
             try:
                 transaction.abort()
@@ -278,6 +347,8 @@ class qLmdbDatasetBase(qDictDataset):
                 environments.append(environment)
                 transactions.append(environment.begin(write=False))
         except Exception:
+            for transaction in transactions:
+                transaction.abort()
             for environment in environments:
                 environment.close()
             raise
@@ -288,15 +359,7 @@ class qLmdbDatasetBase(qDictDataset):
 
     @staticmethod
     def _open_readonly_environment(path: Path):
-        return lmdb.open(
-            str(path),
-            subdir=path.is_dir(),
-            readonly=True,
-            lock=False,
-            readahead=False,
-            meminit=False,
-            max_readers=128,
-        )
+        return _ReadonlyEnvironmentLease(path)
 
     def _resolve_true_idx(self, idx: int) -> tuple[int, int]:
         self._ensure_layout_loaded()
@@ -470,15 +533,7 @@ class qLmdbDataset(qLmdbDatasetBase):
 
     @staticmethod
     def _open_sequential_environment(path: Path):
-        return lmdb.open(
-            str(path),
-            subdir=path.is_dir(),
-            readonly=True,
-            lock=False,
-            readahead=True,
-            meminit=False,
-            max_readers=128,
-        )
+        return _ReadonlyEnvironmentLease(path, readahead=True)
 
     def _iter_source_blobs_sequential(self) -> Iterator[tuple[int, bytes]]:
         """Yield source blobs in cursor order while validating shard keys."""

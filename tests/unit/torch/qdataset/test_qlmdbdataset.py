@@ -150,12 +150,14 @@ def test_get_raw_blob_uses_global_multishard_indices_and_reports_errors(tmp_path
 
     subset = dataset[[3, 0]]
     assert pickle.loads(subset.get_raw_blob(0)) == first_samples[0]
+    subset.close()
     with pytest.raises(IndexError, match="out of range"):
         dataset.get_raw_blob(4)
     with pytest.raises(IndexError, match="out of range"):
         dataset.get_raw_blob(-5)
 
     dataset.close()
+    subset.close()
     environment = lmdb.open(str(second_path), subdir=False, map_size=1 << 26)
     try:
         with environment.begin(write=True) as transaction:
@@ -399,6 +401,7 @@ def test_rewrite_preserves_source_order_asset_and_aligns_effective_costs(tmp_pat
         stored_order,
     )
 
+    dataset.close()
     environment = lmdb.open(str(dataset.rewrite_path), subdir=False, readonly=True, lock=False)
     try:
         with environment.begin(write=False) as transaction:
