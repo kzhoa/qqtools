@@ -38,6 +38,8 @@ from .group_ready_members_upgrade import (
 from .layout import clear_context, load_context, load_root_config, migrate_schema5_to_schema6, save_context
 from .lease import LeasePolicy, load_lease_policy, save_lease_policy
 from .machine_agent import (
+    _enable_command,
+    enable_project,
     ensure_machine_agent_started,
     get_machine_agent_status,
     migrate_project,
@@ -168,7 +170,7 @@ def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[ob
             )
     machine = assertion or "unbound"
     runtime = None
-    if args.command == "agent" and args.agent_action == "migrate-project":
+    if args.command == "agent" and args.agent_action in {"add-project", "migrate-project"}:
         runtime = getattr(args, "runtime_root", None) or os.environ.get("QEXP_RUNTIME_ROOT")
     cfg = load_root_config(shared, machine, runtime, require_initialized=True)
     return cfg, ExecutionContext(cfg, machine_runtime)
@@ -404,6 +406,7 @@ def build_parser() -> argparse.ArgumentParser:
         "stop",
         "add-project",
         "list-projects",
+        "enable-project",
         "disable-project",
         "remove-project",
         "migrate-project",
@@ -417,7 +420,12 @@ def build_parser() -> argparse.ArgumentParser:
     cpu_lane_set = cpu_lane_sub.add_parser("set")
     _add_output_format(cpu_lane_set)
     cpu_lane_set.add_argument("--capacity", type=int, required=True)
-    for name in ("disable-project", "remove-project"):
+    agent_sub.choices["add-project"].add_argument(
+        "--adopt-existing",
+        action="store_true",
+        help="Explicitly reuse a logically owned name after its old write eligibility has expired.",
+    )
+    for name in ("disable-project", "enable-project", "remove-project"):
         agent_sub.choices[name].add_argument("project")
     agent_upgrade = agent_sub.add_parser(
         "upgrade",
@@ -719,6 +727,7 @@ def main(argv: list[str] | None = None) -> int:
             "status",
             "list-projects",
             "disable-project",
+            "enable-project",
             "remove-project",
             "stop",
             "restart",
@@ -735,6 +744,17 @@ def main(argv: list[str] | None = None) -> int:
             elif args.agent_action == "disable-project":
                 binding = set_project_enabled(runtime, args.project, False)
                 _emit("agent", {"action": "project_disabled", **binding.to_dict()}, args.format)
+            elif args.agent_action == "enable-project":
+                binding = enable_project(runtime, args.project)
+                _emit(
+                    "agent",
+                    {
+                        "action": "project_enabled",
+                        **binding.to_dict(),
+                        "message": "Project registration checks passed; new task admission is enabled.",
+                    },
+                    args.format,
+                )
             elif args.agent_action == "remove-project":
                 binding = unregister_project(runtime, args.project)
                 _emit("agent", {"action": "project_removed", **binding.to_dict()}, args.format)
@@ -1098,9 +1118,28 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "agent":
             runtime = get_execution_context().machine_runtime
             if args.agent_action == "add-project":
-                registration = register_project(runtime, cfg.shared_root, cfg.machine_name)
+                registration = register_project(
+                    runtime,
+                    cfg.shared_root,
+                    cfg.machine_name,
+                    adopt_existing=args.adopt_existing,
+                )
                 action = "project_added" if registration.is_added else "project_already_registered"
-                _emit("agent", {"action": action, **registration.binding.to_dict()}, args.format)
+                if registration.is_adopted:
+                    print(
+                        f"Warning: registration generation {registration.binding.registration_generation!r} "
+                        "replaced the previous logical-machine ownership; the previous environment will lose "
+                        "automatic access to this name on its next start.",
+                        file=sys.stderr,
+                    )
+                result = {
+                    "action": action,
+                    **registration.binding.to_dict(),
+                    "message": registration.message,
+                }
+                if not registration.binding.enabled:
+                    result["enable_command"] = _enable_command(runtime, registration.binding)
+                _emit("agent", result, args.format)
                 return 0
             if args.agent_action == "migrate-project":
                 binding = migrate_project(runtime, cfg)

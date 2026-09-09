@@ -12,7 +12,7 @@ from typing import Any
 from .config_types import RootConfig
 from .lease import default_lease_policy_document
 from .runtime.locks import exclusive, schema_lock
-from .runtime.paths import local_paths, machine_path, shared_log_path, shared_paths
+from .runtime.paths import local_paths, machine_path, machine_registration_path, shared_log_path, shared_paths
 from .runtime.records import SCHEMA_VERSION, AttemptRecord, TaskRecord, utc_now
 from .runtime.store import atomic_replace, read_json
 
@@ -517,6 +517,17 @@ def load_machine_record(cfg: RootConfig) -> dict[str, Any] | None:
 
 def save_machine_record(cfg: RootConfig, record: dict[str, Any]) -> None:
     atomic_replace(machine_path(cfg.shared_root, cfg.machine_name), record)
+
+
+def load_machine_registration(cfg: RootConfig) -> dict[str, Any] | None:
+    """Read the project-owned logical-machine registration, when present."""
+    path = machine_registration_path(cfg.shared_root, cfg.machine_name)
+    return read_json(path) if path.exists() else None
+
+
+def save_machine_registration(cfg: RootConfig, record: dict[str, Any]) -> None:
+    """Persist the project-owned logical-machine registration atomically."""
+    atomic_replace(machine_registration_path(cfg.shared_root, cfg.machine_name), record)
 
 
 def project_id(shared_root: Path) -> str:

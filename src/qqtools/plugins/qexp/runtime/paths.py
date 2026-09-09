@@ -106,6 +106,11 @@ def machine_path(root: Path, machine: str) -> Path:
     return shared_paths(root)["machines"] / machine / "machine.json"
 
 
+def machine_registration_path(root: Path, machine: str) -> Path:
+    """Return the project-owned logical-machine registration record path."""
+    return shared_paths(root)["machines"] / machine / "registration.json"
+
+
 def lock_path(root: Path, kind: str, identifier: str | None = None) -> Path:
     base = shared_paths(root)["locks"]
     if kind == "schema":
@@ -129,6 +134,7 @@ def machine_runtime_paths(root: Path) -> dict[str, Path]:
         "reservation_lock": root / "locks" / "gpu-reservations.lock",
         "cpu_lane_lock": root / "locks" / "cpu-lane.lock",
         "registry": root / "registry.json",
+        "identity": root / "identity.json",
         "cursor": root / "scheduler" / "cursor.json",
         "upgrade_cursor": root / "scheduler" / "upgrade-cursor.json",
         "agent": root / "agent",

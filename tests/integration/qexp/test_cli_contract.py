@@ -717,6 +717,108 @@ def test_agent_project_registry_commands(tmp_path: Path, capsys) -> None:
     assert json.loads(capsys.readouterr().out)["action"] == "project_removed"
 
 
+def test_agent_add_project_reports_disabled_state_and_enable_command(tmp_path: Path, capsys) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime_root = tmp_path / "machine-runtime"
+    runtime = MachineRuntime(runtime_root)
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    runtime.set_enabled(binding.project_id, False)
+    base = [
+        "--shared-root",
+        str(cfg.shared_root),
+        "--machine",
+        cfg.machine_name,
+        "--runtime-root",
+        str(cfg.runtime_root),
+        "--machine-runtime-root",
+        str(runtime_root),
+        "agent",
+    ]
+
+    assert main([*base, "add-project", "--format=json"]) == 0
+    repeated = json.loads(capsys.readouterr().out)
+    assert repeated["action"] == "project_already_registered"
+    assert repeated["shared_root"] == str(cfg.shared_root)
+    assert repeated["message"] == (
+        "Project is already registered and remains disabled. Registration checks passed; "
+        "new task admission is disabled."
+    )
+    assert repeated["enable_command"].startswith("qexp --machine-runtime-root ")
+    assert binding.project_id in repeated["enable_command"]
+
+    assert main([*base, "enable-project", binding.project_id, "--format=json"]) == 0
+    enabled = json.loads(capsys.readouterr().out)
+    assert enabled["action"] == "project_enabled"
+    assert enabled["enabled"] is True
+
+
+def test_agent_add_project_can_create_a_new_logical_name_without_init(tmp_path: Path, capsys) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime_root = tmp_path / "machine-runtime"
+    assert (
+        main(
+            [
+                "--shared-root",
+                str(cfg.shared_root),
+                "--machine",
+                "gpu-2",
+                "--runtime-root",
+                str(tmp_path / "gpu-2-runtime"),
+                "--machine-runtime-root",
+                str(runtime_root),
+                "agent",
+                "add-project",
+                "--format=json",
+            ]
+        )
+        == 0
+    )
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["action"] == "project_added"
+    assert result["machine_name"] == "gpu-2"
+    assert (cfg.shared_root / "machines" / "gpu-2" / "machine.json").exists()
+
+
+def test_agent_add_project_recovery_replaces_a_superseded_local_binding(tmp_path: Path, capsys) -> None:
+    from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime_root = tmp_path / "machine-runtime"
+    runtime = MachineRuntime(runtime_root)
+    original = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    registration = read_json(registration_path)["registration"]
+    registration["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(registration_path, {"registration": registration})
+    MachineRuntime(tmp_path / "replacement-runtime").add_binding(
+        cfg.shared_root,
+        cfg.machine_name,
+        adopt_existing=True,
+    )
+    assert runtime.registration_status(original)["state"] == "superseded"
+
+    result = main(
+        [
+            "--shared-root",
+            str(cfg.shared_root),
+            "--machine",
+            "gpu-1-replacement",
+            "--machine-runtime-root",
+            str(runtime_root),
+            "agent",
+            "add-project",
+            "--format=json",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert output["action"] == "project_added"
+    assert output["machine_name"] == "gpu-1-replacement"
+    assert runtime.load_registry()[1][0].machine_name == "gpu-1-replacement"
+
+
 def test_agent_project_add_can_register_while_scheduler_is_running(tmp_path: Path, capsys) -> None:
     from qqtools.plugins.qexp.machine_runtime import MachineRuntime
 

@@ -97,8 +97,10 @@ API.
    ownership. Another project or an incomplete migration must not release, overwrite, or treat a
    valid reservation as available capacity.
 5. **Migration transition**: verified legacy-agent stop, reservation and local-evidence import,
-   and binding enablement are ordered and recoverable. A failure leaves a diagnosable incomplete
-   state.
+   and binding enablement are ordered and recoverable. If migration replaces a registration owned
+   by another machine runtime, its shared write eligibility must first expire; local PID and
+   runtime-path observations cannot shorten that interval. A failure leaves a diagnosable
+   incomplete state.
 
 ## Lifecycle terminal boundary and notifications
 
@@ -203,20 +205,37 @@ launch, observation, termination, and recovery records. It does not own or dupli
 Group, Attempt, claim, lease, log, or terminal truth.
 
 A registry binding contains `project_id`, canonical `shared_root`, project-local `machine_name`,
-and `enabled`. `project_id` is the stable value in the project's `project/identity.json`; paths
-are only location and diagnostic data. Registry changes are serialized and revisioned. Duplicate
-stable IDs and duplicate canonical roots are rejected. Runtime state is derived as `enabled`,
-`draining` (disabled with local blockers), or `disabled` (disabled with no blockers). A binding
-may be removed only when disabled and all associated reservations, process/launch/observation
-records, termination decisions, and pending local convergence evidence are absent.
+`enabled`, a registration generation, and the local machine-runtime instance identity.
+The effective runtime identity combines the runtime-local random identity with the current Linux
+host identity. Copying only a machine-runtime directory to another host therefore cannot renew its
+registration generation; uncertain continuity must use explicit adoption after eligibility expires.
+Ordinary agent restarts on the same host retain the effective identity.
+`project_id` is the stable value in the project's `project/identity.json`; paths are only location
+and diagnostic data. Registry changes are serialized and revisioned. Duplicate stable IDs and
+duplicate canonical roots are rejected. The project also owns a logical-machine registration
+record under `machines/<name>/registration.json`, with a bounded write-eligibility expiry. A
+repeated registration by the same runtime renews its generation and retains the operator's
+enabled/disabled state. A different runtime cannot reclaim an owned name without
+`--adopt-existing` after the previous eligibility is invalid. Superseded generations cannot
+dispatch or publish machine-authoritative state. A claim or machine-state publication holds the
+registration fence from current-generation validation through its authoritative commit, so a
+replacement generation cannot activate between validation and commit. Runtime state is derived as
+`enabled`, `draining`
+(disabled with local blockers), or `disabled` (disabled with no blockers). A binding may be removed
+only when disabled and all associated reservations, process/launch/observation records,
+termination decisions, and pending local convergence evidence are absent.
 After shared terminal truth commits, the agent consumes the corresponding process,
 registration, observation, launch-intent, and completed termination records. Successful removal
 deletes the binding's disposable project runtime partition before removing the registry entry.
 `qexp init` registers new-generation projects with the global agent before reporting success.
 `qexp agent add-project` may restore an absent current-generation binding while the global agent is
-running. A project whose machine metadata predates the global runtime must use
-`qexp agent migrate-project`; the migration creates a disabled binding, stops only a verified old
-agent, imports local reservations and evidence, then enables the binding after the durable handoff.
+running, including atomically replacing a superseded local binding with an available logical name
+and creating its machine record for a known shared project. Reusing
+an owned logical name requires `--adopt-existing`; `qexp agent enable-project` revalidates current
+registration authority before enabling new admission. A project whose machine metadata predates
+the global runtime must use `qexp agent migrate-project`; the migration creates a disabled binding,
+stops only a verified old agent, imports local reservations and evidence, then enables the binding
+after the durable handoff.
 
 ## 4. Runtime Invariants
 
