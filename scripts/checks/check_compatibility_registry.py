@@ -44,6 +44,16 @@ ITEM_FIELDS = {
     "pitch_refs",
     "verification",
     "extensions",
+    "normal_level",
+    "recovery_level",
+    "source_versions",
+    "target_version",
+    "mixed_version_range",
+    "normal_commands",
+    "machine_status_command",
+    "recovery_command",
+    "workload_continuity",
+    "interruption_budget_seconds",
 }
 EXTENSION_FIELDS = {"field", "from", "to", "approved_in", "reason", "decision_ref"}
 
@@ -82,6 +92,16 @@ class CompatibilityItem:
     decision_refs: tuple[Path, ...]
     pitch_refs: tuple[Path, ...]
     verification: tuple[Path, ...]
+    normal_level: str | None = None
+    recovery_level: str | None = None
+    source_versions: tuple[str, ...] = ()
+    target_version: Version | None = None
+    mixed_version_range: tuple[str, ...] = ()
+    normal_commands: tuple[str, ...] = ()
+    machine_status_command: str | None = None
+    recovery_command: str | None = None
+    workload_continuity: bool | None = None
+    interruption_budget_seconds: float | None = None
 
     def expected_status(self, target: Version) -> str | None:
         if target < self.introduced_in:
@@ -284,6 +304,7 @@ def _parse_item(
         is_required=status == "planned",
     )
     verification = _require_paths(raw_item.get("verification"), f"{item_id}.verification")
+    _validate_operational_contract(raw_item, item_id)
     if validate_references:
         _validate_reference_paths(
             repo_root,
@@ -316,7 +337,62 @@ def _parse_item(
         decision_refs=decision_refs,
         pitch_refs=pitch_refs,
         verification=verification,
+        normal_level=raw_item.get("normal_level"),
+        recovery_level=raw_item.get("recovery_level"),
+        source_versions=tuple(raw_item.get("source_versions", ())),
+        target_version=(
+            Version.parse(raw_item["target_version"], f"{item_id}.target_version")
+            if "target_version" in raw_item
+            else None
+        ),
+        mixed_version_range=tuple(raw_item.get("mixed_version_range", ())),
+        normal_commands=tuple(raw_item.get("normal_commands", ())),
+        machine_status_command=raw_item.get("machine_status_command"),
+        recovery_command=raw_item.get("recovery_command"),
+        workload_continuity=raw_item.get("workload_continuity"),
+        interruption_budget_seconds=raw_item.get("interruption_budget_seconds"),
     )
+
+
+def _validate_operational_contract(raw_item: dict[str, Any], item_id: str) -> None:
+    """Validate the rollout contract when a compatibility item declares one."""
+    fields = {
+        "normal_level",
+        "recovery_level",
+        "source_versions",
+        "target_version",
+        "mixed_version_range",
+        "normal_commands",
+        "machine_status_command",
+        "recovery_command",
+        "workload_continuity",
+        "interruption_budget_seconds",
+    }
+    if not fields.intersection(raw_item):
+        return
+    normal_level = raw_item.get("normal_level")
+    recovery_level = raw_item.get("recovery_level")
+    if normal_level not in {"L0", "L1", "L2"}:
+        raise RegistryError(f"{item_id}.normal_level must be L0, L1, or L2.")
+    if recovery_level not in {"L0", "L1", "L2"}:
+        raise RegistryError(f"{item_id}.recovery_level must be L0, L1, or L2.")
+    if normal_level == "L2" and recovery_level not in {"L2"}:
+        raise RegistryError(f"{item_id}.recovery_level cannot be less disruptive than normal_level.")
+    if normal_level == "L1" and recovery_level == "L0":
+        raise RegistryError(f"{item_id}.recovery_level cannot be less disruptive than normal_level.")
+    for field in ("source_versions", "mixed_version_range", "normal_commands"):
+        value = raw_item.get(field)
+        if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
+            raise RegistryError(f"{item_id}.{field} must be a non-empty string array.")
+    Version.parse(raw_item.get("target_version"), f"{item_id}.target_version")
+    for field in ("machine_status_command", "recovery_command"):
+        if not isinstance(raw_item.get(field), str) or not raw_item[field].strip():
+            raise RegistryError(f"{item_id}.{field} must be a non-empty string.")
+    if raw_item.get("workload_continuity") is not True:
+        raise RegistryError(f"{item_id}.workload_continuity must be true for qexp compatibility.")
+    budget = raw_item.get("interruption_budget_seconds")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+        raise RegistryError(f"{item_id}.interruption_budget_seconds must be positive.")
 
 
 def _candidate_marker_paths(repo_root: Path) -> tuple[Path, ...]:

@@ -154,6 +154,16 @@ class MachineRuntime:
         self.primary_probe_recheck_round_cursors: dict[str, tuple[str, str, str]] = {}
         # Set by the most recent bounded dispatch cycle for on-demand idle exit.
         self.last_cycle_had_demand = True
+        # Upgrade discovery is metadata-only when no project has pending work.  These fields are
+        # intentionally process-local; the project journal remains the source of truth.
+        self.upgrade_registry_revision: int | None = None
+        self.upgrade_discovery_complete = False
+        self.upgrade_pending_projects: set[str] = set()
+        self.upgrade_runnable_projects: set[str] = set()
+        self.upgrade_probe_deadlines: dict[str, float] = {}
+        self.upgrade_probe_budget = 4
+        self.upgrade_next_pass_at = 0.0
+        self.upgrade_admission_blocked_projects: set[str] = set()
 
     def ensure_layout(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -169,6 +179,7 @@ class MachineRuntime:
             "cpu_active",
             "cpu_released",
             "projects",
+            "upgrades",
             "diagnostics",
         ):
             self.paths[name].mkdir(parents=True, exist_ok=True)

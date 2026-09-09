@@ -58,6 +58,8 @@ from .notification_config import (
 from .runtime.paths import shared_paths
 from .runtime.resources.cpu_lane import get_cpu_lane_policy, initialize_cpu_lane_capacity, set_cpu_lane_capacity
 from .runtime.store import iter_json, read_json
+from .runtime.upgrade.framework import UpgradeCoordinator
+from .runtime.upgrade.machine import advance_registered_upgrades, inspect_registered_upgrades
 from .schema6_upgrade import (
     attest_schema6_upgrade,
     check_schema6_upgrade,
@@ -208,6 +210,12 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--to-schema", type=int, required=True)
     upgrade = commands.add_parser("upgrade")
     upgrade_sub = upgrade.add_subparsers(dest="upgrade_feature", required=True)
+    coordinator_upgrade = upgrade_sub.add_parser(
+        "coordinator",
+        help="Run the exceptional machine-level coordinator over registered projects.",
+    )
+    _add_output_format(coordinator_upgrade)
+    coordinator_upgrade.add_argument("--project", dest="upgrade_project")
     schema6_upgrade = upgrade_sub.add_parser("schema6")
     schema6_upgrade_sub = schema6_upgrade.add_subparsers(dest="schema6_upgrade_action", required=True)
     for name in ("check", "start", "status"):
@@ -411,6 +419,34 @@ def build_parser() -> argparse.ArgumentParser:
     cpu_lane_set.add_argument("--capacity", type=int, required=True)
     for name in ("disable-project", "remove-project"):
         agent_sub.choices[name].add_argument("project")
+    agent_upgrade = agent_sub.add_parser(
+        "upgrade",
+        help="Inspect and advance registered-project rolling upgrades.",
+    )
+    agent_upgrade_sub = agent_upgrade.add_subparsers(dest="agent_upgrade_action", required=True)
+    for name in ("status", "retry", "coordinate"):
+        action = agent_upgrade_sub.add_parser(name)
+        _add_output_format(action)
+        action.add_argument("--project", dest="upgrade_project")
+    pause = agent_upgrade_sub.add_parser("pause")
+    _add_output_format(pause)
+    pause.add_argument("--project", dest="upgrade_project", required=True)
+    pause.add_argument("--reason", required=True)
+    inspect = agent_upgrade_sub.add_parser("inspect")
+    _add_output_format(inspect)
+    inspect.add_argument("--project", dest="upgrade_project", required=True)
+    plan = agent_upgrade_sub.add_parser("plan")
+    _add_output_format(plan)
+    plan.add_argument("--project", dest="upgrade_project", required=True)
+    plan.add_argument("--target", required=True)
+    for name in ("apply", "validate"):
+        action = agent_upgrade_sub.add_parser(name)
+        _add_output_format(action)
+        action.add_argument("--project", dest="upgrade_project", required=True)
+        action.add_argument("--repair-id", required=True)
+    resume = agent_upgrade_sub.add_parser("resume")
+    _add_output_format(resume)
+    resume.add_argument("--project", dest="upgrade_project", required=True)
     top = commands.add_parser("top")
     _add_output_format(top)
     machine_list = commands.add_parser("machines")
@@ -505,6 +541,21 @@ def _try_save_context(shared_root: str) -> None:
         )
 
 
+def _upgrade_project_config(runtime: MachineRuntime, identifier: str):
+    """Resolve an explicit registered project for a repair or project-scoped retry."""
+    candidate = str(identifier)
+    canonical = Path(candidate).expanduser().resolve() if candidate.endswith(".qexp") or "/" in candidate else None
+    _revision, bindings = runtime.load_registry()
+    matches = [
+        binding
+        for binding in bindings
+        if binding.project_id == candidate or (canonical is not None and binding.shared_root == canonical)
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"machine registry must identify exactly one project for {identifier!r}.")
+    return matches[0].root_config()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -544,6 +595,15 @@ def main(argv: list[str] | None = None) -> int:
             print(root)
             return 0
         if args.command == "upgrade":
+            if args.upgrade_feature == "coordinator":
+                runtime = MachineRuntime(args.machine_runtime_root)
+                project = getattr(args, "upgrade_project", None)
+                if project is None:
+                    result = advance_registered_upgrades(runtime, force_discovery=True)
+                else:
+                    result = UpgradeCoordinator(_upgrade_project_config(runtime, project)).advance(force_retry=True)
+                _emit("upgrade", result, args.format)
+                return 0
             if not args.shared_root:
                 raise ValueError("schema-6 upgrade requires an explicit --shared-root.")
             machine = args.machine or "upgrade-coordinator"
@@ -697,6 +757,40 @@ def main(argv: list[str] | None = None) -> int:
                     },
                     args.format,
                 )
+            return 0
+        if args.command == "agent" and args.agent_action == "upgrade":
+            runtime = MachineRuntime(args.machine_runtime_root)
+            action = args.agent_upgrade_action
+            project = getattr(args, "upgrade_project", None)
+            if action == "status":
+                if project is None:
+                    result = inspect_registered_upgrades(runtime)
+                else:
+                    result = UpgradeCoordinator(_upgrade_project_config(runtime, project)).status()
+                _emit("upgrade", result, args.format)
+                return 0
+            if action in {"retry", "coordinate"}:
+                if project is None:
+                    result = advance_registered_upgrades(runtime, force_discovery=True)
+                else:
+                    result = UpgradeCoordinator(_upgrade_project_config(runtime, project)).advance(force_retry=True)
+                _emit("upgrade", result, args.format)
+                return 0
+            cfg = _upgrade_project_config(runtime, project)
+            coordinator = UpgradeCoordinator(cfg)
+            if action == "pause":
+                result = coordinator.request_pause(args.reason)
+            elif action == "inspect":
+                result = coordinator.status()
+            elif action == "plan":
+                result = coordinator.inspect_repair(args.target)
+            elif action == "apply":
+                result = coordinator.apply_repair(args.repair_id)
+            elif action == "validate":
+                result = coordinator.validate_repair(args.repair_id)
+            else:
+                result = coordinator.resume()
+            _emit("upgrade", result, args.format)
             return 0
         if args.command == "agent" and args.agent_action == "cpu-lane":
             runtime = MachineRuntime(args.machine_runtime_root)

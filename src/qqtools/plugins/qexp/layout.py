@@ -169,6 +169,8 @@ def ensure_shared_layout(cfg: RootConfig) -> None:
             "notifications",
             "operations_migration",
             "offer_deadlines_migration",
+            "upgrade_journal",
+            "upgrade_pause_intent",
         }:
             continue
         path.mkdir(parents=True, exist_ok=True)
@@ -217,6 +219,9 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                 }
             }
             atomic_replace(_schema_path(cfg), schema)
+            from .runtime.upgrade.production import initialize_upgrade_journal_manifest
+
+            initialize_upgrade_journal_manifest(cfg)
             from .runtime.ready.group_members import initialize_group_ready_members
 
             initialize_group_ready_members(cfg)

@@ -274,6 +274,34 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
                 ("Reason", result.get("reason")),
             ),
         )
+    if kind == "upgrade":
+        projects = result.get("projects", ()) if isinstance(result, Mapping) else ()
+        if projects:
+            return _table(
+                ("Project", "Phase", "State", "Pending", "Admission blocked", "Blockers"),
+                [
+                    (
+                        item.get("project_id"),
+                        item.get("upgrade", {}).get("phase"),
+                        item.get("upgrade", {}).get("state"),
+                        item.get("upgrade", {}).get("pending"),
+                        item.get("upgrade", {}).get("admission_blocked"),
+                        item.get("upgrade", {}).get("blockers"),
+                    )
+                    for item in projects
+                ],
+            )
+        return _operation(
+            "upgrade",
+            result.get("state", result.get("aggregate_state", "completed")),
+            (
+                ("Project", result.get("project_id")),
+                ("Phase", result.get("phase")),
+                ("Pending", result.get("pending")),
+                ("Admission blocked", result.get("admission_blocked")),
+                ("Blockers", result.get("blockers")),
+            ),
+        )
     if kind == "batch-submit":
         return _operation(
             "batch-submit",
