@@ -51,6 +51,7 @@ from .runtime.resources.reservations import (
     reservation_snapshot,
 )
 from .runtime.store import atomic_replace, iter_json, read_json
+from .runtime.upgrade.machine import MachineUpgradeWorker, discover_registered_upgrades, inspect_registered_upgrades
 from .runtime.work_budget import (
     DIAGNOSTIC_PUBLISH_INTERVAL_SECONDS,
     AdaptiveBatchSizer,
@@ -87,6 +88,7 @@ def _probe_primary_demand(
     reservations: tuple[dict[str, Any], ...] = (),
     *,
     lane: str = "gpu",
+    excluded_project_ids: set[str] | frozenset[str] = frozenset(),
 ) -> PrimaryDemandProbe:
     """Scan primary candidates through an independent bounded ready cursor."""
     diagnostics: list[dict[str, str]] = []
@@ -94,7 +96,7 @@ def _probe_primary_demand(
         _, bindings = runtime.load_registry()
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         return PrimaryDemandProbe("unresolved", ({"reason": f"registry_unreadable:{exc}"},))
-    enabled_ids = {binding.project_id for binding in bindings if binding.enabled}
+    enabled_ids = {binding.project_id for binding in bindings if binding.enabled} - set(excluded_project_ids)
     unavailable = sorted(
         project_id for project_id in enabled_ids if project_id not in readable or project_id not in dispatchable
     )
@@ -474,6 +476,8 @@ def _has_local_lifecycle_evidence(runtime: MachineRuntime, project_id: str) -> b
 
 def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool) -> bool:
     """Check the bounded local conditions required by on-demand idle exit."""
+    if getattr(runtime, "upgrade_pending_projects", set()):
+        return False
     try:
         _revision, bindings = runtime.load_registry()
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
@@ -926,6 +930,7 @@ def _dispatch_admission_layer(
     admission_role: str,
     borrow_admission_grant: _BorrowAdmissionGrant | None = None,
     lane: str,
+    admission_blocked_project_ids: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[int], int, ProjectBinding | None]:
     """Run one fair admission layer and return remaining GPUs and last winner."""
     inspected_ready: set[tuple[str, str, str, str]] = set()
@@ -941,6 +946,8 @@ def _dispatch_admission_layer(
         records_before_round = budget.records_used
         round_last_success: ProjectBinding | None = None
         for binding in round_bindings:
+            if binding.project_id in admission_blocked_project_ids:
+                continue
             cfg = dispatchable.get(binding.project_id)
             if cfg is None or (not free and not free_cpu_slots) or not budget.can_start_record():
                 continue
@@ -1029,6 +1036,7 @@ def _dispatch_machine_cycle_locked(
     readable: dict[str, RootConfig] = {}
     dispatchable: dict[str, RootConfig] = {}
     results: list[dict[str, Any]] = []
+    upgrade_blocked: dict[str, dict[str, Any]] = {}
     for binding in supervised:
         try:
             cfg = _binding_config(runtime, binding)
@@ -1064,6 +1072,8 @@ def _dispatch_machine_cycle_locked(
                         supervisors[binding.project_id] = supervisor
                 supervisor.tick()
             dispatchable[binding.project_id] = cfg
+            if binding.project_id in runtime.upgrade_admission_blocked_projects:
+                upgrade_blocked[binding.project_id] = {"admission_blocked": True, "state": "cached"}
         except (OSError, RuntimeError, ValueError) as exc:
             results.append(
                 {
@@ -1104,6 +1114,17 @@ def _dispatch_machine_cycle_locked(
     diagnostic_increment("scheduler.capacity.reserved_gpus", len(snapshot.reserved_gpu_ids))
     diagnostic_increment("scheduler.capacity.free_gpus", len(free))
     result_by_project = {item["project_id"]: item for item in results if item.get("project_id") is not None}
+    for project_id, upgrade_status in upgrade_blocked.items():
+        item = result_by_project.get(project_id)
+        if item is None:
+            item = {"project_id": project_id, "launched": [], "status": "upgrade_blocked"}
+            results.append(item)
+            result_by_project[project_id] = item
+        item["status"] = "upgrade_blocked"
+        item["upgrade"] = upgrade_status
+    admission_dispatchable = {
+        project_id: cfg for project_id, cfg in dispatchable.items() if project_id not in upgrade_blocked
+    }
     for binding in ordered_enabled:
         if binding.project_id in dispatchable and binding.project_id not in result_by_project:
             item = {
@@ -1150,19 +1171,22 @@ def _dispatch_machine_cycle_locked(
             _probe_primary_demand(
                 runtime,
                 readable,
-                dispatchable,
+                admission_dispatchable,
                 visible if lane == "gpu" else list(range(cpu_policy.capacity)),
                 free if lane == "gpu" else list(range(free_cpu_slots)),
                 SliceBudget(WorkBudgetPolicy()),
                 snapshot.reservations,
                 lane=lane,
+                excluded_project_ids=set(upgrade_blocked),
             )
             if has_capacity
             else PrimaryDemandProbe("unresolved")
         )
         borrow_admission_grant = None
         if probe.state == "no_primary_demand":
-            borrow_admission_grant = _build_borrow_admission_grant(runtime, dispatchable, probe, enabled_ids, lane=lane)
+            borrow_admission_grant = _build_borrow_admission_grant(
+                runtime, admission_dispatchable, probe, enabled_ids - set(upgrade_blocked), lane=lane
+            )
             if borrow_admission_grant is None:
                 probe = PrimaryDemandProbe("unresolved", probe.diagnostics)
         dispatch_plan = build_machine_dispatch_plan(
@@ -1183,7 +1207,7 @@ def _dispatch_machine_cycle_locked(
             lane_gpus, lane_cpus, layer_winner = _dispatch_admission_layer(
                 runtime,
                 ordered_enabled,
-                dispatchable,
+                admission_dispatchable,
                 executor,
                 lane_gpus,
                 lane_cpus,
@@ -1194,6 +1218,7 @@ def _dispatch_machine_cycle_locked(
                 admission_role=admission_role,
                 borrow_admission_grant=(borrow_admission_grant if admission_role == "borrow" else None),
                 lane=lane,
+                admission_blocked_project_ids=set(upgrade_blocked),
             )
             if lane == "gpu":
                 free = lane_gpus
@@ -1244,13 +1269,29 @@ def get_machine_agent_status(
     pid = identity[0] if identity is not None else _read_pid(machine_runtime)
     running = bool(identity or (pid and not probe_local_pid))
     revision, bindings = machine_runtime.load_registry()
+    upgrade = inspect_registered_upgrades(machine_runtime)
     return {
         "machine_runtime_root": str(machine_runtime.root),
         "agent_state": "active" if running else "stopped",
         "pid": pid,
         "is_running": running,
         "registry_revision": revision,
-        "projects": [{**binding.to_dict(), "state": machine_runtime.binding_state(binding)} for binding in bindings],
+        "projects": [
+            {
+                **binding.to_dict(),
+                "state": machine_runtime.binding_state(binding),
+                "upgrade": next(
+                    (
+                        project.get("upgrade", {})
+                        for project in upgrade["projects"]
+                        if project.get("project_id") == binding.project_id
+                    ),
+                    {},
+                ),
+            }
+            for binding in bindings
+        ],
+        "upgrade": upgrade,
     }
 
 
@@ -1505,6 +1546,7 @@ def run_machine_agent_loop(
     stop_reason: str | None = None
     has_consumed_binding = False
     idle_since: float | None = None
+    upgrade_worker: MachineUpgradeWorker | None = None
 
     def request_stop(_signum: int, _frame: object) -> None:
         nonlocal stop, stop_reason
@@ -1553,6 +1595,17 @@ def run_machine_agent_loop(
                 if stop:
                     break
                 try:
+                    discovery = discover_registered_upgrades(machine_runtime)
+                    if upgrade_worker is None or not upgrade_worker.is_alive:
+                        if (
+                            discovery.get("runnable_project_ids")
+                            and time.monotonic() >= machine_runtime.upgrade_next_pass_at
+                        ):
+                            upgrade_worker = MachineUpgradeWorker(machine_runtime)
+                            upgrade_worker.start()
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    pass
+                try:
                     with machine_runtime.migration_guard() as is_migration_clear:
                         if is_migration_clear:
                             cycle_results = dispatch_machine_cycle_locked(
@@ -1581,6 +1634,8 @@ def run_machine_agent_loop(
                     idle_since = None
                 scheduler_wakeup.wait(loop_interval)
         finally:
+            if upgrade_worker is not None:
+                upgrade_worker.stop()
             if control_plane is not None:
                 control_plane.stop()
             try:

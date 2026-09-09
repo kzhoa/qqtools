@@ -22,6 +22,10 @@ def shared_paths(root: Path) -> dict[str, Path]:
         "cleanup": root / "operations" / "cleanup",
         "cleanup_active": root / "operations" / "cleanup" / "active",
         "operations_migration": root / "operations" / "active-layout-v1.json",
+        "upgrade": root / "operations" / "upgrades",
+        "upgrade_journal": root / "operations" / "upgrades" / "journal.json",
+        "upgrade_pause_intent": root / "operations" / "upgrades" / "pause-intent.json",
+        "upgrade_repairs": root / "operations" / "upgrades" / "repairs",
         "idempotency": root / "idempotency" / "submissions",
         "claim_archive": root / "claims" / "archive",
         "claim_pending": root / "claims" / "pending",
@@ -126,6 +130,7 @@ def machine_runtime_paths(root: Path) -> dict[str, Path]:
         "cpu_lane_lock": root / "locks" / "cpu-lane.lock",
         "registry": root / "registry.json",
         "cursor": root / "scheduler" / "cursor.json",
+        "upgrade_cursor": root / "scheduler" / "upgrade-cursor.json",
         "agent": root / "agent",
         "pid": root / "agent" / "machine-agent.pid",
         "provisional": root / "reservations" / "provisional",
@@ -136,6 +141,7 @@ def machine_runtime_paths(root: Path) -> dict[str, Path]:
         "cpu_active": root / "cpu-reservations" / "active",
         "cpu_released": root / "cpu-reservations" / "released",
         "projects": root / "projects",
+        "upgrades": root / "upgrades",
         "diagnostics": root / "diagnostics",
     }
 

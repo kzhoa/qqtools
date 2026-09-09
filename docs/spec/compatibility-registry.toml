@@ -1,5 +1,29 @@
 schema_version = 1
-next_id = 11
+next_id = 12
+
+[[items]]
+id = "QQTOOLS-COMPAT-0011"
+component = "qexp.machine-rolling-upgrade-coordinator"
+kind = "runtime_protocol"
+status = "compatibility_active"
+introduced_in = "1.4.0"
+legacy_removed_in = "1.5.0"
+transition_purged_in = "1.6.0"
+marker = "QQTOOLS-COMPAT-0011"
+owner = "qexp.runtime.upgrade"
+decision_refs = ["docs/adr/qexp/0010-machine-rolling-upgrade-coordinator.md"]
+pitch_refs = ["docs/pitch/qexp-machine-rolling-upgrade-coordinator.md"]
+verification = ["tests/integration/qexp/test_upgrade_coordinator.py"]
+normal_level = "L1"
+recovery_level = "L2"
+source_versions = ["1.3.16"]
+target_version = "1.4.0"
+mixed_version_range = ["1.3.16-1.4.x"]
+normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
+machine_status_command = "qexp agent upgrade status"
+recovery_command = "qexp agent upgrade coordinate"
+workload_continuity = true
+interruption_budget_seconds = 1.0
 
 [[items]]
 id = "QQTOOLS-COMPAT-0010"

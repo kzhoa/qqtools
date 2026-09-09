@@ -10,6 +10,64 @@ archived_at:
 This guide is for an existing qexp project rooted at `PROJECT_ROOT` (for example,
 `/mnt/share/myproject/.qexp`). Run commands with its explicit shared-root path.
 
+## Machine-rolling coordinator for supported future protocols
+
+For a release covered by the machine-rolling coordinator contract, the normal operation on each
+already registered machine is:
+
+```bash
+python -m pip install --upgrade qqtools
+qexp agent restart
+```
+
+Restart success means that the global agent restarted and resumed supervision; it does not claim
+that project activation or legacy cleanup has completed. Inspect the bounded machine registry
+view with:
+
+```bash
+qexp agent upgrade status --format json
+```
+
+An exceptional recovery pass can advance every project visible in that machine registry while
+training processes continue:
+
+```bash
+qexp agent upgrade coordinate --format json
+```
+
+The output records the discovery boundary and lists inaccessible or omitted roots. It must not be
+interpreted as fleet-wide completeness. A project filter is available for diagnosis, but project
+filters are not part of the normal rolling workflow.
+
+When a project reports `paused`, `repair_required`, or `pause_pending`, do not edit shared JSON
+files directly. Use the explicit project-scoped flow:
+
+```bash
+qexp agent upgrade pause --project PROJECT_ID --reason "describe the incident"
+qexp agent upgrade inspect --project PROJECT_ID --format json
+qexp agent upgrade plan --project PROJECT_ID --target MIGRATION_OR_PHASE --format json
+qexp agent upgrade apply --project PROJECT_ID --repair-id REPAIR_ID --format json
+qexp agent upgrade validate --project PROJECT_ID --repair-id REPAIR_ID --format json
+qexp agent upgrade resume --project PROJECT_ID --format json
+```
+
+Repair plans must preserve revisions, evidence and a durable snapshot proof. Unsupported
+authoritative corrections, stale plans, failed snapshots and validation failures remain blocked;
+the coordinator does not release reservations or fabricate Task/Attempt completion.
+
+The built-in `upgrade-journal-v1` migration publishes only coordinator-owned metadata under
+`operations/upgrades/`. Its target is `metadata:upgrade-journal-v1`; it does not add fields to
+`schema/version.json` or activate a new shared writer protocol. This keeps schema-6 roots readable
+by strict 1.3.16 readers during a rolling deployment. Audit and activation verify the manifest
+version, capability, source and target metadata protocol, and schema digest. A future migration
+that changes a shared reader or writer contract must supply durable participant eligibility and
+enforceable writer exclusion before activation; this metadata migration is not that proof.
+Migration implementations must use the supplied upgrade storage facade for callback-owned JSON I/O;
+it rejects reads and writes that exceed the declared slice byte budget before the operation proceeds.
+
+The existing `upgrade schema6` flow below is a historical drained transition and is not converted
+to an online coordinator migration by this guide.
+
 ## Do not treat every qqtools upgrade as an agent restart
 
 `qexp agent restart` is sufficient only when the target release does not introduce a new qexp

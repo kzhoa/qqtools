@@ -5,17 +5,49 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Iterator, TypeVar
 
 T = TypeVar("T")
+_migration_json_io_guard: ContextVar[bool] = ContextVar("migration_json_io_guard", default=False)
+_migration_json_io_authorized: ContextVar[bool] = ContextVar(
+    "migration_json_io_authorized", default=False
+)
 
 
 class CASConflict(RuntimeError):
     """Raised when a revisioned update lost a race."""
 
 
+@contextmanager
+def migration_json_io_guard() -> Iterator[None]:
+    """Reject direct JSON-store access while a migration callback is executing."""
+    token = _migration_json_io_guard.set(True)
+    try:
+        yield
+    finally:
+        _migration_json_io_guard.reset(token)
+
+
+@contextmanager
+def authorized_migration_json_io() -> Iterator[None]:
+    """Permit one migration-owned JSON-store operation through UpgradeStorage."""
+    token = _migration_json_io_authorized.set(True)
+    try:
+        yield
+    finally:
+        _migration_json_io_authorized.reset(token)
+
+
+def _require_migration_json_io_authorization() -> None:
+    if _migration_json_io_guard.get() and not _migration_json_io_authorized.get():
+        raise RuntimeError("migration callbacks must use UpgradeContext.storage for JSON I/O")
+
+
 def atomic_replace(path: Path, value: dict[str, Any]) -> None:
+    _require_migration_json_io_authorization()
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -36,6 +68,7 @@ def atomic_replace(path: Path, value: dict[str, Any]) -> None:
 
 
 def read_json(path: Path) -> dict[str, Any]:
+    _require_migration_json_io_authorization()
     with path.open(encoding="utf-8") as handle:
         value = json.load(handle)
     if not isinstance(value, dict):
@@ -45,6 +78,7 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def read_json_limited(path: Path, *, max_bytes: int) -> dict[str, Any]:
     """Read one JSON object after enforcing a durable record-size limit."""
+    _require_migration_json_io_authorization()
     if type(max_bytes) is not int or max_bytes <= 0:
         raise ValueError("max_bytes must be a positive integer.")
     with path.open("rb") as handle:
@@ -69,6 +103,7 @@ def require_json_size(value: dict[str, Any], *, max_bytes: int, record_type: str
 
 
 def create_if_absent(path: Path, value: dict[str, Any]) -> None:
+    _require_migration_json_io_authorization()
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     try:
@@ -92,6 +127,7 @@ def typed_save(path: Path, value: T, dumper: Callable[[T], dict[str, Any]]) -> N
 
 
 def cas_update(path: Path, expected_revision: int, value: dict[str, Any]) -> None:
+    _require_migration_json_io_authorization()
     current = read_json(path)
     actual = current.get("meta", {}).get("revision")
     if actual != expected_revision:

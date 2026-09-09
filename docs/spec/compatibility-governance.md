@@ -187,9 +187,10 @@ chained migration may satisfy a supported path. Required adapters must be perman
 have their registered deadlines explicitly extended before removal; deadlines must not silently
 override continuity requirements.
 
-These operational requirements are decision/review obligations today. Structured registry fields
-and automated operational-evidence enforcement remain planned in the coordinator pitch; the
-existing registry validator does not prove these runtime guarantees.
+These operational requirements remain decision/review obligations. The registry validator now
+accepts and validates structured rollout, continuity and interruption-budget fields for items that
+declare them, but it does not prove the runtime guarantees; those still require the coordinator,
+protocol-specific tests and released-source evidence.
 
 ### Migration development and runtime cost
 
