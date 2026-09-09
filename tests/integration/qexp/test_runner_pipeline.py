@@ -31,6 +31,55 @@ def _launch_id(cfg, attempt):
     ]["launch_id"]
 
 
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ({"attempt_id": "attempt", "observed_exit_code": False}, "exit_observation_code_invalid"),
+        (
+            {"attempt_id": "attempt", "observed_exit_code": 0, "protocol_version": 2},
+            "exit_observation_protocol_unsupported",
+        ),
+        (None, "exit_observation_unreadable"),
+        ([], "exit_observation_unreadable"),
+    ],
+)
+def test_exit_observation_rejects_invalid_records(tmp_path: Path, value, reason):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    paths = local_paths(cfg.runtime_root)
+    path = paths["observations"] / "attempt.json"
+    atomic_replace(path, {"exit_observation": value})
+    supervisor = AuthoritySupervisor(cfg)
+    assert supervisor._read_exit_observation(path, "task", "attempt", {"attempt_id": "attempt"}) == (False, None)
+    assert read_json(path) == {"exit_observation": value}
+    diagnostic = read_json(paths["authority_diagnostics"] / "attempt.json")["authority_diagnostic"]
+    assert diagnostic["reason"] == reason
+
+
+def test_authority_state_publication_keeps_recovered_fencing_token(tmp_path: Path, monkeypatch):
+    from qqtools.plugins.qexp.lease import (
+        AuthorityResolution,
+        AuthorityResolutionOutcome,
+        LeaseRenewalOutcome,
+        LeaseRenewalResult,
+    )
+
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    supervisor = AuthoritySupervisor(cfg)
+    process = {"task_id": "task", "attempt_id": "attempt", "fencing_token": 1}
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.authority.renew_attempt_lease",
+        lambda *args: LeaseRenewalResult(LeaseRenewalOutcome.ORPHANED_RECOVERY_REQUIRED, "attempt", 1),
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.authority.resolve_execution_authority",
+        lambda *args, **kwargs: AuthorityResolution(AuthorityResolutionOutcome.RECOVERED, "decision", "attempt", 1, 2),
+    )
+    supervisor._renew_or_isolate("task", "attempt", 1, process)
+    stored = read_json(local_paths(cfg.runtime_root)["processes"] / "attempt.json")["process"]
+    assert stored["fencing_token"] == 2
+    assert stored["authority_state"] == "healthy"
+
+
 class FakeChild:
     pid = 4321
     returncode = 0
@@ -40,6 +89,34 @@ class FakeChild:
 
     def wait(self):
         return 0
+
+
+def test_confirmed_termination_without_exit_observation_finalizes(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    paths = local_paths(cfg.runtime_root)
+    process = {
+        "task_id": task.task_id,
+        "attempt_id": attempt.attempt_id,
+        "fencing_token": attempt.current_fencing_token,
+    }
+    atomic_replace(paths["processes"] / f"{attempt.attempt_id}.json", {"process": process})
+    atomic_replace(
+        paths["termination_decisions"] / attempt.attempt_id / "decision.json",
+        {"termination_decision": {"state": "sigkill_sent", "decision_id": "decision"}},
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.authority.send_signals",
+        lambda *args: {"state": "confirmed", "signal_attempts": ["SIGKILL"]},
+    )
+    AuthoritySupervisor(cfg)._supervise(process)
+    current = read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]
+    assert current["phase"] == "cancelled"
+    assert current["result"]["exit_code"] is None
+    assert not active_reservations(cfg.runtime_root)
 
 
 def test_runner_publishes_registration_and_exit_observation_only(tmp_path: Path, monkeypatch):

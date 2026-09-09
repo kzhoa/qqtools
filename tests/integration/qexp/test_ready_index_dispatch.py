@@ -1241,9 +1241,11 @@ def test_claim_race_does_not_degrade_ready_index_or_block_other_tasks(
 
     monkeypatch.setattr(scheduler, "classify_ready_marker", claim_before_classify)
 
+    executor = _RecordingExecutor()
     launched = run_dispatch_cycle(
         cfg,
         available_gpus=[0],
+        executor=executor,
         should_recover_starting=False,
         max_new_claims=1,
         work_budget=SliceBudget(WorkBudgetPolicy(soft_deadline_ms=60_000)),
@@ -1251,6 +1253,7 @@ def test_claim_race_does_not_degrade_ready_index_or_block_other_tasks(
 
     assert did_claim
     assert launched == [unrelated.task_id]
+    assert executor.launched == [unrelated.task_id]
     assert read_json(ready_state_path(cfg.shared_root))["ready_index"]["state"] == "active"
 
 

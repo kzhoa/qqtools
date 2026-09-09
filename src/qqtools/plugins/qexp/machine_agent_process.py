@@ -19,12 +19,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="qexp machine agent process")
     parser.add_argument("--machine-runtime-root", required=True)
     parser.add_argument("--loop-interval", type=float, default=5.0)
+    parser.add_argument("--available-gpus", default=None)
     return parser
 
 
 def spawn_machine_agent_process(
     runtime: MachineRuntime | str | Path | None = None,
     *,
+    available_gpus: list[int] | None = None,
     stdin=None,
     stdout=None,
     stderr=None,
@@ -32,14 +34,17 @@ def spawn_machine_agent_process(
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     machine_runtime.ensure_layout()
     startup_log = tempfile.TemporaryFile(mode="w+", encoding="utf-8") if stderr is None else None
+    command = [
+        sys.executable,
+        "-m",
+        "qqtools.plugins.qexp.machine_agent_process",
+        "--machine-runtime-root",
+        str(machine_runtime.root),
+    ]
+    if available_gpus is not None:
+        command.extend(("--available-gpus", ",".join(str(item) for item in available_gpus)))
     process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "qqtools.plugins.qexp.machine_agent_process",
-            "--machine-runtime-root",
-            str(machine_runtime.root),
-        ],
+        command,
         env=os.environ.copy(),
         stdin=subprocess.DEVNULL if stdin is None else stdin,
         stdout=subprocess.DEVNULL if stdout is None else stdout,
@@ -80,7 +85,17 @@ def spawn_machine_agent_process(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    run_machine_agent_loop(args.machine_runtime_root, loop_interval=args.loop_interval)
+    available_gpus = None
+    if args.available_gpus is not None:
+        try:
+            available_gpus = [int(item) for item in args.available_gpus.split(",") if item.strip()]
+        except ValueError as exc:
+            raise RuntimeError("--available-gpus must be a comma-separated list of integers.") from exc
+    run_machine_agent_loop(
+        args.machine_runtime_root,
+        loop_interval=args.loop_interval,
+        available_gpus=available_gpus,
+    )
     return 0
 
 

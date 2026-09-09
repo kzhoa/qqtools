@@ -529,7 +529,7 @@ def resume_starting_attempt(
         if (
             task.state.get("projection") != "running"
             or claim.get("machine_name") != cfg.machine_name
-            or claim.get("launch_state") != "starting"
+            or claim.get("launch_state") not in {"claimed", "starting"}
             or not isinstance(attempt_id, str)
             or not isinstance(attempt_number, int)
             or not isinstance(fencing_token, int)
@@ -569,8 +569,14 @@ def resume_starting_attempt(
         elif not (claim.get("authority_mode") != "bounded_lease" or clock_capability(cfg).is_healthy):
             return None
         else:
-            launch_id = uuid.uuid4().hex
-            authorized_at = utc_now()
+            has_committed_authorization = (
+                attempt.phase == "starting"
+                and isinstance(claim.get("launch_id"), str)
+                and attempt.authorization.get("launch_id") == claim.get("launch_id")
+            )
+            launch_id = claim["launch_id"] if has_committed_authorization else uuid.uuid4().hex
+            authorized_at = claim.get("launch_authorized_at") if has_committed_authorization else utc_now()
+            claim["launch_state"] = "starting"
             claim["launch_id"] = launch_id
             claim["launch_authorized_at"] = authorized_at
             task.meta["revision"] += 1
@@ -1581,11 +1587,16 @@ def finalize_orphaned_attempt(
         attempt = AttemptRecord.from_dict(read_json(path))
         if (
             attempt.attempt_id != attempt_id
-            or attempt.phase not in {"orphaned", "running"}
+            or attempt.phase not in {"orphaned", "running", "succeeded", "failed", "cancelled"}
             or attempt.current_fencing_token != fencing_token
         ):
             return False
-        if was_terminated:
+        if attempt.phase in {"succeeded", "failed", "cancelled"}:
+            phase = attempt.phase
+            reason = attempt.result.get("reason") or "recovered_terminal_attempt"
+            exit_code = attempt.result.get("exit_code")
+            termination_result = attempt.termination.get("result")
+        elif was_terminated:
             phase = "cancelled"
             reason = "termination_process_already_exited"
             termination_result = "already_exited"
@@ -1613,7 +1624,7 @@ def finalize_orphaned_attempt(
                 reason,
                 exit_code,
                 frozenset({"blocked"}),
-                frozenset({"orphaned", "running"}),
+                frozenset({"orphaned", "running", "succeeded", "failed", "cancelled"}),
                 "detached",
                 termination_result,
             ),

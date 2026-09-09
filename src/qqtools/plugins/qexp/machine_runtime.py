@@ -152,6 +152,8 @@ class MachineRuntime:
         # its baseline scan.  Advancing one route at a time prevents an early
         # project from exhausting each slice before later projects are scanned.
         self.primary_probe_recheck_round_cursors: dict[str, tuple[str, str, str]] = {}
+        # Set by the most recent bounded dispatch cycle for on-demand idle exit.
+        self.last_cycle_had_demand = True
 
     def ensure_layout(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)

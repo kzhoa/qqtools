@@ -93,6 +93,9 @@ def _check_tox_boundaries(repo_root: Path) -> list[str]:
     preflight_commands = _section_commands(config, "testenv:preflight")
     if preflight_commands is None or "tests/e2e" in preflight_commands:
         errors.append("preflight must collect only Unit and Integration tests")
+    lifecycle_test = "tests/integration/qexp/test_agent_lifecycle_independence.py"
+    if preflight_commands is None or lifecycle_test not in preflight_commands:
+        errors.append("preflight must run the representative qexp lifecycle gate")
 
     artifact_commands = _section_commands(config, "testenv:artifact-e2e")
     if artifact_commands is None or "tests/e2e" not in artifact_commands:
@@ -117,11 +120,15 @@ def _check_ci_boundaries(repo_root: Path) -> list[str]:
 
 def check_test_lanes(repo_root: Path = REPO_ROOT) -> list[str]:
     """Return violations of the repository's executable test-lane boundaries."""
-    return [
+    errors = [
         *_check_marker_boundaries(repo_root),
         *_check_tox_boundaries(repo_root),
         *_check_ci_boundaries(repo_root),
     ]
+    lifecycle_test = repo_root / "tests/integration/qexp/test_agent_lifecycle_independence.py"
+    if not lifecycle_test.is_file():
+        errors.append("qexp lifecycle gate test is absent")
+    return errors
 
 
 def main() -> int:

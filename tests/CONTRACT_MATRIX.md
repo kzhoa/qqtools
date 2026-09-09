@@ -13,6 +13,7 @@ obvious from the test directory. Every linked test must exist; `Pending` is an e
 | qexp deterministic recovery decisions | [Unit](unit/qexp/test_architecture_primitives.py) | local preflight | covered |
 | qexp expanded seed and crash-point matrix | [Unit](unit/qexp/test_architecture_stress.py) | local preflight | covered |
 | qexp protected installed workflows | [installed E2E](e2e/qexp/test_compatibility_contract.py) | artifact E2E / release | covered |
+| qexp agent lifecycle independence and restart reconciliation | [real-process Integration](integration/qexp/test_agent_lifecycle_independence.py), [installed workflow](e2e/qexp/test_agent_lifecycle_independence.py) | source preflight / qexp-integration / installed E2E | Pending: final requirement audit and latest-change verification; see [acceptance evidence](../docs/spec/qexp_lifecycle_acceptance.md) |
 
 ## Maintenance rule
 

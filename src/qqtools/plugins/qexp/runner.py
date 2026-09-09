@@ -135,17 +135,21 @@ def _publish_registration(cfg: RootConfig, attempt: AttemptRecord, task: object,
     return path
 
 
-def _publish_exit_observation(cfg: RootConfig, attempt_id: str, return_code: int) -> None:
+def _publish_exit_observation(
+    cfg: RootConfig, attempt_id: str, return_code: int, *, task_id: str | None = None
+) -> None:
+    """Persist the runner's immutable exit result with bounded lookup identity."""
+    observation = {
+        "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
+        "attempt_id": attempt_id,
+        "observed_exit_code": return_code,
+        "observed_at": utc_now(),
+    }
+    if task_id is not None:
+        observation["task_id"] = task_id
     atomic_replace(
         observation_path(cfg, attempt_id),
-        {
-            "exit_observation": {
-                "protocol_version": LOCAL_PROCESS_PROTOCOL_VERSION,
-                "attempt_id": attempt_id,
-                "observed_exit_code": return_code,
-                "observed_at": utc_now(),
-            }
-        },
+        {"exit_observation": observation},
     )
 
 
@@ -204,7 +208,7 @@ def run_attempt(
         )
         _publish_registration(cfg, attempt, task, child)
         return_code = child.wait()
-    _publish_exit_observation(cfg, attempt_id, return_code)
+    _publish_exit_observation(cfg, attempt_id, return_code, task_id=task_id)
     return return_code
 
 

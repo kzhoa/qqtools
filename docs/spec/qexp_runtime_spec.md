@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-08
+updated_at: 2026-09-09
 archived_at:
 ---
 
@@ -1008,7 +1008,9 @@ are machine-wide, reservation reconciliation filters by the binding's stable pro
 reading project Task or Attempt truth; it must never release another registered project's
 reservation.
 
-Machine runtime state is disposable. Loss of its registry, cursor, PID, reservation, or process
+Registry, cursor, and PID state may be rebuilt; unresolved execution evidence is not a disposable
+cache. Whole-runtime loss may destroy the only durable exit and accounting evidence.
+Loss of its registry, cursor, PID, reservation, or process
 records neither changes project truth nor proves an old process stopped. A replacement runtime
 requires explicit re-registration and may schedule queued work, but it does not recover or write
 a terminal outcome for executions evidenced only by the lost runtime. Project lease expiry and
@@ -1889,6 +1891,29 @@ select blocked or orphaned work.
 
 ## 17. Agent Lifecycle
 
+### 17.0 Lifecycle independence invariant
+
+Stopping or losing only the machine agent does not signal, detach, or relaunch an already
+authorized runner, guardian, process group, or tmux window. The runner writes an immutable exit
+observation containing the Attempt and Task identity. On the next agent start, startup
+reconciliation validates that identity, then either performs the recovery CAS for a verified live
+process or publishes the recorded exit through the original Attempt. A mismatched or incomplete
+observation remains in the machine-local evidence partition with a diagnostic blocker; it is not
+interpreted as success and is not reclaimed by elapsed downtime.
+
+Terminal evidence is disposable only after Attempt and Task terminal truth, claim archival (or its
+pending archive retry), and reservation release are all durable. A shared-finalization failure may
+therefore retain a small evidence record while releasing verified local capacity; a retained
+record alone never keeps a physically absent GPU reserved.
+
+The declared convergence budget for a healthy Linux/tmux host is 15 seconds from agent return
+to terminal Task projection and reservation reconciliation for at most 4 active or unreconciled
+Attempts, with the default 120-second bounded lease. Four-Attempt offline completion was measured
+against an isolated baseline and candidate using the tracked probe. Candidate runs must report the
+same budget and exact active/unreconciled count; a missing prerequisite or exceeded budget is not
+a pass. Current evidence and remaining acceptance work are recorded in
+[Lifecycle acceptance evidence](qexp_lifecycle_acceptance.md).
+
 ### 17.1 On-Demand Mode
 
 Default behavior:
@@ -1898,6 +1923,12 @@ Default behavior:
 - it exits only after true idleness
 - provisional reservations, active processes, pending termination, and repair work prevent
   idle exit
+
+The global policy considers all enabled bindings: any daemon binding keeps the process active.
+With only on-demand bindings, true idleness must remain proven for a full loop interval before
+exit. Unresolved demand or a failed maintenance pass is not proof of idleness. Empty startup
+waits for a successfully processed binding; merely reading an unreadable binding does not consume
+that wait. After successful consumption, later registry emptiness does not re-enter startup wait.
 
 ### 17.2 Daemon Mode
 
