@@ -16,7 +16,7 @@ from .authority import AuthoritySupervisor
 from .config_types import RootConfig
 from .executor import Executor
 from .layout import load_root_config, machine_state_path, runtime_pid_path
-from .machine_config import is_legacy_agent_project, save_machine_config
+from .machine_config import is_legacy_agent_project, load_machine_policy, save_machine_config
 from .machine_dispatch_plan import (
     MachineDispatchSnapshot,
     PrimaryCandidateObservation,
@@ -32,7 +32,7 @@ from .machine_runtime import MachineRuntime, ProjectBinding
 from .machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from .project_maintenance import maintain_project, reconcile_reservation
 from .runtime.locks import exclusive
-from .runtime.paths import local_paths
+from .runtime.paths import local_paths, shared_paths
 from .runtime.ready import (
     ReadyProbeBudgetExhausted,
     advance_ready_index_build,
@@ -456,6 +456,57 @@ def _read_pid(runtime: MachineRuntime) -> int | None:
         return None
 
 
+def _has_local_lifecycle_evidence(runtime: MachineRuntime, project_id: str) -> bool:
+    """Return whether one project still has evidence requiring agent ownership."""
+    paths = runtime.project_paths(project_id)
+    for name in (
+        "processes",
+        "registrations",
+        "observations",
+        "launch_intents",
+        "termination_decisions",
+    ):
+        root = paths[name]
+        if root.is_dir() and any(root.rglob("*.json")):
+            return True
+    return False
+
+
+def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool) -> bool:
+    """Check the bounded local conditions required by on-demand idle exit."""
+    try:
+        _revision, bindings = runtime.load_registry()
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return False
+    if not bindings and not has_consumed_binding:
+        # Empty startup waits for the first successfully published binding.
+        return False
+    for binding in bindings:
+        if _has_local_lifecycle_evidence(runtime, binding.project_id):
+            return False
+        if not binding.enabled:
+            continue
+        try:
+            cfg = _binding_config(runtime, binding)
+            paths = shared_paths(cfg.shared_root)
+            if any(
+                next(paths[name].glob("*.json"), None) is not None
+                for name in ("availability_active", "group_control_active", "cleanup_active")
+            ):
+                return False
+            if not load_machine_policy(cfg).exit_when_idle:
+                return False
+            if getattr(runtime, "last_cycle_had_demand", True):
+                return False
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return False
+    try:
+        snapshot = reservation_snapshot(runtime.root)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return False
+    return not snapshot.active and not snapshot.provisional
+
+
 def _active_machine_identity(runtime: MachineRuntime) -> tuple[int, str, int] | None:
     """Return a verified machine-agent identity, never trusting a bare PID file."""
     pid = _read_pid(runtime)
@@ -727,7 +778,19 @@ class _MachineControlPlane:
                     self._supervisors[binding.project_id] = supervisor
                 supervisor.tick()
                 authority_interval = min(authority_interval, supervisor.renewal_interval_seconds)
-            except (OSError, RuntimeError, ValueError):
+            except OSError:
+                try:
+                    local_cfg = RootConfig(
+                        binding.shared_root,
+                        binding.shared_root.parent,
+                        binding.machine_name,
+                        self._runtime.project_paths(binding.project_id)["root"],
+                    )
+                    local_supervisor = AuthoritySupervisor(local_cfg, reservation_runtime_root=self._runtime.root)
+                    local_supervisor.reconcile_local_exit_evidence()
+                except (OSError, RuntimeError, ValueError):
+                    continue
+            except (RuntimeError, ValueError):
                 continue
         reserved_after = {
             gpu_id
@@ -954,6 +1017,7 @@ def _dispatch_machine_cycle_locked(
     publish_snapshots: bool = True,
 ) -> list[dict[str, Any]]:
     executor = executor or Executor()
+    runtime.last_cycle_had_demand = False
     _, registered = runtime.load_registry()
     supervised = [binding for binding in registered if binding.enabled or runtime.binding_state(binding) == "draining"]
     if supervisors is not None:
@@ -1017,6 +1081,7 @@ def _dispatch_machine_cycle_locked(
         snapshot.active,
         executor,
     )
+    runtime.last_cycle_had_demand = bool(results) or any(recovered.values())
     snapshot = reconcile_snapshot(runtime.root)
     visible = (
         list(available_gpus)
@@ -1109,6 +1174,8 @@ def _dispatch_machine_cycle_locked(
             )
         )
         diagnostic_increment(f"scheduler.primary_probe.{lane}.{probe.state}")
+        if probe.state in {"runnable_now", "waiting_for_aggregation"} or (has_capacity and probe.state == "unresolved"):
+            runtime.last_cycle_had_demand = True
         budget = SliceBudget(WorkBudgetPolicy())
         for admission_role in dispatch_plan.admission_roles:
             lane_gpus = free if lane == "gpu" else []
@@ -1134,6 +1201,7 @@ def _dispatch_machine_cycle_locked(
                 free_cpu_slots = lane_cpus
             if layer_winner is not None:
                 last_successful_project_id = layer_winner.project_id
+                runtime.last_cycle_had_demand = True
         cursor_effect = reduce_dispatch_cursor(dispatch_plan, last_successful_project_id)
         if cursor_effect is not None:
             runtime.save_cursor(cursor_effect.project_id)
@@ -1434,10 +1502,14 @@ def run_machine_agent_loop(
     control_plane: _MachineControlPlane | None = None
     scheduler_wakeup = threading.Event()
     stop = False
+    stop_reason: str | None = None
+    has_consumed_binding = False
+    idle_since: float | None = None
 
     def request_stop(_signum: int, _frame: object) -> None:
-        nonlocal stop
+        nonlocal stop, stop_reason
         stop = True
+        stop_reason = "stopped_by_signal"
         scheduler_wakeup.set()
 
     with machine_runtime.scheduler_authority(blocking=False) as acquired:
@@ -1483,7 +1555,7 @@ def run_machine_agent_loop(
                 try:
                     with machine_runtime.migration_guard() as is_migration_clear:
                         if is_migration_clear:
-                            dispatch_machine_cycle_locked(
+                            cycle_results = dispatch_machine_cycle_locked(
                                 machine_runtime,
                                 available_gpus=available_gpus,
                                 executor=executor,
@@ -1493,9 +1565,20 @@ def run_machine_agent_loop(
                                 supervise=False,
                                 publish_snapshots=False,
                             )
+                            if any(item.get("status") == "dispatched" for item in cycle_results):
+                                has_consumed_binding = True
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     # A transient shared-root failure must not stop supervision of other projects.
                     pass
+                if _machine_is_true_idle(machine_runtime, has_consumed_binding=has_consumed_binding):
+                    if idle_since is None:
+                        idle_since = time.monotonic()
+                    elif time.monotonic() - idle_since >= loop_interval:
+                        stop = True
+                        stop_reason = "idle"
+                        continue
+                else:
+                    idle_since = None
                 scheduler_wakeup.wait(loop_interval)
         finally:
             if control_plane is not None:
@@ -1529,7 +1612,7 @@ def run_machine_agent_loop(
                                 heartbeat_interval_seconds=loop_interval,
                                 started_at=started_at,
                                 idle_since_at=None if reserved else utc_now(),
-                                stop_reason="stopped_by_signal" if stop else "stopped",
+                                stop_reason=stop_reason or "stopped",
                             )
                         except (OSError, RuntimeError, ValueError):
                             continue
@@ -1549,24 +1632,55 @@ def run_machine_agent_loop(
                         signal.signal(signal.SIGTERM, previous_term)
 
 
-def _start_machine_agent_locked(machine_runtime: MachineRuntime, *, stdin=None, stdout=None, stderr=None):
+def _start_machine_agent_locked(
+    machine_runtime: MachineRuntime,
+    *,
+    available_gpus: list[int] | None = None,
+    stdin=None,
+    stdout=None,
+    stderr=None,
+):
     status = get_machine_agent_status(machine_runtime)
     if status["is_running"]:
         raise RuntimeError(f"machine agent is already running with pid {status['pid']}.")
     from .machine_agent_process import spawn_machine_agent_process
 
-    return spawn_machine_agent_process(machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr)
+    return spawn_machine_agent_process(
+        machine_runtime,
+        available_gpus=available_gpus,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
-def start_machine_agent(runtime: MachineRuntime | str | Path | None = None, *, stdin=None, stdout=None, stderr=None):
+def start_machine_agent(
+    runtime: MachineRuntime | str | Path | None = None,
+    *,
+    available_gpus: list[int] | None = None,
+    stdin=None,
+    stdout=None,
+    stderr=None,
+):
     """Spawn the unique persistent machine agent."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     with machine_runtime.agent_lifecycle_guard():
-        return _start_machine_agent_locked(machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr)
+        return _start_machine_agent_locked(
+            machine_runtime,
+            available_gpus=available_gpus,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
 
 def ensure_machine_agent_started(
-    runtime: MachineRuntime | str | Path | None = None, *, stdin=None, stdout=None, stderr=None
+    runtime: MachineRuntime | str | Path | None = None,
+    *,
+    available_gpus: list[int] | None = None,
+    stdin=None,
+    stdout=None,
+    stderr=None,
 ):
     """Return the running agent status, starting it atomically when absent."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
@@ -1575,7 +1689,13 @@ def ensure_machine_agent_started(
         if status["is_running"]:
             return None, status
         try:
-            process = _start_machine_agent_locked(machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr)
+            process = _start_machine_agent_locked(
+                machine_runtime,
+                available_gpus=available_gpus,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+            )
         except RuntimeError:
             status = get_machine_agent_status(machine_runtime)
             if status["is_running"]:
@@ -1609,13 +1729,26 @@ def stop_machine_agent(runtime: MachineRuntime | str | Path | None = None, *, ti
         return _stop_machine_agent_locked(machine_runtime, timeout=timeout)
 
 
-def restart_machine_agent(runtime: MachineRuntime | str | Path | None = None, *, stdin=None, stdout=None, stderr=None):
+def restart_machine_agent(
+    runtime: MachineRuntime | str | Path | None = None,
+    *,
+    available_gpus: list[int] | None = None,
+    stdin=None,
+    stdout=None,
+    stderr=None,
+):
     """Replace a running machine agent without treating it as a cold start."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     with machine_runtime.agent_lifecycle_guard():
         identity = _active_machine_identity(machine_runtime)
         previous_pid = identity[0] if identity is not None else None
         _stop_machine_agent_locked(machine_runtime, timeout=10.0)
-        process = _start_machine_agent_locked(machine_runtime, stdin=stdin, stdout=stdout, stderr=stderr)
+        process = _start_machine_agent_locked(
+            machine_runtime,
+            available_gpus=available_gpus,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+        )
         process.previous_pid = previous_pid
         return process

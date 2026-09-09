@@ -242,6 +242,40 @@ def test_blocked_orphan_with_missing_process_finalizes_and_releases_gpu(tmp_path
     assert reserved_gpu_ids(cfg.runtime_root) == set()
 
 
+def test_orphan_partial_terminal_replays_persisted_result(tmp_path: Path, monkeypatch):
+    from qqtools.plugins.qexp import lifecycle
+    from qqtools.plugins.qexp.scheduler import finalize_orphaned_attempt
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    original = lifecycle.save_task
+
+    def unavailable(*args, **kwargs):
+        raise OSError("Task publication interrupted")
+
+    monkeypatch.setattr(lifecycle, "save_task", unavailable)
+    with pytest.raises(OSError, match="publication interrupted"):
+        finalize_orphaned_attempt(
+            cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, exit_code=0, was_terminated=False
+        )
+    monkeypatch.setattr(lifecycle, "save_task", original)
+    assert not finalize_orphaned_attempt(
+        cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token + 1, exit_code=9, was_terminated=True
+    )
+    assert load_task(cfg, task.task_id).state["projection"] == "blocked"
+    assert finalize_orphaned_attempt(
+        cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, exit_code=9, was_terminated=True
+    )
+    assert load_task(cfg, task.task_id).state["projection"] == "succeeded"
+    stored = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"]
+    assert stored["result"]["exit_code"] == 0
+    assert not reserved_gpu_ids(cfg.runtime_root)
+
+
 def test_partial_recovery_finalize_preserves_monotonic_fencing_epoch(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
@@ -311,6 +345,186 @@ def test_reconcile_finishes_recovery_when_manifest_write_was_interrupted(tmp_pat
     assert repaired_manifest["fencing_token"] == token
     assert repaired_manifest["supervisor"] == "agent"
     assert calls == []
+
+
+@pytest.mark.parametrize("boundary", ["task", "manifest"])
+@pytest.mark.parametrize("exit_code", [None, 0, 1])
+def test_authority_restart_finishes_interrupted_recovery(tmp_path: Path, monkeypatch, boundary, exit_code):
+    from qqtools.plugins.qexp.runtime import attempt_recovery
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    old_token = attempt.current_fencing_token
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, old_token)
+    path = cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json"
+    atomic_replace(
+        path,
+        {
+            "process": {
+                "protocol_version": 1,
+                "task_id": task.task_id,
+                "attempt_id": attempt.attempt_id,
+                "fencing_token": old_token,
+                "process_group_id": 9876,
+                "process_group_start_time_ticks": 123,
+                "observed_state": "running",
+                "supervisor": "agent",
+            }
+        },
+    )
+    stored_path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    record = read_json(stored_path)
+    record["attempt"]["process"].update(process_group_id=9876, process_group_start_time_ticks=123)
+    atomic_replace(stored_path, record)
+    assert expire_claim(cfg, task.task_id, attempt.attempt_id, old_token)
+    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_start_time_ticks", lambda _: 123)
+    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._is_process_group_alive", lambda _: True)
+
+    class RecoveryCrash(BaseException):
+        pass
+
+    with monkeypatch.context() as crash:
+        if boundary == "task":
+
+            def fail_save(*args):
+                raise RecoveryCrash()
+
+            crash.setattr(attempt_recovery, "save_task", fail_save)
+        else:
+            original = attempt_recovery.atomic_replace
+
+            def fail_manifest(target, value):
+                if target == path:
+                    raise RecoveryCrash()
+                return original(target, value)
+
+            crash.setattr(attempt_recovery, "atomic_replace", fail_manifest)
+        first = AuthoritySupervisor(cfg)
+        first.recover_startup()
+        with pytest.raises(RecoveryCrash):
+            first.tick()
+    assert read_json(path)["process"]["fencing_token"] == old_token
+    new_token = read_json(stored_path)["attempt"]["current_fencing_token"]
+    assert new_token > old_token
+    with monkeypatch.context() as mismatch:
+        mismatch.setattr("qqtools.plugins.qexp.scheduler._process_start_time_ticks", lambda _: 456)
+        rejected = AuthoritySupervisor(cfg)
+        rejected.recover_startup()
+        rejected.tick()
+        assert read_json(path)["process"]["fencing_token"] == old_token
+    if exit_code is not None:
+        monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_start_time_ticks", lambda _: None)
+        monkeypatch.setattr("qqtools.plugins.qexp.scheduler._is_process_group_alive", lambda _: False)
+        observation_path = cfg.runtime_root / "process-observations" / f"{attempt.attempt_id}.json"
+        observation = {
+            "protocol_version": 1,
+            "task_id": task.task_id,
+            "attempt_id": "wrong-attempt",
+            "observed_exit_code": exit_code,
+        }
+        atomic_replace(observation_path, {"exit_observation": observation})
+        rejected = AuthoritySupervisor(cfg)
+        rejected.recover_startup()
+        rejected.tick()
+        assert read_json(path)["process"]["fencing_token"] == old_token
+        expected_projection = "blocked" if boundary == "task" else "running"
+        assert load_task(cfg, task.task_id).state["projection"] == expected_projection
+        observation["attempt_id"] = attempt.attempt_id
+        atomic_replace(observation_path, {"exit_observation": observation})
+    restarted = AuthoritySupervisor(cfg)
+    restarted.recover_startup()
+    restarted.tick()
+    if exit_code is None or boundary == "manifest":
+        assert read_json(path)["process"]["fencing_token"] == new_token
+        assert load_task(cfg, task.task_id).claim_control["active_claim"]["fencing_token"] == new_token
+    if exit_code is not None:
+        if boundary == "manifest":
+            restarted.tick()
+        expected_phase = "succeeded" if exit_code == 0 else "failed"
+        assert load_task(cfg, task.task_id).state["projection"] == expected_phase
+        assert not load_task(cfg, task.task_id).claim_control.get("active_claim")
+        assert read_json(stored_path)["attempt"]["phase"] == expected_phase
+        assert read_json(stored_path)["attempt"]["token_history"] == [old_token, new_token]
+        restarted.tick()
+        assert load_task(cfg, task.task_id).state["projection"] == expected_phase
+        if boundary == "manifest":
+            assert not path.exists()
+        else:
+            # No claim was published for the recovered token in this window.
+            # Terminal reconciliation retains the exited manifest as evidence.
+            process = read_json(path)["process"]
+            assert process["observed_state"] == "exited"
+            assert process["observed_exit_code"] == exit_code
+        return
+    renewed = []
+    from qqtools.plugins.qexp import authority
+
+    original_renew = authority.renew_attempt_lease
+
+    def record_renewal(*args, **kwargs):
+        renewed.append(args[3])
+        return original_renew(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.authority.renew_attempt_lease",
+        record_renewal,
+    )
+    restarted.tick()
+    assert renewed == [new_token]
+    assert read_json(stored_path)["attempt"]["token_history"] == [old_token, new_token]
+
+
+def test_terminal_accounting_read_failure_remains_pending(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    supervisor = AuthoritySupervisor(cfg)
+
+    def unavailable(*args):
+        raise OSError("temporary shared read failure")
+
+    monkeypatch.setattr("qqtools.plugins.qexp.authority.load_task", unavailable)
+    assert supervisor._reconcile_terminal_accounting("task", "attempt") is False
+
+
+def test_terminal_accounting_transient_failure_retries_next_tick(tmp_path: Path, monkeypatch):
+    from qqtools.plugins.qexp import authority
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    process = {
+        "protocol_version": 1,
+        "task_id": task.task_id,
+        "attempt_id": attempt.attempt_id,
+        "fencing_token": attempt.current_fencing_token,
+    }
+    path = cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json"
+    atomic_replace(path, {"process": process})
+    supervisor = AuthoritySupervisor(cfg)
+    original_load = authority.load_task
+    with monkeypatch.context() as outage:
+
+        def unavailable(*args):
+            raise OSError("temporary shared read failure")
+
+        outage.setattr(authority, "load_task", unavailable)
+        supervisor.tick()
+    assert path.exists()
+    assert original_load(cfg, task.task_id).claim_control["active_claim"]
+    renewed = []
+    original_renew = authority.renew_attempt_lease
+
+    def record_renewal(*args):
+        renewed.append(args[3])
+        return original_renew(*args)
+
+    monkeypatch.setattr(authority, "renew_attempt_lease", record_renewal)
+    supervisor.tick()
+    assert renewed == [attempt.current_fencing_token]
+    assert path.exists()
 
 
 def test_agent_supervises_recovered_child_without_runner(tmp_path: Path, monkeypatch):

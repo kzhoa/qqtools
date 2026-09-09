@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-06
+updated_at: 2026-09-09
 archived_at:
 ---
 
@@ -82,6 +82,10 @@ Such changes require an explicit compatibility decision recorded in the relevant
 pitch or delivery change description, with explicit approval.
 
 ## Protected workflows
+
+- Agent lifecycle independence: submit and launch a Task, stop or crash only the machine agent,
+  allow the real runner to finish, then start the agent and observe the original Task/Attempt
+  terminal outcome without manual repair or a successor launch.
 
 - New project activation: `qexp init -> qexp agent start`
 - New project submission: `qexp init -> qexp submit -- <command>`
@@ -1287,6 +1291,9 @@ Default behavior:
 - local work submission automatically starts the current machine's agent when needed, unless the
   submit invocation uses `--no-activate`
 - `on_demand` agents exit after true idleness; `daemon` agents remain active
+- A global agent remains active if any enabled binding opts into daemon mode. Binding order does
+  not select the policy. When all enabled bindings are on-demand, unresolved demand, maintenance
+  errors, or local execution evidence prevent idle exit.
 - qexp does not remotely wake other machines
 
 Daemon mode is opt-in:
@@ -1448,6 +1455,12 @@ The target CLI also does not promise aliases for the old flat `list`, `inspect`,
 - [ ] Explicit project migration verifies old PID identity, keeps training processes alive, and
       leaves one global agent process responsible for the migrated Project.
 - [ ] Machine runtime loss cannot assert process termination or cause automatic retry.
+- [ ] Agent stop/crash leaves an authorized runner, guardian, process group, and tmux execution
+  container alive; restart reconciles the same Attempt and never launches a successor.
+- [ ] Offline runner exit evidence records Task and Attempt identity and converges on restart
+  within the declared 15-second healthy-host budget; mismatched evidence is retained and diagnosed.
+- [ ] Terminal evidence is retained until claim archival and reservation accounting are durable,
+  while verified absent local capacity may be released independently of shared finalization.
 - [ ] Single Task submission remains YAML-free.
 - [ ] New submissions create no public Batch identity.
 - [ ] Unsupported old schema fails fast and is not read, migrated, or partially imported.

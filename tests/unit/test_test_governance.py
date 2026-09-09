@@ -12,6 +12,7 @@ def _write(path: Path, content: str) -> None:
 
 
 def _write_valid_repository(root: Path) -> None:
+    _write(root / "tests/integration/qexp/test_agent_lifecycle_independence.py", "def test_li01():\n    pass\n")
     _write(root / "tests/integration/test_example.py", "def test_integration():\n    pass\n")
     _write(root / "tests/e2e/test_example.py", "def test_e2e():\n    pass\n")
     _write(
@@ -20,6 +21,7 @@ def _write_valid_repository(root: Path) -> None:
 commands =
     pytest tests/unit
     pytest tests/integration
+    pytest tests/integration/qexp/test_agent_lifecycle_independence.py
 
 [testenv:artifact-e2e]
 commands = pytest tests/e2e
@@ -87,12 +89,16 @@ def test_lane_check_rejects_e2e_collection_from_preflight(tmp_path: Path) -> Non
         """[testenv:preflight]
 commands = pytest tests/e2e
 
+
 [testenv:artifact-e2e]
 commands = pytest tests/e2e
 """,
     )
 
-    assert check_test_lanes(tmp_path) == ["preflight must collect only Unit and Integration tests"]
+    assert check_test_lanes(tmp_path) == [
+        "preflight must collect only Unit and Integration tests",
+        "preflight must run the representative qexp lifecycle gate",
+    ]
 
 
 def test_lane_check_rejects_source_tests_in_ordinary_ci(tmp_path: Path) -> None:

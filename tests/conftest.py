@@ -21,6 +21,96 @@ PRESERVE_TEST_ARTIFACTS_ENV = "QQTOOLS_PRESERVE_TEST_ARTIFACTS"
 TEST_TMUX_BASE_ENV = "QQTOOLS_TEST_TMUX_BASE"
 
 
+def pytest_addoption(parser):
+    parser.addoption("--lifecycle-gate", choices=("representative", "full", "installed"))
+
+
+def pytest_configure(config):
+    if config.getoption("--lifecycle-gate"):
+        config.pluginmanager.register(_LifecycleGate(config), "qexp-lifecycle-gate")
+
+
+class _LifecycleGate:
+    """Require selected lifecycle cases to execute successfully, including teardown."""
+
+    representative_names = frozenset(
+        {
+            "test_li01_training_remains_live_and_is_not_relaunched",
+            "test_li02_offline_completion_preserves_exit_result[0-succeeded]",
+            "test_li02_offline_completion_preserves_exit_result[7-failed]",
+            "test_li04_sigkill_agent_does_not_kill_runner",
+        }
+    )
+    full_names = representative_names | frozenset(
+        {
+            "test_li03_expired_claim_recovers_same_attempt_without_relaunch",
+            "test_li03_real_peer_observes_natural_lease_expiry[False]",
+            "test_li03_real_peer_observes_natural_lease_expiry[True]",
+            "test_li05_launch_boundary_has_no_duplicate_authorized_process[before_authorization]",
+            "test_li05_launch_boundary_has_no_duplicate_authorized_process[after_authorization]",
+            "test_li05_agent_crash_between_process_creation_and_registration",
+            "test_li06_terminal_publication_is_idempotent[False-attempt]",
+            "test_li06_terminal_publication_is_idempotent[False-task]",
+            "test_li06_terminal_publication_is_idempotent[False-reservation]",
+            "test_li06_terminal_publication_is_idempotent[True-attempt]",
+            "test_li06_terminal_publication_is_idempotent[True-task]",
+            "test_li06_terminal_publication_is_idempotent[True-reservation]",
+            "test_li07_multiple_bindings_keep_identity_and_reservations_separate[2-False]",
+            "test_li07_multiple_bindings_keep_identity_and_reservations_separate[4-False]",
+            "test_li07_multiple_bindings_keep_identity_and_reservations_separate[4-True]",
+            "test_li08_mismatched_exit_evidence_is_retained_as_blocker",
+            "test_li08_missing_exit_observation_is_diagnosed",
+            "test_li08_superseded_offline_attempt_preserves_evidence",
+            "test_li08_cancellation_while_agent_offline_is_honored",
+            "test_global_idle_policy_considers_every_binding[modes0]",
+            "test_global_idle_policy_considers_every_binding[modes1]",
+            "test_global_idle_policy_considers_every_binding[modes2]",
+            "test_finished_process_releases_capacity_while_publication_is_unavailable[_finalize]",
+            "test_finished_process_releases_capacity_while_publication_is_unavailable[_materialize_registrations]",
+            "test_finished_process_releases_capacity_while_publication_is_unavailable[binding]",
+            "test_global_idle_waits_for_unresolved_demand",
+            "test_failed_binding_is_not_consumed_for_idle_exit",
+            "test_global_idle_does_not_reenter_registration_wait",
+            "test_pending_repair_prevents_idle_exit[availability]",
+            "test_pending_repair_prevents_idle_exit[group_control]",
+            "test_pending_repair_prevents_idle_exit[cleanup]",
+        }
+    )
+
+    def __init__(self, config):
+        self.mode = config.getoption("--lifecycle-gate")
+        self.started_at = time.monotonic()
+        self.budget_seconds = 90 if self.mode == "representative" else 600
+        self.required = set()
+        self.passed = set()
+        self.failed = False
+
+    def pytest_collection_finish(self, session):
+        items = [item for item in session.items if item.path.name == "test_agent_lifecycle_independence.py"]
+        required_names = self.representative_names if self.mode == "representative" else self.full_names
+        missing = sorted(required_names - {item.name for item in items})
+        if missing:
+            raise pytest.UsageError("Missing lifecycle gate cases: " + ", ".join(missing))
+        self.required = {item.nodeid for item in items}
+
+    def pytest_runtest_logreport(self, report):
+        if report.nodeid not in self.required:
+            return
+        if report.skipped or report.failed:
+            self.failed = True
+        if report.when == "call" and report.passed:
+            self.passed.add(report.nodeid)
+
+    def pytest_sessionfinish(self, session, exitstatus):
+        is_over_budget = time.monotonic() - self.started_at > self.budget_seconds
+        if is_over_budget:
+            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+            if reporter is not None:
+                reporter.write_line(f"Lifecycle gate exceeded {self.budget_seconds}s budget", red=True)
+        if self.failed or not self.required or self.passed != self.required or is_over_budget:
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
 def _is_usable_temp_root(root: Path) -> bool:
     """Return whether a root supports the filesystem operations required by tests."""
     probe_dir = root / f".qqtools-write-probe-{uuid.uuid4().hex}"
@@ -176,7 +266,7 @@ class _WorkspaceTemporaryDirectory:
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _configure_temp_root_for_session():
+def _configure_temp_root_for_session(request):
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
     previous_tempdir = tempfile.tempdir
@@ -206,7 +296,7 @@ def _configure_temp_root_for_session():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        if not _should_preserve_test_artifacts():
+        if not _should_preserve_test_artifacts() and not getattr(request.config, "_has_lifecycle_artifacts", False):
             shutil.rmtree(TMP_ROOT, ignore_errors=True)
 
 
@@ -220,11 +310,14 @@ def tmp_path(request):
     if case_dir.exists():
         shutil.rmtree(case_dir, ignore_errors=True)
     case_dir.mkdir(parents=True, exist_ok=True)
+    should_preserve_lifecycle = request.node.path.name == "test_agent_lifecycle_independence.py"
+    if should_preserve_lifecycle:
+        request.config._has_lifecycle_artifacts = True
 
     try:
         yield case_dir
     finally:
-        if not _should_preserve_test_artifacts():
+        if not _should_preserve_test_artifacts() and not should_preserve_lifecycle:
             shutil.rmtree(case_dir, ignore_errors=True)
 
 
