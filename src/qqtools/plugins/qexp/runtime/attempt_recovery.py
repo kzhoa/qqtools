@@ -25,14 +25,24 @@ def recover_running_attempt(
     reservation_runtime_root: Path | None = None,
 ) -> int | None:
     """Restore authority only for a locally verified live orphaned process."""
+    def reject(reason: str) -> None:
+        path = cfg.runtime_root / "authority-diagnostics" / f"{attempt_id}.json"
+        try:
+            from .store import atomic_replace
+            atomic_replace(path, {"authority_diagnostic": {"attempt_id": attempt_id, "reason": reason}})
+        except OSError:
+            pass
+
     reservation_root = reservation_runtime_root or cfg.runtime_root
     policy = load_lease_policy(cfg)
     capability = clock_capability(cfg, policy)
     if not capability.is_healthy or capability.observation is None:
+        reject("recovery_clock_unhealthy")
         return None
     manifest_path = cfg.runtime_root / "processes" / f"{attempt_id}.json"
     with attempt_control_lock(cfg, attempt_id):
         if is_recovery_blocked(cfg, attempt_id):
+            reject("recovery_termination_blocked")
             return None
         if manifest is None:
             if not manifest_path.exists():
@@ -43,11 +53,13 @@ def recover_running_attempt(
             or manifest.get("attempt_id") != attempt_id
             or manifest.get("fencing_token") != expired_token
         ):
+            reject("recovery_manifest_identity_mismatch")
             return None
         task = load_task(cfg, task_id)
         with authority_locks(cfg, task):
             task = load_task(cfg, task_id)
             if task.state["projection"] != "blocked" or task.claim_control.get("active_claim"):
+                reject("recovery_task_state_invalid")
                 return None
             number = task.attempt_control.get("current_attempt_number")
             if number is None:
@@ -64,12 +76,14 @@ def recover_running_attempt(
             if not is_partial_recovery and (
                 attempt.phase != "orphaned" or attempt.current_fencing_token != expired_token
             ):
+                reject("recovery_attempt_state_invalid")
                 return None
             if task.group_name:
                 group = read_json(group_path(cfg.shared_root, task.group_name))
                 normalize_group_record(group)
                 worker = group["group"]["worker_set"].get(cfg.machine_name)
                 if not worker or worker["state"] not in {"active", "draining"}:
+                    reject("recovery_worker_state_invalid")
                     return None
                 if task.control.get("terminate_running"):
                     return None
@@ -93,6 +107,7 @@ def recover_running_attempt(
                 "observation_id": capability.observation.observation_id,
             }
             if not retag(reservation_root, attempt.reservation_id, attempt_id, token):
+                reject("recovery_reservation_retag_failed")
                 return None
             task.claim_control.update(
                 {

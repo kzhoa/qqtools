@@ -48,6 +48,13 @@ class AuthoritySupervisor:
         except OSError:
             self.reconcile_local_exit_evidence()
             raise
+        for path in iter_json(local_paths(self.cfg.runtime_root)["processes"]):
+            process = read_json(path).get("process", {})
+            if process.get("protocol_version") != 1:
+                continue
+            task_id = process.get("task_id")
+            if isinstance(task_id, str):
+                self._reconcile_orphaned_process(process, load_task(self.cfg, task_id))
         for directory in local_paths(self.cfg.runtime_root)["termination_decisions"].glob("*"):
             if directory.is_dir():
                 for decision in iter_json(directory):

@@ -616,6 +616,31 @@ class MachineRuntime:
         with self.binding_write_guard(binding) as is_eligible:
             return is_eligible
 
+    def reactivate_binding(self, binding: ProjectBinding) -> bool:
+        """Renew an expired registration when its generation was not superseded."""
+        cfg = binding.root_config()
+        policy = load_lease_policy(cfg)
+        with self._registration_guard(cfg):
+            raw = load_machine_registration(cfg)
+            record = raw.get("registration") if isinstance(raw, dict) else None
+            if not isinstance(record, dict):
+                return False
+            self._validate_registration_record(record, binding.project_id, cfg)
+            if (
+                record.get("state") == "superseded"
+                or record.get("generation") != binding.registration_generation
+                or record.get("runtime_instance_id") != binding.runtime_instance_id
+                or binding.runtime_instance_id != self.instance_id
+                or record.get("runtime_root") != str(self.root)
+                or binding.runtime_root not in {None, str(self.root)}
+            ):
+                return False
+            record = dict(record)
+            record["eligibility_expires_at"] = lease_expiry(policy)
+            record["updated_at"] = utc_now()
+            save_machine_registration(cfg, {"registration": record})
+            return True
+
     @contextmanager
     def binding_write_guard(self, binding: ProjectBinding) -> Iterator[bool]:
         """Fence one authoritative write to a current, renewed registration generation."""
