@@ -239,9 +239,8 @@ recovery records a durable reason code and never bypasses upgrade writer exclusi
 
 - [ ] Global true-idle behavior has a single approved product/runtime contract and real-process
       evidence; first-registration tests are not substituted for this separate conformance gate.
-- [ ] LI-01 through LI-09 have passing real-boundary evidence on supported Linux.
-      Current rerun still has an LI-03 convergence failure; retain this gate until the
-      live and completed lease-expiry cases pass within the 15-second budget.
+- [x] LI-01 through LI-09 have passing real-boundary evidence on supported Linux; the focused
+      lifecycle integration file passes 36 tests, including both LI-03 lease-expiry cases.
 - [x] Stop/offline completion/start needs no manual repair in the intact, unsuperseded case.
 - [x] Same-version lifecycle correctness is gated independently of migration implementation.
 - [ ] Test runtime, evidence retention, and convergence budgets are recorded and satisfied.
