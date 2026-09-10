@@ -351,7 +351,10 @@ def _reference_from_slot(
         return None
     if generation <= 0 or marker_name != f"{task_id}.{generation}.json":
         return None
-    home_machine = cfg.machine_name
+    # A shared marker is the sole authority for task ownership.  If it is
+    # temporarily unavailable, leave the slot unresolved; never infer that
+    # the scanning machine owns it.
+    home_machine = cfg.machine_name if scope == "home" else None
     if scope == "shared":
         provisional = ReadyMarkerRef(task_id, generation, scope, home_machine, partition, catalog_page, marker_name)
         try:
@@ -360,6 +363,8 @@ def _reference_from_slot(
                 home_machine = validate_identifier(marker["home_machine"], "marker home_machine")
         except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
             pass
+    if home_machine is None:
+        return None
     return ReadyMarkerRef(task_id, generation, scope, home_machine, partition, catalog_page, marker_name)
 
 
@@ -478,16 +483,6 @@ def next_ready_marker(
             continue
         reference = _reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name)
         if reference is None:
-            state.mark_ready_index_degraded(
-                cfg,
-                storage_diagnostic(
-                    "partition_invalid",
-                    route=route_key,
-                    location=partition_name,
-                    stage="slot_identity",
-                    mismatch_fields=["marker_name"],
-                ),
-            )
             return None, False
         if excluded_identities is not None and reference.identity in excluded_identities:
             _save_ready_cursor(
@@ -656,16 +651,6 @@ def peek_ready_marker(
                 budget.consume_operation()
                 reference = _reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name)
                 if reference is None:
-                    state.mark_ready_index_degraded(
-                        cfg,
-                        storage_diagnostic(
-                            "partition_invalid",
-                            route=route_key,
-                            location=partition_name,
-                            stage="slot_identity",
-                            mismatch_fields=["marker_name"],
-                        ),
-                    )
                     return ReadyPeek(None, current, unresolved=True)
                 next_cursor = ReadyCursor(
                     project_id,
