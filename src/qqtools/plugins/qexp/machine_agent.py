@@ -864,6 +864,10 @@ class _MachineControlPlane:
         for binding in bindings:
             try:
                 cfg = _binding_config(self._runtime, binding)
+                is_eligible = self._runtime.binding_write_eligible(binding, renew=True)
+                has_local_process = any(iter_json(local_paths(cfg.runtime_root)["processes"]))
+                if not is_eligible and not has_local_process:
+                    continue
                 supervisor = self._supervisors.get(binding.project_id)
                 if supervisor is not None and self._supervisor_generations.get(binding.project_id) != (
                     binding.registration_generation
@@ -875,7 +879,6 @@ class _MachineControlPlane:
                     supervisor.recover_startup()
                     self._supervisors[binding.project_id] = supervisor
                     self._supervisor_generations[binding.project_id] = binding.registration_generation
-                is_eligible = self._runtime.binding_write_eligible(binding, renew=True)
                 if not is_eligible and not self._runtime.reactivate_binding(binding):
                     continue
                 supervisor.tick()
