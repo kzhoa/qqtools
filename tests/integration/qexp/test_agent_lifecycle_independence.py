@@ -245,6 +245,7 @@ def test_li03_real_peer_observes_natural_lease_expiry(tmp_path: Path, is_finishe
     runtime = MachineRuntime(tmp_path / "machine")
     binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
     create_group(cfg, "peers")
+    change_worker(cfg, "peers", "gpu-1", "add")
     change_worker(cfg, "peers", "gpu-2", "add")
     marker, finish = tmp_path / "count", tmp_path / "finish"
     command = [
