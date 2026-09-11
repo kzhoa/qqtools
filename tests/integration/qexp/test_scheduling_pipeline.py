@@ -222,9 +222,9 @@ def test_agent_finalizes_missing_recovered_process_and_releases_gpu(tmp_path: Pa
 
 def test_agent_termination_escalates_when_sigterm_does_not_stop_process(monkeypatch):
     signals: list[int] = []
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._is_process_group_alive", lambda pid: True)
+    monkeypatch.setattr("qqtools.plugins.qexp.infrastructure.process.is_process_group_alive", lambda pid: True)
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.scheduler.os.killpg",
+        "qqtools.plugins.qexp.infrastructure.process.os.killpg",
         lambda pid, sent_signal: signals.append(sent_signal),
     )
     assert _terminate_process_group(4321, grace_seconds=0) is False

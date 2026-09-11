@@ -339,7 +339,9 @@ def test_reconcile_finishes_recovery_when_manifest_write_was_interrupted(tmp_pat
     atomic_replace(manifest_path, manifest)
     calls: list[tuple[int, int]] = []
     monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *args: "alive")
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler.os.killpg", lambda pid, sig: calls.append((pid, sig)))
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.infrastructure.process.os.killpg", lambda pid, sig: calls.append((pid, sig))
+    )
     reconcile_running_tasks(cfg)
     repaired_manifest = read_json(manifest_path)["process"]
     assert repaired_manifest["fencing_token"] == token
@@ -403,9 +405,8 @@ def test_authority_restart_finishes_interrupted_recovery(tmp_path: Path, monkeyp
 
             crash.setattr(attempt_recovery, "atomic_replace", fail_manifest)
         first = AuthoritySupervisor(cfg)
-        first.recover_startup()
         with pytest.raises(RecoveryCrash):
-            first.tick()
+            first.recover_startup()
     assert read_json(path)["process"]["fencing_token"] == old_token
     new_token = read_json(stored_path)["attempt"]["current_fencing_token"]
     assert new_token > old_token
@@ -434,10 +435,23 @@ def test_authority_restart_finishes_interrupted_recovery(tmp_path: Path, monkeyp
         assert load_task(cfg, task.task_id).state["projection"] == expected_projection
         observation["attempt_id"] = attempt.attempt_id
         atomic_replace(observation_path, {"exit_observation": observation})
+    renewed = []
+    from qqtools.plugins.qexp import authority
+
+    original_renew = authority.renew_attempt_lease
+
+    def record_renewal(*args, **kwargs):
+        renewed.append(args[3])
+        return original_renew(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.authority.renew_attempt_lease",
+        record_renewal,
+    )
     restarted = AuthoritySupervisor(cfg)
     restarted.recover_startup()
     restarted.tick()
-    if exit_code is None or boundary == "manifest":
+    if exit_code is None:
         assert read_json(path)["process"]["fencing_token"] == new_token
         assert load_task(cfg, task.task_id).claim_control["active_claim"]["fencing_token"] == new_token
     if exit_code is not None:
@@ -459,20 +473,6 @@ def test_authority_restart_finishes_interrupted_recovery(tmp_path: Path, monkeyp
             assert process["observed_state"] == "exited"
             assert process["observed_exit_code"] == exit_code
         return
-    renewed = []
-    from qqtools.plugins.qexp import authority
-
-    original_renew = authority.renew_attempt_lease
-
-    def record_renewal(*args, **kwargs):
-        renewed.append(args[3])
-        return original_renew(*args, **kwargs)
-
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.authority.renew_attempt_lease",
-        record_renewal,
-    )
-    restarted.tick()
     assert renewed == [new_token]
     assert read_json(stored_path)["attempt"]["token_history"] == [old_token, new_token]
 
