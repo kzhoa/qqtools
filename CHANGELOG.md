@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.17
+
 - breaking: retire the qexp ready-index diagnostics, Group ready-member, and submission schema-lock
   compatibility transitions. Ordinary mutation now requires the active narrow protocol; legacy
   roots must complete the explicit Group ready-member upgrade before they can be used.
