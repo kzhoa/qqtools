@@ -449,3 +449,7 @@ def restart_machine_agent(
         )
         process.previous_pid = previous_pid
         return process
+
+# Public lifecycle entry point retained for internal test and CLI orchestration.
+def dispatch_machine_cycle_locked(*args, **kwargs):
+    return _dispatch.dispatch_machine_cycle_locked(*args, **kwargs)
