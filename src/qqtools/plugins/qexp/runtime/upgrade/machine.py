@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from threading import Event, Thread
 from typing import Any
 
-from ...machine_runtime import MachineRuntime, ProjectBinding
+from ...agent.context import MachineRuntime, ProjectBinding
 from ...runtime.store import atomic_replace, read_json
 from .framework import UpgradeCoordinator
 

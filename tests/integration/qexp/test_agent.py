@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp.agent import run_agent_loop
+from qqtools.plugins.qexp.legacy_agent import run_agent_loop
 from qqtools.plugins.qexp.machine_config import init_shared_root
 from qqtools.plugins.qexp.machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from qqtools.plugins.qexp.runtime.store import read_json

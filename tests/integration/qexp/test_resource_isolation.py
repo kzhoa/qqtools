@@ -91,7 +91,7 @@ def test_machine_participants_use_distinct_frozen_authority_roots(tmp_path: Path
 import json
 import sys
 from pathlib import Path
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 
 runtime = MachineRuntime(sys.argv[1])
 result = Path(sys.argv[2])
@@ -144,7 +144,7 @@ def test_isolated_authority_allows_only_one_runtime_at_a_time(tmp_path: Path) ->
     participant = """
 import json
 import sys
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 
 runtime = MachineRuntime(sys.argv[1])
 with runtime.scheduler_authority(blocking=False) as acquired:

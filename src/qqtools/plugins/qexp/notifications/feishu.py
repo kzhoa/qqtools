@@ -108,6 +108,9 @@ def _phase_template(phase: Any) -> str:
 def _card_markdown(event: Any) -> str:
     return "\n".join(
         (
+            f"- **Project ID**: `{_markdown_code(getattr(event, 'project_id', None))}`",
+            f"- **Project**: `{_markdown_project(getattr(event, 'project', ''))}`",
+            f"- **Task Name**: `{_markdown_code(getattr(event, 'task_name', None))}`",
             f"- **Task ID**: `{_markdown_code(event.task_id)}`",
             f"- **Attempt ID**: `{_markdown_code(event.attempt_id)}`",
             f"- **原因**: `{_markdown_code(event.reason)}`",
@@ -119,6 +122,12 @@ def _card_markdown(event: Any) -> str:
             f"- **通知机器时间**: `{_markdown_code(event.finished_at)}`",
         )
     )
+
+def _markdown_project(value: Any) -> str:
+    text = _markdown_code(value)
+    if len(text) <= 120:
+        return text
+    return "..." + text[-117:]
 
 
 def _duration_text(duration_ms: Any) -> str | None:

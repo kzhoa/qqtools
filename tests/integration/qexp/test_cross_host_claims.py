@@ -6,7 +6,7 @@ from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import offer
 from qqtools.plugins.qexp.config_types import RootConfig
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.resources.reservations import reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace

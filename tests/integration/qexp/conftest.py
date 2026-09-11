@@ -25,7 +25,7 @@ def _qexp_integration_prerequisites(
     ):
         monkeypatch.setenv(name, environment[name])
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.machine_runtime.tempfile.gettempdir",
+        "qqtools.plugins.qexp.agent.context.tempfile.gettempdir",
         lambda: str(qexp_resource_scope.local_temp_root),
     )
     if request.node.get_closest_marker("qexp_fast_io") is not None:

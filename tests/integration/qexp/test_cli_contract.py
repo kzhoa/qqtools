@@ -4,11 +4,11 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import AGENT_MODE_DAEMON, init_shared_root, submit
-from qqtools.plugins.qexp.agent import get_agent_status
+from qqtools.plugins.qexp.legacy_agent import get_agent_status
 from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.layout import load_context, load_root_config, runtime_pid_path
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, expire_claim, fail_attempt
 
@@ -398,7 +398,7 @@ def test_agent_start_starts_the_registered_global_agent(tmp_path: Path, monkeypa
         runtime_root=tmp_path / "rt",
     )
 
-    from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+    from qqtools.plugins.qexp.agent.context import MachineRuntime
 
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
@@ -443,7 +443,7 @@ def test_agent_start_rejects_removed_background_flag(tmp_path: Path):
 
 def test_agent_run_reports_foreground_start(tmp_path: Path, monkeypatch, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
-    from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+    from qqtools.plugins.qexp.agent.context import MachineRuntime
 
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
@@ -820,7 +820,7 @@ def test_agent_add_project_recovery_replaces_a_superseded_local_binding(tmp_path
 
 
 def test_agent_project_add_can_register_while_scheduler_is_running(tmp_path: Path, capsys) -> None:
-    from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+    from qqtools.plugins.qexp.agent.context import MachineRuntime
 
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime_root = tmp_path / "machine-runtime"
@@ -852,7 +852,7 @@ def test_agent_project_add_can_register_while_scheduler_is_running(tmp_path: Pat
 def test_read_only_task_list_does_not_initialize_machine_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    from qqtools.plugins.qexp.machine_runtime import MACHINE_RUNTIME_ENV
+    from qqtools.plugins.qexp.agent.context import MACHINE_RUNTIME_ENV
 
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     machine_runtime_root = tmp_path / "unused-machine-runtime"
@@ -893,7 +893,7 @@ def test_global_agent_status_and_stop_do_not_require_project_context(tmp_path: P
 def test_explicit_machine_runtime_root_submits_through_global_activation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+    from qqtools.plugins.qexp.agent.context import MachineRuntime
 
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
@@ -926,7 +926,7 @@ def test_explicit_machine_runtime_root_submits_through_global_activation(
 
 
 def test_managed_doctor_reads_project_local_process_evidence(tmp_path: Path, capsys) -> None:
-    from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+    from qqtools.plugins.qexp.agent.context import MachineRuntime
     from qqtools.plugins.qexp.runtime.store import atomic_replace
 
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")

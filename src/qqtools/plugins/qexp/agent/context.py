@@ -15,15 +15,15 @@ from typing import Any, Iterator
 
 from qqtools.version import __version__
 
-from .config_types import RootConfig
-from .layout import load_machine_record, load_machine_registration, load_root_config, save_machine_registration
-from .lease import lease_expiry, load_lease_policy, parse_utc
-from .runtime.locks import exclusive, machine_lock
-from .runtime.paths import local_paths, machine_project_paths, machine_runtime_paths, shared_paths
-from .runtime.ready import ReadyCursor
-from .runtime.records import utc_now
-from .runtime.store import atomic_replace, iter_json, read_json
-from .runtime.work_budget import AdaptiveBatchSizer
+from ..config_types import RootConfig
+from ..layout import load_machine_record, load_machine_registration, load_root_config, save_machine_registration
+from ..lease import lease_expiry, load_lease_policy, parse_utc
+from ..runtime.locks import exclusive, machine_lock
+from ..runtime.paths import local_paths, machine_project_paths, machine_runtime_paths, shared_paths
+from ..runtime.ready import ReadyCursor
+from ..runtime.records import utc_now
+from ..runtime.store import atomic_replace, iter_json, read_json
+from ..runtime.work_budget import AdaptiveBatchSizer
 
 MACHINE_RUNTIME_ENV = "QEXP_MACHINE_RUNTIME_ROOT"
 REGISTRY_VERSION = 1
@@ -392,7 +392,7 @@ class MachineRuntime:
                 str(self.root),
             )
             if record is None:
-                from .machine_config import save_machine_config
+                from ..machine_config import save_machine_config
 
                 save_machine_config(cfg, agent_mode=None)
             if current is not None:

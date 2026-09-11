@@ -6,7 +6,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.commands.group import create_group
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 

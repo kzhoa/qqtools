@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.machine_agent import dispatch_machine_cycle_locked
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.lifecycle import dispatch_machine_cycle_locked
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.resources.reservations import (
     ReservationIdentity,
     active_reservations,
@@ -47,14 +47,14 @@ def test_full_capacity_skips_scheduler_work_but_runs_maintenance(
     maintenance_calls: list[str] = []
 
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.machine_agent.maintain_project",
+        "qqtools.plugins.qexp.agent.lifecycle.maintain_project",
         lambda _cfg, **_kwargs: maintenance_calls.append(binding.project_id),
     )
 
     def fail_dispatch(*_args, **_kwargs):
         raise AssertionError("scheduler work must not run at full capacity")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.run_dispatch_cycle", fail_dispatch)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.run_dispatch_cycle", fail_dispatch)
 
     results = dispatch_machine_cycle_locked(
         runtime,
@@ -196,7 +196,7 @@ def test_reservation_verification_error_is_fail_closed_and_project_isolated(
         raise OSError("shared root unavailable")
 
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.machine_agent.reconcile_reservation",
+        "qqtools.plugins.qexp.agent.lifecycle.reconcile_reservation",
         fail_verification,
     )
 

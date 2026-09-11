@@ -13,13 +13,13 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.machine_agent import (
+from qqtools.plugins.qexp.agent.lifecycle import (
     get_machine_agent_status,
     restart_machine_agent,
     start_machine_agent,
     stop_machine_agent,
 )
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths
 from qqtools.plugins.qexp.runtime.resources.reservations import active_reservations
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -348,7 +348,7 @@ def test_li05_launch_boundary_has_no_duplicate_authorized_process(tmp_path: Path
 import os, sys
 from pathlib import Path
 from qqtools.plugins.qexp import scheduler
-from qqtools.plugins.qexp.machine_agent import run_machine_agent_loop
+from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
 boundary, root, reached = sys.argv[1:]
 original = scheduler.authorize_launch
 def authorize(*args, **kwargs):
@@ -433,7 +433,7 @@ raise SystemExit(result)
     agent_script = """
 import sys
 from qqtools.plugins.qexp.executor import Executor
-from qqtools.plugins.qexp.machine_agent import run_machine_agent_loop
+from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
 original = Executor.build_runner_argv
 def argv(self, *args, **kwargs):
     command = original(self, *args, **kwargs)
@@ -494,7 +494,7 @@ def test_li06_terminal_publication_is_idempotent(tmp_path: Path, boundary: str, 
 import os, sys
 from pathlib import Path
 from qqtools.plugins.qexp import lifecycle, authority, scheduler
-from qqtools.plugins.qexp.machine_agent import run_machine_agent_loop
+from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
 boundary, root, reached = sys.argv[1:]
 def crash():
     Path(reached).write_text(boundary)
@@ -769,7 +769,7 @@ def test_global_idle_policy_considers_every_binding(tmp_path: Path, modes: tuple
         [
             sys.executable,
             "-m",
-            "qqtools.plugins.qexp.machine_agent_process",
+            "qqtools.plugins.qexp.agent.process",
             "--machine-runtime-root",
             str(runtime.root),
             "--loop-interval",
@@ -811,8 +811,8 @@ def test_finished_process_releases_capacity_while_publication_is_unavailable(
 import sys
 from pathlib import Path
 from qqtools.plugins.qexp.authority import AuthoritySupervisor
-from qqtools.plugins.qexp import machine_agent
-from qqtools.plugins.qexp.machine_agent import run_machine_agent_loop
+from qqtools.plugins.qexp.agent import helpers as machine_agent
+from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
 def unavailable(self, *args, **kwargs):
     Path(sys.argv[2]).touch()
     raise OSError("injected shared terminal publication outage")
@@ -851,7 +851,9 @@ def test_global_idle_waits_for_unresolved_demand(tmp_path: Path) -> None:
     script = """
 import sys
 from pathlib import Path
-from qqtools.plugins.qexp import machine_agent
+from qqtools.plugins.qexp.agent import dispatch as machine_agent
+from qqtools.plugins.qexp.agent import lifecycle
+from qqtools.plugins.qexp.agent import lifecycle
 original = machine_agent._probe_primary_demand
 def probe(*args, **kwargs):
     Path(sys.argv[2]).touch()
@@ -859,7 +861,7 @@ def probe(*args, **kwargs):
         return machine_agent.PrimaryDemandProbe("unresolved")
     return original(*args, **kwargs)
 machine_agent._probe_primary_demand = probe
-machine_agent.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
+lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
 """
     process = subprocess.Popen(
         [sys.executable, "-c", script, str(runtime.root), str(reached), str(resolve)], start_new_session=True
@@ -876,7 +878,7 @@ machine_agent.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_g
 
 @pytest.mark.parametrize("kind", ["availability", "group_control", "cleanup"])
 def test_pending_repair_prevents_idle_exit(tmp_path: Path, kind: str) -> None:
-    from qqtools.plugins.qexp.machine_agent import _machine_is_true_idle
+    from qqtools.plugins.qexp.agent.lifecycle import _machine_is_true_idle
     from qqtools.plugins.qexp.runtime.operation_store import active_operation_path
 
     runtime = MachineRuntime(tmp_path / "machine")
@@ -899,7 +901,8 @@ def test_failed_binding_is_not_consumed_for_idle_exit(tmp_path: Path) -> None:
     script = """
 import sys
 from pathlib import Path
-from qqtools.plugins.qexp import machine_agent
+from qqtools.plugins.qexp.agent import helpers as machine_agent
+from qqtools.plugins.qexp.agent import lifecycle
 original = machine_agent._binding_config
 def config(*args):
     if not Path(sys.argv[3]).exists():
@@ -907,7 +910,7 @@ def config(*args):
         raise OSError("unreadable first binding")
     return original(*args)
 machine_agent._binding_config = config
-machine_agent.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
+lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
 """
     process = subprocess.Popen(
         [sys.executable, "-c", script, str(runtime.root), str(reached), str(allow)], start_new_session=True
@@ -935,14 +938,15 @@ def test_global_idle_does_not_reenter_registration_wait(tmp_path: Path) -> None:
     script = """
 import sys
 from pathlib import Path
-from qqtools.plugins.qexp import machine_agent
+from qqtools.plugins.qexp.agent import dispatch as machine_agent
+from qqtools.plugins.qexp.agent import lifecycle
 original = machine_agent.dispatch_machine_cycle_locked
 def cycle(*args, **kwargs):
     result = original(*args, **kwargs)
     Path(sys.argv[2]).touch()
     return result
 machine_agent.dispatch_machine_cycle_locked = cycle
-machine_agent.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
+lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
 """
     process = subprocess.Popen([sys.executable, "-c", script, str(runtime.root), str(consumed)], start_new_session=True)
     try:

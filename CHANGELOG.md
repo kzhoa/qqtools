@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- refactor: split the qexp machine agent and runtime into dependency-directed `agent/` modules while preserving CLI commands and behavior.
+- fix: warn qpipeline users when torchrun environment variables are detected without
+  `--ddp` or `--ddp-detect`, including the recognized environment keys and DDP initialization guidance.
+
 ## v1.3.16
 
 - feat: add structured, bounded qexp ready-index degradation diagnostics across scheduling,

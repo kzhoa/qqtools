@@ -95,7 +95,7 @@ def verify_integrity(
     if type(max_work_items) is not int or not 1 <= max_work_items <= GROUP_MEMBER_PAGE_SIZE:
         raise ValueError(f"max_work_items must be between 1 and {GROUP_MEMBER_PAGE_SIZE}.")
     if reservation_runtime_root is None:
-        from .machine_runtime import resolve_execution_context
+        from .agent.context import resolve_execution_context
 
         context = resolve_execution_context(cfg)
         cfg = context.local_cfg
@@ -478,7 +478,7 @@ def repair_metadata(
     if type(max_work_items) is not int or not 1 <= max_work_items <= GROUP_MEMBER_PAGE_SIZE:
         raise ValueError(f"max_work_items must be between 1 and {GROUP_MEMBER_PAGE_SIZE}.")
     if reservation_runtime_root is None:
-        from .machine_runtime import resolve_execution_context
+        from .agent.context import resolve_execution_context
 
         context = resolve_execution_context(cfg)
         cfg = context.local_cfg

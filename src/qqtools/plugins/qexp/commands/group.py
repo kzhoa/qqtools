@@ -71,7 +71,7 @@ def group_control(
     terminate_running: bool = False,
     reservation_runtime_root: Path | None = None,
 ) -> dict[str, Any]:
-    from ..machine_runtime import resolve_execution_context
+    from ..agent.context import resolve_execution_context
 
     reservation_runtime_root = reservation_runtime_root or resolve_execution_context(cfg).reservation_root
     path = group_path(cfg.shared_root, validate_group_name(name) or name)

@@ -12,7 +12,7 @@ from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.commands.cleanup import clean
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import cancel, submit
-from qqtools.plugins.qexp.machine_agent import (
+from qqtools.plugins.qexp.agent.lifecycle import (
     _MachineControlPlane,
     _pid_start_time_ticks,
     _publish_project_snapshots,
@@ -26,7 +26,7 @@ from qqtools.plugins.qexp.machine_agent import (
     start_machine_agent,
     stop_machine_agent,
 )
-from qqtools.plugins.qexp.machine_runtime import (
+from qqtools.plugins.qexp.agent.context import (
     MACHINE_RUNTIME_ENV,
     MachineRuntime,
     ProjectBinding,
@@ -198,7 +198,7 @@ def test_runtime_copy_cannot_renew_registration_on_another_host(
 ) -> None:
     host_identity = ["host-a"]
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.machine_runtime._host_instance_id",
+        "qqtools.plugins.qexp.agent.context._host_instance_id",
         lambda: host_identity[0],
     )
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
@@ -450,7 +450,8 @@ def test_migration_waits_for_legacy_reservation_lock_before_import(tmp_path: Pat
 def test_migration_disables_binding_when_final_state_write_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import qqtools.plugins.qexp.machine_agent as machine_agent
+    import qqtools.plugins.qexp.agent.lifecycle as machine_agent
+    import qqtools.plugins.qexp.agent.project_admin as project_admin
 
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     record_path = cfg.shared_root / "machines" / cfg.machine_name / "machine.json"
@@ -458,14 +459,14 @@ def test_migration_disables_binding_when_final_state_write_fails(
     record["machine"].pop("agent_runtime")
     atomic_replace(record_path, record)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
-    original_save = machine_agent._save_migration_state
+    original_save = project_admin._save_migration_state
 
     def fail_active_state(*args: object, state: str, **kwargs: object) -> None:
         if state == "active":
             raise OSError("injected final state failure")
         original_save(*args, state=state, **kwargs)
 
-    monkeypatch.setattr(machine_agent, "_save_migration_state", fail_active_state)
+    monkeypatch.setattr(project_admin, "_save_migration_state", fail_active_state)
 
     with pytest.raises(OSError, match="injected final state failure"):
         migrate_project(runtime, cfg)
@@ -477,7 +478,7 @@ def test_migration_disables_binding_when_final_state_write_fails(
 
 def test_legacy_agent_stop_treats_reused_pid_as_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from qqtools.plugins.qexp.layout import runtime_pid_path
-    from qqtools.plugins.qexp.machine_agent import _stop_verified_legacy_agent
+    from qqtools.plugins.qexp.agent.lifecycle import _stop_verified_legacy_agent
 
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     pid_path = runtime_pid_path(cfg)
@@ -485,18 +486,18 @@ def test_legacy_agent_stop_treats_reused_pid_as_stopped(tmp_path: Path, monkeypa
     pid_path.write_text("1234", encoding="utf-8")
     start_ticks = iter([100, 200, 200])
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.machine_agent.get_agent_status",
+        "qqtools.plugins.qexp.agent.lifecycle.get_agent_status",
         lambda _cfg: {"pid": 1234, "is_running": True},
     )
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.machine_agent._legacy_pid_matches",
+        "qqtools.plugins.qexp.agent.lifecycle._legacy_pid_matches",
         lambda _cfg, _pid: True,
     )
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.machine_agent._pid_start_time_ticks",
+        "qqtools.plugins.qexp.agent.lifecycle._pid_start_time_ticks",
         lambda _pid: next(start_ticks),
     )
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.os.kill", lambda _pid, _signal: None)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.os.kill", lambda _pid, _signal: None)
 
     assert _stop_verified_legacy_agent(cfg, timeout=0.0) == 1234
     assert not pid_path.exists()
@@ -759,14 +760,14 @@ def test_machine_dispatch_isolates_unreadable_roots_and_publishes_project_views(
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     first_binding = runtime.add_binding(first.shared_root, first.machine_name)
     second_binding = runtime.add_binding(second.shared_root, second.machine_name)
-    original = __import__("qqtools.plugins.qexp.machine_agent", fromlist=["_binding_config"])._binding_config
+    original = __import__("qqtools.plugins.qexp.agent.lifecycle", fromlist=["_binding_config"])._binding_config
 
     def unreadable_first(machine_runtime, binding):
         if binding == first_binding:
             raise RuntimeError("root unreadable")
         return original(machine_runtime, binding)
 
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent._binding_config", unreadable_first)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle._binding_config", unreadable_first)
     results = dispatch_machine_cycle(runtime, available_gpus=[0], executor=_RecordingExecutor())
 
     assert results[0]["project_id"] == first_binding.project_id
@@ -795,9 +796,9 @@ def test_machine_dispatch_does_not_claim_after_project_precondition_failure(
     if failure_stage == "legacy_drain":
         monkeypatch.setattr(runtime, "drain_legacy_runner_evidence", fail)
     elif failure_stage == "maintenance":
-        monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.maintain_project", fail)
+        monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.maintain_project", fail)
     else:
-        monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.AuthoritySupervisor.tick", fail)
+        monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.AuthoritySupervisor.tick", fail)
 
     results = dispatch_machine_cycle(runtime, available_gpus=[0], executor=executor)
 
@@ -827,10 +828,10 @@ def test_machine_dispatch_supervises_draining_but_revalidates_enabled_claims(
     atomic_replace(runtime.project_paths(disabled.project_id)["processes"] / "active.json", {"process": {}})
     maintained: list[Path] = []
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.machine_agent.maintain_project",
+        "qqtools.plugins.qexp.agent.lifecycle.maintain_project",
         lambda value, **_kwargs: maintained.append(value.shared_root),
     )
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.AuthoritySupervisor.tick", lambda _self: None)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.AuthoritySupervisor.tick", lambda _self: None)
 
     assert dispatch_machine_cycle(runtime, available_gpus=[0], executor=_RecordingExecutor()) == []
     assert maintained == [cfg.shared_root]
@@ -863,7 +864,7 @@ def test_machine_dispatch_reuses_supervisor_for_each_binding(tmp_path: Path, mon
         def tick(self) -> None:
             self.ticks += 1
 
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.AuthoritySupervisor", RecordingSupervisor)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.AuthoritySupervisor", RecordingSupervisor)
     supervisors = {}
 
     dispatch_machine_cycle_locked(runtime, available_gpus=[], supervisors=supervisors)
@@ -905,7 +906,7 @@ def test_machine_dispatch_continues_after_a_project_dispatch_error(
             raise RuntimeError("dispatch failed")
         return []
 
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.run_dispatch_cycle", fail_first)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.run_dispatch_cycle", fail_first)
 
     results = dispatch_machine_cycle(runtime, available_gpus=[0], executor=_RecordingExecutor())
     result_by_project = {result["project_id"]: result for result in results}
@@ -1072,7 +1073,7 @@ def test_first_registration_wait_is_consumed_without_dispatching_work(tmp_path: 
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     script = """
 import sys
-from qqtools.plugins.qexp.machine_agent import run_machine_agent_loop
+from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
 run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
 """
     environment = os.environ.copy()
@@ -1128,7 +1129,7 @@ def test_first_registration_wait_survives_stale_binding_until_adoption(tmp_path:
     atomic_replace(registration_path, {"registration": registration})
     script = """
 import sys
-from qqtools.plugins.qexp.machine_agent import run_machine_agent_loop
+from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
 run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
 """
     environment = os.environ.copy()
@@ -1239,7 +1240,7 @@ def test_machine_control_heartbeat_is_not_blocked_by_slow_maintenance(
         maintenance_started.set()
         time.sleep(0.15)
 
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.maintain_project", slow_maintenance)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.maintain_project", slow_maintenance)
     control_plane.start()
     try:
         assert heartbeat_path.exists()
@@ -1296,8 +1297,8 @@ def test_machine_control_authority_is_not_blocked_by_slow_project_maintenance(
         maintenance_started.set()
         time.sleep(0.15)
 
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.AuthoritySupervisor", RecordingSupervisor)
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.maintain_project", slow_maintenance)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.AuthoritySupervisor", RecordingSupervisor)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.maintain_project", slow_maintenance)
     control_plane = _MachineControlPlane(
         runtime,
         instance_id="test-agent",
@@ -1365,9 +1366,9 @@ def test_restart_and_activation_share_one_lifecycle_lock(tmp_path: Path, monkeyp
         finally:
             leave()
 
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.get_machine_agent_status", get_status)
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent._start_machine_agent_locked", start)
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent._stop_machine_agent_locked", stop)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.get_machine_agent_status", get_status)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle._start_machine_agent_locked", start)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle._stop_machine_agent_locked", stop)
 
     def call(operation) -> None:
         barrier.wait()
@@ -1404,8 +1405,8 @@ import signal
 import sys
 import time
 
-from qqtools.plugins.qexp.machine_agent import _pid_start_time_ticks
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.lifecycle import _pid_start_time_ticks
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.store import atomic_replace
 
 runtime = MachineRuntime(sys.argv[1])

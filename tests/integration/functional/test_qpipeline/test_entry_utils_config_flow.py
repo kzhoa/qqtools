@@ -1,10 +1,17 @@
 import argparse
+import warnings
 
 import pytest
 import torch
 
 import qqtools as qt
-from qqtools.plugins.qpipeline.cmd_args import apply_dotted_overrides, merge_basic_args, prepare_cmd_args, str2bool
+from qqtools.plugins.qpipeline.cmd_args import (
+    apply_dotted_overrides,
+    merge_basic_args,
+    prepare_cmd_args,
+    str2bool,
+    warn_if_torchrun_without_ddp,
+)
 from qqtools.plugins.qpipeline.entry_utils.loss import (
     DDPMeanReducedLoss,
     FocalLoss,
@@ -26,6 +33,27 @@ def test_str2bool_valid_and_invalid():
     assert str2bool("No") is False
     with pytest.raises(Exception):
         str2bool("not_bool")
+
+
+def test_warn_if_torchrun_without_ddp(monkeypatch):
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    with pytest.warns(UserWarning, match="LOCAL_RANK, WORLD_SIZE.*DDP initialization is only enabled.*--ddp"):
+        warn_if_torchrun_without_ddp(False)
+
+
+def test_no_torchrun_warning_when_ddp_enabled_or_environment_absent(monkeypatch):
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.delenv("MASTER_ADDR", raising=False)
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+    monkeypatch.delenv("TORCHELASTIC_RUN_ID", raising=False)
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        warn_if_torchrun_without_ddp(False)
+        warn_if_torchrun_without_ddp(True)
+    assert len(recorded) == 0
 
 
 def test_merge_basic_args_reads_yaml_and_keeps_extra(cmd_args_from_yaml, tmp_path):
