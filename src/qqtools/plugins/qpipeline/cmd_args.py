@@ -1,4 +1,5 @@
 import argparse
+import os
 import re
 import sys
 import warnings
@@ -18,6 +19,41 @@ _GENERIC_BOOL_LITERALS = {
     "f": False,
     "n": False,
 }
+
+
+_TORCHRUN_ENV_KEYS = (
+    "LOCAL_RANK",
+    "RANK",
+    "WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "TORCHELASTIC_RUN_ID",
+)
+
+
+def _has_torchrun_environment() -> tuple[str, ...]:
+    """Return recognized torchrun environment keys present in the process."""
+    detected = tuple(key for key in _TORCHRUN_ENV_KEYS if key in os.environ)
+    if "TORCHELASTIC_RUN_ID" in detected or (
+        "LOCAL_RANK" in detected and {"RANK", "WORLD_SIZE"}.intersection(detected)
+    ):
+        return detected
+    return ()
+
+
+def warn_if_torchrun_without_ddp(ddp_detect: bool) -> None:
+    """Warn when torchrun appears active but DDP detection was not enabled."""
+    detected_keys = _has_torchrun_environment()
+    if ddp_detect or not detected_keys:
+        return
+    warnings.warn(
+        "torchrun environment detected, but DDP is disabled. "
+        "Detected environment keys: "
+        f"{', '.join(detected_keys)}. DDP initialization is only enabled when "
+        "--ddp or --ddp-detect is provided; did you forget one of these flags?",
+        UserWarning,
+        stacklevel=2,
+    )
 
 
 def str2bool(v):
@@ -296,6 +332,8 @@ def prepare_cmd_args(patch=None):
     cmd_args, unknown_tokens = parser.parse_known_args(sys.argv[1:])
     override_tokens = _split_dotted_override_tokens(parser, unknown_tokens)
     cmd_args = qt.qDict.from_namespace(cmd_args)
+
+    warn_if_torchrun_without_ddp(cmd_args.ddp_detect)
 
     args = merge_basic_args(cmd_args)
     apply_dotted_overrides(args, override_tokens, parser_owned_dests, reserved_top_level_keys)
