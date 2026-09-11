@@ -16,6 +16,7 @@ from typing import Any, Iterator
 from qqtools.version import __version__
 
 from ..config_types import RootConfig
+from ..infrastructure.host import host_instance_id as _host_instance_id
 from ..layout import load_machine_record, load_machine_registration, load_root_config, save_machine_registration
 from ..lease import lease_expiry, load_lease_policy, parse_utc
 from ..runtime.locks import exclusive, machine_lock
@@ -36,18 +37,6 @@ LEGACY_AGENT_EVIDENCE = (
     "events",
 )
 LEGACY_RUNNER_INBOX = ("registrations", "observations", "launch_intents")
-
-
-def _host_instance_id() -> str:
-    """Return a host-local token that is not copied with the machine runtime."""
-    for path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
-        try:
-            value = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        if value:
-            return value
-    raise RuntimeError("qexp cannot verify host identity; machine-id is unavailable.")
 
 
 def resolve_machine_runtime_root(value: str | Path | None = None) -> Path:
