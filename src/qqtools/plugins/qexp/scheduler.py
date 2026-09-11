@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterator
 
 from .config_types import RootConfig
+from .domain.policies import group_allows
 from .infrastructure.clock import clock_evidence as _clock_evidence
 from .infrastructure.process import (
     is_process_alive as _is_process_alive,
@@ -145,19 +146,6 @@ def authority_locks(cfg: RootConfig, task: TaskRecord) -> Iterator[None]:
             yield
 
 
-def _group_allows(group: dict[str, Any], task: TaskRecord, machine: str) -> bool:
-    normalize_group_record(group)
-    if group["group"]["dispatch_state"] != "active":
-        return False
-    worker = group["group"]["worker_set"].get(machine)
-    if not worker or worker["state"] != "active":
-        return False
-    if task.placement_runtime["queue_scope"] == "home":
-        return task.placement_policy["home_machine"] == machine
-    fallback = task.placement_policy["fallback_constraint"]
-    return fallback == "group" or machine in fallback
-
-
 def _eligible(cfg: RootConfig, task: TaskRecord) -> bool:
     if task.state["projection"] != "queued" or task.claim_control.get("active_claim"):
         return False
@@ -178,7 +166,7 @@ def _eligible(cfg: RootConfig, task: TaskRecord) -> bool:
     if not task.group_name:
         return task.placement_policy["home_machine"] == cfg.machine_name
     group_file = group_path(cfg.shared_root, task.group_name)
-    return group_file.exists() and _group_allows(read_json(group_file), task, cfg.machine_name)
+    return group_file.exists() and group_allows(read_json(group_file), task, cfg.machine_name)
 
 
 def _task_worker_role(cfg: RootConfig, task: TaskRecord) -> str | None:
@@ -503,7 +491,7 @@ def resume_starting_attempt(
             return None
         elif not _has_active_launch_reservation(task, claim, reservation_runtime_root):
             cancel_result = _cancel_prelaunch_locked(cfg, task, "launch_reservation_lost", {"claimed", "starting"})
-        elif task.group_name and not _group_allows(
+        elif task.group_name and not group_allows(
             read_json(group_path(cfg.shared_root, task.group_name)), task, cfg.machine_name
         ):
             cancel_result = _cancel_prelaunch_locked(cfg, task, "worker_or_dispatch_changed", {"claimed", "starting"})
@@ -592,7 +580,7 @@ def authorize_launch(
             cancel_result = _cancel_prelaunch_locked(cfg, task, "launch_reservation_lost")
         elif task.group_name:
             group = read_json(group_path(cfg.shared_root, task.group_name))
-            if not _group_allows(group, task, cfg.machine_name):
+            if not group_allows(group, task, cfg.machine_name):
                 cancel_result = _cancel_prelaunch_locked(cfg, task, "worker_or_dispatch_changed")
             else:
                 claim["group_dispatch_epoch"] = group["group"]["dispatch_epoch"]
