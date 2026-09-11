@@ -940,12 +940,12 @@ import sys
 from pathlib import Path
 from qqtools.plugins.qexp.agent import dispatch as machine_agent
 from qqtools.plugins.qexp.agent import lifecycle
-original = machine_agent.dispatch_machine_cycle_locked
+original = machine_agent.dispatch_loop_machine_cycle_locked
 def cycle(*args, **kwargs):
     result = original(*args, **kwargs)
     Path(sys.argv[2]).touch()
     return result
-machine_agent.dispatch_machine_cycle_locked = cycle
+machine_agent.dispatch_loop_machine_cycle_locked = cycle
 lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
 """
     process = subprocess.Popen([sys.executable, "-c", script, str(runtime.root), str(consumed)], start_new_session=True)
