@@ -1,16 +1,24 @@
 """Project registration and migration workflows."""
+
 from __future__ import annotations
 
 import os
 import shlex
 import signal
 import time
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from ..config_types import RootConfig
-from ..layout import load_machine_record, load_root_config, runtime_pid_path
+from ..layout import (
+    load_machine_record,
+    load_machine_registration,
+    load_root_config,
+    runtime_pid_path,
+    save_machine_registration,
+)
 from ..legacy_agent import get_agent_status
 from ..machine_config import is_legacy_agent_project, save_machine_config
 from ..runtime.locks import exclusive
@@ -18,7 +26,7 @@ from ..runtime.paths import local_paths
 from ..runtime.records import utc_now
 from ..runtime.store import atomic_replace, iter_json, read_json
 from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
-from .helpers import _pid_start_time_ticks
+from .helpers import _active_machine_identity, _pid_start_time_ticks
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,12 +213,49 @@ def migrate_project(runtime: MachineRuntime | str | Path | None, cfg: RootConfig
     if existing is None:
         if not is_legacy_agent_project(cfg):
             raise ValueError("project already uses the machine-agent runtime; use 'qexp agent add-project'.")
-        binding = machine_runtime.add_binding(
-            cfg.shared_root,
-            cfg.machine_name,
-            enabled=False,
-            adopt_existing=True,
-        )
+        try:
+            binding = machine_runtime.add_binding(
+                cfg.shared_root,
+                cfg.machine_name,
+                enabled=False,
+                adopt_existing=True,
+            )
+        except ValueError as exc:
+            # A bootstrap runtime may have registered this legacy project before
+            # migration selected the machine runtime used today.  If that owner
+            # has no verified live agent, fence its stale registration and retry
+            # adoption.  A live owner remains a competing authority and is
+            # rejected by the normal registration guard.
+            if "active competing authority" not in str(exc):
+                raise
+            registration = load_machine_registration(cfg).get("registration", {})
+            owner_root = registration.get("runtime_root") if isinstance(registration, dict) else None
+            generation = registration.get("generation") if isinstance(registration, dict) else None
+            if not isinstance(owner_root, str) or not isinstance(generation, str):
+                raise
+            owner_runtime = MachineRuntime(owner_root)
+            if _active_machine_identity(owner_runtime) is not None:
+                raise
+            with machine_runtime._registration_guard(cfg):
+                raw_current = load_machine_registration(cfg)
+                current = raw_current.get("registration") if isinstance(raw_current, dict) else None
+                if not isinstance(current, dict) or current.get("generation") != generation:
+                    raise
+                current = dict(current)
+                current.update(
+                    {
+                        "state": "superseded",
+                        "superseded_by_generation": uuid.uuid4().hex,
+                        "updated_at": utc_now(),
+                    }
+                )
+                save_machine_registration(cfg, {"registration": current})
+            binding = machine_runtime.add_binding(
+                cfg.shared_root,
+                cfg.machine_name,
+                enabled=False,
+                adopt_existing=True,
+            )
         prepared_at = utc_now()
         _save_migration_state(machine_runtime, binding, cfg, state="prepared", prepared_at=prepared_at)
     else:
