@@ -5,7 +5,7 @@ import qqtools.torch.ddp.qbalancedsampler as qbs
 
 
 @pytest.mark.parametrize("sampler_type", [qbs.BalancedBatchSampler, qbs.BalancedDistributedSampler])
-@pytest.mark.parametrize("name", ["shuffle", "drop_last"])
+@pytest.mark.parametrize("name", ["shuffle", "drop_last", "pad"])
 @pytest.mark.parametrize("value", ["False", "True", 0, 1, None, [], np.array([True])])
 def test_boolean_settings_reject_implicit_truthiness(sampler_type, name, value, monkeypatch):
     def unexpected_plan(*args, **kwargs):
@@ -31,6 +31,12 @@ def test_seed_rejects_negative_values(sampler_type, seed):
 
 
 @pytest.mark.parametrize("sampler_type", [qbs.BalancedBatchSampler, qbs.BalancedDistributedSampler])
+def test_pad_rejects_drop_last(sampler_type):
+    with pytest.raises(ValueError, match="pad=True.*drop_last=True"):
+        sampler_type([1, 2], batch_size=1, drop_last=True, pad=True)
+
+
+@pytest.mark.parametrize("sampler_type", [qbs.BalancedBatchSampler, qbs.BalancedDistributedSampler])
 @pytest.mark.parametrize("should_shuffle", [False, True])
 @pytest.mark.parametrize("should_drop", [False, True])
 def test_numpy_scalar_settings_match_python_settings(sampler_type, should_shuffle, should_drop):
@@ -41,6 +47,7 @@ def test_numpy_scalar_settings_match_python_settings(sampler_type, should_shuffl
         world_size=np.int64(1),
         shuffle=np.bool_(should_shuffle),
         drop_last=np.bool_(should_drop),
+        pad=np.bool_(not should_drop),
         seed=np.uint64(7),
     )
     python_sampler = sampler_type(
@@ -50,6 +57,7 @@ def test_numpy_scalar_settings_match_python_settings(sampler_type, should_shuffl
         world_size=1,
         shuffle=should_shuffle,
         drop_last=should_drop,
+        pad=not should_drop,
         seed=7,
     )
     for epoch in (0, 1, 3):

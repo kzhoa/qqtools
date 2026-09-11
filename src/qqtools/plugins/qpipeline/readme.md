@@ -47,12 +47,17 @@ python train.py \
 
 ## DDP eval dedup
 
-`runner.ddp_eval_dedup` is only meant for DDP eval/infer cases where the sampler pads repeated
-logical samples to keep per-rank step counts aligned.
+`runner.ddp_eval_dedup` is only meant for DDP eval/infer cases where the sampler or qPipeline
+execution view pads repeated logical samples to keep per-rank step counts aligned. qPipeline
+creates that view automatically for a one-step tail mismatch without changing the user loader.
+Synthetic occurrences are removed before metrics and outputs are gathered.
 
 It is not a general-purpose dedup mechanism. If a sampler intentionally repeats the same logical
 sample as part of its designed semantics, this deduper does not guarantee that those repeated
 occurrences will be preserved as distinct outputs.
+When deduplication is disabled, mismatched rank step counts fail before forward. Automatic
+padding requires an observable map-style sampler or batch sampler whose indices are stable sample
+identities; unsupported custom loaders fail with a diagnostic instead of entering a collective.
 
 
 # trainPipeline

@@ -68,8 +68,10 @@ def test_loader_delegates_strategy_and_order(dataset, monkeypatch, should_shuffl
 
 @pytest.mark.integration
 def test_loader_inherits_default_validation_tail_policy(dataset):
-    with pytest.raises(ValueError, match="Non-shuffled LPT"):
-        dataset.to_dataloader(batch_size=4, shuffle=False)
+    loader = dataset.to_dataloader(batch_size=4, shuffle=False)
+    observed = [int(value) for batch in loader for value in batch["id"]]
+    assert len(observed) == 8
+    assert set(observed) == set(range(6))
     loader = dataset.to_dataloader(batch_size=4, shuffle=False, drop_last=True)
     observed = [int(value) for batch in loader for value in batch["id"]]
     assert len(observed) == len(set(observed)) == 4

@@ -585,6 +585,7 @@ class qLmdbDataset(qLmdbDatasetBase):
         *,
         shuffle: bool = True,
         drop_last: bool = False,
+        pad: bool | None = None,
         num_workers: int = 0,
         pin_memory: bool = False,
         persistent_workers: bool = False,
@@ -595,14 +596,16 @@ class qLmdbDataset(qLmdbDatasetBase):
         """Build a plain or balance-aware dataloader.
 
         Balanced loaders use the sampler's default strategy, independently of the
-        dataset's balance_strategy and cached sample_order. With the current LPT
-        default, shuffle=False requires the sample count to be divisible by
-        batch_size * world_size, or drop_last=True.
+        dataset's balance_strategy and cached sample_order. ``pad`` defaults to
+        ``True`` unless ``drop_last=True`` (where it resolves to ``False`` for
+        compatibility with fixed-size training loaders).
 
         Args:
             batch_size: Number of samples assigned to each rank-local batch.
             shuffle: Whether to generate a seed- and epoch-dependent balanced order.
             drop_last: Whether to drop an incomplete global batch window.
+            pad: Whether to repeat tail occurrences to equalize DDP steps. When omitted,
+                defaults to True unless ``drop_last`` is enabled.
             num_workers: Number of dataloader worker processes.
             pin_memory: Whether dataloader workers should pin returned tensors.
             persistent_workers: Whether workers should remain alive between epochs.
@@ -630,6 +633,9 @@ class qLmdbDataset(qLmdbDatasetBase):
             multiprocessing_context,
         )
 
+        if pad is not None and not isinstance(pad, (bool, np.bool_)):
+            raise TypeError(f"pad must be a boolean or None, got {pad!r}")
+
         graph_mode = self.is_graph if is_graph is None else bool(is_graph)
         if not self._balance.enabled:
             return qDictDataloader(
@@ -645,12 +651,14 @@ class qLmdbDataset(qLmdbDatasetBase):
                 is_graph=graph_mode,
             )
 
+        effective_pad = (not bool(drop_last)) if pad is None else bool(pad)
         batch_sampler = BalancedBatchSampler(
             self.sample_costs,
             batch_size=batch_size,
             shuffle=bool(shuffle),
             seed=self.balance_seed,
             drop_last=bool(drop_last),
+            pad=effective_pad,
         )
         return qDictDataloader(
             dataset=self,

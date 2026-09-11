@@ -92,6 +92,7 @@ class _BalancedPlanCache:
     shuffle: bool
     seed: int
     drop_last: bool
+    pad: bool
     sample_order: np.ndarray | None
     strategy: str
     epoch: int = 0
@@ -101,16 +102,11 @@ class _BalancedPlanCache:
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        if self.pad and self.drop_last:
+            raise ValueError("pad=True cannot be combined with drop_last=True")
         if self.strategy in _LPT_STRATEGIES:
             if self.sample_order is not None:
                 raise ValueError(f"strategy={self.strategy!r} cannot be combined with sample_order")
-            remainder = len(self.sample_costs) % (self.batch_size * self.world_size)
-            if remainder and not self.shuffle and not self.drop_last:
-                raise ValueError(
-                    "Non-shuffled LPT requires N divisible by batch_size * world_size "
-                    "when drop_last=False; validation padding would duplicate samples. "
-                    "Use drop_last=True only if discarding samples is intended."
-                )
             self._lpt_plan = _plan_rank_batches(
                 self.sample_costs,
                 batch_size=self.batch_size,
@@ -134,13 +130,30 @@ class _BalancedPlanCache:
 
     def _build_rank_local_plan(self, epoch: int) -> np.ndarray:
         if self._lpt_plan is not None:
+            steps = np.arange(len(self._lpt_plan), dtype=np.int64)
+            rank_order = np.broadcast_to(np.arange(self.world_size), (len(steps), self.world_size))
             if not self.shuffle:
-                return np.ascontiguousarray(self._lpt_plan[:, self.rank, :].reshape(-1))
-            rng = np.random.default_rng(self.seed + epoch)
-            steps = rng.permutation(len(self._lpt_plan))
-            ranks = np.broadcast_to(np.arange(self.world_size), (len(steps), self.world_size))
-            ranks = rng.permuted(ranks, axis=1)
-            return np.ascontiguousarray(self._lpt_plan[steps, ranks[:, self.rank], :].reshape(-1))
+                pass
+            else:
+                rng = np.random.default_rng(self.seed + epoch)
+                steps = rng.permutation(len(self._lpt_plan))
+                rank_order = rng.permuted(rank_order, axis=1)
+            selected_batches = self._lpt_plan[steps, rank_order[:, self.rank], :]
+            if self.pad:
+                return np.ascontiguousarray(selected_batches.reshape(-1))
+
+            seen: set[int] = set()
+            local_indices: list[int] = []
+            for step_idx, rank_indices in zip(steps.tolist(), rank_order.tolist()):
+                for rank_idx in rank_indices:
+                    batch = self._lpt_plan[step_idx, rank_idx]
+                    for sample_idx in batch.tolist():
+                        if sample_idx in seen:
+                            continue
+                        seen.add(sample_idx)
+                        if rank_idx == self.rank:
+                            local_indices.append(int(sample_idx))
+            return np.asarray(local_indices, dtype=np.int64)
         total = int(self.sample_costs.shape[0])
         global_chunk_size = self.world_size * self.batch_size
         if self.shuffle:
@@ -161,7 +174,7 @@ class _BalancedPlanCache:
 
         if remainder and self.drop_last:
             global_order = global_order[: total - remainder]
-        elif remainder:
+        elif remainder and self.pad:
             target_size = total + (global_chunk_size - remainder)
             global_order = _build_prefix_padding(global_order, target_size)
 
@@ -207,8 +220,10 @@ class BalancedDistributedSampler(Sampler[int]):
             balanced order, not dataset order. Call set_epoch on every rank each epoch.
         seed: Nonnegative integer random seed, shared across ranks. Booleans are invalid.
         drop_last: Boolean. Drop the remainder of a global batch when True. With LPT,
-            False pads training data but rejects non-divisible input if shuffle=False.
+            use pad=True to repeat tail occurrences or pad=False to preserve an uneven tail.
             Dropped or repeated sample occurrences stay fixed across epochs.
+        pad: Boolean. Repeat deterministic tail occurrences when True. ``pad=True`` and
+            ``drop_last=True`` are mutually exclusive.
         sample_order: Legacy V-only permutation used when shuffle=False. LPT rejects it.
         strategy: Planning tier: lpt_fast, lpt-medium (alias/default lpt), or lpt_best.
             Legacy v1 through v3 are deprecated and scheduled for removal in v1.4.0.
@@ -234,8 +249,8 @@ class BalancedDistributedSampler(Sampler[int]):
     from a small repair pool using the base seed, or discarded with ``drop_last=True``;
     at most 2*world_size-1 base batches are regrouped by tail repair (derived step
     optimization can touch other batches in the derived plan). Changing epochs does
-    not change those occurrences. Non-shuffled LPT rejects non-divisible input unless
-    dropping is explicitly requested, preventing silent validation duplicates.
+    not change those occurrences. ``pad=False`` preserves non-divisible input without tail
+    duplicates; rank-local plans may end with an incomplete batch.
     This strategy is sampler-only; dataset ordering and LMDB artifacts are unchanged.
     Legacy sampler strategies ``v1`` through ``v3`` are deprecated and will be removed
     in v1.4.0. The default is ``lpt``, normalized internally to ``lpt-medium``.
@@ -251,10 +266,11 @@ class BalancedDistributedSampler(Sampler[int]):
         shuffle: bool = True,
         seed: int = 0,
         drop_last: bool = False,
+        pad: bool = True,
         sample_order: Sequence[int] | np.ndarray | None = None,
         strategy: str = "lpt",
     ) -> None:
-        for name, value in (("shuffle", shuffle), ("drop_last", drop_last)):
+        for name, value in (("shuffle", shuffle), ("drop_last", drop_last), ("pad", pad)):
             if not isinstance(value, (bool, np.bool_)):
                 raise TypeError(f"{name} must be a boolean, got {value!r}")
         if isinstance(seed, (bool, np.bool_)) or not isinstance(seed, (int, np.integer)):
@@ -285,16 +301,17 @@ class BalancedDistributedSampler(Sampler[int]):
             shuffle=bool(shuffle),
             seed=int(seed),
             drop_last=bool(drop_last),
+            pad=bool(pad),
             sample_order=validated_order,
             strategy=validated_strategy,
         )
+        self.pad = bool(pad)
         # QQTOOLS-COMPAT-0006: remove legacy sampler strategies and warning in v1.4.0.
         if validated_strategy not in _LPT_STRATEGIES:
             warnings.warn(
                 f"Sampler strategy={validated_strategy!r} is deprecated and will be removed "
                 "in v1.4.0. Switch to 'lpt_fast', 'lpt-medium' (alias 'lpt'), or 'lpt_best'. "
-                "LPT changes sample grouping/order, does not accept sample_order, and requires "
-                "divisible input or drop_last=True when shuffle=False.",
+                "LPT changes sample grouping/order and does not accept sample_order.",
                 FutureWarning,
                 stacklevel=2,
             )
@@ -326,8 +343,10 @@ class BalancedBatchSampler(BatchSampler):
             or within-batch order. False means deterministic balanced order.
         seed: Nonnegative integer shared across ranks; booleans are invalid.
         drop_last: Boolean. Drop an incomplete global batch when True. Otherwise LPT
-            pads with shuffle=True and rejects non-divisible input with shuffle=False.
+            follows ``pad`` for tail repetition or uneven rank-local tails.
             Dropped/repeated occurrences remain fixed across epochs for LPT.
+        pad: Boolean. Repeat deterministic tail occurrences when True. ``pad=True`` and
+            ``drop_last=True`` are mutually exclusive.
         sample_order: Legacy V-only permutation for shuffle=False; invalid with LPT.
         strategy: lpt_fast, lpt-medium (alias/default lpt), or lpt_best. Deprecated
             v1 through v3 remain available until v1.4.0.
@@ -348,6 +367,7 @@ class BalancedBatchSampler(BatchSampler):
         shuffle: bool = True,
         seed: int = 0,
         drop_last: bool = False,
+        pad: bool = True,
         sample_order: Sequence[int] | np.ndarray | None = None,
         strategy: str = "lpt",
     ) -> None:
@@ -359,11 +379,13 @@ class BalancedBatchSampler(BatchSampler):
             shuffle=shuffle,
             seed=seed,
             drop_last=drop_last,
+            pad=pad,
             sample_order=sample_order,
             strategy=strategy,
         )
         self.batch_size = int(batch_size)
         self.drop_last = bool(drop_last)
+        self.pad = bool(pad)
         self._plan_cache = self.sampler._plan_cache
 
     def __iter__(self):

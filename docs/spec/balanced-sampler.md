@@ -17,7 +17,7 @@ Prefer `BalancedBatchSampler` with `DataLoader(dataset, batch_sampler=sampler)`;
 do not also pass batch size, shuffle, sampler, or drop policy to the DataLoader.
 With `BalancedDistributedSampler`, the DataLoader batch size must match the sampler's.
 
-`shuffle` and `drop_last` accept Python or NumPy boolean scalars only, not strings
+`shuffle`, `drop_last`, and `pad` accept Python or NumPy boolean scalars only, not strings
 or integers. `seed` accepts a nonnegative Python or NumPy integer, excluding booleans;
 floats are rejected rather than truncated. Validation occurs before plan generation.
 
@@ -31,6 +31,12 @@ call `set_epoch` on every rank. `shuffle=False` means deterministic balanced ord
 not original dataset order. The tail policy below applies to a global batch, and
 dropped/repeated occurrences remain fixed across epochs. `sample_order` is a legacy
 V-only option, not an LPT tuning parameter.
+
+`pad=True` is the default and repeats deterministic tail occurrences so every rank has
+the same number of batches. `pad=False` preserves every real occurrence without adding
+duplicates; rank-local plans may then have an incomplete final batch. `pad=True` and
+`drop_last=True` are mutually exclusive. Use `pad=False, drop_last=True` to discard an
+incomplete global tail.
 
 ## Public batch grouping API
 
@@ -79,8 +85,8 @@ or the dataset-level `balance_strategy` setting used for LMDB artifacts.
 `qLmdbDataset.to_dataloader()` delegates strategy selection to the sampler default;
 it passes neither `strategy` nor the dataset's cached `sample_order`. Dataset-level
 `balance_strategy` controls only dataset artifacts. The loader inherits the sampler's
-tail rules: with the current LPT default, `shuffle=False` and `drop_last=False`
-require `N` divisible by `batch_size * world_size`, rather than padding validation data.
+tail rules: padding is enabled by default. Its `pad` argument defaults to True unless
+`drop_last=True`, where it resolves to False for compatibility with fixed-size training.
 
 ### Legacy sampler strategy deprecation
 
@@ -91,9 +97,8 @@ functional when explicitly selected until removal in v1.4.0. Default constructio
 ordering strategies or `compute_global_even_sort_order`, which cannot consume LPT plans.
 
 Choose `lpt_fast`, `lpt-medium` (or `lpt`), or `lpt_best` explicitly to migrate.
-Migration changes sample grouping and traversal; LPT rejects `sample_order`, preserves
-batch membership across epochs, and rejects non-divisible validation input unless
-`drop_last=True`. It is the recommended fixed-size cost-balancing family, not a guarantee
+Migration changes sample grouping and traversal; LPT rejects `sample_order` and preserves
+batch membership across epochs. It is the recommended fixed-size cost-balancing family, not a guarantee
 of better runtime or peak cost for every input, nor of equivalent training randomness.
 GPU memory safety and convergence remain unverified. The sampler default changes from
 `v3` to `lpt` in this release, so callers omitting `strategy` also adopt the grouping,
@@ -315,9 +320,9 @@ The selected occurrences remain fixed across epochs.
 |---|---|
 | Empty dataset | Empty plan |
 | N divisible by G | Each sample exactly once; equal complete batches on all ranks |
-| Non-divisible, `drop_last=True` | Drop exactly N % G samples from the repair pool, with no duplicates |
-| Non-divisible, `shuffle=True, drop_last=False` | Preserve every sample and add exactly G - N % G occurrences from the pool |
-| Non-divisible, `shuffle=False, drop_last=False` | Raise `ValueError` before iteration |
+| Non-divisible, `pad=False, drop_last=True` | Drop exactly N % G samples from the repair pool, with no duplicates |
+| Non-divisible, `pad=True` | Preserve every sample and add deterministic tail occurrences |
+| Non-divisible, `pad=False, drop_last=False` | Preserve every sample with uneven rank-local tails |
 
 Dropping omits the same samples each epoch; padding repeats the same selected occurrences and may
 place duplicates within a batch. Neither should be interpreted as exact-once evaluation.
@@ -460,9 +465,12 @@ and avoids repeating optimization each epoch; no high-confidence review issue re
 Integration uses actual DataLoaders with ranks simulated in one process, not real multi-GPU
 training. Persistent-cache integrity and cross-process cache coordination are out of scope
 because no persistent cache has been introduced.
-For validation with `shuffle=False, drop_last=False`, non-divisible inputs are rejected to avoid
-silently biased metrics. Do not enable shuffling or dropping merely to bypass this check for
-validation. General exact-once DDP validation tails require a separate execution/masking design.
+For DDP evaluation and inference, qPipeline may create a temporary padded execution view when
+rank step counts differ by one. The original loader and sampler remain unchanged; synthetic
+occurrences carry stable dataset identities and are removed by `DDPOutputDeduper` before
+metrics or outputs are gathered. Loaders must expose observable map-style sampler indices.
+Larger imbalances or unsupported custom samplers fail before forward rather than risking a
+collective desynchronization.
 
 ## Scope and Limitations
 

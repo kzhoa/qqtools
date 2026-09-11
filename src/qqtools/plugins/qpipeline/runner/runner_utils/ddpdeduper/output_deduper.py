@@ -221,7 +221,29 @@ class DDPOutputDeduper:
         local_batches: Sequence[Sequence[Any]],
     ) -> tuple[list[list[OccurrenceKey]], dict[int, bool], set[Any]]:
         gathered_batches = _all_gather_object([list(batch) for batch in local_batches])
-        max_steps = max((len(rank_batches) for rank_batches in gathered_batches), default=0)
+        step_counts = [len(rank_batches) for rank_batches in gathered_batches]
+        max_steps = max(step_counts, default=0)
+        min_steps = min(step_counts, default=0)
+        if max_steps - min_steps > 1:
+            counts = {rank: count for rank, count in enumerate(step_counts)}
+            raise RuntimeError(
+                "DDP evaluation loader batch-count imbalance is too large for automatic padding: "
+                f"stage execution counts={counts}. Only a one-step tail difference is supported."
+            )
+
+        padded_batches: list[list[list[Any]]] = []
+        for rank_idx, rank_batches in enumerate(gathered_batches):
+            rank_copy = [list(batch) for batch in rank_batches]
+            missing_steps = max_steps - len(rank_copy)
+            if missing_steps:
+                if not rank_copy or not rank_copy[-1]:
+                    raise TypeError(
+                        "DDP evaluation loader cannot be automatically padded because rank "
+                        f"{rank_idx} has no observable tail batch to repeat."
+                    )
+                rank_copy.extend([list(rank_copy[-1]) for _ in range(missing_steps)])
+            padded_batches.append(rank_copy)
+
         global_seen: set[Any] = set()
         local_real_slots: dict[int, bool] = {}
         local_occurrence_batches: list[list[OccurrenceKey]] = []
@@ -231,13 +253,13 @@ class DDPOutputDeduper:
 
         for step_idx in range(max_steps):
             step_occurrence_batch: Optional[list[OccurrenceKey]] = None
-            for rank_idx, rank_batches in enumerate(gathered_batches):
-                if step_idx >= len(rank_batches):
-                    continue
+            for rank_idx, rank_batches in enumerate(padded_batches):
                 batch = rank_batches[step_idx]
+                is_synthetic_step = step_idx >= len(gathered_batches[rank_idx])
                 for logical_id in batch:
-                    is_real = logical_id not in global_seen
-                    global_seen.add(logical_id)
+                    is_real = not is_synthetic_step and logical_id not in global_seen
+                    if is_real:
+                        global_seen.add(logical_id)
                     if rank_idx != self.rank:
                         continue
                     occurrence_key = OccurrenceKey(slot=local_slot, logical_sample_id=logical_id)
@@ -323,14 +345,13 @@ def prepare_eval_loader_for_ddp(
     if not distributed:
         return loader
 
-    if should_validate_batch_counts:
+    if not enabled:
         validate_eval_loader_batch_counts(
             loader,
             stage=stage,
             loader_name=loader_name,
             distributed=True,
         )
-    if not enabled:
         return loader
     return wrap_eval_dataloader_for_ddp_dedup(
         loader,
