@@ -68,6 +68,9 @@ def test_feishu_payload_and_business_success():
             "tag": "markdown",
             "content": "\n".join(
                 (
+                    "- **Project ID**: `（未记录）`",
+                    "- **Project**: `（未记录）`",
+                    "- **Task Name**: `（未记录）`",
                     "- **Task ID**: `task-a`",
                     "- **Attempt ID**: `attempt-a`",
                     "- **原因**: `nonzero_exit`",
