@@ -222,6 +222,7 @@ class RunningAgent:
                 epoch=self.state.epoch,
                 global_step=self.state.global_step,
                 total_batches=total_batches,
+                max_epochs=self.config.max_epochs,
             ),
         )
 

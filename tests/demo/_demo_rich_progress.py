@@ -26,6 +26,7 @@ def main():
                 epoch=epoch,
                 global_step=epoch * batches_per_epoch,
                 total_batches=batches_per_epoch,
+                max_epochs=total_epochs,
             )
         )
 
