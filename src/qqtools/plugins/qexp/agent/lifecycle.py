@@ -33,8 +33,8 @@ from .context import MachineRuntime, ProjectBinding, default_machine_runtime_roo
 from .helpers import _active_machine_identity, _machine_is_true_idle, _read_pid, _pid_start_time_ticks, _publish_project_snapshots, _publish_process_status, _consume_first_registered_binding
 from . import helpers as _helpers
 from .control_plane import _MachineControlPlane
-from . import dispatch as _dispatch
-from .dispatch import dispatch_machine_cycle
+from . import dispatch_loop as _dispatch
+from .dispatch_loop import dispatch_machine_cycle
 from .project_admin import migrate_project, _stop_verified_legacy_agent
 from ..machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from ..project_maintenance import maintain_project, reconcile_reservation
