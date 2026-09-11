@@ -13,13 +13,13 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import (
     get_machine_agent_status,
     restart_machine_agent,
     start_machine_agent,
     stop_machine_agent,
 )
-from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths
 from qqtools.plugins.qexp.runtime.resources.reservations import active_reservations
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -851,8 +851,7 @@ def test_global_idle_waits_for_unresolved_demand(tmp_path: Path) -> None:
     script = """
 import sys
 from pathlib import Path
-from qqtools.plugins.qexp.agent import dispatch as machine_agent
-from qqtools.plugins.qexp.agent import lifecycle
+from qqtools.plugins.qexp.agent import dispatch_loop as machine_agent
 from qqtools.plugins.qexp.agent import lifecycle
 original = machine_agent._probe_primary_demand
 def probe(*args, **kwargs):
@@ -938,14 +937,14 @@ def test_global_idle_does_not_reenter_registration_wait(tmp_path: Path) -> None:
     script = """
 import sys
 from pathlib import Path
-from qqtools.plugins.qexp.agent import dispatch as machine_agent
+from qqtools.plugins.qexp.agent import dispatch_loop as machine_agent
 from qqtools.plugins.qexp.agent import lifecycle
-original = machine_agent.dispatch_loop_machine_cycle_locked
+original = machine_agent.dispatch_machine_cycle_locked
 def cycle(*args, **kwargs):
     result = original(*args, **kwargs)
     Path(sys.argv[2]).touch()
     return result
-machine_agent.dispatch_loop_machine_cycle_locked = cycle
+machine_agent.dispatch_machine_cycle_locked = cycle
 lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
 """
     process = subprocess.Popen([sys.executable, "-c", script, str(runtime.root), str(consumed)], start_new_session=True)

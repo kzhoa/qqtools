@@ -30,7 +30,7 @@ def _projection_rebuild_lock_path(cfg: object) -> Path:
 
 
 @contextmanager
-def projection_rebuild_lock(cfg: object):
+def projection_lock(cfg: object):
     """Serialize primary projection mutations with a full rebuild."""
     with exclusive(_projection_rebuild_lock_path(cfg)):
         yield
@@ -53,7 +53,7 @@ def is_projection_active(cfg: object) -> bool:
         return False
 
 
-def rebuild_record(cfg: object) -> dict[str, Any] | None:
+def _read_projection_state(cfg: object) -> dict[str, Any] | None:
     """Return the optional durable owner record for a candidate rebuild."""
     path = projection_state_path(cfg)
     if not path.exists():
@@ -62,9 +62,9 @@ def rebuild_record(cfg: object) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def accepts_updates_under_lock(cfg: object) -> bool:
+def can_update_projection_under_lock(cfg: object) -> bool:
     """Return whether a caller holding the projection lock may write candidates."""
-    primary = rebuild_record(cfg)
+    primary = _read_projection_state(cfg)
     return bool(
         primary is not None
         and primary.get("schema_version") == PRIMARY_READY_PROTOCOL_VERSION
@@ -88,7 +88,7 @@ def _primary_machines_for_task(cfg: object, task: TaskRecord) -> list[str]:
     return sorted(machine for machine, worker in workers.items() if worker["scheduling_role"] == "primary")
 
 
-def _candidate_value(reference: ReadyMarkerRef) -> dict[str, Any]:
+def _serialize_candidate(reference: ReadyMarkerRef) -> dict[str, Any]:
     return {
         "primary_ready_candidate": {
             "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
@@ -103,7 +103,7 @@ def _candidate_value(reference: ReadyMarkerRef) -> dict[str, Any]:
     }
 
 
-def remove_candidate_everywhere_under_lock(cfg: object, identity: str) -> None:
+def remove_candidate_from_all_routes_under_lock(cfg: object, identity: str) -> None:
     """Remove a candidate while the caller holds the projection lock."""
     routes = shared_paths(cfg.shared_root)["ready_primary"] / "routes"
     if not routes.exists():
@@ -113,9 +113,9 @@ def remove_candidate_everywhere_under_lock(cfg: object, identity: str) -> None:
             candidate_path(cfg, route.name, identity).unlink(missing_ok=True)
 
 
-def remove_candidate_everywhere(cfg: object, identity: str) -> None:
-    with projection_rebuild_lock(cfg):
-        remove_candidate_everywhere_under_lock(cfg, identity)
+def remove_candidate_from_all_routes(cfg: object, identity: str) -> None:
+    with projection_lock(cfg):
+        remove_candidate_from_all_routes_under_lock(cfg, identity)
 
 
 def _remove_candidate_from_machines_under_lock(
@@ -128,7 +128,7 @@ def _remove_candidate_from_machines_under_lock(
         candidate_path(cfg, candidate_route, reference.identity).unlink(missing_ok=True)
 
 
-def sync_candidate_under_lock(
+def sync_task_candidate_under_lock(
     cfg: object,
     task: TaskRecord,
     reference: ReadyMarkerRef,
@@ -136,19 +136,19 @@ def sync_candidate_under_lock(
     should_require_active: bool = True,
 ) -> None:
     """Synchronize one candidate while the caller holds the projection lock."""
-    if should_require_active and not accepts_updates_under_lock(cfg):
+    if should_require_active and not can_update_projection_under_lock(cfg):
         return
-    remove_candidate_everywhere_under_lock(cfg, reference.identity)
+    remove_candidate_from_all_routes_under_lock(cfg, reference.identity)
     for machine in _primary_machines_for_task(cfg, task):
         candidate_route = route_key(reference.queue_scope, machine)
         route = route_path(cfg, candidate_route)
         route.mkdir(parents=True, exist_ok=True)
-        atomic_replace(candidate_path(cfg, candidate_route, reference.identity), _candidate_value(reference))
+        atomic_replace(candidate_path(cfg, candidate_route, reference.identity), _serialize_candidate(reference))
 
 
-def sync_candidate(cfg: object, task: TaskRecord, reference: ReadyMarkerRef) -> None:
-    with projection_rebuild_lock(cfg):
-        sync_candidate_under_lock(cfg, task, reference)
+def sync_task_candidate(cfg: object, task: TaskRecord, reference: ReadyMarkerRef) -> None:
+    with projection_lock(cfg):
+        sync_task_candidate_under_lock(cfg, task, reference)
 
 
 def _primary_member_machines(
@@ -177,7 +177,7 @@ def sync_member_candidate_under_lock(
     for machine in sorted(current_machines - previous_machines):
         candidate_route = route_key(reference.queue_scope, machine)
         route_path(cfg, candidate_route).mkdir(parents=True, exist_ok=True)
-        atomic_replace(candidate_path(cfg, candidate_route, reference.identity), _candidate_value(reference))
+        atomic_replace(candidate_path(cfg, candidate_route, reference.identity), _serialize_candidate(reference))
 
 
 def _fsync_directory(path: Path) -> None:
@@ -209,8 +209,8 @@ def park_projection_under_lock(cfg: object, build_id: str) -> None:
 def begin_primary_ready_index_rebuild(cfg: object, build_id: str) -> None:
     """Start or resume one owner-fenced, empty-first candidate rebuild."""
     validate_identifier(build_id, "primary ready rebuild id")
-    with projection_rebuild_lock(cfg):
-        current = rebuild_record(cfg)
+    with projection_lock(cfg):
+        current = _read_projection_state(cfg)
         if (
             current is not None
             and current.get("schema_version") == PRIMARY_READY_PROTOCOL_VERSION
@@ -260,8 +260,8 @@ def rebuild_primary_ready_candidate(
     reference: ReadyMarkerRef,
 ) -> None:
     """Publish one candidate into a rebuild already cleared by its owner."""
-    with projection_rebuild_lock(cfg):
-        current = rebuild_record(cfg)
+    with projection_lock(cfg):
+        current = _read_projection_state(cfg)
         is_rebuilding = bool(
             current is not None
             and current.get("schema_version") == PRIMARY_READY_PROTOCOL_VERSION
@@ -280,13 +280,13 @@ def rebuild_primary_ready_candidate(
         for machine in _primary_machines_for_task(cfg, task):
             candidate_route = route_key(reference.queue_scope, machine)
             route_path(cfg, candidate_route).mkdir(parents=True, exist_ok=True)
-            atomic_replace(candidate_path(cfg, candidate_route, reference.identity), _candidate_value(reference))
+            atomic_replace(candidate_path(cfg, candidate_route, reference.identity), _serialize_candidate(reference))
 
 
 def complete_primary_ready_index_rebuild(cfg: object, build_id: str) -> None:
     """Make a fully populated owner-fenced candidate projection observable."""
-    with projection_rebuild_lock(cfg):
-        current = rebuild_record(cfg)
+    with projection_lock(cfg):
+        current = _read_projection_state(cfg)
         if (
             current is not None
             and current.get("schema_version") == PRIMARY_READY_PROTOCOL_VERSION

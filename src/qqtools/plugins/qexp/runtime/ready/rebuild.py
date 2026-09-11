@@ -171,7 +171,7 @@ def begin_ready_index_build(cfg: object, *, is_repair: bool = False) -> dict[str
 def rebuild_primary_ready_index(cfg: object) -> None:
     """Rebuild primary candidates from authoritative queued Task records."""
     state.ensure_ready_layout(cfg)
-    with primary_candidates.projection_rebuild_lock(cfg):
+    with primary_candidates.projection_lock(cfg):
         build_id = uuid.uuid4().hex
         atomic_replace(
             primary_candidates.projection_state_path(cfg),
@@ -204,7 +204,7 @@ def rebuild_primary_ready_index(cfg: object) -> None:
                 continue
             reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
             if reference is not None:
-                primary_candidates.sync_candidate_under_lock(cfg, task, reference, should_require_active=False)
+                primary_candidates.sync_task_candidate_under_lock(cfg, task, reference, should_require_active=False)
         atomic_replace(
             primary_candidates.projection_state_path(cfg),
             {

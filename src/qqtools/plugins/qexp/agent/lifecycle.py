@@ -12,11 +12,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, ContextManager
 
-from ..legacy_agent import _visible_gpus, get_agent_status
 from ..authority import AuthoritySupervisor
 from ..config_types import RootConfig
 from ..executor import Executor
 from ..layout import load_machine_record, load_root_config, machine_state_path, runtime_pid_path
+from ..legacy_agent import _visible_gpus, get_agent_status
 from ..machine_config import is_legacy_agent_project, load_machine_policy, save_machine_config
 from ..machine_dispatch_plan import (
     MachineDispatchSnapshot,
@@ -29,13 +29,6 @@ from ..machine_dispatch_plan import (
     order_dispatch_project_ids,
     reduce_dispatch_cursor,
 )
-from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
-from .helpers import _active_machine_identity, _machine_is_true_idle, _read_pid, _pid_start_time_ticks, _publish_project_snapshots, _publish_process_status, _consume_first_registered_binding
-from . import helpers as _helpers
-from .control_plane import _MachineControlPlane
-from . import dispatch_loop as _dispatch
-from .dispatch_loop import dispatch_machine_cycle
-from .project_admin import migrate_project, _stop_verified_legacy_agent
 from ..machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from ..project_maintenance import maintain_project, reconcile_reservation
 from ..runtime.locks import exclusive
@@ -77,6 +70,21 @@ from ..scheduler import (
     resume_starting_attempt,
     run_dispatch_cycle,
 )
+from . import dispatch_loop as _dispatch
+from . import helpers as _helpers
+from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
+from .control_plane import _MachineControlPlane
+from .dispatch_loop import dispatch_machine_cycle
+from .helpers import (
+    _active_machine_identity,
+    _consume_first_registered_binding,
+    _machine_is_true_idle,
+    _pid_start_time_ticks,
+    _publish_process_status,
+    _publish_project_snapshots,
+    _read_pid,
+)
+from .project_admin import _stop_verified_legacy_agent, migrate_project
 
 
 def get_machine_agent_status(
