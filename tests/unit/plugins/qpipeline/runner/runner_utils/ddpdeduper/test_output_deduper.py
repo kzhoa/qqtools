@@ -61,6 +61,80 @@ def test_prepare_eval_loader_rejects_unequal_rank_batch_counts(monkeypatch):
         )
 
 
+def test_prepare_eval_loader_pads_one_step_tail_before_forward(monkeypatch):
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_rank",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_world_size",
+        lambda: 2,
+    )
+    gathered_plans = [[[0, 1], [4]], [[2, 3]]]
+    completion_ids = []
+
+    def _fake_gather(value):
+        if value == [[2, 3]]:
+            return gathered_plans
+        completion_ids.append(list(value))
+        return [[0, 1, 4], list(value)]
+
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper._all_gather_object",
+        _fake_gather,
+    )
+    loader = DataLoader(
+        RawDataset(range(5)),
+        batch_sampler=ManualBatchSampler([[2, 3]]),
+        collate_fn=_collate_as_list,
+    )
+
+    prepared = prepare_eval_loader_for_ddp(
+        loader,
+        enabled=True,
+        stage="val",
+        loader_name=None,
+        distributed=True,
+    )
+    batches = list(prepared)
+
+    assert len(batches) == 2
+    assert batches[0].control.all_duplicate is False
+    assert batches[1].control.all_duplicate is True
+    assert batches[1].payload == [2, 3]
+    assert completion_ids == [[2, 3]]
+    assert list(loader.batch_sampler) == [[2, 3]]
+
+
+def test_deduper_rejects_large_step_gap_before_forward(monkeypatch):
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper.qt.qdist.get_world_size",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qpipeline.runner.runner_utils.ddpdeduper.output_deduper._all_gather_object",
+        lambda value: [[[0], [1], [2]], [[3]]],
+    )
+    loader = DataLoader(
+        RawDataset(range(4)),
+        batch_sampler=ManualBatchSampler([[0], [1], [2]]),
+        collate_fn=_collate_as_list,
+    )
+
+    with pytest.raises(RuntimeError, match="too large"):
+        prepare_eval_loader_for_ddp(
+            loader,
+            enabled=True,
+            stage="val",
+            loader_name=None,
+            distributed=True,
+        )
+
+
 def _mock_gather(monkeypatch, gathered_batches, gathered_real_ids):
     def _fake_gather(value):
         if value and isinstance(value[0], list):

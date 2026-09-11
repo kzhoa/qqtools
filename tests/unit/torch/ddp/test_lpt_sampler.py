@@ -72,20 +72,19 @@ def test_lpt_tail_contract(total, world_size, should_shuffle, should_drop, strat
         world_size=world_size,
         shuffle=should_shuffle,
         drop_last=should_drop,
+        pad=not should_drop,
         strategy=strategy,
         seed=7,
     )
     global_size = 2 * world_size
-    if total % global_size and not should_shuffle and not should_drop:
-        with pytest.raises(ValueError, match="validation padding"):
-            BalancedBatchSampler(rank=0, **kwargs)
-        return
     samplers = [BalancedBatchSampler(rank=rank, **kwargs) for rank in range(world_size)]
     steps = total // global_size if should_drop else (total + global_size - 1) // global_size
-    assert [len(sampler) for sampler in samplers] == [steps] * world_size
+    if should_drop or kwargs["pad"]:
+        assert [len(sampler) for sampler in samplers] == [steps] * world_size
     target = steps * global_size
     actual = [i for sampler in samplers for batch in sampler for i in batch]
-    assert len(actual) == target
+    if should_drop or kwargs["pad"]:
+        assert len(actual) == target
     assert all(0 <= i < total for i in actual)
     if should_drop:
         assert len(set(actual)) == target
@@ -93,7 +92,7 @@ def test_lpt_tail_contract(total, world_size, should_shuffle, should_drop, strat
         assert sorted(set(actual)) == list(range(total))
     for sampler in samplers:
         sampler.set_epoch(2)
-        assert all(len(batch) == 2 for batch in sampler)
+        assert all(1 <= len(batch) <= 2 for batch in sampler)
     reseeded = [i for sampler in samplers for batch in sampler for i in batch]
     assert sorted(reseeded) == sorted(actual)
 

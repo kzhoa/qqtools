@@ -145,6 +145,7 @@ def test_sampler_drop_last_removes_incomplete_global_window(monkeypatch):
         world_size=2,
         shuffle=False,
         drop_last=True,
+        pad=False,
         strategy="v3",
     )
 
@@ -191,6 +192,7 @@ def test_batch_sampler_drop_last_preserves_equal_full_batches_per_rank(monkeypat
             world_size=2,
             shuffle=False,
             drop_last=True,
+            pad=False,
             strategy="v3",
         )
         for rank in range(2)

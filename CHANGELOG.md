@@ -5,6 +5,9 @@
 - refactor: split the qexp machine agent and runtime into dependency-directed `agent/` modules while preserving CLI commands and behavior.
 - fix: warn qpipeline users when torchrun environment variables are detected without
   `--ddp` or `--ddp-detect`, including the recognized environment keys and DDP initialization guidance.
+- feat: add explicit balanced-sampler tail padding control and automatically pad one-step DDP
+  evaluation/inference tails in a temporary execution view before deduplicating metrics and outputs.
+- docs: archive the completed qPipeline distributed evaluation and inference padding pitch.
 
 ## v1.3.16
 

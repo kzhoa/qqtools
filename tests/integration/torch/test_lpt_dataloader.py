@@ -70,6 +70,7 @@ def test_lpt_tail_repair_reaches_dataloaders_with_equal_steps(
             strategy=strategy,
             shuffle=True,
             drop_last=should_drop,
+            pad=not should_drop,
             seed=7,
         )
         for rank in range(4)
