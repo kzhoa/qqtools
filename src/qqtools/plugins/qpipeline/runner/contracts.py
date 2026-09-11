@@ -71,6 +71,7 @@ class EpochStartedFact:
     epoch: int
     global_step: int
     total_batches: int
+    max_epochs: Optional[int] = None
 
 
 @dataclass(kw_only=True, frozen=True, slots=True)

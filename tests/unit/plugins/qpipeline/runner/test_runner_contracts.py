@@ -1,6 +1,10 @@
+from unittest.mock import Mock
+
 import pytest
 
+import qqtools.plugins.qpipeline.runner.runner_utils.progress as progress_module
 from qqtools.plugins.qpipeline.runner.contracts import (
+    EpochStartedFact,
     EventListenerBindings,
     ObserverBindings,
     ProgressTickFact,
@@ -59,3 +63,42 @@ def test_local_protected_boundary_reraises_original_error():
             requires_settlement=True,
             boundary_name="validation",
         )
+
+
+def test_rich_progress_uses_zero_based_epoch_denominator():
+    if not progress_module.HAS_RICH:
+        pytest.skip("Rich is not installed")
+
+    displayer = progress_module.LiveDisplayer.__new__(progress_module.LiveDisplayer)
+    displayer.enable = True
+    displayer.progress = Mock()
+    displayer.progress.task_ids = []
+    displayer.progress.add_task.return_value = 1
+    displayer.live = None
+    displayer.train_task_id = None
+    displayer.eval_task_id = None
+
+    displayer.reset_progressbar(num_batches=4, epoch_idx=0, max_epochs=10)
+
+    displayer.progress.add_task.assert_called_once_with("[cyan]Epoch 0/9[/]", total=4)
+
+
+def test_rich_progress_receives_max_epochs_from_epoch_fact(monkeypatch):
+    if not progress_module.HAS_RICH:
+        pytest.skip("Rich is not installed")
+
+    displayer = Mock()
+    monkeypatch.setattr(progress_module, "LiveDisplayer", lambda: displayer)
+    strategy = progress_module.RichProgress()
+
+    strategy.on_epoch_start(
+        EpochStartedFact(
+            epoch=0,
+            global_step=0,
+            total_batches=4,
+            max_epochs=10,
+        )
+    )
+
+    displayer.reset_progressbar.assert_called_once_with(4, 0, 10)
+    displayer.start.assert_called_once_with()

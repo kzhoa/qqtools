@@ -148,11 +148,12 @@ if HAS_RICH:
             else:
                 self.live.update(self.progress)
 
-        def reset_progressbar(self, num_batches: int, epoch_idx: int, max_epochs: int):
+        def reset_progressbar(self, num_batches: int, epoch_idx: int, max_epochs: Optional[int]):
             if not self.enable or not self.progress:
                 return
 
-            desc = f"[cyan]Epoch {epoch_idx}/{max_epochs}[/]"
+            display_max_epochs = max_epochs - 1 if max_epochs is not None else None
+            desc = f"[cyan]Epoch {epoch_idx}/{display_max_epochs}[/]"
             if self.train_task_id is None or self.train_task_id not in self.progress.task_ids:
                 self.train_task_id = self.progress.add_task(desc, total=num_batches)
             else:
@@ -315,7 +316,7 @@ if HAS_RICH:
             self.displayer.reset_progressbar(
                 context.total_batches,
                 context.epoch,
-                None,
+                context.max_epochs,
             )
             self.displayer.start()
 
