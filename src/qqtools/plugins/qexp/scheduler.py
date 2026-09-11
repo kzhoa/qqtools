@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterator
 
 from .config_types import RootConfig
-from .domain.policies import group_allows
+from .domain.policies import group_allows, task_machine_matches
 from .infrastructure.clock import clock_evidence as _clock_evidence
 from .infrastructure.process import (
     is_process_alive as _is_process_alive,
@@ -164,7 +164,7 @@ def _eligible(cfg: RootConfig, task: TaskRecord) -> bool:
     if read_json(operation_file).get("submission", {}).get("state") != "committed":
         return False
     if not task.group_name:
-        return task.placement_policy["home_machine"] == cfg.machine_name
+        return task_machine_matches(task, cfg.machine_name)
     group_file = group_path(cfg.shared_root, task.group_name)
     return group_file.exists() and group_allows(read_json(group_file), task, cfg.machine_name)
 
