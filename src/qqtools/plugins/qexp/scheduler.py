@@ -139,7 +139,7 @@ def _process_evidence_state(attempt: AttemptRecord, data: dict[str, Any]) -> str
 @contextmanager
 def authority_locks(cfg: RootConfig, task: TaskRecord) -> Iterator[None]:
     """Acquire the only permitted shared authority order."""
-    with schema_writer_lock(cfg):
+    with schema_writer_lock(cfg, require_narrow=True):
         with dependency_locks(cfg, task):
             yield
 

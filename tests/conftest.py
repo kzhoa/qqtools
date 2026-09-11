@@ -310,7 +310,10 @@ def tmp_path(request):
     if case_dir.exists():
         shutil.rmtree(case_dir, ignore_errors=True)
     case_dir.mkdir(parents=True, exist_ok=True)
-    should_preserve_lifecycle = request.node.path.name == "test_agent_lifecycle_independence.py"
+    node_path = getattr(request.node, "path", None)
+    should_preserve_lifecycle = bool(
+        node_path is not None and node_path.name == "test_agent_lifecycle_independence.py"
+    )
     if should_preserve_lifecycle:
         request.config._has_lifecycle_artifacts = True
 

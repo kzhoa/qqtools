@@ -1,11 +1,15 @@
 ---
 doc_type: spec
-status: drafting
-updated_at: 2026-09-05
-archived_at:
+status: archived
+updated_at: 2026-09-12
+archived_at: 2026-09-12
 ---
 
 # qexp Task Dependencies Compatibility Transition
+
+Archived on 2026-09-12 after the 1.3.17 purge of `QQTOOLS-COMPAT-0007`. This document
+preserves the historical 1.3.15-1.3.16 transition contract; current releases require
+canonical dependency fields on every schema-6 Task.
 
 This is the planned transition contract for Task dependencies in 1.3.15. Global schema
 `version` and `minimum_reader_version` remain 6. `QQTOOLS-COMPAT-0007` independently tracks

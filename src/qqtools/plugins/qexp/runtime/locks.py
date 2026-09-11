@@ -39,6 +39,16 @@ def is_schema_narrow_protocol_active(cfg: object) -> bool:
     )
 
 
+def _group_members_upgrade_is_active(cfg: object) -> bool:
+    """Return whether the restricted legacy activation window is in progress."""
+    path = shared_paths(cfg.shared_root)["schema"] / "group-ready-members-upgrade.json"
+    try:
+        phase = read_json(path)["group_ready_members_upgrade"].get("phase")
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+        return False
+    return phase == "building"
+
+
 @contextmanager
 def exclusive(path: Path, *, blocking: bool = True) -> Iterator[bool]:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,8 +108,41 @@ def schema_reader_lock(root: Path, *, blocking: bool = True) -> Iterator[bool]:
 
 
 @contextmanager
-def schema_writer_lock(cfg: object, *, blocking: bool = True) -> Iterator[bool]:
+def schema_writer_lock(
+    cfg: object, *, blocking: bool = True, require_narrow: bool = False
+) -> Iterator[bool]:
     """Fence an authoritative writer against schema/capability mutation."""
+    if (
+        require_narrow
+        and not is_schema_narrow_protocol_active(cfg)
+        and not _group_members_upgrade_is_active(cfg)
+    ):
+        if not blocking:
+            yield False
+            return
+        try:
+            schema_path = shared_paths(cfg.shared_root)["schema"] / "version.json"
+            schema = read_json(schema_path).get("schema", {})
+            capabilities = schema.get("required_capabilities", [])
+        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+            capabilities = []
+        if isinstance(capabilities, list) and GROUP_READY_MEMBERS_CAPABILITY in capabilities:
+            state_path = shared_paths(cfg.shared_root)["ready"] / "group-members" / "state.json"
+            try:
+                state = read_json(state_path).get("group_ready_members", {}).get("state")
+            except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+                state = None
+            if state == "degraded":
+                raise RuntimeError(
+                    "group-ready-members projection is degraded; ordinary mutation is disabled."
+                )
+            raise RuntimeError(
+                "group-ready-members projection is not active; ordinary mutation is disabled."
+            )
+        raise RuntimeError(
+            "qexp root requires an active group-ready-members-v1 protocol; "
+            "run 'qexp upgrade group-ready-members' before ordinary mutation."
+        )
     root = cfg.shared_root.resolve()
     held_roots = _schema_writer_roots.get()
     if root in held_roots:
@@ -134,7 +177,7 @@ def group_lock(root: Path, name: str, *, blocking: bool = True) -> Iterator[bool
 @contextmanager
 def group_writer_lock(cfg: object, name: str, *, blocking: bool = True) -> Iterator[bool]:
     """Acquire the schema and Group portions of the authoritative writer order."""
-    with schema_writer_lock(cfg, blocking=blocking) as has_schema_lock:
+    with schema_writer_lock(cfg, blocking=blocking, require_narrow=True) as has_schema_lock:
         if not has_schema_lock:
             yield False
             return
@@ -155,9 +198,10 @@ def task_writer_lock(
     group_name: str | None,
     *,
     blocking: bool = True,
+    require_narrow: bool = True,
 ) -> Iterator[bool]:
     """Acquire schema, optional Group, and Task writer fences in global order."""
-    with schema_writer_lock(cfg, blocking=blocking) as has_schema_lock:
+    with schema_writer_lock(cfg, blocking=blocking, require_narrow=require_narrow) as has_schema_lock:
         if not has_schema_lock:
             yield False
             return

@@ -2,10 +2,12 @@ schema_version = 1
 next_id = 12
 
 [[items]]
+# Planned follow-up for 1.4.0: activate the machine-level rolling coordinator and its
+# mixed-version verification before introducing the upgrade-journal writer.
 id = "QQTOOLS-COMPAT-0011"
 component = "qexp.machine-rolling-upgrade-coordinator"
 kind = "runtime_protocol"
-status = "compatibility_active"
+status = "planned"
 introduced_in = "1.4.0"
 legacy_removed_in = "1.5.0"
 transition_purged_in = "1.6.0"
@@ -29,7 +31,7 @@ interruption_budget_seconds = 1.0
 id = "QQTOOLS-COMPAT-0010"
 component = "qexp.ready-index-degradation-diagnostics"
 kind = "runtime_protocol"
-status = "compatibility_active"
+status = "legacy_removed"
 introduced_in = "1.3.16"
 legacy_removed_in = "1.3.17"
 transition_purged_in = "1.3.18"
@@ -48,7 +50,7 @@ verification = [
 id = "QQTOOLS-COMPAT-0008"
 component = "qexp.group-ready-members-transition"
 kind = "persisted_schema"
-status = "compatibility_active"
+status = "legacy_removed"
 introduced_in = "1.3.16"
 legacy_removed_in = "1.3.17"
 transition_purged_in = "1.3.18"
@@ -68,7 +70,7 @@ verification = [
 id = "QQTOOLS-COMPAT-0009"
 component = "qexp.submission-schema-lock-transition"
 kind = "runtime_protocol"
-status = "compatibility_active"
+status = "legacy_removed"
 introduced_in = "1.3.16"
 legacy_removed_in = "1.3.17"
 transition_purged_in = "1.3.18"
@@ -85,6 +87,8 @@ verification = [
 ]
 
 [[items]]
+# Active through 1.3.x. In 1.4.0 remove the legacy sampler strategies, warnings, and fixtures;
+# keep the canonical LPT strategies and update the unit migration coverage together.
 id = "QQTOOLS-COMPAT-0006"
 component = "data.balanced-sampler-strategies"
 kind = "public_api"

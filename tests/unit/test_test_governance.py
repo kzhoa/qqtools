@@ -82,6 +82,16 @@ def test_integration():
     assert check_test_lanes(tmp_path) == ["Integration may not use host_exclusive: tests/integration/test_example.py"]
 
 
+def test_lane_marker_check_rejects_integration_marker_under_unit(tmp_path: Path) -> None:
+    _write_valid_repository(tmp_path)
+    _write(
+        tmp_path / "tests/unit/test_misplaced.py",
+        "import pytest\n\npytestmark = pytest.mark.integration\n",
+    )
+
+    assert check_test_lanes(tmp_path) == ["Unit may not use integration: tests/unit/test_misplaced.py"]
+
+
 def test_lane_check_rejects_e2e_collection_from_preflight(tmp_path: Path) -> None:
     _write_valid_repository(tmp_path)
     _write(

@@ -229,7 +229,10 @@ def _repair_task_ready_projection(cfg: object, task_id: str) -> tuple[int, int]:
         initial = load_task(cfg, task_id)
     except FileNotFoundError:
         return repaired, stale_removed
-    with task_writer_lock(cfg, task_id, initial.group_name):
+    # This is a schema-fenced doctor repair.  It must be able to restore Task
+    # ready truth while the derived Group projection is degraded; ordinary
+    # callers continue to require the narrow writer protocol.
+    with task_writer_lock(cfg, task_id, initial.group_name, require_narrow=False):
         try:
             task = load_task(cfg, task_id)
         except FileNotFoundError:

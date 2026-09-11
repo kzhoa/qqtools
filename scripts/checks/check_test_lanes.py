@@ -56,6 +56,16 @@ def _uses_pytest_marker(path: Path, marker: str) -> bool:
 
 def _check_marker_boundaries(repo_root: Path) -> list[str]:
     errors: list[str] = []
+    for path in (repo_root / "tests/unit").rglob("test_*.py"):
+        for marker in (
+            "integration",
+            "qexp_fast_io",
+            "qexp_integration",
+            "host_exclusive",
+            "machine_lab",
+        ):
+            if _uses_pytest_marker(path, marker):
+                errors.append(f"Unit may not use {marker}: {path.relative_to(repo_root)}")
     boundaries = (
         ("Integration", repo_root / "tests/integration", "host_exclusive"),
         ("E2E", repo_root / "tests/e2e", "machine_lab"),

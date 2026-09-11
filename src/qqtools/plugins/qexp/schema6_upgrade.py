@@ -1,6 +1,5 @@
 """Shared explicit activation for schema-6 capability protocols."""
 
-# QQTOOLS-COMPAT-0007: restricted legacy dependency normalization is retired in 1.3.17.
 from __future__ import annotations
 
 import uuid

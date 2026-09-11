@@ -41,7 +41,7 @@ uncommitted staged Tasks and inactive additions.
 | Release | Ordinary root behavior | Temporary behavior |
 | --- | --- | --- |
 | 1.3.16 | Active member-projection roots use the narrow protocol | Legacy roots retain the wide lock |
-| 1.3.17 | Only narrow protocol permits ordinary mutation | Restricted upgrader/repair may activate legacy roots |
+| 1.3.17 | Only active narrow protocol permits ordinary mutation | Restricted upgrader/repair may activate legacy roots |
 | 1.3.18 | Narrow protocol only | Remove the marker, legacy path, and fixtures |
 
 `QQTOOLS-COMPAT-0008` and `QQTOOLS-COMPAT-0009` are jointly active in 1.3.16. New roots create

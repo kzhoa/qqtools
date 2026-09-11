@@ -9,7 +9,7 @@ from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import batch_submit, retry, submit
 from qqtools.plugins.qexp.runtime.locks import schema_lock
 from qqtools.plugins.qexp.runtime.paths import group_path, submission_path
-from qqtools.plugins.qexp.runtime.store import read_json
+from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.submission import IdempotencyConflict
 from qqtools.plugins.qexp.scheduler import claim_task, fail_attempt
 
@@ -92,6 +92,17 @@ def test_same_idempotency_key_reuses_resolved_task(tmp_path: Path):
     assert first.task_id == second.task_id
     with pytest.raises(IdempotencyConflict):
         submit(cfg, ["echo", "two"], idempotency_key="k")
+
+
+def test_legacy_root_rejects_submission_until_member_protocol_is_active(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    schema_path = cfg.shared_root / "schema" / "version.json"
+    schema = read_json(schema_path)
+    schema["schema"]["required_capabilities"].remove("group-ready-members-v1")
+    atomic_replace(schema_path, schema)
+
+    with pytest.raises(RuntimeError, match="requires an active group-ready-members-v1 protocol"):
+        submit(cfg, ["echo", "legacy"])
 
 
 # QQTOOLS-COMPAT-0009: active member-projection roots use shared schema readers.
