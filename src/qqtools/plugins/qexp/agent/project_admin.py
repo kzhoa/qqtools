@@ -1,12 +1,17 @@
 """Project registration and migration workflows."""
 from __future__ import annotations
-import os, shlex, signal, time
+
+import os
+import shlex
+import signal
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
-from ..legacy_agent import get_agent_status
+
 from ..config_types import RootConfig
 from ..layout import load_machine_record, load_root_config, runtime_pid_path
+from ..legacy_agent import get_agent_status
 from ..machine_config import is_legacy_agent_project, save_machine_config
 from ..runtime.locks import exclusive
 from ..runtime.paths import local_paths
@@ -14,6 +19,7 @@ from ..runtime.records import utc_now
 from ..runtime.store import atomic_replace, iter_json, read_json
 from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
 from .helpers import _pid_start_time_ticks
+
 
 @dataclass(frozen=True, slots=True)
 class ProjectRegistration:
@@ -87,22 +93,21 @@ def _legacy_pid_matches(cfg: RootConfig, pid: int) -> bool:
 
 
 def _stop_verified_legacy_agent(cfg: RootConfig, *, timeout: float = 5.0) -> int | None:
-    from . import lifecycle as lifecycle_module
     status = get_agent_status(cfg)
     pid = status.get("pid")
     if not isinstance(pid, int) or not status.get("is_running"):
         runtime_pid_path(cfg).unlink(missing_ok=True)
         return None
-    if not lifecycle_module._legacy_pid_matches(cfg, pid):
+    if not _legacy_pid_matches(cfg, pid):
         raise RuntimeError("legacy agent PID cannot be verified; refusing to signal it.")
-    start_ticks = lifecycle_module._pid_start_time_ticks(pid)
+    start_ticks = _pid_start_time_ticks(pid)
     if start_ticks is None:
         raise RuntimeError("legacy agent process identity cannot be verified; refusing to signal it.")
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + timeout
-    while lifecycle_module._pid_start_time_ticks(pid) == start_ticks and time.monotonic() < deadline:
+    while _pid_start_time_ticks(pid) == start_ticks and time.monotonic() < deadline:
         time.sleep(0.05)
-    if lifecycle_module._pid_start_time_ticks(pid) == start_ticks:
+    if _pid_start_time_ticks(pid) == start_ticks:
         raise TimeoutError(f"legacy agent {pid} did not stop within {timeout:g} seconds.")
     runtime_pid_path(cfg).unlink(missing_ok=True)
     return pid

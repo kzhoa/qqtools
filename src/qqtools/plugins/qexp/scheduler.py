@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import uuid
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -12,15 +12,13 @@ from typing import Any, Callable, ContextManager, Iterator
 
 from .config_types import RootConfig
 from .domain.policies import group_allows, task_machine_matches
-from .infrastructure.clock import clock_evidence as _clock_evidence
-from .infrastructure.process import (
-    is_process_alive as _is_process_alive,
-    is_process_group_alive as _is_process_group_alive,
-    process_start_time_ticks as _process_start_time_ticks,
-    terminate_process_group as _terminate_process_group,
-)
 from .events import write_diagnostic_event, write_event
 from .executor import Executor
+from .infrastructure.clock import clock_evidence as _clock_evidence
+from .infrastructure.process import is_process_alive as _is_process_alive
+from .infrastructure.process import is_process_group_alive as _is_process_group_alive
+from .infrastructure.process import process_start_time_ticks as _process_start_time_ticks
+from .infrastructure.process import terminate_process_group as _terminate_process_group
 from .lease import (
     AuthorityResolution,
     AuthorityResolutionOutcome,
@@ -179,6 +177,17 @@ def _task_worker_role(cfg: RootConfig, task: TaskRecord) -> str | None:
     normalize_group_record(group)
     worker = group["group"]["worker_set"].get(cfg.machine_name)
     return worker.get("scheduling_role") if worker else None
+
+
+def _admission_role_matches(cfg: RootConfig, task: TaskRecord, admission_role: str | None) -> bool:
+    """Return whether a task belongs in the requested admission layer."""
+    if admission_role == "borrow":
+        return bool(task.group_name and _task_worker_role(cfg, task) == "borrow")
+    if admission_role == "primary":
+        return not task.group_name or _task_worker_role(cfg, task) == "primary"
+    if admission_role is not None and task.group_name:
+        return _task_worker_role(cfg, task) == admission_role
+    return True
 
 
 def _claim(
@@ -880,7 +889,7 @@ def _run_dispatch_cycle(
                 continue
             if lane == "gpu" and task.spec.is_cpu_only:
                 continue
-            if admission_role is not None and task.group_name and _task_worker_role(cfg, task) != admission_role:
+            if not _admission_role_matches(cfg, task, admission_role):
                 sizer.observe(max(1, time.monotonic_ns() - started_ns))
                 continue
             if borrow_admission_grant is None and task.group_name and _task_worker_role(cfg, task) == "borrow":
@@ -1008,7 +1017,7 @@ def _run_dispatch_cycle(
             continue
         if lane == "gpu" and task.spec.is_cpu_only:
             continue
-        if admission_role is not None and task.group_name and _task_worker_role(cfg, task) != admission_role:
+        if not _admission_role_matches(cfg, task, admission_role):
             continue
         if borrow_admission_grant is None and task.group_name and _task_worker_role(cfg, task) == "borrow":
             diagnostic_increment("scheduler.borrow.skipped_without_admission")

@@ -12,11 +12,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, ContextManager
 
-from ..legacy_agent import _visible_gpus, get_agent_status
 from ..authority import AuthoritySupervisor
 from ..config_types import RootConfig
 from ..executor import Executor
 from ..layout import load_machine_record, load_root_config, machine_state_path, runtime_pid_path
+from ..legacy_agent import _visible_gpus, get_agent_status
 from ..machine_config import is_legacy_agent_project, load_machine_policy, save_machine_config
 from ..machine_dispatch_plan import (
     MachineDispatchSnapshot,
@@ -29,7 +29,6 @@ from ..machine_dispatch_plan import (
     order_dispatch_project_ids,
     reduce_dispatch_cursor,
 )
-from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
 from ..machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from ..project_maintenance import maintain_project, reconcile_reservation
 from ..runtime.locks import exclusive
@@ -71,14 +70,17 @@ from ..scheduler import (
     resume_starting_attempt,
     run_dispatch_cycle,
 )
-
-
-from .helpers import (
-    _binding_config, _record_bad_task_spec,
-    _reconcile_machine_reservations, _recover_starting_reservations,
-    _working_directory_reason, _publish_project_snapshots, _read_pid,
-)
 from . import helpers as _helpers
+from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
+from .helpers import (
+    _publish_project_snapshots,
+    _read_pid,
+    _reconcile_machine_reservations,
+    _record_bad_task_spec,
+    _recover_starting_reservations,
+    _working_directory_reason,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class PrimaryDemandProbe:
@@ -542,7 +544,11 @@ def _dispatch_admission_layer(
                         claim_guard=lambda: runtime.enabled_claim_guard(binding),
                         max_new_claims=1,
                         on_claim=claimed_task_ids.append,
-                        should_recover_starting=True,
+                        # Starting attempts are reconciled once for all bindings before
+                        # admission layers run.  Repeating recovery here would relaunch
+                        # an attempt for every role/lane pass when an executor has not
+                        # yet published local launch evidence.
+                        should_recover_starting=False,
                         work_budget=budget,
                         batch_sizer=batch_sizers[binding.project_id],
                         inspected_ready=inspected_ready,

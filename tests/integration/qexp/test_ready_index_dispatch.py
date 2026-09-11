@@ -9,12 +9,12 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.agent import lifecycle as machine_agent
+from qqtools.plugins.qexp.agent import dispatch_loop as machine_agent
+from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.lifecycle import dispatch_machine_cycle_locked
 from qqtools.plugins.qexp.commands import group as group_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import cancel, edit_dependencies, share
-from qqtools.plugins.qexp.agent.lifecycle import dispatch_machine_cycle_locked
-from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
     ReadyClassificationResult,
@@ -758,7 +758,7 @@ def test_unprobeable_enabled_project_blocks_borrow_admission(tmp_path: Path, mon
     runtime.add_binding(blocked_cfg.shared_root, blocked_cfg.machine_name)
     allowed_binding = runtime.add_binding(allowed_cfg.shared_root, allowed_cfg.machine_name)
     original_maintenance = __import__(
-        "qqtools.plugins.qexp.agent.lifecycle", fromlist=["maintain_project"]
+        "qqtools.plugins.qexp.agent.dispatch_loop", fromlist=["maintain_project"]
     ).maintain_project
 
     def fail_blocked(cfg, **kwargs):
@@ -766,7 +766,7 @@ def test_unprobeable_enabled_project_blocks_borrow_admission(tmp_path: Path, mon
             raise RuntimeError("blocked project maintenance")
         return original_maintenance(cfg, **kwargs)
 
-    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.maintain_project", fail_blocked)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.dispatch_loop.maintain_project", fail_blocked)
     executor = _RecordingExecutor()
 
     results = dispatch_machine_cycle_locked(
@@ -1038,8 +1038,8 @@ def test_primary_rebuild_keeps_concurrently_published_candidate(
     writer_finished = threading.Event()
     original_iter_json = __import__("qqtools.plugins.qexp.runtime.ready.rebuild", fromlist=["iter_json"]).iter_json
     original_sync = __import__(
-        "qqtools.plugins.qexp.runtime.ready.primary_candidates", fromlist=["sync_candidate"]
-    ).sync_candidate
+        "qqtools.plugins.qexp.runtime.ready.primary_candidates", fromlist=["sync_task_candidate"]
+    ).sync_task_candidate
 
     def pause_after_task_scan(directory):
         yield from original_iter_json(directory)
@@ -1052,7 +1052,7 @@ def test_primary_rebuild_keeps_concurrently_published_candidate(
         return original_sync(*args, **kwargs)
 
     monkeypatch.setattr("qqtools.plugins.qexp.runtime.ready.rebuild.iter_json", pause_after_task_scan)
-    monkeypatch.setattr("qqtools.plugins.qexp.runtime.ready.primary_candidates.sync_candidate", record_writer_sync)
+    monkeypatch.setattr("qqtools.plugins.qexp.runtime.ready.primary_candidates.sync_task_candidate", record_writer_sync)
     rebuild_thread = threading.Thread(target=rebuild_primary_ready_index, args=(cfg,))
     rebuild_thread.start()
     assert scan_finished.wait(timeout=5)

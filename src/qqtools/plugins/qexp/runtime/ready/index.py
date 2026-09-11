@@ -116,8 +116,8 @@ def sync_primary_ready_group(
     previous_workers: dict[str, dict[str, Any]],
 ) -> None:
     """Refresh primary candidates affected by a Group worker-role mutation."""
-    with primary_candidates.projection_rebuild_lock(cfg):
-        if not primary_candidates.accepts_updates_under_lock(cfg):
+    with primary_candidates.projection_lock(cfg):
+        if not primary_candidates.can_update_projection_under_lock(cfg):
             return
         if group_ready_members_state(cfg) in {"building", "active"}:
             for entry in read_group_ready_members(cfg, group_name):
@@ -138,7 +138,7 @@ def sync_primary_ready_group(
                 continue
             reference = routes.reference_for_generation(cfg, task.task_id, task.ready_generation)
             if reference is not None:
-                primary_candidates.sync_candidate_under_lock(cfg, task, reference)
+                primary_candidates.sync_task_candidate_under_lock(cfg, task, reference)
 
 
 def primary_projection_routes_for_group(
@@ -213,7 +213,7 @@ def write_ready_marker(
         ):
             atomic_replace(routes.marker_path(cfg.shared_root, reference), marker)
             publish_group_ready_member(cfg, task, reference)
-            primary_candidates.sync_candidate(cfg, task, reference)
+            primary_candidates.sync_task_candidate(cfg, task, reference)
     else:
         atomic_replace(routes.marker_path(cfg.shared_root, reference), marker)
         publish_group_ready_member(cfg, task, reference)
@@ -302,7 +302,7 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
         path.unlink(missing_ok=True)
         if group_name:
             retire_group_ready_member(cfg, group_name, task_id, generation)
-        primary_candidates.remove_candidate_everywhere(cfg, reference.identity)
+        primary_candidates.remove_candidate_from_all_routes(cfg, reference.identity)
         if is_primary:
             allocator_path, allocator = routes.load_or_create_allocator_under_lock(cfg.shared_root, route_key)
             control = allocator["ready_allocator"]
