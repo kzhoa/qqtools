@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import os
-import signal
-import time
 import uuid
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -13,6 +11,13 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterator
 
 from .config_types import RootConfig
+from .infrastructure.clock import clock_evidence as _clock_evidence
+from .infrastructure.process import (
+    is_process_alive as _is_process_alive,
+    is_process_group_alive as _is_process_group_alive,
+    process_start_time_ticks as _process_start_time_ticks,
+    terminate_process_group as _terminate_process_group,
+)
 from .events import write_diagnostic_event, write_event
 from .executor import Executor
 from .lease import (
@@ -97,62 +102,6 @@ class _BorrowAdmissionGrant:
 
 def _reservation_root(cfg: RootConfig, value: Path | None = None) -> Path:
     return value if value is not None else cfg.runtime_root
-
-
-def _is_process_group_alive(process_group_id: int | None) -> bool:
-    if not process_group_id:
-        return False
-    try:
-        os.killpg(process_group_id, 0)
-    except OSError:
-        return False
-    return True
-
-
-def _is_process_alive(process_id: int | None) -> bool:
-    if not process_id:
-        return False
-    try:
-        os.kill(process_id, 0)
-    except OSError:
-        return False
-    return True
-
-
-def _process_start_time_ticks(process_id: int | None) -> int | None:
-    if not process_id:
-        return None
-    try:
-        stat = (Path("/proc") / str(process_id) / "stat").read_text(encoding="utf-8")
-        fields = stat.rsplit(")", 1)[1].split()
-        return int(fields[19])
-    except (FileNotFoundError, IndexError, ValueError, OSError):
-        return None
-
-
-def _terminate_process_group(process_group_id: int, *, grace_seconds: float = TERMINATION_GRACE_SECONDS) -> bool:
-    """Terminate a process group and return only after its absence is confirmed."""
-    if not _is_process_group_alive(process_group_id):
-        return True
-    try:
-        os.killpg(process_group_id, signal.SIGTERM)
-    except OSError:
-        return not _is_process_group_alive(process_group_id)
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not _is_process_group_alive(process_group_id):
-            return True
-        time.sleep(TERMINATION_POLL_SECONDS)
-    try:
-        os.killpg(process_group_id, signal.SIGKILL)
-    except OSError:
-        pass
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not _is_process_group_alive(process_group_id):
-            return True
-        time.sleep(TERMINATION_POLL_SECONDS)
-    return not _is_process_group_alive(process_group_id)
 
 
 def _manifest_supervisor(data: dict[str, Any]) -> str:
@@ -242,14 +191,6 @@ def _task_worker_role(cfg: RootConfig, task: TaskRecord) -> str | None:
     normalize_group_record(group)
     worker = group["group"]["worker_set"].get(cfg.machine_name)
     return worker.get("scheduling_role") if worker else None
-
-
-def _clock_evidence(observation: ClockObservation) -> dict[str, Any]:
-    return {
-        "clock_error_bound_seconds": observation.bound_at(time.monotonic()),
-        "provider": observation.provider,
-        "observation_id": observation.observation_id,
-    }
 
 
 def _claim(
