@@ -859,7 +859,7 @@ for line in sys.stdin:
         print(json.dumps({"pid": os.getpid(), "tmpdir": os.environ["TMPDIR"],
                           "runtime_root": os.environ["QEXP_MACHINE_RUNTIME_ROOT"]}), flush=True)
     elif command == "scheduler_authority":
-        from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+        from qqtools.plugins.qexp.agent.context import MachineRuntime
         runtime = MachineRuntime()
         with runtime.scheduler_authority(blocking=False) as acquired:
             print(json.dumps({"acquired": acquired, "tmpdir": os.environ["TMPDIR"]}), flush=True)

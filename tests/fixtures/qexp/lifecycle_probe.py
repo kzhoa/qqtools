@@ -26,8 +26,8 @@ def main() -> None:
     os.environ["PYTHONPATH"] = str(source)
     os.environ["QEXP_VISIBLE_GPUS"] = "0,1,2,3"
     from qqtools.plugins.qexp import init_shared_root, submit
-    from qqtools.plugins.qexp.machine_agent import get_machine_agent_status, stop_machine_agent
-    from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+    from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status, stop_machine_agent
+    from qqtools.plugins.qexp.agent.context import MachineRuntime
     from qqtools.plugins.qexp.runtime.paths import local_paths
     from qqtools.plugins.qexp.runtime.resources.reservations import active_reservations
     from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -49,7 +49,7 @@ def main() -> None:
             [
                 sys.executable,
                 "-c",
-                "import sys; from qqtools.plugins.qexp.machine_agent import run_machine_agent_loop; "
+                "import sys; from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop; "
                 "run_machine_agent_loop(sys.argv[1], available_gpus=[0,1,2,3])",
                 str(runtime.root),
             ],

@@ -32,6 +32,9 @@ class TaskLifecycleEvent:
     task_revision: int
     execution_started_at: str | None = None
     duration_ms: int | None = None
+    project_id: str | None = None
+    project: str = ""
+    task_name: str | None = None
 
 
 def _duration_ms(started_at: str | None, finished_at: str) -> int | None:
@@ -152,6 +155,11 @@ def commit_terminal_transition_locked(
     save_task(cfg, task)
     retire_current_ready_generation(cfg, task)
     execution_started_at = attempt.timestamps.get("process_created_at") or attempt.timestamps.get("running_at")
+    project_id = None
+    try:
+        project_id = read_json(cfg.shared_root / "project" / "identity.json")["project"]["project_id"]
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
     event = TaskLifecycleEvent(
         event_type="task_terminal",
         task_id=task.task_id,
@@ -167,6 +175,9 @@ def commit_terminal_transition_locked(
         task_revision=task.meta["revision"],
         execution_started_at=execution_started_at,
         duration_ms=_duration_ms(execution_started_at, finished_at),
+        project=str(cfg.shared_root.expanduser().resolve()),
+        task_name=task.name,
+        project_id=project_id,
     )
     return TerminalCommitResult("committed", event, reservation_id, reservation_machine)
 

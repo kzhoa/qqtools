@@ -9,7 +9,7 @@ from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.commands.task import submit as submit_task
 from qqtools.plugins.qexp.layout import load_context
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.observer import inspect_task
 from qqtools.plugins.qexp.runtime.paths import group_path, submission_path
 from qqtools.plugins.qexp.runtime.store import read_json

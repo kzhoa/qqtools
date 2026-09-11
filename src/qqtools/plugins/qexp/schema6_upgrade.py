@@ -9,7 +9,7 @@ from typing import Any
 
 from .config_types import RootConfig
 from .layout import CPU_LANE_CAPABILITY, TASK_DEPENDENCIES_CAPABILITY
-from .machine_runtime import MachineRuntime, ProjectBinding
+from .agent.context import MachineRuntime, ProjectBinding
 from .runtime.locks import schema_lock
 from .runtime.paths import shared_paths
 from .runtime.records import TaskRecord, utc_now

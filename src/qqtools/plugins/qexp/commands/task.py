@@ -108,7 +108,7 @@ def cancel(
     terminate_running: bool = True,
     reservation_runtime_root: Path | None = None,
 ) -> TaskRecord:
-    from ..machine_runtime import resolve_execution_context
+    from ..agent.context import resolve_execution_context
     from ..scheduler import cancel_task
 
     reservation_runtime_root = reservation_runtime_root or resolve_execution_context(cfg).reservation_root

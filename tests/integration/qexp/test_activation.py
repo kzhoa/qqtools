@@ -6,7 +6,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.activation import ensure_local_agent_active
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -38,7 +38,7 @@ def test_registered_project_does_not_start_a_second_machine_agent(
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.machine_agent.get_machine_agent_status",
+        "qqtools.plugins.qexp.agent.lifecycle.get_machine_agent_status",
         lambda _runtime: {"is_running": True},
     )
 
@@ -68,8 +68,8 @@ def test_concurrent_activation_starts_only_one_machine_agent(tmp_path: Path, mon
         barrier.wait()
         results.append(ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime))
 
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.get_machine_agent_status", get_status)
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent._start_machine_agent_locked", start)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.get_machine_agent_status", get_status)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle._start_machine_agent_locked", start)
     threads = [Thread(target=activate), Thread(target=activate)]
     for thread in threads:
         thread.start()
@@ -95,7 +95,7 @@ def test_activation_accepts_an_agent_that_wins_during_startup(tmp_path: Path, mo
     def lose_startup(_runtime, **_kwargs):
         raise RuntimeError("machine scheduler authority is already held")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.get_machine_agent_status", get_status)
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent._start_machine_agent_locked", lose_startup)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.get_machine_agent_status", get_status)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle._start_machine_agent_locked", lose_startup)
 
     assert ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime) is False

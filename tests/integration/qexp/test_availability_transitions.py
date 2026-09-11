@@ -12,7 +12,7 @@ from qqtools.plugins.qexp.cli import _split_machine_list, main
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
 from qqtools.plugins.qexp.runtime.availability import offer_deadlines
 from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime

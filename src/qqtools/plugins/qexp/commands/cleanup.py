@@ -164,7 +164,7 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
 def _cleanup_local_resources(
     cfg: RootConfig, task_id: str, *, reservation_runtime_root: Path | None = None
 ) -> tuple[list[str], list[str]]:
-    from ..machine_runtime import resolve_execution_context
+    from ..agent.context import resolve_execution_context
     from ..runtime.resources.reservations import release
 
     reservation_runtime_root = reservation_runtime_root or resolve_execution_context(cfg).reservation_root
@@ -427,7 +427,7 @@ def clean(
 ) -> dict[str, Any]:
     """Remove terminal Task truth exactly or under a bounded retention policy."""
     if reservation_runtime_root is None:
-        from ..machine_runtime import resolve_execution_context
+        from ..agent.context import resolve_execution_context
 
         context = resolve_execution_context(cfg)
         cfg = context.local_cfg

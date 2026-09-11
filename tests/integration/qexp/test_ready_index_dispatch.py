@@ -8,12 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp import init_shared_root, machine_agent, submit
+from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp.agent import lifecycle as machine_agent
 from qqtools.plugins.qexp.commands import group as group_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import cancel, edit_dependencies, share
-from qqtools.plugins.qexp.machine_agent import dispatch_machine_cycle_locked
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.lifecycle import dispatch_machine_cycle_locked
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
     ReadyClassificationResult,
@@ -757,7 +758,7 @@ def test_unprobeable_enabled_project_blocks_borrow_admission(tmp_path: Path, mon
     runtime.add_binding(blocked_cfg.shared_root, blocked_cfg.machine_name)
     allowed_binding = runtime.add_binding(allowed_cfg.shared_root, allowed_cfg.machine_name)
     original_maintenance = __import__(
-        "qqtools.plugins.qexp.machine_agent", fromlist=["maintain_project"]
+        "qqtools.plugins.qexp.agent.lifecycle", fromlist=["maintain_project"]
     ).maintain_project
 
     def fail_blocked(cfg, **kwargs):
@@ -765,7 +766,7 @@ def test_unprobeable_enabled_project_blocks_borrow_admission(tmp_path: Path, mon
             raise RuntimeError("blocked project maintenance")
         return original_maintenance(cfg, **kwargs)
 
-    monkeypatch.setattr("qqtools.plugins.qexp.machine_agent.maintain_project", fail_blocked)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.maintain_project", fail_blocked)
     executor = _RecordingExecutor()
 
     results = dispatch_machine_cycle_locked(

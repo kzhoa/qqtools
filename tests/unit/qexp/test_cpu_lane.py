@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 import qqtools.plugins.qexp as qexp
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.records import TaskSpec
 from qqtools.plugins.qexp.runtime.resources.cpu_lane import (
     CpuLanePolicy,

@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 from .config_types import RootConfig
 from .events import write_event
-from .machine_agent import (
+from .agent.lifecycle import (
     ensure_machine_agent_started,
     get_machine_agent_status,
     restart_machine_agent,
@@ -15,7 +15,7 @@ from .machine_agent import (
     stop_machine_agent,
 )
 from .machine_config import is_legacy_agent_project
-from .machine_runtime import MachineRuntime, ProjectBinding
+from .agent.context import MachineRuntime, ProjectBinding
 
 
 def managed_project_agent_status(

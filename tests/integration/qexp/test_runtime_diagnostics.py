@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.machine_agent import MachineRuntime, dispatch_machine_cycle_locked
+from qqtools.plugins.qexp.agent.lifecycle import MachineRuntime, dispatch_machine_cycle_locked
 from qqtools.plugins.qexp.runtime.store import read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.runtime.work_budget import RuntimeDiagnostics, activate_diagnostics

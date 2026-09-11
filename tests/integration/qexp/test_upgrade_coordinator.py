@@ -7,7 +7,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.commands.task import submit as submit_task
 from qqtools.plugins.qexp.layout import read_schema_version
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.locks import exclusive
 from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json

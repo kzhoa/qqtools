@@ -4,7 +4,7 @@ import pytest
 
 from qqtools.plugins.qexp.layout import validate_root_contract
 from qqtools.plugins.qexp.machine_config import init_shared_root
-from qqtools.plugins.qexp.machine_runtime import MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.schema6_upgrade import attest_schema6_upgrade, resume_schema6_upgrade, start_schema6_upgrade
 

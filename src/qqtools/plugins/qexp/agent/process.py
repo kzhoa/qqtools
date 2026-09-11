@@ -11,8 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from .machine_agent import run_machine_agent_loop
-from .machine_runtime import MachineRuntime
+from .lifecycle import run_machine_agent_loop
+from .context import MachineRuntime
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,15 +37,21 @@ def spawn_machine_agent_process(
     command = [
         sys.executable,
         "-m",
-        "qqtools.plugins.qexp.machine_agent_process",
+        "qqtools.plugins.qexp.agent.process",
         "--machine-runtime-root",
         str(machine_runtime.root),
     ]
     if available_gpus is not None:
         command.extend(("--available-gpus", ",".join(str(item) for item in available_gpus)))
+    environment = os.environ.copy()
+    source_root = str(Path(__file__).resolve().parents[4])
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source_root if not existing_pythonpath else f"{source_root}{os.pathsep}{existing_pythonpath}"
+    )
     process = subprocess.Popen(
         command,
-        env=os.environ.copy(),
+        env=environment,
         stdin=subprocess.DEVNULL if stdin is None else stdin,
         stdout=subprocess.DEVNULL if stdout is None else stdout,
         stderr=startup_log if startup_log is not None else stderr,
