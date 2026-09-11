@@ -19,7 +19,6 @@ from .contracts import (
 )
 
 UPGRADE_JOURNAL_CAPABILITY = "upgrade-journal-v1"
-# QQTOOLS-COMPAT-0011: keep schema-6 readers untouched during the 1.4.x rolling window.
 UPGRADE_JOURNAL_METADATA_PROTOCOL = "metadata:upgrade-journal-v1"
 _MANIFEST_NAME = "protocol-manifest.json"
 

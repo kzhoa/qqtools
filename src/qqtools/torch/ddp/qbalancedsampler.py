@@ -306,7 +306,7 @@ class BalancedDistributedSampler(Sampler[int]):
             strategy=validated_strategy,
         )
         self.pad = bool(pad)
-        # QQTOOLS-COMPAT-0006: remove legacy sampler strategies and warning in v1.4.0.
+        # QQTOOLS-COMPAT-0006: active until v1.4.0; remove legacy strategies and this warning then.
         if validated_strategy not in _LPT_STRATEGIES:
             warnings.warn(
                 f"Sampler strategy={validated_strategy!r} is deprecated and will be removed "

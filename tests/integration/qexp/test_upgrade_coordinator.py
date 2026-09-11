@@ -289,7 +289,6 @@ def test_production_activation_rejects_schema_changed_after_audit(tmp_path: Path
 
 
 def test_production_activation_keeps_schema_readable_by_strict_legacy_reader(tmp_path: Path) -> None:
-    # QQTOOLS-COMPAT-0011: remove with the bounded schema-6 mixed-version fixture.
     cfg = _config(tmp_path)
     manifest_path = cfg.shared_root / "operations" / "upgrades" / "protocol-manifest.json"
     manifest_path.unlink()

@@ -10,7 +10,7 @@ from qqtools.torch.ddp import BalancedBatchSampler, BalancedDistributedSampler
 @pytest.mark.parametrize("sampler_type", [BalancedBatchSampler, BalancedDistributedSampler])
 @pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])
 def test_legacy_sampler_warns_only_on_construction(sampler_type, strategy):
-    # QQTOOLS-COMPAT-0006: delete legacy behavior fixtures with v1.4.0 removal.
+    # QQTOOLS-COMPAT-0006: active until v1.4.0; delete these legacy fixtures when removed.
     kwargs = {"strategy": strategy}
     with pytest.warns(FutureWarning, match="deprecated.*v1.4.0") as records:
         sampler = sampler_type(np.arange(32), batch_size=4, rank=0, world_size=1, **kwargs)

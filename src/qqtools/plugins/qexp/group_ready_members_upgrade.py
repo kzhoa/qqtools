@@ -1,6 +1,6 @@
 """Explicit resumable activation for group-ready-members-v1."""
 
-# QQTOOLS-COMPAT-0008: legacy roots retain Task-scan Group synchronization through 1.3.16.
+# QQTOOLS-COMPAT-0008: restricted activation remains available through 1.3.17.
 from __future__ import annotations
 
 import uuid

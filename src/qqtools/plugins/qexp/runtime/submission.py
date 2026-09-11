@@ -12,15 +12,7 @@ from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_task_depe
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
 from .availability import remove_deadline_index, sync_deadline_index
 from .dependencies import normalize_dependency_ids, validate_group_dependencies
-from .locks import (
-    group_lock,
-    group_writer_lock,
-    idempotency_lock,
-    is_schema_narrow_protocol_active,
-    schema_writer_lock,
-    task_lock,
-    task_locks,
-)
+from .locks import group_lock, group_writer_lock, idempotency_lock, schema_writer_lock, task_lock, task_locks
 from .operation_store import operation_exists
 from .paths import group_path, idempotency_path, machine_path, shared_paths, submission_path, task_path
 from .ready import (
@@ -53,21 +45,12 @@ def _write_group_record(cfg: object, path: Path, data: dict[str, Any]) -> None:
     atomic_replace(path, data)
 
 
-def _is_submission_schema_lock_active(cfg: object) -> bool:
-    """Return whether member projection activated the narrow submission protocol."""
-    return is_schema_narrow_protocol_active(cfg)
-
-
 @contextmanager
 def _submission_protocol_lock(cfg: object, mapping_digest: str) -> Iterator[None]:
-    """Select the legacy-wide or projection-gated submission fencing protocol."""
-    # QQTOOLS-COMPAT-0009: legacy roots retain the exclusive schema lock through 1.3.17.
-    with schema_writer_lock(cfg):
-        if _is_submission_schema_lock_active(cfg):
-            with idempotency_lock(cfg.shared_root, mapping_digest):
-                yield
-            return
-        yield
+    """Fence submissions through the active member-projection protocol."""
+    with schema_writer_lock(cfg, require_narrow=True):
+        with idempotency_lock(cfg.shared_root, mapping_digest):
+            yield
 
 
 class IdempotencyConflict(ValueError):

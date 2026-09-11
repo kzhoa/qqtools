@@ -445,7 +445,7 @@ def apply_availability_transition(
     operation: dict[str, Any] | None = None
     try:
         with ExitStack() as stack:
-            stack.enter_context(schema_writer_lock(cfg))
+            stack.enter_context(schema_writer_lock(cfg, require_narrow=True))
             if lock_group:
                 stack.enter_context(group_lock(cfg.shared_root, lock_group))
             stack.enter_context(task_lock(cfg.shared_root, request.task_id))

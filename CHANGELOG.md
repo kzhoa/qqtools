@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- breaking: retire the qexp ready-index diagnostics, Group ready-member, and submission schema-lock
+  compatibility transitions. Ordinary mutation now requires the active narrow protocol; legacy
+  roots must complete the explicit Group ready-member upgrade before they can be used.
+- chore: purge the completed qexp Task-dependencies compatibility transition and its legacy marker.
 - refactor: split the qexp machine agent and runtime into dependency-directed `agent/` modules while preserving CLI commands and behavior.
 - fix: warn qpipeline users when torchrun environment variables are detected without
   `--ddp` or `--ddp-detect`, including the recognized environment keys and DDP initialization guidance.

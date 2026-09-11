@@ -310,7 +310,7 @@ def _finalize_cleanup_if_ready(cfg: RootConfig, operation_path: Path) -> list[st
             return []
         return _finalize_cleanup_operation(cfg, operation)
 
-    with schema_writer_lock(cfg, blocking=False) as has_schema_lock:
+    with schema_writer_lock(cfg, blocking=False, require_narrow=True) as has_schema_lock:
         if not has_schema_lock:
             return []
         if group_name:
@@ -351,7 +351,7 @@ def reconcile_cleanup_operations(
             "removed": [],
             "blockers": [],
         }
-        with schema_writer_lock(cfg, blocking=False) as has_schema_lock:
+        with schema_writer_lock(cfg, blocking=False, require_narrow=True) as has_schema_lock:
             if not has_schema_lock:
                 result["blockers"] = ["schema_lock_busy"]
                 results.append(result)
@@ -469,7 +469,7 @@ def clean(
     from ..scheduler import authority_locks
 
     for candidate in candidates:
-        with schema_writer_lock(cfg):
+        with schema_writer_lock(cfg, require_narrow=True):
             with authority_locks(cfg, candidate):
                 task = load_task(cfg, candidate.task_id)
                 blockers = _clean_blockers(cfg, task, reservation_runtime_root=reservation_runtime_root)
