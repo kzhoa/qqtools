@@ -214,19 +214,23 @@ recovery records a durable reason code and never bypasses upgrade writer exclusi
 
 ### Phase 1: establish the contract and baseline
 
-- [ ] Reproduce the global true-idle conformance gap and record the approved lifecycle decision,
+**Environment boundary (2026-09-11):** Acceptance evidence was collected on one development
+machine. No multi-host, released-wheel, or production shared-storage environment is available;
+those boundaries are explicitly unverified and are not treated as failures or waivers.
+
+- [x] Reproduce the global true-idle conformance gap and record the approved lifecycle decision,
       including multi-binding and post-first-registration behavior, before claiming conformance.
-- [ ] Inventory existing lifecycle/recovery tests against LI-01 through LI-09 and reuse valid coverage.
+- [x] Inventory existing lifecycle/recovery tests against LI-01 through LI-09 and reuse valid coverage.
 - [x] Add tracked product/runtime contract text and contract-matrix mapping with honest pending status.
-- [ ] Reproduce LI-01 through LI-04 with real processes and record baseline, state transitions,
+- [x] Reproduce LI-01 through LI-04 with real processes and record baseline, state transitions,
       evidence ownership, numerical convergence budget, and gate runtime budget.
 
 ### Phase 2: close verified gaps
 
 - [x] Add deterministic interruption coverage and multi-project/boundary cases in the focused
       Integration suite; fix only demonstrated lifecycle/evidence/recovery defects.
-- [ ] Verify runner survival separately from runner-death containment; retain existing guardian safety.
-- [ ] Record any required persisted-protocol or authority change before implementing it, applying
+- [x] Verify runner survival separately from runner-death containment; retain existing guardian safety.
+- [x] Record any required persisted-protocol or authority change before implementing it, applying
       existing compatibility governance and the upgrade pitch where relevant.
 
 ### Phase 3: enforce and document
@@ -237,11 +241,15 @@ recovery records a durable reason code and never bypasses upgrade writer exclusi
 
 ## Acceptance checklist
 
-- [ ] Global true-idle behavior has a single approved product/runtime contract and real-process
+- [x] Global true-idle behavior has a single approved product/runtime contract and real-process
       evidence; first-registration tests are not substituted for this separate conformance gate.
 - [x] LI-01 through LI-09 have passing real-boundary evidence on supported Linux; the focused
       lifecycle integration file passes 36 tests, including both LI-03 lease-expiry cases.
 - [x] Stop/offline completion/start needs no manual repair in the intact, unsuperseded case.
 - [x] Same-version lifecycle correctness is gated independently of migration implementation.
-- [ ] Test runtime, evidence retention, and convergence budgets are recorded and satisfied.
-- [ ] Tracked specifications and test mappings describe verified behavior; no pitch-only gate claim.
+- [x] Test runtime, evidence retention, and convergence budgets are recorded and satisfied.
+- [x] Tracked specifications and test mappings describe verified behavior; no pitch-only gate claim.
+
+**Audit disposition:** The lifecycle contract is accepted for the supported single-development-
+machine boundary. Multi-host/production validation remains an explicit environmental limitation,
+not a capability waiver; it must be rerun when such an environment becomes available.
