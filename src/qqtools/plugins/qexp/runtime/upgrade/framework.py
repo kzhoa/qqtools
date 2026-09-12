@@ -348,7 +348,28 @@ class UpgradeCoordinator:
                         }
                     )
             return status
-        except (OSError, KeyError, TypeError, ValueError, UpgradeError) as exc:
+        except OSError as exc:
+            # A registered root can be temporarily unavailable. Preserve that distinction so
+            # machine discovery reports it as unverified/inaccessible rather than as corruption
+            # requiring repair; historical activation evidence remains untouched.
+            return {
+                "project_id": _safe_project_id(self.cfg),
+                "shared_root": str(self.cfg.shared_root),
+                "state": "inaccessible",
+                "phase": None,
+                "source_protocol": None,
+                "target_protocol": None,
+                "migrations": [],
+                "pending": True,
+                "can_run": False,
+                "admission_blocked": False,
+                "migration_blocked": True,
+                "last_progress_at": None,
+                "blockers": [f"registered_root_inaccessible:{exc}"],
+                "pause": None,
+                "repair": None,
+            }
+        except (KeyError, TypeError, ValueError, UpgradeError) as exc:
             return {
                 "project_id": _safe_project_id(self.cfg),
                 "shared_root": str(self.cfg.shared_root),
