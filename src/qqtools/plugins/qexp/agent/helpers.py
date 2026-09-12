@@ -1,21 +1,31 @@
 """Shared machine agent helpers."""
+
 from __future__ import annotations
+
 import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, ContextManager
+
 from ..config_types import RootConfig
-from ..machine_config import load_machine_policy
+from ..executor import Executor
 from ..layout import machine_state_path
+from ..machine_config import load_machine_policy
 from ..machine_state import publish_machine_snapshots
 from ..project_maintenance import reconcile_reservation
-from ..scheduler import resume_starting_attempt, fail_attempt
 from ..runtime.paths import local_paths, shared_paths
 from ..runtime.records import TaskSpec, utc_now
-from ..runtime.resources.reservations import ReservationIdentity, ReservationSnapshot, reconcile_snapshot, reservation_snapshot
+from ..runtime.resources.reservations import (
+    ReservationIdentity,
+    ReservationSnapshot,
+    reconcile_snapshot,
+    reservation_snapshot,
+)
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.work_budget import diagnostic_increment, diagnostic_span
+from ..scheduler import fail_attempt, resume_starting_attempt
 from .context import MachineRuntime, ProjectBinding
+
 
 def _pid_alive(pid: int) -> bool:
     try:
@@ -273,7 +283,7 @@ def _publish_project_snapshot(
             cfg,
             instance_id=instance_id,
             pid=pid,
-            agent_mode="machine",
+            agent_mode=load_machine_policy(cfg).agent_mode,
             observed_state="active" if reserved else "idle",
             active_attempt_ids=[item for item in attempts if isinstance(item, str)],
             visible_gpu_ids=visible,
@@ -367,4 +377,3 @@ def _recover_starting_reservations(
                 except (KeyError, OSError, RuntimeError, ValueError):
                     diagnostic_increment("recovery.starting.compensation_errors")
     return launched
-
