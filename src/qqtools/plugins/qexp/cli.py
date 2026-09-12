@@ -20,7 +20,21 @@ from .activation import (
     start_local_agent,
     stop_local_agent,
 )
-from .legacy_agent import get_agent_status
+from .agent.context import ExecutionContext, MachineRuntime
+from .agent.lifecycle import (
+    ensure_machine_agent_started,
+    get_machine_agent_status,
+    restart_machine_agent,
+    stop_machine_agent,
+)
+from .agent.project_admin import (
+    _enable_command,
+    enable_project,
+    migrate_project,
+    register_project,
+    set_project_enabled,
+    unregister_project,
+)
 from .commands import cleanup
 from .commands import group as group_commands
 from .commands import logs as log_commands
@@ -37,22 +51,8 @@ from .group_ready_members_upgrade import (
 )
 from .layout import clear_context, load_context, load_root_config, migrate_schema5_to_schema6, save_context
 from .lease import LeasePolicy, load_lease_policy, save_lease_policy
-from .agent.lifecycle import (
-    ensure_machine_agent_started,
-    get_machine_agent_status,
-    restart_machine_agent,
-    stop_machine_agent,
-)
-from .agent.project_admin import (
-    _enable_command,
-    enable_project,
-    migrate_project,
-    register_project,
-    set_project_enabled,
-    unregister_project,
-)
+from .legacy_agent import get_agent_status
 from .machine_config import init_shared_root, load_machine_policy
-from .agent.context import ExecutionContext, MachineRuntime
 from .notification_config import (
     DEFAULT_WEBHOOK_ENV,
     load_notifications,

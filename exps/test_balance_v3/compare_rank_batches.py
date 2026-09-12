@@ -6,11 +6,7 @@ from time import perf_counter
 
 import numpy as np
 
-from qqtools.data.qbalance import (
-    _plan_rank_batches,
-    assign_window_to_ranks,
-    compute_global_even_sort_order,
-)
+from qqtools.data.qbalance import _plan_rank_batches, assign_window_to_ranks, compute_global_even_sort_order
 
 
 def _window_plan(costs, *, batch_size, world_size, seed, strategy):

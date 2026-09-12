@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp.agent.process import spawn_machine_agent_process
 from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.process import spawn_machine_agent_process
 
 
 def test_machine_agent_default_stderr_captures_startup_errors_without_a_pipe(tmp_path: Path, monkeypatch) -> None:

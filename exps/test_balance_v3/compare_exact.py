@@ -12,11 +12,15 @@ import argparse
 from time import perf_counter
 
 import numpy as np
-
 from exact_rank_batches import integer_quality, solve_exact
+
 from qqtools.data.qbalance import (
-    _partition_capacity_batches, _partition_layered_batches, _plan_rank_batches,
-    _rank_batch_loads, _rank_batch_quality, _swap_rank_batch_pair,
+    _partition_capacity_batches,
+    _partition_layered_batches,
+    _plan_rank_batches,
+    _rank_batch_loads,
+    _rank_batch_quality,
+    _swap_rank_batch_pair,
 )
 
 

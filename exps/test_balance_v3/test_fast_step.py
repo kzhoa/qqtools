@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
-
 from fast_step import plan_fast, refine_fast_steps
+
 from qqtools.data.qbalance import _plan_rank_batches
 
 

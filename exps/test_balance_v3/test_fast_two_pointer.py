@@ -2,10 +2,10 @@
 
 import numpy as np
 import pytest
-
 from fast_two_pointer import _best_pair_swaps, _swap_once, plan_fast_two_pointer
-from qqtools.data.qbalance import _rank_batch_quality
 from layered_baseline import plan_layered_baseline as _plan_rank_batches
+
+from qqtools.data.qbalance import _rank_batch_quality
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 6, 8, 16, 64])

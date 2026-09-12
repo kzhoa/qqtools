@@ -16,10 +16,10 @@ from random import Random
 from time import perf_counter
 
 import numpy as np
-
-from qqtools.data.qbalance import _plan_rank_batches
 from layered_numpy import _plan_layered_rank_batches
 from reference_schedule import _partition_equal
+
+from qqtools.data.qbalance import _plan_rank_batches
 
 
 def _scalar_layered(costs, batch_size, world_size, seed, *, should_balance_steps):

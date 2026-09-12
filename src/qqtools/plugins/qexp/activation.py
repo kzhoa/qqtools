@@ -5,8 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 
-from .config_types import RootConfig
-from .events import write_event
+from .agent.context import MachineRuntime, ProjectBinding
 from .agent.lifecycle import (
     ensure_machine_agent_started,
     get_machine_agent_status,
@@ -14,8 +13,9 @@ from .agent.lifecycle import (
     run_machine_agent_loop,
     stop_machine_agent,
 )
+from .config_types import RootConfig
+from .events import write_event
 from .machine_config import is_legacy_agent_project
-from .agent.context import MachineRuntime, ProjectBinding
 
 
 def managed_project_agent_status(

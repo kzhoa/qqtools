@@ -1,6 +1,8 @@
 """Pure resource admission decisions."""
 from __future__ import annotations
+
 from .models import AdmissionInput
+
 
 def admits(candidate: AdmissionInput) -> bool:
     """Return whether the available snapshot satisfies task demand."""

@@ -4,11 +4,11 @@ from itertools import combinations
 
 import numpy as np
 import pytest
-
-from exact_rank_batches import integer_quality
 from compare_exact import legacy_best
+from exact_rank_batches import integer_quality
 from inspect_neighborhood import inspect_trap
 from refine_prototype import _repartition_pair, prototype_best
+
 from qqtools.data.qbalance import _rank_batch_quality, _swap_rank_batch_pair
 
 

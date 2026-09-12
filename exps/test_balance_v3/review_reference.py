@@ -6,9 +6,9 @@ from random import Random
 from time import perf_counter
 
 import numpy as np
+from reference_schedule import _improve_by_swaps, _partition_equal, build_balanced_schedule
 
 from qqtools.data.qbalance import _plan_rank_batches
-from reference_schedule import _improve_by_swaps, _partition_equal, build_balanced_schedule
 
 
 def _check_plan(costs, plan):

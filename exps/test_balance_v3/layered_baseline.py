@@ -2,9 +2,7 @@
 
 import numpy as np
 
-from qqtools.data.qbalance import (
-    _normalize_sample_costs, _partition_layered_batches, _rank_batch_loads,
-)
+from qqtools.data.qbalance import _normalize_sample_costs, _partition_layered_batches, _rank_batch_loads
 
 
 def plan_layered_baseline(

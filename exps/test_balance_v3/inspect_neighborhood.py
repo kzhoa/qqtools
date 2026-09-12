@@ -8,7 +8,6 @@ from itertools import combinations
 
 from exact_rank_batches import integer_quality, solve_exact
 
-
 COSTS = (56, 55, 34, 85, 41, 76, 21, 34, 1, 60, 2, 20)
 # Observed prototype result on the held-out uniform/B3/seed109 case.
 INCUMBENT = ((3, 2, 8), (5, 7, 11), (9, 0, 10), (4, 6, 1))

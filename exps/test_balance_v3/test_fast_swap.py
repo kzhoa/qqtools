@@ -2,12 +2,10 @@
 
 import numpy as np
 import pytest
-
 from fast_swap import _swap_once, plan_fast_swap
-from qqtools.data.qbalance import (
-    _has_worse_raw_step_sum, _rank_batch_quality,
-)
 from layered_baseline import plan_layered_baseline as _plan_rank_batches
+
+from qqtools.data.qbalance import _has_worse_raw_step_sum, _rank_batch_quality
 
 
 def _scalar_swap(costs, batches, world_size):

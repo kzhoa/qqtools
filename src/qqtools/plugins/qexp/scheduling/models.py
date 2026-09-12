@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
+
 @dataclass(frozen=True, slots=True)
 class ResourceSnapshot:
     """Resources available to one scheduling cycle."""

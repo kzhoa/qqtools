@@ -4,11 +4,11 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import AGENT_MODE_DAEMON, init_shared_root, submit
-from qqtools.plugins.qexp.legacy_agent import get_agent_status
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.layout import load_context, load_root_config, runtime_pid_path
-from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.legacy_agent import get_agent_status
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, expire_claim, fail_attempt
 
