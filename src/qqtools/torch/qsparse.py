@@ -56,7 +56,7 @@ def scipy2sparsetensor(A):
     elif scipy.sparse.isspmatrix_csr(A):
         return scipy2csrtensor(A)
     elif scipy.sparse.isspmatrix_csc(A):
-        return scipy2cootensor(A)  # 默认将csc转coo，因为torch没有csc的layout。
+        return scipy2cootensor(A)  # By default, convert CSC to COO because Torch has no CSC layout.
         raise NotImplementedError
 
 
