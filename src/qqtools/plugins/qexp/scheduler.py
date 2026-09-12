@@ -546,68 +546,80 @@ def authorize_launch(
     fencing_token: int,
     *,
     reservation_runtime_root: Path | None = None,
+    write_guard: Callable[[], ContextManager[bool]] | None = None,
 ) -> bool:
     reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
     cancel_result = None
-    with authority_locks(cfg, task):
-        task = load_task(cfg, task_id)
-        claim = task.claim_control.get("active_claim") or {}
-        if claim.get("machine_name") != cfg.machine_name:
+    @contextmanager
+    def _authority_write_guard() -> Iterator[bool]:
+        if write_guard is None:
+            yield True
+            return
+        with write_guard() as is_eligible:
+            yield is_eligible
+
+    with _authority_write_guard() as is_eligible:
+        if not is_eligible:
             return False
-        if claim.get("authority_mode") not in {"bounded_lease", "holder_bound"}:
-            return False
-        if claim.get("authority_mode") == "bounded_lease" and not clock_capability(cfg).is_healthy:
-            return False
-        if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
-            return False
-        if operation_exists(cfg, "cleanup", task.task_id):
-            return False
-        if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
-            return False
-        attempt_number = task.attempt_control.get("current_attempt_number")
-        if not isinstance(attempt_number, int):
-            return False
-        try:
-            attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task_id, attempt_number)))
-        except (FileNotFoundError, KeyError, ValueError):
-            return False
-        if (
-            attempt.attempt_id != attempt_id
-            or attempt.current_fencing_token != fencing_token
-            or attempt.machine_name != cfg.machine_name
-        ):
-            return False
-        if claim.get("launch_state") == "starting":
-            return False
-        elif (
-            claim.get("launch_state") != "claimed"
-            or attempt.phase != "claimed"
-            or task.control.get("cancellation_requested_at")
-        ):
-            cancel_result = _cancel_prelaunch_locked(cfg, task, "launch_gate_lost")
-        elif not _has_active_launch_reservation(task, claim, reservation_runtime_root):
-            cancel_result = _cancel_prelaunch_locked(cfg, task, "launch_reservation_lost")
-        elif task.group_name:
-            group = read_json(group_path(cfg.shared_root, task.group_name))
-            if not group_allows(group, task, cfg.machine_name):
-                cancel_result = _cancel_prelaunch_locked(cfg, task, "worker_or_dispatch_changed")
-            else:
-                claim["group_dispatch_epoch"] = group["group"]["dispatch_epoch"]
-                claim["group_worker_set_epoch"] = group["group"]["worker_set_epoch"]
-        if cancel_result is None:
-            authorized_at = utc_now()
-            launch_id = uuid.uuid4().hex
-            claim["launch_state"] = "starting"
-            claim["launch_authorized_at"] = authorized_at
-            claim["launch_id"] = launch_id
-            task.meta["revision"] += 1
-            task.meta["updated_at"] = authorized_at
-            save_task(cfg, task)
-            attempt.phase = "starting"
-            attempt.authorization["launch_id"] = launch_id
-            attempt.timestamps["launch_authorized_at"] = authorized_at
-            atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
+        with authority_locks(cfg, task):
+            task = load_task(cfg, task_id)
+            claim = task.claim_control.get("active_claim") or {}
+            if claim.get("machine_name") != cfg.machine_name:
+                return False
+            if claim.get("authority_mode") not in {"bounded_lease", "holder_bound"}:
+                return False
+            if claim.get("authority_mode") == "bounded_lease" and not clock_capability(cfg).is_healthy:
+                return False
+            if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
+                return False
+            if operation_exists(cfg, "cleanup", task.task_id):
+                return False
+            if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
+                return False
+            attempt_number = task.attempt_control.get("current_attempt_number")
+            if not isinstance(attempt_number, int):
+                return False
+            try:
+                attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task_id, attempt_number)))
+            except (FileNotFoundError, KeyError, ValueError):
+                return False
+            if (
+                attempt.attempt_id != attempt_id
+                or attempt.current_fencing_token != fencing_token
+                or attempt.machine_name != cfg.machine_name
+            ):
+                return False
+            if claim.get("launch_state") == "starting":
+                return False
+            elif (
+                claim.get("launch_state") != "claimed"
+                or attempt.phase != "claimed"
+                or task.control.get("cancellation_requested_at")
+            ):
+                cancel_result = _cancel_prelaunch_locked(cfg, task, "launch_gate_lost")
+            elif not _has_active_launch_reservation(task, claim, reservation_runtime_root):
+                cancel_result = _cancel_prelaunch_locked(cfg, task, "launch_reservation_lost")
+            elif task.group_name:
+                group = read_json(group_path(cfg.shared_root, task.group_name))
+                if not group_allows(group, task, cfg.machine_name):
+                    cancel_result = _cancel_prelaunch_locked(cfg, task, "worker_or_dispatch_changed")
+                else:
+                    claim["group_dispatch_epoch"] = group["group"]["dispatch_epoch"]
+                    claim["group_worker_set_epoch"] = group["group"]["worker_set_epoch"]
+            if cancel_result is None:
+                authorized_at = utc_now()
+                launch_id = uuid.uuid4().hex
+                claim["launch_state"] = "starting"
+                claim["launch_authorized_at"] = authorized_at
+                claim["launch_id"] = launch_id
+                task.meta["revision"] += 1
+                task.meta["updated_at"] = authorized_at
+                save_task(cfg, task)
+                attempt.phase = "starting"
+                attempt.authorization["launch_id"] = launch_id
+                attempt.timestamps["launch_authorized_at"] = authorized_at
+                atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
             _release_task_reservation(
@@ -980,6 +992,7 @@ def _run_dispatch_cycle(
                     attempt.attempt_id,
                     attempt.current_fencing_token,
                     reservation_runtime_root=reservation_runtime_root,
+                    write_guard=claim_guard,
                 ):
                     authorized = _load_current_attempt(cfg, load_task(cfg, task.task_id))
                     if authorized is not None:
@@ -1093,6 +1106,7 @@ def _run_dispatch_cycle(
                 attempt.attempt_id,
                 attempt.current_fencing_token,
                 reservation_runtime_root=reservation_runtime_root,
+                write_guard=claim_guard,
             ):
                 if task.spec.is_cpu_only:
                     available_cpu_slots += task.spec.requested_cpus or 0

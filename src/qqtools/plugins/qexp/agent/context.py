@@ -20,7 +20,14 @@ from ..infrastructure.host import host_instance_id as _host_instance_id
 from ..layout import load_machine_record, load_machine_registration, load_root_config, save_machine_registration
 from ..lease import lease_expiry, load_lease_policy, parse_utc
 from ..runtime.locks import exclusive, machine_lock
-from ..runtime.paths import local_paths, machine_project_paths, machine_runtime_paths, shared_paths
+from ..runtime.paths import (
+    local_paths,
+    machine_path,
+    machine_project_paths,
+    machine_registration_path,
+    machine_runtime_paths,
+    shared_paths,
+)
 from ..runtime.ready import ReadyCursor
 from ..runtime.records import utc_now
 from ..runtime.store import atomic_replace, iter_json, read_json
@@ -308,6 +315,92 @@ class MachineRuntime:
             },
         )
 
+    def _save_registration_transaction(
+        self,
+        *,
+        revision: int,
+        bindings: list[ProjectBinding],
+        registrations: list[tuple[RootConfig, dict[str, Any] | None]],
+        machine_records: list[tuple[RootConfig, dict[str, Any] | None]],
+    ) -> None:
+        """Record enough pre-state to roll back an interrupted registration publication."""
+        atomic_replace(
+            self.paths["registration_transaction"],
+            {
+                "registration_transaction": {
+                    "revision": revision,
+                    "bindings": [binding.to_dict() for binding in bindings],
+                    "registrations": [
+                        {
+                            "shared_root": str(cfg.shared_root),
+                            "machine_name": cfg.machine_name,
+                            "record": record,
+                        }
+                        for cfg, record in registrations
+                    ],
+                    "machine_records": [
+                        {
+                            "shared_root": str(cfg.shared_root),
+                            "machine_name": cfg.machine_name,
+                            "record": record,
+                        }
+                        for cfg, record in machine_records
+                    ],
+                }
+            },
+        )
+
+    def _rollback_registration_transaction(self) -> None:
+        """Restore the last incomplete registration before accepting a new mutation."""
+        path = self.paths["registration_transaction"]
+        if not path.exists():
+            return
+        value = read_json(path).get("registration_transaction")
+        if not isinstance(value, dict):
+            raise RuntimeError("machine registration transaction is malformed.")
+        try:
+            revision = value["revision"]
+            bindings = [ProjectBinding.from_dict(item) for item in value["bindings"]]
+            registrations = value["registrations"]
+            machine_records = value["machine_records"]
+            if not isinstance(revision, int) or not isinstance(registrations, list) or not isinstance(machine_records, list):
+                raise ValueError
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("machine registration transaction is malformed.") from exc
+        configs: list[RootConfig] = []
+        for item in [*registrations, *machine_records]:
+            if not isinstance(item, dict) or not isinstance(item.get("shared_root"), str) or not isinstance(
+                item.get("machine_name"), str
+            ):
+                raise RuntimeError("machine registration transaction is malformed.")
+            cfg = load_root_config(item["shared_root"], item["machine_name"])
+            if not any(
+                existing.shared_root == cfg.shared_root and existing.machine_name == cfg.machine_name
+                for existing in configs
+            ):
+                configs.append(cfg)
+        with self._registration_guards(*configs):
+            for item in registrations:
+                cfg = load_root_config(item["shared_root"], item["machine_name"])
+                registration_path = machine_registration_path(cfg.shared_root, cfg.machine_name)
+                record = item.get("record")
+                if record is None:
+                    registration_path.unlink(missing_ok=True)
+                else:
+                    save_machine_registration(cfg, record)
+            for item in machine_records:
+                cfg = load_root_config(item["shared_root"], item["machine_name"])
+                record_path = machine_path(cfg.shared_root, cfg.machine_name)
+                record = item.get("record")
+                if record is None:
+                    record_path.unlink(missing_ok=True)
+                else:
+                    from ..layout import save_machine_record
+
+                    save_machine_record(cfg, record)
+            self._save_registry(revision, bindings)
+            path.unlink(missing_ok=True)
+
     def ensure_binding(
         self,
         shared_root: str | Path,
@@ -328,6 +421,7 @@ class MachineRuntime:
             raise RuntimeError(f"machine {machine_name!r} is not initialized in {cfg.shared_root}.")
         runtime_instance_id = self.instance_id
         with self.registry_guard():
+            self._rollback_registration_transaction()
             revision, bindings = self.load_registry()
             current = next(
                 (
@@ -355,45 +449,63 @@ class MachineRuntime:
                         f"project {stable_id!r} remains registered as {old.machine_name!r} ({old_status}); "
                         "explicit --adopt-existing is required to replace its logical name."
                     )
+            affected_configs = [cfg]
             if current is None and same_project:
-                registration = self._replace_registration(
-                    cfg,
-                    stable_id,
-                    runtime_instance_id,
-                    same_project[0],
-                    adopt_existing=adopt_existing,
-                )
-            else:
-                registration = self._acquire_registration(
-                    cfg,
-                    stable_id,
-                    runtime_instance_id,
-                    current,
-                    adopt_existing=adopt_existing,
-                )
-            binding = ProjectBinding(
-                stable_id,
-                cfg.shared_root,
-                machine_name,
-                current.enabled if current is not None else enabled,
-                registration["generation"],
-                runtime_instance_id,
-                str(self.root),
+                affected_configs.append(same_project[0].root_config())
+            registration_records = [(item, load_machine_registration(item)) for item in affected_configs]
+            machine_records = [(item, load_machine_record(item)) for item in affected_configs]
+            self._save_registration_transaction(
+                revision=revision,
+                bindings=bindings,
+                registrations=registration_records,
+                machine_records=machine_records,
             )
-            if record is None:
-                from ..machine_config import save_machine_config
+            try:
+                if current is None and same_project:
+                    registration = self._replace_registration(
+                        cfg,
+                        stable_id,
+                        runtime_instance_id,
+                        same_project[0],
+                        adopt_existing=adopt_existing,
+                    )
+                else:
+                    registration = self._acquire_registration(
+                        cfg,
+                        stable_id,
+                        runtime_instance_id,
+                        current,
+                        adopt_existing=adopt_existing,
+                    )
+                binding = ProjectBinding(
+                    stable_id,
+                    cfg.shared_root,
+                    machine_name,
+                    current.enabled if current is not None else enabled,
+                    registration["generation"],
+                    runtime_instance_id,
+                    str(self.root),
+                )
+                if record is None:
+                    from ..machine_config import save_machine_config
 
-                save_machine_config(cfg, agent_mode=None)
-            if current is not None:
-                updated = [binding if item == current else item for item in bindings]
-                if updated != bindings:
-                    self._save_registry(revision + 1, updated)
-                return binding, False
-            if same_project:
-                bindings = [item for item in bindings if item != same_project[0]]
-            if any(item.shared_root == binding.shared_root for item in bindings):
-                raise ValueError(f"project root {binding.shared_root} is already registered.")
-            self._save_registry(revision + 1, [*bindings, binding])
+                    save_machine_config(cfg, agent_mode=None)
+                if current is not None:
+                    updated = [binding if item == current else item for item in bindings]
+                    if updated != bindings:
+                        self._save_registry(revision + 1, updated)
+                    self.paths["registration_transaction"].unlink(missing_ok=True)
+                    return binding, False
+                if same_project:
+                    bindings = [item for item in bindings if item != same_project[0]]
+                if any(item.shared_root == binding.shared_root for item in bindings):
+                    raise ValueError(f"project root {binding.shared_root} is already registered.")
+                self._save_registry(revision + 1, [*bindings, binding])
+                self.paths["registration_transaction"].unlink(missing_ok=True)
+            except Exception:
+                # Keep the durable transaction for the next registration attempt to
+                # inspect and roll back after all nested locks have been released.
+                raise
         return binding, True
 
     def _acquire_registration(

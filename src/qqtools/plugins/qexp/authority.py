@@ -350,6 +350,9 @@ class AuthoritySupervisor:
         if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != token:
             self._reconcile_orphaned_process(process, task)
             return
+        if claim.get("machine_name") != self.cfg.machine_name:
+            self._supervise_renamed_execution(process, task_id, attempt_id, token)
+            return
         for decision_file in iter_json(local_paths(self.cfg.runtime_root)["termination_decisions"] / attempt_id):
             decision = read_json(decision_file).get("termination_decision", {})
             if decision.get("state") in {"signal_committed", "sigterm_sent", "sigkill_sent", "confirmed"}:
@@ -395,6 +398,30 @@ class AuthoritySupervisor:
             self._record_diagnostic(process, "exit_observation_missing")
             return
         self._renew_or_isolate(task_id, attempt_id, token, process)
+
+    def _supervise_renamed_execution(
+        self,
+        process: dict[str, object],
+        task_id: str,
+        attempt_id: str,
+        token: int,
+    ) -> None:
+        """Preserve and reconcile local execution launched under a replaced logical name."""
+        observation = local_paths(self.cfg.runtime_root)["observations"] / f"{attempt_id}.json"
+        if not observation.exists():
+            self._set_authority_state(process, "retained_execution")
+            return
+        is_valid, exit_code = self._read_exit_observation(observation, task_id, attempt_id, process)
+        if not is_valid:
+            return
+        self._finalize(
+            task_id,
+            attempt_id,
+            token,
+            exit_code,
+            was_terminated=False,
+            is_renamed_execution=True,
+        )
 
     def _reconcile_terminal_accounting(self, task_id: str, attempt_id: str) -> bool:
         """Retry reservation/accounting effects after terminal truth already committed."""
@@ -747,7 +774,16 @@ class AuthoritySupervisor:
             commit_signal(self.cfg, attempt_id, decision_id)
             send_signals(self.cfg, attempt_id, decision_id)
 
-    def _finalize(self, task_id: str, attempt_id: str, token: int, exit_code: object, *, was_terminated: bool) -> None:
+    def _finalize(
+        self,
+        task_id: str,
+        attempt_id: str,
+        token: int,
+        exit_code: object,
+        *,
+        was_terminated: bool,
+        is_renamed_execution: bool = False,
+    ) -> None:
         task = load_task(self.cfg, task_id)
         result = None
         with authority_locks(self.cfg, task):
@@ -784,7 +820,9 @@ class AuthoritySupervisor:
             )
         if result.outcome != "committed":
             return
-        if result.reservation_id and result.reservation_machine_name == self.cfg.machine_name:
+        if result.reservation_id and (
+            is_renamed_execution or result.reservation_machine_name == self.cfg.machine_name
+        ):
             release(self.reservation_runtime_root, result.reservation_id, reason)
         manifest_path = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
         process = read_json(manifest_path).get("process", {})

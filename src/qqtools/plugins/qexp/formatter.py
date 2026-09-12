@@ -268,6 +268,7 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
             result.get("agent_state"),
             (
                 ("Agent mode", result.get("agent_mode")),
+                ("Project ID", result.get("project_id")),
                 ("Machine", result.get("machine_name")),
                 ("PID", result.get("pid")),
                 ("Previous PID", result.get("previous_pid")),
