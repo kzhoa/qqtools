@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,7 +13,7 @@ from ..records import validate_identifier
 from ..store import atomic_replace, read_json
 from ..work_budget import SliceBudget
 from . import primary_candidates, routes, state
-from .diagnostics import ReadyDiagnostic, storage_diagnostic
+from .diagnostics import ReadyDiagnostic, diagnostic, exception_fields, storage_diagnostic
 from .records import ReadyMarkerRef, ReadyScope
 
 
@@ -35,6 +37,7 @@ class ReadyPeek:
     wrapped: bool = False
     exhausted: bool = False
     unresolved: bool = False
+    diagnostic: ReadyDiagnostic | None = None
 
 
 _CATALOG_FIELDS = frozenset({"schema_version", "route", "page", "partitions", "successor", "revision"})
@@ -42,6 +45,9 @@ _PARTITION_FIELDS = frozenset(
     {"schema_version", "route", "partition", "catalog_page", "slots", "sealed", "successor", "revision"}
 )
 _NO_INVALID_PARTITION = object()
+_READY_MARKER_READ_ATTEMPTS = 3
+_READY_MARKER_RETRY_DELAY_SECONDS = 0.01
+_LOGGER = logging.getLogger(__name__)
 
 
 class _CatalogValidationError(ValueError):
@@ -341,31 +347,54 @@ def _reference_from_slot(
     catalog_page: int,
     partition: str,
     marker_name: str,
-) -> ReadyMarkerRef | None:
+) -> tuple[ReadyMarkerRef | None, ReadyDiagnostic | None]:
     stem = marker_name[:-5] if marker_name.endswith(".json") else marker_name
     task_id, separator, generation_value = stem.rpartition(".")
     try:
         validate_identifier(task_id, "slot task_id")
         generation = int(generation_value) if separator else -1
     except (TypeError, ValueError):
-        return None
+        return None, None
     if generation <= 0 or marker_name != f"{task_id}.{generation}.json":
-        return None
-    # A shared marker is the sole authority for task ownership.  If it is
-    # temporarily unavailable, leave the slot unresolved; never infer that
-    # the scanning machine owns it.
-    home_machine = cfg.machine_name if scope == "home" else None
-    if scope == "shared":
-        provisional = ReadyMarkerRef(task_id, generation, scope, home_machine, partition, catalog_page, marker_name)
+        return None, None
+    try:
+        reference = routes.reference_for_generation(cfg, task_id, generation)
+    except OSError as exc:
+        return None, diagnostic(
+            "marker_unavailable",
+            stage="marker_read",
+            task_id=task_id,
+            generation=generation,
+            **exception_fields(exc),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    if reference is None:
+        return None, None
+    marker_path = routes.marker_path(cfg.shared_root, reference)
+    last_exception: BaseException | None = None
+    for attempt in range(_READY_MARKER_READ_ATTEMPTS):
         try:
-            marker = read_json(routes.marker_path(cfg.shared_root, provisional))["ready_marker"]
-            if isinstance(marker.get("home_machine"), str):
-                home_machine = validate_identifier(marker["home_machine"], "marker home_machine")
-        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
-            pass
-    if home_machine is None:
-        return None
-    return ReadyMarkerRef(task_id, generation, scope, home_machine, partition, catalog_page, marker_name)
+            value = read_json(marker_path)
+            marker = value.get("ready_marker")
+            if not isinstance(marker, dict):
+                return reference, None
+            return reference, None
+        except (FileNotFoundError, OSError) as exc:
+            last_exception = exc
+            if attempt + 1 < _READY_MARKER_READ_ATTEMPTS:
+                time.sleep(_READY_MARKER_RETRY_DELAY_SECONDS)
+        except (KeyError, TypeError, ValueError):
+            return reference, None
+    if last_exception is None:
+        return None, None
+    return None, diagnostic(
+        "marker_unavailable",
+        stage="marker_read",
+        task_id=task_id,
+        generation=generation,
+        **exception_fields(last_exception),
+    )
 
 
 def _is_partition_referenced_under_route_lock(
@@ -481,8 +510,27 @@ def next_ready_marker(
     for marker_name in names:
         if after_name is not None and marker_name <= after_name:
             continue
-        reference = _reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name)
+        reference, _diagnostic = _reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name)
         if reference is None:
+            if _diagnostic is not None:
+                _LOGGER.warning(
+                    "ready marker unresolved task_id=%s generation=%s fields=%s",
+                    marker_name.rsplit(".", 2)[0],
+                    marker_name.rsplit(".", 2)[1],
+                    _diagnostic.as_dict(),
+                )
+            _save_ready_cursor(
+                cfg,
+                ReadyCursor(
+                    project_id,
+                    cfg.machine_name,
+                    queue_scope,
+                    page_number,
+                    partition_name,
+                    marker_name,
+                    cursor.revision + 1,
+                ),
+            )
             return None, False
         if excluded_identities is not None and reference.identity in excluded_identities:
             _save_ready_cursor(
@@ -649,9 +697,25 @@ def peek_ready_marker(
                 if not budget.can_start_operation():
                     return ReadyPeek(None, progress_cursor, exhausted=True)
                 budget.consume_operation()
-                reference = _reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name)
+                reference, marker_diagnostic = _reference_from_slot(
+                    cfg, queue_scope, page_number, partition_name, marker_name
+                )
                 if reference is None:
-                    return ReadyPeek(None, current, unresolved=True)
+                    unresolved_cursor = ReadyCursor(
+                        project_id,
+                        cfg.machine_name,
+                        queue_scope,
+                        page_number,
+                        partition_name,
+                        marker_name,
+                        current.revision + 1,
+                    )
+                    return ReadyPeek(
+                        None,
+                        unresolved_cursor,
+                        unresolved=True,
+                        diagnostic=marker_diagnostic,
+                    )
                 next_cursor = ReadyCursor(
                     project_id,
                     cfg.machine_name,
@@ -854,18 +918,10 @@ def iter_ready_marker_refs(cfg: object, queue_scope: ReadyScope) -> list[ReadyMa
             )
             partition = read_json(partition_path)["ready_partition"]
             for marker_name in sorted(partition["slots"]):
-                reference = _reference_from_slot(cfg, queue_scope, page_number, partition_name, marker_name)
+                reference, _diagnostic = _reference_from_slot(
+                    cfg, queue_scope, page_number, partition_name, marker_name
+                )
                 if reference is None:
-                    state.mark_ready_index_degraded(
-                        cfg,
-                        storage_diagnostic(
-                            "partition_invalid",
-                            route=route_key,
-                            location=partition_name,
-                            stage="slot_identity",
-                            mismatch_fields=["marker_name"],
-                        ),
-                    )
                     continue
                 references.append(reference)
     return references

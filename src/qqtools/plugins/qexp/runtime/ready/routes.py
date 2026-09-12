@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ from .records import ReadyMarkerRef, ReadyScope
 
 READY_PARTITION_SLOTS = 64
 READY_CATALOG_PAGE_SIZE = 64
+READY_PUBLICATION_PENDING = "pending"
+READY_PUBLICATION_COMMITTED = "committed"
 
 
 class ReadyProbeBudgetExhausted(RuntimeError):
@@ -213,6 +216,8 @@ def reserve_slot(cfg: object, task_id: str, generation: int, scope: ReadyScope, 
                     "partition": partition,
                     "catalog_page": catalog_page,
                     "marker_name": marker_name,
+                    "publication_state": READY_PUBLICATION_PENDING,
+                    "publication_token": uuid.uuid4().hex,
                     "created_at": utc_now(),
                 }
             },
@@ -260,6 +265,56 @@ def reference_for_generation(cfg: object, task_id: str, generation: int) -> Read
     ):
         return None
     return reference
+
+
+def publication_state(cfg: object, reference: ReadyMarkerRef) -> str:
+    """Return the reservation publication state, treating legacy records as committed."""
+    record = read_json(reservation_path(cfg.shared_root, reference.task_id, reference.generation))[
+        "ready_reservation"
+    ]
+    token = record.get("publication_token")
+    if token is None:
+        return READY_PUBLICATION_COMMITTED
+    if not isinstance(token, str) or len(token) != 32:
+        raise ValueError("ready reservation publication token is invalid.")
+    try:
+        uuid.UUID(hex=token)
+    except ValueError as exc:
+        raise ValueError("ready reservation publication token is invalid.") from exc
+    current = record.get("publication_state")
+    if current not in {READY_PUBLICATION_PENDING, READY_PUBLICATION_COMMITTED}:
+        raise ValueError("ready reservation publication state is invalid.")
+    return current
+
+
+def commit_publication(cfg: object, reference: ReadyMarkerRef) -> bool:
+    """Atomically mark a reserved ready generation as fully published."""
+    path = reservation_path(cfg.shared_root, reference.task_id, reference.generation)
+    try:
+        value = read_json(path)
+    except FileNotFoundError:
+        return False
+    record = value["ready_reservation"]
+    if record.get("publication_token") is None:
+        return True
+    if publication_state(cfg, reference) == READY_PUBLICATION_COMMITTED:
+        return True
+    if not marker_path(cfg.shared_root, reference).exists():
+        return False
+    if (
+        record.get("task_id") != reference.task_id
+        or record.get("generation") != reference.generation
+        or record.get("queue_scope") != reference.queue_scope
+        or record.get("home_machine") != reference.home_machine
+        or record.get("partition") != reference.partition
+        or record.get("catalog_page") != reference.catalog_page
+        or record.get("marker_name") != reference.marker_name
+    ):
+        raise ValueError("ready reservation publication identity is invalid.")
+    record["publication_state"] = READY_PUBLICATION_COMMITTED
+    record["published_at"] = utc_now()
+    atomic_replace(path, value)
+    return True
 
 
 def is_reference_indexed(cfg: object, reference: ReadyMarkerRef) -> bool:

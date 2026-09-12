@@ -18,6 +18,7 @@ from ..runtime.locks import group_writer_lock, task_lock
 from ..runtime.operation_store import operation_exists
 from ..runtime.paths import attempt_path, shared_paths
 from ..runtime.ready import (
+    commit_ready_publication,
     discard_ready_generation,
     prepare_ready_transition,
     reserve_ready_generation,
@@ -193,6 +194,7 @@ def retry(cfg: RootConfig, task_id: str, *, acknowledge_duplicate_risk: bool = F
             task.meta["updated_at"] = utc_now()
             save_task(cfg, task)
             is_committed = True
+            commit_ready_publication(cfg, task)
             retire_previous_ready_generation(cfg, old_generation, task)
             return task
     finally:

@@ -1484,6 +1484,18 @@ boundary. A crash may repeat at most one bounded slice safely. Writers operating
 begins publish the new marker before Task truth, so Tasks created during watermark capture need not
 be members of the legacy watermark.
 
+Ready reservations created by current writers carry a random `publication_token` and a
+`publication_state` of `pending` until the marker, derived candidate projections, and authoritative
+Task generation have been written. The writer then atomically changes the reservation to
+`committed`; readers treat reservations without these fields as legacy committed records. A slot
+whose marker is absent or unreadable is unresolved and is retried a bounded number of times with
+the exception type and storage error retained in the in-memory diagnostic. If the retries are
+exhausted, the cursor advances past that slot for the current slice so another candidate can run;
+the project is not degraded solely for a transient marker read. Once Task truth is durable, a
+reader may complete a still-pending reservation commit idempotently. A committed reservation with
+a persistently missing or malformed marker remains a confirmed projection defect and follows the
+normal `degraded` repair path.
+
 Backfill creates a new generation for every queued Task whose current marker is missing, corrupt,
 or unreachable from its reservation, partition, and catalog. Non-queued Tasks have any current
 marker retired. A second bounded pass audits the same watermark. Activation requires the audit to

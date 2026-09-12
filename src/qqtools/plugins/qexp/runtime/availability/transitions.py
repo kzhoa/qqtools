@@ -30,6 +30,7 @@ from ..operation_store import (
 )
 from ..paths import group_path, shared_paths, submission_path
 from ..ready import (
+    commit_ready_publication,
     discard_ready_generation,
     prepare_ready_transition,
     ready_task_projection_issue,
@@ -592,6 +593,7 @@ def apply_availability_transition(
                 task.meta["updated_at"] = utc_now()
                 save_task(cfg, task)
                 is_ready_committed = True
+                commit_ready_publication(cfg, task)
                 retire_previous_ready_generation(cfg, old_generation, task)
             offer_deadlines.sync_deadline_index(cfg, task)
             result = _make_result(request.action, task, group, operation_id, idempotent=idempotent)

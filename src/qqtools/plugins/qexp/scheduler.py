@@ -43,6 +43,7 @@ from .runtime.ready import (
     advance_ready_index_build,
     classification_diagnostic,
     classify_ready_marker,
+    commit_ready_publication,
     delete_stale_ready_marker,
     mark_ready_index_degraded,
     next_ready_marker,
@@ -1390,6 +1391,8 @@ def expire_claim(
         task.meta["revision"] += 1
         task.meta["updated_at"] = utc_now()
         save_task(cfg, task)
+        if old_ready_generation is not None:
+            commit_ready_publication(cfg, task)
         if old_ready_generation is not None:
             retire_previous_ready_generation(cfg, old_ready_generation, task)
         if attempt.phase == "orphaned":
