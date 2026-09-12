@@ -118,7 +118,10 @@ def inspect_registered_upgrades(runtime: MachineRuntime) -> dict[str, Any]:
             inaccessible.append({**base, "upgrade": status})
             projects.append({**base, "state": runtime.binding_state(binding), "upgrade": status})
             continue
-        projects.append({**base, "state": runtime.binding_state(binding), "upgrade": status})
+        project = {**base, "state": runtime.binding_state(binding), "upgrade": status}
+        if status.get("state") == "inaccessible":
+            inaccessible.append(project)
+        projects.append(project)
     pending = [item for item in projects if item["upgrade"].get("pending")]
     return {
         "projects": projects,
