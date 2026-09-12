@@ -12,12 +12,12 @@ import argparse
 from time import perf_counter
 
 import numpy as np
-
 from compare_exact import fixed_cases
 from exact_rank_batches import integer_quality, solve_exact
 from fast_swap import plan_fast_swap
 from fast_two_pointer import plan_fast_two_pointer
 from layered_baseline import plan_layered_baseline
+
 from qqtools.data.qbalance import _plan_rank_batches, _rank_batch_quality
 
 

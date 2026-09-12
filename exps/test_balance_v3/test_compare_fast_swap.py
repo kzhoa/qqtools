@@ -1,7 +1,6 @@
 """Opt-in checks for the benchmark's algorithm coverage and reported fields."""
 
 import pytest
-
 from compare_fast_swap import timing_comparison
 
 

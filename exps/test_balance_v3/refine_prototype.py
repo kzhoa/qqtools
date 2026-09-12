@@ -7,8 +7,12 @@ from numbers import Integral
 import numpy as np
 
 from qqtools.data.qbalance import (
-    _partition_capacity_batches, _partition_layered_batches, _rank_batch_loads,
-    _rank_batch_quality, _refine_rank_batches, _swap_rank_batch_pair,
+    _partition_capacity_batches,
+    _partition_layered_batches,
+    _rank_batch_loads,
+    _rank_batch_quality,
+    _refine_rank_batches,
+    _swap_rank_batch_pair,
 )
 
 

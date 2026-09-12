@@ -4,7 +4,6 @@ import argparse
 from time import perf_counter
 
 import numpy as np
-
 from compare_exact import fixed_cases
 from exact_rank_batches import integer_quality, solve_exact
 from fast_step import plan_fast

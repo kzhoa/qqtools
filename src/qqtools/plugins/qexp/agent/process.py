@@ -11,8 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from .lifecycle import run_machine_agent_loop
 from .context import MachineRuntime
+from .lifecycle import run_machine_agent_loop
 
 
 def build_parser() -> argparse.ArgumentParser:

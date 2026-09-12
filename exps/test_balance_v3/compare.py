@@ -7,7 +7,6 @@ import numpy as np
 
 from qqtools.data.qbalance import assign_window_to_ranks, compute_global_even_sort_order
 
-
 baseline = {}
 exec(subprocess.check_output(
     ["git", "show", "HEAD:src/qqtools/data/qbalance.py"], text=True

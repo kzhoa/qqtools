@@ -8,9 +8,9 @@ import argparse
 from time import perf_counter
 
 import numpy as np
-
-from refine_prototype import prototype_best
 from compare_exact import legacy_best
+from refine_prototype import prototype_best
+
 from qqtools.data.qbalance import _plan_rank_batches, _rank_batch_quality
 
 

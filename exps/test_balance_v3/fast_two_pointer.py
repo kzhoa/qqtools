@@ -1,11 +1,9 @@
 """One disjoint-pair swap pass with linear searches in descending batch costs."""
 
 import numpy as np
-
-from qqtools.data.qbalance import (
-    _has_worse_raw_step_sum, _rank_batch_loads, _rank_batch_quality,
-)
 from layered_baseline import plan_layered_baseline as _plan_rank_batches
+
+from qqtools.data.qbalance import _has_worse_raw_step_sum, _rank_batch_loads, _rank_batch_quality
 
 
 def _best_pair_swaps(

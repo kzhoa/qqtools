@@ -6,8 +6,6 @@ The production layered planner is covered independently in tests/unit/.
 
 import numpy as np
 import pytest
-
-
 from layered_numpy import _plan_layered_rank_batches as _plan
 
 

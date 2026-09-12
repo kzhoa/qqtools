@@ -3,7 +3,6 @@
 from itertools import permutations
 
 import pytest
-
 from exact_rank_batches import integer_quality, solve_exact
 
 
