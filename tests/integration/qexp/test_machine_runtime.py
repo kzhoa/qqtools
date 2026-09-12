@@ -284,6 +284,124 @@ def test_enabled_claim_guard_blocks_generation_adoption_until_claim_commit(tmp_p
     assert adopted.is_set()
 
 
+def test_launch_authorization_revalidates_registration_write_guard(tmp_path: Path) -> None:
+    from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
+
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    task = submit(cfg, ["echo", "ok"])
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    context = runtime.execution_context(cfg)
+    attempt = claim_task(
+        context.local_cfg,
+        task.task_id,
+        [0],
+        reservation_runtime_root=runtime.root,
+        project_id=binding.project_id,
+    )
+    assert attempt is not None
+
+    @contextmanager
+    def deny_stale_generation():
+        yield False
+
+    assert not authorize_launch(
+        context.local_cfg,
+        task.task_id,
+        attempt.attempt_id,
+        attempt.current_fencing_token,
+        reservation_runtime_root=runtime.root,
+        write_guard=deny_stale_generation,
+    )
+    stored = load_task(cfg, task.task_id)
+    assert stored.claim_control["active_claim"]["launch_state"] == "claimed"
+    assert read_json(cfg.shared_root / "attempts" / task.task_id / "1.json")["attempt"]["phase"] == "claimed"
+
+
+def test_interrupted_registration_is_rolled_back_before_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    save_registry = runtime._save_registry
+
+    def fail_registry_write(_revision, _bindings) -> None:
+        raise OSError("injected registry publication failure")
+
+    monkeypatch.setattr(runtime, "_save_registry", fail_registry_write)
+    with pytest.raises(OSError, match="registry publication failure"):
+        runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
+
+    assert runtime.paths["registration_transaction"].exists()
+    assert (cfg.shared_root / "machines" / cfg.machine_name / "registration.json").exists()
+
+    monkeypatch.setattr(runtime, "_save_registry", save_registry)
+    binding, is_added = runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
+
+    assert is_added
+    assert not runtime.paths["registration_transaction"].exists()
+    assert runtime.load_registry()[1] == [binding]
+    assert runtime.binding_write_eligible(binding)
+
+
+def test_replaced_logical_name_retains_live_execution_without_termination(tmp_path: Path) -> None:
+    from qqtools.plugins.qexp.agent.helpers import _binding_config
+    from qqtools.plugins.qexp.authority import AuthoritySupervisor
+    from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
+
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    task = submit(cfg, ["echo", "ok"])
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    context = runtime.execution_context(cfg)
+    attempt = claim_task(
+        context.local_cfg,
+        task.task_id,
+        [0],
+        reservation_runtime_root=runtime.root,
+        project_id=binding.project_id,
+    )
+    assert attempt is not None
+    assert authorize_launch(
+        context.local_cfg,
+        task.task_id,
+        attempt.attempt_id,
+        attempt.current_fencing_token,
+        reservation_runtime_root=runtime.root,
+    )
+    process = {
+        "protocol_version": 1,
+        "task_id": task.task_id,
+        "attempt_id": attempt.attempt_id,
+        "fencing_token": attempt.current_fencing_token,
+        "authority_mode": attempt.authority_mode,
+        "observed_state": "running",
+    }
+
+    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    registration = read_json(registration_path)["registration"]
+    registration["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(registration_path, {"registration": registration})
+    MachineRuntime(tmp_path / "other-machine-runtime").add_binding(
+        cfg.shared_root,
+        cfg.machine_name,
+        adopt_existing=True,
+    )
+    renamed = runtime.add_binding(cfg.shared_root, "gpu-1-replacement")
+    supervisor = AuthoritySupervisor(_binding_config(runtime, renamed), reservation_runtime_root=runtime.root)
+    terminated = False
+
+    def fail_termination(*_args, **_kwargs) -> None:
+        nonlocal terminated
+        terminated = True
+
+    supervisor._terminate = fail_termination
+    supervisor._supervise(process)
+
+    assert not terminated
+    assert load_task(cfg, task.task_id).state["projection"] == "running"
+
+
 def test_remove_project_deletes_its_disposable_runtime_partition(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")

@@ -29,6 +29,7 @@ from .agent.lifecycle import (
 )
 from .agent.project_admin import (
     _enable_command,
+    adoption_warning_generation,
     enable_project,
     migrate_project,
     register_project,
@@ -1120,6 +1121,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "agent":
             runtime = get_execution_context().machine_runtime
             if args.agent_action == "add-project":
+                warned_generation = None
+                if args.adopt_existing:
+                    warned_generation = adoption_warning_generation(runtime, cfg)
+                    if warned_generation is not None:
+                        print(
+                            f"Warning: registration generation {warned_generation!r} will be replaced; "
+                            "the previous environment will lose automatic access to this name on its next start.",
+                            file=sys.stderr,
+                        )
                 registration = register_project(
                     runtime,
                     cfg.shared_root,
@@ -1127,7 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
                     adopt_existing=args.adopt_existing,
                 )
                 action = "project_added" if registration.is_added else "project_already_registered"
-                if registration.is_adopted:
+                if registration.is_adopted and warned_generation is None:
                     print(
                         f"Warning: registration generation {registration.binding.registration_generation!r} "
                         "replaced the previous logical-machine ownership; the previous environment will lose "

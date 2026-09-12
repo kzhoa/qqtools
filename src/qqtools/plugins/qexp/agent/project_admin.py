@@ -40,6 +40,13 @@ class ProjectRegistration:
     @property
     def message(self) -> str:
         """Return the stable operator-facing registration result."""
+        if self.is_adopted:
+            state = "enabled" if self.binding.enabled else "disabled"
+            admission = "enabled" if self.binding.enabled else "disabled"
+            return (
+                f"Project registration ownership was adopted and remains {state}. "
+                f"Registration checks passed; new task admission is {admission}."
+            )
         if self.binding.enabled:
             return (
                 "Project registration checks passed; new task admission is enabled."
@@ -81,8 +88,38 @@ def register_project(
         ) from exc
     if load_machine_record(cfg) is not None and is_legacy_agent_project(cfg):
         raise ValueError("legacy project metadata requires 'qexp agent migrate-project'.")
+    previous = machine_runtime.matching_binding(cfg)
     binding, is_added = machine_runtime.ensure_binding(shared_root, machine_name, adopt_existing=adopt_existing)
-    return ProjectRegistration(binding, is_added, adopt_existing and is_added)
+    is_generation_replaced = bool(
+        previous is not None and previous.registration_generation != binding.registration_generation
+    )
+    return ProjectRegistration(
+        binding,
+        is_added,
+        adopt_existing and (is_added or is_generation_replaced),
+    )
+
+
+def adoption_warning_generation(runtime: MachineRuntime, cfg: RootConfig) -> str | None:
+    """Return the generation that explicit adoption would replace, when mutation is possible."""
+    raw = load_machine_registration(cfg)
+    registration = raw.get("registration") if isinstance(raw, dict) else None
+    if not isinstance(registration, dict):
+        return None
+    generation = registration.get("generation")
+    if not isinstance(generation, str) or not generation:
+        return None
+    current = runtime.matching_binding(cfg)
+    is_same_owner = bool(
+        current is not None
+        and current.registration_generation == generation
+        and current.runtime_instance_id == runtime.instance_id
+        and registration.get("runtime_instance_id") == runtime.instance_id
+        and registration.get("runtime_root") == str(runtime.root)
+    )
+    if is_same_owner or runtime._registration_state(registration) == "eligible":
+        return None
+    return generation
 
 
 def _legacy_pid_matches(cfg: RootConfig, pid: int) -> bool:

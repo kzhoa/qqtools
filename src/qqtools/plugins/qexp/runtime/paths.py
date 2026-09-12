@@ -134,6 +134,7 @@ def machine_runtime_paths(root: Path) -> dict[str, Path]:
         "reservation_lock": root / "locks" / "gpu-reservations.lock",
         "cpu_lane_lock": root / "locks" / "cpu-lane.lock",
         "registry": root / "registry.json",
+        "registration_transaction": root / "registration-transaction.json",
         "identity": root / "identity.json",
         "cursor": root / "scheduler" / "cursor.json",
         "upgrade_cursor": root / "scheduler" / "upgrade-cursor.json",

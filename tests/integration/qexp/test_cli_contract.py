@@ -9,6 +9,7 @@ from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.layout import load_context, load_root_config, runtime_pid_path
 from qqtools.plugins.qexp.legacy_agent import get_agent_status
+from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, expire_claim, fail_attempt
 
@@ -817,6 +818,44 @@ def test_agent_add_project_recovery_replaces_a_superseded_local_binding(tmp_path
     assert output["action"] == "project_added"
     assert output["machine_name"] == "gpu-1-replacement"
     assert runtime.load_registry()[1][0].machine_name == "gpu-1-replacement"
+
+
+def test_agent_add_project_adoption_reports_replaced_generation(
+    tmp_path: Path, capsys
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime_root = tmp_path / "machine-runtime"
+    runtime = MachineRuntime(runtime_root)
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    registration = read_json(registration_path)["registration"]
+    registration["runtime_instance_id"] = "uncertain-runtime"
+    registration["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(registration_path, {"registration": registration})
+
+    assert (
+        main(
+            [
+                "--shared-root",
+                str(cfg.shared_root),
+                "--machine",
+                cfg.machine_name,
+                "--machine-runtime-root",
+                str(runtime_root),
+                "agent",
+                "add-project",
+                "--adopt-existing",
+                "--format=json",
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert binding.registration_generation in captured.err
+    assert "previous environment will lose automatic access" in captured.err
+    result = json.loads(captured.out)
+    assert result["action"] == "project_already_registered"
+    assert result["message"].startswith("Project registration ownership was adopted")
 
 
 def test_agent_project_add_can_register_while_scheduler_is_running(tmp_path: Path, capsys) -> None:
