@@ -7,19 +7,24 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import create_group
+from qqtools.plugins.qexp.layout import project_id
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
 from qqtools.plugins.qexp.runtime.operation_store import iter_active_operation_paths, write_active_operation
 from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
     ReadyMarkerRef,
     classify_ready_marker,
+    commit_ready_publication,
     delete_ready_marker,
     delete_stale_ready_marker,
+    peek_ready_marker,
+    publication_state,
     reserve_ready_generation,
     write_ready_marker,
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
+from qqtools.plugins.qexp.runtime.work_budget import SliceBudget, WorkBudgetPolicy
 from qqtools.plugins.qexp.scheduler import claim_task
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -50,6 +55,7 @@ def test_submission_commits_one_durable_ready_generation(tmp_path: Path):
     assert stored.ready_generation == 1
     assert result.classification == "claimable"
     assert result.task is not None and result.task.task_id == task.task_id
+    assert publication_state(cfg, reference) == "committed"
     assert read_json(ready_state_path(cfg.shared_root))["ready_index"]["state"] == "absent"
 
 
@@ -184,6 +190,210 @@ def test_ready_generation_publication_is_not_cleaned_as_stale(tmp_path: Path):
     assert delete_stale_ready_marker(cfg, reference) is False
     assert reservation_path.exists()
 
+
+def test_pending_publication_commits_after_task_truth_is_durable(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    stored = load_task(cfg, task.task_id)
+    generation = stored.ready_generation + 1
+    reference = reserve_ready_generation(
+        cfg,
+        stored.task_id,
+        generation,
+        stored.placement_runtime["queue_scope"],
+        stored.placement_policy["home_machine"],
+    )
+    write_ready_marker(
+        cfg,
+        stored,
+        generation=generation,
+        source_transition="test_publication",
+        source_revision=stored.meta["revision"],
+        target_revision=stored.meta["revision"] + 1,
+        reference=reference,
+    )
+    assert publication_state(cfg, reference) == "pending"
+
+    stored.ready_generation = generation
+    stored.meta["revision"] += 1
+    atomic_replace(shared_paths(cfg.shared_root)["tasks"] / f"{stored.task_id}.json", stored.to_dict())
+
+    result = classify_ready_marker(cfg, reference)
+
+    assert result.classification == "claimable"
+    assert publication_state(cfg, reference) == "committed"
+    assert commit_ready_publication(cfg, stored) is True
+
+
+def test_interrupted_publication_commit_is_retryable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    stored = load_task(cfg, task.task_id)
+    generation = stored.ready_generation + 1
+    reference = reserve_ready_generation(
+        cfg,
+        stored.task_id,
+        generation,
+        stored.placement_runtime["queue_scope"],
+        stored.placement_policy["home_machine"],
+    )
+    write_ready_marker(
+        cfg,
+        stored,
+        generation=generation,
+        source_transition="test_publication",
+        source_revision=stored.meta["revision"],
+        target_revision=stored.meta["revision"] + 1,
+        reference=reference,
+    )
+    stored.ready_generation = generation
+    stored.meta["revision"] += 1
+    task_path = shared_paths(cfg.shared_root)["tasks"] / f"{stored.task_id}.json"
+    atomic_replace(task_path, stored.to_dict())
+
+    from qqtools.plugins.qexp.runtime.ready import routes
+
+    original_atomic_replace = routes.atomic_replace
+    failed = False
+
+    def fail_commit(path, value):
+        nonlocal failed
+        if path == shared_paths(cfg.shared_root)["ready_reservations"] / f"{stored.task_id}.{generation}.json" and not failed:
+            failed = True
+            raise OSError("publication commit interrupted")
+        return original_atomic_replace(path, value)
+
+    monkeypatch.setattr(routes, "atomic_replace", fail_commit)
+    first = classify_ready_marker(cfg, reference)
+
+    assert first.classification == "temporarily_unavailable"
+    assert first.reason == "publication_commit_pending"
+    assert publication_state(cfg, reference) == "pending"
+
+    monkeypatch.setattr(routes, "atomic_replace", original_atomic_replace)
+    second = classify_ready_marker(cfg, reference)
+
+    assert second.classification == "claimable"
+    assert publication_state(cfg, reference) == "committed"
+
+
+def test_unreadable_marker_retries_then_returns_a_diagnostic_without_degrading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    reference = _ready_reference(cfg, task.task_id, task.ready_generation)
+    marker_path = shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / reference.marker_name
+    from qqtools.plugins.qexp.runtime.ready import traversal
+
+    original_read_json = traversal.read_json
+    calls = 0
+
+    def delayed_marker(path):
+        nonlocal calls
+        if path == marker_path and calls < 2:
+            calls += 1
+            raise FileNotFoundError(path)
+        return original_read_json(path)
+
+    monkeypatch.setattr(traversal, "read_json", delayed_marker)
+    peek = peek_ready_marker(
+        cfg,
+        project_id(cfg.shared_root),
+        "home",
+        None,
+        SliceBudget(WorkBudgetPolicy(soft_deadline_ms=60_000)),
+    )
+
+    assert calls == 2
+    assert peek.reference is not None
+    assert not peek.unresolved
+
+
+def test_classify_transient_marker_read_does_not_degrade(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    reference = _ready_reference(cfg, task.task_id, task.ready_generation)
+    marker_path = shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / reference.marker_name
+    from qqtools.plugins.qexp.runtime.ready import index as ready_index
+
+    original_read_json = ready_index.read_json
+
+    def unavailable_marker(path):
+        if path == marker_path:
+            raise OSError("shared marker temporarily unavailable")
+        return original_read_json(path)
+
+    monkeypatch.setattr(ready_index, "read_json", unavailable_marker)
+    result = classify_ready_marker(cfg, reference)
+
+    assert result.classification == "temporarily_unavailable"
+    assert result.reason == "marker_unavailable"
+    assert result.diagnostic is not None
+    assert result.diagnostic.reason_code == "marker_unavailable"
+
+
+def test_unreadable_marker_isolated_after_bounded_retries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    reference = _ready_reference(cfg, task.task_id, task.ready_generation)
+    marker_path = shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / reference.marker_name
+    from qqtools.plugins.qexp.runtime.ready import traversal
+
+    original_read_json = traversal.read_json
+
+    def unavailable_marker(path):
+        if path == marker_path:
+            raise OSError("shared marker temporarily unavailable")
+        return original_read_json(path)
+
+    monkeypatch.setattr(traversal, "read_json", unavailable_marker)
+    peek = peek_ready_marker(
+        cfg,
+        project_id(cfg.shared_root),
+        "home",
+        None,
+        SliceBudget(WorkBudgetPolicy(soft_deadline_ms=60_000)),
+    )
+
+    assert peek.reference is None
+    assert peek.unresolved
+    assert peek.cursor.after_name == reference.marker_name
+    assert peek.diagnostic is not None
+    assert peek.diagnostic.reason_code == "marker_unavailable"
+
+
+def test_unreadable_shared_marker_never_infers_scanning_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg = init_shared_root(tmp_path / ".qexp", "scanner", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    task_commands.share(cfg, task.task_id)
+    stored = load_task(cfg, task.task_id)
+    reference = _ready_reference(cfg, stored.task_id, stored.ready_generation)
+    marker_path = shared_paths(cfg.shared_root)["ready_shared"] / reference.partition / reference.marker_name
+    from qqtools.plugins.qexp.runtime.ready import traversal
+
+    original_read_json = traversal.read_json
+
+    def unavailable_marker(path):
+        if path == marker_path:
+            raise FileNotFoundError(path)
+        return original_read_json(path)
+
+    monkeypatch.setattr(traversal, "read_json", unavailable_marker)
+    peek = peek_ready_marker(
+        cfg,
+        project_id(cfg.shared_root),
+        "shared",
+        None,
+        SliceBudget(WorkBudgetPolicy(soft_deadline_ms=60_000)),
+    )
+
+    assert peek.reference is None
+    assert peek.unresolved
+    assert peek.cursor.after_name == reference.marker_name
 
 def test_ready_delete_failure_does_not_roll_back_authoritative_claim(
     tmp_path: Path,

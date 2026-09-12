@@ -45,7 +45,7 @@ class FeishuNotifier:
                     "template": _phase_template(event.phase),
                     "title": {
                         "tag": "plain_text",
-                        "content": f"qexp 任务{_phase_label(event.phase)}",
+                        "content": f"qexp task {_phase_label(event.phase)}",
                     },
                 },
                 "elements": [{"tag": "markdown", "content": _card_markdown(event)}],
@@ -98,7 +98,7 @@ class FeishuNotifier:
 
 
 def _phase_label(phase: Any) -> str:
-    return {"succeeded": "成功", "failed": "失败", "cancelled": "已取消"}.get(phase, str(phase))
+    return {"succeeded": "succeeded", "failed": "failed", "cancelled": "cancelled"}.get(phase, str(phase))
 
 
 def _phase_template(phase: Any) -> str:
@@ -113,13 +113,13 @@ def _card_markdown(event: Any) -> str:
             f"- **Task Name**: `{_markdown_code(getattr(event, 'task_name', None))}`",
             f"- **Task ID**: `{_markdown_code(event.task_id)}`",
             f"- **Attempt ID**: `{_markdown_code(event.attempt_id)}`",
-            f"- **原因**: `{_markdown_code(event.reason)}`",
-            f"- **退出码**: `{_markdown_code(event.exit_code)}`",
-            f"- **执行机器**: `{_markdown_code(event.execution_machine_name)}`",
-            f"- **通知机器**: `{_markdown_code(event.dispatching_machine_name)}`",
-            f"- **开始时间**: `{_markdown_code(getattr(event, 'execution_started_at', None))}`",
-            f"- **执行时长**: `{_markdown_code(_duration_text(getattr(event, 'duration_ms', None)))}`",
-            f"- **通知机器时间**: `{_markdown_code(event.finished_at)}`",
+            f"- **Reason**: `{_markdown_code(event.reason)}`",
+            f"- **Exit Code**: `{_markdown_code(event.exit_code)}`",
+            f"- **Execution Machine**: `{_markdown_code(event.execution_machine_name)}`",
+            f"- **Notification Machine**: `{_markdown_code(event.dispatching_machine_name)}`",
+            f"- **Start Time**: `{_markdown_code(getattr(event, 'execution_started_at', None))}`",
+            f"- **Execution Duration**: `{_markdown_code(_duration_text(getattr(event, 'duration_ms', None)))}`",
+            f"- **Notification Machine Time**: `{_markdown_code(event.finished_at)}`",
         )
     )
 
@@ -138,8 +138,8 @@ def _duration_text(duration_ms: Any) -> str | None:
 
 def _markdown_code(value: Any) -> str:
     if value is None:
-        return "（未记录）"
+        return "(not recorded)"
     text = str(value)
     if not text.strip():
-        return "（未记录）"
+        return "(not recorded)"
     return text.replace("\\", "\\\\").replace("`", "\\`").replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")

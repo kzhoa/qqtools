@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ from .group_members import (
 from .records import ReadyMarkerRef, ReadyScope
 
 ReadyClassification = Literal["claimable", "temporarily_unavailable", "permanently_stale", "corrupt"]
+_READY_MARKER_READ_ATTEMPTS = 3
+_READY_MARKER_RETRY_DELAY_SECONDS = 0.01
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +223,23 @@ def write_ready_marker(
     return reference
 
 
+def commit_ready_publication(
+    cfg: object,
+    task: TaskRecord,
+    generation: int | None = None,
+) -> bool:
+    """Commit a ready publication after its authoritative Task write succeeds."""
+    target_generation = generation if generation is not None else task.ready_generation
+    if target_generation <= 0:
+        return False
+    reference = routes.reference_for_generation(cfg, task.task_id, target_generation)
+    if reference is None:
+        return False
+    if target_generation != task.ready_generation:
+        raise ValueError("ready publication generation does not match Task truth.")
+    return routes.commit_publication(cfg, reference)
+
+
 def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
     """Delete only the exact generation and its slot reservation."""
     path = routes.reservation_path(cfg.shared_root, task_id, generation)
@@ -370,7 +390,10 @@ def _is_ready_publication_pending(
     """Return whether a valid future generation is still being published."""
     if reference.generation <= task.ready_generation:
         return False
-    reservation = routes.reference_for_generation(cfg, reference.task_id, reference.generation)
+    try:
+        reservation = routes.reference_for_generation(cfg, reference.task_id, reference.generation)
+    except OSError:
+        return True
     if reservation is None:
         return False
     if (
@@ -381,6 +404,25 @@ def _is_ready_publication_pending(
     ):
         return False
     return reference.queue_scope == "shared" or reservation.home_machine == reference.home_machine
+
+
+def _publication_commit_pending(
+    cfg: object,
+    reference: ReadyMarkerRef,
+    task: TaskRecord,
+) -> bool:
+    """Return whether a current generation still needs its publication commit."""
+    try:
+        return (
+            reference.generation == task.ready_generation
+            and routes.publication_state(cfg, reference) == routes.READY_PUBLICATION_PENDING
+        )
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def _recheck_missing_ready_marker(
@@ -398,7 +440,7 @@ def _recheck_missing_ready_marker(
             task = TaskRecord.from_dict(read_json(task_file))
         except (KeyError, OSError, TypeError, ValueError) as exc:
             return _classification_result(cfg, reference, "corrupt", "task_invalid", exception=exc)
-        if _is_ready_publication_pending(cfg, reference, task):
+        if _is_ready_publication_pending(cfg, reference, task) or _publication_commit_pending(cfg, reference, task):
             return _classification_result(cfg, reference, "temporarily_unavailable", "marker_publication_pending", task)
         if reference.generation != task.ready_generation:
             return _classification_result(cfg, reference, "permanently_stale", "generation_superseded", task)
@@ -488,31 +530,60 @@ def classify_ready_marker(
     """Classify one advisory marker against authoritative Task and Submission truth."""
     if reference.generation <= 0 or not reference.task_id:
         return _classification_result(cfg, reference, "corrupt", "marker_identity_invalid")
-    try:
-        envelope = read_json(routes.marker_path(cfg.shared_root, reference))
-        marker = envelope["ready_marker"]
-        if not isinstance(marker, dict):
-            raise TypeError("ready marker envelope is invalid")
-    except FileNotFoundError:
-        marker = _recheck_missing_ready_marker(cfg, reference)
-        if isinstance(marker, ReadyClassificationResult):
-            return marker
-    except (KeyError, OSError, TypeError, ValueError) as exc:
-        return _classification_result(
-            cfg,
-            reference,
-            "corrupt",
-            "marker_invalid",
-            diagnostic_value=diagnostic(
-                "record_invalid",
-                object="marker",
-                stage="marker_parse",
-                issue_code="marker_invalid",
-                **({"task_id": reference.task_id} if reference.task_id else {}),
-                **({"generation": reference.generation} if reference.generation >= 0 else {}),
-                **exception_fields(exc),
-            ),
-        )
+    marker_path = routes.marker_path(cfg.shared_root, reference)
+    marker: dict[str, Any] | ReadyClassificationResult | None = None
+    last_read_exception: BaseException | None = None
+    for attempt in range(_READY_MARKER_READ_ATTEMPTS):
+        try:
+            envelope = read_json(marker_path)
+            marker = envelope["ready_marker"]
+            if not isinstance(marker, dict):
+                raise TypeError("ready marker envelope is invalid")
+            break
+        except FileNotFoundError:
+            if attempt + 1 < _READY_MARKER_READ_ATTEMPTS:
+                time.sleep(_READY_MARKER_RETRY_DELAY_SECONDS)
+                continue
+            marker = _recheck_missing_ready_marker(cfg, reference)
+            if isinstance(marker, ReadyClassificationResult):
+                return marker
+            break
+        except OSError as exc:
+            last_read_exception = exc
+            if attempt + 1 < _READY_MARKER_READ_ATTEMPTS:
+                time.sleep(_READY_MARKER_RETRY_DELAY_SECONDS)
+                continue
+            return _classification_result(
+                cfg,
+                reference,
+                "temporarily_unavailable",
+                "marker_unavailable",
+                diagnostic_value=diagnostic(
+                    "marker_unavailable",
+                    stage="marker_read",
+                    task_id=reference.task_id,
+                    generation=reference.generation,
+                    **exception_fields(last_read_exception),
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return _classification_result(
+                cfg,
+                reference,
+                "corrupt",
+                "marker_invalid",
+                diagnostic_value=diagnostic(
+                    "record_invalid",
+                    object="marker",
+                    stage="marker_parse",
+                    issue_code="marker_invalid",
+                    **({"task_id": reference.task_id} if reference.task_id else {}),
+                    **({"generation": reference.generation} if reference.generation >= 0 else {}),
+                    **exception_fields(exc),
+                ),
+            )
+    if marker is None:
+        return _classification_result(cfg, reference, "temporarily_unavailable", "marker_unavailable")
     try:
         common = {
             "schema_version",
@@ -588,6 +659,29 @@ def classify_ready_marker(
         return _classification_result(cfg, reference, "corrupt", "task_invalid", exception=exc)
     if _is_ready_publication_pending(cfg, reference, task):
         return _classification_result(cfg, reference, "temporarily_unavailable", "marker_publication_pending", task)
+    if _publication_commit_pending(cfg, reference, task):
+        try:
+            if not commit_ready_publication(cfg, task):
+                return _classification_result(
+                    cfg, reference, "temporarily_unavailable", "marker_publication_pending", task
+                )
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            return _classification_result(
+                cfg,
+                reference,
+                "temporarily_unavailable",
+                "publication_commit_pending",
+                task,
+                diagnostic_value=diagnostic(
+                    "record_invalid",
+                    object="marker",
+                    stage="marker_truth",
+                    issue_code="publication_commit_pending",
+                    task_id=reference.task_id,
+                    generation=reference.generation,
+                    **exception_fields(exc),
+                ),
+            )
     if reference.generation != task.ready_generation:
         return _classification_result(cfg, reference, "permanently_stale", "generation_superseded", task)
     if reference.queue_scope != task.placement_runtime.get(

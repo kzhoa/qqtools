@@ -24,6 +24,7 @@ from .diagnostics import (
 from .index import (
     begin_primary_ready_index_rebuild,
     classify_ready_marker,
+    commit_ready_publication,
     delete_ready_marker,
     prepare_ready_transition,
     retire_previous_ready_generation,
@@ -250,6 +251,7 @@ def _repair_task_ready_projection(cfg: object, task_id: str) -> tuple[int, int]:
             task.meta["revision"] += 1
             task.meta["updated_at"] = utc_now()
             save_task(cfg, task)
+            commit_ready_publication(cfg, task)
             retire_previous_ready_generation(cfg, old_generation, task)
             return 1, int(old_generation > 0)
         if reference is not None and delete_ready_marker(cfg, task.task_id, task.ready_generation):

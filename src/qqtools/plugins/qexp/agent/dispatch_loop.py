@@ -271,6 +271,15 @@ def _probe_primary_demand(
                     )
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 if result.classification == "temporarily_unavailable":
+                    if result.diagnostic is not None:
+                        diagnostics.append(
+                            {
+                                "project_id": project_id,
+                                "task_id": reference.task_id,
+                                "reason": result.reason,
+                                "diagnostic": result.diagnostic.as_dict(),
+                            }
+                        )
                     if result.reason.startswith("dependency_"):
                         # A dependency can become claimable without changing this
                         # route's revision.  Preserve its cursor across bounded scan

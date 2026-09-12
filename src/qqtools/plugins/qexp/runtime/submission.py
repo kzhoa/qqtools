@@ -17,6 +17,7 @@ from .operation_store import operation_exists
 from .paths import group_path, idempotency_path, machine_path, shared_paths, submission_path, task_path
 from .ready import (
     assert_ready_writer_compatible,
+    commit_ready_publication,
     delete_ready_marker,
     prepare_ready_transition,
     primary_projection_routes_for_group,
@@ -641,6 +642,7 @@ def submit_specs(
                         current.meta["revision"] += 1
                         current.meta["updated_at"] = utc_now()
                         save_task(cfg, current)
+                        commit_ready_publication(cfg, current)
                         retire_previous_ready_generation(cfg, old_generation, current)
                     sync_deadline_index(cfg, current)
                     staged.append(current)
@@ -659,6 +661,7 @@ def submit_specs(
                     target_revision=task.meta["revision"],
                 )
                 save_task(cfg, task)
+                commit_ready_publication(cfg, task)
                 retire_previous_ready_generation(cfg, old_generation, task)
                 sync_deadline_index(cfg, task)
                 staged.append(task)

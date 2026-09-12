@@ -61,25 +61,25 @@ def test_feishu_payload_and_business_success():
     assert payload["msg_type"] == "interactive"
     assert payload["card"]["header"] == {
         "template": "red",
-        "title": {"tag": "plain_text", "content": "qexp 任务失败"},
+        "title": {"tag": "plain_text", "content": "qexp task failed"},
     }
     assert payload["card"]["elements"] == [
         {
             "tag": "markdown",
             "content": "\n".join(
                 (
-                    "- **Project ID**: `（未记录）`",
-                    "- **Project**: `（未记录）`",
-                    "- **Task Name**: `（未记录）`",
+                    "- **Project ID**: `(not recorded)`",
+                    "- **Project**: `(not recorded)`",
+                    "- **Task Name**: `(not recorded)`",
                     "- **Task ID**: `task-a`",
                     "- **Attempt ID**: `attempt-a`",
-                    "- **原因**: `nonzero_exit`",
-                    "- **退出码**: `（未记录）`",
-                    "- **执行机器**: `gpu-a`",
-                    "- **通知机器**: `gpu-b`",
-                    "- **开始时间**: `（未记录）`",
-                    "- **执行时长**: `（未记录）`",
-                    "- **通知机器时间**: `2026-08-07T00:00:00Z`",
+                    "- **Reason**: `nonzero_exit`",
+                    "- **Exit Code**: `(not recorded)`",
+                    "- **Execution Machine**: `gpu-a`",
+                    "- **Notification Machine**: `gpu-b`",
+                    "- **Start Time**: `(not recorded)`",
+                    "- **Execution Duration**: `(not recorded)`",
+                    "- **Notification Machine Time**: `2026-08-07T00:00:00Z`",
                 )
             ),
         }
@@ -90,8 +90,8 @@ def test_feishu_payload_and_business_success():
 @pytest.mark.parametrize(
     ("phase", "template", "title"),
     [
-        ("succeeded", "green", "qexp 任务成功"),
-        ("cancelled", "orange", "qexp 任务已取消"),
+        ("succeeded", "green", "qexp task succeeded"),
+        ("cancelled", "orange", "qexp task cancelled"),
     ],
 )
 def test_feishu_card_uses_phase_status_colours(phase, template, title):
@@ -120,8 +120,8 @@ def test_feishu_card_uses_phase_status_colours(phase, template, title):
 @pytest.mark.parametrize(
     ("machine_name", "expected"),
     [
-        (None, "（未记录）"),
-        (" \t ", "（未记录）"),
+        (None, "(not recorded)"),
+        (" \t ", "(not recorded)"),
         ("gpu`a\\b\nnext\rrow\tcell", "gpu\\`a\\\\b\\nnext\\rrow\\tcell"),
     ],
 )
@@ -146,7 +146,7 @@ def test_feishu_card_safely_displays_machine_name(machine_name, expected):
     )
 
     markdown = seen["payload"]["card"]["elements"][0]["content"]
-    assert f"- **执行机器**: `{expected}`" in markdown
+    assert f"- **Execution Machine**: `{expected}`" in markdown
 
 
 def test_feishu_rejects_boolean_business_code():

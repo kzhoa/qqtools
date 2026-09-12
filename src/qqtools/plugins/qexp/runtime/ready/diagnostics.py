@@ -48,6 +48,10 @@ _REASON_FIELDS: dict[str, tuple[set[str], set[str]]] = {
         {"stage", "task_id", "generation"},
         {"unexpected_fields", "missing_fields", "observed_schema_version", "supported_schema_versions"},
     ),
+    "marker_unavailable": (
+        {"stage", "task_id", "generation"},
+        {"exception_type", "errno", "json_line", "json_column"},
+    ),
     "marker_missing": (
         {"stage", "task_id", "generation"},
         {"indexed", "task_projection", "active_claim"},
@@ -141,6 +145,7 @@ _REASON_FIELDS: dict[str, tuple[set[str], set[str]]] = {
 
 _PREFIX_REASONS = {
     "marker_corrupt": {"marker_invalid", "marker_missing", "identity_mismatch", "record_invalid"},
+    "marker_unavailable": {"marker_unavailable"},
     "catalog_invalid": {"catalog_invalid"},
     "partition_invalid": {"partition_invalid"},
     "partition_missing": {"partition_missing"},
@@ -178,6 +183,7 @@ _ENUM_FIELDS = {
     "task_projection": {"queued", "running", "succeeded", "failed", "cancelled", "blocked", UNOBSERVED},
     "stage": {
         "marker_parse",
+        "marker_read",
         "marker_schema",
         "marker_identity",
         "marker_truth",
@@ -228,6 +234,7 @@ _ENUM_FIELDS = {
         "marker_stale",
         "marker_missing",
         "marker_corrupt",
+        "publication_commit_pending",
         "generation_superseded",
         "task_not_queued",
         "task_controlled",
