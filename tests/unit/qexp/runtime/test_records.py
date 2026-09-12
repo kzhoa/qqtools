@@ -84,3 +84,8 @@ def test_canonical_borrow_worker_encoding_is_readable():
     normalize_group_record(group)
 
     assert group["group"]["worker_set"]["gpu-1"]["scheduling_role"] == "borrow"
+
+
+def test_task_spec_rejects_boolean_gpu_count(tmp_path):
+    with pytest.raises(ValueError, match="requested_gpus"):
+        TaskSpec(["echo"], str(tmp_path), True)

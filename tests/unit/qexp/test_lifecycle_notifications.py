@@ -87,6 +87,25 @@ def test_feishu_payload_and_business_success():
     assert b"secret" not in seen["data"]
 
 
+def test_feishu_closes_response_after_reading():
+    class Response:
+        status = 200
+        closed = False
+
+        def read(self):
+            return b'{"code": 0}'
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    FeishuNotifier(urlopen=lambda request, timeout: response).send(
+        _event(), webhook="https://example.invalid/hook", secret=None, timeout_seconds=5
+    )
+
+    assert response.closed is True
+
+
 @pytest.mark.parametrize(
     ("phase", "template", "title"),
     [
