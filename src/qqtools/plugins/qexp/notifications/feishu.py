@@ -63,8 +63,13 @@ class FeishuNotifier:
         )
         try:
             response = self._urlopen(request, timeout=timeout_seconds)
-            status = getattr(response, "status", getattr(response, "code", None))
-            body = response.read()
+            try:
+                status = getattr(response, "status", getattr(response, "code", None))
+                body = response.read()
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
         except TimeoutError as exc:
             raise NotificationTransportError("timeout", error_type="timeout") from exc
         except urllib.error.HTTPError as exc:

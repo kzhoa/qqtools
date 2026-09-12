@@ -84,12 +84,12 @@ class TaskSpec:
         if not self.working_directory.startswith("/"):
             raise ValueError("working_directory must be absolute.")
         if self.lane is None:
-            if not isinstance(self.requested_gpus, int) or self.requested_gpus <= 0:
+            if type(self.requested_gpus) is not int or self.requested_gpus <= 0:
                 raise ValueError("legacy requested_gpus must be a positive integer.")
             if self.requested_cpus is not None:
                 raise ValueError("legacy TaskSpec cannot contain requested_cpus.")
         elif self.lane == "gpu":
-            if not isinstance(self.requested_gpus, int) or self.requested_gpus <= 0:
+            if type(self.requested_gpus) is not int or self.requested_gpus <= 0:
                 raise ValueError("GPU lane requested_gpus must be a positive integer.")
             if self.requested_cpus is not None:
                 raise ValueError("GPU lane cannot contain requested_cpus.")

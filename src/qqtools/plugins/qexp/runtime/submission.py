@@ -156,6 +156,9 @@ def _resolved_specs(specs: list[dict[str, Any]], submitting_machine: str) -> lis
     result = []
     seen: set[str] = set()
     for raw in specs:
+        command = raw.get("command")
+        if not isinstance(command, list) or not command or any(not isinstance(item, str) for item in command):
+            raise ValueError("command must be a non-empty list of strings.")
         task_id = raw.get("task_id") or new_id()
         if task_id in seen:
             raise ValueError(f"duplicate task_id {task_id!r} in submission.")
@@ -166,7 +169,7 @@ def _resolved_specs(specs: list[dict[str, Any]], submitting_machine: str) -> lis
                 "task_id": task_id,
                 "name": raw.get("name"),
                 "home_machine": home_machine,
-                "command": list(raw["command"]),
+                "command": list(command),
                 "working_directory": raw.get("working_directory", str(Path.cwd())),
                 "requested_gpus": raw.get("requested_gpus", 1),
                 "requested_cpus": raw.get("requested_cpus"),

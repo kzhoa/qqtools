@@ -10,7 +10,7 @@ from typing import Iterator
 
 from ...config_types import RootConfig
 from ..locks import schema_lock
-from ..paths import shared_paths
+from ..paths import local_paths, shared_paths
 from ..records import TaskRecord
 from ..store import atomic_replace, iter_json, read_json
 
@@ -32,6 +32,38 @@ def _active_deadline_path(cfg: RootConfig, task: TaskRecord) -> Path:
         / bucket
         / f"{task.task_id}.json"
     )
+
+
+def _deadline_cursor_path(cfg: RootConfig) -> Path:
+    return local_paths(cfg.runtime_root)["maintenance_cursors"] / "offer_deadlines.json"
+
+
+def _load_deadline_cursor(cfg: RootConfig) -> str | None:
+    try:
+        value = read_json(_deadline_cursor_path(cfg)).get("offer_deadline_cursor", {})
+        cursor = value.get("after") if isinstance(value, dict) else None
+        return cursor if isinstance(cursor, str) else None
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return None
+
+
+def _save_deadline_cursor(cfg: RootConfig, path: Path) -> None:
+    atomic_replace(
+        _deadline_cursor_path(cfg),
+        {"offer_deadline_cursor": {"after": f"{path.parent.name}/{path.name}"}},
+    )
+
+
+def _deadline_sort_key(path: Path) -> str:
+    return f"{path.parent.name}/{path.name}"
+
+
+def _iter_bucket_paths(buckets: list[Path]) -> Iterator[Path]:
+    for bucket in buckets:
+        with os.scandir(bucket) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.endswith(".json"):
+                    yield Path(entry.path)
 
 
 def remove_deadline_index(cfg: RootConfig, task_id: str) -> None:
@@ -100,20 +132,26 @@ def iter_due_deadline_paths(cfg: RootConfig, *, limit: int = 64) -> Iterator[Pat
         return
     current_bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
     yielded = 0
-    due_buckets = heapq.nsmallest(
-        limit,
+    after = _load_deadline_cursor(cfg)
+    due_buckets = sorted(
         (Path(entry.path) for entry in os.scandir(home) if entry.is_dir() and entry.name <= current_bucket),
         key=lambda path: path.name,
     )
-    for bucket in due_buckets:
-        with os.scandir(bucket) as entries:
-            for entry in entries:
-                if not entry.is_file() or not entry.name.endswith(".json"):
-                    continue
-                if yielded >= limit:
-                    return
-                yielded += 1
-                yield Path(entry.path)
+    candidates = _iter_bucket_paths(due_buckets)
+    selected = heapq.nsmallest(
+        limit,
+        (path for path in candidates if after is None or _deadline_sort_key(path) > after),
+        key=_deadline_sort_key,
+    )
+    if not selected and after is not None:
+        candidates = _iter_bucket_paths(due_buckets)
+        selected = heapq.nsmallest(limit, candidates, key=_deadline_sort_key)
+    for path in selected:
+        if yielded >= limit:
+            return
+        yielded += 1
+        _save_deadline_cursor(cfg, path)
+        yield path
 
 
 def iter_flat_deadline_paths(cfg: RootConfig, *, limit: int = 64) -> Iterator[Path]:

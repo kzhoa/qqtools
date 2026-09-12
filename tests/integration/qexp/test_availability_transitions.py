@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.cli import _split_machine_list, main
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
-from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
 from qqtools.plugins.qexp.runtime.availability import offer_deadlines
 from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime
@@ -61,6 +62,21 @@ def test_share_now_persists_journal_audit_and_keeps_home_eligible(tmp_path: Path
     event_files = list(shared_paths(cfg.shared_root)["events"].glob(f"*/{result.operation_id}.json"))
     assert event_files
     assert claim_task(cfg, task.task_id, [0]) is not None
+
+
+def test_due_deadline_cursor_rotates_past_first_bounded_batch(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+    root = shared_paths(cfg.shared_root)["offer_deadlines_active"] / cfg.machine_name / bucket
+    root.mkdir(parents=True, exist_ok=True)
+    for index in range(65):
+        atomic_replace(root / f"task-{index:03d}.json", {"offer_deadline": {"task_id": str(index)}})
+
+    first = list(offer_deadlines.iter_due_deadline_paths(cfg))
+    second = list(offer_deadlines.iter_due_deadline_paths(cfg))
+
+    assert len(first) == 64
+    assert [path.name for path in second] == ["task-064.json"]
 
 
 def test_share_without_helpers_replaces_stale_private_fallback_with_group(tmp_path: Path):
