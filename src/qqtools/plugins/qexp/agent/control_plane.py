@@ -1,17 +1,21 @@
 """Machine control plane."""
+
 from __future__ import annotations
+
 import threading
 import time
+
 from ..authority import AuthoritySupervisor
+from ..authority import AuthoritySupervisor as _AuthoritySupervisor
 from ..config_types import RootConfig
+from ..legacy_agent import _visible_gpus
 from ..runtime.paths import local_paths
 from ..runtime.resources.reservations import reservation_snapshot
 from ..runtime.store import iter_json
+from . import helpers as _helpers
 from .context import MachineRuntime, ProjectBinding
 from .helpers import _publish_project_snapshots, _read_pid
-from . import helpers as _helpers
-from ..legacy_agent import _visible_gpus
-from ..authority import AuthoritySupervisor as _AuthoritySupervisor
+
 
 class _MachineControlPlane:
     """Run deadline-sensitive heartbeats and authority renewal outside dispatch scans."""
@@ -79,11 +83,7 @@ class _MachineControlPlane:
 
     def _run_authority_cycle(self) -> float:
         authority_interval = self._loop_interval
-        reserved_before = {
-            gpu_id
-            for item in reservation_snapshot(self._runtime.root).reservations
-            for gpu_id in item.get("gpu_ids", [])
-        }
+        reserved_before = self._reserved_gpu_ids()
         try:
             bindings = self._supervised_bindings()
         except (OSError, RuntimeError, ValueError):
@@ -128,14 +128,26 @@ class _MachineControlPlane:
                     continue
             except (RuntimeError, ValueError):
                 continue
-        reserved_after = {
-            gpu_id
-            for item in reservation_snapshot(self._runtime.root).reservations
-            for gpu_id in item.get("gpu_ids", [])
-        }
-        if reserved_after < reserved_before and self._scheduler_wakeup is not None:
+        reserved_after = self._reserved_gpu_ids()
+        if (
+            reserved_before is not None
+            and reserved_after is not None
+            and reserved_after < reserved_before
+            and self._scheduler_wakeup is not None
+        ):
             self._scheduler_wakeup.set()
         return authority_interval
+
+    def _reserved_gpu_ids(self) -> set[int] | None:
+        """Read occupancy without allowing a transient storage error to stop supervision."""
+        try:
+            return {
+                gpu_id
+                for item in reservation_snapshot(self._runtime.root).reservations
+                for gpu_id in item.get("gpu_ids", [])
+            }
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return None
 
     def _refresh_visible_gpus(self) -> None:
         if self._visible_gpus is not None:

@@ -303,7 +303,7 @@ def run_machine_agent_loop(
                                         cfg,
                                         instance_id=instance_id,
                                         pid=None,
-                                        agent_mode="machine",
+                                        agent_mode=load_machine_policy(cfg).agent_mode,
                                         visible_gpu_ids=_visible_gpus(cfg),
                                         reserved_gpu_ids=reserved,
                                         heartbeat_interval_seconds=loop_interval,
@@ -457,6 +457,7 @@ def restart_machine_agent(
         )
         process.previous_pid = previous_pid
         return process
+
 
 # Public lifecycle entry point retained for internal test and CLI orchestration.
 def dispatch_machine_cycle_locked(*args, **kwargs):

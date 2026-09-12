@@ -380,6 +380,28 @@ def test_project_snapshots_preserve_agent_start_and_continuous_idle_times(tmp_pa
 
     assert first["started_at"] == second["started_at"] == "2026-08-27T00:00:00Z"
     assert first["idle_since_at"] == second["idle_since_at"]
+    assert first["configured_mode"] == second["configured_mode"] == "on_demand"
+
+
+def test_project_snapshot_publishes_daemon_mode(tmp_path: Path) -> None:
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp",
+        "gpu-1",
+        agent_mode="daemon",
+        runtime_root=tmp_path / "project-runtime",
+    )
+    agent_path = cfg.shared_root / "machines" / cfg.machine_name / "state" / "agent.json"
+
+    _publish_project_snapshots(
+        {"project-1": cfg},
+        instance_id="agent-1",
+        pid=123,
+        visible=[0],
+        reservations=[],
+        started_at="2026-08-27T00:00:00Z",
+    )
+
+    assert read_json(agent_path)["agent"]["configured_mode"] == "daemon"
 
 
 def test_migrate_project_preserves_intentionally_disabled_active_binding(tmp_path: Path) -> None:
@@ -1325,6 +1347,45 @@ def test_machine_control_authority_is_not_blocked_by_slow_project_maintenance(
         assert not worker.is_alive()
     finally:
         control_plane.stop()
+
+
+def test_machine_control_authority_survives_reservation_snapshot_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    is_ticked = Event()
+
+    class RecordingSupervisor:
+        def __init__(self, _cfg, *, reservation_runtime_root) -> None:
+            del reservation_runtime_root
+
+        @property
+        def renewal_interval_seconds(self) -> float:
+            return 0.02
+
+        def recover_startup(self) -> None:
+            return None
+
+        def tick(self) -> None:
+            is_ticked.set()
+
+    def unavailable_snapshot(_runtime_root):
+        raise OSError("injected reservation storage failure")
+
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.control_plane._AuthoritySupervisor", RecordingSupervisor)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.control_plane.reservation_snapshot", unavailable_snapshot)
+    control_plane = _MachineControlPlane(
+        runtime,
+        instance_id="test-agent",
+        loop_interval=0.02,
+        started_at="2026-01-01T00:00:00Z",
+        available_gpus=[],
+    )
+
+    assert control_plane._run_authority_cycle() == 0.02
+    assert is_ticked.is_set()
 
 
 def test_restart_and_activation_share_one_lifecycle_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

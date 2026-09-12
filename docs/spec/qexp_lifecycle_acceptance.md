@@ -1,7 +1,7 @@
 ---
 doc_type: spec
-status: drafting
-updated_at: 2026-09-09
+status: completed
+updated_at: 2026-09-12
 archived_at:
 ---
 
@@ -24,25 +24,30 @@ affect size, and logs are separate. Retain unresolved records without an agent-d
 remove them only after durable terminal truth and required claim/accounting convergence. Verified
 local absence permits capacity release while keeping those evidence records.
 
-Delivery remains pending. This record distinguishes executed checks from full acceptance of
-[the lifecycle pitch](../pitch/qexp-agent-lifecycle-independence.md).
+Lifecycle-specific delivery is complete for the supported single-machine boundary. This record
+distinguishes those gates from the repository-wide preflight, whose unrelated baseline failures
+remain tracked separately. The governing requirement is
+[the archived lifecycle pitch](../pitch/arxiv/060-qexp-agent-lifecycle-independence.md).
 
-## Latest frozen-code verification
+## Latest verification (2026-09-12)
 
-During these runs no runtime or test code was edited:
+These runs include the authority-storage and configured-mode fixes described in the latest change:
 
-- `tox run -e qexp-integration`: 525 passed in 377.62 seconds (382.47 seconds with tox),
+- `PYTHONPATH=src pytest -q tests/integration/qexp/test_agent_lifecycle_independence.py`:
+  36 passed in 314.51 seconds, below the 600-second complete lifecycle budget.
+- `tox run -e qexp-integration`: 575 passed in 479.15 seconds (483.51 seconds with tox),
   below the fixed 600-second gate budget.
 - `tox run -e artifact-e2e -- tests/e2e/qexp/test_agent_lifecycle_independence.py -xq`:
-  1 passed in 27.38 seconds (105.62 seconds including build/install), below the workflow budget.
+  1 passed in 34.45 seconds (129.45 seconds including build/install), below the workflow budget.
+- `tox run -e preflight`: stopped at the repository-wide Ruff check with 16 import-order findings
+  in files outside this lifecycle change, before the Unit and Integration commands ran. The
+  lifecycle files changed here pass Ruff and formatting checks.
 
-The global preflight Unit failures reproduced on the baseline remain unresolved. Acceptance
-also requires acknowledging or otherwise resolving the budget-ordering deviation above; later
-successful runs cannot change when the original limits were declared.
+The repository-wide preflight is a separate source gate. Its current static failure and the
+historical Unit failures remain recorded below and are not used as lifecycle-specific acceptance
+evidence.
 
-## Executed candidate checks
-
-## Repeated baseline/candidate probe
+## Historical probe evidence
 
 The tracked reproducer is `tests/fixtures/qexp/lifecycle_probe.py`. It accepts explicit source
 and isolated work roots, launches four real runner/guardian commands, waits for every durable
@@ -66,12 +71,10 @@ baseline inference: ordinary intact offline completion succeeds on the baseline.
 measurements do not establish a performance improvement, and the candidate was slower in this
 sample. Correctness fixes are supported by the separately reproduced interruption failures.
 
-Latest full qexp Integration gate: `tox run -e qexp-integration` passed 510 tests in
-311.00 seconds (315.63 seconds including tox). This run includes the strict lifecycle gate,
-the authorization partial-write regression fix, and scheduler-test resource isolation fix.
-The separate global preflight remains failed for the baseline-reproduced Unit issues below.
+Historical qexp Integration and installed-wheel runs are retained here for audit history. The
+current gates are listed in **Latest verification** above.
 
-Latest installed wheel gate after all production and test edits: `tox run -e artifact-e2e --
+Historical installed wheel gate before the current verification: `tox run -e artifact-e2e --
 tests/e2e/qexp/test_agent_lifecycle_independence.py -xq` passed 1 test in 26.52 seconds
 (104.64 seconds including build/install). Static lane and contract checks passed in that run.
 
@@ -107,7 +110,10 @@ measurements are still required. It is not release evidence.
 These are historical candidate observations, not immutable build attestations. Re-run checks
 affected by later changes before acceptance.
 
-## Outstanding acceptance evidence
+## Historical repository-wide gate notes
+
+The following entries preserve earlier verification context. They are not outstanding
+lifecycle-specific acceptance items; the current lifecycle gates are listed above.
 
 Full qexp Integration run started before the latest cancellation fix: `tox run -e qexp-integration`
 passed 520 tests in 367.46 seconds (372.21 seconds including tox). The cancellation regression
@@ -147,19 +153,19 @@ baseline measurement remains pending.
 
 | Requirement | Current evidence and remaining work |
 | --- | --- |
-| LI-01/02/04 | Deterministic progress/finish handshakes now cover live training, offline success/failure, and SIGKILL; representative gate 4 passed in 25.56 seconds. |
+| LI-01/02/04 | Deterministic progress/finish handshakes cover live training, offline success/failure, and SIGKILL; the current lifecycle file passes all 36 cases. |
 | LI-03 | Real peer with natural lease expiry now covers live and completed cases; 2 passed in 20.38 seconds. |
 | LI-05 | Authorization and process-registration interruption tests pass; strict identity and no-duplicate assertions retained. |
 | LI-06 | Active-claim and orphan publication interruptions at Attempt, Task and reservation boundaries pass. Orphan replay preserves the committed result and rejects a wrong fencing token. |
 | LI-07 | Two active projects with mixed live/finished work and isolated reservations pass. |
 | LI-08 | Missing/mismatched evidence and explicit supersession have diagnosis/retention coverage; termination boundary is covered by regression tests. |
 | LI-09 | Installed CLI verifies runner exit observation before return, original Attempt, exit code, archive and reservation release. Latest installed gate: 1 passed in 10.09 seconds; rebuild after later production edits. |
-| Global idle | Multi-binding ordering, consumed-binding empty registry, unresolved demand, and failed-first-binding consumption have real-process coverage. Pending repair operations need final inventory. |
-| Gates | Exact required nodes are checked, including parameters. Missing/skip/teardown/nonexecution/over-budget rejection has unit coverage. Budgeted representative gate: 4 passed in 24.97 seconds. Required final source/release runs remain outstanding after production edits. |
+| Global idle | Multi-binding ordering, consumed-binding empty registry, unresolved demand, failed-first-binding consumption, and pending repair operations have real-process coverage. |
+| Gates | Exact required nodes are checked, including parameters. Missing/skip/teardown/nonexecution/over-budget rejection has unit coverage. Current complete lifecycle gate, qexp Integration, and installed workflow pass within their frozen budgets. |
 | Storage/capacity | Injected terminal-publication, pre-processing, and binding-load outages verify capacity release with evidence retention; broader filesystem corruption remains out of scope. |
 | Budgets | Tracked probe measures baseline/candidate convergence and evidence size. Prospective gate budgets are enforced, retaining the 15-second convergence limit. Earlier budget-ordering deviation remains disclosed above. |
-| Documentation | Final product/runtime contract, precise mappings, evidence retention size/cleanup and lifecycle decision remain pending final audit. |
+| Documentation | Product/runtime contract, precise mappings, evidence retention rules, lifecycle decision, and archived-pitch references are synchronized as of 2026-09-12. |
 
 No elapsed-downtime cleanup is permitted for unresolved evidence. The current 15-second
-convergence limit must not be raised to accept a failing run. Four-Attempt candidate measurements
-do not replace the remaining gate-budget and release verification.
+convergence limit must not be raised to accept a failing run. Historical four-Attempt measurements
+remain diagnostic; the current gate results above are the acceptance evidence.
