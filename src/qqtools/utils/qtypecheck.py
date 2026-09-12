@@ -43,7 +43,7 @@ def is_number(inpt) -> bool:
 def is_inf(x) -> bool:
 
     if isinstance(x, torch.Tensor):
-        return torch.isinf(x).any().item()  # 返回 bool
+        return torch.isinf(x).any().item()  # returns a bool
 
     elif isinstance(x, (int, float)):
         return math.isinf(x)

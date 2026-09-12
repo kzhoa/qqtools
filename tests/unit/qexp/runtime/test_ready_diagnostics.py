@@ -20,7 +20,7 @@ from qqtools.plugins.qexp.runtime.ready.state import degrade_state_record
 
 
 class _Config:
-    machine_name = "机器 A"
+    machine_name = "Machine A"
 
 
 def test_v1_reason_round_trips_observed_marker_difference() -> None:
@@ -141,7 +141,7 @@ def test_unicode_dynamic_fields_obey_encoded_byte_limit() -> None:
         exception_type="ValueError",
         object="build",
     )
-    config = type("UnicodeConfig", (), {"machine_name": "机" * 300})()
+    config = type("UnicodeConfig", (), {"machine_name": "machine" * 300})()
 
     reason = serialize_reason(config, "build_failed", value)
 
