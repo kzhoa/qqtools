@@ -4,6 +4,8 @@
 
 ## v1.3.18
 
+- fix: roll back a rejected qexp legacy-migration registration attempt before fencing its stale
+  owner, so the replacement machine runtime can safely adopt the project.
 - fix: make qexp ready-marker publication explicit and recoverable with bounded marker-read
   retries, pending-slot isolation, and idempotent publication commits.
 - breaking: complete the qexp group-ready-members, submission schema-lock, and ready-index
