@@ -1,1 +1,1 @@
-from .yaml import InheritLoader, dump_yaml, load_yaml
+from .yaml import InheritLoader, QExpandSafeLoader, dump_yaml, load_yaml

@@ -7,7 +7,7 @@ import yaml
 
 from ...qdict import qDict
 from ...qimport import LazyImport
-from .qInheritLoader import InheritLoader
+from .qInheritLoader import InheritLoader, QExpandSafeLoader
 
 parse_device = LazyImport("qqtools.torch.qgpu", object_name="parse_device")
 
@@ -101,7 +101,7 @@ def load_yaml(path, inherit=True, ignore_keys=[]) -> qDict:
         warnings.warn(f"file:{path} not exists")
         return qDict()
 
-    loader = InheritLoader if inherit else yaml.UnsafeLoader
+    loader = InheritLoader if inherit else QExpandSafeLoader
     with open(path, "r") as f:
         cfg = yaml.load(f, Loader=loader)
     cfg = qDict(cfg)

@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 import yaml
@@ -13,11 +14,57 @@ def python_set_constructor(loader, node):
     return set(loader.construct_sequence(node))
 
 
+def python_complex_constructor(loader, node):
+    return complex(loader.construct_scalar(node))
+
+
+def python_name_constructor(loader, suffix, node):
+    value = loader.construct_scalar(node)
+    if value:
+        raise yaml.constructor.ConstructorError(
+            "while constructing a Python name",
+            node.start_mark,
+            "expected the empty value, but found %r" % value,
+            node.start_mark,
+        )
+    if not suffix:
+        raise yaml.constructor.ConstructorError(
+            "while constructing a Python name",
+            node.start_mark,
+            "expected non-empty name appended to the tag",
+            node.start_mark,
+        )
+
+    if "." in suffix:
+        module_name, object_name = suffix.rsplit(".", 1)
+    else:
+        module_name, object_name = "builtins", suffix
+    try:
+        module = sys.modules.get(module_name)
+        if module is None:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a Python name",
+                node.start_mark,
+                "module %r is not imported" % module_name,
+                node.start_mark,
+            )
+        return getattr(module, object_name)
+    except AttributeError as exc:
+        raise yaml.constructor.ConstructorError(
+            "while constructing a Python name",
+            node.start_mark,
+            "cannot resolve %r (%s)" % (suffix, exc),
+            node.start_mark,
+        ) from exc
+
+
 class QExpandSafeLoader(yaml.SafeLoader):
     def __init__(self, stream):
         super().__init__(stream)
         self.add_constructor("tag:yaml.org,2002:python/tuple", python_tuple_constructor)
         self.add_constructor("tag:yaml.org,2002:python/set", python_set_constructor)
+        self.add_constructor("tag:yaml.org,2002:python/complex", python_complex_constructor)
+        self.add_multi_constructor("tag:yaml.org,2002:python/name:", python_name_constructor)
 
 
 class InheritLoader(QExpandSafeLoader):
