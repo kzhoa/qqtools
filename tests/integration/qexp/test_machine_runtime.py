@@ -434,6 +434,34 @@ def test_migrate_project_imports_legacy_reservation_and_marks_machine_runtime(tm
     assert read_json(record_path)["machine"]["agent_runtime"] == "machine"
 
 
+def test_migrate_project_rolls_back_failed_adoption_before_fencing_stale_owner(
+    tmp_path: Path,
+) -> None:
+    cfg = init_shared_root(
+        tmp_path / "project" / ".qexp",
+        "gpu-1",
+        runtime_root=tmp_path / "legacy-runtime",
+    )
+    record_path = cfg.shared_root / "machines" / cfg.machine_name / "machine.json"
+    record = read_json(record_path)
+    record["machine"].pop("agent_runtime")
+    atomic_replace(record_path, record)
+    bootstrap_runtime = MachineRuntime(tmp_path / "bootstrap-machine-runtime")
+    bootstrap_binding = bootstrap_runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+
+    binding = migrate_project(runtime, cfg)
+
+    assert binding.enabled
+    assert not runtime.paths["registration_transaction"].exists()
+    assert runtime.binding_write_eligible(binding)
+    registration = read_json(
+        cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    )["registration"]
+    assert registration["runtime_root"] == str(runtime.root)
+    assert registration["generation"] != bootstrap_binding.registration_generation
+
+
 def test_migration_moves_agent_evidence_and_drains_only_late_runner_records(
     tmp_path: Path,
 ) -> None:
