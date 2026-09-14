@@ -39,16 +39,6 @@ def is_schema_narrow_protocol_active(cfg: object) -> bool:
     )
 
 
-def _group_members_upgrade_is_active(cfg: object) -> bool:
-    """Return whether the restricted legacy activation window is in progress."""
-    path = shared_paths(cfg.shared_root)["schema"] / "group-ready-members-upgrade.json"
-    try:
-        phase = read_json(path)["group_ready_members_upgrade"].get("phase")
-    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
-        return False
-    return phase == "building"
-
-
 @contextmanager
 def exclusive(path: Path, *, blocking: bool = True) -> Iterator[bool]:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,7 +105,6 @@ def schema_writer_lock(
     if (
         require_narrow
         and not is_schema_narrow_protocol_active(cfg)
-        and not _group_members_upgrade_is_active(cfg)
     ):
         if not blocking:
             yield False
@@ -141,7 +130,7 @@ def schema_writer_lock(
             )
         raise RuntimeError(
             "qexp root requires an active group-ready-members-v1 protocol; "
-            "run 'qexp upgrade group-ready-members' before ordinary mutation."
+            "upgrade the root with a supported release before ordinary mutation."
         )
     root = cfg.shared_root.resolve()
     held_roots = _schema_writer_roots.get()

@@ -105,7 +105,6 @@ def test_legacy_root_rejects_submission_until_member_protocol_is_active(tmp_path
         submit(cfg, ["echo", "legacy"])
 
 
-# QQTOOLS-COMPAT-0009: active member-projection roots use shared schema readers.
 def test_active_lock_protocol_allows_independent_submission_fences_together(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -138,7 +137,6 @@ def test_active_lock_protocol_allows_independent_submission_fences_together(
     assert not second.is_alive()
 
 
-# QQTOOLS-COMPAT-0009: the keyed fence makes concurrent same-key submissions converge.
 def test_active_lock_protocol_serializes_same_idempotency_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     _activate_narrow_submission_protocol(cfg, monkeypatch)
@@ -173,7 +171,6 @@ def test_active_lock_protocol_serializes_same_idempotency_key(tmp_path: Path, mo
     assert results[0][0].task_id == results[1][0].task_id
 
 
-# QQTOOLS-COMPAT-0009: same-key conflicting requests preserve the winner's mapping.
 def test_active_lock_protocol_rejects_conflicting_same_key_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -221,7 +218,6 @@ def test_active_lock_protocol_rejects_conflicting_same_key_request(
     assert isinstance(failures[0], IdempotencyConflict)
 
 
-# QQTOOLS-COMPAT-0009: cleanup tombstones win a Task-identity creation race.
 def test_active_protocol_cleanup_tombstone_blocks_concurrent_task_id_reuse(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -272,7 +268,6 @@ def test_active_protocol_cleanup_tombstone_blocks_concurrent_task_id_reuse(
     assert "cleaned" in str(failures[0])
 
 
-# QQTOOLS-COMPAT-0009: Group addition and retry retain Group -> Task serialization.
 def test_active_protocol_serializes_group_worker_addition_and_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -311,7 +306,6 @@ def test_active_protocol_serializes_group_worker_addition_and_retry(
     assert retried["task"]["state"]["projection"] == "queued"
 
 
-# QQTOOLS-COMPAT-0009: an exclusive activation or migration cannot overtake a narrow writer.
 def test_active_protocol_schema_mutation_waits_for_submission_fence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

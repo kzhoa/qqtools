@@ -45,9 +45,11 @@ uncommitted staged Tasks and inactive additions.
 | 1.3.18 | Narrow protocol only | Remove the marker, legacy path, and fixtures |
 
 `QQTOOLS-COMPAT-0008` and `QQTOOLS-COMPAT-0009` are jointly active in 1.3.16. New roots create
-the canonical member projection immediately. Existing roots use `qexp upgrade group-ready-members`
-to build and audit it under the wide schema fence; the atomic `active` state transition is also the
-only point at which the narrow writer protocol becomes selectable.
+the canonical member projection immediately. Existing roots were required to complete the
+transition before 1.3.18; the temporary `qexp upgrade group-ready-members` command is no longer
+available in 1.3.18. During the transition, the projection was built and audited under the wide
+schema fence; the atomic `active` state transition was the only point at which the narrow writer
+protocol became selectable.
 
 ## Verification boundary
 

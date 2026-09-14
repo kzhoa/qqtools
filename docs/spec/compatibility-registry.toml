@@ -28,65 +28,6 @@ workload_continuity = true
 interruption_budget_seconds = 1.0
 
 [[items]]
-id = "QQTOOLS-COMPAT-0010"
-component = "qexp.ready-index-degradation-diagnostics"
-kind = "runtime_protocol"
-status = "legacy_removed"
-introduced_in = "1.3.16"
-legacy_removed_in = "1.3.17"
-transition_purged_in = "1.3.18"
-marker = "QQTOOLS-COMPAT-0010"
-owner = "qexp.runtime"
-decision_refs = ["docs/spec/qexp_runtime_spec.md"]
-pitch_refs = ["docs/pitch/arxiv/059-qexp-ready-index-degradation-diagnostics.md"]
-verification = [
-    "tests/unit/qexp/runtime/test_ready_diagnostics.py",
-    "tests/integration/qexp/test_ready_index_activation.py",
-    "tests/integration/qexp/test_ready_index_repair.py",
-    "tests/integration/qexp/test_clean_doctor.py",
-]
-
-[[items]]
-id = "QQTOOLS-COMPAT-0008"
-component = "qexp.group-ready-members-transition"
-kind = "persisted_schema"
-status = "legacy_removed"
-introduced_in = "1.3.16"
-legacy_removed_in = "1.3.17"
-transition_purged_in = "1.3.18"
-marker = "QQTOOLS-COMPAT-0008"
-owner = "qexp.runtime"
-decision_refs = ["docs/spec/qexp_runtime_spec.md"]
-pitch_refs = [
-    "docs/pitch/arxiv/055-qexp-group-ready-membership-projection.md",
-    "docs/pitch/arxiv/057-qexp-group-ready-members-maintenance-io-budget.md",
-]
-verification = [
-    "tests/integration/qexp/test_group_ready_members_upgrade.py",
-    "tests/integration/qexp/test_clean_doctor.py",
-]
-
-[[items]]
-id = "QQTOOLS-COMPAT-0009"
-component = "qexp.submission-schema-lock-transition"
-kind = "runtime_protocol"
-status = "legacy_removed"
-introduced_in = "1.3.16"
-legacy_removed_in = "1.3.17"
-transition_purged_in = "1.3.18"
-marker = "QQTOOLS-COMPAT-0009"
-owner = "qexp.runtime"
-decision_refs = [
-    "docs/spec/qexp_runtime_spec.md",
-    "docs/spec/qexp_submission_schema_lock_compatibility.md",
-]
-pitch_refs = ["docs/pitch/arxiv/054-qexp-submission-schema-lock-scope.md"]
-verification = [
-    "tests/integration/qexp/test_submission_protocol.py",
-    "tests/integration/qexp/test_clean_doctor.py",
-]
-
-[[items]]
 # Active through 1.3.x. In 1.4.0 remove the legacy sampler strategies, warnings, and fixtures;
 # keep the canonical LPT strategies and update the unit migration coverage together.
 id = "QQTOOLS-COMPAT-0006"
