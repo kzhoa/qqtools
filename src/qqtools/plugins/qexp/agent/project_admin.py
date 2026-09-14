@@ -265,6 +265,12 @@ def migrate_project(runtime: MachineRuntime | str | Path | None, cfg: RootConfig
             # rejected by the normal registration guard.
             if "active competing authority" not in str(exc):
                 raise
+            # The rejected binding attempt deliberately retains its transaction so the
+            # next registration mutation can restore the exact pre-attempt state. Complete
+            # that rollback before fencing the stale owner; otherwise the retry below would
+            # restore the active registration after we supersede it.
+            with machine_runtime.registry_guard():
+                machine_runtime._rollback_registration_transaction()
             registration = load_machine_registration(cfg).get("registration", {})
             owner_root = registration.get("runtime_root") if isinstance(registration, dict) else None
             generation = registration.get("generation") if isinstance(registration, dict) else None
