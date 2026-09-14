@@ -16,8 +16,6 @@ from qqtools.plugins.qexp.runtime.ready.diagnostics import (
 )
 from qqtools.plugins.qexp.runtime.ready.state import degrade_state_record
 
-# QQTOOLS-COMPAT-0010
-
 
 class _Config:
     machine_name = "Machine A"

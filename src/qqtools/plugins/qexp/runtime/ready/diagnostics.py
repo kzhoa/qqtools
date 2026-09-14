@@ -10,7 +10,6 @@ from typing import Any, Mapping
 
 from qqtools.version import __version__
 
-# QQTOOLS-COMPAT-0010
 DIAGNOSTIC_VERSION = 1
 MAX_REASON_BYTES = 1024
 MAX_REASONS = 32

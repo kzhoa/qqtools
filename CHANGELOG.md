@@ -4,6 +4,8 @@
 
 - fix: make qexp ready-marker publication explicit and recoverable with bounded marker-read
   retries, pending-slot isolation, and idempotent publication commits.
+- breaking: complete the qexp group-ready-members, submission schema-lock, and ready-index
+  diagnostics compatibility transitions; remove the temporary group-ready-members upgrade CLI.
 
 ## v1.3.17
 
