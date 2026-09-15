@@ -1173,9 +1173,6 @@ def main(argv: list[str] | None = None) -> int:
             task_views = observer.list_tasks(cfg, limit=10**9) if args.format == "human" else None
             _emit("machines", result, args.format, tasks=task_views)
             return 0
-        if args.command == "logs":
-            print(log_commands.read_logs(cfg, args.task_id), end="")
-            return 0
         if args.command == "doctor":
             context = get_execution_context()
             result = (

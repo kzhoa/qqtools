@@ -64,7 +64,7 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
 
         wait_for(is_done, timeout=TASK_TERMINAL_TIMEOUT_SECONDS, label="failing task terminal state")
         task = jrun([*common, "task", "show", task_id], env=env)
-        logs = run([*common, "logs", task_id], env=env).stdout
+        logs = run([*common, "task", "logs", task_id], env=env).stdout
         clean = None
 
         def clean_after_local_process_exit() -> bool:
