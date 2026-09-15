@@ -79,10 +79,8 @@ class _Reporter:
                 wake = self._pending is None or self._pending["stage"] != stage
                 self._pending = payload
                 if self._thread is None:
-                    # Starting while holding the short state lock prevents a
-                    # concurrent flush from retiring this reporter before the
-                    # daemon can start. The lock is never held across file I/O;
-                    # close waits for it only within its explicit timeout.
+                    # Serialize startup with close. The state lock is never held
+                    # across file I/O, and close waits on it only within timeout.
                     self._thread = threading.Thread(
                         target=self._run,
                         name="qexp-progress-writer",
@@ -158,6 +156,13 @@ class _Reporter:
         except RuntimeError:
             pass
 
+    def replaceable(self) -> bool:
+        """Whether a new singleton can be created without overlapping writers."""
+        thread = self._thread
+        if thread is None:
+            return self._closing
+        return not thread.is_alive()
+
 
 _reporter: _Reporter | None = None
 _reporter_lock = threading.Lock()
@@ -167,11 +172,15 @@ def _get_reporter() -> _Reporter | None:
     global _reporter
     if not os.environ.get("QEXP_PROGRESS_PATH") or not _is_primary():
         return None
-    if _reporter is not None:
-        return _reporter
+    current = _reporter
+    if current is not None and not current.replaceable():
+        return current
     if not _reporter_lock.acquire(blocking=False):
         return None
     try:
+        current = _reporter
+        if current is not None and current.replaceable():
+            _reporter = None
         if _reporter is None:
             _reporter = _Reporter(os.environ["QEXP_PROGRESS_PATH"])
         return _reporter
@@ -198,7 +207,7 @@ def update(
 
 
 def flush(*, timeout: float = 0.1) -> None:
-    """Close and reset the process writer so a later run can create a new one."""
+    """Close the process writer; reset only after its daemon has actually exited."""
     global _reporter
     try:
         budget = max(0.0, min(float(timeout), 1.0))
@@ -215,7 +224,11 @@ def flush(*, timeout: float = 0.1) -> None:
         reporter = _reporter
         if reporter is not None:
             reporter.close(timeout=max(0.0, deadline - time.monotonic()))
-        _reporter = None
+            # A writer blocked in the filesystem remains the singleton sentinel.
+            # Updates are rejected while it is closing. The next update replaces
+            # it only after its daemon has really exited.
+            if reporter.replaceable():
+                _reporter = None
     finally:
         _reporter_lock.release()
 
