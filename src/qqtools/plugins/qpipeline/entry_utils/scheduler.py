@@ -352,9 +352,9 @@ def prepare_scheduler(args: qt.qDict, optimizer: Optimizer, batches_per_epoch: i
     # Build warmup config from yaml parameters
     if warmup_params is not None:
         warmup_params = warmup_params.to_dict()
-        warmup_steps = getattr(warmup_params, "warmup_steps", 0)
-        warmup_epochs = getattr(warmup_params, "warmup_epochs", 0)
-        warmup_factor = getattr(warmup_params, "warmup_factor", 0.1)
+        warmup_steps = warmup_params.get("warmup_steps", 0)
+        warmup_epochs = warmup_params.get("warmup_epochs", 0)
+        warmup_factor = warmup_params.get("warmup_factor", 0.1)
 
         # Convert warmup_epochs to steps if warmup_steps is not set
         if warmup_steps <= 0 and warmup_epochs > 0:

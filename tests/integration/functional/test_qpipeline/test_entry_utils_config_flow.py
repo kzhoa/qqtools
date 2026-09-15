@@ -547,16 +547,67 @@ def test_prepare_scheduler_lambda_scheduler_success(base_args, tiny_model):
     )
 
     scheduler = prepare_scheduler(args, optimizer)
-    scheduler.step_warmup()
-    scheduler.step_warmup()
 
-    optimizer.zero_grad()
-    tiny_model(torch.randn(2, 6)).sum().backward()
-    optimizer.step()
+    for _ in range(2):
+        optimizer.zero_grad()
+        tiny_model(torch.randn(2, 6)).sum().backward()
+        optimizer.step()
+        scheduler.step_after_optimizer_update()
 
     scheduler.step_main(metrics=1.0)
     assert scheduler is not None
     assert hasattr(scheduler, "main_scheduler")
+
+
+def test_prepare_scheduler_applies_warmup_params(base_args, tiny_model):
+    optimizer = torch.optim.Adam(tiny_model.parameters(), lr=2.0e-4)
+    args = base_args.copy()
+    args.optim = qt.qDict(
+        {
+            "scheduler": "step",
+            "scheduler_params": qt.qDict({"step_size": 100, "gamma": 0.1}),
+            "warmup_params": qt.qDict({"warmup_steps": 500, "warmup_factor": 0.2}),
+        }
+    )
+
+    scheduler = prepare_scheduler(args, optimizer)
+
+    assert scheduler.warmup_steps == 500
+    assert scheduler.warmup_factor == pytest.approx(0.2)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(4.0e-5)
+
+
+def test_prepare_scheduler_converts_warmup_epochs_to_steps(base_args, tiny_model):
+    optimizer = torch.optim.Adam(tiny_model.parameters(), lr=2.0e-4)
+    args = base_args.copy()
+    args.optim = qt.qDict(
+        {
+            "scheduler": "step",
+            "scheduler_params": qt.qDict({"step_size": 100, "gamma": 0.1}),
+            "warmup_params": qt.qDict({"warmup_epochs": 2, "warmup_factor": 0.2}),
+        }
+    )
+
+    scheduler = prepare_scheduler(args, optimizer, batches_per_epoch=10)
+
+    assert scheduler.warmup_steps == 20
+    assert scheduler.warmup_factor == pytest.approx(0.2)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(4.0e-5)
+
+
+def test_prepare_scheduler_warmup_epochs_requires_batches_per_epoch(base_args, tiny_model):
+    optimizer = torch.optim.Adam(tiny_model.parameters(), lr=2.0e-4)
+    args = base_args.copy()
+    args.optim = qt.qDict(
+        {
+            "scheduler": "step",
+            "scheduler_params": qt.qDict({"step_size": 100, "gamma": 0.1}),
+            "warmup_params": qt.qDict({"warmup_epochs": 2, "warmup_factor": 0.2}),
+        }
+    )
+
+    with pytest.raises(ValueError, match="batches_per_epoch must be > 0"):
+        prepare_scheduler(args, optimizer)
 
 
 def test_prepare_scheduler_non_plateau_defaults_step_on_optimizer_step(base_args, tiny_model):
