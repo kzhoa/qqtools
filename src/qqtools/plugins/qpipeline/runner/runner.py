@@ -37,6 +37,7 @@ from .runner_utils.eval_formatter import EvalSummaryObserver
 from .runner_utils.evaluation import EvaluationResult
 from .runner_utils.metrics_jsonl import MetricsJsonlLogger, MetricsJsonlObserver
 from .runner_utils.progress import ProgressTracker
+from .runner_utils.qexp_progress import bind_qexp_progress
 from .runner_utils.types import RunConfig, RunMode, RunningState, TerminalEvent, TerminalReason, TrainRunnerResult
 
 __all__ = ["train_runner", "MetricsJsonlObserver"]
@@ -634,6 +635,7 @@ def train_runner(
     if task.has_implemented("on_early_stop"):
         observers.bind("early_stop", task.on_early_stop, policy="settled_fatal")
 
+    qexp_progress_observer = bind_qexp_progress(observers, config)
     progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type, rank=config.rank)
     observers.bind("epoch_started", progress_tracker.on_epoch_start)
     observers.bind("progress_tick", progress_tracker.on_progress_tick)
@@ -748,12 +750,19 @@ def train_runner(
         primary_traceback = error.__traceback__
 
     finally:
-        _finalize_train_runner(
-            logger=logger,
-            progress_tracker=progress_tracker,
-            profiler=profiler,
-            owns_logger=owns_logger,
-        )
+        try:
+            _finalize_train_runner(
+                logger=logger,
+                progress_tracker=progress_tracker,
+                profiler=profiler,
+                owns_logger=owns_logger,
+            )
+        finally:
+            if qexp_progress_observer is not None:
+                try:
+                    qexp_progress_observer.close()
+                except Exception:
+                    pass
 
     logger_error: Optional[BaseException] = None
     if metrics_logger is not None:
