@@ -7,6 +7,8 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .runtime.progress import progress_details
+
 
 def render(kind: str, result: Any, output_format: str, *, tasks: Sequence[Mapping[str, Any]] = ()) -> str:
     if output_format == "json":
@@ -166,6 +168,7 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
                 ("Reason", state.get("reason")),
                 ("Dependency gate", result.get("dependency_gate")),
             ),
+            progress_details(result),
         )
     if kind == "task-operation":
         return _operation(
