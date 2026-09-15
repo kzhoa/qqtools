@@ -103,7 +103,7 @@ def test_installed_cli_stop_offline_completion_start(tmp_path: Path) -> None:
             timeout=5,
             label="reservation release",
         )
-        assert "offline lifecycle result" in run([*common, "logs", task_id], env=env).stdout
+        assert "offline lifecycle result" in run([*common, "task", "logs", task_id], env=env).stdout
         assert marker.read_text(encoding="utf-8") == "1"
         assert "site-packages" in ensure_site_packages_import()
     finally:

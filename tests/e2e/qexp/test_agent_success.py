@@ -64,7 +64,7 @@ def test_installed_wheel_agent_completes_task(tmp_path):
 
         wait_for(is_done, timeout=TASK_TERMINAL_TIMEOUT_SECONDS, label="task terminal state")
         task = jrun([*common, "task", "show", task_id], env=env)
-        logs = run([*common, "logs", task_id], env=env).stdout
+        logs = run([*common, "task", "logs", task_id], env=env).stdout
 
         assert "site-packages" in imported_from
         assert task["task"]["state"]["projection"] == "succeeded"
