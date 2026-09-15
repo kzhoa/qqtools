@@ -1,6 +1,7 @@
-"""Deterministic projector policy tests; no timers, agents or GPUs required."""
+"""Deterministic projector policy tests; no agents or GPUs required."""
 
-import os
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -19,19 +20,38 @@ def channel(tmp_path):
     assert path is not None
     clock = [0.0]
     flags = {"fencing_token": 1, "terminal": False, "retired": False}
+
     def resolve(cfg, context):
         if flags["retired"]:
             return None
         return {**context, "fencing_token": flags["fencing_token"], "terminal": flags["terminal"]}
+
     def wall():
         return (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=clock[0])).isoformat()
-    def projector():
-        return runtime.ProgressProjector(cfg, clock=lambda: clock[0], wall_clock=wall, resolver=resolve)
+
+    def projector(generation="generation-1"):
+        return runtime.ProgressProjector(
+            cfg,
+            clock=lambda: clock[0],
+            wall_clock=wall,
+            resolver=resolve,
+            registration_generation=generation,
+        )
+
     def send(update_id, *, stage="train", current=1, total=10, message=None):
-        replace_advisory_snapshot(runtime.local_progress_path(cfg.runtime_root, "a1"), {
-            "protocol_version": 1, "update_id": update_id, "stage": stage,
-            "current": current, "total": total, "unit": "step", "message": message,
-        })
+        replace_advisory_snapshot(
+            runtime.local_progress_path(cfg.runtime_root, "a1"),
+            {
+                "protocol_version": 1,
+                "update_id": update_id,
+                "stage": stage,
+                "current": current,
+                "total": total,
+                "unit": "step",
+                "message": message,
+            },
+        )
+
     shared = runtime.shared_progress_path(cfg.shared_root, "task", "a1")
     return SimpleNamespace(cfg=cfg, clock=clock, flags=flags, projector=projector, send=send, shared=shared)
 
@@ -45,6 +65,7 @@ def test_current_snapshot_and_restart_dedupe(channel):
     c.projector().observe("a1")
     assert read_advisory_snapshot(c.shared) == first
     assert first["fencing_token"] == 1
+    assert first["registration_generation"] == "generation-1"
     assert first["sequence"] == 1
 
 
@@ -71,10 +92,12 @@ def test_shared_writes_are_coalesced_and_stage_bursts_bounded(channel, monkeypat
     p = c.projector()
     writes = []
     original = runtime.replace_advisory_snapshot
+
     def record(path, value, **kwargs):
         if path == c.shared:
             writes.append(c.clock[0])
         return original(path, value, **kwargs)
+
     monkeypatch.setattr(runtime, "replace_advisory_snapshot", record)
     for i in range(101):
         c.clock[0] = i / 20
@@ -116,6 +139,16 @@ def test_fencing_recovery_preserves_freshness(channel):
     assert second["sequence"] == first["sequence"]
 
 
+def test_registration_generation_fences_old_projection(channel):
+    c = channel
+    c.send("one")
+    c.projector("generation-1").observe("a1")
+    assert read_advisory_snapshot(c.shared)["registration_generation"] == "generation-1"
+    c.clock[0] = 10
+    c.projector("generation-2").observe("a1")
+    assert read_advisory_snapshot(c.shared)["registration_generation"] == "generation-2"
+
+
 def test_superseded_attempt_does_not_publish(channel):
     c = channel
     p = c.projector()
@@ -153,10 +186,12 @@ def test_projection_failure_recovers_latest_state(channel, monkeypatch):
     c.send("one")
     p.observe("a1")
     original = runtime.replace_advisory_snapshot
+
     def fail_shared(path, *args, **kwargs):
         if path == c.shared:
             raise OSError("shared filesystem unavailable")
         return original(path, *args, **kwargs)
+
     monkeypatch.setattr(runtime, "replace_advisory_snapshot", fail_shared)
     c.clock[0] = 5
     c.send("two", current=2)
@@ -164,8 +199,7 @@ def test_projection_failure_recovers_latest_state(channel, monkeypatch):
     assert read_advisory_snapshot(c.shared)["progress"]["current"] == 1
     monkeypatch.setattr(runtime, "replace_advisory_snapshot", original)
     c.clock[0] = 10
-    p = c.projector()
-    p.observe("a1")
+    c.projector().observe("a1")
     assert read_advisory_snapshot(c.shared)["progress"]["current"] == 2
 
 
@@ -191,16 +225,64 @@ def test_cleanup_and_no_recreation(channel):
     runtime.cleanup_shared_progress(c.cfg, "task")
     p.tick()
     assert not c.shared.parent.exists()
-    for name in runtime._LOCAL_DIRS:
-        assert list((c.cfg.runtime_root / name).iterdir()) == []
+    assert not runtime.local_progress_path(c.cfg.runtime_root, "a1").parent.exists()
+    with pytest.raises(FileNotFoundError):
+        replace_advisory_snapshot(
+            runtime.local_progress_path(c.cfg.runtime_root, "a1"),
+            {"protocol_version": 1, "update_id": "late", "stage": "train", "current": 2, "total": 10, "unit": "step", "message": None},
+        )
+
+
+def test_shared_cleanup_waits_for_projection_and_wins(channel, monkeypatch):
+    c = channel
+    c.send("one")
+    p = c.projector()
+    original = runtime.replace_advisory_snapshot
+    entered, release, cleaned = threading.Event(), threading.Event(), threading.Event()
+
+    def blocked(path, value, **kwargs):
+        if path == c.shared:
+            entered.set()
+            release.wait(2)
+        return original(path, value, **kwargs)
+
+    monkeypatch.setattr(runtime, "replace_advisory_snapshot", blocked)
+    publisher = threading.Thread(target=p.observe, args=("a1",))
+    publisher.start()
+    assert entered.wait(1)
+    c.flags["retired"] = True
+
+    def clean():
+        runtime.cleanup_shared_progress(c.cfg, "task")
+        cleaned.set()
+
+    cleaner = threading.Thread(target=clean)
+    cleaner.start()
+    time.sleep(0.05)
+    assert not cleaned.is_set()
+    release.set()
+    publisher.join(2)
+    cleaner.join(2)
+    assert cleaned.is_set()
+    assert not c.shared.parent.exists()
+    p.observe("a1")
+    assert not c.shared.parent.exists()
 
 
 def test_zero_total_and_missing_progress_formatting():
     assert runtime.progress_details({}) == (("Progress", "unavailable"),)
-    details = dict(runtime.progress_details({"progress": {
-        "status": "available", "reported_at": "bad", "advanced_at": "bad",
-        "progress": {"stage": "train", "current": 0, "total": 0, "unit": "step", "message": None},
-    }}))
+    details = dict(
+        runtime.progress_details(
+            {
+                "progress": {
+                    "status": "available",
+                    "reported_at": "bad",
+                    "advanced_at": "bad",
+                    "progress": {"stage": "train", "current": 0, "total": 0, "unit": "step", "message": None},
+                }
+            }
+        )
+    )
     assert details["Progress"] == "0/0 step"
     assert details["Progress reported"] == "unknown"
 
@@ -211,10 +293,12 @@ def test_cleanup_race_cannot_resurrect_local_observation(channel, monkeypatch):
     original = runtime.replace_advisory_snapshot
     observed = c.cfg.runtime_root / "progress-observed" / "a1.json"
     context = c.cfg.runtime_root / "progress-contexts" / "a1.json"
+
     def racing_write(path, value, **kwargs):
         if path == observed:
             context.unlink()
         return original(path, value, **kwargs)
+
     monkeypatch.setattr(runtime, "replace_advisory_snapshot", racing_write)
     c.projector().observe("a1")
     assert not observed.exists()
