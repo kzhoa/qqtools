@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from ..runtime.progress import ProgressProjector, resolve_progress_binding
+from ..runtime.progress import ProgressProjector, has_local_progress_mailbox, resolve_progress_binding
 from . import helpers
 
 
@@ -23,7 +23,6 @@ class ProgressObservationLoop:
         try:
             self._thread.start()
         except Exception:
-            # Optional observation must not prevent the actual agent starting.
             pass
 
     def stop(self) -> None:
@@ -36,6 +35,7 @@ class ProgressObservationLoop:
             if self._stop.is_set() or not self._runtime.binding_write_eligible(binding):
                 raise ValueError("progress registration is not current")
             return resolve_progress_binding(cfg, context)
+
         return resolve
 
     def cycle(self) -> None:
@@ -45,7 +45,6 @@ class ProgressObservationLoop:
             self._projectors.pop(key).close()
         if not bindings:
             return
-        # Bound work and rotate projects rather than favoring the first project.
         for offset in range(min(16, len(bindings))):
             if self._stop.is_set():
                 return
@@ -53,13 +52,22 @@ class ProgressObservationLoop:
             try:
                 if not (binding.enabled or self._runtime.binding_state(binding) == "draining"):
                     continue
+                # The cheap gate is entirely machine-local. Projects that never
+                # publish progress cause no additional shared registration polls.
+                runtime_root = self._runtime.project_paths(binding.project_id)["root"]
+                if not has_local_progress_mailbox(runtime_root):
+                    continue
                 if not self._runtime.binding_write_eligible(binding):
                     continue
                 key = binding.project_id, binding.registration_generation
                 projector = self._projectors.get(key)
                 if projector is None:
                     cfg = helpers._binding_config(self._runtime, binding)
-                    projector = ProgressProjector(cfg, resolver=self._resolver(binding))
+                    projector = ProgressProjector(
+                        cfg,
+                        resolver=self._resolver(binding),
+                        registration_generation=binding.registration_generation,
+                    )
                     self._projectors[key] = projector
                 projector.tick()
             except Exception:
