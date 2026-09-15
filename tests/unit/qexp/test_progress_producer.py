@@ -48,6 +48,30 @@ def test_global_helper_and_flush_reset(tmp_path, monkeypatch):
     assert read_advisory_snapshot(second)["current"] == 7
 
 
+def test_timed_out_flush_keeps_old_writer_as_singleton(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked(path, value, **kwargs):
+        entered.set()
+        release.wait(3)
+
+    monkeypatch.setattr(progress, "replace_advisory_snapshot", blocked)
+    monkeypatch.setenv("QEXP_PROGRESS_PATH", str(tmp_path / "progress.json"))
+    assert progress.update(stage="train", current=1)
+    assert entered.wait(1)
+    old = progress._reporter
+    progress.flush(timeout=0.01)
+    assert progress._reporter is old
+    assert progress.update(stage="train", current=2) is False
+    release.set()
+    deadline = time.monotonic() + 1
+    while not old.replaceable() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert old.replaceable()
+    assert progress.update(stage="train", current=3)
+    assert progress._reporter is not old
+
+
 def test_rank_nonzero_and_fork_inheritance_are_noops(tmp_path, monkeypatch):
     path = tmp_path / "progress.json"
     reporter = progress._Reporter(path)
