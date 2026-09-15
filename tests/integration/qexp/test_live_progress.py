@@ -21,10 +21,16 @@ from qqtools.qexp._progress_protocol import replace_advisory_snapshot
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
+_TEST_GENERATION = "test-generation"
+
 
 @pytest.fixture
 def cfg(tmp_path):
     return init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+
+
+def projector(cfg):
+    return ProgressProjector(cfg, registration_generation=_TEST_GENERATION)
 
 
 def launch(cfg, task, monkeypatch, *, code=0, payload=None):
@@ -50,16 +56,29 @@ def launch(cfg, task, monkeypatch, *, code=0, payload=None):
         kwargs["stdout"].write(b"application event\n")
         return Child()
 
-    result = run_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token,
-                         launch_id, popen_factory=popen)
+    result = run_attempt(
+        cfg,
+        task.task_id,
+        attempt.attempt_id,
+        attempt.current_fencing_token,
+        launch_id,
+        popen_factory=popen,
+    )
     assert result == code
     AuthoritySupervisor(cfg).tick()
     return attempt, envs[0]
 
 
 def report(current=3, update_id="update-1"):
-    return dict(protocol_version=1, update_id=update_id, stage="train",
-                current=current, total=10, unit="step", message="epoch 0")
+    return dict(
+        protocol_version=1,
+        update_id=update_id,
+        stage="train",
+        current=current,
+        total=10,
+        unit="step",
+        message="epoch 0",
+    )
 
 
 def test_short_command_final_report_survives_normal_evidence_cleanup(cfg, monkeypatch):
@@ -68,9 +87,9 @@ def test_short_command_final_report_survives_normal_evidence_cleanup(cfg, monkey
     task = submit(cfg, ["echo", "ok"])
     attempt, _ = launch(cfg, task, monkeypatch, payload=report())
     assert not (cfg.runtime_root / "process-registrations" / f"{attempt.attempt_id}.json").exists()
-    projector = ProgressProjector(cfg)
-    projector.tick()
-    projector.close()
+    p = projector(cfg)
+    p.tick()
+    p.close()
     view = inspect_task(cfg, task.task_id)
     assert view["task"]["state"]["projection"] == "succeeded"
     assert view["progress"]["progress"]["current"] == 3
@@ -81,14 +100,13 @@ def test_short_command_final_report_survives_normal_evidence_cleanup(cfg, monkey
 def test_retry_never_displays_previous_attempt_as_current(cfg, monkeypatch):
     task = submit(cfg, ["echo", "ok"])
     old, _ = launch(cfg, task, monkeypatch, code=1, payload=report(7))
-    # Keep old context/mailbox, as if the progress collector was offline.
     retry(cfg, task.task_id)
     assert inspect_task(cfg, task.task_id)["progress"]["status"] == "unavailable"
     new, _ = launch(cfg, task, monkeypatch, payload=report(2, "new-update"))
     assert old.attempt_id != new.attempt_id
-    projector = ProgressProjector(cfg)
-    projector.tick()
-    projector.close()
+    p = projector(cfg)
+    p.tick()
+    p.close()
     view = inspect_task(cfg, task.task_id)["progress"]
     assert view["attempt_id"] == new.attempt_id
     assert view["progress"]["current"] == 2
@@ -98,9 +116,9 @@ def test_retry_never_displays_previous_attempt_as_current(cfg, monkeypatch):
 def test_inspector_rejects_stale_token(cfg, monkeypatch):
     task = submit(cfg, ["echo", "ok"])
     attempt, _ = launch(cfg, task, monkeypatch, payload=report())
-    projector = ProgressProjector(cfg)
-    projector.tick()
-    projector.close()
+    p = projector(cfg)
+    p.tick()
+    p.close()
     path = shared_progress_path(cfg.shared_root, task.task_id, attempt.attempt_id)
     value = read_json(path)
     value["fencing_token"] += 1
@@ -112,9 +130,9 @@ def test_inspector_rejects_stale_token(cfg, monkeypatch):
 def test_missing_or_malformed_progress_does_not_fail_task(cfg, monkeypatch, payload):
     task = submit(cfg, ["echo", "ok"])
     launch(cfg, task, monkeypatch, payload=payload)
-    projector = ProgressProjector(cfg)
-    projector.tick()
-    projector.close()
+    p = projector(cfg)
+    p.tick()
+    p.close()
     view = inspect_task(cfg, task.task_id)
     assert view["task"]["state"]["projection"] == "succeeded"
     assert view["progress"]["status"] == "unavailable"
@@ -123,12 +141,13 @@ def test_missing_or_malformed_progress_does_not_fail_task(cfg, monkeypatch, payl
 def test_cleanup_removes_progress_sidecars(cfg, monkeypatch):
     task = submit(cfg, ["echo", "ok"])
     attempt, _ = launch(cfg, task, monkeypatch, payload=report())
-    projector = ProgressProjector(cfg)
-    projector.tick()
-    projector.close()
+    p = projector(cfg)
+    p.tick()
+    p.close()
     clean(cfg, task_id=task.task_id, reservation_runtime_root=cfg.runtime_root)
     assert not (cfg.shared_root / "progress" / task.task_id).exists()
-    for directory in ("progress", "progress-contexts", "progress-observed", "progress-diagnostics"):
+    assert not local_progress_path(cfg.runtime_root, attempt.attempt_id).parent.exists()
+    for directory in ("progress-contexts", "progress-observed", "progress-diagnostics"):
         assert not (cfg.runtime_root / directory / f"{attempt.attempt_id}.json").exists()
 
 
@@ -158,17 +177,23 @@ def test_real_guardian_inherits_channel_and_runs_public_api(cfg, monkeypatch):
                 self.child.wait(timeout=5)
                 raise
 
-    assert run_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token,
-                       launch_id, popen_factory=BoundedChild) == 0
+    assert run_attempt(
+        cfg,
+        task.task_id,
+        attempt.attempt_id,
+        attempt.current_fencing_token,
+        launch_id,
+        popen_factory=BoundedChild,
+    ) == 0
     AuthoritySupervisor(cfg).tick()
-    projector = ProgressProjector(cfg)
-    projector.tick()
-    projector.close()
+    p = projector(cfg)
+    p.tick()
+    p.close()
     assert inspect_task(cfg, task.task_id)["progress"]["progress"]["current"] == 3
     assert read_logs(cfg, task.task_id).strip() == "done"
 
 
-def test_progress_loop_is_separate_and_stop_is_bounded(monkeypatch):
+def test_progress_loop_is_separate_and_stop_is_bounded(monkeypatch, tmp_path):
     import threading
     import time
     from types import SimpleNamespace
@@ -177,19 +202,30 @@ def test_progress_loop_is_separate_and_stop_is_bounded(monkeypatch):
 
     entered, release = threading.Event(), threading.Event()
     binding = SimpleNamespace(project_id="p", registration_generation="g", enabled=True)
+    runtime_root = tmp_path / "project-runtime"
+    mailbox = runtime_root / "progress" / "attempt" / "latest.json"
+    mailbox.parent.mkdir(parents=True)
+    mailbox.write_text("{}")
 
     class Runtime:
         def load_registry(self):
             return 1, [binding]
 
+        def project_paths(self, project_id):
+            assert project_id == "p"
+            return {"root": runtime_root}
+
+        def binding_state(self, selected):
+            return "enabled"
+
         def binding_write_eligible(self, selected, *, renew=False):
             assert selected is binding
-            assert renew is False  # Observability must not renew identity authority.
+            assert renew is False
             return True
 
     class SlowProjector:
         def __init__(self, cfg, **kwargs):
-            pass
+            assert kwargs["registration_generation"] == "g"
 
         def tick(self):
             entered.set()
@@ -212,3 +248,30 @@ def test_progress_loop_is_separate_and_stop_is_bounded(monkeypatch):
     finally:
         release.set()
         loop.stop()
+
+
+def test_idle_progress_loop_does_not_poll_shared_registration(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from qqtools.plugins.qexp.agent import progress_loop
+
+    binding = SimpleNamespace(project_id="p", registration_generation="g", enabled=True)
+    runtime_root = tmp_path / "project-runtime"
+    runtime_root.mkdir()
+
+    class Runtime:
+        def load_registry(self):
+            return 1, [binding]
+
+        def project_paths(self, project_id):
+            return {"root": runtime_root}
+
+        def binding_state(self, selected):
+            return "enabled"
+
+        def binding_write_eligible(self, *args, **kwargs):
+            pytest.fail("idle progress loop touched shared registration")
+
+    loop = progress_loop.ProgressObservationLoop(Runtime())
+    loop.cycle()
+    assert not loop._projectors
