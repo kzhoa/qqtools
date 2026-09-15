@@ -73,36 +73,26 @@ class _Reporter:
             )
             if not self._lock.acquire(blocking=False):
                 return False
-            thread_to_start: threading.Thread | None = None
             try:
                 if self._closing:
                     return False
                 wake = self._pending is None or self._pending["stage"] != stage
                 self._pending = payload
                 if self._thread is None:
+                    # Starting while holding the short state lock prevents a
+                    # concurrent flush from retiring this reporter before the
+                    # daemon can start. The lock is never held across file I/O;
+                    # close waits for it only within its explicit timeout.
                     self._thread = threading.Thread(
                         target=self._run,
                         name="qexp-progress-writer",
                         daemon=True,
                     )
-                    thread_to_start = self._thread
+                    self._thread.start()
                 if wake:
                     self._wake.set()
             finally:
                 self._lock.release()
-            if thread_to_start is not None:
-                try:
-                    # Start outside the state lock so close/update can never wait
-                    # behind Python's thread-start handshake while holding it.
-                    thread_to_start.start()
-                except Exception:
-                    if self._lock.acquire(blocking=False):
-                        try:
-                            if self._thread is thread_to_start:
-                                self._thread = None
-                        finally:
-                            self._lock.release()
-                    return False
             return True
         except Exception:
             return False
@@ -160,7 +150,7 @@ class _Reporter:
             thread = self._thread
         finally:
             self._lock.release()
-        if thread is None or thread.ident is None:
+        if thread is None:
             return
         remaining = max(0.0, deadline - time.monotonic())
         try:
