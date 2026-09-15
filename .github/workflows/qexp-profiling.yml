@@ -19,4 +19,4 @@ jobs:
       - run: python -m pip install --upgrade pip tox
       - name: Run qexp full suite with timing
         run: |
-          tox run -e qexp-integration --             --lifecycle-gate=full             --durations=100             --durations-min=0.01             -q
+          tox run -e qexp-integration --             tests/integration/qexp             --lifecycle-gate=full             --durations=100             --durations-min=0.01             -q
