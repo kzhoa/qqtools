@@ -162,7 +162,12 @@ def test_init_succeeds_when_context_save_fails(tmp_path: Path, monkeypatch, caps
     )
 
     captured = capsys.readouterr()
-    assert captured.out.strip() == str(root.resolve())
+    assert captured.out.strip().splitlines() == [
+        "Project initialized.",
+        "Machine registration completed.",
+        "Agent is not running.",
+        "Run: qexp agent start",
+    ]
     assert "initialized successfully, but failed to save CLI context" in captured.err
     cfg = load_root_config(root, "gpu-1", runtime_root, require_initialized=True)
     assert cfg.shared_root == root.resolve()
