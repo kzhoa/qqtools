@@ -1,14 +1,8 @@
-"""Best-effort, single-writer progress reporting for arbitrary applications.
+"""Best-effort single-writer progress reporting for arbitrary applications.
 
-Example::
-
-    from qqtools.qexp import progress
-    progress.update(stage="download", current=3, total=10, unit="file")
-
-Updates are full replacements. Outside qexp this is a no-op. A single daemon
-worker writes a latest-only mailbox; application threads never perform disk I/O.
-Only the main process (global rank zero in distributed applications) should use
-this API. Progress reports do not prove that an application is healthy.
+Applications normally use only :func:`update` and :func:`flush`. The process
+owns one bounded latest-value slot and one daemon file writer. Outside qexp this
+module is a safe no-op. Progress never participates in task authority.
 """
 
 from __future__ import annotations
@@ -23,7 +17,7 @@ from typing import Any
 
 from ._progress_protocol import MAX_PAYLOAD_BYTES, replace_advisory_snapshot, validate_payload
 
-__all__ = ["Reporter", "update", "flush"]
+__all__ = ["update", "flush"]
 
 
 def _is_primary() -> bool:
@@ -34,12 +28,12 @@ def _is_primary() -> bool:
     return True
 
 
-class Reporter:
-    """One bounded mailbox writer. ``close`` waits at most its timeout.
+class _Reporter:
+    """One process-local latest-value writer.
 
-    The optional path is useful for adapters and tests; normal applications use
-    ``update`` and the attempt-local path supplied by qexp. This is not an API
-    for selecting another task. A reporter inherited through fork is disabled.
+    Filesystem I/O happens only on the daemon writer. ``update`` uses a
+    non-blocking state lock. The first accepted update may pay normal Python
+    daemon-thread startup cost, but never waits for mailbox filesystem I/O.
     """
 
     def __init__(self, path: str | Path | None = None, *, interval_seconds: float = 1.0) -> None:
@@ -55,36 +49,62 @@ class Reporter:
         self._last_stage: str | None = None
 
     def update(
-        self, *, stage: str, current: int | None = None, total: int | None = None,
-        unit: str | None = None, message: str | None = None,
+        self,
+        *,
+        stage: str,
+        current: int | None = None,
+        total: int | None = None,
+        unit: str | None = None,
+        message: str | None = None,
     ) -> bool:
-        """Offer the latest state; return False if disabled, invalid or contended."""
         if self._path is None or os.getpid() != self._pid or not _is_primary():
             return False
         try:
-            payload = validate_payload({
-                "protocol_version": 1, "update_id": uuid.uuid4().hex,
-                "stage": stage, "current": current, "total": total,
-                "unit": unit, "message": message,
-            })
+            payload = validate_payload(
+                {
+                    "protocol_version": 1,
+                    "update_id": uuid.uuid4().hex,
+                    "stage": stage,
+                    "current": current,
+                    "total": total,
+                    "unit": unit,
+                    "message": message,
+                }
+            )
             if not self._lock.acquire(blocking=False):
                 return False
+            thread_to_start: threading.Thread | None = None
             try:
                 if self._closing:
                     return False
                 wake = self._pending is None or self._pending["stage"] != stage
                 self._pending = payload
                 if self._thread is None:
-                    self._thread = threading.Thread(target=self._run, name="qexp-progress-writer", daemon=True)
-                    self._thread.start()
+                    self._thread = threading.Thread(
+                        target=self._run,
+                        name="qexp-progress-writer",
+                        daemon=True,
+                    )
+                    thread_to_start = self._thread
                 if wake:
                     self._wake.set()
             finally:
                 self._lock.release()
+            if thread_to_start is not None:
+                try:
+                    # Start outside the state lock so close/update can never wait
+                    # behind Python's thread-start handshake while holding it.
+                    thread_to_start.start()
+                except Exception:
+                    if self._lock.acquire(blocking=False):
+                        try:
+                            if self._thread is thread_to_start:
+                                self._thread = None
+                        finally:
+                            self._lock.release()
+                    return False
             return True
         except Exception:
-            # An optional observer may never turn a successful application into
-            # a failure, including during interpreter shutdown or invalid input.
             return False
 
     def _run(self) -> None:
@@ -120,50 +140,94 @@ class Reporter:
             delay = None
 
     def close(self, *, timeout: float = 0.1) -> None:
-        """Best-effort final flush; never join a stuck writer indefinitely."""
+        """Best-effort close with a real upper bound on lock/join waiting."""
         if os.getpid() != self._pid:
             return
         try:
-            with self._lock:
-                self._closing = True
-                self._wake.set()
-                thread = self._thread
-            if thread is not None:
-                thread.join(timeout=max(0.0, min(float(timeout), 1.0)))
+            budget = max(0.0, min(float(timeout), 1.0))
+        except (TypeError, ValueError):
+            budget = 0.1
+        deadline = time.monotonic() + budget
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            if not self._lock.acquire(timeout=remaining):
+                return
         except Exception:
+            return
+        try:
+            self._closing = True
+            self._wake.set()
+            thread = self._thread
+        finally:
+            self._lock.release()
+        if thread is None or thread.ident is None:
+            return
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            thread.join(timeout=remaining)
+        except RuntimeError:
             pass
 
 
-_reporter: Reporter | None = None
+_reporter: _Reporter | None = None
 _reporter_lock = threading.Lock()
 
 
-def update(
-    *, stage: str, current: int | None = None, total: int | None = None,
-    unit: str | None = None, message: str | None = None,
-) -> bool:
-    """Report progress for the current qexp attempt, or safely do nothing."""
+def _get_reporter() -> _Reporter | None:
     global _reporter
     if not os.environ.get("QEXP_PROGRESS_PATH") or not _is_primary():
-        return False
+        return None
+    if _reporter is not None:
+        return _reporter
+    if not _reporter_lock.acquire(blocking=False):
+        return None
     try:
         if _reporter is None:
-            if not _reporter_lock.acquire(blocking=False):
-                return False
-            try:
-                if _reporter is None:
-                    _reporter = Reporter(os.environ["QEXP_PROGRESS_PATH"])
-            finally:
-                _reporter_lock.release()
-        return _reporter.update(stage=stage, current=current, total=total, unit=unit, message=message)
+            _reporter = _Reporter(os.environ["QEXP_PROGRESS_PATH"])
+        return _reporter
+    finally:
+        _reporter_lock.release()
+
+
+def update(
+    *,
+    stage: str,
+    current: int | None = None,
+    total: int | None = None,
+    unit: str | None = None,
+    message: str | None = None,
+) -> bool:
+    """Offer progress to the current qexp Attempt, or safely do nothing."""
+    try:
+        reporter = _get_reporter()
+        if reporter is None:
+            return False
+        return reporter.update(stage=stage, current=current, total=total, unit=unit, message=message)
     except Exception:
         return False
 
 
 def flush(*, timeout: float = 0.1) -> None:
-    """Flush and close the process reporter at the end of an application run."""
-    if _reporter is not None:
-        _reporter.close(timeout=timeout)
+    """Close and reset the process writer so a later run can create a new one."""
+    global _reporter
+    try:
+        budget = max(0.0, min(float(timeout), 1.0))
+    except (TypeError, ValueError):
+        budget = 0.1
+    deadline = time.monotonic() + budget
+    remaining = max(0.0, deadline - time.monotonic())
+    try:
+        if not _reporter_lock.acquire(timeout=remaining):
+            return
+    except Exception:
+        return
+    try:
+        reporter = _reporter
+        if reporter is not None:
+            reporter.close(timeout=max(0.0, deadline - time.monotonic()))
+        _reporter = None
+    finally:
+        _reporter_lock.release()
 
 
 atexit.register(flush)
