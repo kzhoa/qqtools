@@ -48,7 +48,7 @@ def test_global_helper_and_flush_reset(tmp_path, monkeypatch):
     assert read_advisory_snapshot(second)["current"] == 7
 
 
-def test_timed_out_flush_keeps_old_writer_as_singleton(tmp_path, monkeypatch):
+def test_timed_out_flush_fences_next_attempt_path_until_old_writer_exits(tmp_path, monkeypatch):
     entered, release = threading.Event(), threading.Event()
 
     def blocked(path, value, **kwargs):
@@ -56,13 +56,20 @@ def test_timed_out_flush_keeps_old_writer_as_singleton(tmp_path, monkeypatch):
         release.wait(3)
 
     monkeypatch.setattr(progress, "replace_advisory_snapshot", blocked)
-    monkeypatch.setenv("QEXP_PROGRESS_PATH", str(tmp_path / "progress.json"))
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    monkeypatch.setenv("QEXP_PROGRESS_PATH", str(first))
     assert progress.update(stage="train", current=1)
     assert entered.wait(1)
     old = progress._reporter
     progress.flush(timeout=0.01)
     assert progress._reporter is old
+
+    # A later Attempt must never reuse the still-running writer for the old path.
+    monkeypatch.setenv("QEXP_PROGRESS_PATH", str(second))
     assert progress.update(stage="train", current=2) is False
+    assert progress._reporter is old
+
     release.set()
     deadline = time.monotonic() + 1
     while not old.replaceable() and time.monotonic() < deadline:
@@ -70,6 +77,7 @@ def test_timed_out_flush_keeps_old_writer_as_singleton(tmp_path, monkeypatch):
     assert old.replaceable()
     assert progress.update(stage="train", current=3)
     assert progress._reporter is not old
+    assert progress._reporter.path == second
 
 
 def test_rank_nonzero_and_fork_inheritance_are_noops(tmp_path, monkeypatch):
