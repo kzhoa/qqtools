@@ -84,6 +84,8 @@ def resolve_progress_binding(cfg: Any, context: dict[str, Any]) -> dict[str, Any
 
     This intentionally takes no authority lock. A read-side identity/token check
     rejects a projection racing retry or recovery instead of delaying leases.
+    Terminal publication clears ``current_attempt_id`` by qexp contract, so a
+    terminal Task is joined by its preserved current Attempt number instead.
     """
     from .paths import attempt_path
     from .records import AttemptRecord
@@ -98,10 +100,17 @@ def resolve_progress_binding(cfg: Any, context: dict[str, Any]) -> dict[str, Any
         return None
     if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
         return None
-    if task.attempt_control.get("current_attempt_id") != attempt_id:
-        return None
     number = task.attempt_control.get("current_attempt_number")
     if type(number) is not int or number != context.get("attempt_number"):
+        return None
+    task_terminal = task.state["projection"] in _TERMINAL
+    current_attempt_id = task.attempt_control.get("current_attempt_id")
+    if task_terminal:
+        # Terminal commit deliberately clears current_attempt_id while retaining
+        # current_attempt_number. A non-null different ID is still a mismatch.
+        if current_attempt_id not in {None, attempt_id}:
+            return None
+    elif current_attempt_id != attempt_id:
         return None
     attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task_id, number)))
     if attempt.attempt_id != attempt_id or attempt.task_id != task_id or attempt.machine_name != cfg.machine_name:
@@ -112,7 +121,11 @@ def resolve_progress_binding(cfg: Any, context: dict[str, Any]) -> dict[str, Any
         if type(context.get(key)) is not int or attempt.process.get(key) != context[key]:
             # Registration may not have been materialized yet. Keep the channel.
             raise ValueError("progress process identity not yet verified")
-    terminal = task.state["projection"] in _TERMINAL and attempt.phase in _TERMINAL
+    terminal = task_terminal and attempt.phase in _TERMINAL
+    if task_terminal and not terminal:
+        # Shared terminal publication is multi-record. Keep the context while a
+        # reader observes an incomplete transition instead of retiring it.
+        raise ValueError("terminal progress transition incomplete")
     if not terminal:
         claim = task.claim_control.get("active_claim") or {}
         if (task.state["projection"] != "running" or attempt.phase not in {"starting", "running"}
@@ -333,7 +346,7 @@ class ProgressProjector:
 
 
 def inspect_progress(cfg: Any, task: Any) -> dict[str, Any]:
-    """Join the explicit current Attempt, never the newest file by mtime."""
+    """Join running by current ID and terminal history by its preserved number."""
     from .paths import attempt_path
     from .records import AttemptRecord
     from .store import read_json
@@ -342,13 +355,20 @@ def inspect_progress(cfg: Any, task: Any) -> dict[str, Any]:
     try:
         if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
             return unavailable
-        attempt_id = task.attempt_control.get("current_attempt_id")
         number = task.attempt_control.get("current_attempt_number")
-        if attempt_id is None or type(number) is not int:
+        if type(number) is not int:
             return unavailable
         attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task.task_id, number)))
-        if attempt.attempt_id != attempt_id:
-            return unavailable
+        task_terminal = task.state["projection"] in _TERMINAL
+        current_attempt_id = task.attempt_control.get("current_attempt_id")
+        if task_terminal:
+            if attempt.phase not in _TERMINAL or current_attempt_id not in {None, attempt.attempt_id}:
+                return unavailable
+            attempt_id = attempt.attempt_id
+        else:
+            if current_attempt_id is None or attempt.attempt_id != current_attempt_id:
+                return unavailable
+            attempt_id = current_attempt_id
         identity = {"task_id": task.task_id, "attempt_id": attempt_id,
                     "attempt_number": number, "machine_name": attempt.machine_name,
                     "launch_id": attempt.authorization.get("launch_id"),
