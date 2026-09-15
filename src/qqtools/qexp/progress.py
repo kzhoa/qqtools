@@ -42,11 +42,15 @@ class _Reporter:
         self._pid = os.getpid()
         self._lock = threading.Lock()
         self._wake = threading.Event()
+        self._close_requested = threading.Event()
         self._pending: dict[str, Any] | None = None
         self._thread: threading.Thread | None = None
-        self._closing = False
         self._last_attempt = float("-inf")
         self._last_stage: str | None = None
+
+    @property
+    def path(self) -> Path | None:
+        return self._path
 
     def update(
         self,
@@ -74,7 +78,7 @@ class _Reporter:
             if not self._lock.acquire(blocking=False):
                 return False
             try:
-                if self._closing:
+                if self._close_requested.is_set():
                     return False
                 wake = self._pending is None or self._pending["stage"] != stage
                 self._pending = payload
@@ -103,13 +107,13 @@ class _Reporter:
             with self._lock:
                 payload = self._pending
                 if payload is None:
-                    if self._closing:
+                    if self._close_requested.is_set():
                         return
                     delay = None
                     continue
                 interval = 0.1 if payload["stage"] != self._last_stage else self._interval
                 remaining = self._last_attempt + interval - time.monotonic()
-                if remaining > 0 and not self._closing:
+                if remaining > 0 and not self._close_requested.is_set():
                     delay = remaining
                     continue
                 self._pending = None
@@ -121,16 +125,18 @@ class _Reporter:
             self._last_attempt = time.monotonic()
             self._last_stage = payload["stage"]
             with self._lock:
-                if self._closing and self._pending is None:
+                if self._close_requested.is_set() and self._pending is None:
                     return
                 if self._pending is not None:
                     self._wake.set()
             delay = None
 
     def close(self, *, timeout: float = 0.1) -> None:
-        """Best-effort close with a real upper bound on lock/join waiting."""
+        """Request shutdown immediately and wait only within the supplied budget."""
         if os.getpid() != self._pid:
             return
+        self._close_requested.set()
+        self._wake.set()
         try:
             budget = max(0.0, min(float(timeout), 1.0))
         except (TypeError, ValueError):
@@ -143,8 +149,6 @@ class _Reporter:
         except Exception:
             return
         try:
-            self._closing = True
-            self._wake.set()
             thread = self._thread
         finally:
             self._lock.release()
@@ -160,7 +164,7 @@ class _Reporter:
         """Whether a new singleton can be created without overlapping writers."""
         thread = self._thread
         if thread is None:
-            return self._closing
+            return self._close_requested.is_set()
         return not thread.is_alive()
 
 
@@ -170,10 +174,15 @@ _reporter_lock = threading.Lock()
 
 def _get_reporter() -> _Reporter | None:
     global _reporter
-    if not os.environ.get("QEXP_PROGRESS_PATH") or not _is_primary():
+    path_value = os.environ.get("QEXP_PROGRESS_PATH")
+    if not path_value or not _is_primary():
         return None
+    desired_path = Path(path_value)
     current = _reporter
     if current is not None and not current.replaceable():
+        # Never route a later Attempt to an older Attempt's still-running writer.
+        if current.path != desired_path:
+            return None
         return current
     if not _reporter_lock.acquire(blocking=False):
         return None
@@ -181,8 +190,9 @@ def _get_reporter() -> _Reporter | None:
         current = _reporter
         if current is not None and current.replaceable():
             _reporter = None
-        if _reporter is None:
-            _reporter = _Reporter(os.environ["QEXP_PROGRESS_PATH"])
+        if _reporter is not None:
+            return _reporter if _reporter.path == desired_path else None
+        _reporter = _Reporter(desired_path)
         return _reporter
     finally:
         _reporter_lock.release()
@@ -225,8 +235,7 @@ def flush(*, timeout: float = 0.1) -> None:
         if reporter is not None:
             reporter.close(timeout=max(0.0, deadline - time.monotonic()))
             # A writer blocked in the filesystem remains the singleton sentinel.
-            # Updates are rejected while it is closing. The next update replaces
-            # it only after its daemon has really exited.
+            # The independent close-request Event guarantees it eventually exits.
             if reporter.replaceable():
                 _reporter = None
     finally:
