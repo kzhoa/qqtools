@@ -180,8 +180,8 @@ def build_parser() -> argparse.ArgumentParser:
             "start a target agent."
         ),
         epilog=(
-            "To join a new machine to an existing project, run: qexp init --shared-root "
-            "<project/.qexp> --machine <local-machine>. qexp use only saves local CLI context; "
+            "To join a new machine to an existing project, run: qexp --shared-root "
+            "<project/.qexp> --machine <local-machine> init. qexp use only saves local CLI context; "
             "it does not initialize or register a project."
         ),
     )
@@ -202,6 +202,8 @@ def build_parser() -> argparse.ArgumentParser:
             "the local machine agent, and saves CLI context. It does not start the agent."
         ),
     )
+    init.add_argument("--shared-root", dest="init_shared_root")
+    init.add_argument("--machine", dest="init_machine")
     init.add_argument("--agent-mode", choices=["on_demand", "daemon"], default="on_demand")
     init.add_argument("--cpu-lane-capacity", type=int)
     migrate = commands.add_parser("migrate")
@@ -233,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
     schema6_resume = schema6_upgrade_sub.add_parser("resume")
     _add_output_format(schema6_resume)
     schema6_resume.add_argument("--activation-id", required=True)
-    lease_policy = commands.add_parser("lease-policy")
+    lease_policy = commands.add_parser("lease-policy", help=argparse.SUPPRESS)
     lease_policy_sub = lease_policy.add_subparsers(dest="lease_policy_action", required=True)
     lease_show = lease_policy_sub.add_parser("show")
     _add_output_format(lease_show)
@@ -248,6 +250,15 @@ def build_parser() -> argparse.ArgumentParser:
     policy_set.add_argument("--renewal-commit-margin-seconds", type=float)
     config = commands.add_parser("config")
     config_sub = config.add_subparsers(dest="config_action", required=True)
+    config_lease = config_sub.add_parser("lease", help="Configure lease policy.")
+    config_lease_sub = config_lease.add_subparsers(dest="lease_policy_action", required=True)
+    for _name in ("show", "set"):
+        _lp = config_lease_sub.add_parser(_name)
+        _add_output_format(_lp)
+        if _name == "set":
+            for _arg, _typ in (("ttl-seconds", int), ("renew-interval-seconds", float), ("max-clock-skew-seconds", float), ("clock-observation-max-age-seconds", float), ("clock-provider-margin-seconds", float), ("renewal-commit-margin-seconds", float)):
+                _lp.add_argument("--"+_arg, type=_typ)
+            _lp.add_argument("--clock-provider-priority")
     notifications = config_sub.add_parser("notifications")
     notifications_sub = notifications.add_subparsers(dest="notifications_action", required=True)
     notifications_show = notifications_sub.add_parser("show")
@@ -441,8 +452,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_format(top)
     machine_list = commands.add_parser("machines")
     _add_output_format(machine_list)
-    logs_top = commands.add_parser("logs")
-    logs_top.add_argument("task_id")
     doctor = commands.add_parser("doctor")
     _add_output_format(doctor)
     doctor.add_argument("action", choices=["verify", "repair"], default="verify", nargs="?")
@@ -550,6 +559,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "init":
+            args.shared_root = args.init_shared_root or args.shared_root
+            args.machine = args.init_machine or args.machine
             if not args.shared_root or not args.machine:
                 raise ValueError("init requires --shared-root and --machine.")
             cfg = init_shared_root(
@@ -572,7 +583,10 @@ def main(argv: list[str] | None = None) -> int:
                     f"resolve the registration error and run 'qexp agent add-project': {exc}"
                 ) from exc
             _try_save_context(str(cfg.shared_root))
-            print(cfg.shared_root)
+            print("Project initialized.")
+            print("Machine registration completed.")
+            print("Agent is not running.")
+            print("Run: qexp agent start")
             return 0
         if args.command == "migrate":
             if not args.shared_root or not args.machine:
@@ -851,7 +865,7 @@ def main(argv: list[str] | None = None) -> int:
                     write_shared_feishu_webhook(cfg, shared_webhook)
                 _emit("notifications", value, args.format)
                 return 0
-        if args.command == "lease-policy":
+        if args.command == "lease-policy" or (args.command == "config" and args.config_action == "lease"):
             current = load_lease_policy(cfg)
             if args.lease_policy_action == "show":
                 _emit("lease-policy", {"lease_policy": asdict(current)}, args.format)
