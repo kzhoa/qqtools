@@ -13,6 +13,7 @@ from pathlib import Path
 from .config_types import RootConfig
 from .layout import load_root_config, shared_attempt_log_path
 from .runtime.paths import local_paths
+from .runtime.progress import prepare_progress_channel
 from .runtime.records import AttemptRecord, utc_now
 from .runtime.store import atomic_replace, create_if_absent, read_json
 from .runtime.tasks import load_task
@@ -181,7 +182,23 @@ def run_attempt(
         ):
             raise RuntimeError("Attempt is not authorized to launch.")
         _publish_launch_intent(cfg, attempt, task)
+
+    # Progress is optional advisory state. Local provisioning is deliberately
+    # outside launch authority locks and never touches the shared progress tree.
+    progress_path = None
+    try:
+        progress_path = prepare_progress_channel(
+            cfg, task, attempt, wrapper_start_time_ticks=_process_start_time_ticks(os.getpid())
+        )
+    except Exception:
+        pass
+
     environment = os.environ.copy()
+    # Never let a nested submission inherit another Attempt's channel.
+    environment.pop("QEXP_PROGRESS_PATH", None)
+    environment.pop("QEXP_PROGRESS_FD", None)
+    if progress_path is not None:
+        environment["QEXP_PROGRESS_PATH"] = progress_path
     if task.spec.is_cpu_only:
         environment["CUDA_VISIBLE_DEVICES"] = ""
     elif attempt.assigned_gpus:

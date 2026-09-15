@@ -16,6 +16,6 @@ from qqtools.plugins.qpipeline.runner.runner_utils.progress import resolve_rende
     ],
 )
 def test_resolve_render_mode(requested_mode, has_rich, has_tqdm, expected, expected_msg):
-    resolved_mode, message = resolve_render_mode(requested_mode, has_rich, has_tqdm)
+    resolved_mode, message = resolve_render_mode(requested_mode, has_rich, has_tqdm, is_terminal=True)
     assert resolved_mode == expected
     assert message == expected_msg

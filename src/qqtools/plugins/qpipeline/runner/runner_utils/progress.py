@@ -26,6 +26,8 @@ from ..contracts import (
     ProgressTickFact,
 )
 
+from .render_mode import resolve_render_mode
+
 # Check for optional dependencies
 try:
     import rich
@@ -490,52 +492,6 @@ class PlainProgress:
 
     def on_eval_end(self, context: EvaluationCommittedFact):
         pass
-
-
-def resolve_render_mode(requested_mode: Optional[str], has_rich: bool, has_tqdm: bool) -> tuple[str, Optional[str]]:
-    """
-    Resolve the final render mode based on request and availability.
-
-    Returns:
-        A tuple of (resolved_mode, mode_change_message).
-        mode_change_message is only provided when input mode differs from output mode.
-    """
-    input_mode = requested_mode or "auto"
-
-    def _resolve() -> str:
-        # 1. Auto-detect if no specific mode requested (or explicitly requested as auto)
-        if requested_mode is None or requested_mode == "auto":
-            if has_rich:
-                return "rich"
-            if has_tqdm:
-                return "tqdm"
-            return "plain"
-
-        # 2. Check if requested mode is available
-        if requested_mode == "rich":
-            if has_rich:
-                return "rich"
-            else:
-                # Try downgrade to tqdm
-                if has_tqdm:
-                    return "tqdm"
-                return "plain"
-
-        if requested_mode == "tqdm":
-            if has_tqdm:
-                return "tqdm"
-            else:
-                return "plain"
-
-        if requested_mode == "plain":
-            return "plain"
-
-        # Default fallback
-        return "plain"
-
-    resolved_mode = _resolve()
-    message = f"Mode {input_mode} -> {resolved_mode}" if input_mode != resolved_mode else None
-    return resolved_mode, message
 
 
 def create_progress_strategy(render_mode: str, logger: Any, print_freq: int) -> ProgressStrategy:
