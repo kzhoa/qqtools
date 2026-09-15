@@ -182,13 +182,17 @@ def run_attempt(
         ):
             raise RuntimeError("Attempt is not authorized to launch.")
         _publish_launch_intent(cfg, attempt, task)
-        progress_path = None
-        try:
-            progress_path = prepare_progress_channel(
-                cfg, task, attempt, wrapper_start_time_ticks=_process_start_time_ticks(os.getpid())
-            )
-        except Exception:
-            pass
+
+    # Progress is optional advisory state. Local provisioning is deliberately
+    # outside launch authority locks and never touches the shared progress tree.
+    progress_path = None
+    try:
+        progress_path = prepare_progress_channel(
+            cfg, task, attempt, wrapper_start_time_ticks=_process_start_time_ticks(os.getpid())
+        )
+    except Exception:
+        pass
+
     environment = os.environ.copy()
     # Never let a nested submission inherit another Attempt's channel.
     environment.pop("QEXP_PROGRESS_PATH", None)
