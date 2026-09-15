@@ -326,23 +326,32 @@ class ProgressProjector:
             pass
 
     def _restore(self, attempt_id: str, binding: dict[str, Any]) -> dict[str, Any]:
+        """Restore freshness locally across agent-generation changes without trusting stale shared writers."""
         shared_path = shared_progress_path(self.cfg.shared_root, binding["task_id"], attempt_id)
-        values: list[dict[str, Any]] = []
-        published = None
-        for path in (_local_path(self.cfg, "progress-observed", attempt_id), shared_path):
-            try:
-                value = _validate_projection(
-                    read_advisory_snapshot(path),
-                    binding,
-                    require_generation=True,
-                )
-                values.append(value)
-                if path == shared_path:
-                    published = value
-            except (OSError, ValueError, KeyError, TypeError):
-                pass
+        local_latest = None
+        shared_latest = None
+        try:
+            # The local accepted observation is bound to runner process identity,
+            # so a new machine registration generation may reuse its timestamps.
+            local_latest = _validate_projection(
+                read_advisory_snapshot(_local_path(self.cfg, "progress-observed", attempt_id)),
+                binding,
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        try:
+            # A shared snapshot from another registration generation is not used
+            # as recovery evidence by a new projector.
+            shared_latest = _validate_projection(
+                read_advisory_snapshot(shared_path),
+                binding,
+                require_generation=True,
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        values = [value for value in (local_latest, shared_latest) if value is not None]
         latest = max(values, key=lambda item: item["sequence"]) if values else None
-        return {"latest": latest, "published": published, "last_write": float("-inf")}
+        return {"latest": latest, "published": shared_latest, "last_write": float("-inf")}
 
     def _retire(self, attempt_id: str) -> None:
         self._entries.pop(attempt_id, None)
@@ -526,8 +535,6 @@ def inspect_progress(cfg: Any, task: Any) -> dict[str, Any]:
                 require_token=True,
                 require_generation=True,
             )
-            # Close the small read race with registration replacement. Advisory
-            # progress becomes unavailable rather than accepting a superseded writer.
             if _running_registration_generation(cfg, attempt.machine_name) != generation:
                 return unavailable
         return {"status": "available", **value}
@@ -578,43 +585,54 @@ def _unlink_record(path: Path, removed: list[str]) -> None:
     try:
         path.unlink()
         removed.append(str(path))
-    except FileNotFoundError:
+    except OSError:
+        # Advisory cleanup must never block authoritative Task cleanup.
         pass
 
 
 def cleanup_local_progress(cfg: Any, task_id: str, attempt_ids: set[str]) -> list[str]:
-    """Remove advisory local state without TOCTOU failures or parent recreation."""
+    """Best-effort removal of local advisory state without TOCTOU failures."""
     removed: list[str] = []
     contexts = Path(cfg.runtime_root) / "progress-contexts"
-    if contexts.is_dir():
-        for path in contexts.glob("*.json"):
-            try:
-                if read_advisory_snapshot(path).get("task_id") == task_id:
-                    attempt_ids.add(identifier(path.stem))
-            except (OSError, ValueError, TypeError):
-                continue
+    try:
+        context_paths = list(contexts.glob("*.json")) if contexts.is_dir() else []
+    except OSError:
+        context_paths = []
+    for path in context_paths:
+        try:
+            if read_advisory_snapshot(path).get("task_id") == task_id:
+                attempt_ids.add(identifier(path.stem))
+        except (OSError, ValueError, TypeError):
+            continue
     for attempt_id in attempt_ids:
-        # Context first fences projector cache writes. Removing the Attempt-owned
-        # mailbox directory then prevents a late producer from recreating latest.json
-        # because advisory writers intentionally never create parents.
         _unlink_record(_local_path(cfg, "progress-contexts", attempt_id), removed)
         mailbox_dir = local_progress_path(cfg.runtime_root, attempt_id).parent
-        if mailbox_dir.exists():
+        try:
+            existed = mailbox_dir.exists()
             shutil.rmtree(mailbox_dir, ignore_errors=True)
-            if not mailbox_dir.exists():
+            if existed and not mailbox_dir.exists():
                 removed.append(str(mailbox_dir))
+        except OSError:
+            pass
         for directory in ("progress-observed", "progress-diagnostics"):
             path = _local_path(cfg, directory, attempt_id)
             _unlink_record(path, removed)
-            for temporary in path.parent.glob(f".{path.name}.*"):
+            try:
+                temporaries = list(path.parent.glob(f".{path.name}.*"))
+            except OSError:
+                temporaries = []
+            for temporary in temporaries:
                 _unlink_record(temporary, removed)
     return removed
 
 
 def cleanup_shared_progress(cfg: Any, task_id: str) -> list[str]:
-    """Fence projection against cleanup, then remove the task advisory directory."""
-    directory = Path(cfg.shared_root) / "progress" / identifier(task_id)
-    with exclusive(_progress_lock_path(cfg.shared_root, task_id)):
-        existed = directory.exists()
-        shutil.rmtree(directory, ignore_errors=True)
-        return [str(directory)] if existed and not directory.exists() else []
+    """Fence shared projection removal, but never fail authoritative cleanup."""
+    try:
+        directory = Path(cfg.shared_root) / "progress" / identifier(task_id)
+        with exclusive(_progress_lock_path(cfg.shared_root, task_id)):
+            existed = directory.exists()
+            shutil.rmtree(directory, ignore_errors=True)
+            return [str(directory)] if existed and not directory.exists() else []
+    except (OSError, RuntimeError, ValueError):
+        return []
