@@ -9,6 +9,7 @@ from typing import Any
 from .config_types import RootConfig
 from .runtime.dependencies import dependency_gate
 from .runtime.paths import group_path, machine_path, shared_paths, submission_path, task_path
+from .runtime.progress import inspect_progress
 from .runtime.records import TaskRecord, normalize_group_record
 from .runtime.resources.reservations import reservation_snapshot
 from .runtime.store import iter_json, read_json
@@ -53,6 +54,7 @@ def list_tasks(
 def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
     task = load_task(cfg, task_id)
     result = task.to_dict()
+    result["progress"] = inspect_progress(cfg, task)
     gate = dependency_gate(cfg, task)
     result["dependency_gate"] = {"state": gate.state, "reasons": list(gate.reasons)}
     attempts_dir = shared_paths(cfg.shared_root)["attempts"] / task_id

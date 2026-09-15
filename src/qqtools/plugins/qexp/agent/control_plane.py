@@ -15,6 +15,7 @@ from ..runtime.store import iter_json
 from . import helpers as _helpers
 from .context import MachineRuntime, ProjectBinding
 from .helpers import _publish_project_snapshots, _read_pid
+from .progress_loop import ProgressObservationLoop
 
 
 class _MachineControlPlane:
@@ -31,6 +32,7 @@ class _MachineControlPlane:
         scheduler_wakeup: threading.Event | None = None,
     ) -> None:
         self._runtime = runtime
+        self._progress_loop = ProgressObservationLoop(runtime)
         self._instance_id = instance_id
         self._loop_interval = loop_interval
         self._started_at = started_at
@@ -57,10 +59,12 @@ class _MachineControlPlane:
         self._publish_heartbeat()
         self._authority_thread.start()
         self._heartbeat_thread.start()
+        self._progress_loop.start()
 
     def stop(self) -> None:
         """Stop control loops before publishing the terminal machine snapshot."""
         self._stop_event.set()
+        self._progress_loop.stop()
         for thread in (self._authority_thread, self._heartbeat_thread):
             if thread.is_alive():
                 thread.join()
