@@ -3,6 +3,7 @@
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -139,14 +140,19 @@ def test_fencing_recovery_preserves_freshness(channel):
     assert second["sequence"] == first["sequence"]
 
 
-def test_registration_generation_fences_old_projection(channel):
+def test_registration_generation_fences_old_projection_without_fabricating_freshness(channel):
     c = channel
     c.send("one")
     c.projector("generation-1").observe("a1")
-    assert read_advisory_snapshot(c.shared)["registration_generation"] == "generation-1"
+    first = read_advisory_snapshot(c.shared)
+    assert first["registration_generation"] == "generation-1"
     c.clock[0] = 10
     c.projector("generation-2").observe("a1")
-    assert read_advisory_snapshot(c.shared)["registration_generation"] == "generation-2"
+    second = read_advisory_snapshot(c.shared)
+    assert second["registration_generation"] == "generation-2"
+    assert second["reported_at"] == first["reported_at"]
+    assert second["advanced_at"] == first["advanced_at"]
+    assert second["sequence"] == first["sequence"]
 
 
 def test_superseded_attempt_does_not_publish(channel):
@@ -229,8 +235,39 @@ def test_cleanup_and_no_recreation(channel):
     with pytest.raises(FileNotFoundError):
         replace_advisory_snapshot(
             runtime.local_progress_path(c.cfg.runtime_root, "a1"),
-            {"protocol_version": 1, "update_id": "late", "stage": "train", "current": 2, "total": 10, "unit": "step", "message": None},
+            {
+                "protocol_version": 1,
+                "update_id": "late",
+                "stage": "train",
+                "current": 2,
+                "total": 10,
+                "unit": "step",
+                "message": None,
+            },
         )
+
+
+def test_local_cleanup_io_failure_is_advisory(channel, monkeypatch):
+    c = channel
+    c.send("one")
+    context = c.cfg.runtime_root / "progress-contexts" / "a1.json"
+    original_unlink = Path.unlink
+
+    def fail_context(self, *args, **kwargs):
+        if self == context:
+            raise OSError("read-only filesystem")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_context)
+    assert isinstance(runtime.cleanup_local_progress(c.cfg, "task", {"a1"}), list)
+
+
+def test_shared_cleanup_lock_failure_is_advisory(channel, monkeypatch):
+    def fail_lock(*args, **kwargs):
+        raise OSError("shared filesystem unavailable")
+
+    monkeypatch.setattr(runtime, "exclusive", fail_lock)
+    assert runtime.cleanup_shared_progress(channel.cfg, "task") == []
 
 
 def test_shared_cleanup_waits_for_projection_and_wins(channel, monkeypatch):
@@ -278,7 +315,13 @@ def test_zero_total_and_missing_progress_formatting():
                     "status": "available",
                     "reported_at": "bad",
                     "advanced_at": "bad",
-                    "progress": {"stage": "train", "current": 0, "total": 0, "unit": "step", "message": None},
+                    "progress": {
+                        "stage": "train",
+                        "current": 0,
+                        "total": 0,
+                        "unit": "step",
+                        "message": None,
+                    },
                 }
             }
         )
