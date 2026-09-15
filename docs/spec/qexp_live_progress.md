@@ -8,21 +8,24 @@ observation**, never execution truth. It cannot renew a lease, change a claim,
 retry/cancel a Task, publish terminal truth, or release resources.
 
 No Task/Attempt schema, required capability, CI workflow, or default `task list`
-format changes. Old readers ignore the additional namespace; commands without
-a producer show `Progress: unavailable`.
+format changes. Old readers ignore the additional namespace; commands without a
+producer show `Progress: unavailable`.
 
-```
+```text
 application -> machine-local mailbox -> agent observation thread
                                     -> shared advisory snapshot -> task show
 stdout/stderr -------------------------------------------------> attempt log
 ```
 
-The runner provisions the channel under its existing launch authorization and
-passes only `QEXP_PROGRESS_PATH` through the guardian to the application. It
-clears inherited progress environment variables to avoid a nested submission
-using a parent's channel. Producers never select Task IDs or supply trusted
-fencing metadata. This is an ownership contract, not a security sandbox against
-applications with the same Unix user and unrestricted access to runtime storage.
+The runner validates launch authority first, releases launch authority locks,
+then provisions only machine-local progress state. It never creates or writes a
+shared progress path. The application receives only `QEXP_PROGRESS_PATH`; nested
+submissions have inherited progress variables removed. Producers never choose a
+Task ID, Attempt ID, fencing token, or machine registration generation.
+
+The agent observation thread is the sole shared progress writer. Shared progress
+writes are fenced independently from Task/Attempt authority and cannot delay the
+agent heartbeat or lease-renewal threads.
 
 ## Python API
 
@@ -32,29 +35,33 @@ from qqtools.qexp import progress
 for completed in range(1, 101):
     do_work()
     progress.update(stage="indexing", current=completed, total=100, unit="shard")
-progress.flush()  # Optional bounded final flush; also registered at process exit.
+progress.flush()
 ```
 
-The public implementation is standard-library-only and does not import qexp's
-scheduler or a training framework. Installing qqtools' normal base dependencies
-is still necessary. With no injected path, `update` is a no-op returning False.
-It returns whether a report was accepted into a latest-only in-memory slot,
-**not** whether it reached disk or the viewer. `flush` closes the default process
-reporter; use it at application end, not inside the work loop. Framework adapters
-use a dedicated `Reporter` per run.
+The supported application surface is `update()` and `flush()`. The implementation
+is standard-library-only and does not import qexp scheduling or a training
+framework. Without `QEXP_PROGRESS_PATH`, `update()` is a no-op returning `False`.
+The return value means only that a latest-value report was accepted in process;
+it does not prove that the value reached disk, the agent, or a viewer.
 
-One daemon writer performs file I/O. Application updates never wait for disk.
-There is one pending slot, not an unbounded queue. Ordinary local writes are
-limited to roughly once per second; stage changes may bypass that interval but
-have a 100 ms minimum spacing. Intermediate updates may be lost. Shutdown waits
-at most 100 ms by default (at most one second with an explicit timeout); final
-report delivery is not guaranteed after abrupt exit or blocked storage.
+One process singleton owns one daemon writer. qPipeline uses the same singleton
+rather than creating a second writer, so framework facts and explicit user calls
+cannot race as independent mailbox writers. `flush()` closes the singleton; if
+the daemon is still blocked in filesystem I/O after the bounded timeout, the
+closing reporter remains the singleton sentinel and new reports are rejected
+until that daemon actually exits. This preserves both bounded shutdown and the
+single-writer invariant.
 
-Only the canonical main process/global rank zero should report. The helper
-recognizes RANK, SLURM_PROCID and OMPI_COMM_WORLD_RANK without importing torch.
-An already-created Reporter inherited across fork is disabled in the child.
-Arbitrary non-DDP multi-process applications must designate their own writer;
-this API is not a multi-writer election protocol.
+Application updates use a non-blocking state lock and never perform mailbox file
+I/O on the application thread. The first accepted update may pay normal Python
+thread-startup cost. There is one pending latest-value slot, not an unbounded
+queue. Ordinary local writes are limited to roughly once per second; stage
+changes may bypass that interval with a 100 ms minimum spacing. Intermediate
+updates may be lost.
+
+Only canonical global rank zero should report. The helper recognizes `RANK`,
+`SLURM_PROCID`, and `OMPI_COMM_WORLD_RANK` without importing torch. An inherited
+reporter is disabled after fork. This is not a multi-writer election protocol.
 
 ## Complete replacement protocol
 
@@ -70,106 +77,139 @@ this API is not a multi-writer election protocol.
 }
 ```
 
-Updates replace the whole state; omitted optional fields become null. Stage and
-update_id are required. Counts are null or nonnegative signed-64-bit integers
-(not booleans); current cannot exceed a known total. Unknown totals and 0/0 are
-valid, but 0/0 has no percentage. Stage and unit have no scheduler semantics.
-A stage switch, unit switch or counter reset is a semantic change, not proof of
-forward work or health.
+Updates replace the whole state; omitted optional fields become null. `stage` and
+`update_id` are required. Counts are null or nonnegative signed-64-bit integers
+(not booleans); current cannot exceed a known total. Unknown totals and `0/0` are
+valid, but `0/0` has no percentage.
 
-Limits: 8 KiB wire record, stage 64 UTF-8 bytes, unit 32 bytes, message 1024 bytes,
-identifier 128 ASCII characters. NaN, Infinity, duplicate keys, unsupported
-versions, unknown payload fields, nested metrics and terminal control characters
-are rejected. Readers bound bytes and refuse symlink/FIFO/device payload files.
-Malformed reports never fail the application; diagnostics contain a bounded
-reason code, not the original payload, and use one replaceable file per attempt.
+Limits: 8 KiB wire record, stage 64 UTF-8 bytes, unit 32 bytes, message 1024
+bytes, identifier 128 ASCII characters. NaN, Infinity, duplicate JSON keys,
+unsupported versions, unknown payload fields, nested metrics, and control
+characters are rejected. Readers bound bytes and refuse symlink/FIFO/device
+payload files. Malformed reports never fail the application.
 
-## Storage and lifecycle
+## Local storage and cleanup fencing
 
 The local project runtime holds:
 
+```text
+progress/<attempt-id>/latest.json       # application mailbox
+progress-contexts/<attempt-id>.json     # runner-owned launch/process identity
+progress-observed/<attempt-id>.json     # last accepted agent observation
+progress-diagnostics/<attempt-id>.json  # bounded latest diagnostic
 ```
-progress/<attempt-id>.json             # application mailbox
-progress-contexts/<attempt-id>.json    # runner-owned launch/process identity
-progress-observed/<attempt-id>.json    # last observation accepted by the agent
-progress-diagnostics/<attempt-id>.json # bounded latest diagnostic
-```
+
+The mailbox lives inside an Attempt-owned directory. Cleanup removes the context
+first and then removes the entire Attempt mailbox directory. Advisory writers do
+not create parent directories, so a late producer cannot recreate
+`progress/<attempt-id>/latest.json` after cleanup removed its parent.
+
+Local cleanup uses race-safe deletion (`missing_ok`/ignored missing directories)
+rather than `exists() -> unlink()` sequences. Projector cache writes recheck the
+context after replace and delete themselves if cleanup won the race.
+
+## Shared projection and cleanup fencing
 
 Shared readers consume:
 
-```
+```text
 <shared-root>/progress/<task-id>/<attempt-id>.json
 ```
 
-The context is advisory identity evidence, not an execution authorization. It
-survives normal process-evidence removal so a command that exits between agent
-polls can still have its final report collected. Local accepted state preserves
-restart deduplication while shared writes are coalesced or unavailable.
+The runner never creates this namespace. Immediately before a shared write the
+agent acquires a dedicated per-Task advisory progress lock, revalidates current
+Task/Attempt authority and machine registration eligibility, creates the shared
+progress directory if still valid, then atomically replaces the snapshot.
 
-The shared snapshot includes task/attempt/launch/process identity, current
-fencing token, source_update_id, agent sequence, reported_at, advanced_at and the
-normalized progress payload. Identity comes from the runner context cross-checked
-against the current Task/Attempt and registration generation, never the payload.
+Task cleanup marks the Task as cleaning through the existing authoritative
+workflow and later acquires the same progress lock before removing the shared
+Task progress directory. Therefore:
 
-Only the agent's separate progress thread projects snapshots. It does not acquire
-Task/lease locks or call renewal APIs. The current binding is checked again before
-publication; observers validate current attempt and fencing token when joining a
-snapshot. A race can temporarily make progress unavailable, not change authority.
-A queued retry never shows the previous attempt as its current progress.
+- a projector that wins the progress lock first finishes before cleanup removes
+  its result;
+- a projector that arrives after cleanup was marked fails revalidation and does
+  not recreate the directory;
+- cleanup and projection never rely on a racy `exists() -> unlink()` contract.
 
-Reads rotate across projects and bounded batches of local contexts. Shared writes
-normally occur at most once per five seconds per attempt. First/stage/terminal
-updates can be expedited, with a one-second minimum spacing even for stage floods.
-These are soft best-effort intervals, not a hard visibility deadline on a slow
-filesystem. An unavailable shared filesystem delays progress, not the agent's
-independent heartbeat/authority threads. The existing runtime's own storage and
-lease failure policies remain unchanged.
+The progress lock is not a Task/Attempt authority lock. Projectors never acquire
+Task/lease locks, never renew a lease, and never mutate execution truth.
 
-Advisory writes use same-directory temporary files and `os.replace`, without
-file/directory fsync. Atomic visibility is not crash durability. This primitive
-is separate from authoritative `runtime.store.atomic_replace` and never creates
-parents on update, preventing stale writers from recreating cleaned shared task
-directories. Loss of all advisory caches may lose deduplication evidence; this is
-not an exactly-once/durable event protocol.
+## Projection identity and fencing
 
-Terminal collection preserves the last shared snapshot and retires local
-artifacts. Existing Task cleanup removes shared and remaining local artifacts;
-there is no additional retention policy. No final observation creates a fake
-"100%" or overrides exit status.
+The shared snapshot contains:
+
+- runner-derived Task/Attempt/launch/process identity;
+- current Attempt fencing token;
+- **machine registration generation** owned by the projecting agent;
+- source update ID and agent sequence;
+- `reported_at` and `advanced_at`;
+- normalized progress payload.
+
+The machine registration generation is not producer-controlled. Each
+`ProgressProjector` is permanently bound to the registration generation of the
+agent binding that created it. Before every shared write, the agent checks that
+that binding is still write-eligible.
+
+Running-task readers require both the current Attempt fencing token and the
+current shared machine registration generation. If a machine registration is
+superseded in the narrow check-to-write window, an old-generation snapshot may
+briefly exist on disk but a running reader rejects it. Terminal snapshots keep
+registration generation as provenance but are not invalidated by a later machine
+adoption, preserving historical final progress.
+
+Retry isolation remains Attempt-scoped: queued retry never displays the previous
+Attempt as current progress. Terminal Task publication deliberately clears
+`current_attempt_id`, so terminal progress is joined using the preserved current
+Attempt number and its AttemptRecord.
+
+## Polling and I/O behavior
+
+The progress observation loop is a dedicated daemon thread. Before it touches any
+shared machine-registration state, it checks the project-local runtime for a real
+producer mailbox (`progress/*/latest.json`). Projects that have never emitted a
+progress update therefore add no progress-specific shared registration polling.
+
+Projects are rotated and local contexts are processed with bounded work per
+cycle. Shared writes normally occur at most once per five seconds per Attempt.
+First/stage/terminal publications can be expedited with a one-second minimum
+shared-write spacing. These are soft visibility intervals, not health deadlines.
+
+Advisory snapshots use same-directory temporary files and `os.replace` without
+file/directory fsync. This primitive is intentionally separate from authoritative
+`runtime.store.atomic_replace`.
 
 ## Freshness and presentation
 
-`qexp task show TASK_ID` adds Stage, Progress, Message, Progress reported and
-Progress advanced; JSON includes a separate top-level progress object.
-`reported_at` advances only for a new accepted update_id. `advanced_at` changes
-only when stage/current/total/unit changes. Message-only updates do not refresh
-advanced_at. Restart or token recovery alone changes neither time.
+`qexp task show TASK_ID` adds Stage, Progress, Message, Progress reported, and
+Progress advanced. JSON contains a separate top-level `progress` object.
 
-These timestamps mean agent receipt, not producer wall time or a health verdict.
-The agent's UTC receipt timestamps are compared with the viewer's clock; negative
-ages show `unknown (clock difference)`. Cross-host age is approximate without
-clock synchronization. No stale threshold, automatic cancellation, speed, or ETA
-is provided. Agent heartbeat and lease renewal are not renamed process heartbeat.
+`reported_at` advances for each newly accepted `update_id`. `advanced_at` changes
+only when stage/current/total/unit changes; message-only updates do not count as
+business advancement. Agent restart, fencing-token recovery, or registration
+metadata alone do not fabricate progress time.
+
+These timestamps are observations, not a health verdict. No stale threshold,
+automatic cancellation, speed, or ETA is included in Phase 1.
 
 ## qPipeline
 
-A rank-zero best-effort peer observer consumes existing runner facts. Training
-uses global_step (optimizer steps), max_steps when available, unit=step and an
-epoch message. It never reconstructs an independent step counter or reads Rich
-state. EvaluationStartedFact lacks a val/test discriminator, so its initial
-stage is honestly `evaluation`; existing progress ticks refine it to validation
-or test with batch counts. Evaluation completion restores the fact's train
-cursor. Different loaders may reset evaluation counts; no total-run ETA is implied.
+A rank-zero best-effort peer observer consumes existing runner facts. It calls the
+same process-level `qqtools.qexp.progress.update()` API available to user code.
+There is no qPipeline-owned Reporter and no second mailbox writer.
 
-Automatic rendering probes actual streams: Rich uses stdout TTY, tqdm uses
-stderr TTY, otherwise plain. Explicit rich/tqdm requests retain existing dependency
-fallbacks. This fixes renderer selection only: plain batch logging remains the
-existing policy and is **not** silently disabled by progress transport availability.
-A broader quiet/sparse logging policy is a separate change.
+Training uses optimizer `global_step`, `max_steps` when available, `unit=step`,
+and an epoch message. Evaluation starts as `evaluation` because
+`EvaluationStartedFact` has no val/test discriminator; subsequent progress ticks
+refine it to `validation` or `test` with batch counts. Evaluation completion
+restores the train cursor. The adapter never reads Rich/Tqdm renderer state.
+
+Automatic rendering probes actual streams: Rich requires stdout TTY, tqdm uses
+stderr TTY, otherwise auto resolves to plain. Explicit renderer requests retain
+existing dependency fallbacks. This does not redesign plain-log verbosity.
 
 ## Validation
 
-From a complete checkout with project test dependencies installed:
+Run the focused feature suite:
 
 ```bash
 PYTHONPATH=src python -m pytest -q \
@@ -179,17 +219,23 @@ PYTHONPATH=src python -m pytest -q \
   tests/unit/qexp/test_progress_adapter.py \
   tests/integration/qexp/test_live_progress.py \
   tests/integration/functional/test_runner/test_progress_render_mode.py
+```
 
-PYTHONPATH=src python -m pytest -q tests/unit/qexp tests/integration/qexp \
+Then run the related regression surface:
+
+```bash
+PYTHONPATH=src python -m pytest -q \
+  tests/unit/qexp \
+  tests/integration/qexp \
   tests/integration/functional/test_runner
 ```
 
-The added pure-module tests were executed in an isolated source workspace (75
-passed). All modified/new Python files passed compileall. This is **not** a full
-installed-package or full-repository regression run. Repository lifecycle tests,
-real guardian execution, existing test gates and genuine multi-rank/GPU or shared
-filesystem qualification require running the commands above in a complete
-checkout. No CI or complete pytest success is claimed by this implementation.
+A pre-hardening machine run of the related regression surface reached 988 passed,
+2 skipped, with one unrelated stale `qexp init` output-contract test; that test
+was fixed separately on `main`. The concurrency-hardening changes in this branch
+add new race/single-writer tests and require a fresh machine run before merge. No
+post-hardening full-suite success is claimed here yet.
 
-Deferred: FD transport, watch, metrics, history, ETA, list progress columns,
-multiple streams, stale policy, stdout parsers and third-party framework adapters.
+Deferred: FD transport, `task watch`, metrics, history, ETA, list progress
+columns, multiple streams, stale policy, stdout parsers, and third-party framework
+adapters.
