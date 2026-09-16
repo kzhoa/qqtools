@@ -15,6 +15,7 @@ from qqtools.plugins.qexp.agent.lifecycle import dispatch_machine_cycle_locked
 from qqtools.plugins.qexp.commands import group as group_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import cancel, edit_dependencies, share
+from qqtools.plugins.qexp.executor import LaunchHandoff
 from qqtools.plugins.qexp.runtime.paths import ready_state_path, shared_paths
 from qqtools.plugins.qexp.runtime.ready import (
     ReadyClassificationResult,
@@ -50,6 +51,23 @@ class _RecordingExecutor:
 
     def launch_attempt(self, _cfg, task_id, _attempt) -> None:
         self.launched.append(task_id)
+
+
+class _BatchedRecordingExecutor(_RecordingExecutor):
+    def __init__(self, *, should_fail_first: bool = False) -> None:
+        super().__init__()
+        self.waited_attempt_ids: list[str] = []
+        self.should_fail_first = should_fail_first
+
+    def initiate_attempt(self, cfg, task_id, attempt):
+        self.launched.append(task_id)
+        return "runner", LaunchHandoff(attempt.attempt_id, cfg.runtime_root / "unused", float("inf"))
+
+    def wait_for_launch_handoffs(self, handoffs):
+        self.waited_attempt_ids = [handoff.attempt_id for handoff in handoffs]
+        if self.should_fail_first:
+            return {self.waited_attempt_ids[0]: RuntimeError("handoff failed")}
+        return {}
 
 
 def _borrow_project(tmp_path: Path, work: Path):
@@ -654,6 +672,7 @@ def test_missing_primary_projection_fails_closed(
     state["ready_index"]["state"] = "active"
     state["ready_index"]["writer_capability"] = "ready-v1"
     atomic_replace(ready_state_path(cfg.shared_root), state)
+    (shared_paths(cfg.shared_root)["ready_primary"] / "state.json").unlink()
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
 
@@ -1382,7 +1401,7 @@ def test_project_round_robin_fairness_survives_dynamic_binding(tmp_path: Path) -
         binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
         projects.append((cfg, task, binding))
     runtime.save_cursor(projects[1][2].project_id)
-    executor = _RecordingExecutor()
+    executor = _BatchedRecordingExecutor()
 
     results = dispatch_machine_cycle_locked(
         runtime,
@@ -1394,5 +1413,35 @@ def test_project_round_robin_fairness_survives_dynamic_binding(tmp_path: Path) -
 
     result_by_project = {item["project_id"]: item for item in results}
     assert executor.launched == [projects[1][1].task_id, projects[0][1].task_id]
+    assert len(executor.waited_attempt_ids) == 2
     assert all(result_by_project[binding.project_id]["launched"] == [task.task_id] for _cfg, task, binding in projects)
     assert runtime.load_cursor() == projects[1][2].project_id
+
+
+def test_machine_dispatch_attributes_batched_handoff_failure(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ready"], task_id="task-ready", working_dir=work)
+    _activate_ready(cfg)
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+
+    results = dispatch_machine_cycle_locked(
+        runtime,
+        available_gpus=[0],
+        executor=_BatchedRecordingExecutor(should_fail_first=True),
+        supervise=False,
+        publish_snapshots=False,
+    )
+
+    result_by_project = {item["project_id"]: item for item in results}
+    assert result_by_project[binding.project_id] == {
+        "project_id": binding.project_id,
+        "launched": [],
+        "status": "error",
+        "error": "handoff failed",
+    }
+    assert read_json(shared_paths(cfg.shared_root)["tasks"] / f"{task.task_id}.json")["task"][
+        "state"
+    ]["projection"] == "failed"

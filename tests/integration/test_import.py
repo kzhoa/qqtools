@@ -3,6 +3,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.integration
+
 
 def test_import_mypackage():
     source_root = Path(__file__).resolve().parents[2] / "src"

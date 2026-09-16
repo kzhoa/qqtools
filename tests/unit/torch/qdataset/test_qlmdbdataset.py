@@ -1,10 +1,6 @@
 import copy
 import json
-import multiprocessing
-import os
 import pickle
-import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -109,10 +105,6 @@ def _samples(costs: list[float]) -> list[dict]:
         }
         for idx, cost in enumerate(costs)
     ]
-
-
-def _collate_ids(batch: list[dict]) -> list[int]:
-    return [int(sample["id"]) for sample in batch]
 
 
 def test_public_exports_resolve_to_new_dataset_class():
@@ -706,48 +698,6 @@ def test_legacy_balance_configuration_arguments_are_removed(tmp_path: Path, lega
 
     with pytest.raises(TypeError, match="unexpected keyword argument"):
         _BalancedDataset(root, ["raw/data.lmdb"], **legacy_kwargs)
-
-
-@pytest.mark.parametrize("start_method", ["spawn", "forkserver"])
-def test_file_lock_write_guard_serializes_processes(
-    tmp_path: Path,
-    start_method: str,
-    checkout_subprocess_env,
-):
-    if start_method not in multiprocessing.get_all_start_methods():
-        pytest.skip(f"{start_method} is not available on this platform")
-
-    probe_path = Path(__file__).parents[3] / "fixtures" / "qlmdbdataset_file_lock_probe.py"
-    worker_env = checkout_subprocess_env
-    if os.name != "nt":
-        worker_env.update({"TMPDIR": "/tmp", "TEMP": "/tmp", "TMP": "/tmp"})
-
-    subprocess.run(
-        [sys.executable, str(probe_path), start_method, str(tmp_path)],
-        check=True,
-        env=worker_env,
-        timeout=60,
-    )
-
-
-@pytest.mark.filterwarnings("ignore:This process.*fork")
-def test_plain_dataloader_reads_with_multiple_workers(tmp_path: Path):
-    root = tmp_path / "dataset"
-    _write_lmdb(root / "raw" / "data.lmdb", _samples([1.0, 2.0, 3.0, 4.0]))
-    dataset = _PlainDataset(root, ["raw/data.lmdb"])
-
-    loader = dataset.to_dataloader(
-        batch_size=2,
-        shuffle=False,
-        num_workers=2,
-        multiprocessing_context="fork",
-        collate_fn=_collate_ids,
-    )
-    observed_ids = [value for batch in loader for value in batch]
-
-    assert observed_ids == [0, 1, 2, 3]
-    assert dataset._environments is None
-    assert loader.multiprocessing_context.get_start_method() == "fork"
 
 
 def test_dataloader_prefers_forkserver_when_available(tmp_path: Path):

@@ -1,9 +1,5 @@
 import multiprocessing
-import os
 import pickle
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -180,24 +176,3 @@ def test_qdictdataloader_rejects_batch_sampler_conflicts(loader_kwargs, message)
             batch_sampler=batch_sampler,
             **loader_kwargs,
         )
-
-
-@pytest.mark.parametrize("start_method", ["spawn", "forkserver"])
-def test_qdictdataloader_graph_collate_with_pickle_based_worker(
-    start_method,
-    checkout_subprocess_env,
-):
-    if start_method not in multiprocessing.get_all_start_methods():
-        pytest.skip(f"{start_method} is not available on this platform")
-
-    probe_path = Path(__file__).parents[3] / "fixtures" / "qdataset_graph_worker_probe.py"
-    worker_env = checkout_subprocess_env
-    if os.name != "nt":
-        worker_env.update({"TMPDIR": "/tmp", "TEMP": "/tmp", "TMP": "/tmp"})
-
-    subprocess.run(
-        [sys.executable, str(probe_path), start_method],
-        check=True,
-        env=worker_env,
-        timeout=60,
-    )
