@@ -7,14 +7,15 @@ license = "MIT"
 license-files = ["LICENSE*"]
 requires-python = ">=3.11"
 authors = [{ name = "qq" }]
-dependencies = ["torch", "PyYAML", "matplotlib", "pandas", "scipy", "rich"]
+dependencies = ["torch", "PyYAML", "scipy", "rich"]
 
 # note:
 # scipy requires: numpy
-# matplotlib requires: numpy
-# seaborn requires: matplotlib, pandas
 
 [project.optional-dependencies]
+# Optional plotting/data convenience dependencies. Core imports must not require
+# either package; `full` retains the historical all-features installation.
+data = ["matplotlib", "pandas"]
 # optionally required by standard distribution
 std = ["lmdb", "tqdm", "requests"]
 plugins = ["rich", "scikit-learn", "prompt_toolkit"]
@@ -22,8 +23,8 @@ exp = ["libtmux>=0.62.0", "psutil", "nvidia-ml-py"]
 dev = ["tox", "pytest", "ruff", "build"]
 # GitHub Dev Preflight dependency surface. Keep this explicit rather than
 # inheriting `full`: CI needs LMDB/metrics/qcgen/qexp lifecycle coverage, but it
-# does not need network download helpers, NVML/psutil tooling, package-build
-# tooling, or pytest-xdist.
+# does not need network download helpers, plotting/data convenience packages,
+# NVML/psutil tooling, package-build tooling, or pytest-xdist.
 ci-preflight = [
     "lmdb",
     "tqdm",
@@ -35,6 +36,7 @@ ci-preflight = [
     "ruff",
 ]
 full = [
+    "qqtools[data]",
     "qqtools[std]",
     "qqtools[plugins]",
     "qqtools[exp]",

@@ -2,10 +2,8 @@ import random
 from collections import Counter
 from typing import Sequence
 
-import matplotlib.pyplot as plt
 import numpy as np
 
-from .plot_utils import plot_dict_distribution, plot_list_histogram
 from .qscaladict import qScalaDict
 
 
@@ -94,12 +92,18 @@ class qList(list):
 
     def plot_histogram(self, bins=10):
         """"""
+        from .plot_utils import plot_list_histogram
+
         plot_list_histogram(self, bins=bins)
 
     def plot_count(self):
+        from .plot_utils import plot_dict_distribution
+
         plot_dict_distribution(self.count().to_dict())
 
     def plot_count_count(self):
+        from .plot_utils import plot_dict_distribution
+
         plot_dict_distribution(self.count_count().to_dict())
 
 
@@ -111,7 +115,7 @@ class qDataList:
     - counts: Returns the count of values associated with a given key in each dictionary.
     - count_distribution(key, skip_none=False): Returns the distribution (count) of values associated with the specified key in each dictionary.
     - get_list(key): Returns a list of values for the given key from each dictionary in the list.
-    - get_set(key): Returns a set of unique values for the given key from each dictionary in the list.
+    - get_set(key): Returns a set of unique values corresponding to the key.
     - get_map(key1, key2): Returns a dictionary mapping key1 to key2 for each dictionary in the list.
     - shuffle(seed): Shuffles the list of dictionaries. If seed is provided, the shuffle will be deterministic.
 
@@ -205,6 +209,8 @@ class qDataList:
         return shuffled_list
 
     def plot_counts(self, key):
+        import matplotlib.pyplot as plt
+
         cnt_dict = self.counts(key)
         names = list(cnt_dict.keys())
         counts = list(cnt_dict.values())
@@ -218,6 +224,8 @@ class qDataList:
         plt.show()
 
     def plot_count_distribution(self, key):
+        import matplotlib.pyplot as plt
+
         cnt_dist = self.count_count(key)
         names = list(cnt_dist.keys())
         counts = list(cnt_dist.values())
