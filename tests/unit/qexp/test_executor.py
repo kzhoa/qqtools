@@ -139,15 +139,55 @@ def test_executor_rejects_runner_without_launch_handoff(tmp_path: Path):
         executor._wait_for_launch_intent(_cfg(tmp_path), "task-1-attempt-1", timeout_seconds=0.01)
 
 
-def test_executor_reports_only_failed_handoffs(tmp_path: Path):
-    published = tmp_path / "published.json"
+def test_executor_reports_only_failed_handoffs_with_duplicate_attempt_ids(tmp_path: Path):
+    published = tmp_path / "project-a" / "published.json"
+    published.parent.mkdir()
     published.touch()
-    failures = Executor.wait_for_launch_handoffs(
-        [
-            LaunchHandoff("published", published, 0.0),
-            LaunchHandoff("missing", tmp_path / "missing.json", 0.0),
-        ]
-    )
+    published_handoff = LaunchHandoff("shared-attempt", published, 0.0)
+    missing_handoff = LaunchHandoff("shared-attempt", tmp_path / "project-b" / "missing.json", 0.0)
 
-    assert list(failures) == ["missing"]
-    assert str(failures["missing"]) == "runner did not publish launch intent for 'missing'"
+    failures = Executor.wait_for_launch_handoffs([published_handoff, missing_handoff])
+
+    assert list(failures) == [missing_handoff]
+    assert str(failures[missing_handoff]) == "runner did not publish launch intent for 'shared-attempt'"
+
+
+def test_launch_batch_isolates_duplicate_attempt_ids_across_projects(tmp_path: Path, monkeypatch):
+    from qqtools.plugins.qexp.agent import dispatch_loop
+
+    successful_path = tmp_path / "project-a" / "intent.json"
+    successful_path.parent.mkdir()
+    successful_path.touch()
+    successful = LaunchHandoff("shared-attempt", successful_path, 0.0)
+    failed = LaunchHandoff("shared-attempt", tmp_path / "project-b" / "intent.json", 0.0)
+
+    class _BatchExecutor:
+        def wait_for_launch_handoffs(self, handoffs):
+            assert handoffs == [successful, failed]
+            return {failed: RuntimeError("handoff failed")}
+
+    cfg_a = RootConfig(tmp_path / "a" / ".qexp", tmp_path / "a", "gpu-1", tmp_path / "a" / "rt")
+    cfg_b = RootConfig(tmp_path / "b" / ".qexp", tmp_path / "b", "gpu-1", tmp_path / "b" / "rt")
+    batch = dispatch_loop._LaunchHandoffBatch(_BatchExecutor(), tmp_path / "machine")
+    batch._pending = [
+        dispatch_loop._PendingLaunchHandoff(cfg_a, "task", "shared-attempt", 7, "project-a", successful),
+        dispatch_loop._PendingLaunchHandoff(cfg_b, "task", "shared-attempt", 8, "project-b", failed),
+    ]
+    failed_attempts = []
+
+    def record_failure(cfg, task_id, attempt_id, fencing_token, reason, **_kwargs):
+        failed_attempts.append((cfg.shared_root, task_id, attempt_id, fencing_token, reason))
+
+    monkeypatch.setattr(dispatch_loop, "fail_attempt", record_failure)
+    results = {
+        "project-a": {"launched": ["task"], "status": "dispatched"},
+        "project-b": {"launched": ["task"], "status": "dispatched"},
+    }
+
+    batch.finish(results)
+
+    assert failed_attempts == [(cfg_b.shared_root, "task", "shared-attempt", 8, "executor_launch_failed")]
+    assert results["project-a"] == {"launched": ["task"], "status": "dispatched"}
+    assert results["project-b"]["launched"] == []
+    assert results["project-b"]["status"] == "error"
+    assert results["project-b"]["error"] == "handoff failed"

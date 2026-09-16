@@ -132,7 +132,8 @@ class _LaunchHandoffBatch:
                 [pending.handoff for pending in self._pending]
             )
         for pending in self._pending:
-            if pending.attempt_id not in failures:
+            failure = failures.get(pending.handoff)
+            if failure is None:
                 continue
             fail_attempt(
                 pending.cfg,
@@ -147,7 +148,7 @@ class _LaunchHandoffBatch:
                 launched.remove(pending.task_id)
             item = result_by_project[pending.project_id]
             item["status"] = "error"
-            item["error"] = str(failures[pending.attempt_id])
+            item["error"] = str(failure)
         self._pending.clear()
 
 
