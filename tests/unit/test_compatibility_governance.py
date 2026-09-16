@@ -5,14 +5,7 @@ from pathlib import Path
 import pytest
 
 from scripts import release_preflight
-from scripts.checks.check_compatibility_registry import (
-    RegistryError,
-    Version,
-    _parse_registry,
-    check_registry_transition,
-    check_release,
-    load_registry,
-)
+from scripts.checks.check_compatibility_registry import RegistryError, Version, check_release, load_registry
 
 
 def _write_registry(
@@ -40,8 +33,7 @@ def _write_registry(
     item_number = int(item_id.rsplit("-", 1)[1])
     effective_next_id = next_id if next_id is not None else item_number + 1
     registry.write_text(
-        f"""schema_version = 1
-next_id = {effective_next_id}
+        f"""next_id = {effective_next_id}
 
 [[items]]
 id = "{item_id}"
@@ -65,7 +57,7 @@ verification = ["tests/test_example.py"]
 def _write_empty_registry(root: Path, *, next_id: int = 9002) -> Path:
     registry = root / "docs/spec/compatibility-registry.toml"
     registry.parent.mkdir(parents=True, exist_ok=True)
-    registry.write_text(f"schema_version = 1\nnext_id = {next_id}\n", encoding="utf-8")
+    registry.write_text(f"next_id = {next_id}\n", encoding="utf-8")
     return registry
 
 
@@ -157,14 +149,25 @@ def test_registry_requires_summary(tmp_path: Path) -> None:
         load_registry(registry, tmp_path)
 
 
-def test_registry_rejects_action_refs(tmp_path: Path) -> None:
+def test_registry_rejects_schema_version(tmp_path: Path) -> None:
     registry = _write_registry(tmp_path)
     registry.write_text(
-        registry.read_text(encoding="utf-8") + 'action_refs = ["docs/private/example.md"]\n',
+        "schema_version = 1\n" + registry.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
 
-    with pytest.raises(RegistryError, match="unknown field 'action_refs'"):
+    with pytest.raises(RegistryError, match="unknown field 'schema_version'"):
+        load_registry(registry, tmp_path)
+
+
+@pytest.mark.parametrize("field", ["decision_refs", "pitch_refs", "action_refs"])
+def test_registry_rejects_private_or_action_reference_fields(tmp_path: Path, field: str) -> None:
+    registry = _write_registry(tmp_path)
+    registry.write_text(
+        registry.read_text(encoding="utf-8") + f'{field} = ["docs/private/example.md"]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(RegistryError, match=f"unknown field '{field}'"):
         load_registry(registry, tmp_path)
 
 
@@ -180,49 +183,6 @@ def test_registry_allows_no_unfinished_items(tmp_path: Path) -> None:
 
     assert registry.items == ()
     assert registry.next_id == 9002
-
-
-def test_current_registry_rejects_other_schema_versions(tmp_path: Path) -> None:
-    registry = _write_registry(tmp_path)
-    registry.write_text(
-        registry.read_text(encoding="utf-8").replace("schema_version = 1", "schema_version = 2", 1),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(RegistryError, match="schema_version must be 1"):
-        load_registry(registry, tmp_path)
-
-
-def test_historical_schema_v1_is_readable_for_release_transition(tmp_path: Path) -> None:
-    raw = {
-        "schema_version": 1,
-        "next_id": 9002,
-        "items": [
-            {
-                "id": "QQTOOLS-COMPAT-9001",
-                "component": "example.legacy",
-                "kind": "public_api",
-                "status": "legacy_removed",
-                "introduced_in": "1.0.0",
-                "legacy_removed_in": "2.0.0",
-                "transition_purged_in": "3.0.0",
-                "marker": "QQTOOLS-COMPAT-9001",
-                "owner": "example",
-                "decision_refs": ["docs/adr/private-in-v2.md"],
-                "pitch_refs": ["docs/pitch/private.md"],
-                "verification": ["tests/test_legacy.py"],
-            }
-        ],
-    }
-
-    registry = _parse_registry(
-        raw,
-        tmp_path,
-        validate_repository=False,
-    )
-
-    assert registry[0].item_id == "QQTOOLS-COMPAT-9001"
-    assert registry[0].summary == "Legacy compatibility item for example.legacy."
 
 
 def test_registry_requires_next_id_above_every_item_id(tmp_path: Path) -> None:
@@ -311,99 +271,6 @@ def test_planned_future_item_passes_an_earlier_release(tmp_path: Path) -> None:
     item = load_registry(registry, tmp_path)[0]
 
     check_release((item,), Version.parse("2.9.0", "target"))
-
-
-def test_registry_allows_removal_at_purge_version(tmp_path: Path) -> None:
-    previous = load_registry(
-        _write_registry(tmp_path, status="legacy_removed"),
-        tmp_path,
-    )
-    (tmp_path / "src/example.py").unlink()
-    current = load_registry(_write_empty_registry(tmp_path), tmp_path)
-
-    check_registry_transition(
-        current,
-        previous,
-        Version.parse("4.0.0", "target"),
-        tmp_path,
-    )
-
-
-def test_registry_rejects_removal_before_purge_version(tmp_path: Path) -> None:
-    previous = load_registry(
-        _write_registry(tmp_path, status="legacy_removed"),
-        tmp_path,
-    )
-    (tmp_path / "src/example.py").unlink()
-    current = load_registry(_write_empty_registry(tmp_path), tmp_path)
-
-    with pytest.raises(RegistryError, match="removed before transition_purged_in"):
-        check_registry_transition(
-            current,
-            previous,
-            Version.parse("3.9.0", "target"),
-            tmp_path,
-        )
-
-
-def test_registry_rejects_retirement_while_marker_remains(tmp_path: Path) -> None:
-    previous = load_registry(
-        _write_registry(tmp_path, status="legacy_removed"),
-        tmp_path,
-    )
-    current = load_registry(_write_empty_registry(tmp_path), tmp_path)
-
-    with pytest.raises(RegistryError, match="retired but its marker remains"):
-        check_registry_transition(
-            current,
-            previous,
-            Version.parse("4.0.0", "target"),
-            tmp_path,
-        )
-
-
-def test_registry_rejects_decreasing_next_id(tmp_path: Path) -> None:
-    previous = load_registry(_write_registry(tmp_path), tmp_path)
-    (tmp_path / "src/example.py").unlink()
-    current = load_registry(_write_empty_registry(tmp_path, next_id=9001), tmp_path)
-
-    with pytest.raises(RegistryError, match="next_id decreased"):
-        check_registry_transition(
-            current,
-            previous,
-            Version.parse("4.0.0", "target"),
-            tmp_path,
-        )
-
-
-def test_registry_rejects_reusing_retired_id(tmp_path: Path) -> None:
-    previous_path = _write_registry(tmp_path / "previous", next_id=9002)
-    previous = load_registry(previous_path, tmp_path / "previous")
-    current_path = _write_registry(
-        tmp_path / "current",
-        item_id="QQTOOLS-COMPAT-9000",
-        next_id=9002,
-    )
-    current = load_registry(current_path, tmp_path / "current")
-
-    with pytest.raises(RegistryError, match="cannot be reused"):
-        check_registry_transition(
-            current,
-            previous,
-            Version.parse("2.5.0", "target"),
-            tmp_path / "current",
-        )
-
-
-def test_registry_bootstrap_has_no_previous_release_contract(tmp_path: Path) -> None:
-    current = load_registry(_write_empty_registry(tmp_path), tmp_path)
-
-    check_registry_transition(
-        current,
-        None,
-        Version.parse("4.0.0", "target"),
-        tmp_path,
-    )
 
 
 def test_preflight_runs_compatibility_gate_before_expensive_checks(

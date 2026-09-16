@@ -45,12 +45,15 @@ Registry items use exact `X.Y.Z` versions. `introduced_in` must precede `legacy_
 `transition_purged_in` must not precede `legacy_removed_in`. Equal removal and purge versions are
 allowed when no separate migration release is needed.
 
-## Registry schema
+## Registry format
 
-The compatibility registry remains on schema v1. This change deliberately does not introduce a
-new governance schema merely because private design-document references were removed.
+The compatibility registry is a developer-facing lifecycle ledger, not a user-facing data format,
+wire protocol, or persisted product schema. It intentionally has **no registry schema version**.
+The top-level field `schema_version` is forbidden and must not be introduced in future revisions.
+Changing developer-only registry metadata does not require a migration framework or a versioned
+parser.
 
-Current registry entries contain:
+Current unfinished entries contain:
 
 - a unique `QQTOOLS-COMPAT-NNNN` ID and identical `marker`;
 - `component`, `kind`, and module-level `owner`;
@@ -60,15 +63,23 @@ Current registry entries contain:
 - optional append-only `extensions` for approved deadline changes; and
 - structured rollout fields when the item declares an operational migration contract.
 
-Current entries omit `pitch_refs`, `decision_refs`, and `action_refs`. Private planning and design
-files are not registry dependencies. The checker temporarily tolerates the old `decision_refs` and
-`pitch_refs` keys when reading the previous `v1.3.18` release snapshot; those keys are ignored and
-carry no authority. After a clean schema-v1 registry is published in the next patch release, that
-legacy-key tolerance can be removed.
+`pitch_refs`, `decision_refs`, and `action_refs` are not registry fields. Private planning and design
+files are not registry dependencies. Implementation progress belongs to disposable feature-branch
+state, commits, tests, and CI rather than to the compatibility ledger.
+
+The checker validates only the registry in the current checkout. It does not parse compatibility
+registries from old release tags and it does not provide backward compatibility for obsolete
+developer-registry formats. Product compatibility moves forward: once a temporary compatibility
+item has been intentionally cleaned up, it stays cleaned up. Git history and release tags remain
+available for human archaeology, not as machine-readable registry inputs.
+
+The top-level `next_id` is the next compatibility ID to allocate. Maintainers advance it when new
+items are created and do not reuse retired IDs. This is a forward-only maintenance convention, not
+a cross-release registry migration protocol.
 
 Temporary implementation and behavior fixtures carry their compatibility ID. The checker scans
-tracked and non-ignored files under `src/`, `tests/`, and `scripts/`. Planned items must have no
-marker; active and legacy-removed items must retain at least one marker.
+tracked and non-ignored files under `src/`, `tests`, and `scripts`. Planned items must have no marker;
+active and legacy-removed items must retain at least one marker.
 
 ## Correlation and implementation history
 
@@ -81,12 +92,10 @@ not lifecycle authority and is stripped before promotion to `dev`. Pull requests
 required. Long-term correctness must remain recoverable from the registry, code markers,
 verification tests, public product documentation when applicable, and Git history.
 
-Completed items are not a registry state and are not retained indefinitely. At release check time,
-the checker reads the registry from the exact `v<current source version>` tag. An item may disappear
-only when the target reaches its effective `transition_purged_in` and its markers are absent. The
-same baseline prevents `next_id` rollback and reuse of retired IDs. If that prior tag predates the
-registry, the comparison bootstraps without historical items. Git history, release tags, and the
-CHANGELOG are the historical record.
+Completed items are not a registry state and are not retained indefinitely. Once their temporary
+behavior and markers are intentionally removed, they leave the current ledger and do not return.
+The checker does not reconstruct prior registry state to second-guess that forward cleanup. Git
+history, release tags, and the CHANGELOG remain available for human historical inspection only.
 
 ## Operational compatibility gate
 
@@ -252,7 +261,7 @@ An extension names `legacy_removed_in` or `transition_purged_in`, chains from th
 value to a later version, records the approval version, and records a non-empty reason. Original
 deadlines are not overwritten.
 
-Schema-v2 extensions do not carry a document reference. `approved_in`, `reason`, the compatibility
+Extensions do not carry a document reference. `approved_in`, `reason`, the compatibility
 ID, and Git history provide the public audit trail. A private planning or design record may contain
 additional rationale but is not required by validation.
 
@@ -265,8 +274,9 @@ python scripts/checks/check_compatibility_registry.py check --release-version X.
 ```
 
 `validate` checks registry structure and repository evidence. `plan` reports the state or registry
-removal required at a target release. `check` fails when the recorded state does not match that
-target, an item was removed early, a retired marker remains, or the ID watermark regresses.
+removal required for items that still exist at a target release. `check` fails when a currently
+registered item is in the wrong lifecycle state for that target or remains registered past its purge
+version. It intentionally does not reconstruct or validate already-cleaned historical items.
 
 The release operator must inspect `plan`, resolve every due action, commit the candidate, and run:
 

@@ -28,8 +28,7 @@ KINDS = {
     "runtime_protocol",
 }
 EXTENDABLE_FIELDS = {"legacy_removed_in", "transition_purged_in"}
-REGISTRY_FIELDS = {"schema_version", "next_id", "items"}
-SCHEMA_VERSION = 1
+REGISTRY_FIELDS = {"next_id", "items"}
 ITEM_FIELDS = {
     "id",
     "component",
@@ -41,8 +40,6 @@ ITEM_FIELDS = {
     "transition_purged_in",
     "marker",
     "owner",
-    "decision_refs",
-    "pitch_refs",
     "verification",
     "extensions",
     "normal_level",
@@ -244,13 +241,7 @@ def _parse_item(
     status = _require_string(raw_item.get("status"), f"{item_id}.status")
     if status not in STATUSES:
         raise RegistryError(f"{item_id}.status must be one of {sorted(STATUSES)}, got {status!r}.")
-    raw_summary = raw_item.get("summary")
-    if validate_references:
-        summary = _require_string(raw_summary, f"{item_id}.summary")
-    elif raw_summary is None:
-        summary = f"Legacy compatibility item for {component}."
-    else:
-        summary = _require_string(raw_summary, f"{item_id}.summary")
+    summary = _require_string(raw_item.get("summary"), f"{item_id}.summary")
     introduced_in = Version.parse(raw_item.get("introduced_in"), f"{item_id}.introduced_in")
     deadlines = {
         "legacy_removed_in": Version.parse(raw_item.get("legacy_removed_in"), f"{item_id}.legacy_removed_in"),
@@ -397,8 +388,6 @@ def _parse_registry(
 ) -> CompatibilityRegistry:
     """Parse registry data and optionally validate working-tree evidence."""
     _reject_unknown(raw_registry, REGISTRY_FIELDS, "registry")
-    if raw_registry.get("schema_version") != SCHEMA_VERSION:
-        raise RegistryError(f"compatibility registry schema_version must be {SCHEMA_VERSION}.")
     next_id = raw_registry.get("next_id")
     if not isinstance(next_id, int) or isinstance(next_id, bool) or next_id < 1:
         raise RegistryError("compatibility registry next_id must be a positive integer.")
@@ -444,69 +433,6 @@ def load_registry(registry_path: Path, repo_root: Path) -> CompatibilityRegistry
     return _parse_registry(raw_registry, repo_root, validate_repository=True)
 
 
-def _current_version(repo_root: Path) -> Version:
-    version_path = repo_root / DEFAULT_VERSION_PATH
-    try:
-        version_source = version_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise RegistryError(f"could not read {DEFAULT_VERSION_PATH}: {exc}") from exc
-    match = re.search(
-        r'^__version__\s*=\s*["\']([^"\']+)["\']\s*$',
-        version_source,
-        re.MULTILINE,
-    )
-    if match is None:
-        raise RegistryError(f"could not resolve __version__ from {DEFAULT_VERSION_PATH}.")
-    return Version.parse(match.group(1), str(DEFAULT_VERSION_PATH))
-
-
-def load_previous_registry(
-    repo_root: Path,
-    current_version: Version,
-) -> CompatibilityRegistry | None:
-    """Load the registry from the exact previous release tag, if governance existed then."""
-    if not _has_git_repository(repo_root):
-        return None
-    tag = f"v{current_version}"
-    tag_check = subprocess.run(
-        ["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"],
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if tag_check.returncode != 0:
-        raise RegistryError(f"previous release tag {tag} does not exist.")
-    registry_path = DEFAULT_REGISTRY.as_posix()
-    tree_result = subprocess.run(
-        ["git", "ls-tree", "--name-only", tag, "--", registry_path],
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if tree_result.returncode != 0:
-        details = tree_result.stderr.strip()
-        raise RegistryError(f"could not inspect compatibility registry in {tag}: {details}")
-    if registry_path not in tree_result.stdout.splitlines():
-        return None
-    result = subprocess.run(
-        ["git", "show", f"{tag}:{registry_path}"],
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        details = result.stderr.strip()
-        raise RegistryError(f"could not read compatibility registry from {tag}: {details}")
-    try:
-        raw_registry = tomllib.loads(result.stdout)
-    except tomllib.TOMLDecodeError as exc:
-        raise RegistryError(f"could not parse compatibility registry from {tag}: {exc}") from exc
-    return _parse_registry(raw_registry, repo_root, validate_repository=False)
-
-
 def _expected_label(expected_status: str | None) -> str:
     return expected_status if expected_status is not None else "registry removal"
 
@@ -514,9 +440,7 @@ def _expected_label(expected_status: str | None) -> str:
 def release_plan(
     items: Iterable[CompatibilityItem],
     target: Version,
-    previous: CompatibilityRegistry | None = None,
 ) -> list[str]:
-    items = tuple(items)
     lines = [f"Compatibility plan for release {target}:"]
     for item in items:
         expected = item.expected_status(target)
@@ -524,14 +448,6 @@ def release_plan(
             f"- {item.item_id} ({item.component}): {item.status} -> expected {_expected_label(expected)}; "
             f"{item.summary}"
         )
-    current_ids = {item.item_id for item in items}
-    if previous is not None:
-        for item in previous:
-            if item.item_id not in current_ids:
-                lines.append(
-                    f"- {item.item_id} ({item.component}): absent -> expected "
-                    f"{_expected_label(item.expected_status(target))}"
-                )
     return lines
 
 
@@ -548,40 +464,6 @@ def check_release(items: Iterable[CompatibilityItem], target: Version) -> None:
     if mismatches:
         details = "\n".join(f"- {mismatch}" for mismatch in mismatches)
         raise RegistryError(f"compatibility release gate failed:\n{details}")
-
-
-def check_registry_transition(
-    current: CompatibilityRegistry,
-    previous: CompatibilityRegistry | None,
-    target: Version,
-    repo_root: Path,
-) -> None:
-    """Protect retirement deadlines and the monotonic compatibility ID watermark."""
-    if previous is None:
-        return
-    if current.next_id < previous.next_id:
-        raise RegistryError(f"registry next_id decreased from {previous.next_id} to {current.next_id}.")
-    previous_by_id = {item.item_id: item for item in previous}
-    current_by_id = {item.item_id: item for item in current}
-    reused_ids = [
-        item.item_id
-        for item in current
-        if item.item_id not in previous_by_id and int(item.item_id.rsplit("-", 1)[1]) < previous.next_id
-    ]
-    if reused_ids:
-        raise RegistryError(f"retired compatibility item ID cannot be reused: {reused_ids[0]}.")
-    removed = [item for item in previous if item.item_id not in current_by_id]
-    premature = [item for item in removed if target < item.transition_purged_in]
-    if premature:
-        item = premature[0]
-        raise RegistryError(
-            f"{item.item_id} was removed before transition_purged_in {item.transition_purged_in}; target is {target}."
-        )
-    marker_matches = _marker_files(repo_root, (item.marker for item in removed))
-    for item in removed:
-        marker_files = marker_matches[item.marker]
-        if marker_files:
-            raise RegistryError(f"{item.item_id} was retired but its marker remains in {list(marker_files)}.")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -608,11 +490,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Compatibility registry is valid ({len(registry)} unfinished items).")
             return 0
         target = Version.parse(args.release_version, "--release-version")
-        previous = load_previous_registry(repo_root, _current_version(repo_root))
-        print("\n".join(release_plan(registry, target, previous)), flush=True)
+        print("\n".join(release_plan(registry, target)), flush=True)
         if args.command == "check":
             check_release(registry, target)
-            check_registry_transition(registry, previous, target, repo_root)
             print("Compatibility release gate passed.")
         return 0
     except RegistryError as exc:
