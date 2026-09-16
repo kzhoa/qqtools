@@ -20,6 +20,20 @@ std = ["lmdb", "tqdm", "requests"]
 plugins = ["rich", "scikit-learn", "prompt_toolkit"]
 exp = ["libtmux>=0.62.0", "psutil", "nvidia-ml-py"]
 dev = ["tox", "pytest", "ruff", "build"]
+# GitHub Dev Preflight dependency surface. Keep this explicit rather than
+# inheriting `full`: CI needs LMDB/metrics/qcgen/qexp lifecycle coverage, but it
+# does not need network download helpers, NVML/psutil tooling, package-build
+# tooling, or pytest-xdist.
+ci-preflight = [
+    "lmdb",
+    "tqdm",
+    "scikit-learn",
+    "prompt_toolkit",
+    "libtmux>=0.62.0",
+    "tox",
+    "pytest",
+    "ruff",
+]
 full = [
     "qqtools[std]",
     "qqtools[plugins]",

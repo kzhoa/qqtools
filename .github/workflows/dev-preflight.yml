@@ -31,14 +31,16 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       # GitHub-hosted runners have no GPU. Install the CPU wheel first so the
-      # project's unpinned `torch` dependency is already satisfied when full
-      # test dependencies are resolved. Local `tox -e preflight` intentionally
-      # keeps the normal/full torch installation policy for developer machines.
+      # project's unpinned `torch` dependency is already satisfied. CI then
+      # installs only the dependency surface required by the shared preflight
+      # gates. Local `tox -e preflight` intentionally keeps `.[full]` for
+      # developer machines.
       - name: Install CPU-only preflight environment
         run: |
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-          python -m pip install -e ".[full]" pytest-xdist
+          python -m pip install -e ".[ci-preflight]"
           python -c "import torch; assert torch.version.cuda is None, f'GitHub preflight must use CPU-only torch, got CUDA {torch.version.cuda}'"
+          python -c "import libtmux, lmdb, prompt_toolkit, sklearn; print('required preflight dependencies available')"
 
       - name: Run shared preflight gates in CI tox shell
         run: python -m tox run -e preflight-ci
