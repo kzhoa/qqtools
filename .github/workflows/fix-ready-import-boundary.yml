@@ -1,0 +1,60 @@
+name: Fix ready import boundary
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install ruff
+      - name: Move shared primary-ready protocol metadata to support module
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          protocol = Path('src/qqtools/plugins/qexp/runtime/ready/protocol.py')
+          protocol.write_text('''"""Shared protocol metadata for ready projections."""\n\nfrom __future__ import annotations\n\nfrom pathlib import Path\n\nfrom ..paths import shared_paths\n\nPRIMARY_READY_PROTOCOL_VERSION = 1\n\n\ndef projection_state_path(cfg: object) -> Path:\n    """Return the durable state path for the primary-ready projection."""\n    return shared_paths(cfg.shared_root)["ready_primary"] / "state.json"\n''', encoding='utf-8')
+
+          primary = Path('src/qqtools/plugins/qexp/runtime/ready/primary_candidates.py')
+          text = primary.read_text(encoding='utf-8')
+          old = '''from .records import ReadyMarkerRef, ReadyScope\n\nPRIMARY_READY_PROTOCOL_VERSION = 1\n\n\ndef route_key(scope: ReadyScope, machine: str) -> str:\n'''
+          new = '''from .protocol import PRIMARY_READY_PROTOCOL_VERSION, projection_state_path\nfrom .records import ReadyMarkerRef, ReadyScope\n\n\ndef route_key(scope: ReadyScope, machine: str) -> str:\n'''
+          if text.count(old) != 1:
+              raise SystemExit('unexpected primary_candidates protocol block')
+          text = text.replace(old, new, 1)
+          old_path = '''\n\ndef projection_state_path(cfg: object) -> Path:\n    return shared_paths(cfg.shared_root)["ready_primary"] / "state.json"\n'''
+          if text.count(old_path) != 1:
+              raise SystemExit('unexpected primary_candidates path helper')
+          primary.write_text(text.replace(old_path, '', 1), encoding='utf-8')
+
+          state = Path('src/qqtools/plugins/qexp/runtime/ready/state.py')
+          text = state.read_text(encoding='utf-8')
+          old = '    from .primary_candidates import PRIMARY_READY_PROTOCOL_VERSION, projection_state_path\n'
+          new = '    from .protocol import PRIMARY_READY_PROTOCOL_VERSION, projection_state_path\n'
+          if text.count(old) != 1:
+              raise SystemExit('unexpected state primary import')
+          state.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+          ruff check --fix src/qqtools/plugins/qexp/runtime/ready/protocol.py src/qqtools/plugins/qexp/runtime/ready/primary_candidates.py src/qqtools/plugins/qexp/runtime/ready/state.py
+          ruff format src/qqtools/plugins/qexp/runtime/ready/protocol.py src/qqtools/plugins/qexp/runtime/ready/primary_candidates.py src/qqtools/plugins/qexp/runtime/ready/state.py
+          git rm .github/workflows/fix-ready-import-boundary.yml
+          git diff --check
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/qqtools/plugins/qexp/runtime/ready
+          git commit -m "fix(qexp): preserve ready import boundaries"
+          git push origin HEAD:dev
