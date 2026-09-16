@@ -1,0 +1,71 @@
+name: Apply qexp handoff collision fix
+
+on:
+  push:
+    branches: [qexp-lifecycle-governance]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: qexp-lifecycle-governance
+      - name: Apply focused handoff identity fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one match in {path}, found {count}")
+              file.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          executor = "src/qqtools/plugins/qexp/executor.py"
+          replace_once(
+              executor,
+              """        if failure := failures.get(attempt.attempt_id):\n            raise failure\n""",
+              """        if failure := failures.get(handoff):\n            raise failure\n""",
+          )
+          replace_once(
+              executor,
+              '''    @staticmethod\n    def wait_for_launch_handoffs(\n        handoffs: list[LaunchHandoff],\n    ) -> dict[str, RuntimeError]:\n        """Wait for several runner handoffs against their independent deadlines."""\n        remaining = {handoff.attempt_id: handoff for handoff in handoffs}\n        failures: dict[str, RuntimeError] = {}\n        while remaining:\n            now = time.monotonic()\n            for attempt_id, handoff in list(remaining.items()):\n                if handoff.intent_path.exists():\n                    del remaining[attempt_id]\n                elif now >= handoff.deadline:\n                    failures[attempt_id] = RuntimeError(\n                        f"runner did not publish launch intent for {attempt_id!r}"\n                    )\n                    del remaining[attempt_id]\n            if remaining:\n                time.sleep(0.01)\n        return failures\n''',
+              '''    @staticmethod\n    def wait_for_launch_handoffs(\n        handoffs: list[LaunchHandoff],\n    ) -> dict[LaunchHandoff, RuntimeError]:\n        """Wait for handoffs by durable path identity, not project-local Attempt ID."""\n        remaining = list(handoffs)\n        failures: dict[LaunchHandoff, RuntimeError] = {}\n        while remaining:\n            now = time.monotonic()\n            for handoff in list(remaining):\n                if handoff.intent_path.exists():\n                    remaining.remove(handoff)\n                elif now >= handoff.deadline:\n                    failures[handoff] = RuntimeError(\n                        f"runner did not publish launch intent for {handoff.attempt_id!r}"\n                    )\n                    remaining.remove(handoff)\n            if remaining:\n                time.sleep(0.01)\n        return failures\n''',
+          )
+          replace_once(
+              executor,
+              """        if failure := failures.get(attempt_id):\n            raise failure\n""",
+              """        if failure := failures.get(handoff):\n            raise failure\n""",
+          )
+
+          dispatch = "src/qqtools/plugins/qexp/agent/dispatch_loop.py"
+          replace_once(
+              dispatch,
+              '''        for pending in self._pending:\n            if pending.attempt_id not in failures:\n                continue\n            fail_attempt(\n                pending.cfg,\n                pending.task_id,\n                pending.attempt_id,\n                pending.fencing_token,\n                "executor_launch_failed",\n                reservation_runtime_root=self._runtime_root,\n            )\n            launched = result_by_project[pending.project_id]["launched"]\n            if pending.task_id in launched:\n                launched.remove(pending.task_id)\n            item = result_by_project[pending.project_id]\n            item["status"] = "error"\n            item["error"] = str(failures[pending.attempt_id])\n''',
+              '''        for pending in self._pending:\n            failure = failures.get(pending.handoff)\n            if failure is None:\n                continue\n            fail_attempt(\n                pending.cfg,\n                pending.task_id,\n                pending.attempt_id,\n                pending.fencing_token,\n                "executor_launch_failed",\n                reservation_runtime_root=self._runtime_root,\n            )\n            launched = result_by_project[pending.project_id]["launched"]\n            if pending.task_id in launched:\n                launched.remove(pending.task_id)\n            item = result_by_project[pending.project_id]\n            item["status"] = "error"\n            item["error"] = str(failure)\n''',
+          )
+
+          tests = "tests/unit/qexp/test_executor.py"
+          replace_once(
+              tests,
+              '''def test_executor_reports_only_failed_handoffs(tmp_path: Path):\n    published = tmp_path / "published.json"\n    published.touch()\n    failures = Executor.wait_for_launch_handoffs(\n        [\n            LaunchHandoff("published", published, 0.0),\n            LaunchHandoff("missing", tmp_path / "missing.json", 0.0),\n        ]\n    )\n\n    assert list(failures) == ["missing"]\n    assert str(failures["missing"]) == "runner did not publish launch intent for 'missing'"\n''',
+              '''def test_executor_reports_only_failed_handoffs_with_duplicate_attempt_ids(tmp_path: Path):\n    published = tmp_path / "project-a" / "published.json"\n    published.parent.mkdir()\n    published.touch()\n    published_handoff = LaunchHandoff("shared-attempt", published, 0.0)\n    missing_handoff = LaunchHandoff("shared-attempt", tmp_path / "project-b" / "missing.json", 0.0)\n\n    failures = Executor.wait_for_launch_handoffs([published_handoff, missing_handoff])\n\n    assert list(failures) == [missing_handoff]\n    assert str(failures[missing_handoff]) == "runner did not publish launch intent for 'shared-attempt'"\n\n\ndef test_launch_batch_isolates_duplicate_attempt_ids_across_projects(tmp_path: Path, monkeypatch):\n    from qqtools.plugins.qexp.agent import dispatch_loop\n\n    successful_path = tmp_path / "project-a" / "intent.json"\n    successful_path.parent.mkdir()\n    successful_path.touch()\n    successful = LaunchHandoff("shared-attempt", successful_path, 0.0)\n    failed = LaunchHandoff("shared-attempt", tmp_path / "project-b" / "intent.json", 0.0)\n\n    class _BatchExecutor:\n        def wait_for_launch_handoffs(self, handoffs):\n            assert handoffs == [successful, failed]\n            return {failed: RuntimeError("handoff failed")}\n\n    cfg_a = RootConfig(tmp_path / "a" / ".qexp", tmp_path / "a", "gpu-1", tmp_path / "a" / "rt")\n    cfg_b = RootConfig(tmp_path / "b" / ".qexp", tmp_path / "b", "gpu-1", tmp_path / "b" / "rt")\n    batch = dispatch_loop._LaunchHandoffBatch(_BatchExecutor(), tmp_path / "machine")\n    batch._pending = [\n        dispatch_loop._PendingLaunchHandoff(cfg_a, "task", "shared-attempt", 7, "project-a", successful),\n        dispatch_loop._PendingLaunchHandoff(cfg_b, "task", "shared-attempt", 8, "project-b", failed),\n    ]\n    failed_attempts = []\n\n    def record_failure(cfg, task_id, attempt_id, fencing_token, reason, **_kwargs):\n        failed_attempts.append((cfg.shared_root, task_id, attempt_id, fencing_token, reason))\n\n    monkeypatch.setattr(dispatch_loop, "fail_attempt", record_failure)\n    results = {\n        "project-a": {"launched": ["task"], "status": "dispatched"},\n        "project-b": {"launched": ["task"], "status": "dispatched"},\n    }\n\n    batch.finish(results)\n\n    assert failed_attempts == [(cfg_b.shared_root, "task", "shared-attempt", 8, "executor_launch_failed")]\n    assert results["project-a"] == {"launched": ["task"], "status": "dispatched"}\n    assert results["project-b"]["launched"] == []\n    assert results["project-b"]["status"] == "error"\n    assert results["project-b"]["error"] == "handoff failed"\n''',
+          )
+          PY
+      - name: Commit fix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/qqtools/plugins/qexp/executor.py src/qqtools/plugins/qexp/agent/dispatch_loop.py tests/unit/qexp/test_executor.py
+          git diff --cached --check
+          git commit -m "fix(qexp): isolate batched launch handoffs"
+          git push origin HEAD:qexp-lifecycle-governance
