@@ -22,9 +22,10 @@ plugins = ["rich", "scikit-learn", "prompt_toolkit"]
 exp = ["libtmux>=0.62.0", "psutil", "nvidia-ml-py"]
 dev = ["tox", "pytest", "ruff", "build"]
 # GitHub Dev Preflight dependency surface. Keep this explicit rather than
-# inheriting `full`: CI needs LMDB/metrics/qcgen/qexp lifecycle coverage, but it
-# does not need network download helpers, plotting/data convenience packages,
-# NVML/psutil tooling, package-build tooling, or pytest-xdist.
+# inheriting `full`: CI needs LMDB/metrics/qcgen/qexp lifecycle coverage and
+# pytest-xdist's hook specification for the lifecycle gate, but it does not need
+# network download helpers, plotting/data convenience packages, NVML/psutil
+# tooling, or package-build tooling.
 ci-preflight = [
     "lmdb",
     "tqdm",
@@ -33,6 +34,7 @@ ci-preflight = [
     "libtmux>=0.62.0",
     "tox",
     "pytest",
+    "pytest-xdist",
     "ruff",
 ]
 full = [

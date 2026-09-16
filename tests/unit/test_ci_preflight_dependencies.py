@@ -9,6 +9,7 @@ EXPECTED_CI_PREFLIGHT = {
     "lmdb",
     "prompt_toolkit",
     "pytest",
+    "pytest-xdist",
     "ruff",
     "scikit-learn",
     "tox",
@@ -21,7 +22,7 @@ def test_ci_preflight_extra_is_explicit_and_minimal() -> None:
     dependencies = set(config["project"]["optional-dependencies"]["ci-preflight"])
 
     assert dependencies == EXPECTED_CI_PREFLIGHT
-    assert not {"build", "nvidia-ml-py", "psutil", "pytest-xdist", "requests"}.intersection(dependencies)
+    assert not {"build", "nvidia-ml-py", "psutil", "requests"}.intersection(dependencies)
 
 
 def test_dev_preflight_uses_cpu_only_focused_profile() -> None:
