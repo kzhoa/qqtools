@@ -20,9 +20,7 @@ from qqtools.plugins.qpipeline.entry_utils.loss import (
     prepare_loss,
 )
 from qqtools.plugins.qpipeline.entry_utils.optimizer import getCanonicalName, prepare_optimizer
-from qqtools.plugins.qpipeline.entry_utils.scheduler import (
-    prepare_scheduler,
-)
+from qqtools.plugins.qpipeline.entry_utils.scheduler import prepare_scheduler
 
 
 def test_str2bool_valid_and_invalid():

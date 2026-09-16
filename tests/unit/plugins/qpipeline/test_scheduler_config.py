@@ -1,10 +1,6 @@
 import pytest
 
-from qqtools.plugins.qpipeline.entry_utils.scheduler import (
-    SchedulerConfig,
-    WarmupConfig,
-    get_lambda_lr,
-)
+from qqtools.plugins.qpipeline.entry_utils.scheduler import SchedulerConfig, WarmupConfig, get_lambda_lr
 
 
 def test_warmup_config_rejects_invalid_factor() -> None:
