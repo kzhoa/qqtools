@@ -61,7 +61,7 @@ def ensure_ready_layout(cfg: object) -> None:
 
 def _activate_empty_ready_index(cfg: object, build_id: str) -> None:
     """Activate a new root's provably empty ready projection."""
-    from .primary_candidates import PRIMARY_READY_PROTOCOL_VERSION, projection_state_path
+    from .protocol import PRIMARY_READY_PROTOCOL_VERSION, projection_state_path
 
     paths = shared_paths(cfg.shared_root)
     if any(paths["tasks"].iterdir()):

@@ -11,18 +11,13 @@ from ..locks import exclusive
 from ..paths import group_path, shared_paths
 from ..records import TaskRecord, normalize_group_record, utc_now, validate_identifier
 from ..store import atomic_replace, read_json
+from .protocol import PRIMARY_READY_PROTOCOL_VERSION, projection_state_path
 from .records import ReadyMarkerRef, ReadyScope
-
-PRIMARY_READY_PROTOCOL_VERSION = 1
 
 
 def route_key(scope: ReadyScope, machine: str) -> str:
     validate_identifier(machine, "machine")
     return f"{scope}.{machine}"
-
-
-def projection_state_path(cfg: object) -> Path:
-    return shared_paths(cfg.shared_root)["ready_primary"] / "state.json"
 
 
 def _projection_rebuild_lock_path(cfg: object) -> Path:
