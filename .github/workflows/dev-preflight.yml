@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   preflight:
-    name: preflight (Python 3.13)
+    name: CPU-only preflight (Python 3.13)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -23,13 +23,22 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.13
+      - name: Set up Python 3.13 with pip cache
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
-      - name: Install tox
-        run: python -m pip install --upgrade pip tox
+      # GitHub-hosted runners have no GPU. Install the CPU wheel first so the
+      # project's unpinned `torch` dependency is already satisfied when full
+      # test dependencies are resolved. Local `tox -e preflight` intentionally
+      # keeps the normal/full torch installation policy for developer machines.
+      - name: Install CPU-only preflight environment
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[full]" pytest-xdist
+          python -c "import torch; assert torch.version.cuda is None, f'GitHub preflight must use CPU-only torch, got CUDA {torch.version.cuda}'"
 
-      - name: Run preflight
-        run: tox run -e preflight
+      - name: Run shared preflight gates
+        run: python scripts/ci/run_preflight.py
