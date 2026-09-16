@@ -26,11 +26,13 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import expire_claim
 from qqtools.plugins.qexp.tmux import is_libtmux_available
+from tests.helpers.qexp.lifecycle import LifecycleBranch, LifecycleLab, wait_all
 
 pytestmark = [pytest.mark.integration, pytest.mark.machine_lab]
 
 CONVERGENCE_BUDGET_SECONDS = 15.0
 PROCESS_START_BUDGET_SECONDS = 15.0
+POLL_INTERVAL_SECONDS = 0.01
 
 
 @pytest.fixture(autouse=True)
@@ -66,16 +68,59 @@ def _cleanup_owned_tmux(qexp_resource_scope):
     _wait_for(lambda: not _has_active_unix_socket(qexp_resource_scope.tmux_root), timeout=5)
 
 
-def _wait_for(predicate, *, timeout: float = CONVERGENCE_BUDGET_SECONDS) -> None:
+def _wait_for(
+    predicate,
+    *,
+    timeout: float = CONVERGENCE_BUDGET_SECONDS,
+    description: str = "lifecycle condition",
+    on_timeout=None,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
             return
-        time.sleep(0.05)
-    raise AssertionError("lifecycle condition did not converge within the declared budget")
+        time.sleep(POLL_INTERVAL_SECONDS)
+    diagnostics = on_timeout() if on_timeout is not None else None
+    suffix = f"; diagnostics={diagnostics}" if diagnostics is not None else ""
+    raise AssertionError(f"{description} did not converge within {timeout:.1f}s{suffix}")
 
 
-def _start_case(tmp_path: Path, *, exit_code: int = 0, seconds: float = 1.0, should_wait: bool = False):
+def _li03_timeout_diagnostics(cfg, runtime: MachineRuntime, task_id: str, process, *, observed: Path) -> dict:
+    """Capture the state needed to distinguish lease recovery from agent startup delay."""
+    try:
+        task = load_task(cfg, task_id)
+        task_state = {
+            "projection": task.state.get("projection"),
+            "reason": task.state.get("reason"),
+            "attempt": task.attempt_control,
+            "claim": task.claim_control.get("active_claim"),
+        }
+    except Exception as exc:  # diagnostics must not hide the original timeout
+        task_state = {"error": f"{type(exc).__name__}: {exc}"}
+    try:
+        agent = get_machine_agent_status(runtime)
+    except Exception as exc:
+        agent = {"error": f"{type(exc).__name__}: {exc}"}
+    try:
+        reservations = active_reservations(runtime.root)
+    except Exception as exc:
+        reservations = {"error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "task": task_state,
+        "agent": agent,
+        "reservations": reservations,
+        "process": {"pid": process.pid, "returncode": process.poll()},
+        "peer_observed": observed.exists(),
+    }
+
+
+def _create_case(
+    tmp_path: Path,
+    *,
+    exit_code: int = 0,
+    seconds: float = 1.0,
+    should_wait: bool = False,
+):
     project_root = tmp_path / "project"
     shared_root = project_root / ".qexp"
     cfg = init_shared_root(shared_root, "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy")
@@ -87,24 +132,38 @@ def _start_case(tmp_path: Path, *, exit_code: int = 0, seconds: float = 1.0, sho
         "-c",
         (
             "from pathlib import Path\nimport time\n"
-            f"p=Path({str(marker)!r})\np.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\n"
+            f"p=Path({str(marker)!r})\n"
+            "p.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\n"
             "deadline=time.monotonic()+60\n"
             f"while {should_wait!r} and not p.with_suffix('.finish').exists():\n"
             "    if time.monotonic()>deadline: raise SystemExit(99)\n"
             "    p.with_suffix('.progress').write_text(str(time.monotonic()))\n"
-            "    time.sleep(0.05)\n"
+            "    time.sleep(0.01)\n"
             f"time.sleep({0 if should_wait else seconds!r})\nraise SystemExit({exit_code})"
         ),
     ]
     task = submit(cfg, command, working_dir=project_root)
-    process = start_machine_agent(runtime, available_gpus=[0])
+    process = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
     return cfg, runtime, task, marker, process
 
 
+def _start_case(
+    tmp_path: Path,
+    *,
+    exit_code: int = 0,
+    seconds: float = 1.0,
+    should_wait: bool = False,
+):
+    return _create_case(tmp_path, exit_code=exit_code, seconds=seconds, should_wait=should_wait)
+
+
 def _wait_running(cfg, task_id: str, marker: Path | None = None) -> None:
-    _wait_for(lambda: load_task(cfg, task_id).state["projection"] == "running", timeout=PROCESS_START_BUDGET_SECONDS)
-    if marker is not None:
-        _wait_for(marker.exists, timeout=5.0)
+    def is_running_and_observed() -> bool:
+        if load_task(cfg, task_id).state["projection"] != "running":
+            return False
+        return marker is None or marker.exists()
+
+    _wait_for(is_running_and_observed, timeout=PROCESS_START_BUDGET_SECONDS)
 
 
 def _wait_terminal(cfg, task_id: str) -> object:
@@ -141,7 +200,7 @@ def test_li01_training_remains_live_and_is_not_relaunched(tmp_path: Path) -> Non
         _wait_for(lambda: progress.read_text() not in {"", previous})
         assert len(active_reservations(runtime.root)) == 1
         assert marker.read_text(encoding="utf-8") == "1"
-        restarted = restart_machine_agent(runtime, available_gpus=[0])
+        restarted = restart_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
         marker.with_suffix(".finish").touch()
         terminal = _wait_terminal(cfg, task.task_id)
         assert terminal.attempt_control["next_attempt_number"] == 2
@@ -155,32 +214,81 @@ def test_li01_training_remains_live_and_is_not_relaunched(tmp_path: Path) -> Non
         _cleanup(runtime, process)
 
 
-@pytest.mark.parametrize(("exit_code", "phase"), ((0, "succeeded"), (7, "failed")))
-def test_li02_offline_completion_preserves_exit_result(tmp_path: Path, exit_code: int, phase: str) -> None:
-    cfg, runtime, task, marker, process = _start_case(tmp_path, exit_code=exit_code, should_wait=True)
+def test_li02_offline_completion_preserves_exit_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("QEXP_VISIBLE_GPUS", "0,1")
+    project_root = tmp_path / "project"
+    cfg = init_shared_root(project_root / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+    paths = local_paths(runtime.project_paths(binding.project_id)["root"])
+    branches = []
+    for name, exit_code, phase in (("success", 0, "succeeded"), ("failure", 7, "failed")):
+        marker = tmp_path / name
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path\nimport time\n"
+                f"p=Path({str(marker)!r})\np.write_text('1')\n"
+                "deadline=time.monotonic()+60\n"
+                "while not p.with_suffix('.finish').exists():\n"
+                "    if time.monotonic()>deadline: raise SystemExit(99)\n"
+                "    time.sleep(0.01)\n"
+                f"raise SystemExit({exit_code})"
+            ),
+        ]
+        task = submit(cfg, command, working_dir=project_root)
+        branches.append((name, exit_code, phase, task, marker))
+    process = start_machine_agent(runtime, available_gpus=[0, 1], loop_interval=0.1)
     try:
-        _wait_running(cfg, task.task_id, marker)
+        wait_all(
+            {
+                f"running:{name}": lambda task=task, marker=marker: (
+                    load_task(cfg, task.task_id).state["projection"] == "running" and marker.exists()
+                )
+                for name, _exit_code, _phase, task, marker in branches
+            }
+        )
+        attempts = {
+            name: load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
+            for name, _exit_code, _phase, task, _marker in branches
+        }
         stop_machine_agent(runtime)
-        marker.with_suffix(".finish").touch()
-        binding = runtime.load_registry()[1][0]
-        paths = local_paths(runtime.project_paths(binding.project_id)["root"])
-        attempt_id = load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
-        _wait_for((paths["observations"] / f"{attempt_id}.json").exists)
-        assert load_task(cfg, task.task_id).state["projection"] == "running"
+        for _name, _exit_code, _phase, _task, marker in branches:
+            marker.with_suffix(".finish").touch()
+        wait_all(
+            {
+                f"observation:{name}": lambda name=name: (paths["observations"] / f"{attempts[name]}.json").exists()
+                for name, _exit_code, _phase, _task, _marker in branches
+            }
+        )
+        assert all(load_task(cfg, task.task_id).state["projection"] == "running" for *_, task, _ in branches)
         start = time.monotonic()
-        start_machine_agent(runtime, available_gpus=[0])
-        terminal = _wait_terminal(cfg, task.task_id)
+        restarted = start_machine_agent(runtime, available_gpus=[0, 1], loop_interval=0.1)
+        wait_all(
+            {
+                f"terminal:{name}": lambda task=task, phase=phase: (
+                    load_task(cfg, task.task_id).state["projection"] == phase
+                )
+                for name, _exit_code, phase, task, _marker in branches
+            }
+        )
         _wait_for(
             lambda: not active_reservations(runtime.root),
             timeout=max(0, CONVERGENCE_BUDGET_SECONDS - (time.monotonic() - start)),
         )
         assert time.monotonic() - start <= CONVERGENCE_BUDGET_SECONDS
-        assert terminal.state["projection"] == phase
-        attempt = read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]
-        assert attempt["result"]["exit_code"] == exit_code
-        assert marker.read_text(encoding="utf-8") == "1"
+        for name, exit_code, phase, task, marker in branches:
+            assert load_task(cfg, task.task_id).state["projection"] == phase
+            attempt = read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]
+            assert attempt["result"]["exit_code"] == exit_code, name
+            assert marker.read_text(encoding="utf-8") == "1", name
         assert active_reservations(runtime.root) == []
+        stop_machine_agent(runtime)
+        restarted.wait(timeout=5)
     finally:
+        for _name, _exit_code, _phase, _task, marker in branches:
+            marker.with_suffix(".finish").touch()
         _cleanup(runtime, process)
 
 
@@ -196,7 +304,7 @@ def test_li03_expired_claim_recovers_same_attempt_without_relaunch(tmp_path: Pat
         atomic_replace(claim_path, value)
         stop_machine_agent(runtime)
         assert expire_claim(cfg, task.task_id, claim["attempt_id"], claim["fencing_token"])
-        start_machine_agent(runtime, available_gpus=[0])
+        start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
         terminal = _wait_terminal(cfg, task.task_id)
         assert terminal.state["projection"] == "succeeded"
         assert marker.read_text(encoding="utf-8") == "1"
@@ -216,7 +324,7 @@ def test_li04_sigkill_agent_does_not_kill_runner(tmp_path: Path) -> None:
         attempt_id = load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
         _wait_for((paths["observations"] / f"{attempt_id}.json").exists)
         assert marker.read_text(encoding="utf-8") == "1"
-        start_machine_agent(runtime, available_gpus=[0])
+        start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
         assert _wait_terminal(cfg, task.task_id).state["projection"] == "succeeded"
     finally:
         _cleanup(runtime, process)
@@ -262,7 +370,7 @@ def test_li03_real_peer_observes_natural_lease_expiry(tmp_path: Path, is_finishe
     ]
     task = submit(cfg, command, working_dir=cfg.project_root, group="peers", sharing_mode="spillover")
     offer(cfg, task.task_id)
-    process = start_machine_agent(runtime, available_gpus=[0])
+    process = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
     peer = None
     observed = tmp_path / "peer-observed"
     try:
@@ -289,7 +397,7 @@ while time.monotonic()<deadline:
         assert claim_task(cfg,task_id,[0]) is None
         Path(observed).touch()
         break
-    time.sleep(0.05)
+    time.sleep(0.01)
 else: raise TimeoutError("peer did not observe natural expiry")
 """
         peer = subprocess.Popen(
@@ -306,15 +414,28 @@ else: raise TimeoutError("peer did not observe natural expiry")
             ],
             start_new_session=True,
         )
-        _wait_for(observed.exists)
+        _wait_for(
+            observed.exists,
+            description="LI-03 peer lease-expiry observation",
+            on_timeout=lambda: _li03_timeout_diagnostics(cfg, runtime, task.task_id, peer, observed=observed),
+        )
         assert peer.wait(timeout=5) == 0
         assert marker.read_text() == "1"
-        restarted = start_machine_agent(runtime, available_gpus=[0])
+        restarted = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
         if not is_finished:
-            _wait_for(lambda: load_task(cfg, task.task_id).state["projection"] == "running")
+            _wait_for(
+                lambda: load_task(cfg, task.task_id).state["projection"] == "running",
+                description="LI-03 recovered task projection",
+                on_timeout=lambda: _li03_timeout_diagnostics(cfg, runtime, task.task_id, restarted, observed=observed),
+            )
             assert load_task(cfg, task.task_id).attempt_control["current_attempt_id"] == claim["attempt_id"]
             finish.touch()
-        assert _wait_terminal(cfg, task.task_id).state["projection"] == "succeeded"
+        _wait_for(
+            lambda: load_task(cfg, task.task_id).state["projection"] == "succeeded",
+            description="LI-03 recovered task terminal projection",
+            on_timeout=lambda: _li03_timeout_diagnostics(cfg, runtime, task.task_id, restarted, observed=observed),
+        )
+        assert load_task(cfg, task.task_id).state["projection"] == "succeeded"
         assert marker.read_text() == "1"
         stop_machine_agent(runtime)
         restarted.wait(timeout=5)
@@ -366,12 +487,15 @@ run_machine_agent_loop(root, loop_interval=0.1, available_gpus=[0])
     process = subprocess.Popen(
         [sys.executable, "-c", script, boundary, str(runtime.root), str(reached)], start_new_session=True
     )
+    lab = LifecycleLab(runtime, [0])
+    lab.add_branch(LifecycleBranch(boundary, cfg, task, marker))
+    lab.adopt_process(process)
     try:
         _wait_for(reached.exists)
         assert process.wait(timeout=5) == 73
         assert not marker.exists()
         original_attempt = load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
-        restarted = start_machine_agent(runtime, available_gpus=[0])
+        restarted = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
         _wait_for(lambda: marker.exists() or load_task(cfg, task.task_id).state["projection"] == "blocked")
         if marker.exists():
             assert _wait_terminal(cfg, task.task_id).state["projection"] == "succeeded"
@@ -388,7 +512,7 @@ run_machine_agent_loop(root, loop_interval=0.1, available_gpus=[0])
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
-        _cleanup(runtime, process)
+        lab.close()
 
 
 def test_li05_agent_crash_between_process_creation_and_registration(tmp_path: Path) -> None:
@@ -445,6 +569,9 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
         [sys.executable, "-c", agent_script, str(runtime.root), runner_script, str(reached), str(resume)],
         start_new_session=True,
     )
+    lab = LifecycleLab(runtime, [0])
+    lab.add_branch(LifecycleBranch("registration", cfg, task, marker))
+    lab.adopt_process(process)
     try:
         _wait_for(lambda: reached.exists() or reached.with_suffix(".error").exists())
         assert not reached.with_suffix(".error").exists(), reached.with_suffix(".error").read_text()
@@ -453,7 +580,7 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
         assert not (paths["registrations"] / f"{attempt_id}.json").exists()
         process.kill()
         process.wait(timeout=5)
-        restarted = start_machine_agent(runtime, available_gpus=[0])
+        restarted = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
         assert marker.read_text() == "1"
         resume.touch()
         assert _wait_terminal(cfg, task.task_id).state["projection"] == "succeeded"
@@ -466,13 +593,15 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
-        _cleanup(runtime, process)
+        lab.close()
 
 
 @pytest.mark.parametrize("boundary", ["attempt", "task", "reservation"])
 @pytest.mark.parametrize("is_orphaned", [False, True])
 def test_li06_terminal_publication_is_idempotent(tmp_path: Path, boundary: str, is_orphaned: bool) -> None:
-    cfg, runtime, task, marker, process = _start_case(tmp_path, seconds=2.0)
+    # The runner only needs to publish exit evidence before the crash boundary;
+    # a short real process keeps that prerequisite while avoiding idle wall time.
+    cfg, runtime, task, marker, process = _start_case(tmp_path, seconds=0.2)
     crashing = None
     try:
         _wait_running(cfg, task.task_id, marker)
@@ -535,7 +664,7 @@ run_machine_agent_loop(root, loop_interval=0.1, available_gpus=[0])
         assert crashing.wait(timeout=5) == 73
         assert observation.exists(), "exit evidence must survive interrupted publication"
         for _ in range(2):
-            restarted = restart_machine_agent(runtime, available_gpus=[0])
+            restarted = restart_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
             assert _wait_terminal(cfg, task.task_id).state["projection"] == "succeeded"
             _wait_for(lambda: not active_reservations(runtime.root))
             stop_machine_agent(runtime)
@@ -551,102 +680,186 @@ run_machine_agent_loop(root, loop_interval=0.1, available_gpus=[0])
         _cleanup(runtime, process)
 
 
-@pytest.mark.parametrize("project_count,is_all_offline", [(2, False), (4, False), (4, True)])
-def test_li07_multiple_bindings_keep_identity_and_reservations_separate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, project_count: int, is_all_offline: bool
+def _create_li07_case(tmp_path: Path, runtime: MachineRuntime, name: str):
+    root = tmp_path / name
+    cfg = init_shared_root(root / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=root / "legacy")
+    binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+    marker, finish = root / "launch-count", root / "finish"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "from pathlib import Path\nimport time\n"
+            f"marker = Path({str(marker)!r})\nfinish = Path({str(finish)!r})\n"
+            "marker.write_text(str(int(marker.read_text()) + 1) if marker.exists() else '1')\n"
+            "deadline = time.monotonic() + 60\n"
+            "while not finish.exists():\n"
+            "    if time.monotonic() > deadline: raise SystemExit(99)\n"
+            "    time.sleep(0.01)\n"
+        ),
+    ]
+    task = submit(cfg, command, working_dir=root)
+    paths = local_paths(runtime.project_paths(binding.project_id)["root"])
+    return cfg, binding, task, marker, finish, paths
+
+
+def _wait_li07_running(cases) -> None:
+    wait_all(
+        {
+            f"running:{index}": lambda case=case: (
+                load_task(case[0], case[2].task_id).state["projection"] == "running" and case[3].exists()
+            )
+            for index, case in enumerate(cases)
+        }
+    )
+
+
+def _assert_li07_results(cases, identities) -> None:
+    for index, (cfg, _binding, task, marker, _finish, _paths) in enumerate(cases):
+        attempt = read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]
+        assert attempt["attempt_id"] == identities[index]
+        assert attempt["result"]["exit_code"] == 0
+        assert marker.read_text() == "1"
+
+
+def test_li07_cold_start_bindings_keep_identity_and_reservations_separate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    gpu_ids = list(range(project_count))
+    project_count = 4
+    gpu_ids = list(range(4))
     monkeypatch.setenv("QEXP_VISIBLE_GPUS", ",".join(map(str, gpu_ids)))
     runtime = MachineRuntime(tmp_path / "machine-runtime")
-    cases = []
-    for name in map(str, range(project_count)):
-        root = tmp_path / name
-        cfg = init_shared_root(root / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=root / "legacy")
-        binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
-        marker, finish = root / "launch-count", root / "finish"
-        command = [
-            sys.executable,
-            "-c",
-            (
-                "from pathlib import Path\nimport time\n"
-                f"marker = Path({str(marker)!r})\nfinish = Path({str(finish)!r})\n"
-                "marker.write_text(str(int(marker.read_text()) + 1) if marker.exists() else '1')\n"
-                "deadline = time.monotonic() + 60\n"
-                "while not finish.exists():\n"
-                "    if time.monotonic() > deadline: raise SystemExit(99)\n"
-                "    time.sleep(0.05)\n"
-            ),
-        ]
-        task = submit(cfg, command, working_dir=root)
-        paths = local_paths(runtime.project_paths(binding.project_id)["root"])
-        cases.append((cfg, binding, task, marker, finish, paths))
-    process = start_machine_agent(runtime, available_gpus=gpu_ids)
+    cases = [_create_li07_case(tmp_path, runtime, str(index)) for index in range(project_count)]
+    process = start_machine_agent(runtime, available_gpus=gpu_ids, loop_interval=0.1)
     try:
-        identities = []
-        for cfg, binding, task, marker, finish, paths in cases:
-            _wait_running(cfg, task.task_id, marker)
-            identities.append(load_task(cfg, task.task_id).attempt_control["current_attempt_id"])
+        _wait_li07_running(cases)
+        identities = [
+            load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
+            for cfg, _binding, task, _marker, _finish, _paths in cases
+        ]
         reservations = active_reservations(runtime.root)
         assert {item["project_id"] for item in reservations} == {case[1].project_id for case in cases}
         assert len(reservations) == project_count
         stop_machine_agent(runtime)
         cases[0][4].touch()
         _wait_for((cases[0][5]["observations"] / f"{identities[0]}.json").exists)
-        if is_all_offline:
-            for index, case in enumerate(cases[1:], 1):
-                case[4].touch()
-                _wait_for((case[5]["observations"] / f"{identities[index]}.json").exists)
-        else:
-            assert not (cases[1][5]["observations"] / f"{identities[1]}.json").exists()
+        assert not (cases[1][5]["observations"] / f"{identities[1]}.json").exists()
         assert len(active_reservations(runtime.root)) == project_count
         start = time.monotonic()
-        restarted = start_machine_agent(runtime, available_gpus=gpu_ids)
-        assert _wait_terminal(cases[0][0], cases[0][2].task_id).state["projection"] == "succeeded"
-        if is_all_offline:
-            for case in cases[1:]:
-                assert _wait_terminal(case[0], case[2].task_id).state["projection"] == "succeeded"
-            _wait_for(lambda: not active_reservations(runtime.root))
-        else:
-            _wait_for(lambda: len(active_reservations(runtime.root)) == project_count - 1)
-            assert {item["project_id"] for item in active_reservations(runtime.root)} == {
-                case[1].project_id for case in cases[1:]
+        restarted = start_machine_agent(runtime, available_gpus=gpu_ids, loop_interval=0.1)
+        wait_all(
+            {
+                "terminal:offline": lambda: (
+                    load_task(cases[0][0], cases[0][2].task_id).state["projection"] == "succeeded"
+                ),
+                "reservations:live": lambda: len(active_reservations(runtime.root)) == project_count - 1,
             }
-            for index, case in enumerate(cases[1:], 1):
-                assert load_task(case[0], case[2].task_id).attempt_control["current_attempt_id"] == identities[index]
-        assert time.monotonic() - start <= CONVERGENCE_BUDGET_SECONDS
-        print(
-            f"lifecycle workload={project_count} all_offline={is_all_offline} return_seconds={time.monotonic() - start:.3f}"
         )
+        assert {item["project_id"] for item in active_reservations(runtime.root)} == {
+            case[1].project_id for case in cases[1:]
+        }
+        for index, case in enumerate(cases[1:], 1):
+            assert load_task(case[0], case[2].task_id).attempt_control["current_attempt_id"] == identities[index]
+        assert time.monotonic() - start <= CONVERGENCE_BUDGET_SECONDS
         for case in cases[1:]:
             case[4].touch()
-            assert _wait_terminal(case[0], case[2].task_id).state["projection"] == "succeeded"
+        wait_all(
+            {
+                f"terminal:{index}": lambda case=case: (
+                    load_task(case[0], case[2].task_id).state["projection"] == "succeeded"
+                )
+                for index, case in enumerate(cases[1:], 1)
+            }
+        )
         _wait_for(lambda: not active_reservations(runtime.root))
-        for index, (cfg, binding, task, marker, finish, paths) in enumerate(cases):
-            attempt = read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]
-            assert attempt["attempt_id"] == identities[index]
-            assert attempt["result"]["exit_code"] == 0
-            assert marker.read_text() == "1"
+        _assert_li07_results(cases, identities)
         stop_machine_agent(runtime)
         restarted.wait(timeout=5)
     finally:
-        for cfg, binding, task, marker, finish, paths in cases:
+        for _cfg, _binding, _task, _marker, finish, _paths in cases:
+            finish.touch()
+        _cleanup(runtime, process)
+
+
+def test_li07_running_agent_discovers_dynamic_bindings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gpu_ids = list(range(4))
+    monkeypatch.setenv("QEXP_VISIBLE_GPUS", ",".join(map(str, gpu_ids)))
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    cases = [_create_li07_case(tmp_path, runtime, str(index)) for index in range(2)]
+    process = start_machine_agent(runtime, available_gpus=gpu_ids, loop_interval=0.1)
+    try:
+        _wait_li07_running(cases)
+        initial_ids = {case[1].project_id for case in cases}
+        initial_attempt_ids = [
+            load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
+            for cfg, _binding, task, _marker, _finish, _paths in cases
+        ]
+        cases.extend(_create_li07_case(tmp_path, runtime, str(index)) for index in range(2, 4))
+        _wait_li07_running(cases[2:])
+        identities = [
+            load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
+            for cfg, _binding, task, _marker, _finish, _paths in cases
+        ]
+        reservations = active_reservations(runtime.root)
+        assert {item["project_id"] for item in reservations} == {case[1].project_id for case in cases}
+        assert initial_ids < {item["project_id"] for item in reservations}
+        assert identities[:2] == initial_attempt_ids
+        stop_machine_agent(runtime)
+        for case in cases:
+            case[4].touch()
+        wait_all(
+            {
+                f"observation:{index}": lambda case=case, index=index: (
+                    case[5]["observations"] / f"{identities[index]}.json"
+                ).exists()
+                for index, case in enumerate(cases)
+            }
+        )
+        restarted = start_machine_agent(runtime, available_gpus=gpu_ids, loop_interval=0.1)
+        wait_all(
+            {
+                **{
+                    f"terminal:{index}": lambda case=case: (
+                        load_task(case[0], case[2].task_id).state["projection"] == "succeeded"
+                    )
+                    for index, case in enumerate(cases)
+                },
+                "reservations:released": lambda: not active_reservations(runtime.root),
+            }
+        )
+        _assert_li07_results(cases, identities)
+        stop_machine_agent(runtime)
+        restarted.wait(timeout=5)
+    finally:
+        for _cfg, _binding, _task, _marker, finish, _paths in cases:
             finish.touch()
         _cleanup(runtime, process)
 
 
 def test_li08_mismatched_exit_evidence_is_retained_as_blocker(tmp_path: Path) -> None:
-    cfg, runtime, task, marker, process = _start_case(tmp_path, seconds=0.2)
+    cfg, runtime, task, marker, process = _start_case(tmp_path, should_wait=True)
     try:
         _wait_running(cfg, task.task_id, marker)
         binding = runtime.load_registry()[1][0]
         paths = local_paths(runtime.project_paths(binding.project_id)["root"])
         stop_machine_agent(runtime)
+        marker.with_suffix(".finish").touch()
         observation = paths["observations"] / f"{task.task_id}-attempt-1.json"
-        _wait_for(observation.exists, timeout=5.0)
+        _wait_for(
+            observation.exists,
+            timeout=5.0,
+            description="LI-08 durable exit observation",
+            on_timeout=lambda: {
+                "attempt": load_task(cfg, task.task_id).attempt_control,
+                "agent": get_machine_agent_status(runtime),
+                "process_returncode": process.poll(),
+                "observation": str(observation),
+            },
+        )
         value = read_json(observation)
         value["exit_observation"]["task_id"] = "other-task"
         atomic_replace(observation, value)
-        start_machine_agent(runtime, available_gpus=[0])
+        start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
         diagnostic = paths["authority_diagnostics"] / observation.name
         _wait_for(
             lambda: (
@@ -672,7 +885,7 @@ def test_li08_missing_exit_observation_is_diagnosed(tmp_path: Path) -> None:
         observation = paths["observations"] / f"{attempt_id}.json"
         _wait_for(observation.exists)
         observation.rename(tmp_path / "withheld-observation.json")
-        restarted = start_machine_agent(runtime, available_gpus=[0])
+        restarted = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
         diagnostic = paths["authority_diagnostics"] / observation.name
         _wait_for(
             lambda: (
@@ -708,7 +921,7 @@ def test_li08_superseded_offline_attempt_preserves_evidence(tmp_path: Path) -> N
         retry(cfg, task.task_id)
         runtime.set_enabled(binding.project_id, False)
         expected = load_task(cfg, task.task_id).to_dict()
-        restarted = start_machine_agent(runtime, available_gpus=[0])
+        restarted = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
         diagnostic = paths["authority_diagnostics"] / observation.name
         _wait_for(
             lambda: (
@@ -734,9 +947,14 @@ def test_li08_cancellation_while_agent_offline_is_honored(tmp_path: Path) -> Non
         attempt_id = load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
         stop_machine_agent(runtime)
         cancel(cfg, task.task_id, reservation_runtime_root=runtime.root)
-        restarted = start_machine_agent(runtime, available_gpus=[0])
-        assert _wait_terminal(cfg, task.task_id).state["projection"] == "cancelled"
-        _wait_for(lambda: not active_reservations(runtime.root))
+        restarted = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
+        wait_all(
+            {
+                "task:cancelled": lambda: load_task(cfg, task.task_id).state["projection"] == "cancelled",
+                "reservation:released": lambda: not active_reservations(runtime.root),
+            }
+        )
+        assert load_task(cfg, task.task_id).state["projection"] == "cancelled"
         attempt = read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]
         assert attempt["attempt_id"] == attempt_id
         assert marker.read_text() == "1"
@@ -795,7 +1013,9 @@ def test_global_idle_policy_considers_every_binding(tmp_path: Path, modes: tuple
 def test_finished_process_releases_capacity_while_publication_is_unavailable(
     tmp_path: Path, failure_point: str
 ) -> None:
-    cfg, runtime, task, marker, process = _start_case(tmp_path, seconds=2)
+    # Publication failure is injected after local exit evidence exists; the
+    # runner does not need two seconds of unrelated work to reach that boundary.
+    cfg, runtime, task, marker, process = _start_case(tmp_path, should_wait=True)
     blocked_agent = None
     try:
         _wait_running(cfg, task.task_id, marker)
@@ -803,8 +1023,19 @@ def test_finished_process_releases_capacity_while_publication_is_unavailable(
         stop_machine_agent(runtime)
         binding = runtime.load_registry()[1][0]
         paths = local_paths(runtime.project_paths(binding.project_id)["root"])
+        marker.with_suffix(".finish").touch()
         observation = paths["observations"] / f"{attempt_id}.json"
-        _wait_for(observation.exists)
+        _wait_for(
+            observation.exists,
+            description="durable exit observation before publication outage",
+            on_timeout=lambda: {
+                "failure_point": failure_point,
+                "attempt": load_task(cfg, task.task_id).attempt_control,
+                "agent": get_machine_agent_status(runtime),
+                "process_returncode": process.poll(),
+                "observation": str(observation),
+            },
+        )
         evidence = read_json(observation)
         reached = tmp_path / "publication-blocked"
         script = """
@@ -831,7 +1062,7 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
         assert load_task(cfg, task.task_id).state["projection"] == "running"
         stop_machine_agent(runtime)
         blocked_agent.wait(timeout=5)
-        restarted = start_machine_agent(runtime, available_gpus=[0])
+        restarted = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
         assert _wait_terminal(cfg, task.task_id).state["projection"] == "succeeded"
         assert marker.read_text() == "1"
         stop_machine_agent(runtime)

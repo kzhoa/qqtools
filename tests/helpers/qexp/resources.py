@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 TEST_TMUX_BASE_ENV = "QQTOOLS_TEST_TMUX_BASE"
+TEST_SOURCE_ROOT_ENV = "QQTOOLS_TEST_SOURCE_ROOT"
 
 
 def _safe_node_name(nodeid: str) -> str:
@@ -91,6 +92,10 @@ class TestResourceScope:
     def child_environment(self, base: dict[str, str] | None = None) -> dict[str, str]:
         """Build an environment frozen before a participant imports qexp."""
         environment = dict(os.environ if base is None else base)
+        source_root = environment.get(TEST_SOURCE_ROOT_ENV)
+        if source_root:
+            python_path = environment.get("PYTHONPATH")
+            environment["PYTHONPATH"] = os.pathsep.join((source_root, python_path)) if python_path else source_root
         environment.update(
             {
                 "TMPDIR": str(self.local_temp_root),

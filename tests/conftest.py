@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -7,6 +8,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from multiprocessing.util import Finalize
 from pathlib import Path
 
 import pytest
@@ -19,15 +21,93 @@ INSTALLED_E2E_ROOT = PROJECT_ROOT / "tests" / "e2e"
 INSTALLED_E2E_PYTEST_INI = PROJECT_ROOT / "tests" / "e2e" / "installed_artifact_pytest.ini"
 PRESERVE_TEST_ARTIFACTS_ENV = "QQTOOLS_PRESERVE_TEST_ARTIFACTS"
 TEST_TMUX_BASE_ENV = "QQTOOLS_TEST_TMUX_BASE"
+TEST_SOURCE_ROOT_ENV = "QQTOOLS_TEST_SOURCE_ROOT"
 
 
 def pytest_addoption(parser):
-    parser.addoption("--lifecycle-gate", choices=("representative", "full", "installed"))
+    parser.addoption(
+        "--lifecycle-gate",
+        choices=("representative", "full", "installed"),
+    )
+    parser.addoption("--qexp-collection-manifest", type=Path)
+    parser.addoption("--qexp-timing-json", type=Path)
 
 
 def pytest_configure(config):
     if config.getoption("--lifecycle-gate"):
         config.pluginmanager.register(_LifecycleGate(config), "qexp-lifecycle-gate")
+    manifest = config.getoption("--qexp-collection-manifest")
+    if manifest is not None:
+        config.pluginmanager.register(_CollectionManifest(manifest), "qexp-collection-manifest")
+    timing_json = config.getoption("--qexp-timing-json")
+    if timing_json is not None:
+        config.pluginmanager.register(_TimingJson(timing_json), "qexp-timing-json")
+
+
+class _CollectionManifest:
+    """Persist the node IDs collected by a source-test phase."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.nodeids: set[str] = set()
+
+    def pytest_collection_finish(self, session):
+        self.nodeids.update(item.nodeid for item in session.items)
+
+    def pytest_xdist_node_collection_finished(self, node, ids):
+        self.nodeids.update(ids)
+
+    def pytest_sessionfinish(self, session, exitstatus):
+        if hasattr(getattr(session, "config", None), "workerinput"):
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("".join(f"{nodeid}\n" for nodeid in sorted(self.nodeids)), encoding="utf-8")
+
+
+class _TimingJson:
+    """Persist raw pytest phase reports without requiring a reporting plugin."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.started_at = time.monotonic()
+        self.reports: list[dict[str, object]] = []
+        self.has_skipped = False
+
+    def pytest_runtest_logreport(self, report):
+        self.has_skipped = self.has_skipped or report.skipped
+        self.reports.append(
+            {
+                "nodeid": report.nodeid,
+                "when": report.when,
+                "outcome": report.outcome,
+                "duration_seconds": report.duration,
+            }
+        )
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_sessionfinish(self, session, exitstatus):
+        if hasattr(getattr(session, "config", None), "workerinput"):
+            return
+        if self.has_skipped and session.exitstatus == pytest.ExitCode.OK:
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        finished_at = time.monotonic()
+        payload = {
+            "exit_code": int(session.exitstatus),
+            "duration_seconds": finished_at - self.started_at,
+            "has_skipped": self.has_skipped,
+            "reports": self.reports,
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def pytest_collection_modifyitems(items):
+    """Derive Integration ownership from the canonical filesystem layer."""
+    integration_root = (PROJECT_ROOT / "tests" / "integration").resolve()
+    for item in items:
+        path = Path(str(item.path)).resolve()
+        if path == integration_root or integration_root in path.parents:
+            item.add_marker(pytest.mark.integration)
 
 
 class _LifecycleGate:
@@ -36,8 +116,7 @@ class _LifecycleGate:
     representative_names = frozenset(
         {
             "test_li01_training_remains_live_and_is_not_relaunched",
-            "test_li02_offline_completion_preserves_exit_result[0-succeeded]",
-            "test_li02_offline_completion_preserves_exit_result[7-failed]",
+            "test_li02_offline_completion_preserves_exit_results",
             "test_li04_sigkill_agent_does_not_kill_runner",
         }
     )
@@ -55,9 +134,8 @@ class _LifecycleGate:
             "test_li06_terminal_publication_is_idempotent[True-attempt]",
             "test_li06_terminal_publication_is_idempotent[True-task]",
             "test_li06_terminal_publication_is_idempotent[True-reservation]",
-            "test_li07_multiple_bindings_keep_identity_and_reservations_separate[2-False]",
-            "test_li07_multiple_bindings_keep_identity_and_reservations_separate[4-False]",
-            "test_li07_multiple_bindings_keep_identity_and_reservations_separate[4-True]",
+            "test_li07_cold_start_bindings_keep_identity_and_reservations_separate",
+            "test_li07_running_agent_discovers_dynamic_bindings",
             "test_li08_mismatched_exit_evidence_is_retained_as_blocker",
             "test_li08_missing_exit_observation_is_diagnosed",
             "test_li08_superseded_offline_attempt_preserves_evidence",
@@ -87,11 +165,30 @@ class _LifecycleGate:
 
     def pytest_collection_finish(self, session):
         items = [item for item in session.items if item.path.name == "test_agent_lifecycle_independence.py"]
-        required_names = self.representative_names if self.mode == "representative" else self.full_names
+        if self.mode == "representative":
+            required_names = self.representative_names
+        else:
+            required_names = self.full_names
         missing = sorted(required_names - {item.name for item in items})
         if missing:
             raise pytest.UsageError("Missing lifecycle gate cases: " + ", ".join(missing))
         self.required = {item.nodeid for item in items}
+
+    def pytest_xdist_node_collection_finished(self, node, ids):
+        """Collect the lifecycle matrix once on the xdist controller."""
+        lifecycle_ids = {
+            nodeid for nodeid in ids if nodeid.split("::", 1)[0].endswith("test_agent_lifecycle_independence.py")
+        }
+        if not lifecycle_ids:
+            return
+        collected_names = {nodeid.rsplit("::", 1)[-1] for nodeid in lifecycle_ids}
+        expected_names = self.representative_names if self.mode == "representative" else self.full_names
+        missing = sorted(expected_names - collected_names)
+        if missing:
+            raise pytest.UsageError("Missing lifecycle gate cases: " + ", ".join(missing))
+        if self.required and self.required != lifecycle_ids:
+            raise pytest.UsageError("xdist workers collected different lifecycle gate cases")
+        self.required = lifecycle_ids
 
     def pytest_runtest_logreport(self, report):
         if report.nodeid not in self.required:
@@ -102,12 +199,21 @@ class _LifecycleGate:
             self.passed.add(report.nodeid)
 
     def pytest_sessionfinish(self, session, exitstatus):
+        if hasattr(getattr(session, "config", None), "workerinput"):
+            return
         is_over_budget = time.monotonic() - self.started_at > self.budget_seconds
+        config = getattr(session, "config", None)
+        reporter = config.pluginmanager.get_plugin("terminalreporter") if config is not None else None
         if is_over_budget:
-            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
             if reporter is not None:
                 reporter.write_line(f"Lifecycle gate exceeded {self.budget_seconds}s budget", red=True)
         if self.failed or not self.required or self.passed != self.required or is_over_budget:
+            if reporter is not None:
+                reporter.write_line(
+                    f"Lifecycle gate diagnostics: required={len(self.required)} "
+                    f"passed={len(self.passed)} failed={self.failed} over_budget={is_over_budget}",
+                    red=True,
+                )
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
@@ -212,6 +318,10 @@ def _should_preserve_test_artifacts() -> bool:
     return os.environ.get(PRESERVE_TEST_ARTIFACTS_ENV) == "1"
 
 
+def _cleanup_session_temp_root(root: Path) -> None:
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def _workspace_mkdtemp(suffix=None, prefix=None, dir=None):
     suffix = "" if suffix is None else suffix
     prefix = "tmp" if prefix is None else prefix
@@ -256,7 +366,12 @@ class _WorkspaceTemporaryDirectory:
         if not self._delete:
             return
 
-        shutil.rmtree(self.name, ignore_errors=self._ignore_cleanup_errors)
+        try:
+            shutil.rmtree(self.name, ignore_errors=self._ignore_cleanup_errors)
+        except FileNotFoundError:
+            # A parent fixture or multiprocessing finalizer may already own the
+            # same temporary subtree. Cleanup is intentionally idempotent.
+            return
 
     def __del__(self):
         try:
@@ -268,19 +383,30 @@ class _WorkspaceTemporaryDirectory:
 @pytest.fixture(autouse=True, scope="session")
 def _configure_temp_root_for_session(request):
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    # Multiprocessing owns children below tempfile.tempdir until its atexit
+    # finalizers complete. A negative-priority finalizer runs after them.
+    root_finalizer = Finalize(
+        None,
+        _cleanup_session_temp_root,
+        args=(TMP_ROOT,),
+        exitpriority=-100,
+    )
 
     previous_tempdir = tempfile.tempdir
-    previous_env = {key: os.environ.get(key) for key in ("TMPDIR", "TMP", "TEMP", TEST_TMUX_BASE_ENV)}
+    previous_env = {
+        key: os.environ.get(key) for key in ("TMPDIR", "TMP", "TEMP", TEST_TMUX_BASE_ENV, TEST_SOURCE_ROOT_ENV)
+    }
     original_mkdtemp = tempfile.mkdtemp
     original_temporary_directory = tempfile.TemporaryDirectory
     tmp_root_str = str(TMP_ROOT)
 
-    # Make all tempfile-based APIs resolve under project-local ./tmp.
+    # Keep tempfile-based APIs under /tmp when usable, with project-local ./tmp as fallback.
     tempfile.tempdir = tmp_root_str
     os.environ["TMPDIR"] = tmp_root_str
     os.environ["TMP"] = tmp_root_str
     os.environ["TEMP"] = tmp_root_str
     os.environ[TEST_TMUX_BASE_ENV] = str(TEST_TMP_BASE)
+    os.environ[TEST_SOURCE_ROOT_ENV] = str(SRC_ROOT)
     tempfile.mkdtemp = _workspace_mkdtemp
     tempfile.TemporaryDirectory = _WorkspaceTemporaryDirectory
 
@@ -296,8 +422,11 @@ def _configure_temp_root_for_session(request):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        if not _should_preserve_test_artifacts() and not getattr(request.config, "_has_lifecycle_artifacts", False):
-            shutil.rmtree(TMP_ROOT, ignore_errors=True)
+        should_preserve_root = _should_preserve_test_artifacts() or getattr(
+            request.config, "_has_lifecycle_artifacts", False
+        )
+        if should_preserve_root:
+            root_finalizer.cancel()
 
 
 @pytest.fixture
@@ -311,9 +440,7 @@ def tmp_path(request):
         shutil.rmtree(case_dir, ignore_errors=True)
     case_dir.mkdir(parents=True, exist_ok=True)
     node_path = getattr(request.node, "path", None)
-    should_preserve_lifecycle = bool(
-        node_path is not None and node_path.name == "test_agent_lifecycle_independence.py"
-    )
+    should_preserve_lifecycle = bool(node_path is not None and node_path.name == "test_agent_lifecycle_independence.py")
     if should_preserve_lifecycle:
         request.config._has_lifecycle_artifacts = True
 

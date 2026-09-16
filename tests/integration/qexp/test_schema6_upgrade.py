@@ -8,6 +8,8 @@ from qqtools.plugins.qexp.machine_config import init_shared_root
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.schema6_upgrade import attest_schema6_upgrade, resume_schema6_upgrade, start_schema6_upgrade
 
+pytestmark = pytest.mark.integration
+
 
 def _legacy_root(tmp_path: Path):
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1")

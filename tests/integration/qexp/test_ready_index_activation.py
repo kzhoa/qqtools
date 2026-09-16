@@ -34,6 +34,11 @@ from qqtools.plugins.qexp.runtime.work_budget import SliceBudget, WorkBudgetPoli
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
+class _NoopExecutor:
+    def launch_attempt(self, _cfg, _task_id, _attempt) -> None:
+        pass
+
+
 def test_ready_state_facade_exports_the_actual_owner_symbols() -> None:
     from qqtools.plugins.qexp.runtime import ready
 
@@ -57,6 +62,46 @@ def test_primary_rebuild_initializes_the_complete_ready_layout(tmp_path: Path) -
     assert paths["ready_primary"].is_dir()
     primary = read_json(paths["ready_primary"] / "state.json")["primary_ready_index"]
     assert primary["state"] == "rebuilding"
+
+
+def test_new_root_starts_with_an_active_empty_ready_projection(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    paths = shared_paths(cfg.shared_root)
+
+    assert read_ready_index_state(cfg) == "active"
+    assert read_json(paths["ready_primary"] / "state.json")["primary_ready_index"]["state"] == "active"
+    assert read_json(paths["ready"] / "state.json")["ready_index"]["build"]["watermark"]["task_count"] == 0
+
+
+def test_first_dispatch_from_new_root_does_not_rebuild_ready_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qqtools.plugins.qexp.agent.context import MachineRuntime
+    from qqtools.plugins.qexp.agent.lifecycle import dispatch_machine_cycle_locked
+
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    submit(cfg, ["echo", "ok"], working_dir=tmp_path)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    build_calls: list[str] = []
+
+    def unexpected_build(_cfg):
+        build_calls.append(read_ready_index_state(_cfg))
+        raise AssertionError("active fresh-root projection must not enter ready rebuild")
+
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.dispatch_loop.advance_ready_index_build", unexpected_build)
+
+    dispatch_machine_cycle_locked(
+        runtime,
+        available_gpus=[0],
+        executor=_NoopExecutor(),
+        supervise=False,
+        publish_snapshots=False,
+    )
+
+    assert build_calls == []
+    assert read_ready_index_state(cfg) == "active"
 
 
 def _ready_reference(cfg, task: TaskRecord):
@@ -94,6 +139,22 @@ def _make_legacy_task(cfg, task_id: str) -> TaskRecord:
     return TaskRecord.from_dict(value)
 
 
+def _reset_ready_index_for_legacy_build(cfg) -> None:
+    path = ready_state_path(cfg.shared_root)
+    value = read_json(path)
+    value["ready_index"].update(
+        {
+            "state": "absent",
+            "writer_capability": None,
+            "build": None,
+            "degraded_reasons": [],
+        }
+    )
+    atomic_replace(path, value)
+    primary_state = shared_paths(cfg.shared_root)["ready_primary"] / "state.json"
+    primary_state.unlink(missing_ok=True)
+
+
 def _finish_build(cfg, *, max_tasks: int = 64) -> dict:
     record = advance_ready_index_build(cfg, max_tasks=max_tasks)
     while record["state"] == "building":
@@ -104,6 +165,7 @@ def _finish_build(cfg, *, max_tasks: int = 64) -> dict:
 def test_build_backfills_legacy_task_and_activates_atomically(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     legacy = _make_legacy_task(cfg, "legacy-task")
+    _reset_ready_index_for_legacy_build(cfg)
 
     record = _finish_build(cfg, max_tasks=1)
 
@@ -119,6 +181,7 @@ def test_build_backfills_legacy_task_and_activates_atomically(tmp_path: Path) ->
 
 def test_build_gate_waits_for_inflight_schema_writer(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    _reset_ready_index_for_legacy_build(cfg)
     started = threading.Event()
     finished = threading.Event()
 
@@ -146,6 +209,7 @@ def test_build_advance_never_waits_for_schema_while_holding_ready_state_lock(
     """Regression for the former state -> schema lock-order inversion."""
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     _make_legacy_task(cfg, "deadlock-task")
+    _reset_ready_index_for_legacy_build(cfg)
     begin_ready_index_build(cfg)
     from qqtools.plugins.qexp.runtime.ready import rebuild as ready_runtime
 
@@ -176,6 +240,7 @@ def test_build_cursor_is_persistent_and_batch_bounded(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     for index in range(3):
         _make_legacy_task(cfg, f"legacy-{index}")
+    _reset_ready_index_for_legacy_build(cfg)
 
     first = advance_ready_index_build(cfg, max_tasks=2)
     persisted = read_json(ready_state_path(cfg.shared_root))["ready_index"]
@@ -190,6 +255,7 @@ def test_build_cursor_is_persistent_and_batch_bounded(tmp_path: Path) -> None:
 def test_task_created_during_build_is_covered_by_writer_protocol(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     _make_legacy_task(cfg, "legacy-task")
+    _reset_ready_index_for_legacy_build(cfg)
     first = advance_ready_index_build(cfg, max_tasks=1)
     assert first["state"] == "building"
 
@@ -236,6 +302,7 @@ def test_reinitialization_preserves_active_writer_gate(tmp_path: Path) -> None:
 def test_final_audit_rejects_non_list_catalog_partitions(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "corrupt"], task_id="corrupt-task")
+    _reset_ready_index_for_legacy_build(cfg)
     first = advance_ready_index_build(cfg, max_tasks=1)
     assert first["build"]["phase"] == "audit"
     reference = _ready_reference(cfg, load_task(cfg, task.task_id))
@@ -433,6 +500,7 @@ def test_marker_identity_diagnostic_omits_unsafe_observed_value(tmp_path: Path) 
 def test_final_audit_rechecks_schema_writer_gate(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     submit(cfg, ["echo", "gate"], task_id="gate-task")
+    _reset_ready_index_for_legacy_build(cfg)
     first = advance_ready_index_build(cfg, max_tasks=1)
     assert first["build"]["phase"] == "audit"
     schema_path = shared_paths(cfg.shared_root)["schema"] / "version.json"
@@ -584,6 +652,7 @@ def test_recent_incompatible_agent_blocks_cutover(tmp_path: Path) -> None:
     agent = read_json(agent_path)
     del agent["agent"]["writer_capability"]
     atomic_replace(agent_path, agent)
+    _reset_ready_index_for_legacy_build(cfg)
 
     record = _finish_build(cfg)
 

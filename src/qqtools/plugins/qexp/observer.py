@@ -35,19 +35,24 @@ def _task_view(task: TaskRecord) -> dict[str, Any]:
 def list_tasks(
     cfg: RootConfig, *, phase: str | None = None, group: str | None = None, limit: int = 50
 ) -> list[dict[str, Any]]:
+    """Return the first matching Task views without scanning past a positive limit."""
+    if limit == 0:
+        return []
     result = []
     for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
         task = TaskRecord.from_dict(read_json(path))
         view = _task_view(task)
-        gate = dependency_gate(cfg, task)
-        view["depends_on_task_ids"] = task.depends_on_task_ids
-        view["dependency_state"] = gate.state
-        view["dependency_reasons"] = list(gate.reasons)
         if phase and view["phase"] != phase:
             continue
         if group and view["group"] != group:
             continue
+        gate = dependency_gate(cfg, task)
+        view["depends_on_task_ids"] = task.depends_on_task_ids
+        view["dependency_state"] = gate.state
+        view["dependency_reasons"] = list(gate.reasons)
         result.append(view)
+        if limit > 0 and len(result) >= limit:
+            break
     return result[:limit]
 
 

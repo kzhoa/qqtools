@@ -27,10 +27,13 @@ def spawn_machine_agent_process(
     runtime: MachineRuntime | str | Path | None = None,
     *,
     available_gpus: list[int] | None = None,
+    loop_interval: float | None = None,
     stdin=None,
     stdout=None,
     stderr=None,
 ) -> subprocess.Popen:
+    if loop_interval is not None and loop_interval <= 0:
+        raise ValueError("loop_interval must be positive.")
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     machine_runtime.ensure_layout()
     startup_log = tempfile.TemporaryFile(mode="w+", encoding="utf-8") if stderr is None else None
@@ -43,6 +46,8 @@ def spawn_machine_agent_process(
     ]
     if available_gpus is not None:
         command.extend(("--available-gpus", ",".join(str(item) for item in available_gpus)))
+    if loop_interval is not None:
+        command.extend(("--loop-interval", str(loop_interval)))
     environment = os.environ.copy()
     source_root = str(Path(__file__).resolve().parents[4])
     existing_pythonpath = environment.get("PYTHONPATH")

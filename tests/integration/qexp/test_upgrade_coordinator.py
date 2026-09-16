@@ -26,6 +26,8 @@ from qqtools.plugins.qexp.runtime.upgrade.machine import (
     inspect_registered_upgrades,
 )
 
+pytestmark = pytest.mark.integration
+
 
 class _OnlinePlugin(MigrationPlugin):
     spec = MigrationSpec(
@@ -304,8 +306,10 @@ def test_production_activation_keeps_schema_readable_by_strict_legacy_reader(tmp
         "version",
         "minimum_reader_version",
         "created_at",
+        "writer_capabilities",
         "required_capabilities",
     }
+    assert schema["writer_capabilities"] == ["ready-v1"]
     assert read_schema_version(cfg) == 6
 
 

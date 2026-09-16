@@ -13,7 +13,8 @@ The earlier exploratory candidate runs preceded a complete gate-runtime budget d
 they cannot retroactively satisfy the pitch's ordering requirement. For subsequent acceptance
 runs, freeze these limits: 15 seconds for return-to-convergence of four healthy-storage Attempts,
 90 seconds for the representative lifecycle pytest call, 600 seconds for the complete qexp
-Integration pytest call, and 90 seconds for the installed lifecycle pytest call. Build and
+Integration aggregate entrypoint (ordinary and lifecycle phases together), and 90 seconds for the
+installed lifecycle pytest call. Build and
 dependency installation time is reported separately. Exceeding a limit fails that acceptance run;
 do not raise it to accept the observation. These prospective limits do not erase the earlier
 process deviation.
@@ -137,14 +138,14 @@ subsequently reproduced together against that source (3 failed in 22.07 seconds)
 All five preflight failures reproduce without the candidate runtime changes in the same
 preflight environment. This attribution does not make the source gate green.
 
-Four-Attempt candidate mixed-work measurement:
+Historical four-Attempt candidate mixed-work measurement:
 `PYTHONPATH=src pytest tests/integration/qexp/test_agent_lifecycle_independence.py -k li07 -xqs`
 passed the 2- and 4-project variants in 24.95 seconds. Return to terminal projection and capacity
 release for the offline-completed Task measured 1.480 and 1.586 seconds respectively; remaining
 live project reservations stayed isolated and all launch counters remained one. Equivalent
 untouched-baseline measurement remains pending; the all-completed candidate is recorded below.
 
-The four-offline-completed candidate variant subsequently passed:
+The historical four-offline-completed candidate variant subsequently passed:
 `PYTHONPATH=src pytest tests/integration/qexp/test_agent_lifecycle_independence.py -k 'li07 and True' -xqs`:
 1 passed in 9.69 seconds; return-to-terminal-and-capacity convergence was 1.578 seconds for all
 four Attempts. Every runner observation existed before return, original Attempt IDs and zero
@@ -157,11 +158,11 @@ baseline measurement remains pending.
 | LI-03 | Real peer with natural lease expiry now covers live and completed cases; 2 passed in 20.38 seconds. |
 | LI-05 | Authorization and process-registration interruption tests pass; strict identity and no-duplicate assertions retained. |
 | LI-06 | Active-claim and orphan publication interruptions at Attempt, Task and reservation boundaries pass. Orphan replay preserves the committed result and rejects a wrong fencing token. |
-| LI-07 | Two active projects with mixed live/finished work and isolated reservations pass. |
+| LI-07 | Four cold-start bindings preserve mixed live/finished reservation isolation; a separate running-agent scenario proves registry-revision discovery when two more bindings are added dynamically, followed by four-way offline completion recovery. |
 | LI-08 | Missing/mismatched evidence and explicit supersession have diagnosis/retention coverage; termination boundary is covered by regression tests. |
 | LI-09 | Installed CLI verifies runner exit observation before return, original Attempt, exit code, archive and reservation release. Latest installed gate: 1 passed in 10.09 seconds; rebuild after later production edits. |
 | Global idle | Multi-binding ordering, consumed-binding empty registry, unresolved demand, failed-first-binding consumption, and pending repair operations have real-process coverage. |
-| Gates | Exact required nodes are checked, including parameters. Missing/skip/teardown/nonexecution/over-budget rejection has unit coverage. Current complete lifecycle gate, qexp Integration, and installed workflow pass within their frozen budgets. |
+| Gates | Exact required nodes are checked, including parameters. Ordinary qexp integration and the complete lifecycle matrix each run in controlled four-worker xdist phases; every node retains an isolated temp/runtime/tmux/authority namespace. Missing/skip/teardown/nonexecution/over-budget rejection has unit coverage. |
 | Storage/capacity | Injected terminal-publication, pre-processing, and binding-load outages verify capacity release with evidence retention; broader filesystem corruption remains out of scope. |
 | Budgets | Tracked probe measures baseline/candidate convergence and evidence size. Prospective gate budgets are enforced, retaining the 15-second convergence limit. Earlier budget-ordering deviation remains disclosed above. |
 | Documentation | Product/runtime contract, precise mappings, evidence retention rules, lifecycle decision, and archived-pitch references are synchronized as of 2026-09-12. |
@@ -169,3 +170,42 @@ baseline measurement remains pending.
 No elapsed-downtime cleanup is permitted for unresolved evidence. The current 15-second
 convergence limit must not be raised to accept a failing run. Historical four-Attempt measurements
 remain diagnostic; the current gate results above are the acceptance evidence.
+
+## Aggregate gate evidence contract (2026-09-15)
+
+The `qexp-integration` tox environment now delegates to `scripts/qexp_integration_gate.py`. The
+wrapper preserves the existing two four-worker phases, but applies one 600-second wall-clock budget
+to their combined collection, execution, and teardown path. Each phase receives a separate JUnit
+XML file, stdout/stderr logs, collection manifest, and raw per-report timing JSON; `summary.json`
+records phase exit codes, durations, status, Python version, and `GITHUB_SHA` when available. The
+wrapper removes only its own known report files at startup, so a rerun cannot inherit stale phase
+artifacts. A collection failure, worker
+failure, timeout, or cleanup failure is non-zero and is not converted to success by a later passing
+phase. CI profiling uploads the report directory on both success and failure. The wrapper adds
+observability and budget aggregation only; it does not claim current-SHA CI acceptance until a run
+on that SHA is archived here.
+
+Two independent local runs of the final aggregate-gate implementation completed on 2026-09-15.
+They used Python 3.13.12 and the same checkout, but the checkout still contained the uncommitted
+Batch 1 changes, so these are local implementation evidence rather than fixed-SHA or CI
+attestations:
+
+- run 1: 95.70 seconds aggregate; ordinary 32.86 seconds (487 passed), lifecycle 62.84
+  seconds (34 passed);
+- run 2: 96.55 seconds aggregate; ordinary 32.66 seconds (487 passed), lifecycle 63.89
+  seconds (34 passed).
+
+Both runs collected 521 required nodes, reported no skips, and completed within the shared
+600-second execution budget. The report directory is intentionally ignored because it contains
+ephemeral local evidence; fixed-SHA CI artifacts remain the durable acceptance source.
+
+The first profiling run for fixed SHA `687573d` (GitHub Actions run
+`35060672167 <https://github.com/kzhoa/qqtools/actions/runs/35060672167>`) completed on
+2026-09-16 and failed in the lifecycle phase: ordinary passed, while 32 of 34 lifecycle nodes
+passed. The two failures were
+`test_li08_mismatched_exit_evidence_is_retained_as_blocker` and
+`test_finished_process_releases_capacity_while_publication_is_unavailable[_finalize]`; both
+timed out waiting for durable process-observation evidence. The run uploaded the phase JUnit,
+manifest, timing, and stdout/stderr artifacts. This is current-SHA failure evidence, not a reason
+to relax the 15-second convergence budget or weaken the assertions; the failures remain open for
+the next lifecycle-diagnostics batch.

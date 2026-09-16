@@ -27,11 +27,39 @@ def test_lifecycle_gate_rejects_missing_required_case():
         gate.pytest_collection_finish(session)
 
 
-def test_lifecycle_gate_rejects_missing_failure_variant():
+def test_lifecycle_gate_requires_combined_exit_result_workload():
     gate, session = _gate()
-    session.items = [item for item in session.items if "7-failed" not in item.name]
-    with pytest.raises(pytest.UsageError, match="7-failed"):
+    session.items = [item for item in session.items if "li02" not in item.name]
+    with pytest.raises(pytest.UsageError, match="preserves_exit_results"):
         gate.pytest_collection_finish(session)
+
+
+def test_lifecycle_gate_selects_full_matrix():
+    gate = _LifecycleGate(SimpleNamespace(getoption=lambda _name: "full"))
+    items = [
+        SimpleNamespace(
+            path=Path("test_agent_lifecycle_independence.py"),
+            name=name,
+            nodeid=f"lifecycle::{name}",
+        )
+        for name in sorted(gate.full_names)
+    ]
+    session = SimpleNamespace(items=items, exitstatus=0)
+
+    gate.pytest_collection_finish(session)
+
+    assert gate.required == {item.nodeid for item in items}
+
+
+def test_lifecycle_gate_collects_required_nodes_from_xdist_worker():
+    gate = _LifecycleGate(SimpleNamespace(getoption=lambda _name: "full"))
+    nodeids = [
+        f"tests/integration/qexp/test_agent_lifecycle_independence.py::{name}" for name in sorted(gate.full_names)
+    ]
+
+    gate.pytest_xdist_node_collection_finished(SimpleNamespace(), nodeids)
+
+    assert gate.required == set(nodeids)
 
 
 @pytest.mark.parametrize("failure", ["skip", "teardown", "not_run"])
@@ -78,3 +106,13 @@ def test_lifecycle_gate_rejects_exceeded_budget(monkeypatch):
     monkeypatch.setattr("tests.conftest.time.monotonic", lambda: gate.started_at + gate.budget_seconds + 1)
     gate.pytest_sessionfinish(session, 0)
     assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+
+def test_lifecycle_gate_leaves_xdist_worker_exit_status_to_controller():
+    gate, session = _gate()
+    session.config = SimpleNamespace(workerinput={})
+    session.exitstatus = 0
+
+    gate.pytest_sessionfinish(session, 0)
+
+    assert session.exitstatus == 0
