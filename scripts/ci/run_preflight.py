@@ -6,6 +6,9 @@ Environment setup is intentionally outside this script:
 - GitHub-hosted CI installs an explicit CPU-only PyTorch environment.
 
 Both paths execute this exact command list so validation semantics cannot drift.
+The torch unit subtree runs in its own pytest process because it exercises
+PyTorch/DataLoader multiprocessing behavior that should not inherit process and
+thread state from the rest of the unit suite.
 """
 
 from __future__ import annotations
@@ -23,7 +26,8 @@ COMMANDS: tuple[tuple[str, ...], ...] = (
     (PYTHON, "scripts/checks/check_repository_governance.py"),
     (PYTHON, "scripts/checks/check_test_lanes.py"),
     (PYTHON, "scripts/checks/check_contract_matrix.py"),
-    (PYTHON, "-m", "pytest", "tests/unit", "-q"),
+    (PYTHON, "-m", "pytest", "tests/unit", "--ignore=tests/unit/torch", "-q"),
+    (PYTHON, "-m", "pytest", "tests/unit/torch", "-q"),
     (
         PYTHON,
         "-m",
