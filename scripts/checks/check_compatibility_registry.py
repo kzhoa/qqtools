@@ -15,7 +15,6 @@ from typing import Any, Iterable
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REGISTRY = Path("docs/spec/compatibility-registry.toml")
 DEFAULT_VERSION_PATH = Path("src/qqtools/version.py")
-PITCH_ROOT = Path("docs/pitch")
 MARKER_ROOTS = (Path("src"), Path("tests"), Path("scripts"))
 ID_PATTERN = re.compile(r"QQTOOLS-COMPAT-[0-9]{4}")
 VERSION_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
@@ -30,18 +29,19 @@ KINDS = {
 }
 EXTENDABLE_FIELDS = {"legacy_removed_in", "transition_purged_in"}
 REGISTRY_FIELDS = {"schema_version", "next_id", "items"}
+CURRENT_SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 ITEM_FIELDS = {
     "id",
     "component",
     "kind",
     "status",
+    "summary",
     "introduced_in",
     "legacy_removed_in",
     "transition_purged_in",
     "marker",
     "owner",
-    "decision_refs",
-    "pitch_refs",
     "verification",
     "extensions",
     "normal_level",
@@ -55,7 +55,9 @@ ITEM_FIELDS = {
     "workload_continuity",
     "interruption_budget_seconds",
 }
-EXTENSION_FIELDS = {"field", "from", "to", "approved_in", "reason", "decision_ref"}
+LEGACY_ITEM_FIELDS = ITEM_FIELDS | {"decision_refs", "pitch_refs"} - {"summary"}
+EXTENSION_FIELDS = {"field", "from", "to", "approved_in", "reason"}
+LEGACY_EXTENSION_FIELDS = EXTENSION_FIELDS | {"decision_ref"}
 
 
 class RegistryError(ValueError):
@@ -89,8 +91,7 @@ class CompatibilityItem:
     transition_purged_in: Version
     marker: str
     owner: str
-    decision_refs: tuple[Path, ...]
-    pitch_refs: tuple[Path, ...]
+    summary: str
     verification: tuple[Path, ...]
     normal_level: str | None = None
     recovery_level: str | None = None
@@ -152,21 +153,6 @@ def _require_paths(value: object, field: str) -> tuple[Path, ...]:
     return tuple(paths)
 
 
-def _require_pitch_refs(value: object, field: str, *, is_required: bool) -> tuple[Path, ...]:
-    """Validate local pitch references without requiring Git tracking."""
-    if value is None:
-        if is_required:
-            raise RegistryError(f"{field} is required while the item is planned.")
-        return ()
-    paths = _require_paths(value, field)
-    if len(paths) != len(set(paths)):
-        raise RegistryError(f"{field} must not contain duplicate paths.")
-    for path in paths:
-        if not path.is_relative_to(PITCH_ROOT) or path.suffix != ".md":
-            raise RegistryError(f"{field} entries must be .md files under {PITCH_ROOT}/.")
-    return paths
-
-
 def _is_tracked_candidate(repo_root: Path, path: Path) -> bool:
     result = subprocess.run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--", str(path)],
@@ -209,21 +195,20 @@ def _apply_extensions(
     raw_extensions: object,
     item_id: str,
     deadlines: dict[str, Version],
-    repo_root: Path,
     introduced_in: Version,
     *,
-    validate_references: bool,
-    require_tracked: bool,
+    schema_version: int,
 ) -> None:
     if raw_extensions is None:
         return
     if not isinstance(raw_extensions, list):
         raise RegistryError(f"{item_id}.extensions must be an array of tables.")
+    allowed_fields = EXTENSION_FIELDS if schema_version == CURRENT_SCHEMA_VERSION else LEGACY_EXTENSION_FIELDS
     for index, raw_extension in enumerate(raw_extensions):
         prefix = f"{item_id}.extensions[{index}]"
         if not isinstance(raw_extension, dict):
             raise RegistryError(f"{prefix} must be a table.")
-        _reject_unknown(raw_extension, EXTENSION_FIELDS, prefix)
+        _reject_unknown(raw_extension, allowed_fields, prefix)
         field = _require_string(raw_extension.get("field"), f"{prefix}.field")
         if field not in EXTENDABLE_FIELDS:
             raise RegistryError(f"{prefix}.field cannot extend {field!r}.")
@@ -231,16 +216,8 @@ def _apply_extensions(
         new_version = Version.parse(raw_extension.get("to"), f"{prefix}.to")
         approved_in = Version.parse(raw_extension.get("approved_in"), f"{prefix}.approved_in")
         _require_string(raw_extension.get("reason"), f"{prefix}.reason")
-        decision_ref = Path(_require_string(raw_extension.get("decision_ref"), f"{prefix}.decision_ref"))
-        if decision_ref.is_absolute() or ".." in decision_ref.parts:
-            raise RegistryError(f"{prefix}.decision_ref must be repository-relative.")
-        if validate_references:
-            _validate_reference_paths(
-                repo_root,
-                (decision_ref,),
-                f"{prefix}.decision_ref",
-                require_tracked=require_tracked,
-            )
+        if schema_version == LEGACY_SCHEMA_VERSION and "decision_ref" in raw_extension:
+            _require_string(raw_extension.get("decision_ref"), f"{prefix}.decision_ref")
         if deadlines[field] != old_version:
             raise RegistryError(
                 f"{prefix}.from must equal the previous effective {field} ({deadlines[field]}), got {old_version}."
@@ -257,12 +234,14 @@ def _parse_item(
     index: int,
     repo_root: Path,
     *,
+    schema_version: int,
     validate_references: bool,
     require_tracked: bool,
 ) -> CompatibilityItem:
     if not isinstance(raw_item, dict):
         raise RegistryError(f"items[{index}] must be a table.")
-    _reject_unknown(raw_item, ITEM_FIELDS, f"items[{index}]")
+    allowed_fields = ITEM_FIELDS if schema_version == CURRENT_SCHEMA_VERSION else LEGACY_ITEM_FIELDS
+    _reject_unknown(raw_item, allowed_fields, f"items[{index}]")
     item_id = _require_string(raw_item.get("id"), f"items[{index}].id")
     if ID_PATTERN.fullmatch(item_id) is None:
         raise RegistryError(f"items[{index}].id must match QQTOOLS-COMPAT-NNNN.")
@@ -273,6 +252,11 @@ def _parse_item(
     status = _require_string(raw_item.get("status"), f"{item_id}.status")
     if status not in STATUSES:
         raise RegistryError(f"{item_id}.status must be one of {sorted(STATUSES)}, got {status!r}.")
+    summary = (
+        _require_string(raw_item.get("summary"), f"{item_id}.summary")
+        if schema_version == CURRENT_SCHEMA_VERSION
+        else f"Legacy compatibility item for {component}."
+    )
     introduced_in = Version.parse(raw_item.get("introduced_in"), f"{item_id}.introduced_in")
     deadlines = {
         "legacy_removed_in": Version.parse(raw_item.get("legacy_removed_in"), f"{item_id}.legacy_removed_in"),
@@ -286,10 +270,8 @@ def _parse_item(
         raw_item.get("extensions"),
         item_id,
         deadlines,
-        repo_root,
         introduced_in,
-        validate_references=validate_references,
-        require_tracked=require_tracked,
+        schema_version=schema_version,
     )
     if deadlines["transition_purged_in"] < deadlines["legacy_removed_in"]:
         raise RegistryError(f"{item_id} effective transition_purged_in must not precede legacy_removed_in.")
@@ -297,32 +279,18 @@ def _parse_item(
     if marker != item_id:
         raise RegistryError(f"{item_id}.marker must equal its compatibility ID.")
     owner = _require_string(raw_item.get("owner"), f"{item_id}.owner")
-    decision_refs = _require_paths(raw_item.get("decision_refs"), f"{item_id}.decision_refs")
-    pitch_refs = _require_pitch_refs(
-        raw_item.get("pitch_refs"),
-        f"{item_id}.pitch_refs",
-        is_required=status == "planned",
-    )
+    if schema_version == LEGACY_SCHEMA_VERSION:
+        _require_paths(raw_item.get("decision_refs"), f"{item_id}.decision_refs")
+        if raw_item.get("pitch_refs") is not None:
+            _require_paths(raw_item.get("pitch_refs"), f"{item_id}.pitch_refs")
     verification = _require_paths(raw_item.get("verification"), f"{item_id}.verification")
     _validate_operational_contract(raw_item, item_id)
     if validate_references:
         _validate_reference_paths(
             repo_root,
-            decision_refs,
-            f"{item_id}.decision_refs",
-            require_tracked=require_tracked,
-        )
-        _validate_reference_paths(
-            repo_root,
             verification,
             f"{item_id}.verification",
             require_tracked=require_tracked,
-        )
-        _validate_reference_paths(
-            repo_root,
-            pitch_refs,
-            f"{item_id}.pitch_refs",
-            require_tracked=False,
         )
     return CompatibilityItem(
         item_id=item_id,
@@ -334,8 +302,7 @@ def _parse_item(
         transition_purged_in=deadlines["transition_purged_in"],
         marker=marker,
         owner=owner,
-        decision_refs=decision_refs,
-        pitch_refs=pitch_refs,
+        summary=summary,
         verification=verification,
         normal_level=raw_item.get("normal_level"),
         recovery_level=raw_item.get("recovery_level"),
@@ -443,11 +410,26 @@ def _parse_registry(
     repo_root: Path,
     *,
     validate_repository: bool,
+    allow_legacy_schema: bool = False,
 ) -> CompatibilityRegistry:
-    """Parse registry data and optionally validate working-tree evidence."""
+    """Parse current registry data or a historical read-only schema."""
     _reject_unknown(raw_registry, REGISTRY_FIELDS, "registry")
-    if raw_registry.get("schema_version") != 1:
-        raise RegistryError("compatibility registry schema_version must be 1.")
+    schema_version = raw_registry.get("schema_version")
+    allowed_versions = {CURRENT_SCHEMA_VERSION}
+    if allow_legacy_schema:
+        allowed_versions.add(LEGACY_SCHEMA_VERSION)
+    if schema_version not in allowed_versions:
+        if allow_legacy_schema:
+            raise RegistryError(
+                f"compatibility registry schema_version must be {CURRENT_SCHEMA_VERSION} "
+                f"or historical {LEGACY_SCHEMA_VERSION}."
+            )
+        raise RegistryError(f"compatibility registry schema_version must be {CURRENT_SCHEMA_VERSION}.")
+    if schema_version == LEGACY_SCHEMA_VERSION and validate_repository:
+        raise RegistryError(
+            f"compatibility registry schema_version {LEGACY_SCHEMA_VERSION} is historical-only; "
+            f"current source must use {CURRENT_SCHEMA_VERSION}."
+        )
     next_id = raw_registry.get("next_id")
     if not isinstance(next_id, int) or isinstance(next_id, bool) or next_id < 1:
         raise RegistryError("compatibility registry next_id must be a positive integer.")
@@ -460,6 +442,7 @@ def _parse_registry(
             item,
             index,
             repo_root,
+            schema_version=schema_version,
             validate_references=validate_repository,
             require_tracked=require_tracked,
         )
@@ -490,7 +473,7 @@ def load_registry(registry_path: Path, repo_root: Path) -> CompatibilityRegistry
         raw_registry = tomllib.loads(registry_path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise RegistryError(f"could not read compatibility registry {registry_path}: {exc}") from exc
-    return _parse_registry(raw_registry, repo_root, validate_repository=True)
+    return _parse_registry(raw_registry, repo_root, validate_repository=True, allow_legacy_schema=False)
 
 
 def _current_version(repo_root: Path) -> Version:
@@ -553,7 +536,7 @@ def load_previous_registry(
         raw_registry = tomllib.loads(result.stdout)
     except tomllib.TOMLDecodeError as exc:
         raise RegistryError(f"could not parse compatibility registry from {tag}: {exc}") from exc
-    return _parse_registry(raw_registry, repo_root, validate_repository=False)
+    return _parse_registry(raw_registry, repo_root, validate_repository=False, allow_legacy_schema=True)
 
 
 def _expected_label(expected_status: str | None) -> str:
@@ -569,7 +552,10 @@ def release_plan(
     lines = [f"Compatibility plan for release {target}:"]
     for item in items:
         expected = item.expected_status(target)
-        lines.append(f"- {item.item_id} ({item.component}): {item.status} -> expected {_expected_label(expected)}")
+        lines.append(
+            f"- {item.item_id} ({item.component}): {item.status} -> expected {_expected_label(expected)}; "
+            f"{item.summary}"
+        )
     current_ids = {item.item_id for item in items}
     if previous is not None:
         for item in previous:

@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-08
+updated_at: 2026-09-16
 archived_at:
 ---
 
@@ -10,13 +10,16 @@ archived_at:
 ## Authority and scope
 
 This policy covers temporary compatibility behavior across qqtools. The tracked
-`compatibility-registry.toml` is the machine-readable lifecycle authority. Product specifications
-remain authoritative for behavior and protected workflows; pitches explain complex delivery work
-but do not replace the registry.
+`compatibility-registry.toml` is the machine-readable lifecycle authority for unfinished
+compatibility work.
 
-Every temporary reader, writer, CLI alias, migration path, protocol adapter, or behavior fixture
-must have one registry item. Permanent multi-format support is a product contract and must not be
-misrepresented as temporary compatibility.
+The public repository must be sufficient to build, test, release, and safely advance every
+registered compatibility lifecycle. Private pitches, ADRs, local notes, and other design records may
+inform owner decisions, but they are optional context and are never registry dependencies.
+
+Every temporary reader, writer, CLI alias, migration path, protocol adapter, warning, or behavior
+fixture must have one registry item. Permanent multi-format support is a product contract and must
+not be represented as temporary compatibility.
 
 ## Lifecycle
 
@@ -26,55 +29,97 @@ Each item moves through these states:
 planned -> compatibility_active -> legacy_removed -> removed from registry
 ```
 
-- `planned`: the future contract is registered but no compatibility implementation or marker may
-  exist in source, tests, or scripts.
+- `planned`: public implementation intent has been registered, but no temporary compatibility
+  implementation or marker may yet exist in `src/`, `tests/`, or `scripts/`.
 - `compatibility_active`: the new contract is the write/default path and the temporary legacy
   boundary remains available.
-- `legacy_removed`: the legacy public entry or writer has been removed; only an explicitly planned
-  reader, migrator, or transition check may remain.
+- `legacy_removed`: the legacy public entry or writer has been removed; only an explicitly retained
+  reader, migrator, adapter, warning, or transition check may remain.
 - Registry removal: temporary runtime support, warnings, markers, and old-behavior fixtures are
   absent, and the target release has reached `transition_purged_in`.
+
+`planned` is a public implementation state, not a private roadmap state. Exploratory work that is
+not ready to become public implementation intent stays outside the registry.
 
 Registry items use exact `X.Y.Z` versions. `introduced_in` must precede `legacy_removed_in`, and
 `transition_purged_in` must not precede `legacy_removed_in`. Equal removal and purge versions are
 allowed when no separate migration release is needed.
 
-## Registry contract
+## Registry schema
+
+The current checkout uses compatibility registry schema v2. Current source must validate strictly
+against v2. Release-transition checks may read schema v1 registries from historical release tags in
+read-only mode so a governance-format upgrade cannot erase old deadlines, retired-ID history, or
+cleanup obligations.
+
+Historical schema parsing is compatibility for the governance checker itself; it does not authorize
+new v1 registry files in a current branch.
 
 The top-level `next_id` is the next numeric compatibility ID to allocate. It only increases, even
 after older items leave the registry. This prevents ID reuse without retaining completed records.
 The registry may contain no `[[items]]` entries when no compatibility work is unfinished.
 
-Every unfinished `[[items]]` entry contains:
+Every schema-v2 unfinished `[[items]]` entry contains:
 
 - a unique `QQTOOLS-COMPAT-NNNN` ID and identical `marker`;
 - `component`, `kind`, and module-level `owner`;
+- a concise public `summary` identifying the temporary compatibility boundary;
 - lifecycle `status` and the three release versions;
-- tracked or non-ignored `decision_refs` and `verification` files; the clean committed preflight
-  guarantees they are tracked before release;
-- `pitch_refs` when a planned item needs later implementation. Planned items require at least one
-  local pitch reference; active and legacy-removed items may omit it. References must be unique,
-  repository-relative `.md` files under `docs/pitch/` and must exist locally, but are deliberately
-  not required to be Git-tracked;
-- optional append-only `extensions` for approved deadline changes.
+- one or more repository-relative `verification` paths that exist in the committed checkout;
+- optional append-only `extensions` for approved deadline changes; and
+- structured rollout fields when the item declares an operational migration contract.
+
+Schema v2 has no `pitch_refs`, `decision_refs`, or `action_refs`. Private planning and design files
+must not be named as public registry dependencies. Implementation progress belongs to disposable
+feature-branch state, commits, tests, and CI rather than to the compatibility ledger.
+
+Temporary implementation and behavior fixtures carry their compatibility ID. The checker scans
+tracked and non-ignored files under `src/`, `tests/`, and `scripts/`. Planned items must have no
+marker; active and legacy-removed items must retain at least one marker.
+
+## Correlation and implementation history
+
+The compatibility ID is the stable correlation key across public engineering evidence. Feature work
+items, source markers, tests, and useful commit messages should include the relevant
+`QQTOOLS-COMPAT-NNNN` ID when practical.
+
+A feature branch may use `.dev/work-item.md` to carry temporary implementation context. That file is
+not lifecycle authority and is stripped before promotion to `dev`. Pull requests and issues are not
+required. Long-term correctness must remain recoverable from the registry, code markers,
+verification tests, public product documentation when applicable, and Git history.
+
+Completed items are not a registry state and are not retained indefinitely. At release check time,
+the checker reads the registry from the exact `v<current source version>` tag. An item may disappear
+only when the target reaches its effective `transition_purged_in` and its markers are absent. The
+same baseline prevents `next_id` rollback and reuse of retired IDs. If that prior tag predates the
+registry, the comparison bootstraps without historical items. Git history, release tags, and the
+CHANGELOG are the historical record.
 
 ## Operational compatibility gate
 
-A bounded release window is necessary but not sufficient. Every compatibility item must also
-define and verify how operators deploy the release across real machines and projects. The decision
-reference must state:
+A bounded release window is necessary but not sufficient. Compatibility work that changes persisted
+state, runtime protocols, or operator rollout must define enough structured registry metadata and
+verification evidence to establish how operators deploy the release across real machines and
+projects.
 
-- the supported rollout unit: process, machine, project, or coordinated fleet;
-- the exact operator command sequence for the normal path;
-- whether old and new processes may access the same durable state during rollout;
-- how already running workloads retain supervision and publish their terminal outcome;
-- how interrupted migration resumes without repeating completed work; and
-- the machine-level inspection and recovery command when one machine owns multiple projects.
+The structured contract records, when applicable:
+
+- the normal and recovery operational levels;
+- supported source package/data versions and target version;
+- the mixed-version range;
+- the normal operator command sequence;
+- the machine-level inspection and recovery commands;
+- whether running workloads must remain continuous; and
+- the measurable interruption budget.
+
+These fields are public operational commitments, not a record of internal design deliberation.
+Private design records may contain deeper reasoning, alternatives, or implementation sketches, but
+public validation must never require them.
 
 ### Operational migration levels
 
-Compatibility work is classified by the most disruptive action required in its normal upgrade
-path. The level measures operator burden and workload impact, not implementation complexity.
+Compatibility work is classified by the most disruptive action required in its normal upgrade path.
+The level measures operator burden and workload impact, not implementation complexity.
 
 | Level | Name | Maximum required operator action | Running workloads |
 | --- | --- | --- | --- |
@@ -83,10 +128,10 @@ path. The level measures operator burden and workload impact, not implementation
 | L2 | Coordinated agent stop | Stop all qexp agents, run one machine-level coordinator migration for all discoverable projects, then restart agents | Continue; training processes are not stopped or drained |
 | L3 | Workload drain | Stop admission and wait for or terminate running workloads before migration | Interrupted or deliberately drained |
 
-Every compatibility decision must declare one normal operational level and may declare a more
-disruptive recovery level. Its verification files must exercise the declared normal level. A lower
-level implementation may always recover through a declared higher level, but documentation must
-not advertise the recovery path as the normal workflow.
+Every item with an operational contract declares one normal level and may declare a more disruptive
+recovery level. Its verification files must exercise the declared normal level. A lower-level
+implementation may recover through a declared higher level, but user-facing documentation must not
+advertise the recovery path as the normal workflow.
 
 Per-project manual migration is not a separate level and cannot satisfy L0, L1, or L2. When a
 machine can own multiple projects, every supported level operates at machine scope or broader;
@@ -94,14 +139,15 @@ project filters may exist for diagnosis but cannot be mandatory in the normal pr
 
 L0 applies only when already running old processes can continue safely without loading the new
 package and no durable activation is required. L1 is the default ceiling for new qexp persisted
-fields, indexes, capabilities, and runtime protocols. L2 requires a dedicated approved decision
-with evidence that mixed-version rolling activation cannot be made safe. L3 describes a
-nonconforming historical or proposed workflow; it is not an allowed qexp normal or recovery path.
-A major version or breaking-change declaration does not waive running-workload continuity.
+fields, indexes, capabilities, and runtime protocols. L2 is allowed only when implementation and
+verification evidence establish that mixed-version rolling activation cannot be made safe. L3 is
+not an allowed qexp normal or recovery path. A major-version or breaking-change declaration does
+not waive running-workload continuity.
 
 Items introduced before 2026-09-08 retain their recorded lifecycle, but their next lifecycle or
-deadline decision must document the actual normal and recovery levels. This grandfathering does
-not authorize a new persisted writer or a new drain requirement under an existing item.
+deadline change must record the actual normal and recovery levels when those fields are applicable.
+This grandfathering does not authorize a new persisted writer or a new drain requirement under an
+existing item.
 
 For qexp persisted fields, indexes, capabilities, and runtime protocols first introduced after
 2026-09-08, the normal path must be a machine-by-machine rolling upgrade. On each machine the
@@ -114,53 +160,32 @@ pause queue admission and scheduling, but it must not terminate training, wait f
 finish, discard machine-local execution evidence, or require idle GPUs. A release that cannot meet
 this contract may not introduce the persisted change as ordinary qexp compatibility work.
 
-When a protocol-specific safety proof shows that L1 rolling activation is not feasible, a dedicated
-approved decision may select L2: stop all qexp agents and use one coordinator command to advance
-every discoverable project. It must still preserve running training processes and permit later
-agents to reconcile durable terminal evidence. The decision must explain why L1 cannot be met and
-verify the machine-level all-project workflow; it cannot fall back to manual per-project
-maintenance. Machine retirement must use explicit identity or a durable retirement tombstone;
-heartbeat age alone cannot authorize metadata deletion.
+When protocol-specific evidence shows that L1 rolling activation is not feasible, an owner-approved
+registry change may select L2. The implementation must still preserve running training processes and
+permit later agents to reconcile durable terminal evidence. Verification must cover the
+machine-level all-project workflow and cannot fall back to manual per-project maintenance. Machine
+retirement must use explicit identity or a durable retirement tombstone; heartbeat age alone cannot
+authorize metadata deletion.
 
 If the permanent migration infrastructure needed by these rules does not yet exist, register the
-feature as `planned` and deliver that infrastructure before introducing its new persisted writer.
-Do not ship a drain-required schema first and defer operability to a later patch.
-
-An extension names `legacy_removed_in` or `transition_purged_in`, chains from the previous effective
-value to a later version, records the approval version and reason, and points to a tracked decision.
-Original deadlines are not overwritten.
-
-Temporary implementation and behavior fixtures carry their compatibility ID. The checker scans
-tracked and non-ignored files under `src/`, `tests/`, and `scripts/`. Planned items must have no
-marker; active and legacy-removed items must retain at least one marker.
-
-`pitch_refs` are implementation navigation, not behavior authority: `decision_refs` remain the
-formal specification and ADR basis. A pitch archive or rename must update any live reference. On
-registry removal, its pitch references disappear with the item. Because pitches are intentionally
-Git-ignored, a new clone without the local pitch set fails registry validation and local preflight;
-this is an accepted consequence of the trusted local-publish workflow.
-
-Completed items are not a registry state and are not retained indefinitely. At release check time,
-the checker reads the registry from the exact `v<current source version>` tag. An item may disappear
-only when the target reaches its effective `transition_purged_in` and its markers are absent. The
-same baseline prevents `next_id` rollback and reuse of retired IDs. If that prior tag predates the
-registry, the comparison bootstraps without historical items. Git history, release tags, and the
-CHANGELOG are the historical record.
+feature as `planned` only when implementation intent is public and deliver that infrastructure
+before introducing its new persisted writer. Do not ship a drain-required schema first and defer
+operability to a later patch.
 
 ### Continuity and rollout completion
 
-Operator coordination level and service continuity are separate contracts. Each decision must
-specify admission/scheduling interruption scope, a measurable interruption budget, terminal
-reconciliation behavior, and verification evidence. Two commands alone do not prove L1: waiting
-for the fleet to upgrade or a full backfill to finish must not suspend compatible scheduling.
+Operator coordination level and service continuity are separate contracts. Verification must cover
+admission/scheduling interruption scope, terminal reconciliation behavior, and the recorded
+interruption budget. Two commands alone do not prove L1: waiting for the fleet to upgrade or a full
+backfill to finish must not suspend compatible scheduling.
 
-Within the declared supported version range, operators may upgrade machines in any order and
-pause rollout between machines. Existing functionality remains available through compatible paths.
+Within the declared supported version range, operators may upgrade machines in any order and pause
+rollout between machines. Existing functionality remains available through compatible paths.
 Distinguish package/agent deployment, per-project feature activation, and legacy cleanup in status
 and acceptance criteria. Successful restart does not imply that background migration is complete.
 Active legacy Attempts must not prevent deployment completion or restored agent service; their
-evidence adapters remain available until safe terminal reconciliation, even if record conversion
-is deferred. Cleanup must not turn deferred work into a workload-drain prerequisite.
+evidence adapters remain available until safe terminal reconciliation, even if record conversion is
+deferred. Cleanup must not turn deferred work into a workload-drain prerequisite.
 
 Activation proofs cover every relevant writer: agents, runners, submission CLIs, recovery tools,
 and unfinished durable operations. Agent readiness alone is insufficient. L2 also requires safety
@@ -175,36 +200,36 @@ they cannot enumerate projects absent from every available discovery source.
 
 ### Supported upgrade paths and cleanup
 
-Each persisted-protocol decision declares supported source package/data versions, mixed-version
-ranges, and the direct upgrade path to its target. Removing an old live writer and removing the
-ability to migrate historical data require separate evidence. A fixed release count does not prove
-that inactive projects or long-running Attempts no longer need an adapter.
+Each persisted-protocol item with an operational contract declares supported source package/data
+versions, mixed-version ranges, and the direct upgrade path to its target. Removing an old live
+writer and removing the ability to migrate historical data require separate evidence. A fixed
+release count does not prove that inactive projects or long-running Attempts no longer need an
+adapter.
 
-The two-command promise applies to explicitly supported source versions. Supported sources must
-not require manual intermediate package installation or downgrade. Unsupported sources must be
+The two-command promise applies to explicitly supported source versions. Supported sources must not
+require manual intermediate package installation or downgrade. Unsupported sources must be
 identified before destructive migration, with an actionable machine-level explanation. Automatic
 chained migration may satisfy a supported path. Required adapters must be permanent contracts or
 have their registered deadlines explicitly extended before removal; deadlines must not silently
 override continuity requirements.
 
-These operational requirements remain decision/review obligations. The registry validator now
-accepts and validates structured rollout, continuity and interruption-budget fields for items that
-declare them, but it does not prove the runtime guarantees; those still require the coordinator,
-protocol-specific tests and released-source evidence.
+The registry validator validates structured rollout, continuity, interruption-budget, lifecycle,
+and evidence-path fields. It does not prove runtime guarantees; those require protocol-specific
+tests and released-source evidence.
 
 ### Migration development and runtime cost
 
-For qexp persisted-protocol changes, the decision and verification evidence must also establish:
+For qexp persisted-protocol changes, implementation and verification evidence must also establish:
 
-- **Minimum necessary transition:** explain whether conversion or a required capability is needed.
+- **Minimum necessary transition:** determine whether conversion or a required capability is needed.
   Additive defaults and rebuildable projections must be checked against actual old readers and
-  whole-record writers. Apply phase-specific safety predicates rather than a mandatory fleet
-  barrier for every change.
+  whole-record writers. Apply phase-specific safety predicates rather than a mandatory fleet barrier
+  for every change.
 - **Protocol-boundary ownership:** keep version interpretation, write-path selection, and historical
-  Attempt adapters behind stable interfaces. A generic coordinator is not a proof of online safety.
+  Attempt adapters behind stable interfaces. A generic coordinator is not proof of online safety.
   Declare dependencies and conflicting mutations when upgrades can chain.
 - **Concurrent-write correctness:** prove that backfill preserves updates made before and after
-  scanning a record. A watermark alone is not sufficient. Identify the boundary honored by source
+  scanning a record. A watermark alone is insufficient. Identify the boundary honored by source
   writers and prevent races between checking compatibility and mutating state; a newly introduced
   marker cannot exclude an old process that does not consult it. Retain safe compatibility until
   incompatible activation can be enforced.
@@ -223,9 +248,20 @@ A failed migration may leave compatible service available only while that path r
 safe. Indeterminate authoritative state or protocol safety requires isolating unsafe project writes
 while preserving training and safely collectable evidence; it must not disable unrelated projects.
 
-Concrete execution isolation, locking, and cache invalidation belong in the migration architecture
-decision, not in the always-loaded agent instructions. These requirements remain review obligations
-until their planned automated evidence gates are implemented.
+Private design records may document detailed locking, cache invalidation, rejected alternatives, or
+implementation reasoning. Any constraint required for public correctness must still be enforced by
+registry data, source behavior, tests, or stable public product documentation rather than by access
+to those private records.
+
+## Deadline extensions
+
+An extension names `legacy_removed_in` or `transition_purged_in`, chains from the previous effective
+value to a later version, records the approval version, and records a non-empty reason. Original
+deadlines are not overwritten.
+
+Schema-v2 extensions do not carry a document reference. `approved_in`, `reason`, the compatibility
+ID, and Git history provide the public audit trail. A private planning or design record may contain
+additional rationale but is not required by validation.
 
 ## Commands
 
@@ -245,16 +281,15 @@ The release operator must inspect `plan`, resolve every due action, commit the c
 python scripts/release_preflight.py --target-version X.Y.Z
 ```
 
-The local preflight is the only hard compatibility gate. The tag publish workflow trusts it and
-does not repeat compatibility validation.
+Release validation must succeed from a clean committed checkout without private pitches, ADRs, local
+notes, or other ignored planning files.
 
-## When a dedicated decision document is required
+## Public versus private documentation
 
-A normal CLI alias or bounded local reader needs only a registry entry and ordinary feature
-documentation. A dedicated pitch or ADR is required when compatibility changes shared persisted
-truth, permits different versions to run concurrently, performs an irreversible rewrite, changes
-ownership, or requires locks, markers, recovery, or rollback protocols.
+No dedicated public ADR or pitch is required by compatibility governance. The owner may keep design
+history private. Public documentation is required only when users or contributors need it to use,
+migrate, operate, or verify the product safely.
 
-## References
-
-- [qexp machine-level rolling upgrade coordinator](../pitch/qexp-machine-rolling-upgrade-coordinator.md)
+The compatibility registry is intentionally not a design-history database. It records unfinished
+lifecycle obligations and executable public evidence; private reasoning stays outside that control
+plane.
