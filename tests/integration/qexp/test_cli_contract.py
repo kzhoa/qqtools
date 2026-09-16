@@ -825,9 +825,7 @@ def test_agent_add_project_recovery_replaces_a_superseded_local_binding(tmp_path
     assert runtime.load_registry()[1][0].machine_name == "gpu-1-replacement"
 
 
-def test_agent_add_project_adoption_reports_replaced_generation(
-    tmp_path: Path, capsys
-) -> None:
+def test_agent_add_project_adoption_reports_replaced_generation(tmp_path: Path, capsys) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime_root = tmp_path / "machine-runtime"
     runtime = MachineRuntime(runtime_root)

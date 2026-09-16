@@ -114,9 +114,7 @@ def _check_marker_boundaries(repo_root: Path) -> list[str]:
             if _uses_pytest_marker(path, marker):
                 errors.append(f"Unit may not use {marker}: {path.relative_to(repo_root)}")
         for line, call in _real_process_calls(path):
-            errors.append(
-                f"Unit may not start real processes: {path.relative_to(repo_root)}:{line} uses {call}"
-            )
+            errors.append(f"Unit may not start real processes: {path.relative_to(repo_root)}:{line} uses {call}")
     boundaries = (
         ("Integration", repo_root / "tests/integration", "host_exclusive"),
         ("E2E", repo_root / "tests/e2e", "machine_lab"),

@@ -25,10 +25,12 @@ def recover_running_attempt(
     reservation_runtime_root: Path | None = None,
 ) -> int | None:
     """Restore authority only for a locally verified live orphaned process."""
+
     def reject(reason: str) -> None:
         path = cfg.runtime_root / "authority-diagnostics" / f"{attempt_id}.json"
         try:
             from .store import atomic_replace
+
             atomic_replace(path, {"authority_diagnostic": {"attempt_id": attempt_id, "reason": reason}})
         except OSError:
             pass

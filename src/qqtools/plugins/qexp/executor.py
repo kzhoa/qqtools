@@ -103,9 +103,7 @@ class Executor:
         return f"pid:{process.pid}", self._launch_handoff(cfg, attempt.attempt_id)
 
     @staticmethod
-    def _launch_handoff(
-        cfg: RootConfig, attempt_id: str, timeout_seconds: float = 2.0
-    ) -> LaunchHandoff:
+    def _launch_handoff(cfg: RootConfig, attempt_id: str, timeout_seconds: float = 2.0) -> LaunchHandoff:
         path = local_paths(cfg.runtime_root)["launch_intents"] / f"{attempt_id}.json"
         return LaunchHandoff(attempt_id, path, time.monotonic() + timeout_seconds)
 
@@ -122,9 +120,7 @@ class Executor:
                 if handoff.intent_path.exists():
                     remaining.remove(handoff)
                 elif now >= handoff.deadline:
-                    failures[handoff] = RuntimeError(
-                        f"runner did not publish launch intent for {handoff.attempt_id!r}"
-                    )
+                    failures[handoff] = RuntimeError(f"runner did not publish launch intent for {handoff.attempt_id!r}")
                     remaining.remove(handoff)
             if remaining:
                 time.sleep(0.01)

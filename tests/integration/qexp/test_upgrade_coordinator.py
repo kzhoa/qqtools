@@ -222,6 +222,7 @@ def test_registry_sorts_dependencies_and_rejects_cycles() -> None:
         spec = MigrationSpec("a", "schema-6", "a", ("schema-6",), ("schema-6",), dependencies=("z",))
 
     assert [plugin.spec.name for plugin in MigrationRegistry([A(), Z()]).values()] == ["z", "a"]
+
     class Loop(MigrationPlugin):
         spec = MigrationSpec("loop", "schema-6", "loop", ("schema-6",), ("schema-6",), dependencies=("loop",))
 
@@ -327,9 +328,7 @@ def test_repair_validation_rejects_manifest_corrupted_after_apply(tmp_path: Path
     validated = coordinator.validate_repair(repair["repair_id"])
     assert validated["state"] == "validation_failed"
     journal = read_json(shared_paths(cfg.shared_root)["upgrade_journal"])
-    assert "repair_terminal_invariant" in (
-        journal["upgrade"]["migrations"]["upgrade-journal-v1"]["error"]
-    )
+    assert "repair_terminal_invariant" in (journal["upgrade"]["migrations"]["upgrade-journal-v1"]["error"])
 
 
 def test_repair_resume_rechecks_manifest_after_successful_validation(tmp_path: Path) -> None:
@@ -386,9 +385,7 @@ def test_repair_snapshot_write_cannot_exceed_migration_io_budget(tmp_path: Path)
             return {"applied": True}
 
     cfg = _config(tmp_path)
-    coordinator = UpgradeCoordinator(
-        cfg, registry=MigrationRegistry([OversizedRepairSnapshot()])
-    )
+    coordinator = UpgradeCoordinator(cfg, registry=MigrationRegistry([OversizedRepairSnapshot()]))
     coordinator.discover()
     coordinator.request_pause("test oversized repair snapshot")
     repair = coordinator.inspect_repair("oversized-repair-snapshot")
@@ -396,9 +393,7 @@ def test_repair_snapshot_write_cannot_exceed_migration_io_budget(tmp_path: Path)
     with pytest.raises(DeterministicUpgradeError, match="I/O bytes budget"):
         coordinator.apply_repair(repair["repair_id"])
 
-    snapshot_path = (
-        shared_paths(cfg.shared_root)["upgrade_repairs"] / f"{repair['repair_id']}.snapshot.json"
-    )
+    snapshot_path = shared_paths(cfg.shared_root)["upgrade_repairs"] / f"{repair['repair_id']}.snapshot.json"
     assert not snapshot_path.exists()
     assert apply_calls == []
     assert coordinator.status()["repair"]["state"] == "planned"
@@ -438,7 +433,9 @@ def test_upgrade_storage_rejects_actual_json_write_over_io_budget(tmp_path: Path
             return True
 
         def expansion(self, context) -> PhaseResult:
-            context.storage.atomic_replace(context.cfg.shared_root / "operations" / "too-large.json", {"value": "x" * 64})
+            context.storage.atomic_replace(
+                context.cfg.shared_root / "operations" / "too-large.json", {"value": "x" * 64}
+            )
             return PhaseResult("complete")
 
     coordinator = UpgradeCoordinator(_config(tmp_path), registry=MigrationRegistry([OverIoBudget()]))
@@ -496,9 +493,7 @@ def test_activation_predicate_cannot_bypass_storage_budget(tmp_path: Path) -> No
             )
             return True
 
-    coordinator = UpgradeCoordinator(
-        _config(tmp_path), registry=MigrationRegistry([PredicateBypass()])
-    )
+    coordinator = UpgradeCoordinator(_config(tmp_path), registry=MigrationRegistry([PredicateBypass()]))
     coordinator.discover()
     assert coordinator.advance()["phase"] == "activation"
 

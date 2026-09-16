@@ -98,14 +98,9 @@ def schema_reader_lock(root: Path, *, blocking: bool = True) -> Iterator[bool]:
 
 
 @contextmanager
-def schema_writer_lock(
-    cfg: object, *, blocking: bool = True, require_narrow: bool = False
-) -> Iterator[bool]:
+def schema_writer_lock(cfg: object, *, blocking: bool = True, require_narrow: bool = False) -> Iterator[bool]:
     """Fence an authoritative writer against schema/capability mutation."""
-    if (
-        require_narrow
-        and not is_schema_narrow_protocol_active(cfg)
-    ):
+    if require_narrow and not is_schema_narrow_protocol_active(cfg):
         if not blocking:
             yield False
             return
@@ -122,12 +117,8 @@ def schema_writer_lock(
             except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
                 state = None
             if state == "degraded":
-                raise RuntimeError(
-                    "group-ready-members projection is degraded; ordinary mutation is disabled."
-                )
-            raise RuntimeError(
-                "group-ready-members projection is not active; ordinary mutation is disabled."
-            )
+                raise RuntimeError("group-ready-members projection is degraded; ordinary mutation is disabled.")
+            raise RuntimeError("group-ready-members projection is not active; ordinary mutation is disabled.")
         raise RuntimeError(
             "qexp root requires an active group-ready-members-v1 protocol; "
             "upgrade the root with a supported release before ordinary mutation."

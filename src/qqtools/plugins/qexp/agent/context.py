@@ -363,14 +363,20 @@ class MachineRuntime:
             bindings = [ProjectBinding.from_dict(item) for item in value["bindings"]]
             registrations = value["registrations"]
             machine_records = value["machine_records"]
-            if not isinstance(revision, int) or not isinstance(registrations, list) or not isinstance(machine_records, list):
+            if (
+                not isinstance(revision, int)
+                or not isinstance(registrations, list)
+                or not isinstance(machine_records, list)
+            ):
                 raise ValueError
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("machine registration transaction is malformed.") from exc
         configs: list[RootConfig] = []
         for item in [*registrations, *machine_records]:
-            if not isinstance(item, dict) or not isinstance(item.get("shared_root"), str) or not isinstance(
-                item.get("machine_name"), str
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("shared_root"), str)
+                or not isinstance(item.get("machine_name"), str)
             ):
                 raise RuntimeError("machine registration transaction is malformed.")
             cfg = load_root_config(item["shared_root"], item["machine_name"])

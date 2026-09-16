@@ -55,6 +55,7 @@ def __getattr__(name: str):
     globals()[name] = value
     return value
 
+
 __all__ = [
     "AGENT_MODE_DAEMON",
     "AGENT_MODE_ON_DEMAND",

@@ -16,18 +16,45 @@ from qqtools.qexp._progress_protocol import (
 
 
 def payload(**overrides):
-    return dict(protocol_version=1, update_id="update-1", stage="train", current=1,
-                total=10, unit="step", message=None, **{}) | overrides
+    return (
+        dict(
+            protocol_version=1,
+            update_id="update-1",
+            stage="train",
+            current=1,
+            total=10,
+            unit="step",
+            message=None,
+            **{},
+        )
+        | overrides
+    )
 
 
-@pytest.mark.parametrize("overrides", [
-    {"protocol_version": True}, {"protocol_version": 2}, {"update_id": "../other"},
-    {"current": True}, {"current": -1}, {"current": 11}, {"current": 1.5},
-    {"current": float("nan")}, {"total": float("inf")}, {"total": False},
-    {"stage": ""}, {"stage": "x" * 65}, {"stage": "\x1b[2J"},
-    {"unit": "x" * 33}, {"message": "x" * 1025}, {"message": "a\nb"},
-    {"metrics": {"loss": 1.0}}, {"task_id": "other"}, {"current": 2**64},
-])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"protocol_version": True},
+        {"protocol_version": 2},
+        {"update_id": "../other"},
+        {"current": True},
+        {"current": -1},
+        {"current": 11},
+        {"current": 1.5},
+        {"current": float("nan")},
+        {"total": float("inf")},
+        {"total": False},
+        {"stage": ""},
+        {"stage": "x" * 65},
+        {"stage": "\x1b[2J"},
+        {"unit": "x" * 33},
+        {"message": "x" * 1025},
+        {"message": "a\nb"},
+        {"metrics": {"loss": 1.0}},
+        {"task_id": "other"},
+        {"current": 2**64},
+    ],
+)
 def test_invalid_payload_is_rejected(overrides):
     with pytest.raises(ValueError):
         validate_payload(payload(**overrides))
@@ -47,6 +74,7 @@ def test_message_is_not_semantic_progress():
 def test_advisory_replace_is_latest_only_without_fsync(tmp_path, monkeypatch):
     def forbidden(*args):
         raise AssertionError("advisory progress must not fsync")
+
     monkeypatch.setattr(os, "fsync", forbidden)
     path = tmp_path / "progress.json"
     for i in range(1000):
@@ -65,8 +93,10 @@ def test_advisory_replace_does_not_recreate_cleaned_directory(tmp_path):
 def test_failed_rename_retains_previous_snapshot_and_removes_temp(tmp_path, monkeypatch):
     path = tmp_path / "progress.json"
     replace_advisory_snapshot(path, payload())
+
     def fail(*args):
         raise OSError("unavailable")
+
     monkeypatch.setattr(os, "replace", fail)
     with pytest.raises(OSError):
         replace_advisory_snapshot(path, payload(current=2))

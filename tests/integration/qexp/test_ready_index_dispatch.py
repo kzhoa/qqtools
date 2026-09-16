@@ -1442,6 +1442,7 @@ def test_machine_dispatch_attributes_batched_handoff_failure(tmp_path: Path) -> 
         "status": "error",
         "error": "handoff failed",
     }
-    assert read_json(shared_paths(cfg.shared_root)["tasks"] / f"{task.task_id}.json")["task"][
-        "state"
-    ]["projection"] == "failed"
+    assert (
+        read_json(shared_paths(cfg.shared_root)["tasks"] / f"{task.task_id}.json")["task"]["state"]["projection"]
+        == "failed"
+    )

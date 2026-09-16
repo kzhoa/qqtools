@@ -128,9 +128,7 @@ class _LaunchHandoffBatch:
         if not self._pending:
             return
         with diagnostic_span("executor.launch.handoff_batch"):
-            failures = self._executor.wait_for_launch_handoffs(
-                [pending.handoff for pending in self._pending]
-            )
+            failures = self._executor.wait_for_launch_handoffs([pending.handoff for pending in self._pending])
         for pending in self._pending:
             failure = failures.get(pending.handoff)
             if failure is None:

@@ -544,6 +544,7 @@ def authorize_launch(
     reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
     cancel_result = None
+
     @contextmanager
     def _authority_write_guard() -> Iterator[bool]:
         if write_guard is None:

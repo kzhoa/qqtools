@@ -91,8 +91,7 @@ class MigrationRegistry:
         # A conflict is serialized by waiting until the named migration is completed, so it is an
         # ordering edge too.  Compiling both declarations prevents a runtime-only stalemate.
         remaining = {
-            name: set(plugin.spec.dependencies) | set(plugin.spec.conflicts)
-            for name, plugin in self._plugins.items()
+            name: set(plugin.spec.dependencies) | set(plugin.spec.conflicts) for name, plugin in self._plugins.items()
         }
         ordered: list[str] = []
         while remaining:
@@ -343,8 +342,7 @@ class UpgradeCoordinator:
                             "pending": True,
                             "can_run": False,
                             "migration_blocked": True,
-                            "blockers": status["blockers"]
-                            + [f"completed_migration_drift:{name}" for name in drifted],
+                            "blockers": status["blockers"] + [f"completed_migration_drift:{name}" for name in drifted],
                         }
                     )
             return status
@@ -482,7 +480,9 @@ class UpgradeCoordinator:
                 raise ValueError("no migration is pending for this project")
             upgrade = journal["upgrade"]
             pause = upgrade["pause"]
-            pause.update(_load_pause_intent(self.cfg) or {"state": "requested", "requested_at": utc_now(), "reason": reason})
+            pause.update(
+                _load_pause_intent(self.cfg) or {"state": "requested", "requested_at": utc_now(), "reason": reason}
+            )
             for item in upgrade["migrations"].values():
                 if item.get("state") not in {"completed", "repair_required"}:
                     item["state"] = "pause_pending" if item.get("in_flight") else "paused"
@@ -625,9 +625,7 @@ class UpgradeCoordinator:
                     is_activation_ready = plugin.activation_ready(context)
                     is_writer_safe = plugin.writer_safe(context)
                 if validation.state != "complete":
-                    raise DeterministicUpgradeError(
-                        validation.blocker or "repair terminal invariant no longer holds"
-                    )
+                    raise DeterministicUpgradeError(validation.blocker or "repair terminal invariant no longer holds")
                 if not is_activation_ready or not is_writer_safe:
                     raise TransientUpgradeError("repair safety predicates are not currently satisfied")
             upgrade["pause"] = {"state": None, "requested_at": None, "reason": None}
@@ -757,9 +755,7 @@ class UpgradeCoordinator:
             active["admission_blocked"] = bool(result.detail.get("admission_blocked"))
         elif result.state == "waiting":
             active["state"] = "waiting"
-            active["next_probe_at"] = result.detail.get("next_probe_at") or _probe_after(
-                spec, upgrade["project_id"]
-            )
+            active["next_probe_at"] = result.detail.get("next_probe_at") or _probe_after(spec, upgrade["project_id"])
         elif result.state == "complete":
             if phase == "audit":
                 active["audit_passed"] = True
@@ -826,9 +822,7 @@ class UpgradeCoordinator:
             UpgradeStorage(slice_budget),
         )
 
-    def _validate_slice_result(
-        self, spec: MigrationSpec, result: PhaseResult, budget: UpgradeSliceBudget
-    ) -> None:
+    def _validate_slice_result(self, spec: MigrationSpec, result: PhaseResult, budget: UpgradeSliceBudget) -> None:
         if result.work_items > spec.max_records_per_slice:
             raise DeterministicUpgradeError("migration phase exceeded its declared record budget")
         if result.metadata_ops > spec.max_metadata_ops_per_slice:
@@ -848,7 +842,11 @@ class UpgradeCoordinator:
         migrations = upgrade["migrations"]
         for plugin in self.registry.values():
             item = migrations.get(plugin.spec.name)
-            if item is not None and item.get("state") != "completed" and self._prerequisites_satisfied(upgrade, plugin.spec):
+            if (
+                item is not None
+                and item.get("state") != "completed"
+                and self._prerequisites_satisfied(upgrade, plugin.spec)
+            ):
                 return item
         return next((item for item in migrations.values() if item.get("state") != "completed"), None)
 
