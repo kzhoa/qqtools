@@ -73,7 +73,7 @@ class Executor:
             reference, handoff = self.initiate_attempt(cfg, task_id, attempt, session_name)
         with diagnostic_span("executor.launch.handoff"):
             failures = self.wait_for_launch_handoffs([handoff])
-        if failure := failures.get(attempt.attempt_id):
+        if failure := failures.get(handoff):
             raise failure
         return reference
 
@@ -112,20 +112,20 @@ class Executor:
     @staticmethod
     def wait_for_launch_handoffs(
         handoffs: list[LaunchHandoff],
-    ) -> dict[str, RuntimeError]:
-        """Wait for several runner handoffs against their independent deadlines."""
-        remaining = {handoff.attempt_id: handoff for handoff in handoffs}
-        failures: dict[str, RuntimeError] = {}
+    ) -> dict[LaunchHandoff, RuntimeError]:
+        """Wait for handoffs by durable path identity, not project-local Attempt ID."""
+        remaining = list(handoffs)
+        failures: dict[LaunchHandoff, RuntimeError] = {}
         while remaining:
             now = time.monotonic()
-            for attempt_id, handoff in list(remaining.items()):
+            for handoff in list(remaining):
                 if handoff.intent_path.exists():
-                    del remaining[attempt_id]
+                    remaining.remove(handoff)
                 elif now >= handoff.deadline:
-                    failures[attempt_id] = RuntimeError(
-                        f"runner did not publish launch intent for {attempt_id!r}"
+                    failures[handoff] = RuntimeError(
+                        f"runner did not publish launch intent for {handoff.attempt_id!r}"
                     )
-                    del remaining[attempt_id]
+                    remaining.remove(handoff)
             if remaining:
                 time.sleep(0.01)
         return failures
@@ -135,7 +135,7 @@ class Executor:
         """Wait until the runner has durably claimed the launch handoff."""
         handoff = Executor._launch_handoff(cfg, attempt_id, timeout_seconds)
         failures = Executor.wait_for_launch_handoffs([handoff])
-        if failure := failures.get(attempt_id):
+        if failure := failures.get(handoff):
             raise failure
 
     def cleanup_window(self, window_id: str | None) -> None:
