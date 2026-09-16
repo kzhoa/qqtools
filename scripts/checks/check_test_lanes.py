@@ -16,6 +16,7 @@ RETIRED_TOX_LANES = (
     "testenv:qexp-stress",
 )
 SOURCE_TOX_LANES = frozenset(("unit", "integration", "qexp", "preflight"))
+SHARED_PREFLIGHT_RUNNER = Path("scripts/ci/run_preflight.py")
 REAL_PROCESS_CALLS = frozenset(
     {
         "multiprocessing.Process",
@@ -139,6 +140,19 @@ def _section_commands(config: ConfigParser, section: str) -> str | None:
     return config.get(section, "commands", fallback="")
 
 
+def _preflight_contract_text(repo_root: Path, preflight_commands: str | None) -> tuple[str | None, list[str]]:
+    """Return the executable preflight contract, following the shared runner when configured."""
+    if preflight_commands is None:
+        return None, []
+    runner_name = SHARED_PREFLIGHT_RUNNER.as_posix()
+    if runner_name not in preflight_commands:
+        return preflight_commands, []
+    runner_path = repo_root / SHARED_PREFLIGHT_RUNNER
+    if not runner_path.is_file():
+        return preflight_commands, [f"preflight shared runner is absent: {runner_name}"]
+    return f"{preflight_commands}\n{runner_path.read_text(encoding='utf-8')}", []
+
+
 def _check_tox_boundaries(repo_root: Path) -> list[str]:
     try:
         config = _load_tox_config(repo_root / "tox.ini")
@@ -150,10 +164,12 @@ def _check_tox_boundaries(repo_root: Path) -> list[str]:
         errors.append("retired qexp tox lanes are present")
 
     preflight_commands = _section_commands(config, "testenv:preflight")
-    if preflight_commands is None or "tests/e2e" in preflight_commands:
+    preflight_contract, contract_errors = _preflight_contract_text(repo_root, preflight_commands)
+    errors.extend(contract_errors)
+    if preflight_contract is None or "tests/e2e" in preflight_contract:
         errors.append("preflight must collect only Unit and Integration tests")
     lifecycle_test = "tests/integration/qexp/test_agent_lifecycle_independence.py"
-    if preflight_commands is None or lifecycle_test not in preflight_commands:
+    if preflight_contract is None or lifecycle_test not in preflight_contract:
         errors.append("preflight must run the representative qexp lifecycle gate")
 
     parallel_commands = _section_commands(config, "testenv:qexp-lifecycle-parallel")
