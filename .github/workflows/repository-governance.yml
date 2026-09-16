@@ -1,0 +1,98 @@
+name: Repository Governance
+
+on:
+  push:
+  pull_request:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate-checkout:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate repository governance
+        run: python3 scripts/checks/check_repository_governance.py
+
+      - name: Enforce owner-only governance changes on push
+        if: github.event_name == 'push' && github.actor != 'kzhoa'
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+            changed="$(git diff-tree --no-commit-id --name-only -r "$AFTER")"
+          else
+            changed="$(git diff --name-only "$BEFORE" "$AFTER")"
+          fi
+
+          protected='^(AGENTS\.md|\.github/CODEOWNERS|\.github/workflows/repository-governance\.yml|\.github/workflows/feature-promote\.yml|scripts/checks/check_repository_governance\.py)$'
+          if printf '%s\n' "$changed" | grep -Eq "$protected"; then
+            echo "Only repository owner kzhoa may modify the protected governance surface."
+            printf '%s\n' "$changed" | grep -E "$protected" || true
+            exit 1
+          fi
+
+  inspect-pull-request:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce protected paths without checking out untrusted code
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const protectedPaths = new Set([
+              'AGENTS.md',
+              '.github/CODEOWNERS',
+              '.github/workflows/repository-governance.yml',
+              '.github/workflows/feature-promote.yml',
+              'scripts/checks/check_repository_governance.py',
+            ]);
+
+            const protectedChanges = files.filter((file) =>
+              protectedPaths.has(file.filename) ||
+              (file.previous_filename && protectedPaths.has(file.previous_filename))
+            );
+
+            if (protectedChanges.length > 0 && context.actor !== 'kzhoa') {
+              core.setFailed(
+                `Only repository owner kzhoa may modify protected governance files: ${protectedChanges
+                  .map((file) => file.filename)
+                  .join(', ')}`
+              );
+            }
+
+            if (['dev', 'main'].includes(pr.base.ref)) {
+              const devState = files.filter((file) =>
+                file.filename === '.dev' ||
+                file.filename.startsWith('.dev/') ||
+                (file.previous_filename &&
+                  (file.previous_filename === '.dev' || file.previous_filename.startsWith('.dev/')))
+              );
+              if (devState.length > 0) {
+                core.setFailed('.dev/** is feature-local state and may not enter dev or main.');
+              }
+            }

@@ -1,0 +1,90 @@
+name: Promote Feature to Dev
+
+on:
+  push:
+    branches:
+      - 'feat/**'
+      - 'feature/**'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: feature-promotion-to-dev
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: startsWith(github.event.head_commit.message, 'promote:')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate repository governance
+        run: python3 scripts/checks/check_repository_governance.py
+
+      - name: Prepare promotion
+        id: prepare
+        env:
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          git fetch origin dev
+          dev_sha="$(git rev-parse origin/dev)"
+
+          if ! git merge-base --is-ancestor "$dev_sha" HEAD; then
+            echo "Feature branch is behind dev. Rebase/rebuild it on the current dev before promotion."
+            exit 1
+          fi
+
+          protected='^(AGENTS\.md|\.github/CODEOWNERS|\.github/workflows/repository-governance\.yml|\.github/workflows/feature-promote\.yml|scripts/checks/check_repository_governance\.py)$'
+          if [[ "$ACTOR" != "kzhoa" ]] && git diff --name-only "$dev_sha"...HEAD | grep -Eq "$protected"; then
+            echo "Only repository owner kzhoa may promote protected governance changes."
+            git diff --name-only "$dev_sha"...HEAD | grep -E "$protected" || true
+            exit 1
+          fi
+
+          rm -rf .dev
+          git add -A
+          tree_sha="$(git write-tree)"
+          dev_tree="$(git rev-parse "$dev_sha^{tree}")"
+          if [[ "$tree_sha" == "$dev_tree" ]]; then
+            echo "Promotion contains no changes after stripping .dev/**."
+            exit 1
+          fi
+
+          subject="$(printf '%s\n' "$HEAD_MESSAGE" | head -n 1)"
+          squash_subject="${subject#promote:}"
+          squash_subject="${squash_subject# }"
+          if [[ -z "$squash_subject" ]]; then
+            squash_subject="promote $BRANCH"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          commit_sha="$(printf '%s\n\nPromoted-from: %s\n' "$squash_subject" "$BRANCH" | git commit-tree "$tree_sha" -p "$dev_sha")"
+
+          echo "dev_sha=$dev_sha" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Advance dev with squash commit
+        env:
+          COMMIT_SHA: ${{ steps.prepare.outputs.commit_sha }}
+        run: git push origin "$COMMIT_SHA:refs/heads/dev"
+
+      - name: Trigger Dev Preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run dev-preflight.yml --ref dev
+
+      - name: Delete promoted feature branch
+        env:
+          BRANCH: ${{ steps.prepare.outputs.branch }}
+        run: git push origin --delete "$BRANCH"
