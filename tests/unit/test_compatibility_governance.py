@@ -40,7 +40,7 @@ def _write_registry(
     item_number = int(item_id.rsplit("-", 1)[1])
     effective_next_id = next_id if next_id is not None else item_number + 1
     registry.write_text(
-        f"""schema_version = 2
+        f"""schema_version = 1
 next_id = {effective_next_id}
 
 [[items]]
@@ -65,7 +65,7 @@ verification = ["tests/test_example.py"]
 def _write_empty_registry(root: Path, *, next_id: int = 9002) -> Path:
     registry = root / "docs/spec/compatibility-registry.toml"
     registry.parent.mkdir(parents=True, exist_ok=True)
-    registry.write_text(f"schema_version = 2\nnext_id = {next_id}\n", encoding="utf-8")
+    registry.write_text(f"schema_version = 1\nnext_id = {next_id}\n", encoding="utf-8")
     return registry
 
 
@@ -157,15 +157,14 @@ def test_registry_requires_summary(tmp_path: Path) -> None:
         load_registry(registry, tmp_path)
 
 
-@pytest.mark.parametrize("field", ["decision_refs", "pitch_refs", "action_refs"])
-def test_registry_v2_rejects_private_or_action_reference_fields(tmp_path: Path, field: str) -> None:
+def test_registry_rejects_action_refs(tmp_path: Path) -> None:
     registry = _write_registry(tmp_path)
     registry.write_text(
-        registry.read_text(encoding="utf-8") + f'{field} = ["docs/private/example.md"]\n',
+        registry.read_text(encoding="utf-8") + 'action_refs = ["docs/private/example.md"]\n',
         encoding="utf-8",
     )
 
-    with pytest.raises(RegistryError, match=f"unknown field '{field}'"):
+    with pytest.raises(RegistryError, match="unknown field 'action_refs'"):
         load_registry(registry, tmp_path)
 
 
@@ -183,14 +182,14 @@ def test_registry_allows_no_unfinished_items(tmp_path: Path) -> None:
     assert registry.next_id == 9002
 
 
-def test_current_registry_rejects_schema_v1(tmp_path: Path) -> None:
+def test_current_registry_rejects_other_schema_versions(tmp_path: Path) -> None:
     registry = _write_registry(tmp_path)
     registry.write_text(
-        registry.read_text(encoding="utf-8").replace("schema_version = 2", "schema_version = 1", 1),
+        registry.read_text(encoding="utf-8").replace("schema_version = 1", "schema_version = 2", 1),
         encoding="utf-8",
     )
 
-    with pytest.raises(RegistryError, match="schema_version must be 2"):
+    with pytest.raises(RegistryError, match="schema_version must be 1"):
         load_registry(registry, tmp_path)
 
 
@@ -220,7 +219,6 @@ def test_historical_schema_v1_is_readable_for_release_transition(tmp_path: Path)
         raw,
         tmp_path,
         validate_repository=False,
-        allow_legacy_schema=True,
     )
 
     assert registry[0].item_id == "QQTOOLS-COMPAT-9001"

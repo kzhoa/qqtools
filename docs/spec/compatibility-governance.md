@@ -47,19 +47,10 @@ allowed when no separate migration release is needed.
 
 ## Registry schema
 
-The current checkout uses compatibility registry schema v2. Current source must validate strictly
-against v2. Release-transition checks may read schema v1 registries from historical release tags in
-read-only mode so a governance-format upgrade cannot erase old deadlines, retired-ID history, or
-cleanup obligations.
+The compatibility registry remains on schema v1. This change deliberately does not introduce a
+new governance schema merely because private design-document references were removed.
 
-Historical schema parsing is compatibility for the governance checker itself; it does not authorize
-new v1 registry files in a current branch.
-
-The top-level `next_id` is the next numeric compatibility ID to allocate. It only increases, even
-after older items leave the registry. This prevents ID reuse without retaining completed records.
-The registry may contain no `[[items]]` entries when no compatibility work is unfinished.
-
-Every schema-v2 unfinished `[[items]]` entry contains:
+Current registry entries contain:
 
 - a unique `QQTOOLS-COMPAT-NNNN` ID and identical `marker`;
 - `component`, `kind`, and module-level `owner`;
@@ -69,9 +60,11 @@ Every schema-v2 unfinished `[[items]]` entry contains:
 - optional append-only `extensions` for approved deadline changes; and
 - structured rollout fields when the item declares an operational migration contract.
 
-Schema v2 has no `pitch_refs`, `decision_refs`, or `action_refs`. Private planning and design files
-must not be named as public registry dependencies. Implementation progress belongs to disposable
-feature-branch state, commits, tests, and CI rather than to the compatibility ledger.
+Current entries omit `pitch_refs`, `decision_refs`, and `action_refs`. Private planning and design
+files are not registry dependencies. The checker temporarily tolerates the old `decision_refs` and
+`pitch_refs` keys when reading the previous `v1.3.18` release snapshot; those keys are ignored and
+carry no authority. After a clean schema-v1 registry is published in the next patch release, that
+legacy-key tolerance can be removed.
 
 Temporary implementation and behavior fixtures carry their compatibility ID. The checker scans
 tracked and non-ignored files under `src/`, `tests/`, and `scripts/`. Planned items must have no
