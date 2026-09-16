@@ -2,7 +2,11 @@ name: Repository Governance
 
 on:
   push:
-  pull_request:
+    branches:
+      - dev
+      - main
+      - 'feat/**'
+      - 'feature/**'
   pull_request_target:
     types:
       - opened
@@ -15,8 +19,8 @@ permissions:
   pull-requests: read
 
 jobs:
-  validate-checkout:
-    if: github.event_name != 'pull_request_target'
+  validate-push:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -28,7 +32,7 @@ jobs:
         run: python3 scripts/checks/check_repository_governance.py
 
       - name: Enforce owner-only governance changes on push
-        if: github.event_name == 'push' && github.actor != 'kzhoa'
+        if: github.actor != 'kzhoa'
         env:
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
@@ -40,12 +44,92 @@ jobs:
             changed="$(git diff --name-only "$BEFORE" "$AFTER")"
           fi
 
-          protected='^(AGENTS\.md|\.github/CODEOWNERS|\.github/workflows/repository-governance\.yml|\.github/workflows/feature-promote\.yml|scripts/checks/check_repository_governance\.py)$'
+          protected='^(AGENTS\.md|\.github/CODEOWNERS|\.github/workflows/.*|scripts/checks/check_repository_governance\.py)$'
           if printf '%s\n' "$changed" | grep -Eq "$protected"; then
             echo "Only repository owner kzhoa may modify the protected governance surface."
             printf '%s\n' "$changed" | grep -E "$protected" || true
             exit 1
           fi
+
+  promote-feature:
+    if: >-
+      github.event_name == 'push' &&
+      (startsWith(github.ref_name, 'feat/') || startsWith(github.ref_name, 'feature/')) &&
+      startsWith(github.event.head_commit.message, 'promote:')
+    needs: validate-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    concurrency:
+      group: feature-promotion-to-dev
+      cancel-in-progress: false
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare promotion
+        id: prepare
+        env:
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          git fetch origin dev
+          dev_sha="$(git rev-parse origin/dev)"
+
+          if ! git merge-base --is-ancestor "$dev_sha" HEAD; then
+            echo "Feature branch is behind dev. Rebase/rebuild it on the current dev before promotion."
+            exit 1
+          fi
+
+          protected='^(AGENTS\.md|\.github/CODEOWNERS|\.github/workflows/.*|scripts/checks/check_repository_governance\.py)$'
+          if [[ "$ACTOR" != "kzhoa" ]] && git diff --name-only "$dev_sha"...HEAD | grep -Eq "$protected"; then
+            echo "Only repository owner kzhoa may promote protected governance changes."
+            git diff --name-only "$dev_sha"...HEAD | grep -E "$protected" || true
+            exit 1
+          fi
+
+          rm -rf .dev
+          git add -A
+          tree_sha="$(git write-tree)"
+          dev_tree="$(git rev-parse "$dev_sha^{tree}")"
+          if [[ "$tree_sha" == "$dev_tree" ]]; then
+            echo "Promotion contains no changes after stripping .dev/**."
+            exit 1
+          fi
+
+          subject="$(printf '%s\n' "$HEAD_MESSAGE" | head -n 1)"
+          squash_subject="${subject#promote:}"
+          squash_subject="${squash_subject# }"
+          if [[ -z "$squash_subject" ]]; then
+            squash_subject="promote $BRANCH"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          commit_sha="$(printf '%s\n\nPromoted-from: %s\n' "$squash_subject" "$BRANCH" | git commit-tree "$tree_sha" -p "$dev_sha")"
+
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Advance dev with squash commit
+        env:
+          COMMIT_SHA: ${{ steps.prepare.outputs.commit_sha }}
+        run: git push origin "$COMMIT_SHA:refs/heads/dev"
+
+      - name: Trigger Dev Preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run dev-preflight.yml --ref dev
+
+      - name: Delete promoted feature branch
+        env:
+          BRANCH: ${{ steps.prepare.outputs.branch }}
+        run: git push origin --delete "$BRANCH"
 
   inspect-pull-request:
     if: github.event_name == 'pull_request_target'
@@ -64,17 +148,15 @@ jobs:
               per_page: 100,
             });
 
-            const protectedPaths = new Set([
-              'AGENTS.md',
-              '.github/CODEOWNERS',
-              '.github/workflows/repository-governance.yml',
-              '.github/workflows/feature-promote.yml',
-              'scripts/checks/check_repository_governance.py',
-            ]);
+            const isProtected = (path) =>
+              path === 'AGENTS.md' ||
+              path === '.github/CODEOWNERS' ||
+              path === 'scripts/checks/check_repository_governance.py' ||
+              path.startsWith('.github/workflows/');
 
             const protectedChanges = files.filter((file) =>
-              protectedPaths.has(file.filename) ||
-              (file.previous_filename && protectedPaths.has(file.previous_filename))
+              isProtected(file.filename) ||
+              (file.previous_filename && isProtected(file.previous_filename))
             );
 
             if (protectedChanges.length > 0 && context.actor !== 'kzhoa') {

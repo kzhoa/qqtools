@@ -2,6 +2,7 @@
 <!-- qqtools-governance:strip-dot-dev=v1 -->
 <!-- qqtools-governance:agents-owner=kzhoa -->
 <!-- qqtools-governance:no-pr-required=v1 -->
+<!-- qqtools-governance:workflow-policy=v1 -->
 
 # AGENTS.md
 
@@ -71,7 +72,7 @@ A conforming promotion must:
 6. delete the disposable feature branch after a successful push; and
 7. trigger the `Dev Preflight` workflow for the promoted `dev` commit.
 
-The repository workflow may use a final feature-branch commit whose subject starts with `promote:` as the promotion request. Do not use that convention until the feature is ready to integrate.
+The repository governance workflow may use a final feature-branch commit whose subject starts with `promote:` as the promotion request. Do not use that convention until the feature is ready to integrate.
 
 ## Validation
 
@@ -85,6 +86,26 @@ Before code is treated as integrated:
 
 Do not weaken tests, skip lifecycle coverage, or create a superficial fast lane merely to make a feature pass.
 
+## Workflow governance
+
+GitHub Actions workflows are long-lived repository infrastructure, not an ad-hoc remote shell or a temporary editing mechanism.
+
+The stable workflow allowlist is:
+
+- `.github/workflows/ci.yml`
+- `.github/workflows/dev-preflight.yml`
+- `.github/workflows/publish.yml`
+- `.github/workflows/repository-governance.yml`
+
+Rules:
+
+- Agents must not create, delete, rename, or modify any file under `.github/workflows/**` unless the repository owner has explicitly approved that workflow change in the current task.
+- If the existing workflows cannot support a task, stop that part of the implementation and ask the owner for approval before changing workflow infrastructure.
+- Do not create one-shot, temporary, recovery, patching, or code-editing workflows. Use normal repository file/Git operations for code changes.
+- Do not add a new workflow merely to run a command once. Prefer an existing stable workflow, a repository script, or a local/connector execution path.
+- Any approved workflow-set change must also update the repository-governance allowlist and keep workflow ownership protections intact.
+- Public contributor PRs may still use the stable CI workflows; owner-driven development does not require PRs.
+
 ## Compatibility governance
 
 - `docs/spec/compatibility-registry.toml` is a lifecycle ledger, not a design-history database.
@@ -92,6 +113,7 @@ Do not weaken tests, skip lifecycle coverage, or create a superficial fast lane 
 - Public compatibility validation must not require ignored or private pitch/ADR files.
 - Temporary compatibility behavior must remain discoverable through its compatibility marker and verification tests.
 - Private planning records are optional context and must never be required to build, test, release, or safely advance a compatibility lifecycle.
+- Any intentionally temporary compatibility shim that must survive until a later release must be registered before integration, including temporary parser/checker tolerance in developer tooling. Do not rely on TODOs, private notes, or human memory for future cleanup. If the shim can be removed immediately, remove it instead of registering a fake completed item.
 
 ## Protected governance surface
 
@@ -99,13 +121,14 @@ The following files define or enforce repository governance and are owner-contro
 
 - `AGENTS.md`
 - `.github/CODEOWNERS`
-- `.github/workflows/repository-governance.yml`
-- `.github/workflows/feature-promote.yml`
+- every file under `.github/workflows/**`
 - `scripts/checks/check_repository_governance.py`
 
 Only GitHub actor `kzhoa` may intentionally modify this protected governance surface.
 
 Agents running under any other actor must not edit these files. If a requested change requires modifying them, stop that part of the change and ask the repository owner to perform or authorize it.
+
+Even when an agent is operating through credentials that appear as GitHub actor `kzhoa`, the agent must still follow the workflow-governance approval rule above. Owner credentials are not implicit approval to change workflow infrastructure.
 
 Owner changes must preserve the machine-readable governance markers at the top of this file and pass the repository-governance checker. This requirement is intended to prevent accidental policy erosion as well as unauthorized edits.
 

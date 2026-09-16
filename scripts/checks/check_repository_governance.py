@@ -10,12 +10,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AGENTS_PATH = REPO_ROOT / "AGENTS.md"
+WORKFLOW_ROOT = REPO_ROOT / ".github" / "workflows"
 
 REQUIRED_MARKERS = (
     "<!-- qqtools-governance:branch-model=v1 -->",
     "<!-- qqtools-governance:strip-dot-dev=v1 -->",
     "<!-- qqtools-governance:agents-owner=kzhoa -->",
     "<!-- qqtools-governance:no-pr-required=v1 -->",
+    "<!-- qqtools-governance:workflow-policy=v1 -->",
 )
 
 REQUIRED_SECTIONS = (
@@ -23,9 +25,17 @@ REQUIRED_SECTIONS = (
     "## Feature-local agent state",
     "## Feature promotion",
     "## Validation",
+    "## Workflow governance",
     "## Compatibility governance",
     "## Protected governance surface",
 )
+
+ALLOWED_WORKFLOWS = {
+    "ci.yml",
+    "dev-preflight.yml",
+    "publish.yml",
+    "repository-governance.yml",
+}
 
 PUBLIC_BRANCHES = {"dev", "main"}
 
@@ -58,6 +68,12 @@ def _tracked_dev_paths() -> tuple[str, ...]:
     return tuple(line for line in result.stdout.splitlines() if line)
 
 
+def _workflow_names() -> set[str]:
+    if not WORKFLOW_ROOT.is_dir():
+        return set()
+    return {path.name for path in WORKFLOW_ROOT.iterdir() if path.is_file()}
+
+
 def main() -> int:
     errors: list[str] = []
 
@@ -78,6 +94,21 @@ def main() -> int:
 
     if "Only GitHub actor `kzhoa` may intentionally modify this protected governance surface." not in content:
         errors.append("AGENTS.md must retain the owner-only governance statement for GitHub actor kzhoa")
+
+    workflow_rule = (
+        "Agents must not create, delete, rename, or modify any file under `.github/workflows/**` "
+        "unless the repository owner has explicitly approved that workflow change in the current task."
+    )
+    if workflow_rule not in content:
+        errors.append("AGENTS.md must retain the explicit owner-approval rule for workflow changes")
+
+    workflow_names = _workflow_names()
+    missing_workflows = sorted(ALLOWED_WORKFLOWS - workflow_names)
+    unexpected_workflows = sorted(workflow_names - ALLOWED_WORKFLOWS)
+    if missing_workflows:
+        errors.append(f"required stable workflows are missing: {missing_workflows}")
+    if unexpected_workflows:
+        errors.append(f"unexpected workflow files are forbidden: {unexpected_workflows}")
 
     branch = _current_branch()
     if branch in PUBLIC_BRANCHES:
