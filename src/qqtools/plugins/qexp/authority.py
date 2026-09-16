@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import shutil
 import uuid
 from dataclasses import asdict
@@ -220,7 +221,10 @@ class AuthoritySupervisor:
                 if not isinstance(number, int):
                     return
                 try:
-                    attempt = AttemptRecord.from_dict(read_json(attempt_path(self.cfg.shared_root, task_id, number)))
+                    attempt_file = attempt_path(self.cfg.shared_root, task_id, number)
+                    stored_attempt = read_json(attempt_file)
+                    attempt = AttemptRecord.from_dict(stored_attempt)
+                    original_attempt_value = copy.deepcopy(stored_attempt)
                 except (FileNotFoundError, KeyError, ValueError):
                     return
                 if (
@@ -260,7 +264,9 @@ class AuthoritySupervisor:
                 if attempt.timestamps.get("running_at") is None:
                     attempt.timestamps["running_at"] = utc_now()
                 attempt.phase = "running"
-                atomic_replace(attempt_path(self.cfg.shared_root, task_id, number), attempt.to_dict())
+                attempt_value = attempt.to_dict()
+                if attempt_value != original_attempt_value:
+                    atomic_replace(attempt_file, attempt_value)
                 if claim.get("launch_state") != "running":
                     claim["launch_state"] = "running"
                     task.meta["revision"] += 1
@@ -820,9 +826,7 @@ class AuthoritySupervisor:
             )
         if result.outcome != "committed":
             return
-        if result.reservation_id and (
-            is_renamed_execution or result.reservation_machine_name == self.cfg.machine_name
-        ):
+        if result.reservation_id and (is_renamed_execution or result.reservation_machine_name == self.cfg.machine_name):
             release(self.reservation_runtime_root, result.reservation_id, reason)
         manifest_path = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
         process = read_json(manifest_path).get("process", {})

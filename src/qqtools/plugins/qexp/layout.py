@@ -54,6 +54,7 @@ def read_schema_version(cfg: RootConfig) -> int | None:
 CPU_LANE_CAPABILITY = "cpu-lane-v1"
 TASK_DEPENDENCIES_CAPABILITY = "task-dependencies-v1"
 GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
+READY_WRITER_CAPABILITY = "ready-v1"
 _CPU_LANE_REQUIRED_ERROR = "qexp root requires cpu-lane-v1; complete conversion with qqtools 1.3.15."
 SUPPORTED_REQUIRED_CAPABILITIES = frozenset(
     {
@@ -216,6 +217,7 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                         TASK_DEPENDENCIES_CAPABILITY,
                         GROUP_READY_MEMBERS_CAPABILITY,
                     ],
+                    "writer_capabilities": [READY_WRITER_CAPABILITY],
                 }
             }
             atomic_replace(_schema_path(cfg), schema)
@@ -225,6 +227,9 @@ def initialize_shared_root(cfg: RootConfig) -> None:
             from .runtime.ready.group_members import initialize_group_ready_members
 
             initialize_group_ready_members(cfg)
+            from .runtime.ready.state import _activate_empty_ready_index
+
+            _activate_empty_ready_index(cfg, uuid.uuid4().hex)
     ensure_machine_layout(cfg)
     identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
     if not identity_path.exists():

@@ -25,6 +25,12 @@ commands =
 
 [testenv:artifact-e2e]
 commands = pytest tests/e2e
+
+[testenv:qexp-lifecycle-parallel]
+commands = pytest --lifecycle-gate=full tests/integration/qexp/test_agent_lifecycle_independence.py -n 4 --dist load
+
+[testenv:qexp-integration]
+commands = python scripts/qexp_integration_gate.py --budget-seconds 600
 """,
     )
     _write(
@@ -92,6 +98,28 @@ def test_lane_marker_check_rejects_integration_marker_under_unit(tmp_path: Path)
     assert check_test_lanes(tmp_path) == ["Unit may not use integration: tests/unit/test_misplaced.py"]
 
 
+def test_lane_marker_check_rejects_real_subprocess_under_unit(tmp_path: Path) -> None:
+    _write_valid_repository(tmp_path)
+    _write(
+        tmp_path / "tests/unit/test_misplaced.py",
+        "import subprocess as sp\n\ndef test_process():\n    sp.run(['true'], check=True)\n",
+    )
+
+    assert check_test_lanes(tmp_path) == [
+        "Unit may not start real processes: tests/unit/test_misplaced.py:4 uses subprocess.run"
+    ]
+
+
+def test_lane_marker_check_allows_mocked_subprocess_symbol_under_unit(tmp_path: Path) -> None:
+    _write_valid_repository(tmp_path)
+    _write(
+        tmp_path / "tests/unit/test_local_process_policy.py",
+        "def test_policy():\n    calls = ['subprocess.run']\n    assert calls\n",
+    )
+
+    assert check_test_lanes(tmp_path) == []
+
+
 def test_lane_check_rejects_e2e_collection_from_preflight(tmp_path: Path) -> None:
     _write_valid_repository(tmp_path)
     _write(
@@ -102,6 +130,12 @@ commands = pytest tests/e2e
 
 [testenv:artifact-e2e]
 commands = pytest tests/e2e
+
+[testenv:qexp-lifecycle-parallel]
+commands = pytest --lifecycle-gate=full tests/integration/qexp/test_agent_lifecycle_independence.py -n 4 --dist load
+
+[testenv:qexp-integration]
+commands = python scripts/qexp_integration_gate.py --budget-seconds 600
 """,
     )
 

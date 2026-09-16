@@ -1,7 +1,9 @@
 from pathlib import Path
 
+import pytest
+
 from qqtools.plugins.qexp.config_types import RootConfig
-from qqtools.plugins.qexp.executor import Executor
+from qqtools.plugins.qexp.executor import Executor, LaunchHandoff
 from qqtools.plugins.qexp.runtime.records import SCHEMA_VERSION, AttemptRecord
 
 
@@ -80,9 +82,16 @@ def _cfg(tmp_path: Path) -> RootConfig:
 
 def test_executor_uses_tmux_when_available(tmp_path: Path):
     sent: list[tuple[str, str]] = []
+
+    def send_command(window_id: str, command: str) -> None:
+        sent.append((window_id, command))
+        intent = tmp_path / "rt" / "launch-intents" / "task-1-attempt-1.json"
+        intent.parent.mkdir(parents=True, exist_ok=True)
+        intent.touch()
+
     executor = Executor(
         create_window=lambda *args: "@7",
-        send_command=lambda window_id, command: sent.append((window_id, command)),
+        send_command=send_command,
         destroy_window=lambda window_id: None,
         check_window=lambda window_id: True,
         tmux_available=lambda: True,
@@ -99,6 +108,9 @@ def test_executor_falls_back_to_detached_runner_without_tmux(tmp_path: Path):
 
     def fake_spawn(argv, **kwargs):
         spawned.append({"argv": argv, **kwargs})
+        intent = tmp_path / "rt" / "launch-intents" / "task-1-attempt-1.json"
+        intent.parent.mkdir(parents=True)
+        intent.touch()
         return _FakeProcess(4321)
 
     executor = Executor(
@@ -118,3 +130,24 @@ def test_executor_falls_back_to_detached_runner_without_tmux(tmp_path: Path):
     assert spawned[0]["argv"] == executor.build_runner_argv(cfg, "task-1", "task-1-attempt-1", 7, "launch-1")
     assert spawned[0]["cwd"] == str(cfg.project_root)
     assert spawned[0]["start_new_session"] is True
+
+
+def test_executor_rejects_runner_without_launch_handoff(tmp_path: Path):
+    executor = Executor(tmux_available=lambda: False, spawn_runner=lambda *_args, **_kwargs: _FakeProcess(4321))
+
+    with pytest.raises(RuntimeError, match="did not publish launch intent"):
+        executor._wait_for_launch_intent(_cfg(tmp_path), "task-1-attempt-1", timeout_seconds=0.01)
+
+
+def test_executor_reports_only_failed_handoffs(tmp_path: Path):
+    published = tmp_path / "published.json"
+    published.touch()
+    failures = Executor.wait_for_launch_handoffs(
+        [
+            LaunchHandoff("published", published, 0.0),
+            LaunchHandoff("missing", tmp_path / "missing.json", 0.0),
+        ]
+    )
+
+    assert list(failures) == ["missing"]
+    assert str(failures["missing"]) == "runner did not publish launch intent for 'missing'"

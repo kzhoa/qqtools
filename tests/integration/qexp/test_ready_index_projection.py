@@ -56,7 +56,7 @@ def test_submission_commits_one_durable_ready_generation(tmp_path: Path):
     assert result.classification == "claimable"
     assert result.task is not None and result.task.task_id == task.task_id
     assert publication_state(cfg, reference) == "committed"
-    assert read_json(ready_state_path(cfg.shared_root))["ready_index"]["state"] == "absent"
+    assert read_json(ready_state_path(cfg.shared_root))["ready_index"]["state"] == "active"
 
 
 def test_claim_commits_truth_before_retiring_ready_marker(tmp_path: Path):

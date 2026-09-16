@@ -12,9 +12,7 @@ from typing import Any, Callable, Iterator, TypeVar
 
 T = TypeVar("T")
 _migration_json_io_guard: ContextVar[bool] = ContextVar("migration_json_io_guard", default=False)
-_migration_json_io_authorized: ContextVar[bool] = ContextVar(
-    "migration_json_io_authorized", default=False
-)
+_migration_json_io_authorized: ContextVar[bool] = ContextVar("migration_json_io_authorized", default=False)
 
 
 class CASConflict(RuntimeError):
@@ -137,6 +135,11 @@ def cas_update(path: Path, expected_revision: int, value: dict[str, Any]) -> Non
 
 
 def iter_json(directory: Path) -> list[Path]:
+    """Return sorted regular JSON files without following filesystem symlinks."""
     if not directory.is_dir():
         return []
-    return sorted(path for path in directory.glob("*.json") if path.is_file())
+    with os.scandir(directory) as entries:
+        names = sorted(
+            entry.name for entry in entries if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False)
+        )
+    return [directory / name for name in names]

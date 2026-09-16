@@ -10,6 +10,7 @@ import pytest
 from qqtools.torch.qlmdbdataset import qLmdbDataset
 
 lmdb = pytest.importorskip("lmdb")
+pytestmark = pytest.mark.integration
 
 
 class _Dataset(qLmdbDataset):
