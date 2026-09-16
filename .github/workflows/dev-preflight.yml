@@ -40,5 +40,5 @@ jobs:
           python -m pip install -e ".[full]" pytest-xdist
           python -c "import torch; assert torch.version.cuda is None, f'GitHub preflight must use CPU-only torch, got CUDA {torch.version.cuda}'"
 
-      - name: Run shared preflight gates
-        run: python scripts/ci/run_preflight.py
+      - name: Run shared preflight gates in CI tox shell
+        run: python -m tox run -e preflight-ci
