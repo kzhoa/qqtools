@@ -122,3 +122,28 @@ def test_release_push_preserves_validated_sha_and_ancestry(tmp_path: Path, state
     else:
         assert result.returncode != 0
         assert after == before
+
+
+@pytest.mark.parametrize("workflow", ["dev-preflight.yml", "ci.yml"])
+@pytest.mark.parametrize(
+    ("evidence", "reused", "fresh", "success"),
+    [
+        ("success", "true", "skipped skipped", True),
+        ("success", "false", "success success", True),
+        ("failure", "true", "skipped skipped", False),
+        ("cancelled", "false", "success success", False),
+        ("success", "false", "success skipped", False),
+        ("success", "false", "success failure", False),
+        ("success", "false", "", False),
+    ],
+)
+def test_gate_result_requires_evidence_or_all_fresh_jobs(workflow, evidence, reused, fresh, success):
+    jobs = yaml.safe_load((ROOT / ".github/workflows" / workflow).read_text())["jobs"]
+    result = subprocess.run(
+        ["bash", "-c", jobs["gate-result"]["steps"][0]["run"]],
+        env={**os.environ, "EVIDENCE_RESULT": evidence, "REUSED": reused, "FRESH_RESULTS": fresh},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (result.returncode == 0) is success

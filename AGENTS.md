@@ -64,7 +64,8 @@ understandable without private documents.
 Before changing `dev`, the feature must contain current `dev`, and the candidate
 tree with `.dev/**` removed must pass governance and complete preflight.
 Create one squash commit with current `dev` as parent; delete the feature only
-after a successful push. Dev Preflight then verifies the promoted commit.
+after a successful push. Dev Preflight then verifies the promoted commit; release may reuse that exact
+commit's successful evidence under the development workflow rules.
 Reserve `promote:` commit subjects for ready-to-integrate promotion requests.
 
 ## Dev release promotion
@@ -72,7 +73,8 @@ Reserve `promote:` commit subjects for ready-to-integrate promotion requests.
 Dispatch from current `dev`; validate preflight and installed-artifact E2E
 against that exact commit. Abort if `dev` advances. Verify `main` ancestry and
 fast-forward it to the validated commit without another squash or merge-back.
-Main push workflows provide post-promotion verification. Release tags must
+Main push workflows verify exact-commit evidence from the release gates, or run
+the full artifact gate when reusable evidence is unavailable. Release tags must
 point to commits reachable from `main`. Follow the development workflow for
 dispatch commands and owner-credential promotion of workflow changes.
 

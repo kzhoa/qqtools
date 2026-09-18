@@ -78,6 +78,8 @@ gh workflow run repository-governance.yml --ref dev -f operation=promote-dev-to-
 ```
 
 The exact `dev` commit must pass repository preflight and installed-artifact E2E.
+The release preflight reuses the recent Dev Preflight push run for that SHA,
+waiting for it to finish if necessary; it does not cancel and restart that run.
 If `dev` advances during validation, the operation must abort and be dispatched
 again. Current `main` must be an ancestor of the validated commit; promotion
 fast-forwards `main` to that same commit. Do not create another squash commit,
@@ -92,7 +94,35 @@ require a local terminal or agent session to remain open. Keep the run URL and
 candidate SHA to inspect the result. Dispatch success means submitted, not
 promoted; a failed gate or credential check leaves main unchanged. Enable Actions
 notifications in GitHub notification settings for completion/failure updates.
-Post-promotion workflows run separately and have their own results.
+Post-promotion workflows run separately and have their own results. Main's
+artifact workflow verifies successful release-gate jobs for the exact SHA instead
+of rebuilding and retesting the same commit.
+
+## Reusing gate evidence
+
+Reuse accepts only `kzhoa`-requested and `kzhoa`-rerun executions on `dev`, created
+within the last 24 hours, for the identical commit SHA. Preflight evidence comes
+from `dev-preflight.yml` push runs; artifact evidence comes from
+`repository-governance.yml` release dispatches and must include all three Python
+smoke jobs and the Python 3.13 installed E2E job. Evidence jobs must finish
+successfully; skipped jobs are not evidence. The run attempt is fixed while
+waiting, and the newest eligible run takes precedence over older successes.
+
+An in-progress source run is awaited for up to 20 minutes. A failed/cancelled
+source gate, changed attempt, or timeout fails the consuming gate; it never
+silently retries a known failure. Missing or expired evidence, or an unavailable
+GitHub API, selects full execution. Each selector writes its evidence run/attempt
+URL or fresh-execution decision to the Actions summary. Gate-result jobs require
+successful evidence or every fresh job, preventing skipped dependencies from
+turning a release green.
+
+This is commit-result reuse within a bounded time window, not a dependency lock:
+external package indexes and runner images may change during that window. Code,
+workflow, tests, or dependency declaration edits change the SHA and invalidate
+reuse. Manually dispatch Dev Preflight for a fresh source run; for fresh artifact
+verification use PR CI or the release dispatch, which always executes artifact
+tests. Feature and squash commits remain separate candidates and are not equated
+by tree or commit message. Version-tag publishing keeps its own exact-wheel gate.
 
 ## Prepare a versioned release
 

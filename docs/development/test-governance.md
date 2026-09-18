@@ -108,7 +108,10 @@ continues, but it does not waive a mandatory integration or release gate.
 Feature promotion validates the candidate with `.dev/**` removed before changing
 `dev`. A subsequent Dev Preflight run verifies the push. Promotion from `dev` to
 `main` validates repository preflight and installed-artifact E2E against the
-exact `dev` commit before the fast-forward. Post-push checks are not substitutes
+exact `dev` commit before the fast-forward. A release may reuse recent successful
+Dev Preflight evidence for that same SHA, and main push artifact CI may reuse the
+release artifact jobs, under the [evidence rules](development-workflow.md#reusing-gate-evidence).
+Post-push checks are not substitutes
 for these pre-promotion gates.
 
 Ordinary main/PR artifact CI validates installed wheels using the matrix in its

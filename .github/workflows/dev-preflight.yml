@@ -7,6 +7,10 @@ on:
   workflow_dispatch:
   workflow_call:
     inputs:
+      reuse_existing:
+        description: Reuse the same dev commit's recent push preflight
+        type: boolean
+        default: false
       strip_dev_state:
         description: Remove feature-local .dev state before validating a promotion candidate
         required: false
@@ -15,13 +19,27 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: dev-preflight-${{ github.ref }}
-  cancel-in-progress: true
+  actions: read
 
 jobs:
+  select-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      reused: ${{ steps.evidence.outputs.reused }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check exact-commit gate evidence
+        id: evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE: preflight
+          ALLOW_REUSE: ${{ inputs.reuse_existing && 'true' || 'false' }}
+        run: python3 scripts/ci/reuse_gate.py
+
   preflight:
+    needs: select-evidence
+    if: needs.select-evidence.outputs.reused != 'true'
     name: CPU-only preflight (Python 3.13)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -55,3 +73,23 @@ jobs:
 
       - name: Run shared preflight gates in CI tox shell
         run: python -m tox run -e preflight-ci
+
+  gate-result:
+    if: always()
+    needs: [select-evidence, preflight]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful evidence or fresh gates
+        env:
+          EVIDENCE_RESULT: ${{ needs.select-evidence.result }}
+          REUSED: ${{ needs.select-evidence.outputs.reused }}
+          FRESH_RESULTS: ${{ needs.preflight.result }}
+        run: |
+          set -euo pipefail
+          [[ "$EVIDENCE_RESULT" == "success" ]] || exit 1
+          if [[ "$REUSED" != "true" ]]; then
+            [[ -n "$FRESH_RESULTS" ]] || exit 1
+            for result in $FRESH_RESULTS; do
+              [[ "$result" == "success" ]] || exit 1
+            done
+          fi

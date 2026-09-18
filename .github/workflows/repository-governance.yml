@@ -23,6 +23,7 @@ on:
           - promote-dev-to-main
 
 permissions:
+  actions: read
   contents: read
   pull-requests: read
 
@@ -67,6 +68,7 @@ jobs:
     needs: validate-push
     permissions:
       contents: read
+      actions: read
     uses: ./.github/workflows/dev-preflight.yml
     with:
       strip_dev_state: true
@@ -195,12 +197,16 @@ jobs:
     needs: validate-release-request
     permissions:
       contents: read
+      actions: read
     uses: ./.github/workflows/dev-preflight.yml
+    with:
+      reuse_existing: true
 
   artifact-e2e-dev-release:
     needs: validate-release-request
     permissions:
       contents: read
+      actions: read
     uses: ./.github/workflows/ci.yml
 
   promote-dev-to-main:
