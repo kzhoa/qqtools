@@ -62,11 +62,12 @@ The `dev` push triggers post-promotion verification. That verification does not
 replace the candidate gate. Never merge a feature directly into `main`.
 
 Protected governance changes require the owner under the root contract. Workflow
-changes additionally require explicit approval for the current task. When an
-approved feature changes workflow files, the owner must perform the final
-promotion using owner credentials after the normal candidate gates; the workflow
-token cannot perform that update. Preserve the validated candidate tree and
-ancestry when doing so.
+changes additionally require explicit approval for the current task. Automatic
+promotion requires owner `kzhoa` as both the requesting and rerunning actor, and
+the configured `OWNER_PROMOTION_TOKEN`; see
+[credential setup](repository-governance.md#workflow-publication-credentials).
+The final job uses that owner credential for approved workflow-file updates and
+normal pushes, preserving the validated candidate tree and ancestry.
 
 ## Promote dev to main
 
@@ -82,10 +83,16 @@ again. Current `main` must be an ancestor of the validated commit; promotion
 fast-forwards `main` to that same commit. Do not create another squash commit,
 force-push public branches, or merge `main` back into `dev` after a normal release.
 
-The first such promotion containing approved workflow changes also requires
-owner credentials for the final fast-forward. All gates, ancestry checks, and
-validated tree equality still apply. Main push workflows provide post-promotion
-verification.
+The final fast-forward uses `OWNER_PROMOTION_TOKEN`, including when the candidate
+contains approved workflow changes. All gates, ancestry checks, and validated
+tree equality still apply. Main push workflows provide post-promotion verification.
+
+After dispatch is accepted, execution belongs to GitHub Actions and does not
+require a local terminal or agent session to remain open. Keep the run URL and
+candidate SHA to inspect the result. Dispatch success means submitted, not
+promoted; a failed gate or credential check leaves main unchanged. Enable Actions
+notifications in GitHub notification settings for completion/failure updates.
+Post-promotion workflows run separately and have their own results.
 
 ## Prepare a versioned release
 

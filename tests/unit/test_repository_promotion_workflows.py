@@ -24,7 +24,6 @@ def test_feature_promotion_preflights_stripped_candidate_before_advancing_dev() 
     assert "uses: ./.github/workflows/dev-preflight.yml" in governance[preflight_job:advance_step]
     assert "strip_dev_state: true" in governance[preflight_job:advance_step]
     assert "gh workflow run dev-preflight.yml" not in governance
-    assert "GitHub's workflow token cannot update workflow files." in governance
 
 
 def test_dev_release_runs_both_gates_and_fast_forwards_exact_validated_sha() -> None:
@@ -39,7 +38,6 @@ def test_dev_release_runs_both_gates_and_fast_forwards_exact_validated_sha() -> 
     assert 'if [[ "$dev_sha" != "$EXPECTED_DEV_SHA" ]]' in governance
     assert 'git merge-base --is-ancestor "$main_sha" "$dev_sha"' in governance
     assert 'git push origin "$dev_sha:refs/heads/main"' in governance
-    assert "GitHub's workflow token cannot promote workflow-file changes to main." in governance
     assert "--force" not in governance
 
 
@@ -49,3 +47,26 @@ def test_publish_rejects_tags_that_are_not_reachable_from_main() -> None:
     assert "fetch-depth: 0" in publish
     assert 'tag_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"' in publish
     assert 'git merge-base --is-ancestor "$tag_commit" origin/main' in publish
+
+
+def test_owner_credential_is_confined_to_gated_promotion_jobs() -> None:
+    import yaml
+
+    jobs = yaml.safe_load(_workflow("repository-governance.yml"))["jobs"]
+    expected_gates = {
+        "promote-feature": {"validate-push", "preflight-feature-promotion"},
+        "promote-dev-to-main": {"validate-release-request", "preflight-dev-release", "artifact-e2e-dev-release"},
+    }
+    for name, job in jobs.items():
+        if name not in expected_gates:
+            assert "OWNER_PROMOTION_TOKEN" not in str(job)
+            continue
+        assert set(job["needs"]) == expected_gates[name]
+        assert job["permissions"]["contents"] == "read"
+        steps = job["steps"]
+        verify, checkout = steps[:2]
+        assert verify["env"]["GH_TOKEN"] == "${{ secrets.OWNER_PROMOTION_TOKEN }}"
+        assert "gh api user --jq .login" in verify["run"]
+        assert checkout["uses"].startswith("actions/checkout@")
+        assert checkout["with"]["token"] == "${{ secrets.OWNER_PROMOTION_TOKEN }}"
+        assert "workflow token cannot" not in str(job)

@@ -81,15 +81,37 @@ jobs:
       - preflight-feature-promotion
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     concurrency:
       group: feature-promotion-to-dev
       cancel-in-progress: false
     steps:
+      - name: Verify owner promotion credential
+        env:
+          GH_TOKEN: ${{ secrets.OWNER_PROMOTION_TOKEN }}
+          REQUEST_ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          if [[ "$REQUEST_ACTOR" != "kzhoa" || "$TRIGGERING_ACTOR" != "kzhoa" ]]; then
+            echo "Only repository owner kzhoa may request or rerun promotion."
+            exit 1
+          fi
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "Configure OWNER_PROMOTION_TOKEN with Contents and Workflows write access to this repository."
+            exit 1
+          fi
+          credential_owner="$(gh api user --jq .login)"
+          if [[ "$credential_owner" != "kzhoa" ]]; then
+            echo "OWNER_PROMOTION_TOKEN must authenticate as repository owner kzhoa."
+            exit 1
+          fi
+
       - name: Check out feature branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.OWNER_PROMOTION_TOKEN }}
 
       - name: Prepare promotion
         id: prepare
@@ -111,12 +133,6 @@ jobs:
           if [[ "$ACTOR" != "kzhoa" ]] && git diff --name-only "$dev_sha"...HEAD | grep -Eq "$protected"; then
             echo "Only repository owner kzhoa may promote protected governance changes."
             git diff --name-only "$dev_sha"...HEAD | grep -E "$protected" || true
-            exit 1
-          fi
-
-          if git diff --name-only "$dev_sha"...HEAD | grep -Eq '^\.github/workflows/'; then
-            echo "GitHub's workflow token cannot update workflow files."
-            echo "After this candidate passes preflight, the owner must perform the governed promotion with owner credentials."
             exit 1
           fi
 
@@ -162,7 +178,14 @@ jobs:
       - name: Require dispatch from dev
         env:
           REQUEST_REF: ${{ github.ref_name }}
+          REQUEST_ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         run: |
+          set -euo pipefail
+          if [[ "$REQUEST_ACTOR" != "kzhoa" || "$TRIGGERING_ACTOR" != "kzhoa" ]]; then
+            echo "Only repository owner kzhoa may request or rerun promotion."
+            exit 1
+          fi
           if [[ "$REQUEST_REF" != "dev" ]]; then
             echo "Dev-to-main promotion must be dispatched with --ref dev."
             exit 1
@@ -187,15 +210,37 @@ jobs:
       - artifact-e2e-dev-release
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     concurrency:
       group: dev-promotion-to-main
       cancel-in-progress: false
     steps:
+      - name: Verify owner promotion credential
+        env:
+          GH_TOKEN: ${{ secrets.OWNER_PROMOTION_TOKEN }}
+          REQUEST_ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          if [[ "$REQUEST_ACTOR" != "kzhoa" || "$TRIGGERING_ACTOR" != "kzhoa" ]]; then
+            echo "Only repository owner kzhoa may request or rerun promotion."
+            exit 1
+          fi
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "Configure OWNER_PROMOTION_TOKEN with Contents and Workflows write access to this repository."
+            exit 1
+          fi
+          credential_owner="$(gh api user --jq .login)"
+          if [[ "$credential_owner" != "kzhoa" ]]; then
+            echo "OWNER_PROMOTION_TOKEN must authenticate as repository owner kzhoa."
+            exit 1
+          fi
+
       - name: Check out validated dev commit
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.OWNER_PROMOTION_TOKEN }}
 
       - name: Fast-forward main to validated dev
         env:
@@ -219,12 +264,6 @@ jobs:
           if [[ "$main_sha" == "$dev_sha" ]]; then
             echo "Main already points at the validated dev commit."
             exit 0
-          fi
-
-          if ! git diff --quiet "$main_sha".."$dev_sha" -- .github/workflows; then
-            echo "GitHub's workflow token cannot promote workflow-file changes to main."
-            echo "The owner must fast-forward main to this validated dev commit with owner credentials."
-            exit 1
           fi
 
           git push origin "$dev_sha:refs/heads/main"

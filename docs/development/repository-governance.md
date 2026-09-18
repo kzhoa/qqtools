@@ -53,14 +53,31 @@ route, not skipped gates, unauthorized workflow edits, or rewritten public
 history. Authorization to maintain this guide is not authorization to publish
 a particular release.
 
-GitHub's built-in workflow token cannot create or update workflow files. For an
-approved feature containing workflow changes, perform the final feature-to-dev
-promotion and the first dev-to-main fast-forward containing those changes with
-owner credentials. This is a credential boundary, not a gate exemption.
+The existing promotion jobs use the repository Actions secret
+`OWNER_PROMOTION_TOKEN` for Git authentication. Create it as owner `kzhoa` using a
+fine-grained personal access token limited to this repository with **Contents:
+read and write** and **Workflows: read and write**. Metadata read access is
+implicit. Actions write permission is not required for Git pushes. Set an expiry
+and replace the secret before the token expires; never put the token in Git or
+workflow logs. The separate publishing secret `ACCESS_TOKEN` is unchanged.
+
+Only owner `kzhoa` may request or rerun automatic promotion. Before authenticated
+checkout, each final promotion job checks both actors and verifies the token's
+identity through GitHub's user API. A missing, expired, or non-owner token stops
+promotion; insufficient write permissions cause the push to fail. There is no
+fallback to `GITHUB_TOKEN`. The owner token is exposed only to the final promotion
+job, after validation, and checkout removes its persisted Git credential during
+job cleanup. Validation jobs retain their read-only built-in tokens.
+
+This credential permits approved workflow-file changes and allows dev/main pushes
+to trigger their normal post-promotion workflows. GitHub's built-in token cannot
+perform workflow-file updates, and its pushes do not trigger push workflows.
+Credential possession does not replace explicit owner approval for workflow edits.
 
 Retain normal candidate validation, `.dev/**` stripping, ancestry checks, and
 equality between the validated candidate tree and published tree. Follow the
-development workflow for each promotion stage. Do not invent a temporary
+development workflow for each promotion stage. Configure the secret before the
+first `promote:` feature push using this workflow. Do not invent a temporary
 workflow to bypass the credential boundary.
 
 ## Validation and enforcement
