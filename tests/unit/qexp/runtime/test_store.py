@@ -4,7 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp.runtime.store import CASConflict, atomic_replace, cas_update, create_if_absent, read_json
+from qqtools.plugins.qexp.runtime.store import (
+    CASConflict,
+    atomic_replace,
+    cas_update,
+    create_if_absent,
+    iter_json,
+    read_json,
+)
 
 
 def test_create_if_absent_and_cas(tmp_path: Path):
@@ -38,3 +45,13 @@ def test_atomic_replace_flushes_file_and_parent_directory(
 
     assert read_json(path) == {"value": 1}
     assert flushed_types == ["file", "directory"]
+
+
+def test_iter_json_returns_sorted_regular_json_files(tmp_path: Path) -> None:
+    (tmp_path / "b.json").touch()
+    (tmp_path / "a.json").touch()
+    (tmp_path / "ignored.txt").touch()
+    (tmp_path / "directory.json").mkdir()
+    (tmp_path / "link.json").symlink_to(tmp_path / "a.json")
+
+    assert iter_json(tmp_path) == [tmp_path / "a.json", tmp_path / "b.json"]

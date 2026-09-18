@@ -5,13 +5,7 @@ from pathlib import Path
 import pytest
 
 from scripts import release_preflight
-from scripts.checks.check_compatibility_registry import (
-    RegistryError,
-    Version,
-    check_registry_transition,
-    check_release,
-    load_registry,
-)
+from scripts.checks.check_compatibility_registry import RegistryError, Version, check_release, load_registry
 
 
 def _write_registry(
@@ -20,47 +14,39 @@ def _write_registry(
     item_id: str = "QQTOOLS-COMPAT-9001",
     component: str = "example.component",
     status: str = "compatibility_active",
+    summary: str = "Temporary compatibility boundary for the example component.",
     introduced_in: str = "2.0.0",
     legacy_removed_in: str = "3.0.0",
     transition_purged_in: str = "4.0.0",
     extensions: str = "",
-    pitch_refs: tuple[str, ...] | None = None,
     next_id: int | None = None,
 ) -> Path:
-    for path in (root / "docs/spec/decision.md", root / "tests/test_example.py"):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("evidence\n", encoding="utf-8")
+    verification = root / "tests/test_example.py"
+    verification.parent.mkdir(parents=True, exist_ok=True)
+    verification.write_text("evidence\n", encoding="utf-8")
     if status in {"compatibility_active", "legacy_removed"}:
         marker_path = root / "src/example.py"
         marker_path.parent.mkdir(parents=True, exist_ok=True)
         marker_path.write_text(f"# {item_id}\n", encoding="utf-8")
     registry = root / "docs/spec/compatibility-registry.toml"
+    registry.parent.mkdir(parents=True, exist_ok=True)
     item_number = int(item_id.rsplit("-", 1)[1])
     effective_next_id = next_id if next_id is not None else item_number + 1
-    pitch_section = ""
-    if pitch_refs is not None:
-        for pitch_ref in pitch_refs:
-            pitch_path = root / pitch_ref
-            pitch_path.parent.mkdir(parents=True, exist_ok=True)
-            pitch_path.write_text("pitch\n", encoding="utf-8")
-        quoted_refs = ", ".join(f'"{pitch_ref}"' for pitch_ref in pitch_refs)
-        pitch_section = f"pitch_refs = [{quoted_refs}]\n"
     registry.write_text(
-        f"""schema_version = 1
-next_id = {effective_next_id}
+        f"""next_id = {effective_next_id}
 
 [[items]]
 id = "{item_id}"
 component = "{component}"
 kind = "public_api"
 status = "{status}"
+summary = "{summary}"
 introduced_in = "{introduced_in}"
 legacy_removed_in = "{legacy_removed_in}"
 transition_purged_in = "{transition_purged_in}"
 marker = "{item_id}"
 owner = "example"
-decision_refs = ["docs/spec/decision.md"]
-{pitch_section}verification = ["tests/test_example.py"]
+verification = ["tests/test_example.py"]
 {extensions}
 """,
         encoding="utf-8",
@@ -71,7 +57,7 @@ decision_refs = ["docs/spec/decision.md"]
 def _write_empty_registry(root: Path, *, next_id: int = 9002) -> Path:
     registry = root / "docs/spec/compatibility-registry.toml"
     registry.parent.mkdir(parents=True, exist_ok=True)
-    registry.write_text(f"schema_version = 1\nnext_id = {next_id}\n", encoding="utf-8")
+    registry.write_text(f"next_id = {next_id}\n", encoding="utf-8")
     return registry
 
 
@@ -140,7 +126,6 @@ def test_registry_rejects_marker_for_planned_item(tmp_path: Path) -> None:
     registry = _write_registry(
         tmp_path,
         status="planned",
-        pitch_refs=("docs/pitch/example.md",),
     )
     marker = tmp_path / "src/example.py"
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -150,45 +135,39 @@ def test_registry_rejects_marker_for_planned_item(tmp_path: Path) -> None:
         load_registry(registry, tmp_path)
 
 
-def test_registry_requires_pitch_reference_for_planned_item(tmp_path: Path) -> None:
-    registry = _write_registry(tmp_path, status="planned")
-
-    with pytest.raises(RegistryError, match="pitch_refs is required"):
-        load_registry(registry, tmp_path)
-
-
-def test_registry_allows_active_item_without_pitch_reference(tmp_path: Path) -> None:
+def test_registry_requires_summary(tmp_path: Path) -> None:
     registry = _write_registry(tmp_path)
+    registry.write_text(
+        registry.read_text(encoding="utf-8").replace(
+            'summary = "Temporary compatibility boundary for the example component."\n',
+            "",
+        ),
+        encoding="utf-8",
+    )
 
-    assert load_registry(registry, tmp_path)[0].pitch_refs == ()
-
-
-@pytest.mark.parametrize(
-    ("pitch_refs", "message"),
-    [
-        ((), "must be a non-empty array"),
-        (("docs/spec/not-a-pitch.md",), "must be .md files under docs/pitch/"),
-        (("docs/pitch/not-a-pitch.txt",), "must be .md files under docs/pitch/"),
-        (("docs/pitch/example.md", "docs/pitch/example.md"), "must not contain duplicate"),
-    ],
-)
-def test_registry_rejects_invalid_pitch_references(
-    tmp_path: Path,
-    pitch_refs: tuple[str, ...],
-    message: str,
-) -> None:
-    registry = _write_registry(tmp_path, pitch_refs=pitch_refs)
-
-    with pytest.raises(RegistryError, match=message):
+    with pytest.raises(RegistryError, match="summary must be a non-empty string"):
         load_registry(registry, tmp_path)
 
 
-def test_registry_rejects_missing_local_pitch_reference(tmp_path: Path) -> None:
-    pitch_ref = "docs/pitch/example.md"
-    registry = _write_registry(tmp_path, status="planned", pitch_refs=(pitch_ref,))
-    (tmp_path / pitch_ref).unlink()
+def test_registry_rejects_schema_version(tmp_path: Path) -> None:
+    registry = _write_registry(tmp_path)
+    registry.write_text(
+        "schema_version = 1\n" + registry.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
 
-    with pytest.raises(RegistryError, match="pitch_refs path does not exist"):
+    with pytest.raises(RegistryError, match="unknown field 'schema_version'"):
+        load_registry(registry, tmp_path)
+
+
+@pytest.mark.parametrize("field", ["decision_refs", "pitch_refs", "action_refs"])
+def test_registry_rejects_private_or_action_reference_fields(tmp_path: Path, field: str) -> None:
+    registry = _write_registry(tmp_path)
+    registry.write_text(
+        registry.read_text(encoding="utf-8") + f'{field} = ["docs/private/example.md"]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(RegistryError, match=f"unknown field '{field}'"):
         load_registry(registry, tmp_path)
 
 
@@ -213,11 +192,11 @@ def test_registry_requires_next_id_above_every_item_id(tmp_path: Path) -> None:
         load_registry(registry, tmp_path)
 
 
-def test_registry_rejects_missing_decision_reference(tmp_path: Path) -> None:
+def test_registry_rejects_missing_verification_reference(tmp_path: Path) -> None:
     registry = _write_registry(tmp_path)
-    (tmp_path / "docs/spec/decision.md").unlink()
+    (tmp_path / "tests/test_example.py").unlink()
 
-    with pytest.raises(RegistryError, match="path does not exist"):
+    with pytest.raises(RegistryError, match="verification path does not exist"):
         load_registry(registry, tmp_path)
 
 
@@ -233,9 +212,6 @@ def test_registry_rejects_unknown_item_field(tmp_path: Path) -> None:
 
 
 def test_registry_accepts_chained_deadline_extension(tmp_path: Path) -> None:
-    decision = tmp_path / "docs/spec/extension.md"
-    decision.parent.mkdir(parents=True, exist_ok=True)
-    decision.write_text("approved\n", encoding="utf-8")
     registry = _write_registry(
         tmp_path,
         extensions="""
@@ -245,7 +221,6 @@ from = "3.0.0"
 to = "3.1.0"
 approved_in = "2.5.0"
 reason = "Deployment inventory needs one more release."
-decision_ref = "docs/spec/extension.md"
 """,
     )
 
@@ -255,9 +230,6 @@ decision_ref = "docs/spec/extension.md"
 
 
 def test_registry_rejects_broken_deadline_extension_chain(tmp_path: Path) -> None:
-    decision = tmp_path / "docs/spec/extension.md"
-    decision.parent.mkdir(parents=True, exist_ok=True)
-    decision.write_text("approved\n", encoding="utf-8")
     registry = _write_registry(
         tmp_path,
         extensions="""
@@ -267,7 +239,6 @@ from = "2.9.0"
 to = "3.1.0"
 approved_in = "2.5.0"
 reason = "Deployment inventory needs one more release."
-decision_ref = "docs/spec/extension.md"
 """,
     )
 
@@ -296,104 +267,10 @@ def test_planned_future_item_passes_an_earlier_release(tmp_path: Path) -> None:
         introduced_in="3.0.0",
         legacy_removed_in="4.0.0",
         transition_purged_in="5.0.0",
-        pitch_refs=("docs/pitch/example.md",),
     )
     item = load_registry(registry, tmp_path)[0]
 
     check_release((item,), Version.parse("2.9.0", "target"))
-
-
-def test_registry_allows_removal_at_purge_version(tmp_path: Path) -> None:
-    previous = load_registry(
-        _write_registry(tmp_path, status="legacy_removed"),
-        tmp_path,
-    )
-    (tmp_path / "src/example.py").unlink()
-    current = load_registry(_write_empty_registry(tmp_path), tmp_path)
-
-    check_registry_transition(
-        current,
-        previous,
-        Version.parse("4.0.0", "target"),
-        tmp_path,
-    )
-
-
-def test_registry_rejects_removal_before_purge_version(tmp_path: Path) -> None:
-    previous = load_registry(
-        _write_registry(tmp_path, status="legacy_removed"),
-        tmp_path,
-    )
-    (tmp_path / "src/example.py").unlink()
-    current = load_registry(_write_empty_registry(tmp_path), tmp_path)
-
-    with pytest.raises(RegistryError, match="removed before transition_purged_in"):
-        check_registry_transition(
-            current,
-            previous,
-            Version.parse("3.9.0", "target"),
-            tmp_path,
-        )
-
-
-def test_registry_rejects_retirement_while_marker_remains(tmp_path: Path) -> None:
-    previous = load_registry(
-        _write_registry(tmp_path, status="legacy_removed"),
-        tmp_path,
-    )
-    current = load_registry(_write_empty_registry(tmp_path), tmp_path)
-
-    with pytest.raises(RegistryError, match="retired but its marker remains"):
-        check_registry_transition(
-            current,
-            previous,
-            Version.parse("4.0.0", "target"),
-            tmp_path,
-        )
-
-
-def test_registry_rejects_decreasing_next_id(tmp_path: Path) -> None:
-    previous = load_registry(_write_registry(tmp_path), tmp_path)
-    (tmp_path / "src/example.py").unlink()
-    current = load_registry(_write_empty_registry(tmp_path, next_id=9001), tmp_path)
-
-    with pytest.raises(RegistryError, match="next_id decreased"):
-        check_registry_transition(
-            current,
-            previous,
-            Version.parse("4.0.0", "target"),
-            tmp_path,
-        )
-
-
-def test_registry_rejects_reusing_retired_id(tmp_path: Path) -> None:
-    previous_path = _write_registry(tmp_path / "previous", next_id=9002)
-    previous = load_registry(previous_path, tmp_path / "previous")
-    current_path = _write_registry(
-        tmp_path / "current",
-        item_id="QQTOOLS-COMPAT-9000",
-        next_id=9002,
-    )
-    current = load_registry(current_path, tmp_path / "current")
-
-    with pytest.raises(RegistryError, match="cannot be reused"):
-        check_registry_transition(
-            current,
-            previous,
-            Version.parse("2.5.0", "target"),
-            tmp_path / "current",
-        )
-
-
-def test_registry_bootstrap_has_no_previous_release_contract(tmp_path: Path) -> None:
-    current = load_registry(_write_empty_registry(tmp_path), tmp_path)
-
-    check_registry_transition(
-        current,
-        None,
-        Version.parse("4.0.0", "target"),
-        tmp_path,
-    )
 
 
 def test_preflight_runs_compatibility_gate_before_expensive_checks(

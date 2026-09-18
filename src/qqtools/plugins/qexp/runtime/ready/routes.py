@@ -269,9 +269,7 @@ def reference_for_generation(cfg: object, task_id: str, generation: int) -> Read
 
 def publication_state(cfg: object, reference: ReadyMarkerRef) -> str:
     """Return the reservation publication state, treating legacy records as committed."""
-    record = read_json(reservation_path(cfg.shared_root, reference.task_id, reference.generation))[
-        "ready_reservation"
-    ]
+    record = read_json(reservation_path(cfg.shared_root, reference.task_id, reference.generation))["ready_reservation"]
     token = record.get("publication_token")
     if token is None:
         return READY_PUBLICATION_COMMITTED

@@ -14,7 +14,7 @@ from typing import Any, Callable, ContextManager
 
 from ..authority import AuthoritySupervisor
 from ..config_types import RootConfig
-from ..executor import Executor
+from ..executor import Executor, LaunchHandoff
 from ..layout import load_machine_record, load_root_config, machine_state_path, runtime_pid_path
 from ..legacy_agent import _visible_gpus, get_agent_status
 from ..machine_config import is_legacy_agent_project, load_machine_policy, save_machine_config
@@ -86,6 +86,77 @@ from .helpers import (
 class PrimaryDemandProbe:
     state: str
     diagnostics: tuple[dict[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingLaunchHandoff:
+    cfg: RootConfig
+    task_id: str
+    attempt_id: str
+    fencing_token: int
+    project_id: str
+    handoff: LaunchHandoff
+
+
+class _LaunchHandoffBatch:
+    """Initiate machine-cycle launches before jointly awaiting runner handoffs."""
+
+    def __init__(self, executor: Executor, runtime_root: Path) -> None:
+        self._executor = executor
+        self._runtime_root = runtime_root
+        self._pending: list[_PendingLaunchHandoff] = []
+
+    def launch(self, cfg: RootConfig, task_id: str, attempt: Any, project_id: str) -> None:
+        initiate = getattr(self._executor, "initiate_attempt", None)
+        if initiate is None:
+            self._executor.launch_attempt(cfg, task_id, attempt)
+            return
+        with diagnostic_span("executor.launch.initiate"):
+            _, handoff = initiate(cfg, task_id, attempt)
+        self._pending.append(
+            _PendingLaunchHandoff(
+                cfg,
+                task_id,
+                attempt.attempt_id,
+                attempt.current_fencing_token,
+                project_id,
+                handoff,
+            )
+        )
+
+    def finish(self, result_by_project: dict[str, dict[str, Any]]) -> None:
+        if not self._pending:
+            return
+        with diagnostic_span("executor.launch.handoff_batch"):
+            failures = self._executor.wait_for_launch_handoffs([pending.handoff for pending in self._pending])
+        for pending in self._pending:
+            failure = failures.get(pending.handoff)
+            if failure is None:
+                continue
+            fail_attempt(
+                pending.cfg,
+                pending.task_id,
+                pending.attempt_id,
+                pending.fencing_token,
+                "executor_launch_failed",
+                reservation_runtime_root=self._runtime_root,
+            )
+            launched = result_by_project[pending.project_id]["launched"]
+            if pending.task_id in launched:
+                launched.remove(pending.task_id)
+            item = result_by_project[pending.project_id]
+            item["status"] = "error"
+            item["error"] = str(failure)
+        self._pending.clear()
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectLaunchExecutor:
+    batch: _LaunchHandoffBatch
+    project_id: str
+
+    def launch_attempt(self, cfg: RootConfig, task_id: str, attempt: Any) -> None:
+        self.batch.launch(cfg, task_id, attempt, self.project_id)
 
 
 def _probe_primary_demand(
@@ -508,6 +579,7 @@ def _dispatch_admission_layer(
     result_by_project: dict[str, dict[str, Any]],
     batch_sizers: dict[str, AdaptiveBatchSizer],
     budget: SliceBudget,
+    launch_batch: _LaunchHandoffBatch,
     *,
     admission_role: str,
     borrow_admission_grant: _BorrowAdmissionGrant | None = None,
@@ -540,7 +612,7 @@ def _dispatch_admission_layer(
                         cfg,
                         available_gpus=free,
                         available_cpus=free_cpu_slots,
-                        executor=executor,
+                        executor=_ProjectLaunchExecutor(launch_batch, binding.project_id),
                         reservation_runtime_root=runtime.root,
                         project_id=binding.project_id,
                         admission_role=admission_role,
@@ -610,9 +682,11 @@ def _dispatch_machine_cycle_locked(
     publish_snapshots: bool = True,
 ) -> list[dict[str, Any]]:
     executor = executor or Executor()
+    launch_batch = _LaunchHandoffBatch(executor, runtime.root)
     runtime.last_cycle_had_demand = False
     runtime.last_cycle_consumed_binding = False
-    _, registered = runtime.load_registry()
+    with diagnostic_span("machine.registry.load"):
+        _, registered = runtime.load_registry()
     supervised = [
         binding
         for binding in registered
@@ -656,8 +730,9 @@ def _dispatch_machine_cycle_locked(
             )
             continue
         try:
-            cfg = _helpers._binding_config(runtime, binding)
-            runtime.drain_legacy_runner_evidence(binding)
+            with diagnostic_span("machine.binding.load"):
+                cfg = _helpers._binding_config(runtime, binding)
+                runtime.drain_legacy_runner_evidence(binding)
             readable[binding.project_id] = cfg
             readable_bindings[binding.project_id] = binding
             runtime.last_cycle_consumed_binding = True
@@ -670,7 +745,8 @@ def _dispatch_machine_cycle_locked(
                     "error": str(exc),
                 }
             )
-    snapshot = _reconcile_machine_reservations(runtime, readable)
+    with diagnostic_span("machine.reservations.reconcile_projects"):
+        snapshot = _reconcile_machine_reservations(runtime, readable)
     for binding in supervised:
         cfg = readable.get(binding.project_id)
         if cfg is None:
@@ -711,7 +787,8 @@ def _dispatch_machine_cycle_locked(
                 }
             )
     executor = executor or Executor()
-    snapshot = reconcile_snapshot(runtime.root)
+    with diagnostic_span("machine.reservations.snapshot"):
+        snapshot = reconcile_snapshot(runtime.root)
     recovered = _recover_starting_reservations(
         runtime,
         dispatchable,
@@ -719,7 +796,8 @@ def _dispatch_machine_cycle_locked(
         executor,
     )
     runtime.last_cycle_had_demand = bool(results) or any(recovered.values())
-    snapshot = reconcile_snapshot(runtime.root)
+    with diagnostic_span("machine.reservations.snapshot"):
+        snapshot = reconcile_snapshot(runtime.root)
     visible = (
         list(available_gpus)
         if available_gpus is not None
@@ -764,11 +842,16 @@ def _dispatch_machine_cycle_locked(
     if free or free_cpu_slots:
         for binding in ordered_enabled:
             cfg = dispatchable.get(binding.project_id)
-            if cfg is None or read_ready_index_state(cfg) not in {"absent", "building"}:
+            if cfg is None:
+                continue
+            with diagnostic_span("machine.ready.state"):
+                ready_state = read_ready_index_state(cfg)
+            if ready_state not in {"absent", "building"}:
                 continue
             try:
                 for _ in range(8):
-                    state = advance_ready_index_build(cfg)
+                    with diagnostic_span("machine.ready.build"):
+                        state = advance_ready_index_build(cfg)
                     if state.get("state") != "building":
                         break
             except (OSError, RuntimeError, ValueError) as exc:
@@ -842,6 +925,7 @@ def _dispatch_machine_cycle_locked(
                 result_by_project,
                 batch_sizers,
                 budget,
+                launch_batch,
                 admission_role=admission_role,
                 borrow_admission_grant=(borrow_admission_grant if admission_role == "borrow" else None),
                 lane=lane,
@@ -857,6 +941,7 @@ def _dispatch_machine_cycle_locked(
         cursor_effect = reduce_dispatch_cursor(dispatch_plan, last_successful_project_id)
         if cursor_effect is not None:
             runtime.save_cursor(cursor_effect.project_id)
+    launch_batch.finish(result_by_project)
     if publish_snapshots:
         reservations = list(reservation_snapshot(runtime.root).reservations)
         _publish_project_snapshots(

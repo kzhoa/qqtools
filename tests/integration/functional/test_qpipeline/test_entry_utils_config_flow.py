@@ -20,12 +20,7 @@ from qqtools.plugins.qpipeline.entry_utils.loss import (
     prepare_loss,
 )
 from qqtools.plugins.qpipeline.entry_utils.optimizer import getCanonicalName, prepare_optimizer
-from qqtools.plugins.qpipeline.entry_utils.scheduler import (
-    SchedulerConfig,
-    WarmupConfig,
-    get_lambda_lr,
-    prepare_scheduler,
-)
+from qqtools.plugins.qpipeline.entry_utils.scheduler import prepare_scheduler
 
 
 def test_str2bool_valid_and_invalid():
@@ -502,22 +497,6 @@ def test_comboloss_rejects_empty_loss_fns():
 
     with pytest.raises(AssertionError, match="loss_fns must not be empty"):
         ComboLoss({}, {})
-
-
-def test_warmup_config_invalid_factor_raises():
-    with pytest.raises(ValueError):
-        WarmupConfig(steps=10, epochs=0, initial_factor=1.2)
-
-
-def test_scheduler_config_invalid_name_raises():
-    with pytest.raises(ValueError):
-        SchedulerConfig(name="invalid", params={})
-
-
-def test_get_lambda_lr_invalid_expression_raises():
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.tensor([1.0]))], lr=0.1)
-    with pytest.raises(Exception):
-        get_lambda_lr({"lr_lambda": "lambda epoch: bad + 1"}, optimizer)
 
 
 def test_prepare_scheduler_unknown_scheduler_raises(base_args, tiny_model):

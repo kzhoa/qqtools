@@ -56,7 +56,7 @@ def test_submission_commits_one_durable_ready_generation(tmp_path: Path):
     assert result.classification == "claimable"
     assert result.task is not None and result.task.task_id == task.task_id
     assert publication_state(cfg, reference) == "committed"
-    assert read_json(ready_state_path(cfg.shared_root))["ready_index"]["state"] == "absent"
+    assert read_json(ready_state_path(cfg.shared_root))["ready_index"]["state"] == "active"
 
 
 def test_claim_commits_truth_before_retiring_ready_marker(tmp_path: Path):
@@ -258,7 +258,10 @@ def test_interrupted_publication_commit_is_retryable(tmp_path: Path, monkeypatch
 
     def fail_commit(path, value):
         nonlocal failed
-        if path == shared_paths(cfg.shared_root)["ready_reservations"] / f"{stored.task_id}.{generation}.json" and not failed:
+        if (
+            path == shared_paths(cfg.shared_root)["ready_reservations"] / f"{stored.task_id}.{generation}.json"
+            and not failed
+        ):
             failed = True
             raise OSError("publication commit interrupted")
         return original_atomic_replace(path, value)
@@ -283,7 +286,9 @@ def test_unreadable_marker_retries_then_returns_a_diagnostic_without_degrading(
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     reference = _ready_reference(cfg, task.task_id, task.ready_generation)
-    marker_path = shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / reference.marker_name
+    marker_path = (
+        shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / reference.marker_name
+    )
     from qqtools.plugins.qexp.runtime.ready import traversal
 
     original_read_json = traversal.read_json
@@ -314,7 +319,9 @@ def test_classify_transient_marker_read_does_not_degrade(tmp_path: Path, monkeyp
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     reference = _ready_reference(cfg, task.task_id, task.ready_generation)
-    marker_path = shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / reference.marker_name
+    marker_path = (
+        shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / reference.marker_name
+    )
     from qqtools.plugins.qexp.runtime.ready import index as ready_index
 
     original_read_json = ready_index.read_json
@@ -337,7 +344,9 @@ def test_unreadable_marker_isolated_after_bounded_retries(tmp_path: Path, monkey
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     reference = _ready_reference(cfg, task.task_id, task.ready_generation)
-    marker_path = shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / reference.marker_name
+    marker_path = (
+        shared_paths(cfg.shared_root)["ready_home"] / cfg.machine_name / reference.partition / reference.marker_name
+    )
     from qqtools.plugins.qexp.runtime.ready import traversal
 
     original_read_json = traversal.read_json
@@ -363,9 +372,7 @@ def test_unreadable_marker_isolated_after_bounded_retries(tmp_path: Path, monkey
     assert peek.diagnostic.reason_code == "marker_unavailable"
 
 
-def test_unreadable_shared_marker_never_infers_scanning_machine(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_unreadable_shared_marker_never_infers_scanning_machine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg = init_shared_root(tmp_path / ".qexp", "scanner", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")
     task = submit(cfg, ["echo", "ok"], group="exp")
@@ -394,6 +401,7 @@ def test_unreadable_shared_marker_never_infers_scanning_machine(
     assert peek.reference is None
     assert peek.unresolved
     assert peek.cursor.after_name == reference.marker_name
+
 
 def test_ready_delete_failure_does_not_roll_back_authoritative_claim(
     tmp_path: Path,

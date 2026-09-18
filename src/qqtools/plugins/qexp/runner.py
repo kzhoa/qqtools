@@ -11,13 +11,14 @@ import sys
 from pathlib import Path
 
 from .config_types import RootConfig
+from .infrastructure.process import process_start_time_ticks as _process_start_time_ticks
 from .layout import load_root_config, shared_attempt_log_path
+from .runtime.authority_lock import authority_locks
 from .runtime.paths import local_paths
 from .runtime.progress import prepare_progress_channel
 from .runtime.records import AttemptRecord, utc_now
 from .runtime.store import atomic_replace, create_if_absent, read_json
 from .runtime.tasks import load_task
-from .scheduler import _process_start_time_ticks, authority_locks
 
 LOCAL_PROCESS_PROTOCOL_VERSION = 1
 

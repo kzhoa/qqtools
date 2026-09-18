@@ -59,6 +59,55 @@ def ensure_ready_layout(cfg: object) -> None:
         )
 
 
+def _activate_empty_ready_index(cfg: object, build_id: str) -> None:
+    """Activate a new root's provably empty ready projection."""
+    from .protocol import PRIMARY_READY_PROTOCOL_VERSION, projection_state_path
+
+    paths = shared_paths(cfg.shared_root)
+    if any(paths["tasks"].iterdir()):
+        raise RuntimeError("empty ready projection activation requires a root without Tasks.")
+    (paths["ready_primary"] / "routes").mkdir(parents=True, exist_ok=True)
+    atomic_replace(
+        projection_state_path(cfg),
+        {
+            "primary_ready_index": {
+                "schema_version": PRIMARY_READY_PROTOCOL_VERSION,
+                "state": "active",
+                "completed_build_id": build_id,
+                "updated_at": utc_now(),
+            }
+        },
+    )
+    path = ready_state_path(cfg.shared_root)
+    value, record = read_state_record(cfg)
+    record.update(
+        {
+            "state": "active",
+            "writer_capability": READY_WRITER_CAPABILITY,
+            "build": {
+                "build_id": build_id,
+                "phase": "completed",
+                "is_repair": False,
+                "watermark": {
+                    "page_count": 0,
+                    "task_count": 0,
+                    "captured_at": utc_now(),
+                    "is_complete": True,
+                },
+                "cursor": {"page": 0, "offset": 0},
+                "audit_cursor": {"page": 0, "offset": 0},
+                "primary_cursor": {"page": 0, "offset": 0},
+                "processed": 0,
+                "repaired": 0,
+                "stale_removed": 0,
+                "started_at": utc_now(),
+                "completed_at": utc_now(),
+            },
+        }
+    )
+    commit_state_under_lock(path, value, record)
+
+
 def read_ready_index_state(cfg: object) -> ReadyIndexState:
     """Return the scheduling gate for this project's ready projection."""
     path = ready_state_path(cfg.shared_root)

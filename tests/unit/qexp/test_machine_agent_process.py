@@ -54,3 +54,36 @@ def test_machine_agent_startup_error_includes_child_failure(tmp_path: Path, monk
 
     with pytest.raises(RuntimeError, match="machine scheduler authority is already held"):
         spawn_machine_agent_process(runtime)
+
+
+def test_machine_agent_process_accepts_explicit_loop_interval(tmp_path: Path, monkeypatch) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 123
+
+        def poll(self) -> None:
+            return None
+
+    def start_process(command, **_kwargs) -> FakeProcess:
+        captured["command"] = command
+        status_path = runtime.paths["agent"] / "status.json"
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps({"machine_agent": {"state": "active", "pid": FakeProcess.pid}}),
+            encoding="utf-8",
+        )
+        return FakeProcess()
+
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.process.subprocess.Popen", start_process)
+
+    spawn_machine_agent_process(runtime, loop_interval=0.1)
+
+    command = captured["command"]
+    assert command[-2:] == ["--loop-interval", "0.1"]
+
+
+def test_machine_agent_process_rejects_non_positive_loop_interval(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="loop_interval must be positive"):
+        spawn_machine_agent_process(MachineRuntime(tmp_path / "machine-runtime"), loop_interval=0)

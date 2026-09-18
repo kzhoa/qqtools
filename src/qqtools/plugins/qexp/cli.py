@@ -256,8 +256,15 @@ def build_parser() -> argparse.ArgumentParser:
         _lp = config_lease_sub.add_parser(_name)
         _add_output_format(_lp)
         if _name == "set":
-            for _arg, _typ in (("ttl-seconds", int), ("renew-interval-seconds", float), ("max-clock-skew-seconds", float), ("clock-observation-max-age-seconds", float), ("clock-provider-margin-seconds", float), ("renewal-commit-margin-seconds", float)):
-                _lp.add_argument("--"+_arg, type=_typ)
+            for _arg, _typ in (
+                ("ttl-seconds", int),
+                ("renew-interval-seconds", float),
+                ("max-clock-skew-seconds", float),
+                ("clock-observation-max-age-seconds", float),
+                ("clock-provider-margin-seconds", float),
+                ("renewal-commit-margin-seconds", float),
+            ):
+                _lp.add_argument("--" + _arg, type=_typ)
             _lp.add_argument("--clock-provider-priority")
     notifications = config_sub.add_parser("notifications")
     notifications_sub = notifications.add_subparsers(dest="notifications_action", required=True)

@@ -1,0 +1,5 @@
+# Repository governance is owner-controlled.
+/AGENTS.md @kzhoa
+/.github/CODEOWNERS @kzhoa
+/.github/workflows/ @kzhoa
+/scripts/checks/check_repository_governance.py @kzhoa

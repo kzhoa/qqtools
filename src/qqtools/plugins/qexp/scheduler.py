@@ -33,6 +33,7 @@ from .lease import (
     reclaim_allowed_at,
 )
 from .lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
+from .runtime.authority_lock import authority_locks
 from .runtime.claims import archive_claim
 from .runtime.dependencies import dependency_gate, dependency_locks
 from .runtime.locks import group_lock, schema_writer_lock, task_lock
@@ -135,14 +136,6 @@ def _process_evidence_state(attempt: AttemptRecord, data: dict[str, Any]) -> str
     if current_start is not None:
         return "mismatch"
     return "unverifiable" if _is_process_group_alive(manifest_group) else "absent"
-
-
-@contextmanager
-def authority_locks(cfg: RootConfig, task: TaskRecord) -> Iterator[None]:
-    """Acquire the only permitted shared authority order."""
-    with schema_writer_lock(cfg, require_narrow=True):
-        with dependency_locks(cfg, task):
-            yield
 
 
 def _eligible(cfg: RootConfig, task: TaskRecord) -> bool:
@@ -551,6 +544,7 @@ def authorize_launch(
     reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
     cancel_result = None
+
     @contextmanager
     def _authority_write_guard() -> Iterator[bool]:
         if write_guard is None:
@@ -942,6 +936,24 @@ def _run_dispatch_cycle(
                             else:
                                 available = gpus + available
                             break
+                        with diagnostic_span("scheduler.claim"):
+                            attempt = claim_task(
+                                cfg,
+                                task.task_id,
+                                gpus,
+                                reservation_runtime_root=reservation_runtime_root,
+                                project_id=project_id,
+                                admission_role=admission_role,
+                                borrow_admission_grant=borrow_admission_grant,
+                            )
+                else:
+                    if before_claim is not None and not before_claim():
+                        if task.spec.is_cpu_only:
+                            available_cpu_slots += task.spec.requested_cpus or 0
+                        else:
+                            available = gpus + available
+                        break
+                    with diagnostic_span("scheduler.claim"):
                         attempt = claim_task(
                             cfg,
                             task.task_id,
@@ -951,22 +963,6 @@ def _run_dispatch_cycle(
                             admission_role=admission_role,
                             borrow_admission_grant=borrow_admission_grant,
                         )
-                else:
-                    if before_claim is not None and not before_claim():
-                        if task.spec.is_cpu_only:
-                            available_cpu_slots += task.spec.requested_cpus or 0
-                        else:
-                            available = gpus + available
-                        break
-                    attempt = claim_task(
-                        cfg,
-                        task.task_id,
-                        gpus,
-                        reservation_runtime_root=reservation_runtime_root,
-                        project_id=project_id,
-                        admission_role=admission_role,
-                        borrow_admission_grant=borrow_admission_grant,
-                    )
             except ValueError:
                 if task.spec.is_cpu_only:
                     available_cpu_slots += task.spec.requested_cpus or 0
@@ -986,14 +982,16 @@ def _run_dispatch_cycle(
             if on_claim is not None:
                 on_claim(task.task_id)
             try:
-                if authorize_launch(
-                    cfg,
-                    task.task_id,
-                    attempt.attempt_id,
-                    attempt.current_fencing_token,
-                    reservation_runtime_root=reservation_runtime_root,
-                    write_guard=claim_guard,
-                ):
+                with diagnostic_span("scheduler.authorize"):
+                    is_authorized = authorize_launch(
+                        cfg,
+                        task.task_id,
+                        attempt.attempt_id,
+                        attempt.current_fencing_token,
+                        reservation_runtime_root=reservation_runtime_root,
+                        write_guard=claim_guard,
+                    )
+                if is_authorized:
                     authorized = _load_current_attempt(cfg, load_task(cfg, task.task_id))
                     if authorized is not None:
                         executor.launch_attempt(cfg, task.task_id, authorized)

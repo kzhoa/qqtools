@@ -128,6 +128,7 @@ def _card_markdown(event: Any) -> str:
         )
     )
 
+
 def _markdown_project(value: Any) -> str:
     text = _markdown_code(value)
     if len(text) <= 120:

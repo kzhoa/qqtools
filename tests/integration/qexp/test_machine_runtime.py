@@ -44,6 +44,7 @@ from qqtools.plugins.qexp.runtime.resources.reservations import (
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
+from tests.helpers.qexp.lifecycle import wait_until
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -318,9 +319,7 @@ def test_launch_authorization_revalidates_registration_write_guard(tmp_path: Pat
     assert read_json(cfg.shared_root / "attempts" / task.task_id / "1.json")["attempt"]["phase"] == "claimed"
 
 
-def test_interrupted_registration_is_rolled_back_before_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_interrupted_registration_is_rolled_back_before_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     save_registry = runtime._save_registry
@@ -455,9 +454,7 @@ def test_migrate_project_rolls_back_failed_adoption_before_fencing_stale_owner(
     assert binding.enabled
     assert not runtime.paths["registration_transaction"].exists()
     assert runtime.binding_write_eligible(binding)
-    registration = read_json(
-        cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
-    )["registration"]
+    registration = read_json(cfg.shared_root / "machines" / cfg.machine_name / "registration.json")["registration"]
     assert registration["runtime_root"] == str(runtime.root)
     assert registration["generation"] != bootstrap_binding.registration_generation
 
@@ -1252,9 +1249,12 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
         start_new_session=True,
     )
     try:
-        deadline = time.monotonic() + 5.0
-        while not (runtime.paths["agent"] / "status.json").exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
+        wait_until(
+            "agent-status",
+            lambda: (runtime.paths["agent"] / "status.json").exists() or process.poll() is not None,
+            stage="first-registration:startup",
+            on_timeout=lambda: {"process_returncode": process.poll()},
+        )
         assert process.poll() is None
         assert get_machine_agent_status(runtime)["waiting_for_first_registration"] is True
 
@@ -1266,9 +1266,12 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
         )
         runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
 
-        deadline = time.monotonic() + 5.0
-        while get_machine_agent_status(runtime)["waiting_for_first_registration"] and time.monotonic() < deadline:
-            time.sleep(0.01)
+        wait_until(
+            "registration-consumed",
+            lambda: not get_machine_agent_status(runtime)["waiting_for_first_registration"],
+            stage="first-registration:consume",
+            on_timeout=lambda: get_machine_agent_status(runtime),
+        )
         status = get_machine_agent_status(runtime)
         assert status["waiting_for_first_registration"] is False
         assert process.poll() is None
@@ -1308,10 +1311,21 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
         start_new_session=True,
     )
     try:
-        deadline = time.monotonic() + 5.0
-        while not (runtime.paths["agent"] / "status.json").exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        time.sleep(0.2)
+        wait_until(
+            "registration-wait",
+            lambda: (
+                (
+                    (runtime.paths["agent"] / "status.json").exists()
+                    and get_machine_agent_status(runtime)["waiting_for_first_registration"]
+                )
+                or process.poll() is not None
+            ),
+            stage="stale-registration:startup",
+            on_timeout=lambda: {
+                "process_returncode": process.poll(),
+                "status": get_machine_agent_status(runtime),
+            },
+        )
         assert process.poll() is None
         assert get_machine_agent_status(runtime)["waiting_for_first_registration"] is True
 
@@ -1319,9 +1333,12 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
         assert is_added is False
         assert adopted.registration_generation != binding.registration_generation
 
-        deadline = time.monotonic() + 5.0
-        while get_machine_agent_status(runtime)["waiting_for_first_registration"] and time.monotonic() < deadline:
-            time.sleep(0.01)
+        wait_until(
+            "registration-consumed",
+            lambda: not get_machine_agent_status(runtime)["waiting_for_first_registration"],
+            stage="stale-registration:adoption",
+            on_timeout=lambda: get_machine_agent_status(runtime),
+        )
         assert get_machine_agent_status(runtime)["waiting_for_first_registration"] is False
     finally:
         if process.poll() is None:
@@ -1652,11 +1669,15 @@ with runtime.scheduler_authority(blocking=True):
         stderr=subprocess.PIPE,
         text=True,
     )
-    deadline = time.monotonic() + 5.0
-    while not get_machine_agent_status(runtime)["is_running"] and time.monotonic() < deadline:
-        if old_process.poll() is not None:
-            pytest.fail(f"delayed-stop helper exited early: {old_process.stderr.read()}")
-        time.sleep(0.02)
+    wait_until(
+        "old-agent-running",
+        lambda: get_machine_agent_status(runtime)["is_running"] or old_process.poll() is not None,
+        poll_interval=0.02,
+        stage="restart:old-agent-startup",
+        on_timeout=lambda: {"process_returncode": old_process.poll()},
+    )
+    if old_process.poll() is not None:
+        pytest.fail(f"delayed-stop helper exited early: {old_process.stderr.read()}")
     assert get_machine_agent_status(runtime)["pid"] == old_process.pid
 
     reaper = Thread(target=old_process.wait)

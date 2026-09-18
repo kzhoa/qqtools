@@ -385,6 +385,8 @@ def test_progress_tracker_auto_mode_logs_info(monkeypatch):
 
     monkeypatch.setattr(progress_module, "HAS_RICH", True)
     monkeypatch.setattr(progress_module, "HAS_TQDM", True)
+    monkeypatch.setattr(progress_module.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(progress_module.sys.stderr, "isatty", lambda: True)
     monkeypatch.setattr(progress_module, "create_progress_strategy", lambda mode, logger, freq: _DummyStrategy())
 
     progress_module.ProgressTracker(logger=logger, print_freq=5, render_type="auto")

@@ -16,6 +16,17 @@ RETIRED_TOX_LANES = (
     "testenv:qexp-stress",
 )
 SOURCE_TOX_LANES = frozenset(("unit", "integration", "qexp", "preflight"))
+SHARED_PREFLIGHT_RUNNER = Path("scripts/ci/run_preflight.py")
+REAL_PROCESS_CALLS = frozenset(
+    {
+        "multiprocessing.Process",
+        "subprocess.Popen",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.run",
+    }
+)
 TOX_ENVIRONMENT_PATTERN = re.compile(
     r"(?:^|\s)(?:python(?:\d+(?:\.\d+)*)?\s+-m\s+)?tox(?:\s+run)?"
     r"(?:\s+(?!--?e(?:\s|=|$))--?[A-Za-z][\w-]*(?:[= ][^\s]+)?)*\s+-e\s*=?\s*"
@@ -54,6 +65,43 @@ def _uses_pytest_marker(path: Path, marker: str) -> bool:
     return False
 
 
+def _import_aliases(module: ast.Module) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for node in module.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return aliases
+
+
+def _call_name(node: ast.Call, aliases: dict[str, str]) -> str | None:
+    parts: list[str] = []
+    owner: ast.expr = node.func
+    while isinstance(owner, ast.Attribute):
+        parts.append(owner.attr)
+        owner = owner.value
+    if not isinstance(owner, ast.Name):
+        return None
+    parts.append(aliases.get(owner.id, owner.id))
+    return ".".join(reversed(parts))
+
+
+def _real_process_calls(path: Path) -> list[tuple[int, str]]:
+    module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    aliases = _import_aliases(module)
+    calls: list[tuple[int, str]] = []
+    for node in ast.walk(module):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node, aliases)
+        if name in REAL_PROCESS_CALLS:
+            calls.append((node.lineno, name))
+    return sorted(calls)
+
+
 def _check_marker_boundaries(repo_root: Path) -> list[str]:
     errors: list[str] = []
     for path in (repo_root / "tests/unit").rglob("test_*.py"):
@@ -66,6 +114,8 @@ def _check_marker_boundaries(repo_root: Path) -> list[str]:
         ):
             if _uses_pytest_marker(path, marker):
                 errors.append(f"Unit may not use {marker}: {path.relative_to(repo_root)}")
+        for line, call in _real_process_calls(path):
+            errors.append(f"Unit may not start real processes: {path.relative_to(repo_root)}:{line} uses {call}")
     boundaries = (
         ("Integration", repo_root / "tests/integration", "host_exclusive"),
         ("E2E", repo_root / "tests/e2e", "machine_lab"),
@@ -90,6 +140,19 @@ def _section_commands(config: ConfigParser, section: str) -> str | None:
     return config.get(section, "commands", fallback="")
 
 
+def _preflight_contract_text(repo_root: Path, preflight_commands: str | None) -> tuple[str | None, list[str]]:
+    """Return the executable preflight contract, following the shared runner when configured."""
+    if preflight_commands is None:
+        return None, []
+    runner_name = SHARED_PREFLIGHT_RUNNER.as_posix()
+    if runner_name not in preflight_commands:
+        return preflight_commands, []
+    runner_path = repo_root / SHARED_PREFLIGHT_RUNNER
+    if not runner_path.is_file():
+        return preflight_commands, [f"preflight shared runner is absent: {runner_name}"]
+    return f"{preflight_commands}\n{runner_path.read_text(encoding='utf-8')}", []
+
+
 def _check_tox_boundaries(repo_root: Path) -> list[str]:
     try:
         config = _load_tox_config(repo_root / "tox.ini")
@@ -101,11 +164,31 @@ def _check_tox_boundaries(repo_root: Path) -> list[str]:
         errors.append("retired qexp tox lanes are present")
 
     preflight_commands = _section_commands(config, "testenv:preflight")
-    if preflight_commands is None or "tests/e2e" in preflight_commands:
+    preflight_contract, contract_errors = _preflight_contract_text(repo_root, preflight_commands)
+    errors.extend(contract_errors)
+    if preflight_contract is None or "tests/e2e" in preflight_contract:
         errors.append("preflight must collect only Unit and Integration tests")
     lifecycle_test = "tests/integration/qexp/test_agent_lifecycle_independence.py"
-    if preflight_commands is None or lifecycle_test not in preflight_commands:
+    if preflight_contract is None or lifecycle_test not in preflight_contract:
         errors.append("preflight must run the representative qexp lifecycle gate")
+
+    parallel_commands = _section_commands(config, "testenv:qexp-lifecycle-parallel")
+    if parallel_commands is None:
+        errors.append("controlled qexp lifecycle parallel lane is absent")
+    else:
+        if (
+            "--lifecycle-gate=full" not in parallel_commands
+            or "-n 4" not in parallel_commands
+            or "--dist load" not in parallel_commands
+        ):
+            errors.append("controlled lifecycle lane must run the full gate with four isolated workers")
+
+    qexp_commands = _section_commands(config, "testenv:qexp-integration")
+    if qexp_commands is None:
+        errors.append("complete qexp integration lane is absent")
+    else:
+        if "python scripts/qexp_integration_gate.py --budget-seconds 600" not in qexp_commands:
+            errors.append("qexp integration must use the bounded two-phase aggregate gate")
 
     artifact_commands = _section_commands(config, "testenv:artifact-e2e")
     if artifact_commands is None or "tests/e2e" not in artifact_commands:

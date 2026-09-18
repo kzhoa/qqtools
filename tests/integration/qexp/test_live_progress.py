@@ -37,7 +37,9 @@ def launch(cfg, task, monkeypatch, *, code=0, payload=None):
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    launch_id = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"]["authorization"]["launch_id"]
+    launch_id = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"][
+        "authorization"
+    ]["launch_id"]
     monkeypatch.setattr("qqtools.plugins.qexp.runner._process_start_time_ticks", lambda pid: pid + 100)
     envs = []
 
@@ -162,7 +164,9 @@ def test_real_guardian_inherits_channel_and_runs_public_api(cfg, monkeypatch):
     task = submit(cfg, [sys.executable, "-c", code])
     attempt = claim_task(cfg, task.task_id, [0])
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    launch_id = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"]["authorization"]["launch_id"]
+    launch_id = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"][
+        "authorization"
+    ]["launch_id"]
 
     class BoundedChild:
         def __init__(self, *args, **kwargs):
@@ -177,14 +181,17 @@ def test_real_guardian_inherits_channel_and_runs_public_api(cfg, monkeypatch):
                 self.child.wait(timeout=5)
                 raise
 
-    assert run_attempt(
-        cfg,
-        task.task_id,
-        attempt.attempt_id,
-        attempt.current_fencing_token,
-        launch_id,
-        popen_factory=BoundedChild,
-    ) == 0
+    assert (
+        run_attempt(
+            cfg,
+            task.task_id,
+            attempt.attempt_id,
+            attempt.current_fencing_token,
+            launch_id,
+            popen_factory=BoundedChild,
+        )
+        == 0
+    )
     AuthoritySupervisor(cfg).tick()
     p = projector(cfg)
     p.tick()

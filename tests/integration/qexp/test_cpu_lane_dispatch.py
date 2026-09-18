@@ -11,6 +11,8 @@ from qqtools.plugins.qexp.runtime.resources.cpu_lane import cpu_reservation_snap
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, run_dispatch_cycle
 
+pytestmark = pytest.mark.integration
+
 
 class _RecordingExecutor(Executor):
     def __init__(self) -> None:

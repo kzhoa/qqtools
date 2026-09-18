@@ -341,6 +341,7 @@ def _start_machine_agent_locked(
     machine_runtime: MachineRuntime,
     *,
     available_gpus: list[int] | None = None,
+    loop_interval: float | None = None,
     stdin=None,
     stdout=None,
     stderr=None,
@@ -353,6 +354,7 @@ def _start_machine_agent_locked(
     return spawn_machine_agent_process(
         machine_runtime,
         available_gpus=available_gpus,
+        loop_interval=loop_interval,
         stdin=stdin,
         stdout=stdout,
         stderr=stderr,
@@ -363,6 +365,7 @@ def start_machine_agent(
     runtime: MachineRuntime | str | Path | None = None,
     *,
     available_gpus: list[int] | None = None,
+    loop_interval: float | None = None,
     stdin=None,
     stdout=None,
     stderr=None,
@@ -373,6 +376,7 @@ def start_machine_agent(
         return _start_machine_agent_locked(
             machine_runtime,
             available_gpus=available_gpus,
+            loop_interval=loop_interval,
             stdin=stdin,
             stdout=stdout,
             stderr=stderr,
@@ -383,6 +387,7 @@ def ensure_machine_agent_started(
     runtime: MachineRuntime | str | Path | None = None,
     *,
     available_gpus: list[int] | None = None,
+    loop_interval: float | None = None,
     stdin=None,
     stdout=None,
     stderr=None,
@@ -397,6 +402,7 @@ def ensure_machine_agent_started(
             process = _start_machine_agent_locked(
                 machine_runtime,
                 available_gpus=available_gpus,
+                loop_interval=loop_interval,
                 stdin=stdin,
                 stdout=stdout,
                 stderr=stderr,
@@ -438,6 +444,7 @@ def restart_machine_agent(
     runtime: MachineRuntime | str | Path | None = None,
     *,
     available_gpus: list[int] | None = None,
+    loop_interval: float | None = None,
     stdin=None,
     stdout=None,
     stderr=None,
@@ -451,6 +458,7 @@ def restart_machine_agent(
         process = _start_machine_agent_locked(
             machine_runtime,
             available_gpus=available_gpus,
+            loop_interval=loop_interval,
             stdin=stdin,
             stdout=stdout,
             stderr=stderr,

@@ -154,6 +154,43 @@ def test_runner_publishes_registration_and_exit_observation_only(tmp_path: Path,
     assert not (cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json").exists()
 
 
+def test_repeated_registration_materialization_does_not_rewrite_running_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    monkeypatch.setattr("qqtools.plugins.qexp.runner._process_start_time_ticks", lambda pid: pid + 100)
+    assert (
+        run_attempt(
+            cfg,
+            task.task_id,
+            attempt.attempt_id,
+            attempt.current_fencing_token,
+            _launch_id(cfg, attempt),
+            popen_factory=lambda *args, **kwargs: FakeChild(),
+        )
+        == 0
+    )
+    supervisor = AuthoritySupervisor(cfg)
+    supervisor._materialize_registrations()
+    writes: list[Path] = []
+    original_atomic_replace = __import__("qqtools.plugins.qexp.authority", fromlist=["atomic_replace"]).atomic_replace
+
+    def record_atomic_replace(path: Path, value: dict[str, object]) -> None:
+        writes.append(path)
+        original_atomic_replace(path, value)
+
+    monkeypatch.setattr("qqtools.plugins.qexp.authority.atomic_replace", record_atomic_replace)
+
+    supervisor._materialize_registrations()
+
+    assert writes == []
+
+
 def test_read_logs_uses_attempt_log_written_by_runner(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])

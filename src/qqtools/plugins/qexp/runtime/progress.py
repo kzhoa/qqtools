@@ -152,7 +152,9 @@ def resolve_progress_binding(cfg: Any, context: dict[str, Any]) -> dict[str, Any
     attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task_id, number)))
     if attempt.attempt_id != attempt_id or attempt.task_id != task_id or attempt.machine_name != cfg.machine_name:
         return None
-    if context.get("machine_name") != attempt.machine_name or context.get("launch_id") != attempt.authorization.get("launch_id"):
+    if context.get("machine_name") != attempt.machine_name or context.get("launch_id") != attempt.authorization.get(
+        "launch_id"
+    ):
         return None
     for key in ("wrapper_pid", "wrapper_start_time_ticks"):
         if type(context.get(key)) is not int or attempt.process.get(key) != context[key]:
@@ -216,15 +218,11 @@ def _validate_projection(
         stamp = datetime.fromisoformat(value[key].replace("Z", "+00:00"))
         if stamp.tzinfo is None:
             raise ValueError("progress timestamp must have a timezone")
-    normalized = validate_payload(
-        {**value["progress"], "protocol_version": 1, "update_id": value["source_update_id"]}
-    )
+    normalized = validate_payload({**value["progress"], "protocol_version": 1, "update_id": value["source_update_id"]})
     if any(key in value["progress"] for key in ("protocol_version", "update_id")):
         raise ValueError("invalid nested progress payload")
     result = dict(value)
-    result["progress"] = {
-        key: item for key, item in normalized.items() if key not in {"protocol_version", "update_id"}
-    }
+    result["progress"] = {key: item for key, item in normalized.items() if key not in {"protocol_version", "update_id"}}
     return result
 
 
@@ -310,8 +308,7 @@ class ProgressProjector:
             try:
                 previous = read_advisory_snapshot(path)
                 elapsed = (
-                    datetime.now(timezone.utc)
-                    - datetime.fromisoformat(previous["at"].replace("Z", "+00:00"))
+                    datetime.now(timezone.utc) - datetime.fromisoformat(previous["at"].replace("Z", "+00:00"))
                 ).total_seconds()
                 if previous.get("reason") == reason and elapsed < 60:
                     return
@@ -439,9 +436,7 @@ class ProgressProjector:
             return
         now_monotonic = self._clock()
         urgent = (
-            published is None
-            or binding["terminal"]
-            or latest["progress"]["stage"] != published["progress"]["stage"]
+            published is None or binding["terminal"] or latest["progress"]["stage"] != published["progress"]["stage"]
         )
         interval = 1.0 if urgent else 5.0
         if now_monotonic - state["last_write"] < interval:
@@ -544,9 +539,7 @@ def inspect_progress(cfg: Any, task: Any) -> dict[str, Any]:
 
 def _age(stamp: str) -> str:
     try:
-        seconds = (
-            datetime.now(timezone.utc) - datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-        ).total_seconds()
+        seconds = (datetime.now(timezone.utc) - datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds()
         if seconds < 0:
             return "unknown (clock difference)"
         if seconds < 60:

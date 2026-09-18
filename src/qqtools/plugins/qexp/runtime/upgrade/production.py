@@ -90,9 +90,7 @@ class UpgradeJournalMigration(MigrationPlugin):
             return True
         return self._is_target_state_missing(manifest, schema)
 
-    def _is_target_state_missing(
-        self, manifest_document: dict[str, Any], schema: dict[str, Any]
-    ) -> bool:
+    def _is_target_state_missing(self, manifest_document: dict[str, Any], schema: dict[str, Any]) -> bool:
         value = manifest_document.get("upgrade_protocol_manifest", {})
         return not (
             value.get("version") == 1
@@ -106,9 +104,7 @@ class UpgradeJournalMigration(MigrationPlugin):
 
     def is_applicable_with_storage(self, cfg, storage: UpgradeStorage) -> bool:
         try:
-            manifest = storage.read_json(
-                shared_paths(cfg.shared_root)["upgrade"] / _MANIFEST_NAME
-            )
+            manifest = storage.read_json(shared_paths(cfg.shared_root)["upgrade"] / _MANIFEST_NAME)
             schema = storage.read_json(shared_paths(cfg.shared_root)["schema"] / "version.json")
         except (OSError, KeyError, TypeError, ValueError):
             return True
@@ -130,9 +126,7 @@ class UpgradeJournalMigration(MigrationPlugin):
         manifest_path = _manifest_path(context)
         schema = context.storage.read_json(_schema_path(context))
         if not context.storage.exists(manifest_path):
-            context.storage.atomic_replace(
-                manifest_path, _manifest_document(schema, protocol=_schema_protocol(schema))
-            )
+            context.storage.atomic_replace(manifest_path, _manifest_document(schema, protocol=_schema_protocol(schema)))
         context.slice_budget.consume_records()
         usage = context.slice_budget.used(
             max_records=self.spec.max_records_per_slice,
@@ -189,9 +183,7 @@ class UpgradeJournalMigration(MigrationPlugin):
     def activation(self, context: UpgradeContext) -> PhaseResult:
         manifest = context.storage.read_json(_manifest_path(context))["upgrade_protocol_manifest"]
         schema = context.storage.read_json(_schema_path(context))
-        self._validate_manifest(
-            schema, manifest, context.journal["upgrade"]["migrations"][self.spec.name]
-        )
+        self._validate_manifest(schema, manifest, context.journal["upgrade"]["migrations"][self.spec.name])
         if _schema_protocol(schema) != self.spec.source_protocol:
             raise DeterministicUpgradeError("schema protocol is outside the migration boundary")
         context.storage.atomic_replace(
@@ -211,9 +203,7 @@ class UpgradeJournalMigration(MigrationPlugin):
             detail={"capability": UPGRADE_JOURNAL_CAPABILITY},
         )
 
-    def _validate_manifest(
-        self, schema: dict[str, Any], manifest: dict[str, Any], migration: dict[str, Any]
-    ) -> None:
+    def _validate_manifest(self, schema: dict[str, Any], manifest: dict[str, Any], migration: dict[str, Any]) -> None:
         """Verify the audited schema and manifest still form a safe activation boundary."""
         expected = {
             "version": 1,
@@ -251,9 +241,7 @@ class UpgradeJournalMigration(MigrationPlugin):
         manifest_path = _manifest_path(context)
         manifest = context.storage.read_json(manifest_path) if context.storage.exists(manifest_path) else None
         migration = context.journal["upgrade"]["migrations"][self.spec.name]
-        expected_protocol = (
-            self.spec.target_protocol if migration.get("completed_at") else self.spec.source_protocol
-        )
+        expected_protocol = self.spec.target_protocol if migration.get("completed_at") else self.spec.source_protocol
         return {
             "target": target,
             "observed_revisions": {"journal": int(context.journal["upgrade"].get("revision", 0))},
@@ -301,9 +289,7 @@ class UpgradeJournalMigration(MigrationPlugin):
         except (OSError, KeyError, TypeError, ValueError) as exc:
             return PhaseResult("blocked", blocker=f"repair_terminal_invariant:{exc}")
         try:
-            self._validate_repaired_manifest(
-                schema, manifest, expected_protocol=plan.get("expected_manifest_protocol")
-            )
+            self._validate_repaired_manifest(schema, manifest, expected_protocol=plan.get("expected_manifest_protocol"))
         except DeterministicUpgradeError as exc:
             return PhaseResult("blocked", blocker=f"repair_terminal_invariant:{exc}")
         repair = context.journal["upgrade"].get("repair")
@@ -326,9 +312,7 @@ class UpgradeJournalMigration(MigrationPlugin):
         )
 
     def _validate_terminal_manifest(self, schema: dict[str, Any], manifest: dict[str, Any]) -> None:
-        self._validate_repaired_manifest(
-            schema, manifest, expected_protocol=self.spec.target_protocol
-        )
+        self._validate_repaired_manifest(schema, manifest, expected_protocol=self.spec.target_protocol)
 
     def _validate_repaired_manifest(
         self, schema: dict[str, Any], manifest: dict[str, Any], *, expected_protocol: object
@@ -354,9 +338,7 @@ class UpgradeJournalMigration(MigrationPlugin):
         return {
             "schema_version": context.storage.read_json(_schema_path(context)),
             "protocol_manifest": (
-                context.storage.read_json(manifest_path)
-                if context.storage.exists(manifest_path)
-                else None
+                context.storage.read_json(manifest_path) if context.storage.exists(manifest_path) else None
             ),
         }
 

@@ -144,7 +144,11 @@ def discover_registered_upgrades(runtime: MachineRuntime, *, force: bool = False
     ):
         pending_ids = set(getattr(runtime, "upgrade_pending_projects", set()))
         deadlines = getattr(runtime, "upgrade_probe_deadlines", {})
-        due_ids = [project_id for project_id in sorted(pending_ids) if deadlines.get(project_id, float("inf")) <= time.monotonic()]
+        due_ids = [
+            project_id
+            for project_id in sorted(pending_ids)
+            if deadlines.get(project_id, float("inf")) <= time.monotonic()
+        ]
         for binding in (item for item in bindings if item.project_id in due_ids[: runtime.upgrade_probe_budget]):
             try:
                 coordinator = UpgradeCoordinator(binding.root_config())
@@ -242,7 +246,9 @@ def advance_registered_upgrades(
         }
 
     runnable_ids = set(getattr(runtime, "upgrade_runnable_projects", pending_ids))
-    ordered = [binding for binding in bindings if binding.project_id in pending_ids and binding.project_id in runnable_ids]
+    ordered = [
+        binding for binding in bindings if binding.project_id in pending_ids and binding.project_id in runnable_ids
+    ]
     cursor = _load_upgrade_cursor(runtime)
     ordered = _rotate_bindings(ordered, cursor)
     results: list[dict[str, Any]] = []

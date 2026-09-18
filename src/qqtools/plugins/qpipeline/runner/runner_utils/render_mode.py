@@ -13,7 +13,11 @@ def _isatty(stream: object) -> bool:
 
 
 def resolve_render_mode(
-    requested_mode: str | None, has_rich: bool, has_tqdm: bool, *, is_terminal: bool | None = None,
+    requested_mode: str | None,
+    has_rich: bool,
+    has_tqdm: bool,
+    *,
+    is_terminal: bool | None = None,
 ) -> tuple[str, str | None]:
     """Resolve auto against the renderer's output stream, not import availability.
 

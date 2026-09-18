@@ -1,4 +1,5 @@
 """Pure resource admission decisions."""
+
 from __future__ import annotations
 
 from .models import AdmissionInput
