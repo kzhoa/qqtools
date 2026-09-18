@@ -18,12 +18,14 @@ REQUIRED_MARKERS = (
     "<!-- qqtools-governance:agents-owner=kzhoa -->",
     "<!-- qqtools-governance:no-pr-required=v1 -->",
     "<!-- qqtools-governance:workflow-policy=v1 -->",
+    "<!-- qqtools-governance:release-model=v1 -->",
 )
 
 REQUIRED_SECTIONS = (
     "## Branch model",
     "## Feature-local agent state",
     "## Feature promotion",
+    "## Dev release promotion",
     "## Validation",
     "## Workflow governance",
     "## Compatibility governance",

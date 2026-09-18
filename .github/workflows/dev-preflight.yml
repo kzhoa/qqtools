@@ -5,6 +5,13 @@ on:
     branches:
       - dev
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      strip_dev_state:
+        description: Remove feature-local .dev state before validating a promotion candidate
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,6 +29,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Strip feature-local state from promotion candidate
+        if: inputs.strip_dev_state
+        run: rm -rf .dev
 
       - name: Set up Python 3.13 with pip cache
         uses: actions/setup-python@v5

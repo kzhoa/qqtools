@@ -13,6 +13,14 @@ on:
       - synchronize
       - reopened
       - edited
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Governed repository operation to run
+        required: true
+        type: choice
+        options:
+          - promote-dev-to-main
 
 permissions:
   contents: read
@@ -51,16 +59,29 @@ jobs:
             exit 1
           fi
 
-  promote-feature:
+  preflight-feature-promotion:
     if: >-
       github.event_name == 'push' &&
       (startsWith(github.ref_name, 'feat/') || startsWith(github.ref_name, 'feature/')) &&
       startsWith(github.event.head_commit.message, 'promote:')
     needs: validate-push
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dev-preflight.yml
+    with:
+      strip_dev_state: true
+
+  promote-feature:
+    if: >-
+      github.event_name == 'push' &&
+      (startsWith(github.ref_name, 'feat/') || startsWith(github.ref_name, 'feature/')) &&
+      startsWith(github.event.head_commit.message, 'promote:')
+    needs:
+      - validate-push
+      - preflight-feature-promotion
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: write
     concurrency:
       group: feature-promotion-to-dev
       cancel-in-progress: false
@@ -93,6 +114,12 @@ jobs:
             exit 1
           fi
 
+          if git diff --name-only "$dev_sha"...HEAD | grep -Eq '^\.github/workflows/'; then
+            echo "GitHub's workflow token cannot update workflow files."
+            echo "After this candidate passes preflight, the owner must perform the governed promotion with owner credentials."
+            exit 1
+          fi
+
           rm -rf .dev
           git add -A
           tree_sha="$(git write-tree)"
@@ -121,15 +148,86 @@ jobs:
           COMMIT_SHA: ${{ steps.prepare.outputs.commit_sha }}
         run: git push origin "$COMMIT_SHA:refs/heads/dev"
 
-      - name: Trigger Dev Preflight
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run dev-preflight.yml --ref dev
-
       - name: Delete promoted feature branch
         env:
           BRANCH: ${{ steps.prepare.outputs.branch }}
         run: git push origin --delete "$BRANCH"
+
+  validate-release-request:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.operation == 'promote-dev-to-main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require dispatch from dev
+        env:
+          REQUEST_REF: ${{ github.ref_name }}
+        run: |
+          if [[ "$REQUEST_REF" != "dev" ]]; then
+            echo "Dev-to-main promotion must be dispatched with --ref dev."
+            exit 1
+          fi
+
+  preflight-dev-release:
+    needs: validate-release-request
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dev-preflight.yml
+
+  artifact-e2e-dev-release:
+    needs: validate-release-request
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  promote-dev-to-main:
+    needs:
+      - validate-release-request
+      - preflight-dev-release
+      - artifact-e2e-dev-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: dev-promotion-to-main
+      cancel-in-progress: false
+    steps:
+      - name: Check out validated dev commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward main to validated dev
+        env:
+          EXPECTED_DEV_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main dev
+          main_sha="$(git rev-parse origin/main)"
+          dev_sha="$(git rev-parse origin/dev)"
+
+          if [[ "$dev_sha" != "$EXPECTED_DEV_SHA" ]]; then
+            echo "Dev advanced while release gates were running; dispatch the promotion again."
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$main_sha" "$dev_sha"; then
+            echo "Main is not an ancestor of dev; refusing a non-fast-forward release."
+            exit 1
+          fi
+
+          if [[ "$main_sha" == "$dev_sha" ]]; then
+            echo "Main already points at the validated dev commit."
+            exit 0
+          fi
+
+          if ! git diff --quiet "$main_sha".."$dev_sha" -- .github/workflows; then
+            echo "GitHub's workflow token cannot promote workflow-file changes to main."
+            echo "The owner must fast-forward main to this validated dev commit with owner credentials."
+            exit 1
+          fi
+
+          git push origin "$dev_sha:refs/heads/main"
 
   inspect-pull-request:
     if: github.event_name == 'pull_request_target'

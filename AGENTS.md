@@ -3,6 +3,7 @@
 <!-- qqtools-governance:agents-owner=kzhoa -->
 <!-- qqtools-governance:no-pr-required=v1 -->
 <!-- qqtools-governance:workflow-policy=v1 -->
+<!-- qqtools-governance:release-model=v1 -->
 
 # AGENTS.md
 
@@ -25,7 +26,7 @@ feat/* or feature/*
         v
        dev
         |
-        | validated integration
+        | validated fast-forward promotion
         v
        main
 ```
@@ -36,6 +37,7 @@ feat/* or feature/*
 - Pull requests are optional and are not required for owner-driven development.
 - Do not promote a feature branch if it is behind `dev`; rebase or otherwise rebuild it on the current `dev` first.
 - Do not merge a feature branch directly into `main`.
+- `main` must remain an ancestor of `dev`. Release promotion advances `main` to an already validated `dev` commit without creating a second squash commit.
 
 ## Feature-local agent state
 
@@ -67,12 +69,36 @@ A conforming promotion must:
 1. verify the feature branch contains the current `dev` head;
 2. validate repository-governance invariants;
 3. build the feature tree with `.dev/**` removed;
-4. create one squash commit whose parent is the current `dev` head;
-5. advance `dev` to that commit;
-6. delete the disposable feature branch after a successful push; and
-7. trigger the `Dev Preflight` workflow for the promoted `dev` commit.
+4. run the configured preflight against that promotion candidate before changing `dev`;
+5. create one squash commit whose parent is the current `dev` head;
+6. advance `dev` to that commit;
+7. delete the disposable feature branch only after the successful push; and
+8. allow the `dev` push to trigger `Dev Preflight` again as post-promotion verification.
 
 The repository governance workflow may use a final feature-branch commit whose subject starts with `promote:` as the promotion request. Do not use that convention until the feature is ready to integrate.
+
+## Dev release promotion
+
+Promotion from `dev` to `main` publishes an already validated commit; it does not create another squash commit.
+
+A conforming release promotion must:
+
+1. be explicitly dispatched from the current `dev` ref;
+2. run repository preflight and installed-artifact E2E against that exact `dev` commit;
+3. abort if `dev` advances while those gates run;
+4. verify the current `main` is an ancestor of the validated `dev` commit;
+5. update `main` by fast-forward only; and
+6. rely on the `main` push workflows for post-promotion verification.
+
+The standard owner-driven command is:
+
+```bash
+gh workflow run repository-governance.yml --ref dev -f operation=promote-dev-to-main
+```
+
+Do not squash `dev` into `main`, merge `main` back into `dev` after an ordinary release, or force-push either public branch as part of this release flow. Release tags must point to commits reachable from `main`.
+
+GitHub's built-in workflow token cannot create or update `.github/workflows/**`. An explicitly approved owner workflow change must still pass the normal candidate gates, but its final feature-to-`dev` promotion and the first `dev`-to-`main` fast-forward containing that change must be performed with owner credentials. This is a credential boundary, not permission to bypass ancestry, validation, `.dev/**` stripping, or tree-equality checks.
 
 ## Validation
 
@@ -83,6 +109,8 @@ Before code is treated as integrated:
 - `ruff format --check src tests scripts` must pass;
 - the configured `preflight` lane must pass, except for a separately identified pre-existing baseline blocker that is explicitly being repaired; and
 - feature-specific regression tests must exist for defects discovered during implementation.
+
+Feature preflight is a gate before `dev` changes. Dev release preflight and installed-artifact E2E are gates before `main` changes. Post-push workflows are verification and must not be the first point at which an integration candidate is tested.
 
 Do not weaken tests, skip lifecycle coverage, or create a superficial fast lane merely to make a feature pass.
 
