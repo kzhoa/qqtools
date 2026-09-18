@@ -108,6 +108,8 @@ def _build_agent_for_offload_tests(
 )
 def setup_agent_with_ema(request):
     device = torch.device(request.param)  # Use CPU or CUDA
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
 
     model = SimpleModel().to(device)
     optimizer = optim.SGD(model.parameters(), lr=0.01)
