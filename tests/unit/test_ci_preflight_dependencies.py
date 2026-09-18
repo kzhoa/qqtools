@@ -12,7 +12,9 @@ EXPECTED_CI_PREFLIGHT = {
     "pytest-xdist",
     "ruff",
     "scikit-learn",
-    "tox",
+    "tox==4.61.5",
+    "tox-uv==1.36.0",
+    "uv==0.12.16",
     "tqdm",
 }
 

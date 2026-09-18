@@ -75,5 +75,5 @@ drained schema6 transition remains outside this coordinator.
 ## References
 
 - [Machine rolling upgrade coordinator pitch](../../pitch/qexp-machine-rolling-upgrade-coordinator.md)
-- [Compatibility governance](../../spec/compatibility-governance.md)
+- [Compatibility governance](../../development/compatibility-governance.md)
 - [Upgrade and ready-index recovery guide](../../spec/qexp_upgrade_guide.md)

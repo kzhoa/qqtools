@@ -185,7 +185,7 @@ Every qexp agent process uses this resolver to acquire the same lifetime-held ma
 lock.
 
 Temporary compatibility readers, migrations, and protocol adapters in this runtime must be
-registered under the project-wide [compatibility governance](compatibility-governance.md); the
+registered under the project-wide [compatibility governance](../development/compatibility-governance.md); the
 registry's release state does not replace the runtime invariants in this specification.
 
 Operational project commands resolve a canonical shared root and stable Project ID, then require

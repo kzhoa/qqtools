@@ -108,7 +108,7 @@ describe earlier algorithm work and are superseded by this default-selection dec
 ### v1.4.0 maintainer removal checklist
 
 This checklist retires `QQTOOLS-COMPAT-0006`; follow the shared
-[compatibility governance](compatibility-governance.md) and
+[compatibility governance](../development/compatibility-governance.md) and
 [publish pipeline](../../.github/publish.md). Removing the registry entry alone is not
 an implementation cleanup.
 
@@ -479,7 +479,7 @@ collective desynchronization.
 - Batch membership is fixed. Traversal shuffle is not uniform random repartitioning.
 - Similar-load step grouping can increase variation in total load between steps.
 - LPT is a heuristic on additive cost estimates, not an optimality or GPU-memory guarantee.
-- Real GPU/DDP throughput, memory and training convergence are **假设/未验证**. Integration tests
+- Real GPU/DDP throughput, memory and training convergence are **Assumption / Unverified**. Integration tests
   cover real CPU DataLoaders with explicit ranks, not a multi-process distributed training run.
 
 ## Test Placement
@@ -644,7 +644,7 @@ improvements on this workload. Final local measurements:
 | 1,000,000 / 16 / 4 | Prototype | 2829.916 | 36712 | 2524.01 | 15529583 |
 
 It remains experimental. Broader real-data quality, memory,
-GPU/DDP throughput and convergence effects are **假设/未验证**; synthetic exact results do not
+GPU/DDP throughput and convergence effects are **Assumption / Unverified**; synthetic exact results do not
 establish a universal approximation ratio or practical training benefit.
 
 ### Verification and reproduction
@@ -727,7 +727,7 @@ The minimum affected helper, sampler and real CPU DataLoader tests passed (513 c
 including 54 focused bounded-repair checks. Budgets are checked by invocation counts, not
 elapsed-time assertions. The 116 experimental oracle/prototype checks passed and remain opt-in.
 No GPU memory, multi-process DDP throughput or training convergence was measured; those remain
-**假设/未验证**. No whole-repository or installed-artifact suite was needed for this internal change.
+**Assumption / Unverified**. No whole-repository or installed-artifact suite was needed for this internal change.
 
 ```bash
 PYTHONPATH=src python -m pytest tests/unit/data_utils/test_lpt_repair.py tests/unit/data_utils/test_lpt_tiers.py tests/unit/data_utils/test_rank_batch_plan.py tests/unit/torch/ddp/test_lpt_sampler.py tests/unit/torch/ddp/test_qbalancedsampler.py tests/integration/torch/test_lpt_dataloader.py -q
@@ -830,7 +830,7 @@ explicit; finite costs, tails and fixed cardinality remain supported. It does no
 public strategy, assume uniform permutations, or claim global optimality. The implementation
 wraps the existing planner, so timing includes its initial final-sort plus any subsequent
 candidate scoring/re-sorting. Integrating and reusing intermediate arrays might reduce overhead,
-but that benefit is **假设/未验证**, as are real GPU/DDP throughput and convergence effects.
+but that benefit is **Assumption / Unverified**, as are real GPU/DDP throughput and convergence effects.
 
 ## Two-Pointer Fast Swap Experiment (2026-09-05)
 
@@ -945,7 +945,7 @@ PYTHONPATH=src python exps/test_balance_v3/compare_fast_swap.py --two-pointer --
 Post-change review confirms the same experimental interface and inherited validation, explicit
 internal sorted-row requirements, fixed exchange count, and full-score fallback. Searches run
 only during static planning, never during traversal. Real GPU memory, DDP throughput, convergence
-and savings from integrating/reusing planner intermediates remain **假设/未验证**.
+and savings from integrating/reusing planner intermediates remain **Assumption / Unverified**.
 
 ## Complete Five-Way Comparison (2026-09-05)
 
@@ -1030,7 +1030,7 @@ Recommendation: the two-pointer pass is a useful fast-tier candidate under the a
 planning-overhead tradeoff. It is neither globally optimal nor always faster than `lpt` on
 tiny inputs. Higher tiers must inherit the improved fast candidate when integration happens;
 the current middle tier can lose to experimental fast on individual cases. Production remains
-unchanged. GPU memory, actual DDP throughput and convergence are **假设/未验证**.
+unchanged. GPU memory, actual DDP throughput and convergence are **Assumption / Unverified**.
 
 ### Reproduction and review
 
@@ -1091,7 +1091,7 @@ odd batch counts, fixed cardinality, tier ordering, determinism and cached DataL
 The descending-row prerequisite is internal and satisfied immediately after layered planning;
 there is no new caller requirement. Pair search matches exhaustive B-by-B search in unit tests.
 The changed membership/order and cross-version best-tier limitation are explicit. Performance
-experiments remain under `exps/`, not unit tests. GPU memory/convergence remain **假设/未验证**.
+experiments remain under `exps/`, not unit tests. GPU memory/convergence remain **Assumption / Unverified**.
 The integrated unit/DataLoader suite passed 776 tests; the separate experimental/tier run
 passed 443 tests (including 328 experimental checks). Both exact runs and the timing smoke
 matrix passed. No high-confidence review findings remain; retaining an additional old-start

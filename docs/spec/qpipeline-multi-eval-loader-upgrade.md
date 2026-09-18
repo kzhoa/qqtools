@@ -7,6 +7,9 @@ archived_at:
 
 # qpipeline v1.2.34 Structured Multi-Evaluation Upgrade
 
+See the [qpipeline user guide](../../src/qqtools/plugins/qpipeline/readme.md)
+for metric-hook signatures, readable log interpretation, and run terminal events.
+
 `qTask.val_loader` and `qTask.test_loader` now accept `None`, one `DataLoader`, or a non-empty
 `dict[str, DataLoader]`. A mapping evaluates each source in insertion order. Mapping keys are loader
 labels for structured output; a single unnamed loader is represented by `name=None`.

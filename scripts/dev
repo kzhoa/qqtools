@@ -1,0 +1,72 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.13,<3.14"
+# dependencies = ["tox==4.61.5", "tox-uv==1.36.0", "uv==0.12.16"]
+# ///
+"""Repository-owned developer entry point (Python is provisioned by uv)."""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.ci.run_preflight import check_prerequisites  # noqa: E402
+
+
+def run(command: list[str]) -> int:
+    return subprocess.run(command, cwd=ROOT, check=False).returncode
+
+
+def prepare_env() -> int:
+    venv = ROOT / ".venv"
+    python = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    if venv.exists():
+        if not python.is_file():
+            print(".venv is not a usable environment. Remove it and rerun ./scripts/dev env.", file=sys.stderr)
+            return 1
+        result = subprocess.run(
+            [str(python), "-c", "import sys; raise SystemExit(sys.version_info[:2] != (3, 13))"],
+            cwd=ROOT,
+            check=False,
+        )
+        if result.returncode:
+            print(".venv requires Python 3.13. Remove it and rerun ./scripts/dev env.", file=sys.stderr)
+            return 1
+    else:
+        result = run(["uv", "venv", "--python", sys.executable, str(venv)])
+        if result:
+            return result
+    return run(["uv", "pip", "install", "--python", str(python), "-e", ".[full]", "pytest-xdist"])
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("env", "test", "preflight"))
+    parser.add_argument("args", nargs=argparse.REMAINDER, help="pytest arguments (test only)")
+    options = parser.parse_args(argv)
+    if options.command != "test" and options.args:
+        parser.error(f"{options.command} does not accept extra arguments")
+    if options.command == "env":
+        return prepare_env()
+    if options.command == "preflight":
+        error = check_prerequisites()
+        if error:
+            print(error, file=sys.stderr)
+            return 1
+    command = [sys.executable, "-m", "tox", "run", "-e", "unit" if options.command == "test" else "preflight"]
+    if options.command == "test":
+        args = options.args[1:] if options.args[:1] == ["--"] else options.args
+        command.extend(["--", *args])
+    return run(command)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None

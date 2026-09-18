@@ -64,6 +64,6 @@ CPU requests for GPU Tasks. Detailed release and activation behavior belongs to 
 
 - [ADR-QEXP-0007](0007-cpu-only-lane-isolation.md)
 - [CPU lane compatibility contract](../../spec/qexp_cpu_lane_compatibility.md)
-- [Compatibility governance](../../spec/compatibility-governance.md)
+- [Compatibility governance](../../development/compatibility-governance.md)
 - [Compatibility registry](../../spec/compatibility-registry.toml)
 - [CPU-only Task Lane pitch](../../pitch/arxiv/053-qexp-cpu-only-task-scheduling.md)

@@ -74,9 +74,11 @@ recovery, offline/live-client refusal and no dispatch during preparation. Verify
 context isolation across processes/roots and no periodic gate reads after validation. Check
 the release-specific legacy removal and final purge without removing permanent gates.
 
-**假设/未验证**：依赖协议激活、嵌套副本清单、双协议协调与旧二进制拒绝尚未实现或验证。
+**Assumption / Unverified:** Dependency protocol activation, the inventory of nested
+replicas, dual-protocol coordination, and rejection of old binaries have not yet been
+implemented or verified.
 
 ## References
 
-- [Compatibility governance](compatibility-governance.md)
+- [Compatibility governance](../development/compatibility-governance.md)
 - [CPU lane rollout decision](../adr/qexp/0009-staged-cpu-lane-rollout.md)

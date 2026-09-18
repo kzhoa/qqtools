@@ -20,7 +20,7 @@ data = ["matplotlib", "pandas"]
 std = ["lmdb", "tqdm", "requests"]
 plugins = ["rich", "scikit-learn", "prompt_toolkit"]
 exp = ["libtmux>=0.62.0", "psutil", "nvidia-ml-py"]
-dev = ["tox", "pytest", "ruff", "build"]
+dev = ["tox==4.61.5", "tox-uv==1.36.0", "uv==0.12.16", "pytest", "ruff", "build"]
 # GitHub Dev Preflight dependency surface. Keep this explicit rather than
 # inheriting `full`: CI needs LMDB/metrics/qcgen/qexp lifecycle coverage and
 # pytest-xdist's hook specification for the lifecycle gate, but it does not need
@@ -32,7 +32,9 @@ ci-preflight = [
     "scikit-learn",
     "prompt_toolkit",
     "libtmux>=0.62.0",
-    "tox",
+    "tox==4.61.5",
+    "tox-uv==1.36.0",
+    "uv==0.12.16",
     "pytest",
     "pytest-xdist",
     "ruff",
@@ -75,6 +77,7 @@ version = { attr = "qqtools.version.__version__" }
 
 # === dev settings ===
 [tool.ruff]
+extend-include = ["scripts/dev"]
 line-length = 120
 target-version = "py311"
 src = ["src"]

@@ -187,8 +187,10 @@ on legacy/preparing roots direct operators to use 1.3.15 and the same commands t
 canonical roots need no upgrade command. Release cleanup includes parser entries and command
 fixtures as well as the underlying decoder and journal recovery implementation.
 
-**假设/未验证**：旧版本及已运行进程的门禁覆盖、完整嵌套记录清单、升级入口覆盖和跨机器
-排空确认尚未实现或验证；必须通过实现阶段的故障注入验收后才能宣称安全过渡。
+**Assumption / Unverified:** Gate coverage for old versions and already-running processes,
+a complete inventory of nested records, coverage of upgrade entry points, and cross-machine
+drain confirmation have not yet been implemented or verified. Fault-injection acceptance
+tests during implementation must pass before the transition can be claimed to be safe.
 
 ## Release verification
 
@@ -219,5 +221,5 @@ CPU transition coverage.
 ## References
 
 - [ADR-QEXP-0008](../adr/qexp/0008-cpu-lane-schema6-compatibility.md)
-- [Compatibility governance](compatibility-governance.md)
+- [Compatibility governance](../development/compatibility-governance.md)
 - [CPU-only Task Lane pitch](../pitch/arxiv/053-qexp-cpu-only-task-scheduling.md)

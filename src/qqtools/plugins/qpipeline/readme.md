@@ -1,30 +1,20 @@
+# qpipeline
 
-# general position
+qpipeline builds training and evaluation workflows on top of the project's torch
+utilities. For configuration fields and optimizer-step semantics, see the
+[configuration guide](../../../../docs/qConfig_en.md). For evaluation data
+structures and multi-loader migration, see the
+[structured evaluation spec](../../../../docs/spec/qpipeline-multi-eval-loader-upgrade.md).
 
-`.pipeline` 是 `.torch` 的 消费者。
+## Command-line arguments
 
+Load a configuration with `python train.py --config /path/to/config.yml` and
+`prepare_cmd_args()`. A `patch` callback can register additional parser arguments:
 
-# cmd_args
-
-标准args通过 `python xx.py --config /path/to/config.yml`的方式，指定config文件。
-在py文件中通过这个函数加载config文件中的内容。
-`args = prepare_cmd_args()`
-
-若是希望通过 cmd line 自定义更多其它参数，可以通过 `patch` 回调向基础 parser 注册额外参数。
-此外，未被显式 parser 消费的 dotted CLI 参数会作为配置树覆盖项处理，例如
-`--task.dataloader.eval_batch_size 32`。
-
-覆盖规则：
-
-- 显式 parser 参数和 `patch` 注册参数优先被 `argparse` 正常消费
-- 未消费的 `--a.b.c value` / `--a.b.c=value` 会在 YAML 加载后写入最终 `args`
-- dotted override 优先级最高，高于 YAML 和基础显式参数合并结果
-- flag-only 形式 `--a.b.c` 只允许用于布尔安全目标
-- 负值或以 `-` 开头的值必须使用等号形式，例如 `--task.threshold=-0.5`
-
-example:
 ```python
-from qqtools.pipeline import prepare_cmd_args
+import argparse
+
+from qqtools.plugins.qpipeline import prepare_cmd_args
 
 
 def patch(parser: argparse.ArgumentParser):
@@ -36,7 +26,13 @@ args = prepare_cmd_args(patch=patch)
 file = args.file
 ```
 
-example:
+Explicit parser arguments, including those registered by `patch`, are consumed
+by argparse first. Remaining dotted options such as `--a.b.c value` or
+`--a.b.c=value` override the configuration after YAML and explicit arguments are
+merged. Dotted overrides have the highest precedence. Flag-only dotted options
+are allowed only for boolean-safe targets. Values beginning with `-` must use
+`=`, for example `--task.threshold=-0.5`.
+
 ```bash
 python train.py \
   --config configs/train.yaml \
@@ -45,34 +41,125 @@ python train.py \
   --runner.fast_dev_run
 ```
 
-## DDP eval dedup
+## Pipeline initialization and caches
 
-`runner.ddp_eval_dedup` is only meant for DDP eval/infer cases where the sampler or qPipeline
-execution view pads repeated logical samples to keep per-rank step counts aligned. qPipeline
-creates that view automatically for a one-step tail mismatch without changing the user loader.
-Synthetic occurrences are removed before metrics and outputs are gathered.
+Pass prepared task and model instances, or subclass `qPipeline` and implement
+`prepare_task(args)` and `prepare_model(args)`:
 
-It is not a general-purpose dedup mechanism. If a sampler intentionally repeats the same logical
-sample as part of its designed semantics, this deduper does not guarantee that those repeated
-occurrences will be preserved as distinct outputs.
-When deduplication is disabled, mismatched rank step counts fail before forward. Automatic
-padding requires an observable map-style sampler or batch sampler whose indices are stable sample
-identities; unsupported custom loaders fail with a diagnostic instead of entering a collective.
+```python
+from qqtools.plugins.qpipeline import qPipeline
 
 
-# trainPipeline
+# prepare_model and prepare_task are application-defined functions.
+pipe = qPipeline(args, mode="train", task=prepare_task(args), model=prepare_model(args))
 
-## Training metrics JSONL
 
-When logging is enabled, qpipeline writes `metrics.jsonl`. Every line is an independent JSON event:
-`train_batch`, `evaluation`, or `checkpoint_saved`. Evaluation records preserve the complete
-model → stage → loader hierarchy and each stage's task-derived score, so multi-loader metrics do
-not rely on ambiguous flattened column names.
+class MyPipeline(qPipeline):
+    prepare_model = staticmethod(prepare_model)
+    prepare_task = staticmethod(prepare_task)
+
+
+pipe = MyPipeline(args, mode="train")
+```
+
+Both preparation methods receive the configuration arguments. The pipeline
+places the model on the configured device and invokes `task.to(args.device)`
+when the task implements that optional method.
+
+`pipe.regist_extra_ckp_caches({"key": value})` adds run-wide information to
+checkpoints. `pipe.regist_middleware(callback)` invokes a callback with the
+pipeline; it also accepts a list or tuple of callbacks.
+
+## Training logs and metrics
+
+Run termination, evaluation, and epoch completion are distinct events. They may
+refer to the same metrics without representing the same boundary.
+
+### Structured metrics JSONL
+
+On rank zero, enabled metrics logging writes `metrics.jsonl` under the runner's
+save directory. Each line is an independent `train_batch`, `evaluation`, or
+successful `checkpoint_saved` event. `log_granularity` selects evaluation and/or
+batch records; evaluation logging is enabled by default. If metrics logging is
+disabled, absence of a JSONL record does not prove an evaluation did not occur.
+
+For machine consumption, use the structured `evaluation` records when enabled
+rather than scraping display tables. They include `epoch`, `global_step`, and
+an `evaluation` tree preserving model, stage, and loader identities and stage
+scores. The [structured evaluation spec](../../../../docs/spec/qpipeline-multi-eval-loader-upgrade.md)
+defines that data model and target selection. CSV metrics logging is no longer
+supported.
+
+### Readable evaluation and checkpoint output
+
+The current display uses `[Evaluation]` for the control summary and
+`[Evaluation Metrics]` for the metric table. The summary includes epoch, step,
+learning rate (`n/a` when unavailable), the target, and available best-model
+state. A new best includes its delta and a `Checkpoint: best requested` marker.
+That marker is a request, not proof that a checkpoint was saved; successful
+saves produce a separate `[Checkpoint Saved]` INFO record and, when enabled,
+a `checkpoint_saved` JSONL event.
+
+The metric table contains available `train:interval` metrics, stage scores, and
+per-loader metrics, including EMA variants. Older `[Eval Summary]` and
+`[Eval Summary Table]` examples do not describe the current display.
+
+Periodic evaluation uses `eval_interval` in epochs for `run_mode=epoch` and
+completed optimizer updates for `run_mode=step`. Step mode can evaluate several
+times within one epoch. Completion actions can also request evaluation at the
+final successful boundary; see [training completion actions](#training-completion-actions).
+If the runner detects NaN training loss before a selected evaluation, it fails
+with `nan_detected` instead of executing that evaluation.
+
+### Epoch result summaries
+
+A committed epoch emits `--- Epoch N Results ---`, a `[train]` line when training
+metrics are available, and `[val]` / `[test]` lines with explicit provenance:
+
+| Source | Meaning |
+| --- | --- |
+| `current_eval` | Evaluation ran at this epoch-end boundary and produced the score |
+| `latest_eval_reuse` | The score is cached from an earlier evaluation |
+| `missing` | No corresponding score is available; the value is `n/a` |
+
+The distinction concerns the epoch-end boundary, not whether evaluation ran
+somewhere earlier in the same epoch. A mid-epoch evaluation can therefore be
+followed by an epoch summary marked `latest_eval_reuse`. An epoch summary is
+not evidence of a new evaluation.
+
+Evaluation at an epoch-end boundary precedes the epoch result summary. Reaching
+`max_steps` mid-epoch can terminate training without an epoch summary. Epoch
+numbers are zero-based internal counters; the committed summary identifies the
+epoch just completed.
+
+### Run terminal events
+
+The outer `train_runner` boundary classifies managed run termination and emits
+one terminal record on that path:
+
+| Status | Reasons |
+| --- | --- |
+| `finished` | `max_steps`, `max_epochs`, `early_stop` |
+| `stopped` | `user_interrupt` |
+| `failed` | `oom`, `exception`, `nan_detected`, `logger_failure` |
+
+Readable text has the form `Training <status>: reason=<reason>`. Normal returned
+results include `terminal_event` with `status`, `reason`, `text`, `epoch`, and
+`step`; when an exception is attached, it includes `exception_type`. The
+`early_stopped` result is true only for `early_stop`, not interruption or other
+termination reasons. Exception paths may emit the event and then re-raise,
+so they do not necessarily return a result dictionary.
+
+The terminal payload does not include the original exception message or
+traceback; other error logging can include diagnostic information. A hard
+process kill or failure before the managed run boundary does not guarantee a
+terminal record. These records describe the training run, not qexp Task/Attempt
+authority, and are not terminal events in the metrics JSONL stream.
 
 ## Training completion actions
 
-`runner.completion` can request normal final-boundary work when a successful training conclusion
-does not match the periodic intervals:
+`runner.completion` can request normal final-boundary work when a successful
+training conclusion does not match the periodic intervals:
 
 ```yaml
 runner:
@@ -81,383 +168,176 @@ runner:
     save: true
 ```
 
-Both values default to `false`. `eval` performs the normal evaluation flow (including validation
-listeners and best-model tracking); `save` writes a normal regular checkpoint, not a weights-only
-or best-checkpoint export. Actions run only after a processed boundary that finishes through a
-limit or early stop, and do not run after interruption, NaN detection, or an exception.
+Both values default to `false`. `eval` performs the normal evaluation flow,
+including validation listeners and best-model tracking. `save` writes a normal
+regular checkpoint, not a weights-only or best-checkpoint export. Actions run
+only after a processed boundary that finishes through a limit or early stop;
+they do not run after interruption, NaN detection, or an exception.
 
+## Tasks and metric aggregation
 
+A task connects dataset and model behavior through runner-defined interfaces.
+Subclass `qTaskBase`, call its initializer, and prepare `train_loader`,
+`val_loader`, and `test_loader`. Validation and test loaders may be `None`, one
+DataLoader, or a non-empty mapping of names to DataLoaders, as described in the
+structured evaluation spec.
 
-## pipeline init
-有两种init方式。
-
-第一种直接传入实例化的task和model。
-
-```python
-model = prepare_model(args)
-task = prepare_task(args)
-pipe = QPipeline(args, mode="train", task=task, model=model)
-```
-
-
-
-在每个训练脚本里面继承，
-子类只需要实现prepare_task和prepare_model方法。
+Required methods are `batch_forward`, `batch_metric`, `batch_loss`, and
+`post_metrics_to_value`:
 
 ```python
-class MyPipeline(QPipeline):
-    @staticmethod
-    def prepare_task(args):
-        pass
+from collections.abc import Mapping
+from typing import Any
 
-    @staticmethod
-    def prepare_model(args):
-        pass
-
-
-# or
-
-
-class MyPipeline(QPipeline):
-    prepare_model = staticmethod(prepare_model)
-    prepare_task = staticmethod(prepare_task)
-
-
-pipe = MyPipeline(args, mode="train")
-```
-
-这两个方法只接受一个标准args入参 （后面会解释为什么是标准args）
-其中model就是我们理解的model。
-需要在这里完成model.to(device)操作。
-task见下一节。
-
-
-## pipeline cache
-
-```python
-def regist_extra_ckp_caches(self, caches: dict):
-```
-接受传入一个字典，保存本次任务的全局信息。
-这个字典中的内容会存入每个checkpoint文件中。
-使用：
-`pipe.regist_extra_ckp_caches({'a':1})`
-
-
-
-
-# pipeline 可以自定义覆盖的地方
-
-### 自定义optimizer
- 一个常见需求是。
- 对不同的参数用不同的lr或者weightdecay。
-
-
-# No Weight Decay 自动发现
-
-qpipeline 支持通过约定方法自动发现哪些参数应该免除 weight decay。
-当 `optim.optimizer_params.weight_decay > 0` 时，框架会递归遍历模型的 module tree，
-根据约定方法将参数自动拆分为两个 optimizer param group：正常衰减组 + 免除衰减组。
-
-## 约定方法
-
-在 `nn.Module` 子类上实现以下方法之一（返回值 `List[str]`）：
-
-### `no_decay() -> List[str]`
-
-返回当前模块中不需要 weight decay 的**局部参数名**列表。
-框架会**继续递归**遍历子模块。
-
-```python
-class MyLayerNorm(nn.LayerNorm):
-    def no_decay(self) -> List[str]:
-        return ["weight", "bias"]
-
-
-class MyBlock(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.pos_embed = nn.Parameter(torch.randn(1, 64, 128))
-        self.norm = MyLayerNorm(128)
-        self.linear = nn.Linear(128, 128)
-
-    def no_decay(self) -> List[str]:
-        return ["pos_embed"]
-```
-
-上例中，`pos_embed` 由 `MyBlock.no_decay()` 声明免除，
-`norm.weight` 和 `norm.bias` 由 `MyLayerNorm.no_decay()` 声明免除。
-框架在收集 `MyBlock` 的声明后，仍会递归进入 `self.norm`、`self.linear` 检查。
-
-### `no_decay_deep() -> List[str]`
-
-返回不需要 weight decay 的参数名列表（支持带点的子路径）。
-框架遇到此方法后**停止递归**——该模块对其整个子树的 no-decay 声明负全责。
-
-```python
-class PretrainedBackbone(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.cls_token = nn.Parameter(torch.randn(1, 1, 768))
-        self.pos_embed = nn.Parameter(torch.randn(1, 197, 768))
-        self.blocks = nn.ModuleList([...])
-
-    def no_decay_deep(self) -> List[str]:
-        return [
-            "cls_token",
-            "pos_embed",
-            "blocks.0.norm1.weight",
-            "blocks.0.norm1.bias",
-            # ... 对整个子树的完整声明
-        ]
-```
-
-## 行为规则
-
-- 若同一模块同时实现 `no_decay_deep` 和 `no_decay`，仅 `no_decay_deep` 生效
-- 当 `weight_decay=0` 时，整个发现机制不执行（no-op）
-- 冻结参数（`requires_grad=False`）不会进入任何 optimizer group
-- 返回的参数名不存在于实际模型参数中时，触发 warning 并跳过
-- 最终产生两个 param group，共享 lr、betas 等所有超参，仅 `weight_decay` 不同：
-  - Group 0: `weight_decay = 配置值`
-  - Group 1: `weight_decay = 0.0`
-- 若所有参数都不声明 no_decay，则维持单 param group（与未实现约定方法等价）
-
-
-
-
-# task
-
-task的设计概念，能同时看到dataset实现和model实现的胶水层。
-但同时又看不到runner细节，只知道根据约定实现runner需要的某些接口，
-是夹在中间的这么一个单位。
-
-
-task需要继承qTaskBase，
-
-实现 `__init__` 方法，在初始化过程中，准备3个dataloader赋予自身。
-    - self.train_loader
-    - self.val_loader
-    - self.test_loader  (optional, can be None)
-
-并实现 
-- batch_forward
-- batch_metric
-- batch_loss
-- post_metric_to_err方法。
-
-```python
-from qqtools.pipeline import qTaskBase
+from qqtools.plugins.qpipeline import Stage, qTaskBase
 
 
 class MyTask(qTaskBase):
-    def __init__(self, args):
+    def __init__(self, train_loader, val_loader=None, test_loader=None):
         super().__init__()
-        self.train_loader = None
-        self.val_loader = None
-        self.test_loader = None
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
 
-    def batch_forward(self, model, batch_data) -> Dict[str, Tensor]:
-        """
-        Returns:
-            out (dict): dict-like
-        """
-        pass
+    def batch_forward(self, model, batch_data):
+        # Return the model output mapping for this application's data.
+        raise NotImplementedError
 
-    def batch_metric(self, out, batch_data) -> Dict[str, Tuple[Tensor, int]]:
-        """
-        Returns:
-            dict:  `{ 'metric_name': (metric_value, sample_count) }`
-        """
-        pass
+    def batch_metric(self, out, batch_data):
+        # Return {metric_name: (metric_value, sample_count)}.
+        raise NotImplementedError
 
-    def batch_loss(self, out, batch_data) -> Dict[str, Tuple[Tensor, int]]:
-        """
-        Returns:
-            dict:  `{ 'loss': (loss_value, sample_count) }`
-        """
-        pass
+    def batch_loss(self, out, batch_data):
+        # Return {"loss": (loss_value, sample_count)}.
+        raise NotImplementedError
 
-    def post_metric_to_err(self, result) -> float:
-        """
-        In cases where multiple metrics are available, the error metric must be prioritized
-        to identify the optimal validation performance.
-
-        Args:
-            result: Dict[metric_name, metric_avg]
-
-        Returns:
-            float: The performance error value.
-        """
-        pass
+    def post_metrics_to_value(self, result: Mapping[str, Any], *, stage: Stage) -> float:
+        # This example assumes one unnamed evaluation loader producing "mae".
+        if stage in (Stage.VAL, Stage.TEST):
+            return result["mae"]
+        return result["loss"]
 ```
 
+### Metric hook signature
 
-task 为了适应不同的模型，
-允许添加optional function
-- pre_batch_forward(batch_data)  处理batch数据格式
-- post_batch_forward(output, batch_data)  处理模型输出
+`Stage` is the shared enum with `TRAIN`, `VAL`, and `TEST` values. The hook receives
+the stage's metric mapping and returns its task-derived score, separately from
+raw loader metrics. Named loaders supply nested mappings; consult the structured
+evaluation spec for aggregation examples.
 
+The framework binds `post_metrics_to_value` by parameter name once during runner
+initialization, before training or evaluation. `result` is required; `stage` is
+optional. A hook declared as `post_metrics_to_value(self, result)` remains
+supported. Rename parameter aliases such as `metrics` to `result`.
 
+When declared, `stage` may be positional-or-keyword or keyword-only and may appear
+before or after `result`. The only accepted parameter names are `result` and
+`stage`; parameters must be explicit. Unknown names, positional-only parameters,
+`*args`, and `**kwargs` are rejected. Runtime calls reuse the bound resolver
+without inspecting the signature again.
 
-这些操作可以统一成pipeline的middleware
-- pipeline.regist_middleware()
-- `def middileware(pipe):` 这里可以对task做任意修改。  
+The public hook contract is `-> float`. For `Stage.TEST`, returning `None` omits
+the stage score while retaining raw test metrics.
 
+`evaluate_runner(...)` and `qPipeline.evaluate_once(...)` accept keyword-only
+`stage: Stage = Stage.TEST` and return an `EvaluationResult` for successful
+evaluation. For example, `pipeline.evaluate_once(stage=Stage.VAL)` selects
+validation semantics. These are single-loader actions: pass a selected loader
+explicitly when the task's test loaders are a mapping.
 
-## Task Runner的生命周期
+### Batch and task lifecycle
 
+The runner moves batch data to the device, applies `pre_batch_forward`, calls
+`batch_forward`, then applies `post_batch_forward`. It collects metrics and,
+when training, loss. Aggregated metrics feed `post_metrics_to_value`; resulting
+stage scores drive the configured checkpoint, scheduler, and early-stop targets.
+Override the pre/post methods when the application needs input or output adaptation.
 
+Supported task lifecycle hooks are declared on `qTaskBase`, listed in
+`OPTIONAL_METHODS`, and use fixed typed contexts:
 
-```bash
-┌───────────────────────────────────────────────────────┐
-│          pre_batch_forward(batch_data) -> batch_data  │
-└───────────────────────┬───────────────────────────────┘
-                        │
-                        ↓
-┌───────────────────────────────────────────────────────┐
-│         batch_forward(batch_data) -> batch_out        │
-└───────────────────────┬───────────────────────────────┘
-                        │
-                        ↓
-┌────────────────────────────────────────────────────────┐
-│ post_batch_forward(batch_out, batch_data) -> batch_out │
-└───────────────────────┬────────────────────────────────┘
-                        │
-           ┌────────────┴────────────────────────────────┐
-           │                                             │
-           v                                             v
-┌────────────────────────────────────┐ ┌──────────────────────────────────┐
-│batch_metric(batch_out, batch_data) │ │batch_loss(batch_out, batch_data) │
-│-> batch_metrics                    │ │-> loss (if training)             │
-└──────────┬─────────────────────────┘ └───────────────┬──────────────────┘
-           │                                           │
-           │                                           │
-           └──────────────────┬────────────────────────┘
-                              │  
-                              v
-┌────────────────────────────────────────────────────────────────┐
-│   gather_all_batch_metrics  -> (epoch_metrics, epoch_loss_avg) │
-└─────────────────────────────┬──────────────────────────────────┘        
-                              │       
-                              v
-┌──────────────────────────────────────────────────────────────┐
-│       post_metric_to_err(epoch_metrics)-> err: float         │
-└──────────────────────────────────────────────────────────────┘
-```
+| Hook | Context | Available fields |
+| --- | --- | --- |
+| `on_epoch_start` | `TaskEpochStartContext` | `epoch`, `global_step`, `total_batches` |
+| `on_train_batch_end` | `TaskTrainBoundaryContext` | `epoch`, `global_step`, `batch_index`, `total_batches`, `did_optimizer_step`, `lr`, `batch_metrics` |
+| `on_validation_end` | `TaskValidationContext` | `epoch`, `global_step`, `evaluation`, `is_best`, `previous_best`, `lr` |
+| `on_epoch_end` | `TaskEpochEndContext` | `completed_epoch`, `global_step`, `epoch_metrics` |
+| `on_early_stop` | `StopCommittedFact` | `source`, `message`, `epoch`, `global_step` |
 
-- 约定batch_data需要支持 `.to(device)` 方法，runner会自动调用
-- post_metric_to_err 输出一个float，用来作为validation metric，挑选best model，以及控制early stop逻辑。
+Signatures use `def on_hook(self, context: ContextType) -> None`. Contexts are
+frozen typed snapshots with read-only metric mappings. They do not expose the
+runner, `RunningState`, or a generic signal. The early-stop hook observes an
+already-committed stop decision.
 
+Task hooks may observe context and perform task-owned boundary work, but cannot
+rewrite the main loop, request checkpoints, or register dynamic events. Methods
+outside the declared lifecycle surface are not supported lifecycle hooks.
 
-## task的可选方法
-如果task 实现了`.to(device)` 方法,pipeline会在prepare_task后调用
+## Runner extension boundaries
 
-# Task lifecycle hooks
+Task lifecycle listeners react within uncommitted boundaries without controlling
+training. Observers consume committed facts. `RunnerHooks` provides single-slot
+lifecycle capabilities frozen during runner composition. These contracts are
+distinct; registration, removal, or replacement is not allowed during a run.
 
-除了必须实现的方法外，`qTaskBase` 还支持少量显式声明的 task 生命周期 hook。
-这些 hook:
+The standard `CheckpointPlugin` occupies `after_validation`, `boundary_cursor`,
+and `after_epoch_commit`. It calls `CheckpointManager`, writes `best_ckp_file`,
+and projects checkpoint text/JSONL records. `RunningAgent` does not receive
+checkpoint paths and has no command handler or checkpoint-saved notification.
+DDP validates that all ranks have identical frozen hook plans before training.
 
-- 必须声明在 `qTaskBase`
-- 必须列在 `OPTIONAL_METHODS`
-- 必须使用固定 typed context 签名：
-  - `on_epoch_start(self, context: TaskEpochStartContext) -> None`
-  - `on_train_batch_end(self, context: TaskTrainBoundaryContext) -> None`
-  - `on_validation_end(self, context: TaskValidationContext) -> None`
-  - `on_epoch_end(self, context: TaskEpochEndContext) -> None`
-  - `on_early_stop(self, context: StopCommittedFact) -> None`
+## DDP evaluation deduplication
 
-目前支持的 task 生命周期 hook:
+`runner.ddp_eval_dedup` handles DDP eval/infer padding that repeats logical samples
+to align per-rank step counts. qPipeline automatically creates an execution view
+for a one-step tail mismatch without changing the user's loader. Synthetic
+occurrences are removed before gathering metrics and outputs.
 
-- `on_epoch_start`
-- `on_epoch_end`
-- `on_train_batch_end`
-- `on_validation_end`
-- `on_early_stop`
+This is not general-purpose deduplication. Intentional sampler repetition is not
+guaranteed to survive as distinct outputs. With deduplication disabled, mismatched
+rank step counts fail before forward. Automatic padding requires an observable
+map-style sampler or batch sampler with stable sample identities; unsupported
+custom loaders fail diagnostically rather than entering a collective.
 
-这些 hook 会在 runner 的对应生命周期边界同步调用。
-未列入 `qTaskBase` / `OPTIONAL_METHODS` 的生命周期方法，不属于官方支持面。
+## Automatic weight-decay exclusions
 
-context 读取约定：
+When `optim.optimizer_params.weight_decay > 0`, optimizer preparation traverses
+the model to discover parameters excluded from weight decay. Implement one of
+these methods on an `nn.Module`:
 
-- context 是冻结的 typed snapshot，只提供该 hook 声明的字段；不暴露 `runner`、
-  `RunningState` 或通用 `signal`。
-- `on_epoch_start` 接收 `epoch`、`global_step`、`total_batches`。
-- `on_train_batch_end` 接收 `epoch`、`global_step`、`batch_index`、`total_batches`、
-  `did_optimizer_step`、`lr` 和只读的 `batch_metrics`。
-- `on_validation_end` 接收 `epoch`、`global_step`、`evaluation`、`is_best`、
-  `previous_best` 和 `lr`。
-- `on_epoch_end` 接收 `completed_epoch`、`global_step` 和只读的 `epoch_metrics`。
-- `on_early_stop` 在停止决定已提交后接收 `source`、`message`、`epoch` 和 `global_step`。
-- task 生命周期 hook 只能观察这些上下文或执行 task 自身的边界操作，不能回写主循环、
-  请求 checkpoint 或注册动态事件。checkpoint 及其他 runner 扩展能力必须在 runner
-  组合期通过对应的显式 hook contract 配置。
-
-# qstd Args
-
-根据约定的一组args。
-
-接受`qTrainSchema.json`校验。
-
-保留关键字：
-- `$BASE` 负责继承其它配置文件。
-- log_dir 所有日志、ckp、metric的存储路径。
-- ckp_file 指定模型ckp文件。 
-
-
-
-# RunAgent 与 logger类
-
-runner 扩展分为三个不能混用的契约：任务生命周期 listener 在未提交边界内反应但不能控制训练；observer
-只消费已提交事实；`RunnerHooks` 是 runner 组装阶段冻结的单槽生命周期能力。运行期间不能注册、删除或替换
-这些扩展点。
-
-checkpoint 是标准 `CheckpointPlugin`，在组合时占用 `after_validation`、`boundary_cursor` 与
-`after_epoch_commit` 三个 hook。插件自行调用 `CheckpointManager`、写入 `best_ckp_file` 并投影 checkpoint
-日志/JSONL；`RunningAgent` 不接收 checkpoint 路径，也没有 command handler 或 checkpoint-saved notification。
-DDP 运行会在训练开始前验证所有 rank 的冻结 hook 计划一致。
-
-
-
-
-
-# ddp remarks
+- `no_decay() -> List[str]`: local parameter names; traversal continues into children.
+- `no_decay_deep() -> List[str]`: names including dotted descendant paths; traversal
+  stops at this module, which owns the declaration for its entire subtree.
 
 ```python
-# torch/nn/parallel/distributed.py
-# self._pre_forward(*inputs, **kwargs)
-# moved_inputs, moved_kwargs = _to_kwargs(
+from typing import List
 
+from torch import nn
+
+
+class MyLayerNorm(nn.LayerNorm):
+    def no_decay(self) -> List[str]:
+        return ["weight", "bias"]
 ```
 
+For a backbone, `no_decay_deep()` might return `['cls_token', 'pos_embed',
+'blocks.0.norm1.weight', 'blocks.0.norm1.bias']`; the list must cover its intended
+subtree exclusions. If both methods exist, only `no_decay_deep` applies.
 
-# EMA support
+Discovery is a no-op when weight decay is zero. Frozen parameters are excluded
+from optimizer groups, and unknown parameter names warn and are skipped. When
+exclusions exist, the regular and exempt groups share other optimizer settings
+but use configured weight decay and zero respectively. Without exclusions, the
+optimizer retains a single group.
 
-TODO
-qt.recover  add  
-try_ema = True, 
+## Configuration and unfinished design notes
 
+`$BASE` inherits configuration files; `log_dir` selects the logs, checkpoints,
+and metrics location; `ckp_file` selects a checkpoint. See the configuration guide
+for supported fields and dtype/EMA settings. Applications needing custom batch
+dtype conversion can perform it in `pre_batch_forward`.
 
-
-# 单双精度支持
-
-自动读取 `args.model.dtype`
-> assert args.model.dtype in ['float32', 'float64']
-
-- 自动 model.to(dtype)
-- 约定 batch_data 支持 `to_dtype(target)` 方法
-- 如果 batch_data不支持 `to_dtype`，可以在 `task.pre_batch_forward(batch_data)` 中处理dtype。
-
-
-
-
-
-# 多阶段 Optim
-
-Demand:
->stage 1 用一组超参 比如控制lr
-> stage 2 换一组超参，weight 甚至换optim。
-需要提供修改optim的接口。
-
->还有一个问题，如果要修改的stage2的超参是task wise的
-怎么跟task约定接口？
-task的实现者需要知道什么？
+The earlier README's EMA recovery and multi-stage optimizer sections were design
+notes, not complete usage contracts. Changing optimizer hyperparameters or the
+optimizer itself between stages, including task-specific stage settings, still
+requires a concrete application design; those notes do not define a public API.

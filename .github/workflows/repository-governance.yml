@@ -136,8 +136,8 @@ jobs:
             squash_subject="promote $BRANCH"
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "qq"
+          git config user.email "qq@x1q.cc"
           commit_sha="$(printf '%s\n\nPromoted-from: %s\n' "$squash_subject" "$BRANCH" | git commit-tree "$tree_sha" -p "$dev_sha")"
 
           echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"

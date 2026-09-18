@@ -7,157 +7,128 @@
 
 # AGENTS.md
 
-This file is the stable execution contract for coding agents and repository automation working on qqtools. It intentionally contains repository-level rules, not private design exploration or implementation journals.
+This file defines the shared execution contract for agents working on qqtools.
+Linked guides provide scenario-specific procedures. Private configuration may
+supplement collaboration preferences but must not override public contracts or
+gates. Public development, validation, and release must not depend on ignored
+or private documents.
 
-## Authority
+Read `.codex/AGENTS.md` for supplemental personal preferences if it exists.
 
-- These rules apply to human-assisted and autonomous coding agents working in this repository.
-- Public repository correctness must not depend on ignored, local-only, or private planning documents.
-- Private planning material may inform an owner decision, but once implementation starts, the feature branch itself must contain enough non-sensitive execution context for an agent to continue the work.
+## Engineering boundaries
+
+- Inspect relevant code, tests, and specifications before editing. Preserve
+  unrelated work, keep changes scoped, and report material assumptions.
+- Keep affected public contracts and documentation aligned with behavior.
+  Private planning templates are not required public deliverables.
+- Use standard tools to manage project environments and caches. Do not modify
+  shared/system environments, dependency implementations, or unrelated external
+  files unless the task explicitly requires it.
+
+## Scenario navigation
+
+Read the applicable guide; do not load every reference for every task.
+
+| Scenario | Reference |
+| --- | --- |
+| Implementation and code review | [Code style](docs/development/code-style.md) |
+| Commits, feature state, promotion, release | [Development workflow](docs/development/development-workflow.md) |
+| Environment setup, dependencies, tool maintenance | [Developer tooling](docs/development/developer-tooling.md) |
+| Writing or moving documentation | [Documentation guide](docs/development/documentation-guide.md) |
+| Test selection, isolation, execution, evidence | [Test governance](docs/development/test-governance.md) |
+| Temporary compatibility, persisted formats, upgrades | [Compatibility governance](docs/development/compatibility-governance.md) |
+| Protected files, workflow changes, owner credentials | [Repository governance](docs/development/repository-governance.md) |
 
 ## Branch model
 
-The canonical development flow is:
+The normal route uses `feat/*` or `feature/*` based on current `dev` for substantial changes.
+Promote features to `dev` by squash, then `dev` to `main` by validated
+fast-forward. `main` must remain an ancestor of `dev`. Never merge a feature
+directly into `main` or force-push either public branch as part of promotion.
+Pull requests are optional for owner-driven development.
 
-```text
-feat/* or feature/*
-        |
-        | squash promotion
-        v
-       dev
-        |
-        | validated fast-forward promotion
-        v
-       main
-```
-
-- `main` is the stable branch.
-- `dev` is the persistent integration branch.
-- Substantial changes must be developed on disposable `feat/*` or `feature/*` branches based on the latest `dev`.
-- Pull requests are optional and are not required for owner-driven development.
-- Do not promote a feature branch if it is behind `dev`; rebase or otherwise rebuild it on the current `dev` first.
-- Do not merge a feature branch directly into `main`.
-- `main` must remain an ancestor of `dev`. Release promotion advances `main` to an already validated `dev` commit without creating a second squash commit.
+The owner may explicitly choose an [administrator manual release](.github/publish.md)
+instead of the normal promotion route below. This exception permits a directly
+prepared release and dev reconciliation, but preserves validation gates,
+public-history integrity, `.dev/**` exclusion, and `main` ancestry in `dev`.
 
 ## Feature-local agent state
 
-A feature branch may contain `.dev/**` for temporary execution state, including `.dev/work-item.md`.
-
-Recommended `.dev/work-item.md` sections are:
-
-- Goal
-- Scope
-- Invariants
-- Acceptance criteria
-- Current state
-- Known blockers
-- Next actions
-
-Rules:
-
-- `.dev/**` is disposable and may be visible while the public feature branch exists. Never place secrets, private pitch content, unpublished roadmap material, credentials, or other sensitive information there.
-- `.dev/**` must never enter `dev` or `main`.
-- Promotion must automatically strip `.dev/**` before constructing the squash commit.
-- `dev` and `main` CI must fail if `.dev/**` is present.
+Optional `.dev/**` holds disposable, non-sensitive feature execution context.
+Never put secrets or private planning content there. Promotion must strip it;
+CI must reject its presence on `dev` and `main`. The feature must remain
+understandable without private documents.
 
 ## Feature promotion
 
-Promotion is a repository operation, not an ordinary merge.
-
-A conforming promotion must:
-
-1. verify the feature branch contains the current `dev` head;
-2. validate repository-governance invariants;
-3. build the feature tree with `.dev/**` removed;
-4. run the configured preflight against that promotion candidate before changing `dev`;
-5. create one squash commit whose parent is the current `dev` head;
-6. advance `dev` to that commit;
-7. delete the disposable feature branch only after the successful push; and
-8. allow the `dev` push to trigger `Dev Preflight` again as post-promotion verification.
-
-The repository governance workflow may use a final feature-branch commit whose subject starts with `promote:` as the promotion request. Do not use that convention until the feature is ready to integrate.
+Before changing `dev`, the feature must contain current `dev`, and the candidate
+tree with `.dev/**` removed must pass governance and complete preflight.
+Create one squash commit with current `dev` as parent; delete the feature only
+after a successful push. Dev Preflight then verifies the promoted commit.
+Reserve `promote:` commit subjects for ready-to-integrate promotion requests.
 
 ## Dev release promotion
 
-Promotion from `dev` to `main` publishes an already validated commit; it does not create another squash commit.
-
-A conforming release promotion must:
-
-1. be explicitly dispatched from the current `dev` ref;
-2. run repository preflight and installed-artifact E2E against that exact `dev` commit;
-3. abort if `dev` advances while those gates run;
-4. verify the current `main` is an ancestor of the validated `dev` commit;
-5. update `main` by fast-forward only; and
-6. rely on the `main` push workflows for post-promotion verification.
-
-The standard owner-driven command is:
-
-```bash
-gh workflow run repository-governance.yml --ref dev -f operation=promote-dev-to-main
-```
-
-Do not squash `dev` into `main`, merge `main` back into `dev` after an ordinary release, or force-push either public branch as part of this release flow. Release tags must point to commits reachable from `main`.
-
-GitHub's built-in workflow token cannot create or update `.github/workflows/**`. An explicitly approved owner workflow change must still pass the normal candidate gates, but its final feature-to-`dev` promotion and the first `dev`-to-`main` fast-forward containing that change must be performed with owner credentials. This is a credential boundary, not permission to bypass ancestry, validation, `.dev/**` stripping, or tree-equality checks.
+Dispatch from current `dev`; validate preflight and installed-artifact E2E
+against that exact commit. Abort if `dev` advances. Verify `main` ancestry and
+fast-forward it to the validated commit without another squash or merge-back.
+Main push workflows provide post-promotion verification. Release tags must
+point to commits reachable from `main`. Follow the development workflow for
+dispatch commands and owner-credential promotion of workflow changes.
 
 ## Validation
 
-Before code is treated as integrated:
+Use `./scripts/dev test [pytest arguments]` for selected tests (Unit by default),
+`./scripts/dev preflight` for the complete gate, and `./scripts/dev env` for the
+optional IDE environment. Standard tooling uses Python 3.13; full preflight
+requires Linux and system tmux. Missing prerequisites must fail, not skip coverage.
 
-- repository governance checks must pass;
-- `ruff check src tests scripts` must pass;
-- `ruff format --check src tests scripts` must pass;
-- the configured `preflight` lane must pass, except for a separately identified pre-existing baseline blocker that is explicitly being repaired; and
-- feature-specific regression tests must exist for defects discovered during implementation.
+During development, run checks appropriate to the changed behavior and report
+actual results. Add or update effective regression coverage for executable
+behavior defects fixed in the task; use applicable static checks for documents.
+Record unrelated defects without expanding scope automatically.
 
-Feature preflight is a gate before `dev` changes. Dev release preflight and installed-artifact E2E are gates before `main` changes. Post-push workflows are verification and must not be the first point at which an integration candidate is tested.
-
-Do not weaken tests, skip lifecycle coverage, or create a superficial fast lane merely to make a feature pass.
+Before integration, governance, `ruff check src tests scripts`,
+`ruff format --check src tests scripts`, and complete preflight must pass.
+Release additionally requires the configured installed-artifact gate. A known
+baseline failure may be investigated during development but does not waive a
+mandatory gate. Post-push checks never replace candidate validation.
+Do not weaken assertions, hide failures, or skip required lifecycle coverage.
 
 ## Workflow governance
 
-GitHub Actions workflows are long-lived repository infrastructure, not an ad-hoc remote shell or a temporary editing mechanism.
+Agents must not create, delete, rename, or modify any file under `.github/workflows/**` unless the repository owner has explicitly approved that workflow change in the current task.
 
-The stable workflow allowlist is:
-
-- `.github/workflows/ci.yml`
-- `.github/workflows/dev-preflight.yml`
-- `.github/workflows/publish.yml`
-- `.github/workflows/repository-governance.yml`
-
-Rules:
-
-- Agents must not create, delete, rename, or modify any file under `.github/workflows/**` unless the repository owner has explicitly approved that workflow change in the current task.
-- If the existing workflows cannot support a task, stop that part of the implementation and ask the owner for approval before changing workflow infrastructure.
-- Do not create one-shot, temporary, recovery, patching, or code-editing workflows. Use normal repository file/Git operations for code changes.
-- Do not add a new workflow merely to run a command once. Prefer an existing stable workflow, a repository script, or a local/connector execution path.
-- Any approved workflow-set change must also update the repository-governance allowlist and keep workflow ownership protections intact.
-- Public contributor PRs may still use the stable CI workflows; owner-driven development does not require PRs.
+Workflows are stable infrastructure. Do not create temporary, one-shot, recovery,
+or code-editing workflows. If existing infrastructure cannot support the task,
+pause that part and seek owner approval. Approved changes must preserve ownership
+protections and update the allowlist as described in the governance guide.
+Owner credentials alone are not workflow-change approval.
 
 ## Compatibility governance
 
-- `docs/spec/compatibility-registry.toml` is a lifecycle ledger, not a design-history database.
-- Compatibility IDs such as `QQTOOLS-COMPAT-NNNN` are stable correlation identifiers across registry entries, temporary code markers, tests, commits, and feature work items.
-- Public compatibility validation must not require ignored or private pitch/ADR files.
-- Temporary compatibility behavior must remain discoverable through its compatibility marker and verification tests.
-- Private planning records are optional context and must never be required to build, test, release, or safely advance a compatibility lifecycle.
-- Any intentionally temporary compatibility shim that must survive until a later release must be registered before integration, including temporary parser/checker tolerance in developer tooling. Do not rely on TODOs, private notes, or human memory for future cleanup. If the shim can be removed immediately, remove it instead of registering a fake completed item.
+Register intentionally temporary compatibility behavior before integration in
+`docs/spec/compatibility-registry.toml`; keep stable compatibility IDs, code
+markers, and verification tests discoverable. Remove shims immediately when
+possible. Private notes and TODOs cannot replace lifecycle registration.
+
+Before changing qexp CLI, initialization, registration, lifecycle, migration,
+or ownership, read the protected workflows in the
+[product spec](docs/spec/qexp_product_spec.md) and invariants in the
+[runtime spec](docs/spec/qexp_runtime_spec.md). Breaking protected behavior
+requires an explicit compatibility decision and approval before implementation.
+Record the affected workflow, impact, and decision in public delivery context.
+Do not rewrite protected tests or specs to accommodate a regression.
 
 ## Protected governance surface
 
-The following files define or enforce repository governance and are owner-controlled:
-
-- `AGENTS.md`
-- `.github/CODEOWNERS`
-- every file under `.github/workflows/**`
-- `scripts/checks/check_repository_governance.py`
+`AGENTS.md`, `.github/CODEOWNERS`, `.github/workflows/**`, and
+`scripts/checks/check_repository_governance.py` are owner-controlled.
 
 Only GitHub actor `kzhoa` may intentionally modify this protected governance surface.
 
-Agents running under any other actor must not edit these files. If a requested change requires modifying them, stop that part of the change and ask the repository owner to perform or authorize it.
-
-Even when an agent is operating through credentials that appear as GitHub actor `kzhoa`, the agent must still follow the workflow-governance approval rule above. Owner credentials are not implicit approval to change workflow infrastructure.
-
-Owner changes must preserve the machine-readable governance markers at the top of this file and pass the repository-governance checker. This requirement is intended to prevent accidental policy erosion as well as unauthorized edits.
-
-CI detection alone cannot revoke an already-authorized direct push. The strongest enforcement therefore also requires GitHub branch/ruleset protection that makes the governance check required on `dev` and `main` and restricts direct pushes according to the repository owner's policy.
+Owner-authorized agents may prepare the explicitly approved local edits on the
+owner's behalf; this does not grant another GitHub actor publication rights.
+Without owner authorization, pause the affected edits and request it. Preserve
+governance markers and pass the governance checker. See the governance guide
+for approval scope, publication credentials, and enforcement limits.

@@ -1,64 +1,52 @@
-# Test Suite Convention
+# Test suite navigation
 
-Test placement is determined by the behavior boundary under test, never by the
-location of production code.
+See [test governance](../docs/development/test-governance.md) for test placement,
+verification selection, isolation, mandatory gates, and reporting requirements.
+See [developer tooling](../docs/development/developer-tooling.md) for setup.
+Run the following commands from the repository root.
 
-## Test Layers
+## Directories
 
-- `tests/unit`: one function, class, or local module. Avoid complete training,
-  network access, and persistent side effects.
-- `tests/integration`: two or more real modules collaborating. Tests must assert
-  effective state or output, not only that no exception was raised.
-- `tests/e2e`: a public YAML, CLI, or Python entry point completing a user-visible
-  workflow with a tiny local model/dataset.
-- `tests/e2e/qexp`: installed-wheel public qexp workflows.
-- `tests/demo`: manually runnable demonstrations. Demos do not provide regression
-  protection.
+| Directory | Purpose |
+| --- | --- |
+| `unit/` | Local deterministic behavior |
+| `integration/` | Real component collaboration; historical `functional/` remains here |
+| `e2e/` | Installed public workflows, including qexp in `e2e/qexp/` |
+| `helpers/` and `fixtures/` | Shared test support and consumed assets |
+| `demo/` | Manual demonstrations |
 
-Historical functional coverage lives in `tests/integration/functional` until it can be split more
-precisely. Do not add a fourth test layer.
+[CONTRACT_MATRIX.md](CONTRACT_MATRIX.md) maps public contracts to test evidence.
 
-## Markers and Commands
-
-Use module-level markers for suite ownership and add `slow`, `gpu`, or `ddp` only
-when the runtime requirement is real. Markers must not hide a flaky test.
+## Common local commands
 
 ```bash
-PYTHONPATH=src python -m pytest tests/unit -q
-PYTHONPATH=src python -m pytest tests/integration -q
-tox run -e preflight
-tox run -e unit
-tox run -e integration
-tox run -e artifact-e2e
-tox run -e release-e2e
+./scripts/dev test
+./scripts/dev test tests/unit/test_dev_entry.py -q
+./scripts/dev test tests/integration/qexp/test_resource_isolation.py -q
+./scripts/dev preflight
 ```
 
-Test placement and execution frequency are separate decisions. An integration test remains an
-integration test even when it is intentionally excluded from the fast pull-request loop.
+`test` defaults to Unit tests; explicit paths/node IDs select other source tests.
+`preflight` is the complete shared gate and accepts no extra arguments.
 
-For qexp, use these stable module entry points:
+## Maintainer lanes
+
+With Python 3.13 and the tooling dependencies prepared, maintainers may invoke
+repository-defined tox environments directly:
 
 ```bash
 tox run -e qexp-unit
 tox run -e qexp-integration
 tox run -e qexp-machine-lab
+tox run -e artifact-e2e
+tox run -e release-e2e --installpkg /path/to/selected.whl
 ```
 
-During development, run `qexp-unit` and the specific integration files that protect the changed
-behavior. `qexp-integration` is the complete qexp integration layer. `preflight` is the local
-push gate. The qexp Integration entrypoint runs its ordinary and lifecycle collections as two
-four-worker phases under one 600-second execution budget. Reports are written to
-`qexp-gate-reports/`; set `QEXP_GATE_REPORT_DIR` to choose another location.
+The complete qexp Integration gate runs ordinary and lifecycle collections as
+two four-worker phases within a shared 600-second budget. Reports go to
+`qexp-gate-reports/`; `QEXP_GATE_REPORT_DIR` overrides that location.
 
-Main CI runs only installed-artifact evidence. The canonical Python runs `artifact-e2e`; declared
-non-canonical Python versions run `artifact-smoke`. Unit and Integration evidence belongs to the
-local preflight, not normal CI.
-
-Default pytest collection excludes `tests/e2e`. `tox run -e artifact-e2e` builds and validates a
-wheel from the current checkout; use
-`tox run -e release-e2e --installpkg <wheel>` when validating a selected,
-non-editable release artifact rather than a checkout or arbitrary installed package. The publish
-workflow is the release gate that runs this installed-wheel E2E against the exact tagged artifact.
-
-`CONTRACT_MATRIX.md` tracks public behavior and links it to protecting tests.
-Coverage reports only show executed code and do not prove public behavior is protected.
+Default source pytest collection excludes E2E. `artifact-e2e` builds a wheel
+from the checkout; `release-e2e` validates the selected exact wheel. See
+[test governance](../docs/development/test-governance.md#integration-ci-and-release-gates)
+for when each gate is required.

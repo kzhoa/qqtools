@@ -2,7 +2,7 @@
 """Run the shared qqtools preflight validation commands.
 
 Environment setup is intentionally outside this script:
-- local developers use ``tox -e preflight`` with ``.[full]``;
+- local developers use ``./scripts/dev preflight`` with ``.[full]``;
 - GitHub-hosted CI installs an explicit CPU-only PyTorch environment.
 
 Both paths execute this exact command list so validation semantics cannot drift.
@@ -13,6 +13,7 @@ thread state from the rest of the unit suite.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -54,7 +55,24 @@ COMMANDS: tuple[tuple[str, ...], ...] = (
 )
 
 
+def check_prerequisites() -> str | None:
+    if sys.version_info[:2] != (3, 13):
+        return (
+            f"Preflight requires Python 3.13; got {sys.version_info.major}.{sys.version_info.minor}. "
+            "Locally, run: ./scripts/dev preflight. In CI, verify the configured Python interpreter."
+        )
+    if sys.platform != "linux":
+        return "Preflight requires Linux for the real-process lifecycle gate. Use a Linux development host."
+    if shutil.which("tmux") is None:
+        return "Preflight requires tmux. Install tmux with your system package manager, then rerun ./scripts/dev preflight."
+    return None
+
+
 def main() -> int:
+    error = check_prerequisites()
+    if error:
+        print(error, file=sys.stderr)
+        return 1
     for command in COMMANDS:
         print(f"+ {' '.join(command)}", flush=True)
         completed = subprocess.run(command, cwd=REPO_ROOT, check=False)

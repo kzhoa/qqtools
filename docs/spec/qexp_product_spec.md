@@ -63,7 +63,7 @@ Anything marked **Assumption / Unverified** is not a guarantee of the installed 
 
 Project-wide temporary compatibility lifecycles are registered in
 [`compatibility-registry.toml`](compatibility-registry.toml) and governed by
-[`compatibility-governance.md`](compatibility-governance.md). The registry schedules removal and
+[`compatibility-governance.md`](../development/compatibility-governance.md). The registry schedules removal and
 purge work; this specification remains authoritative for qexp behavior and protected workflows.
 
 Workflows listed under **Protected workflows**, and workflows explicitly marked as stable in

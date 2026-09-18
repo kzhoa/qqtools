@@ -377,8 +377,29 @@ Under `src/qqtools/plugins/`, there are also:
 - `qpipeline` - a training pipeline framework built on top of the core torch utilities
 - `qhyperconnect` - an implementation of Hyper-Connection for PyTorch
 
-## Test
+## Development
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/); the repository
+manages Python and test tools. No environment activation is needed.
 
 ```bash
-tox
+# Daily tests (optional pytest arguments follow the command)
+./scripts/dev test
+./scripts/dev test tests/unit/qexp -q
+
+# Complete integration gate (requires Linux and system tmux)
+./scripts/dev preflight
+
+# Optional: prepare .venv for your IDE; rerun when dependencies change
+./scripts/dev env
 ```
+
+Public engineering guides cover [development and promotion](docs/development/development-workflow.md),
+[code style](docs/development/code-style.md),
+[documentation](docs/development/documentation-guide.md),
+[test governance](docs/development/test-governance.md),
+[repository governance](docs/development/repository-governance.md), and
+[compatibility governance](docs/development/compatibility-governance.md).
+
+See [developer tooling maintenance](docs/development/developer-tooling.md) for platform
+support, environment setup, and CI details.
