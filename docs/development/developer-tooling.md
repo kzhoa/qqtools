@@ -97,3 +97,52 @@ For a cache on a different filesystem from the environments, `UV_LINK_MODE=copy`
 explicitly accepts copying. For link-based reuse, place a personal `UV_CACHE_DIR`
 on the same filesystem as the environments, provided it supports linking. Neither
 choice removes shared-filesystem I/O costs, and neither belongs in committed machine-specific paths.
+
+## Selecting tox gates
+
+Bare `tox` runs only `preflight`, which already includes Unit and the required
+Integration selection. Run `unit` or a scoped qexp lane while developing; run
+`artifact-e2e` separately when installed delivery behavior or release policy
+requires it. The redundant `base` lane and automatic `cleanup` lane are removed;
+validation preserves `tmp/` diagnostics instead of deleting them afterward.
+The unused pytest-cov dependency and obsolete pip-cache override are removed;
+tox-uv uses the uv cache settings described above.
+The release preflight script invokes tox through its current Python interpreter,
+so it does not require a separate global tox executable on PATH.
+`release-e2e` inherits the installed E2E environment and still accepts
+`--installpkg` for the exact wheel selected by publishing.
+
+For local Python compatibility checks, run:
+
+```bash
+tox run-parallel -e 'py{311,312,313,314}-artifact-smoke'
+```
+
+These lanes install wheels, verify that imports come from site-packages, and
+exercise `qexp --help`. They do not run four copies of the source Unit suite or
+install pytest/coverage tools. Missing interpreters fail instead of silently
+skipping a claimed compatibility check; install the requested Python with uv
+beforehand. Full source validation stays on Python 3.13. CI keeps Python 3.13
+installed E2E plus smoke checks on 3.11, 3.12, and 3.14. This is installation and
+CLI-startup compatibility evidence, not full functional coverage on every minor.
+
+The unused `check_qexp_shared_filesystem.py` probe has been removed following
+[ADR-QEXP-0003](../adr/qexp/0003-remove-filesystem-qualification-gate.md).
+Store regression tests retain exclusive-create conflict and JSON readback
+coverage; a local sequential probe does not certify cross-host filesystem semantics.
+
+## Action runtime maintenance
+
+Workflows use GitHub-hosted Ubuntu runners. JavaScript actions use Node 24:
+checkout v7, setup-python v7, upload-artifact v7, github-script v9, and
+softprops/action-gh-release v3. Node 24 actions require runner 2.327.1 or later;
+any future self-hosted runner setup must account for each action's requirements.
+The PyPI publisher follows its maintained `release/v1` channel and uses a
+composite/container implementation. Action runtime versions are independent of
+the Python version selected for package tests.
+
+Review [checkout release notes](https://github.com/actions/checkout/releases),
+[setup-python release notes](https://github.com/actions/setup-python/releases),
+and the other actions' metadata when upgrading majors,
+including checkout credential persistence and github-script API changes.
+Preserve the owner credential boundary and the read-only PR inspection path.

@@ -20,6 +20,7 @@ def test_create_if_absent_and_cas(tmp_path: Path):
     with pytest.raises(CASConflict):
         create_if_absent(path, {"meta": {"revision": 1}, "value": 2})
     value = read_json(path)
+    assert value == {"meta": {"revision": 1}, "value": 1}
     value["value"] = 2
     cas_update(path, 1, value)
     assert read_json(path)["meta"]["revision"] == 2

@@ -185,9 +185,8 @@ def main(argv: list[str] | None = None) -> int:
     _check_target_version(target)
     _check_compatibility(target)
     _check_lazy_export_stubs()
-    _run("tox", "run", "-e", "unit")
-    _run("tox", "run", "-e", "integration")
-    _run("tox", "run", "-e", "qexp-integration")
+    for environment in ("unit", "integration", "qexp-integration"):
+        _run(sys.executable, "-m", "tox", "run", "-e", environment)
     print(f"Release preflight passed for {target}.")
     return 0
 

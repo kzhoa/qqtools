@@ -28,7 +28,7 @@ jobs:
     outputs:
       reused: ${{ steps.evidence.outputs.reused }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check exact-commit gate evidence
         id: evidence
         env:
@@ -46,14 +46,14 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Strip feature-local state from promotion candidate
         if: inputs.strip_dev_state
         run: rm -rf .dev
 
       - name: Set up Python 3.13 with pip cache
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: pip

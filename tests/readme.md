@@ -39,8 +39,12 @@ tox run -e qexp-unit
 tox run -e qexp-integration
 tox run -e qexp-machine-lab
 tox run -e artifact-e2e
+tox run-parallel -e 'py{311,312,313,314}-artifact-smoke'
 tox run -e release-e2e --installpkg /path/to/selected.whl
 ```
+
+Bare `tox` runs only the complete source preflight. The explicit Python matrix
+checks installed-package imports and CLI startup; missing interpreters fail.
 
 The complete qexp Integration gate runs ordinary and lifecycle collections as
 two four-worker phases within a shared 600-second budget. Reports go to

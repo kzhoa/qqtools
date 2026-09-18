@@ -291,9 +291,9 @@ def test_preflight_runs_compatibility_gate_before_expensive_checks(
     assert release_preflight.main(["--target-version", "1.3.13"]) == 0
     assert order == ["clean", "target", "compatibility", "stubs"]
     assert commands == [
-        (("tox", "run", "-e", "unit"), {}),
-        (("tox", "run", "-e", "integration"), {}),
-        (("tox", "run", "-e", "qexp-integration"), {}),
+        ((release_preflight.sys.executable, "-m", "tox", "run", "-e", "unit"), {}),
+        ((release_preflight.sys.executable, "-m", "tox", "run", "-e", "integration"), {}),
+        ((release_preflight.sys.executable, "-m", "tox", "run", "-e", "qexp-integration"), {}),
     ]
 
 
@@ -332,3 +332,23 @@ def test_preflight_rejects_non_exact_target_version() -> None:
         release_preflight.main(["--target-version", "1.3"])
 
     assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize("failed_environment", ["unit", "integration", "qexp-integration"])
+def test_release_preflight_stops_at_first_failed_suite(monkeypatch, failed_environment):
+    import subprocess
+
+    for name in ("_require_clean_head", "_check_target_version", "_check_compatibility", "_check_lazy_export_stubs"):
+        monkeypatch.setattr(release_preflight, name, lambda *args: None)
+    calls = []
+
+    def run(*args):
+        calls.append(args[-1])
+        if args[-1] == failed_environment:
+            raise subprocess.CalledProcessError(1, args)
+
+    monkeypatch.setattr(release_preflight, "_run", run)
+    with pytest.raises(subprocess.CalledProcessError):
+        release_preflight.main(["--target-version", "1.3.13"])
+    environments = ["unit", "integration", "qexp-integration"]
+    assert calls == environments[: environments.index(failed_environment) + 1]
