@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import subprocess
 from pathlib import Path
 
@@ -307,3 +308,67 @@ def test_schema5_migration_recovers_after_source_is_parked(tmp_path: Path, monke
     backup = next(tmp_path.glob(".qexp.schema5-backup-*"))
     original = read_json(backup / "tasks" / f"{task.task_id}.json")
     assert original == legacy_task
+
+
+def test_bounded_signal_progress_preserves_grace_and_restarts_conservatively(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from qqtools.plugins.qexp.runtime import termination
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    decision = create_decision(
+        cfg,
+        task_id="task",
+        attempt_id="attempt",
+        fencing_token=1,
+        process={"process_group_id": 12345678, "process_group_start_time_ticks": 42},
+        authority_outcome="termination_required",
+        reason="cancelled",
+    )
+    commit_signal(cfg, "attempt", decision["decision_id"])
+    now = [0.0]
+    is_alive = [True]
+    signals = []
+    monkeypatch.setattr(termination, "_matches_process_group", lambda *_args: is_alive[0])
+    monkeypatch.setattr(termination, "os", SimpleNamespace(killpg=lambda pgid, sig: signals.append((pgid, sig))))
+
+    def forbidden_sleep(_seconds):
+        pytest.fail("bounded termination waited under the Attempt lock")
+
+    monkeypatch.setattr(termination, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=forbidden_sleep))
+
+    def advance(deadline):
+        with termination.attempt_control_lock(cfg, "attempt"):
+            return termination.advance_signals(
+                cfg, "attempt", decision["decision_id"], sigterm_deadline=deadline, grace_seconds=5
+            )
+
+    first, deadline = advance(None)
+    assert first["state"] == "sigterm_sent"
+    assert deadline == 5
+    assert len(signals) == 1
+    now[0] = 4.9
+    waiting, deadline = advance(deadline)
+    assert waiting["state"] == "sigterm_sent"
+    assert len(signals) == 1
+    # A restart after the original grace elapsed still grants a full new grace.
+    now[0] = 20
+    waiting, deadline = advance(None)
+    assert deadline == 25
+    assert len(signals) == 1
+    now[0] = 24.9
+    waiting, deadline = advance(deadline)
+    assert waiting["state"] == "sigterm_sent"
+    assert len(signals) == 1
+    now[0] = 25
+    killed, deadline = advance(deadline)
+    assert killed["state"] == "sigkill_sent"
+    assert len(signals) == 2
+    assert [item[1] for item in signals] == [signal.SIGTERM, signal.SIGKILL]
+    assert deadline is None
+    is_alive[0] = False
+    confirmed, deadline = advance(None)
+    assert confirmed["state"] == "confirmed"
+    assert confirmed["confirmation"] == "identity_absent"
+    assert advance(None)[0]["state"] == "confirmed"
+    assert len(signals) == 2

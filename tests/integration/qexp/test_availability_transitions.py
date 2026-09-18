@@ -23,6 +23,7 @@ from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import claim_task, fail_attempt
+from tests.helpers.qexp.clock import set_offer_evaluation_time
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -507,10 +508,7 @@ def test_agent_removes_stale_deadline_index_without_skipping_remaining_work(
     atomic_replace(stale, {"offer_deadline": {"task_id": "missing"}})
     task = submit(cfg, ["echo", "ok"], group="exp")
     task_commands.share(cfg, task.task_id, after_seconds=0)
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.project_maintenance.elapsed_offer_is_proven",
-        lambda *_args: True,
-    )
+    set_offer_evaluation_time(monkeypatch, cfg, task.task_id)
 
     offer_due_tasks(cfg)
 

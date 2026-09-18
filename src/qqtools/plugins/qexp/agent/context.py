@@ -8,7 +8,7 @@ import tempfile
 import uuid
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterator
@@ -18,7 +18,7 @@ from qqtools.version import __version__
 from ..config_types import RootConfig
 from ..infrastructure.host import host_instance_id as _host_instance_id
 from ..layout import load_machine_record, load_machine_registration, load_root_config, save_machine_registration
-from ..lease import lease_expiry, load_lease_policy, parse_utc
+from ..lease import LeasePolicy, lease_expiry, load_lease_policy, parse_utc
 from ..runtime.locks import exclusive, machine_lock
 from ..runtime.paths import (
     local_paths,
@@ -31,7 +31,7 @@ from ..runtime.paths import (
 from ..runtime.ready import ReadyCursor
 from ..runtime.records import utc_now
 from ..runtime.store import atomic_replace, iter_json, read_json
-from ..runtime.work_budget import AdaptiveBatchSizer
+from ..runtime.work_budget import AdaptiveBatchSizer, diagnostic_increment, diagnostic_observe_ns
 
 MACHINE_RUNTIME_ENV = "QEXP_MACHINE_RUNTIME_ROOT"
 REGISTRY_VERSION = 1
@@ -44,6 +44,25 @@ LEGACY_AGENT_EVIDENCE = (
     "events",
 )
 LEGACY_RUNNER_INBOX = ("registrations", "observations", "launch_intents")
+
+
+def _registration_renewal_interval(policy: LeasePolicy) -> float:
+    # Leave a second service opportunity when a valid Attempt interval is near TTL.
+    return min(policy.renew_interval_seconds, policy.ttl_seconds / 2)
+
+
+def _observe_registration_renewal(previous_expiry: str, policy: LeasePolicy, *, is_reactivation: bool) -> None:
+    """Observe completed publication against the previous renewal target."""
+    diagnostic_increment("registration.reactivation" if is_reactivation else "registration.renewal")
+    try:
+        target = parse_utc(previous_expiry) - timedelta(
+            seconds=policy.ttl_seconds - _registration_renewal_interval(policy)
+        )
+        lateness = max(0.0, (datetime.now(timezone.utc) - target).total_seconds())
+    except (ValueError, TypeError, OverflowError):
+        diagnostic_increment("registration.renewal_lateness_unavailable")
+        return
+    diagnostic_observe_ns("registration.renewal_lateness", int(lateness * 1_000_000_000))
 
 
 def resolve_machine_runtime_root(value: str | Path | None = None) -> Path:
@@ -743,14 +762,16 @@ class MachineRuntime:
             ):
                 return False
             record = dict(record)
+            previous_expiry = record["eligibility_expires_at"]
             record["eligibility_expires_at"] = lease_expiry(policy)
             record["updated_at"] = utc_now()
             save_machine_registration(cfg, {"registration": record})
+            _observe_registration_renewal(previous_expiry, policy, is_reactivation=True)
             return True
 
     @contextmanager
     def binding_write_guard(self, binding: ProjectBinding) -> Iterator[bool]:
-        """Fence one authoritative write to a current, renewed registration generation."""
+        """Fence an authoritative write, renewing the current generation when due."""
         cfg = binding.root_config()
         policy = load_lease_policy(cfg)
         with self._registration_guard(cfg):
@@ -770,10 +791,20 @@ class MachineRuntime:
             ):
                 yield False
                 return
-            record = dict(record)
-            record["eligibility_expires_at"] = lease_expiry(policy)
-            record["updated_at"] = utc_now()
-            save_machine_registration(cfg, {"registration": record})
+            previous_expiry = record["eligibility_expires_at"]
+            expires_at = parse_utc(previous_expiry)
+            next_expiry = lease_expiry(policy)
+            renew_at = expires_at - timedelta(seconds=policy.ttl_seconds - _registration_renewal_interval(policy))
+            # Derive scheduling from fenced durable state, never cached authority.
+            # A shorter policy horizon also takes effect without waiting for renewal.
+            if parse_utc(next_expiry) != expires_at and (
+                datetime.now(timezone.utc) >= renew_at or parse_utc(next_expiry) < expires_at
+            ):
+                record = dict(record)
+                record["eligibility_expires_at"] = next_expiry
+                record["updated_at"] = utc_now()
+                save_machine_registration(cfg, {"registration": record})
+                _observe_registration_renewal(previous_expiry, policy, is_reactivation=False)
             yield True
 
     def binding_write_eligible(self, binding: ProjectBinding, *, renew: bool = False) -> bool:

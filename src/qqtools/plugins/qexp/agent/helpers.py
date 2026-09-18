@@ -21,7 +21,7 @@ from ..runtime.resources.reservations import (
     reconcile_snapshot,
     reservation_snapshot,
 )
-from ..runtime.store import atomic_replace, iter_json, read_json
+from ..runtime.store import atomic_replace, iter_json, read_json, replace_snapshot_if_changed
 from ..runtime.work_budget import diagnostic_increment, diagnostic_span
 from ..scheduler import fail_attempt, resume_starting_attempt
 from .context import MachineRuntime, ProjectBinding
@@ -140,7 +140,7 @@ def _publish_process_status(
     state: str = "active",
 ) -> None:
     """Publish live process identity and its process-local registration wait state."""
-    atomic_replace(
+    replace_snapshot_if_changed(
         runtime.paths["agent"] / "status.json",
         {
             "machine_agent": {

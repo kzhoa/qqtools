@@ -11,7 +11,7 @@ from .runtime.paths import local_paths
 from .runtime.ready import READY_WRITER_CAPABILITY
 from .runtime.ready.group_members import GROUP_READY_MEMBERS_CAPABILITY
 from .runtime.records import utc_now
-from .runtime.store import atomic_replace, read_json
+from .runtime.store import read_json, replace_snapshot_if_changed
 
 
 def publish_machine_snapshots(
@@ -133,9 +133,9 @@ def _write_machine_snapshots(
             ],
         }
     }
-    atomic_replace(machine_state_path(cfg, "agent.json"), agent)
-    atomic_replace(machine_state_path(cfg, "gpu.json"), gpu)
-    atomic_replace(machine_state_path(cfg, "summary.json"), summary)
+    replace_snapshot_if_changed(machine_state_path(cfg, "agent.json"), agent)
+    replace_snapshot_if_changed(machine_state_path(cfg, "gpu.json"), gpu)
+    replace_snapshot_if_changed(machine_state_path(cfg, "summary.json"), summary)
 
 
 def publish_machine_stop_snapshot(

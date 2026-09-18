@@ -26,6 +26,7 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.runtime.work_budget import SliceBudget, WorkBudgetPolicy
 from qqtools.plugins.qexp.scheduler import claim_task
+from tests.helpers.qexp.clock import set_offer_evaluation_time
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -463,10 +464,7 @@ def test_offer_due_tasks_never_enumerates_task_truth(
         return original_scandir(directory)
 
     monkeypatch.setattr(offer_deadlines.os, "scandir", record_directory)
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.project_maintenance.elapsed_offer_is_proven",
-        lambda *_args: True,
-    )
+    set_offer_evaluation_time(monkeypatch, cfg, task.task_id)
 
     offer_due_tasks(cfg)
 

@@ -20,6 +20,41 @@ before tox installs project dependencies. Python `libtmux` is installed through
 the project extras; it does not install tmux. Other platforms may use `test` and
 `env` subject to the dependencies and selected tests supporting their platform.
 
+### Clock health for qexp lifecycle tests
+
+LI-03's natural lease-expiry cases require a measured clock error bound of at
+most 100 ms. qexp supports both chrony and Linux `adjtimex` observations. A large
+kernel error bound does not necessarily mean the clock is actually that far off.
+If kernel clock information is unavailable, unsynchronized, or exceeds the test
+limit, install and configure chrony to obtain an independent measurement. On
+Debian/Ubuntu, install the system package with `sudo apt-get install chrony`;
+installing qqtools does not install this service. Chrony is unnecessary when the
+kernel provider already satisfies the required bound.
+
+In Docker or another container without `CAP_SYS_TIME`, configure the chrony
+daemon to run with `-x`. This mode measures against reachable NTP sources without
+adjusting the host's system clock. Configure the existing service or container
+startup command rather than launching competing daemons. In containers without
+an init system, arrange startup explicitly and retain the configuration in the
+container image or provisioning setup so recreation does not lose it. See the
+[chronyd options](https://chrony-project.org/doc/4.9/chronyd.html).
+
+Check `chronyc tracking -n` and allow the initial measurements to converge before
+running clock-sensitive tests. qexp includes system offset, half the root delay,
+root dispersion, observation age, drift, and a safety margin in its bound;
+`Leap status: Normal` alone does not establish qualification. Keep chrony running
+between tests: startup convergence is an environment preparation cost, not a
+per-test requirement.
+
+Installation alone cannot guarantee a qualifying measurement. If NTP is
+unreachable or the measured bound remains above 100 ms, resolve the time-source
+or host-clock issue; do not widen LI-03's threshold or skip its cases. After
+preparing the environment, verify with:
+
+```bash
+./scripts/dev test tests/integration/qexp/test_agent_lifecycle_independence.py::test_li03_real_peer_observes_natural_lease_expiry -q
+```
+
 ## Environment ownership
 
 uv reads PEP 723 metadata in `scripts/dev`, obtains or reuses Python 3.13, and

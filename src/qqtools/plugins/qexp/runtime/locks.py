@@ -11,6 +11,7 @@ from typing import Iterator
 
 from .paths import lock_path, shared_paths
 from .store import read_json
+from .work_budget import diagnostic_span
 
 GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
 _schema_writer_roots: ContextVar[frozenset[Path]] = ContextVar("qexp_schema_writer_roots", default=frozenset())
@@ -47,7 +48,8 @@ def exclusive(path: Path, *, blocking: bool = True) -> Iterator[bool]:
     try:
         flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
         try:
-            fcntl.flock(handle.fileno(), flags)
+            with diagnostic_span("locks.acquire"):
+                fcntl.flock(handle.fileno(), flags)
         except OSError as exc:
             if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
                 yield False
@@ -70,7 +72,8 @@ def shared(path: Path, *, blocking: bool = True) -> Iterator[bool]:
     try:
         flags = fcntl.LOCK_SH if blocking else fcntl.LOCK_SH | fcntl.LOCK_NB
         try:
-            fcntl.flock(handle.fileno(), flags)
+            with diagnostic_span("locks.acquire"):
+                fcntl.flock(handle.fileno(), flags)
         except OSError as exc:
             if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
                 yield False

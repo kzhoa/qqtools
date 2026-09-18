@@ -66,7 +66,7 @@ class _BatchedRecordingExecutor(_RecordingExecutor):
     def wait_for_launch_handoffs(self, handoffs):
         self.waited_attempt_ids = [handoff.attempt_id for handoff in handoffs]
         if self.should_fail_first:
-            return {self.waited_attempt_ids[0]: RuntimeError("handoff failed")}
+            return {handoffs[0]: RuntimeError("handoff failed")}
         return {}
 
 

@@ -29,6 +29,7 @@ from qqtools.plugins.qexp.scheduler import (
     reconcile_running_tasks,
     run_dispatch_cycle,
 )
+from tests.helpers.qexp.clock import set_offer_evaluation_time
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -562,10 +563,10 @@ def test_elapsed_offer_is_applied_by_home_agent(tmp_path: Path, monkeypatch: pyt
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover", offer_after_seconds=0)
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.project_maintenance.elapsed_offer_is_proven",
-        lambda *_args: True,
-    )
+    set_offer_evaluation_time(monkeypatch, cfg, task.task_id, seconds_after_deadline=-1)
+    offer_due_tasks(cfg)
+    assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "home"
+    set_offer_evaluation_time(monkeypatch, cfg, task.task_id)
     offer_due_tasks(cfg)
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
 

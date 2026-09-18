@@ -393,6 +393,34 @@ def active_reservations(runtime_root: Path) -> list[dict[str, Any]]:
     return list(reservation_snapshot(runtime_root).active)
 
 
+def has_reservation(runtime_root: Path, reservation_id: str) -> bool:
+    """Check one usage-bearing identity without enumerating either capacity lane."""
+    if (
+        not isinstance(reservation_id, str)
+        or not reservation_id
+        or reservation_id in {".", ".."}
+        or Path(reservation_id).name != reservation_id
+    ):
+        raise ValueError("reservation_id must be a nonempty filename component.")
+    paths = local_paths(runtime_root)
+    # Keep independent capacity locks unnested, as in reservation_snapshot.
+    for lock_name, active, provisional in (
+        ("gpu-reservations.lock", "active", "provisional"),
+        ("cpu-lane.lock", "cpu_active", "cpu_provisional"),
+    ):
+        with exclusive(paths["locks"] / lock_name):
+            for name in (active, provisional):
+                try:
+                    value = read_json(paths[name] / f"{reservation_id}.json")
+                except FileNotFoundError:
+                    continue
+                if value["reservation"]["reservation_id"] != reservation_id:
+                    raise ValueError("reservation record does not match its filename.")
+                if name == active or not _is_expired(value):
+                    return True
+    return False
+
+
 def reservation_snapshot(runtime_root: Path) -> ReservationSnapshot:
     """Read active and unexpired provisional reservations without mutating state."""
     paths = local_paths(runtime_root)

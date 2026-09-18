@@ -4,26 +4,29 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Generator
 
 from ..config_types import RootConfig
 from ..lease import clock_capability, lease_expiry, load_lease_policy, persist_clock_observation
 from ..scheduler import _manifest_supervisor, authority_locks
-from .paths import attempt_path, group_path
+from .paths import attempt_path, group_path, local_paths
 from .records import AttemptRecord, normalize_group_record, utc_now
 from .resources.reservations import retag
 from .store import atomic_replace, read_json
 from .tasks import load_task, save_task
-from .termination import attempt_control_lock, is_recovery_blocked
+from .termination import attempt_control_lock, recovery_check_steps
 
 
-def recover_running_attempt(
+def recovery_steps(
     cfg: RootConfig,
     task_id: str,
     attempt_id: str,
     expired_token: int,
     manifest: dict[str, object] | None = None,
     reservation_runtime_root: Path | None = None,
-) -> int | None:
+    *,
+    cooperative: bool = True,
+) -> Generator[None, None, int | None]:
     """Restore authority only for a locally verified live orphaned process."""
 
     def reject(reason: str) -> None:
@@ -36,20 +39,26 @@ def recover_running_attempt(
             pass
 
     reservation_root = reservation_runtime_root or cfg.runtime_root
-    policy = load_lease_policy(cfg)
-    capability = clock_capability(cfg, policy)
-    if not capability.is_healthy or capability.observation is None:
-        reject("recovery_clock_unhealthy")
-        return None
     manifest_path = cfg.runtime_root / "processes" / f"{attempt_id}.json"
-    with attempt_control_lock(cfg, attempt_id):
-        if is_recovery_blocked(cfg, attempt_id):
+    with attempt_control_lock(cfg, attempt_id, blocking=not cooperative) as acquired:
+        if not acquired:
+            reject("recovery_lock_busy")
+            return None
+        if (yield from recovery_check_steps(cfg, attempt_id)):
             reject("recovery_termination_blocked")
             return None
-        if manifest is None:
+        policy = load_lease_policy(cfg)
+        capability = clock_capability(cfg, policy)
+        if not capability.is_healthy or capability.observation is None:
+            reject("recovery_clock_unhealthy")
+            return None
+        if manifest is None or cooperative:
             if not manifest_path.exists():
                 return None
-            manifest = read_json(manifest_path).get("process", {})
+            record = read_json(manifest_path)
+            manifest = record.get("process") if isinstance(record, dict) else None
+        if not isinstance(manifest, dict):
+            raise ValueError("local process manifest must be an object")
         if (
             manifest.get("task_id") != task_id
             or manifest.get("attempt_id") != attempt_id
@@ -74,6 +83,14 @@ def recover_running_attempt(
                 return None
             if attempt.termination.get("decision_id"):
                 return None
+            if cooperative:
+                from ..scheduler import _process_evidence_state
+
+                if (local_paths(cfg.runtime_root)["observations"] / f"{attempt_id}.json").exists():
+                    return None
+                if _process_evidence_state(attempt, manifest) != "alive":
+                    reject("recovery_process_not_alive")
+                    return None
             is_partial_recovery = attempt.phase == "running" and attempt.current_fencing_token > expired_token
             if not is_partial_recovery and (
                 attempt.phase != "orphaned" or attempt.current_fencing_token != expired_token
@@ -160,3 +177,24 @@ def recover_running_attempt(
             )
             atomic_replace(manifest_path, {"process": manifest})
             return token
+
+
+def recover_running_attempt(
+    cfg: RootConfig,
+    task_id: str,
+    attempt_id: str,
+    expired_token: int,
+    manifest: dict[str, object] | None = None,
+    reservation_runtime_root: Path | None = None,
+) -> int | None:
+    """Synchronous recovery for doctor and standalone reconciliation callers."""
+    steps = recovery_steps(
+        cfg, task_id, attempt_id, expired_token, manifest, reservation_runtime_root, cooperative=False
+    )
+    try:
+        while True:
+            next(steps)
+    except StopIteration as result:
+        return result.value
+    finally:
+        steps.close()

@@ -18,12 +18,21 @@ pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
 def test_resource_scope_isolates_child_environment(qexp_resource_scope: TestResourceScope) -> None:
-    environment = qexp_resource_scope.child_environment({"PATH": "test-path"})
+    parent = {"PATH": "test-path", "TMUX": "/outside/server.sock,123,0", "TMUX_PANE": "%7"}
+    environment = qexp_resource_scope.child_environment(parent)
 
     assert environment["PATH"] == "test-path"
     assert environment["TMPDIR"] == str(qexp_resource_scope.local_temp_root)
     assert environment["HOME"] == str(qexp_resource_scope.home_root)
     assert environment["QEXP_MACHINE_RUNTIME_ROOT"] == str(qexp_resource_scope.runtime_root)
+    assert "TMUX" not in environment
+    assert "TMUX_PANE" not in environment
+    assert parent["TMUX"] == "/outside/server.sock,123,0"
+
+
+def test_integration_fixture_does_not_inherit_a_tmux_server():
+    assert "TMUX" not in os.environ
+    assert "TMUX_PANE" not in os.environ
 
 
 def test_resource_scope_derives_tmux_root_from_selected_test_base(

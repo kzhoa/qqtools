@@ -12,6 +12,8 @@ def _qexp_integration_prerequisites(
 ):
     """Use deterministic clock proof and honor the explicit fast-I/O marker."""
     environment = qexp_resource_scope.child_environment()
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
     for name in (
         "TMPDIR",
         "TMP",

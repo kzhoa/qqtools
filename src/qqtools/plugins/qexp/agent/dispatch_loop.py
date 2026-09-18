@@ -774,6 +774,13 @@ def _dispatch_machine_cycle_locked(
                         supervisors[binding.project_id] = supervisor
                         supervisor_generations[binding.project_id] = binding.registration_generation
                 supervisor.tick()
+            ready_generations = getattr(runtime, "authority_ready_generations", None)
+            if (
+                ready_generations is not None
+                and ready_generations.get(binding.project_id) != binding.registration_generation
+            ):
+                results.append({"project_id": binding.project_id, "launched": [], "status": "authority_recovering"})
+                continue
             dispatchable[binding.project_id] = cfg
             if binding.project_id in runtime.upgrade_admission_blocked_projects:
                 upgrade_blocked[binding.project_id] = {"admission_blocked": True, "state": "cached"}

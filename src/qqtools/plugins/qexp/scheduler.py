@@ -1226,6 +1226,7 @@ def resolve_execution_authority(
     decision_id: str,
     *,
     reservation_runtime_root: Path | None = None,
+    defer_recovery: bool = False,
 ) -> AuthorityResolution:
     """Perform the final authoritative renewal/recovery decision for a live process."""
     try:
@@ -1248,6 +1249,14 @@ def resolve_execution_authority(
             result.lease_expires_at,
         )
     if result.outcome is LeaseRenewalOutcome.ORPHANED_RECOVERY_REQUIRED:
+        if defer_recovery:
+            return AuthorityResolution(
+                AuthorityResolutionOutcome.AUTHORITY_UNAVAILABLE,
+                decision_id,
+                attempt_id,
+                fencing_token,
+                reason="recovery_deferred",
+            )
         from .runtime.attempt_recovery import recover_running_attempt
 
         token = recover_running_attempt(

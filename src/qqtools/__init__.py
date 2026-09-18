@@ -87,7 +87,7 @@ from .utils.qattr import hasattr_safe, getmultiattr, is_override
 
 # --- optional dependencies ---
 # net IO rely on `requests`
-from .config.fetch.gdown import download_from_gdrive_sharelink
+lazy_export(".config.fetch.gdown", "download_from_gdrive_sharelink")
 
 
 # plugins

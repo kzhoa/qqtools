@@ -163,7 +163,47 @@ def _wait_running(cfg, task_id: str, marker: Path | None = None) -> None:
             return False
         return marker is None or marker.exists()
 
-    _wait_for(is_running_and_observed, timeout=PROCESS_START_BUDGET_SECONDS)
+    def startup_diagnostics():
+        # Resource teardown removes these records, so retain failure-boundary truth.
+        try:
+            task = load_task(cfg, task_id)
+            number = task.attempt_control.get("current_attempt_number")
+            path = attempt_path(cfg.shared_root, task_id, number) if number is not None else None
+            panes = subprocess.run(
+                ["tmux", "list-panes", "-a", "-F", "#{pane_id} #{window_name} #{pane_current_command}"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            pane_output = {}
+            for line in panes.stdout.splitlines()[:8]:
+                pane_id, _, _ = line.partition(" ")
+                captured = subprocess.run(
+                    ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-20"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+                pane_output[line] = captured.stdout[-4000:]
+            return {
+                "tmux_panes": pane_output,
+                "task_state": task.state,
+                "claim": task.claim_control,
+                "attempt_control": task.attempt_control,
+                "attempt": read_json(path) if path is not None and path.exists() else None,
+                "launch_marker": marker.read_text() if marker is not None and marker.exists() else None,
+            }
+        except Exception as exc:  # retain the original timeout if diagnostics fail
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    _wait_for(
+        is_running_and_observed,
+        timeout=PROCESS_START_BUDGET_SECONDS,
+        description=f"Task {task_id} running and observed",
+        on_timeout=startup_diagnostics,
+    )
 
 
 def _wait_terminal(cfg, task_id: str) -> object:

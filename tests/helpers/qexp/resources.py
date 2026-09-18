@@ -92,6 +92,10 @@ class TestResourceScope:
     def child_environment(self, base: dict[str, str] | None = None) -> dict[str, str]:
         """Build an environment frozen before a participant imports qexp."""
         environment = dict(os.environ if base is None else base)
+        # tmux prefers an inherited server socket over TMUX_TMPDIR. A participant
+        # must never attach to the developer's server or inherit its environment.
+        environment.pop("TMUX", None)
+        environment.pop("TMUX_PANE", None)
         source_root = environment.get(TEST_SOURCE_ROOT_ENV)
         if source_root:
             python_path = environment.get("PYTHONPATH")

@@ -32,18 +32,39 @@ tqdm = LazyImport("tqdm", "tqdm")
 __all__ = ["qLmdbDataset", "qLmdbDatasetBase"]
 
 
-_environment_lock = threading.Lock()
+_environment_lock = threading.RLock()
 _environment_pid = os.getpid()
 _environments: dict[Path, tuple[Any, int]] = {}
+_environment_update_active = False
+_pending_environment_closes: list[Any] = []
 
 
 def _reset_environment_registry_after_fork() -> None:
     global _environment_lock, _environment_pid, _environments
-    _environment_lock = threading.Lock()
+    global _environment_update_active, _pending_environment_closes
+    _environment_lock = threading.RLock()
     # Do not close inherited native handles in the child: forked transactions may
     # still reference them. The child registry is discarded and readers reopen lazily.
     _environments = {}
     _environment_pid = os.getpid()
+    _environment_update_active = False
+    _pending_environment_closes = []
+
+
+@contextmanager
+def _environment_registry_update() -> Iterator[None]:
+    """Defer GC-triggered closes until reference-count updates are complete."""
+    global _environment_update_active
+    with _environment_lock:
+        _environment_update_active = True
+        try:
+            yield
+        finally:
+            try:
+                while _pending_environment_closes:
+                    _pending_environment_closes.pop()._close_locked()
+            finally:
+                _environment_update_active = False
 
 
 if hasattr(os, "register_at_fork"):
@@ -58,7 +79,7 @@ class _ReadonlyEnvironmentLease:
         self._path = path.resolve()
         self._pid = os.getpid()
         self._is_closed = False
-        with _environment_lock:
+        with _environment_registry_update():
             if _environment_pid != self._pid:
                 _environments = {}
                 _environment_pid = self._pid
@@ -84,13 +105,24 @@ class _ReadonlyEnvironmentLease:
         with _environment_lock:
             if self._is_closed or self._pid != os.getpid():
                 return
-            self._is_closed = True
-            environment, references = _environments[self._path]
-            if references == 1:
-                del _environments[self._path]
-                environment.close()
-            else:
-                _environments[self._path] = (environment, references - 1)
+            if _environment_update_active:
+                # RLock alone would permit a finalizer to invalidate an entry
+                # between another lease's lookup and reference-count increment.
+                _pending_environment_closes.append(self)
+                return
+            with _environment_registry_update():
+                self._close_locked()
+
+    def _close_locked(self) -> None:
+        if self._is_closed:
+            return
+        self._is_closed = True
+        environment, references = _environments[self._path]
+        if references == 1:
+            del _environments[self._path]
+            environment.close()
+        else:
+            _environments[self._path] = (environment, references - 1)
 
 
 class _FileLockWriteGuard:

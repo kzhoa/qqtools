@@ -10,6 +10,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
 
+from .work_budget import diagnostic_increment, diagnostic_span
+
 T = TypeVar("T")
 _migration_json_io_guard: ContextVar[bool] = ContextVar("migration_json_io_guard", default=False)
 _migration_json_io_authorized: ContextVar[bool] = ContextVar("migration_json_io_authorized", default=False)
@@ -44,6 +46,7 @@ def _require_migration_json_io_authorization() -> None:
         raise RuntimeError("migration callbacks must use UpgradeContext.storage for JSON I/O")
 
 
+@diagnostic_span("store.atomic_replace")
 def atomic_replace(path: Path, value: dict[str, Any]) -> None:
     _require_migration_json_io_authorization()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,11 +56,13 @@ def atomic_replace(path: Path, value: dict[str, Any]) -> None:
         with os.fdopen(fd, "wb") as handle:
             handle.write(encoded)
             handle.flush()
-            os.fsync(handle.fileno())
+            with diagnostic_span("store.fsync"):
+                os.fsync(handle.fileno())
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_DIRECTORY)
         try:
-            os.fsync(directory_fd)
+            with diagnostic_span("store.fsync"):
+                os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
     finally:
@@ -65,6 +70,7 @@ def atomic_replace(path: Path, value: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
+@diagnostic_span("store.read_json")
 def read_json(path: Path) -> dict[str, Any]:
     _require_migration_json_io_authorization()
     with path.open(encoding="utf-8") as handle:
@@ -74,6 +80,22 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def replace_snapshot_if_changed(path: Path, value: dict[str, Any]) -> bool:
+    """Replace advisory state only when different; caller owns writer serialization.
+
+    Compare persisted content so deletion, corruption, or a previous failed write
+    cannot be hidden by a process-local cache. Never use this for authority commits.
+    """
+    try:
+        if read_json(path) == value:
+            return False
+    except (FileNotFoundError, ValueError):
+        pass
+    atomic_replace(path, value)
+    return True
+
+
+@diagnostic_span("store.read_json_limited")
 def read_json_limited(path: Path, *, max_bytes: int) -> dict[str, Any]:
     """Read one JSON object after enforcing a durable record-size limit."""
     _require_migration_json_io_authorization()
@@ -100,6 +122,7 @@ def require_json_size(value: dict[str, Any], *, max_bytes: int, record_type: str
         raise ValueError(f"projection_encoding_unsupported:{record_type}")
 
 
+@diagnostic_span("store.create_if_absent")
 def create_if_absent(path: Path, value: dict[str, Any]) -> None:
     _require_migration_json_io_authorization()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,7 +134,8 @@ def create_if_absent(path: Path, value: dict[str, Any]) -> None:
     try:
         encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
         os.write(fd, encoded)
-        os.fsync(fd)
+        with diagnostic_span("store.fsync"):
+            os.fsync(fd)
     finally:
         os.close(fd)
 
@@ -134,12 +158,16 @@ def cas_update(path: Path, expected_revision: int, value: dict[str, Any]) -> Non
     atomic_replace(path, value)
 
 
+@diagnostic_span("store.iter_json")
 def iter_json(directory: Path) -> list[Path]:
     """Return sorted regular JSON files without following filesystem symlinks."""
     if not directory.is_dir():
         return []
     with os.scandir(directory) as entries:
-        names = sorted(
-            entry.name for entry in entries if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False)
-        )
+        names = []
+        for entry in entries:
+            diagnostic_increment("store.inventory_entries")
+            if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False):
+                names.append(entry.name)
+        names.sort()
     return [directory / name for name in names]

@@ -1,8 +1,10 @@
 import copy
+import gc
 import importlib
 import multiprocessing
 import os
 import pickle
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -129,3 +131,63 @@ def test_failed_transaction_acquisition_releases_its_environment(root, monkeypat
         assert dataset.get(0) == {"id": 7}
     finally:
         dataset.close()
+
+
+def _collect_reader_during_registry_update(root, phase):
+    storage = importlib.import_module("qqtools.torch.qlmdbdataset")
+    gc.disable()
+    try:
+        reader = _Dataset(root)
+        assert reader.get(0) == {"id": 7}
+        reader.cycle = reader
+        previous = weakref.ref(reader)
+        del reader
+
+        class CollectingRegistry(dict):
+            has_collected = False
+
+            def collect_once(self, operation):
+                if operation == phase and not self.has_collected:
+                    self.has_collected = True
+                    gc.collect()
+                    assert previous() is None
+
+            def get(self, key, default=None):
+                entry = super().get(key, default)
+                self.collect_once("lookup")
+                return entry
+
+            def __setitem__(self, key, value):
+                self.collect_once("increment")
+                super().__setitem__(key, value)
+
+        storage._environments = CollectingRegistry(storage._environments)
+        lease = storage._ReadonlyEnvironmentLease(root / "data.lmdb")
+        try:
+            assert storage._environments.has_collected
+            assert storage._environments[(root / "data.lmdb").resolve()][1] == 1
+            with lease.begin() as transaction:
+                assert pickle.loads(transaction.get(b"0")) == {"id": 7}
+        finally:
+            lease.close()
+        assert not storage._environments
+        # Native handle was actually released, not just removed from bookkeeping.
+        with lmdb.open(str(root / "data.lmdb"), subdir=False) as environment:
+            with environment.begin(write=True) as transaction:
+                transaction.put(b"0", pickle.dumps({"id": 8}))
+    finally:
+        gc.enable()
+
+
+@pytest.mark.parametrize("phase", ["lookup", "increment"])
+def test_gc_finalizer_cannot_deadlock_or_invalidate_inflight_lease(root, phase):
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=_collect_reader_during_registry_update, args=(root, phase))
+    try:
+        process.start()
+        process.join(timeout=30)
+        assert process.exitcode == 0, "GC reentered an unfinished LMDB registry update"
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)

@@ -119,6 +119,17 @@ def diagnostic_increment(name: str, amount: int = 1) -> None:
         diagnostics.increment(name, amount)
 
 
+def diagnostic_observe_ns(name: str, duration_ns: int) -> None:
+    """Record an observed duration without treating it as measured operation time."""
+    if type(duration_ns) is not int or duration_ns < 0:
+        raise ValueError("observed duration must be a nonnegative integer")
+    diagnostics = _ACTIVE_DIAGNOSTICS.get()
+    if diagnostics is not None:
+        diagnostics.increment(f"{name}.observations")
+        diagnostics.elapsed_ns[name] += duration_ns
+        diagnostics.maximum_ns[name] = max(diagnostics.maximum_ns[name], duration_ns)
+
+
 @dataclass(slots=True)
 class SliceBudget:
     """Enforce count limits and a monotonic soft deadline between records."""

@@ -7,13 +7,14 @@ import signal
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Generator, Iterator
 
 from ..config_types import RootConfig
 from ..runtime.paths import attempt_control_lock_path, local_paths
 from ..runtime.records import new_id, utc_now
 from ..runtime.store import atomic_replace, iter_json, read_json
 from .locks import exclusive
+from .work_budget import diagnostic_increment, diagnostic_span
 
 TERMINATION_STATES = frozenset(
     {"pending", "signal_committed", "sigterm_sent", "sigkill_sent", "confirmed", "superseded"}
@@ -29,9 +30,9 @@ _TERMINATION_TRANSITIONS = {
 
 
 @contextmanager
-def attempt_control_lock(cfg: RootConfig, attempt_id: str) -> Iterator[None]:
-    with exclusive(attempt_control_lock_path(cfg.runtime_root, attempt_id)):
-        yield
+def attempt_control_lock(cfg: RootConfig, attempt_id: str, *, blocking: bool = True) -> Iterator[bool]:
+    with exclusive(attempt_control_lock_path(cfg.runtime_root, attempt_id), blocking=blocking) as acquired:
+        yield acquired
 
 
 def decision_path(cfg: RootConfig, attempt_id: str, decision_id: str) -> Path:
@@ -103,15 +104,57 @@ def update_decision(cfg: RootConfig, attempt_id: str, decision_id: str, **change
     return decision
 
 
+def termination_check_steps(
+    cfg: RootConfig, attempt_id: str, limit: int = 8
+) -> Generator[None, None, dict[str, Any] | None]:
+    """Find a commitment in bounded pages while the caller owns the Attempt lock.
+
+    A yielded value is unfinished work, never a negative proof. The caller must
+    retain the lock through the returned result and its subsequent recovery CAS.
+    """
+    if type(limit) is not int or limit < 1:
+        raise ValueError("recovery page limit must be a positive integer")
+    directory = local_paths(cfg.runtime_root)["termination_decisions"] / attempt_id
+    try:
+        entries = os.scandir(directory)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    with entries:
+        visited = 0
+        for entry in entries:
+            diagnostic_increment("store.inventory_entries")
+            visited += 1
+            if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False):
+                record = read_json(Path(entry.path))
+                decision = record.get("termination_decision") if isinstance(record, dict) else None
+                if not isinstance(decision, dict):
+                    raise ValueError("local termination decision must be an object")
+                if decision.get("state") in {"signal_committed", "sigterm_sent", "sigkill_sent", "confirmed"}:
+                    return decision
+                if decision.get("shared_commitment") in {"committed", "unavailable"}:
+                    return decision
+            if visited == limit:
+                yield
+                visited = 0
+    return None
+
+
+def recovery_check_steps(cfg: RootConfig, attempt_id: str, limit: int = 8) -> Generator[None, None, bool]:
+    """Return a negative recovery proof only at EOF under the caller's lock."""
+    return (yield from termination_check_steps(cfg, attempt_id, limit)) is not None
+
+
 def is_recovery_blocked(cfg: RootConfig, attempt_id: str) -> bool:
-    """Return whether a local irreversible termination commitment exists."""
-    for path in list_decisions(cfg, attempt_id):
-        decision = read_json(path).get("termination_decision", {})
-        if decision.get("state") in {"signal_committed", "sigterm_sent", "sigkill_sent", "confirmed"}:
-            return True
-        if decision.get("shared_commitment") in {"committed", "unavailable"}:
-            return True
-    return False
+    """Synchronous recovery check for callers retaining the Attempt lock."""
+    with diagnostic_span("termination.recovery_inventory"):
+        steps = recovery_check_steps(cfg, attempt_id)
+        try:
+            while True:
+                next(steps)
+        except StopIteration as result:
+            return result.value
+        finally:
+            steps.close()
 
 
 def commit_local_unavailable(cfg: RootConfig, attempt_id: str, decision_id: str) -> dict[str, Any]:
@@ -173,3 +216,58 @@ def send_signals(cfg: RootConfig, attempt_id: str, decision_id: str, *, grace_se
     if not _matches_process_group(pgid, start):
         return update_decision(cfg, attempt_id, decision_id, state="confirmed", confirmation="process_absent")
     return decision
+
+
+def advance_signals(
+    cfg: RootConfig,
+    attempt_id: str,
+    decision_id: str,
+    *,
+    sigterm_deadline: float | None,
+    grace_seconds: float = 5.0,
+) -> tuple[dict[str, Any], float | None]:
+    """Advance one committed signal step without sleeping under the Attempt lock.
+
+    The caller owns the Attempt control lock and the advisory monotonic deadline.
+    Losing that deadline grants a fresh grace period; it never accelerates SIGKILL.
+    Every call reloads the durable decision and rechecks process-group identity.
+    """
+    decision = read_json(decision_path(cfg, attempt_id, decision_id))["termination_decision"]
+    state = decision["state"]
+    if state == "pending":
+        raise RuntimeError("signal_committed must be durable before sending a signal.")
+    if state in {"confirmed", "superseded"}:
+        return decision, None
+    pgid = decision.get("process_group_id")
+    start = decision.get("process_group_start_time_ticks")
+    if not _matches_process_group(pgid, start):
+        return (
+            update_decision(cfg, attempt_id, decision_id, state="confirmed", confirmation="identity_absent"),
+            None,
+        )
+    if state == "signal_committed":
+        os.killpg(pgid, signal.SIGTERM)
+        decision = update_decision(
+            cfg,
+            attempt_id,
+            decision_id,
+            state="sigterm_sent",
+            signal_attempts=decision["signal_attempts"] + [{"signal": "SIGTERM", "at": utc_now()}],
+        )
+        return decision, time.monotonic() + grace_seconds
+    if state == "sigterm_sent":
+        if sigterm_deadline is None:
+            return decision, time.monotonic() + grace_seconds
+        if time.monotonic() < sigterm_deadline:
+            return decision, sigterm_deadline
+        os.killpg(pgid, signal.SIGKILL)
+        decision = update_decision(
+            cfg,
+            attempt_id,
+            decision_id,
+            state="sigkill_sent",
+            signal_attempts=decision["signal_attempts"] + [{"signal": "SIGKILL", "at": utc_now()}],
+        )
+    if not _matches_process_group(pgid, start):
+        decision = update_decision(cfg, attempt_id, decision_id, state="confirmed", confirmation="process_absent")
+    return decision, None

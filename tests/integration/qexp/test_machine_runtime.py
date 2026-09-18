@@ -44,6 +44,7 @@ from qqtools.plugins.qexp.runtime.resources.reservations import (
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
+from tests.helpers.qexp.clock import set_offer_evaluation_time
 from tests.helpers.qexp.lifecycle import wait_until
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -1113,7 +1114,7 @@ def test_machine_cleanup_keeps_other_project_reservation_with_same_task_id(tmp_p
     assert [item["project_id"] for item in active_reservations(runtime.root)] == [second_binding.project_id]
 
 
-def test_machine_maintenance_offers_elapsed_work(tmp_path: Path) -> None:
+def test_machine_maintenance_offers_elapsed_work(tmp_path: Path, monkeypatch) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     create_group(cfg, "exp")
     task = submit(
@@ -1126,6 +1127,7 @@ def test_machine_maintenance_offers_elapsed_work(tmp_path: Path) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
 
+    set_offer_evaluation_time(monkeypatch, cfg, task.task_id)
     dispatch_machine_cycle(runtime, available_gpus=[], executor=_RecordingExecutor())
 
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
@@ -1379,6 +1381,7 @@ def test_machine_control_heartbeat_skips_binding_without_write_eligibility(
     control_plane._publish_heartbeat()
 
     assert eligibility_checks == [(binding, True)]
+    assert control_plane._heartbeat_snapshot["operations"]["counters"]["heartbeat.write_guard_rejected_projects"] == 1
     assert not (cfg.shared_root / "machines" / cfg.machine_name / "state" / "agent.json").exists()
 
 
@@ -1463,8 +1466,14 @@ def test_machine_control_authority_is_not_blocked_by_slow_project_maintenance(
     maintenance_started = Event()
 
     class RecordingSupervisor:
-        def __init__(self, cfg, *, reservation_runtime_root) -> None:
+        work_snapshot = {"startup_complete": True}
+
+        def close(self) -> None:
+            pass
+
+        def __init__(self, cfg, *, reservation_runtime_root, work_limit=64) -> None:
             del reservation_runtime_root
+            self.work_limit = work_limit
             self.cfg = cfg
 
         @property
@@ -1521,8 +1530,14 @@ def test_machine_control_authority_survives_reservation_snapshot_failure(
     is_ticked = Event()
 
     class RecordingSupervisor:
-        def __init__(self, _cfg, *, reservation_runtime_root) -> None:
+        work_snapshot = {"startup_complete": True}
+
+        def close(self) -> None:
+            pass
+
+        def __init__(self, _cfg, *, reservation_runtime_root, work_limit=64) -> None:
             del reservation_runtime_root
+            self.work_limit = work_limit
 
         @property
         def renewal_interval_seconds(self) -> float:
@@ -1714,3 +1729,268 @@ def test_machine_agent_ignores_a_reused_or_stale_pid_record(tmp_path: Path) -> N
     assert get_machine_agent_status(runtime)["is_running"] is False
     assert stop_machine_agent(runtime) is False
     assert not runtime.paths["pid"].exists()
+
+
+def test_machine_dispatch_waits_for_current_generation_authority_recovery(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    task = submit(cfg, ["echo", "ready"], working_dir=tmp_path)
+    runtime = MachineRuntime(tmp_path / "machine")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    executor = _RecordingExecutor()
+    plane = _MachineControlPlane(
+        runtime, instance_id="test", loop_interval=0.1, started_at="2026-09-18T00:00:00Z", available_gpus=[0]
+    )
+    try:
+        result = dispatch_machine_cycle_locked(runtime, available_gpus=[0], executor=executor, supervise=False)
+        assert any(item["status"] == "authority_recovering" for item in result)
+        assert executor.launched == []
+        assert not load_task(cfg, task.task_id).claim_control.get("active_claim")
+        plane._run_authority_cycle()
+        assert runtime.authority_ready_generations[binding.project_id] == binding.registration_generation
+        dispatch_machine_cycle_locked(runtime, available_gpus=[0], executor=executor, supervise=False)
+        assert [task_id for task_id, _attempt in executor.launched] == [task.task_id]
+    finally:
+        plane.stop()
+
+
+@pytest.mark.parametrize("is_superseded", [False, True])
+def test_ineligible_registration_only_exit_releases_capacity_without_shared_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, is_superseded: bool
+) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    task = submit(cfg, ["echo", "finished"], working_dir=tmp_path)
+    runtime = MachineRuntime(tmp_path / "machine")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    paths = runtime.project_paths(binding.project_id)
+    reservation = reserve(runtime.root, task.task_id, [0], project_id=binding.project_id)
+    attach(runtime.root, reservation["reservation"]["reservation_id"], "finished-attempt", 1)
+    registration = paths["registrations"] / "finished-attempt.json"
+    observation = paths["observations"] / "finished-attempt.json"
+    atomic_replace(
+        registration,
+        {
+            "process_registration": {
+                "protocol_version": 1,
+                "task_id": task.task_id,
+                "attempt_id": "finished-attempt",
+                "fencing_token": 1,
+                "process_group_id": 99999992,
+                "process_group_start_time_ticks": 2,
+            }
+        },
+    )
+    atomic_replace(
+        observation,
+        {
+            "exit_observation": {
+                "protocol_version": 1,
+                "task_id": task.task_id,
+                "attempt_id": "finished-attempt",
+                "observed_exit_code": 0,
+            }
+        },
+    )
+    before = load_task(cfg, task.task_id).to_dict()
+    monkeypatch.setattr(runtime, "binding_write_eligible", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        runtime, "registration_status", lambda _binding: {"state": "superseded" if is_superseded else "expired"}
+    )
+
+    def unexpected_reactivation(_binding):
+        pytest.fail("registration-only local cleanup must not reactivate shared ownership")
+
+    monkeypatch.setattr(runtime, "reactivate_binding", unexpected_reactivation)
+    plane = _MachineControlPlane(
+        runtime, instance_id="test", loop_interval=0.1, started_at="2026-09-18T00:00:00Z", available_gpus=[0]
+    )
+    try:
+        plane._run_authority_cycle()
+        assert bool(active_reservations(runtime.root)) is is_superseded
+        assert registration.exists() and observation.exists()
+        assert not (paths["processes"] / "finished-attempt.json").exists()
+        assert load_task(cfg, task.task_id).to_dict() == before
+        assert runtime.authority_ready_generations == {}
+    finally:
+        plane.stop()
+
+
+@pytest.mark.parametrize("is_reactivation", [False, True])
+def test_registration_renewal_diagnostics_measure_completed_publication(tmp_path, monkeypatch, is_reactivation):
+    from datetime import datetime, timedelta, timezone
+
+    from qqtools.plugins.qexp.agent import context
+    from qqtools.plugins.qexp.lease import load_lease_policy
+    from qqtools.plugins.qexp.runtime.work_budget import RuntimeDiagnostics, activate_diagnostics
+
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    stored = read_json(path)
+    now = datetime.now(timezone.utc)
+    remaining = -5 if is_reactivation else 100
+    stored["registration"]["eligibility_expires_at"] = (now + timedelta(seconds=remaining)).isoformat()
+    atomic_replace(path, stored)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(context, "datetime", FixedDateTime)
+    policy = load_lease_policy(cfg)
+    diagnostics = RuntimeDiagnostics()
+    with activate_diagnostics(diagnostics):
+        if is_reactivation:
+            assert runtime.reactivate_binding(binding)
+        else:
+            assert runtime.binding_write_eligible(binding, renew=True)
+    expected = int((policy.ttl_seconds - policy.renew_interval_seconds - remaining) * 1_000_000_000)
+    assert diagnostics.elapsed_ns["registration.renewal_lateness"] == expected
+    assert diagnostics.maximum_ns["registration.renewal_lateness"] == expected
+    assert diagnostics.counters["registration.renewal_lateness.observations"] == 1
+    outcome = "registration.reactivation" if is_reactivation else "registration.renewal"
+    assert diagnostics.counters[outcome] == 1
+    assert read_json(path)["registration"]["generation"] == binding.registration_generation
+
+    if is_reactivation:
+        damaged = read_json(path)
+        damaged["registration"]["eligibility_expires_at"] = "unreadable-date"
+        atomic_replace(path, damaged)
+        repaired = RuntimeDiagnostics()
+        with activate_diagnostics(repaired):
+            assert runtime.reactivate_binding(binding)
+        assert repaired.counters["registration.reactivation"] == 1
+        assert repaired.counters["registration.renewal_lateness_unavailable"] == 1
+        assert repaired.counters["registration.renewal_lateness.observations"] == 0
+
+    def failed_save(*_args):
+        raise OSError("registration publication failed")
+
+    due = read_json(path)
+    due["registration"]["eligibility_expires_at"] = (now + timedelta(seconds=100)).isoformat()
+    atomic_replace(path, due)
+    monkeypatch.setattr(context, "save_machine_registration", failed_save)
+    failed = RuntimeDiagnostics()
+    with activate_diagnostics(failed):
+        assert not runtime.binding_write_eligible(binding, renew=True)
+    assert failed.counters["registration.renewal"] == 0
+    assert failed.counters["registration.renewal_lateness.observations"] == 0
+
+
+@pytest.mark.parametrize("is_due", [False, True])
+def test_heartbeat_snapshot_counts_actual_registration_publications(tmp_path, is_due):
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    if is_due:
+        from datetime import datetime, timedelta, timezone
+
+        path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+        due = read_json(path)
+        due["registration"]["eligibility_expires_at"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=100)
+        ).isoformat()
+        atomic_replace(path, due)
+    plane = _MachineControlPlane(
+        runtime,
+        instance_id="test-agent",
+        loop_interval=0.25,
+        started_at="2026-09-18T00:00:00Z",
+        available_gpus=[],
+    )
+    plane._publish_heartbeat()
+    sample = plane._heartbeat_snapshot
+    assert sample["observation_status"] == "returned"
+    counters = sample["operations"]["counters"]
+    # Both paths validate authority, but only the first due guard publishes.
+    assert counters.get("registration.renewal", 0) == int(is_due)
+    assert counters.get("registration.renewal_lateness.observations", 0) == int(is_due)
+    assert counters["store.atomic_replace.calls"] >= 1 + int(is_due)
+    assert (cfg.shared_root / "machines" / cfg.machine_name / "state" / "agent.json").exists()
+    assert runtime.registration_status(binding)["write_eligible"]
+
+
+@pytest.mark.parametrize("lane", ["active", "provisional", "cpu_active", "cpu_provisional"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        [],
+        {},
+        {"reservation": None},
+        {"reservation": []},
+        {"reservation": "bad"},
+        {"reservation": {"state": "active", "gpu_ids": [0, "bad"]}},
+    ],
+)
+def test_malformed_capacity_does_not_stop_heartbeat_and_is_retained(tmp_path, lane, value):
+    from qqtools.plugins.qexp.runtime.paths import local_paths
+
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    path = local_paths(runtime.root)[lane] / "invalid.json"
+    atomic_replace(path, value)
+    original = path.read_bytes()
+    plane = _MachineControlPlane(
+        runtime, instance_id="test", loop_interval=0.1, started_at="2026-09-18T00:00:00Z", available_gpus=[0]
+    )
+    try:
+        status = "capacity_unavailable"
+        if value == {"reservation": {"state": "active", "gpu_ids": [0, "bad"]}}:
+            status = "publication_unavailable"
+        else:
+            assert plane._reserved_gpu_ids() is None
+        for sequence in (1, 2):
+            plane._publish_heartbeat()
+            assert plane._heartbeat_snapshot["sequence"] == sequence
+            assert plane._heartbeat_snapshot["observation_status"] == status
+            assert path.read_bytes() == original
+        path.rename(tmp_path / "retained-invalid.json")
+        plane._publish_heartbeat()
+        assert plane._heartbeat_snapshot["sequence"] == 3
+        assert plane._heartbeat_snapshot["observation_status"] == "returned"
+        assert (tmp_path / "retained-invalid.json").read_bytes() == original
+    finally:
+        plane.stop()
+
+
+@pytest.mark.parametrize("is_active", [False, True])
+def test_disabled_reservation_only_binding_drains_before_authority_readiness(tmp_path, is_active):
+    from qqtools.plugins.qexp.runtime.paths import local_paths
+
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    reservation = reserve(runtime.root, "unclaimed-task", [0], project_id=binding.project_id)
+    reservation_id = reservation["reservation"]["reservation_id"]
+    if is_active:
+        attach(runtime.root, reservation_id, "absent-attempt", 1)
+        path = local_paths(runtime.root)["active"] / f"{reservation_id}.json"
+    else:
+        path = local_paths(runtime.root)["provisional"] / f"{reservation_id}.json"
+        value = read_json(path)
+        value["reservation"]["expires_at"] = "2000-01-01T00:00:00Z"
+        atomic_replace(path, value)
+    disabled = runtime.set_enabled(binding.project_id, False)
+    assert runtime.binding_state(disabled) == "draining"
+    plane = _MachineControlPlane(
+        runtime, instance_id="test", loop_interval=0.1, started_at="2026-09-18T00:00:00Z", available_gpus=[0]
+    )
+    executor = _RecordingExecutor()
+    try:
+        plane._run_authority_cycle()
+        assert runtime.authority_ready_generations == {}
+        assert plane._supervisors == {}
+        dispatch_machine_cycle_locked(
+            runtime, available_gpus=[0], executor=executor, supervise=False, publish_snapshots=False
+        )
+        assert not path.exists()
+        released = local_paths(runtime.root)["released"] / path.name
+        assert read_json(released)["reservation"]["release_reason"] == (
+            "task_missing" if is_active else "provisional_expired"
+        )
+        assert runtime.binding_state(disabled) == "disabled"
+        assert executor.launched == []
+    finally:
+        plane.stop()
