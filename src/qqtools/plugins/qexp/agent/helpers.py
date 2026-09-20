@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, ContextManager
@@ -56,25 +57,11 @@ def _read_pid(runtime: MachineRuntime) -> int | None:
         return None
 
 
-def _has_local_lifecycle_evidence(runtime: MachineRuntime, project_id: str) -> bool:
-    """Return whether one project still has evidence requiring agent ownership."""
-    paths = runtime.project_paths(project_id)
-    for name in (
-        "processes",
-        "registrations",
-        "observations",
-        "launch_intents",
-        "termination_decisions",
-    ):
-        root = paths[name]
-        if root.is_dir() and any(root.rglob("*.json")):
-            return True
-    return False
-
-
 def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool) -> bool:
-    """Check the bounded local conditions required by on-demand idle exit."""
+    """Retain unfinished recovery and reservations before on-demand idle exit."""
     if getattr(runtime, "upgrade_pending_projects", set()):
+        return False
+    if getattr(runtime, "recovery_enrollment_pending_projects", set()):
         return False
     try:
         _revision, bindings = runtime.load_registry()
@@ -84,11 +71,12 @@ def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool
         # Startup waits until the current process has validated and consumed a binding.
         return False
     for binding in bindings:
-        if _has_local_lifecycle_evidence(runtime, binding.project_id):
-            return False
-        if not binding.enabled:
-            continue
         try:
+            with closing(runtime.iter_recovery_blockers(binding, should_use_capture=True)) as blockers:
+                if next(blockers, None) is not None:
+                    return False
+            if not binding.enabled:
+                continue
             cfg = _binding_config(runtime, binding)
             paths = shared_paths(cfg.shared_root)
             if any(
@@ -372,6 +360,7 @@ def _recover_starting_reservations(
                         attempt.attempt_id,
                         attempt.current_fencing_token,
                         "executor_launch_failed",
+                        should_require_unstarted=True,
                         reservation_runtime_root=runtime.root,
                     )
                 except (KeyError, OSError, RuntimeError, ValueError):

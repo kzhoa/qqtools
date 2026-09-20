@@ -143,7 +143,11 @@ def iter_active_operation_paths(
         for entry in entries:
             if yielded >= limit:
                 return
-            if not entry.is_file() or not entry.name.endswith(".json"):
+            if entry.is_symlink() or not entry.is_file() or not entry.name.endswith(".json"):
+                continue
+            # Stable aliases and interrupted-import copies refer to the active
+            # truth already covered above; never grant it a second work slice.
+            if (active / entry.name).exists():
                 continue
             path = Path(entry.path)
             try:
@@ -171,6 +175,15 @@ def _operation_is_terminal(kind: ActiveOperationKind, record: dict) -> bool:
     state = _operation_state(kind, record)
     if state in _terminal_states(kind):
         return True
+    if (
+        kind == "group_control"
+        and record.get(kind, {}).get("operation_type") == "worker_remove"
+        and state == "blocked"
+        and record.get(kind, {}).get("blocked_reason") == "legacy_worker_incarnation_unknown"
+    ):
+        return True
+    if kind == "group_control" and record.get(kind, {}).get("operation_type") == "worker_remove_v2":
+        return state == "superseded"
     if kind == "availability":
         return state == "blocked" and bool(record.get("availability_operation", {}).get("blocked_reason"))
     return False

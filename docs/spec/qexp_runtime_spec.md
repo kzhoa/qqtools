@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-09
+updated_at: 2026-09-20
 archived_at:
 ---
 
@@ -1091,6 +1091,24 @@ schema fence before its Group or Task locks. Schema/capability mutation holds th
 lock, which waits for all narrow writers and prevents a mutation from overtaking one. The projection
 activation commit is the sole selector of the narrow path.
 
+After acquiring either side of the writer fence, current writers validate the
+entire required-capability set and the installed ready writer revision before
+entering the mutation section. This includes cached submissions, Group-only
+controls and cleanup replay after Task truth is gone; validation at `save_task`
+alone is too late for prior Attempt or reservation writes. Nested writer scopes
+reuse the outer validation while retaining its schema lock. If the Group-member
+projection becomes inactive while an ordinary writer waits, acquiring the broad
+fence does not permit that writer to proceed. Ordinary narrow
+writers also require the complete ready schema gate. Broad maintenance entry
+can inspect a missing ready schema marker so build/audit can report degradation;
+it still rejects unknown required/ready writer capabilities, and any Task save
+requires the complete gate. Empty-root initialization remains available through
+the broad primitive.
+
+This guard describes current code. Released writers lacking the locked checks
+remain subject to separate activation qualification; installing a new capability
+is not evidence that all old processes are fenced.
+
 The operation exists before Task staging, so `doctor` can recover a terminal interruption.
 Doctor reads, validates, and clears a terminal operation's pending Group commit only while holding
 the same schema and Group writer fences; it must not overwrite a Group snapshot read before those
@@ -1208,6 +1226,64 @@ Completion rules:
 After CLI or agent restart, `qexp group show`, the cancellation command, or `doctor`
 reloads the operation and resumes convergence idempotently. CLI pending-machine output is
 derived from `pending_machine_acknowledgements`, never from an in-memory command session.
+An operation still marked `preparing` is resumable when its Group barrier is durable.
+Reconciliation replays missed queued cancellation, pre-launch terminal transition,
+and running termination intent before declaring convergence. It reloads operation
+truth after acquiring the Group lock, and replay of an older default cancellation
+must not clear a later termination request. Local reservation release and lifecycle
+hooks follow committed pre-launch transitions after authority locks are released.
+`doctor repair` uses this same replay for active and legacy operation records and
+reports rejected or unfinished cancellation as blocked rather than repaired.
+
+An active applicable barrier also fences claim and fresh launch authorization,
+before a member's asynchronous cancellation effect reaches Task truth. A completed
+operation does not permanently prohibit an independent Task retry. Resuming an
+already committed launch under default cancellation preserves its original launch
+identity; that exception requires matching `starting` state and launch identity in
+both Task and Attempt. It does not apply to a terminating cancellation.
+
+In the isolated canonical Group namespace, cancellation traverses the certified
+membership prefix through its fixed high watermark. Each maintenance call handles
+one member or one ordered change record under the existing Group and Task fences.
+Unconfirmed coverage waits for background discovery; it does not trigger a Task
+history scan in cancellation. Other namespaces retain the existing compatibility
+path until canonical Group activation. The CLI activates the local agent after
+publishing pending canonical cancellation intent so background discovery and
+convergence can continue after the command returns.
+
+Each operation persists its membership cursor, change cursor, and per-member
+classification receipts. A pending receipt in the operation record commits the
+counter change and cursor together; restart finishes that receipt before processing
+another member. A pre-effect member intent is not evidence of successful
+cancellation. Missing Task truth requires matching completed cleanup evidence;
+unexplained absence and partial Task/Attempt transitions cannot certify completion.
+Generation invalidation restarts the census while retaining durable receipt
+contributions and any pending receipt write. Retained-Task counts can decrease
+after cleanup; proven historical cancellation effects remain counted. A cancelled
+Attempt records its cancellation operation identity so its own interrupted
+pre-launch transition can finish even if journal publication had to invalidate
+the generation before that effect.
+
+Retry, claim loss, terminal publication, recovered execution authority, cancellation
+effects, and cleanup deletion publish recheck obligations before their covered
+effects while holding the Group fence. Lease-only updates do not publish changes.
+An interrupted obligation remains unresolved until its transition owner or a typed
+settler proves completion or a safe no-effect abort. In particular, retry settlement
+can finish or discard the exact ready generation without re-executing the retry
+command. Cleanup preserves terminal outcome provenance before deleting Task or
+Attempt evidence needed by cancellation.
+Matching completed cleanup can settle older obligations for the retired Task
+identity; it cannot authorize replay or replacement execution.
+
+Completion requires the fixed membership range, all relevant change records,
+receipts, and required acknowledgements to be resolved under the same Group fence.
+A durable discovery-generation change invalidates earlier completion proofs.
+When change publication fails, a writer must durably invalidate those proofs before
+continuing its covered effect; failure of both writes prevents that shared effect.
+The change journal remains enabled after its first consumer. Background maintenance
+reclaims resolved prefixes only after certifying a conservative minimum consumer
+cursor. The scheduling gate's retained-barrier lookup cost remains part of the
+full feature's scale acceptance.
 
 ### 11.3 Worker Set Changes
 
@@ -1231,6 +1307,312 @@ rehome, change queued placement policy, offer, or cancel those Tasks explicitly.
 
 Forced removal publishes termination intent but does not bypass queued-work or ambiguous
 process safety checks.
+
+After automatic Group authority isolation, new removals use `worker_remove_v2`.
+They persist the original worker snapshot and intended draining epoch before any
+worker mutation, then publish `draining` with `removal_operation_id`. The operation
+also binds the project's canonical directory identity. Preparing replay installs
+the drain only if the original worker still matches exactly. Subsequent replay
+requires that exact per-worker operation binding; benign role or quota edits do
+not invalidate it. Reactivating a worker clears the binding and supersedes the old
+removal. Explicitly draining a removing worker also clears the prior binding so
+a later remove can create a fresh operation. Draining an already-draining worker
+keeps its unfinished removal binding. A latest-operation Group snapshot is
+advisory, not ownership authority.
+
+Repeated removal reuses an unfinished bound operation and may escalate
+termination, never downgrade it. An explicit removal after a terminal operation
+creates a fresh intent and checks current blockers, including Tasks retried onto
+the worker after the earlier completion. Finalization publishes the authoritative `removing` state before
+archiving the completed operation. Both interrupted drain publication and
+interrupted completion remain replayable.
+
+Canonical removal discovers candidates from certified Group membership, one Task
+per advance, without enumerating the Task directory. Its initial watermark does
+not freeze membership: completion must cover the current committed Group tail,
+including submissions committed after draining began. Incomplete or damaged
+coverage keeps removal pending; there is no historical-scan fallback. Pending
+CLI removals activate the local agent after durable intent publication.
+
+Each removal keeps its census and change cursors together with current sensitive
+Task classifications in its durable operation. Terminal history needs no retained
+per-Task contribution. Retry, claim, launch, terminal, cancellation, availability
+and cleanup transitions publish ordered recheck obligations at their owners.
+Lease renewal alone does not publish an obligation. A partial claim or launch
+cannot be acknowledged from old Task truth or repaired by inventing execution
+authority; the existing owner or a typed proof of completion must resolve it.
+
+Worker policy changes recheck current sensitive classifications in bounded passes,
+without restarting the terminal-history census. A shared queued Task is safe only
+if another active worker satisfies its fallback constraint and its static GPU
+quota can fit the Task. Temporary Group pause or occupied capacity is not a placement-stranding condition. Private and home-only
+queued Tasks still require explicit user resolution; forced removal never skips
+these checks. A queued Task whose home is draining may still change availability
+to resolve the blocker; helper workers must remain active. A detached orphan does
+not retain an active claim: its existing explicit retry or proven live recovery
+is a fresh journaled transition, not evidence that the old process has stopped.
+Termination escalation rechecks existing active claims and waits
+for authoritative acknowledgement.
+
+Under the same Group fence, finalization verifies current membership coverage,
+the current change generation and tail, current worker policy, the original
+worker binding, and absence of blockers or unresolved changes. The authoritative
+`removing` publication still precedes operation archival. Once that exact bound
+worker is durably `removing`, archive recovery completes the original operation
+without resubscribing to later independent Task retries. Current Group status
+contains a discovery summary; the operation owns the full sensitive-task state.
+A discovery generation change requires a fresh census. A missing Task requires matching completed cleanup
+and its terminal outcome witness; unexplained missing records cannot authorize
+removal. Background journal reclamation preserves the minimum subscribed cursor;
+it never treats an unresolved change as an acknowledgement.
+
+Legacy unfinished `worker_remove` operations have no worker-incarnation proof.
+After namespace cutover they become `blocked` with
+`legacy_worker_incarnation_unknown`, are retained as history, and make no Task,
+process, worker or resource changes. The user may reissue the existing remove
+command to establish a new bound operation. This compatibility change was
+explicitly approved; it is not a required step for agent restart or running-work
+recovery.
+
+### 11.3.1 Canonical Group namespace and rolling activation
+
+Pre-isolation and isolated roots are permanent supported formats. Automatic
+migration, pre-activation writers and legacy-operation blocking have no scheduled
+removal; they are product compatibility contracts rather than temporary shims.
+
+Machine agent status exposes `group_authority` separately from local
+`recovery_capture`: waiting, prepared/moved, active, or unavailable. Reading this
+status performs fixed metadata checks without advancing migration.
+
+Machine enrollment advances Group isolation after its retained-writer capture
+completes and the shared all-participant recovery fence is durable. A busy schema
+lock, conflicting upgrade or unfinished ready build defers activation; compatible
+service continues. No per-project activation command or workload drain is used.
+
+Capture completion certifies discovery coverage for the exact registration
+generation; it does not certify that its captured responsibilities have retired.
+Group activation may proceed while the original source remains retained. Source
+release is a separate maintenance transition, requiring the existing retirement
+and durable release-receipt proof. Enrollment remains pending until activation
+and source release both finish. Neither completion alone establishes supervision
+readiness, permits a duplicate launch, nor replaces the all-participant fence.
+
+Compatibility interpretation for these existing protocols has one policy owner,
+`runtime/protocol_compatibility.py`. Initialization, writer admission, projection
+repair and upgrade metadata consume its definitions through their existing
+storage/locking boundaries. No additional authoritative record is introduced.
+The upgrade metadata manifest recognizes the exact released initializer state
+whose fingerprint predates ready-v1 bootstrap, as well as the already supported
+independently fenced recovery/Group extensions. Unrecognized schema differences
+remain invalid. Audit and repair-plan freshness still fingerprint entire observed
+records; accepting a known terminal manifest does not validate a stale repair.
+If a released agent already recorded the corresponding false-positive metadata
+audit failure, writable upgrade discovery may reconcile that exact historical
+journal after revalidating its terminal manifest under upgrade and schema locks.
+The production migration explicitly opts into this recognition; other migrations
+default to no automatic reconciliation. Explicit pause intents, repair
+transactions, in-flight slices, unrelated errors and changed target evidence
+prevent reconciliation. Success increments the operation fence, retains the
+historical error in diagnostic detail and records completion without rewriting
+schema, manifest or execution records. Read-only status never performs it.
+
+The selected transition boundaries are:
+
+| Transition / entry | Guards before effects | Durable result and recovery owner |
+| --- | --- | --- |
+| Recovery admission / `fence_recovery_admission` | Scheduler authority, registration ownership and schema exclusion; participant validation | Shared capability fence; enrollment retries until all participants qualify |
+| Capture start/completion / `RecoveryCapture.advance` | Scheduler, registry, binding and schema guards around retention/publication; intermediate slices use retained-storage guards | Capture proof bound to source and generation; capture replay resumes it without releasing the source |
+| Group activation / `activate_group_authority` | Current capture proof and source identity, binding ownership, schema exclusion and upgrade readiness | Existing prepared/moved/completed namespace journal; namespace activation resumes partial persistence |
+| Source release / `release_source` | Local scheduler and registry ownership, exact capture proof, source-parent guards and responsibility retirement | Existing release intent/receipt precedes hold deletion; source maintenance retries without changing Group truth |
+| Group removal / `begin_worker_removal_locked` and replay | Schema/Group locks, canonical namespace identity and worker operation binding | Preparing intent precedes draining; removing precedes operation archive; the shared reconciler resumes or supersedes the operation |
+| Attempt terminal transition / `commit_terminal_transition_locked` | Caller-held authority locks and exact Task/Attempt/token applicability | Attempt result precedes claim archive and Task terminal projection; lifecycle reconciliation/doctor repairs partial persistence |
+
+These interfaces are not a universal transaction layer. In particular, Task-save
+validation is later than some terminal effects and cannot replace admission
+checks at the enclosing transition. Released cached writers do not acquire new
+Python guards; their enforced boundary remains the qualified namespace and
+writer-floor protocol.
+
+Under the exclusive schema lock, activation first appends `ready-v2` to supported
+schema writers, then selects it in ready state. Current code serves both ready-v1
+and ready-v2 roots; explicit ready-v1 Task persistence rejects the latter. Ready
+Repair and empty-index reconstruction derive the minimum writer floor from
+durable schema/Group activation metadata, including after loss of ready state. Missing ready state after the ready-v2 schema
+publication rejects current Task writes. This is a Task-record persistence fence, not a
+general fence for every historical Attempt, claim or cleanup writer.
+
+`schema/group-authority.json` records project/root identity, a stable directory
+identity, and prepared/moved/completed phases. A durable `.authority-identity`
+file inside the Group directory supplies a shared identity independent of each
+host's device numbers. Activation renames `groups/` to `groups-v2/` on the same
+filesystem, synchronizes the root, and publishes `group-authority-v2` and journal
+completion. It performs fixed metadata work rather than copying Group history.
+
+Recovery selects only the directory matching that journal identity. A matching
+destination is authoritative even if the process died before recording the moved
+phase. Missing or mismatched activated identity fails closed. Released writers
+may recreate `groups/`; that shadow is never read as authority and no compatibility
+symlink is installed. Shadows are retained rather than recursively deleted during
+activation. Locks retain their existing `locks/groups/` names.
+
+Current writers resolve Group paths inside schema/Group fences. Read-only access
+retries a concurrent namespace change; enumeration uses the shared schema fence.
+Initialization, validation, doctor, scheduling and observation use the canonical
+namespace. Shared operation records grant no authority by themselves: cancellation
+requires the exact canonical barrier, grouped submission finalization requires
+the exact pending submission, and versioned removal requires its per-worker and
+directory binding. Released cached Group writers cannot mutate the moved truth.
+
+### 11.3.2 Background membership discovery and recovery
+
+Group membership discovery derives locators from committed Submission truth in
+the isolated canonical Group namespace. Its identity includes project identity,
+canonical Group directory identity, and Group name. It does not authorize Task
+mutation, launch, cancellation, or resource release. Those operations retain
+current truth checks and their existing authority fences.
+
+The background service projects and qualifies one source incrementally. Recovery
+uses three durable boundaries:
+
+- The parser checkpoint retains the source revision, parsing progress and event
+  spool. An interrupted, unconfirmed uniqueness audit may restart from the
+  completed spool; previously confirmed sources need not be parsed again.
+- A source receipt becomes reusable only after validation and referenced output
+  durability. Reopening checks the exact source and output revisions. A replaced
+  source or invalid receipt cannot count as confirmed membership.
+- Each member locator is durable before its publication cursor advances. Replaying
+  a member after interruption is idempotent. A conflicting mapping makes coverage
+  unavailable instead of replacing the earlier mapping.
+
+Coverage advances only through consecutive verified sequence numbers. Directory
+EOF alone proves nothing. Current Group membership tail and pending Submission
+finalization determine whether the known prefix covers the required range;
+missing members and conflicts remain explicit incomplete states. A locator can
+refer to a cleaned Task and does not establish current Task existence or state.
+
+Before committed Submission finalization clears its Group pending locator, it
+publishes discoverable membership debt. Submission does not wait for historical
+backfill. Initial background discovery reads retained Submission sources;
+completed bootstrap uses the active debt directory on subsequent passes and
+restarts. Interrupted debt consumption retains either the debt or an already
+durable publication. Source confirmation uses byte/operation slices, while
+membership publication uses bounded per-row record operations.
+
+The service runs outside scheduling and renewal paths and does not independently
+keep an otherwise idle on-demand agent alive. Stopping the agent requests source
+cleanup without affecting running Tasks. Group cancellation and Worker removal
+consume this coverage in the canonical namespace. The worker retains per-Group
+confirmation state and rotates after one step. Each Group alternates discovery
+and maintenance visits; a large source, pending finalization, or maintenance
+failure cannot monopolize logical service. Registry refresh preserves unchanged
+bindings and discovers new Groups while earlier bootstraps remain unfinished.
+Removed or disabled bindings stop receiving work and release owned resources
+cooperatively. This cache scales with known Groups; it is not a fixed-memory
+promise for an unlimited Group count.
+
+One machine turn admits at most one Group-directory discovery step, one Group
+work step, and one cooperative cleanup step. Source steps retain their 256 KiB,
+32-operation and 20 ms soft-deadline limits; Group publication retains its existing
+per-record bounds. No Group receives a dedicated thread. These are cooperative
+work limits, not a bound on blocking filesystem calls or fsync latency. Large
+machine-scale qualification remains required before complete feature promotion.
+
+Ready classification, scheduler eligibility, availability transitions and dependency
+checks use bounded Submission visibility. The authoritative operation JSON remains
+the submission commit point. Sources up to 64 KiB are read directly within that
+limit, independently of derived-control health. Larger sources use an at-most
+8 KiB receipt under `indexes/submission-control/records/`, bound to the operation
+ID, resolved shared root and source revision `[0, inode, size, mtime_ns, ctime_ns]`.
+The reserved zero avoids treating client-local device numbers as shared identity.
+Readers validate the regular source file before and after reading its receipt;
+missing truth or replacement cannot be authorized by an old receipt.
+
+Large-source publication durably records pending responsibility before preparing
+the source. After the source temporary file is synchronized, its intended state
+and inode/size/mtime witness are synchronized in the pending record before rename.
+The source rename and parent-directory barrier precede receipt publication and
+pending retirement. A crash after rename can reconstruct the receipt from the
+matching witness without parsing retained specifications. Failed derived writes
+leave discoverable repair responsibility and do not undo committed truth. Small
+source publication retains its single authoritative atomic write.
+
+Fresh roots initialize active control state. Existing roots automatically capture
+Submission sources on an independent registered-project background worker. Source
+capture reads and processes at most 64 KiB per step, retaining revision-bound
+parser checkpoints of at most 512 KiB. Compatible full-source reads remain allowed
+during initial building and explicit exceptional rebuild. On active roots, a large
+source without matching proof queues repair and temporarily withholds that
+candidate; routine admission never falls back to full parsing. The worker rotates
+projects, obeys binding write eligibility and backs off when no pending work exists.
+It does not run on the renewal or supervision loop.
+
+`doctor verify` reports `submission_control.state`; damaged activation metadata is
+reported as unavailable. `doctor repair` requests a background recertification
+under the maintenance lock without changing Submission, Task or Attempt truth.
+This receipt protocol removes the known bulk-source payload-read dependency;
+whole-machine latency and I/O qualification remain separate acceptance evidence.
+
+### 11.3.3 Discovery metadata maintenance
+
+Maintenance runs on the background discovery worker, outside scheduling and
+renewal. It alternates four bounded lanes: resolved change prefixes, completed
+cancellation receipts, confirmed-source audit scratch, and obsolete change
+journal generations. Each step processes one directory entry, event, or deletion;
+recursive bulk removal is forbidden. Failure preserves retryable responsibility
+and a diagnostic under the identity-bound coverage `maintenance/status.json`.
+Unchanged idle visits do not rewrite diagnostic records.
+
+Journal reclamation scans the existing active Group-operation directory across
+steps. A complete pass requires unchanged directory identity and revision,
+unique operation identities, valid records, and final verification under the
+schema and Group writer fences. The active directory is synchronized before
+certifying absence; an unavailable active namespace is not an empty subscriber
+set. An uncertain subscriber prevents reclamation.
+Concurrent active-operation replacement may delay certification; consumers and
+new writers continue independently. The certified bound is the minimum observed
+cursor, capped at the journal tail captured before the pass. Existing same-generation
+consumer cursors only advance, and new consumers start at the current tail, so
+later subscriptions cannot invalidate that bound. Producers do not enumerate
+subscribers.
+
+`rechecks/retention.json` is an additive, identity- and generation-bound record.
+Its absence means no prefix has been retired. Before deleting one resolved event,
+maintenance durably advances its retirement floor; it fsyncs the containing
+directory after unlink and then advances its deletion cursor. Restart retries
+an authorized pending deletion. An unexplained missing event above the floor
+is corruption, and an in-flight event stops reclamation. Reads below the floor
+fail explicitly; a late resolution of an already retired ticket is idempotent.
+Generation invalidation revokes old tickets and resets the current retention
+position. Generation authority uses equality with `state.json`, not numeric UUID
+ordering: missing-state recovery can select a numerically smaller fresh UUID.
+Any noncurrent retention sidecar is logically reset to zero. All positive
+noncurrent generation directories may be reclaimed under the writer fence,
+including an unpublished directory prepared by an interrupted invalidation.
+Invalidation recreates and synchronizes that directory before publishing state;
+no ticket or obligation is reachable from an unpublished generation.
+
+Cancellation receipts are reclaimed only after a regular archived operation
+record proves exact Group/operation identity and completion and its active path
+has durably retired. The archive and its outcome counters remain intact. Active
+or damaged operation evidence retains its receipts.
+
+Source completion publishes a durable cleanup debt before retiring its active
+source locator. A one-time, bounded index-only capture also finds receipts created
+before cleanup debt publication was available. Its identity-bound completion
+marker prevents repeated retained-source scans; interruption restarts that
+exceptional capture, and concurrent namespace changes prevent premature completion.
+New source completion continues publishing its own debt throughout capture.
+Maintenance validates the immutable source receipt and takes the
+source lock before deleting temporary digest files and audit runs. It preserves
+member slots, publication cursors, source receipts, event spools, and positional
+reference files needed by direct member lookup. Thus retained membership storage
+still scales with retained committed membership; this maintenance does not
+compact away cleaned Task membership. Task history pagination has a separate
+observation index and maintenance worker, specified below.
+Bad individual cleanup jobs retain their proof and diagnostic while enumeration
+continues to later jobs. Directory symlinks are rejected before deletion.
+Interrupted deletion resumes from the remaining debt without parsing historical
+Task payloads or discarding the last recovery locator.
 
 ### 11.4 Single Task Cancellation
 
@@ -1693,6 +2075,12 @@ A plain read followed by process creation is invalid.
 
 ### 13.6 Process Creation
 
+Runner admission directly reads the Attempt file at the authorized claim's Attempt
+number under the existing authority locks. Task ID, Attempt ID, number, token and
+launch identity must all match before intent publication. It never enumerates
+historical Attempts to find a matching ID, including for opaque persisted IDs;
+missing or mismatched direct truth cannot authorize process creation.
+
 After launch authorization, the agent starts a passive runner. The runner writes its immutable
 launch intent, creates the guardian-owned training process under the assigned GPUs, writes one
 immutable local process registration, and later writes a separate exit observation. The agent
@@ -1705,8 +2093,18 @@ materialization may only complete a matching partial transition; it must never r
 first-write timestamps. Only the Agent may publish shared running or terminal truth, perform
 Recovery, release the reservation, or issue a qexp signal.
 
-If local process creation fails, the Attempt becomes failed and claim and reservation are
-released idempotently.
+If local process creation fails before any launch evidence exists, the Attempt becomes failed
+and claim and reservation are released idempotently. Executor failure compensation checks local
+launch intent, registration, process manifest and exit-observation paths under the same authority
+fence that protects runner intent publication. Existing evidence, including ambiguous records or
+symlinks, retains the original Attempt and reservation for owning-agent recovery. Inaccessible
+metadata cannot prove absence. A failed handoff observation is therefore not proof that process
+creation failed. The executor still reports its handoff error; it does not grant a replacement
+launch or reuse the capacity. Compensation cannot use another machine's empty inbox as proof.
+
+If compensation commits before intent publication, the delayed runner's locked claim check
+rejects it. If runner intent publication wins, compensation leaves that launch intact. Starting
+recovery also treats an exit observation alone as evidence against relaunching the same Attempt.
 
 ## 14. Compensation and Reservation Convergence
 
@@ -1937,6 +2335,17 @@ pending archive retry), and reservation release are all durable. A shared-finali
 therefore retain a small evidence record while releasing verified local capacity; a retained
 record alone never keeps a physically absent GPU reserved.
 
+During shared-storage outages, machine-agent local capacity reconciliation discovers
+Attempts from the active GPU and CPU reservation lanes in bounded, rotating slices.
+It reads only the selected Attempts' local registration, process and exit evidence;
+settled observation history is not enumerated. Project identity, fencing token and
+verified process absence still gate release. Both reservation lanes make progress
+even with a one-entry budget or an unreadable peer lane. Evidence remains available
+for shared terminal publication after storage recovers.
+Machine-runtime reservations require an exact non-null project identity; projectless
+reservations remain eligible only in standalone operation with the same evidence
+and reservation root.
+
 The declared convergence budget for a healthy Linux/tmux host is 15 seconds from agent return
 to terminal Task projection and reservation reconciliation for at most 4 active or unreconciled
 Attempts, with the default 120-second bounded lease. Four-Attempt offline completion was measured
@@ -1991,6 +2400,18 @@ Before claiming new work, an agent:
 7. starts normal claim scanning
 
 ## 18. Events and Derived Data
+
+The [local recovery membership](qexp_local_responsibility.md) provides direct
+Attempt discovery. Machine-owned bounded supervision replaces its flat evidence
+inventory only after exact-generation retained capture qualification and an
+acknowledged initial active traversal. Unqualified and synchronous APIs retain
+their existing evidence scans. Membership never authorizes execution.
+Current Executors and runners require durable membership before creating their
+respective process; publication failure cannot be ignored at either boundary.
+Already running wrappers can still publish their final observations when the
+membership store is unavailable. Publication alone does not certify old-writer
+completeness; the separate retained capture, shared admission fence and discovery
+qualification establish coverage for the bounded authority path.
 
 Project events include:
 
@@ -2244,3 +2665,65 @@ Mock-only tests are insufficient for the coordination release gate.
 - workflow DAGs, priorities, quotas, or preemption
 - hostile multi-tenant isolation
 - scientific metric, artifact, or checkpoint management
+
+## Task observation publication and indexed traversal
+
+Task JSON remains authoritative. `indexes/task-observation` contains only a
+rebuildable query projection; scheduling, leases and process ownership do not use
+it as authorization. Lifecycle states are absent, building, active and degraded.
+Only active clean state may serve pages. Missing/building state returns
+`index_not_ready`; corrupt, dirty or degraded state returns `index_unavailable`.
+Reads do not trigger repair or fall back to an inventory.
+
+Each rebuild generation has independent unfiltered, phase, Group, and combined
+phase/Group partitions. Canonical filter hashes address partitions directly.
+A mandatory ordered catalog distinguishes an absent partition from the loss of a
+known partition. Ordered radix bucket pages contain at most 128 keys and occupy
+at most 64 KiB. Page traversal seeks strictly after the last inspected Task ID,
+including stale or deleted candidates; it does not inventory directories or
+replay earlier keys. IDs use the existing ASCII identifier syntax and fit the
+250-byte Task filename stem limit.
+
+A request inspects at most `max(page_size, 256)` Task candidates (maximum 1000).
+The partition traversal reads at most 1024 pages and 8 MiB; catalog lookup reads
+at most 65 additional pages, each bounded by 64 KiB. Thus total index-page work
+is at most 1089 pages and less than 13 MiB, plus bounded state/schema metadata.
+Diagnostics count catalog and candidate pages/bytes together. Task JSON parses,
+dependency evaluations and direct prerequisite reads are accounted separately.
+
+The writer lock order is schema, optional Group, Task, then observation. Schema
+activation holds the exclusive schema fence. Ordinary saves/deletes serialize
+publication using the observation fence. Durable dirty state and a new revision
+precede truth mutation; publication updates changed memberships and clears dirty
+only after their durability barriers. Memberships unchanged by a Task update need
+no page rewrite. Index publication failure after successful truth leaves queries
+unavailable and schedules rebuild; it does not undo truth or prevent terminal
+reconciliation from acknowledging a successful truth commit. Failure to durably
+invalidate query eligibility before truth is a write failure.
+
+Queries copy a bounded candidate batch under the nonblocking observation fence,
+read Task and prerequisite truth outside it, and check generation/revision again
+before returning. Concurrent publication may return `index_unavailable`; callers
+can retry. This avoids serving persistent stale negatives after a partial write.
+Missing Task truth removes that candidate; malformed or unreadable truth is an
+explicit error. Cursors bind project identity, normalized filters, ordering
+version, rebuild generation, and last inspected ID. They are validated values,
+never filesystem paths.
+
+New roots initialize an empty active generation. Existing roots wait for the
+already qualified canonical Group isolation and recovery-admission boundary before
+installing `task-observation-v1` under the schema fence. Required-capability checks
+and the retained ready-v2 fence reject incompatible writers. The global agent
+advances builds across registered projects independently of scheduling. No normal
+per-project migration command or training drain is required. Writers publish while
+building. Durable bounded directory capture and namespace revision checks prevent
+activation from overtaking uncaptured truth. Concurrent namespace replacement can
+defer completion without disabling compatible scheduling.
+
+Interrupted in-place publication invalidates its generation. Background repair
+builds another generation from truth and expires old cursors. Cleanup advances in
+bounded deletion steps and does not follow symlinks or delete the current
+generation. A malformed authoritative source remains degraded until repaired;
+doctor requests a new build without completing a history scan inside a page query.
+Performance qualification, including dependency reads and shared-storage costs,
+is separate from these structural protocol bounds.

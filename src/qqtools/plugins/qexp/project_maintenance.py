@@ -29,9 +29,10 @@ from .runtime.resources.reservations import (
     release_if_matches,
     retag_if_matches,
 )
+from .runtime.responsibility_capture import CaptureBusy
 from .runtime.store import iter_json, read_json
 from .runtime.tasks import load_task
-from .runtime.work_budget import diagnostic_span
+from .runtime.work_budget import diagnostic_increment, diagnostic_span
 
 
 def maintain_project(
@@ -56,12 +57,15 @@ def maintain_project(
                 reservation_runtime_root=reservation_root,
                 project_id=project_id,
             )
-        reconcile_group_cancel_operations(cfg, include_legacy=False)
-        reconcile_cleanup_operations(
-            cfg,
-            reservation_runtime_root=reservation_root,
-            include_legacy=False,
-        )
+        reconcile_group_cancel_operations(cfg, include_legacy=False, reservation_runtime_root=reservation_root)
+        try:
+            reconcile_cleanup_operations(
+                cfg,
+                reservation_runtime_root=reservation_root,
+                include_legacy=False,
+            )
+        except CaptureBusy:
+            diagnostic_increment("cleanup.capture_deferred")
         reconcile_availability_operations(cfg, include_legacy=False)
         offer_due_tasks(cfg)
 

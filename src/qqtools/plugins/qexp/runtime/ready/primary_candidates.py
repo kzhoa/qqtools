@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from ..group_namespace import read_group
 from ..locks import exclusive
 from ..paths import group_path, shared_paths
 from ..records import TaskRecord, normalize_group_record, utc_now, validate_identifier
@@ -73,7 +74,7 @@ def can_update_projection_under_lock(cfg: object) -> bool:
 def _primary_machines_for_task(cfg: object, task: TaskRecord) -> list[str]:
     if not task.group_name:
         return [task.placement_policy["home_machine"]]
-    group = read_json(group_path(cfg.shared_root, task.group_name))
+    group = read_group(cfg.shared_root, task.group_name)
     normalize_group_record(group)
     workers = group["group"]["worker_set"]
     if task.placement_runtime["queue_scope"] == "home":
@@ -163,7 +164,7 @@ def sync_member_candidate_under_lock(
     previous_workers: dict[str, dict[str, Any]],
 ) -> None:
     """Refresh a member candidate while the caller holds the projection lock."""
-    group = read_json(group_path(cfg.shared_root, group_name))
+    group = read_group(cfg.shared_root, group_name)
     normalize_group_record(group)
     current_workers = group["group"]["worker_set"]
     previous_machines = _primary_member_machines(reference, previous_workers)

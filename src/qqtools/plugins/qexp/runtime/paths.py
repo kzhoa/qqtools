@@ -83,7 +83,9 @@ def task_path(root: Path, task_id: str) -> Path:
 
 
 def group_path(root: Path, name: str) -> Path:
-    return shared_paths(root)["groups"] / f"{name}.json"
+    from .group_namespace import group_directory
+
+    return group_directory(root) / f"{name}.json"
 
 
 def attempt_path(root: Path, task_id: str, number: int) -> Path:

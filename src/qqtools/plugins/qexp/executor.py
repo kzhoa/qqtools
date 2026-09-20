@@ -84,6 +84,9 @@ class Executor:
         launch_id = attempt.authorization.get("launch_id")
         if not isinstance(launch_id, str):
             raise RuntimeError("Attempt has no launch authorization.")
+        from .runtime.responsibility import require_launch_responsibility
+
+        require_launch_responsibility(cfg, task_id, attempt.attempt_id, attempt.attempt_number)
         if self.tmux_available():
             window_id = self.create_window(task_id, session_name, None)
             self.send_command(

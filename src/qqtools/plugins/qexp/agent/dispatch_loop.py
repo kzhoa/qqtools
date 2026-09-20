@@ -31,6 +31,7 @@ from ..machine_dispatch_plan import (
 )
 from ..machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from ..project_maintenance import maintain_project, reconcile_reservation
+from ..runtime.group_namespace import read_group
 from ..runtime.locks import exclusive
 from ..runtime.paths import local_paths, shared_paths
 from ..runtime.ready import (
@@ -50,6 +51,7 @@ from ..runtime.resources.reservations import (
     reconcile_snapshot,
     reservation_snapshot,
 )
+from ..runtime.responsibility_capture import CaptureBusy
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.upgrade.machine import MachineUpgradeWorker, discover_registered_upgrades, inspect_registered_upgrades
 from ..runtime.work_budget import (
@@ -139,6 +141,7 @@ class _LaunchHandoffBatch:
                 pending.attempt_id,
                 pending.fencing_token,
                 "executor_launch_failed",
+                should_require_unstarted=True,
                 reservation_runtime_root=self._runtime_root,
             )
             launched = result_by_project[pending.project_id]["launched"]
@@ -394,7 +397,7 @@ def _probe_primary_demand(
                 has_primary_group_worker = True
                 if task.group_name is not None:
                     try:
-                        group = read_json(cfg.shared_root / "groups" / f"{task.group_name}.json")
+                        group = read_group(cfg.shared_root, task.group_name)
                         normalize_group_record(group)
                     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                         runtime.primary_probe_cursors[cursor_key] = cursor_before
@@ -732,7 +735,10 @@ def _dispatch_machine_cycle_locked(
         try:
             with diagnostic_span("machine.binding.load"):
                 cfg = _helpers._binding_config(runtime, binding)
-                runtime.drain_legacy_runner_evidence(binding)
+                try:
+                    runtime.drain_legacy_runner_evidence(binding)
+                except CaptureBusy:
+                    diagnostic_increment("legacy_inbox.capture_deferred")
             readable[binding.project_id] = cfg
             readable_bindings[binding.project_id] = binding
             runtime.last_cycle_consumed_binding = True
@@ -974,7 +980,7 @@ def dispatch_machine_cycle(
     with runtime.scheduler_authority(blocking=False) as acquired:
         if not acquired:
             return []
-        with runtime.migration_guard() as is_migration_clear:
+        with runtime.migration_read_guard() as is_migration_clear:
             if not is_migration_clear:
                 return []
             return dispatch_machine_cycle_locked(runtime, available_gpus=available_gpus, executor=executor)

@@ -47,17 +47,26 @@ def _require_migration_json_io_authorization() -> None:
 
 
 @diagnostic_span("store.atomic_replace")
-def atomic_replace(path: Path, value: dict[str, Any]) -> None:
+def atomic_replace(
+    path: Path,
+    value: dict[str, Any],
+    *,
+    before_replace: Callable[[os.stat_result], None] | None = None,
+) -> os.stat_result | None:
     _require_migration_json_io_authorization()
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_stat: os.stat_result | None = None
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(encoded)
             handle.flush()
             with diagnostic_span("store.fsync"):
                 os.fsync(handle.fileno())
+            temporary_stat = os.fstat(handle.fileno())
+        if before_replace is not None:
+            before_replace(temporary_stat)
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_DIRECTORY)
         try:
@@ -65,9 +74,26 @@ def atomic_replace(path: Path, value: dict[str, Any]) -> None:
                 os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+        try:
+            post_stat = os.lstat(path)
+        except OSError:
+            return None
+        if temporary_stat is None or not _same_inode_witness(temporary_stat, post_stat):
+            return None
+        return post_stat
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _same_inode_witness(first: os.stat_result, second: os.stat_result) -> bool:
+    """Return whether two stats identify the same durable file contents."""
+    return (
+        first.st_dev == second.st_dev
+        and first.st_ino == second.st_ino
+        and first.st_size == second.st_size
+        and first.st_mtime_ns == second.st_mtime_ns
+    )
 
 
 @diagnostic_span("store.read_json")

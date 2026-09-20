@@ -4,8 +4,89 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Generator
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def is_path_present(path: Path) -> bool:
+    """Only a missing path proves absence; propagate inaccessible metadata."""
+    try:
+        path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def validate_evidence_path(path: Path, root: Path) -> bool:
+    """Require real directories and a regular leaf within the owned runtime root.
+
+    Missing paths return False; inaccessible or redirected paths cannot prove a
+    durable copy. Call under the owning evidence/reservation fence when mutating.
+    """
+    relative = path.relative_to(root)
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError("evidence path must be a file inside its runtime root")
+    directory = root
+    for part in relative.parts:
+        try:
+            metadata = directory.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"recovery evidence parent is not a real directory: {directory}")
+        directory = directory / part
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError(f"recovery evidence is not a regular file: {path}")
+    return True
+
+
+def iter_evidence_files(directory: Path, *, recursive: bool = False) -> Generator[Path, None, None]:
+    """Stream regular JSON evidence; only an absent lane is an empty lane.
+
+    Unlike glob, enumeration and metadata errors propagate. Symlinks and special
+    JSON files cannot certify absence and are rejected. Close a partially consumed
+    generator to release its open directory handles.
+    """
+    with closing(iter_evidence_entries(directory, recursive=recursive)) as entries:
+        for path in entries:
+            if path is not None:
+                yield path
+
+
+def iter_evidence_entries(directory: Path, *, recursive: bool = False) -> Generator[Path | None, None, None]:
+    """Count each visited name, including non-JSON files and nested directories."""
+    try:
+        metadata = directory.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise NotADirectoryError(str(directory))
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            path = directory / entry.name
+            if entry.is_symlink():
+                raise OSError(f"cannot certify recovery evidence through a symlink: {path}")
+            if recursive and entry.is_dir(follow_symlinks=False):
+                yield None
+                with closing(iter_evidence_entries(path, recursive=True)) as descendants:
+                    yield from descendants
+            elif entry.name.endswith(".json"):
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    yield None
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise OSError(f"recovery evidence is not a regular file: {path}")
+                yield path
+            else:
+                yield None
 
 
 @dataclass(frozen=True, slots=True)

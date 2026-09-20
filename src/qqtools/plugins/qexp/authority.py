@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import shutil
 import uuid
 from collections.abc import Generator, Iterable
 from contextlib import nullcontext
@@ -14,10 +13,11 @@ from pathlib import Path
 from .config_types import RootConfig
 from .lease import AuthorityResolutionOutcome, LeasePolicy, LeaseRenewalOutcome, holder_safe_deadline, load_lease_policy
 from .lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
-from .runtime.authority_scan import EvidenceScan
+from .runtime.authority_scan import EvidenceScan, is_path_present
 from .runtime.claims import archive_claim, reconcile_claim_archives
+from .runtime.locks import exclusive
 from .runtime.paths import attempt_path, local_paths
-from .runtime.records import AttemptRecord, utc_now
+from .runtime.records import AttemptRecord, utc_now, validate_identifier
 from .runtime.resources.reservations import (
     ReservationIdentity,
     has_reservation,
@@ -25,6 +25,16 @@ from .runtime.resources.reservations import (
     release_if_matches,
     reservation_snapshot,
 )
+from .runtime.responsibility import responsibility_root
+from .runtime.responsibility_cleanup import (
+    CLEANUP_FORMAT,
+    CleanupRequest,
+    complete_cleanup,
+    evidence_write_guard,
+    writers_are_quiescent,
+)
+from .runtime.responsibility_import import recovery_locator
+from .runtime.responsibility_store import Ledger, ServiceTraversal
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.tasks import load_task, save_task
 from .runtime.termination import (
@@ -49,14 +59,17 @@ class AuthoritySupervisor:
         *,
         reservation_runtime_root: Path | None = None,
         work_limit: int | None = None,
+        recovery_owner: dict | None = None,
     ) -> None:
         if work_limit is not None and (type(work_limit) is not int or not 1 <= work_limit <= 256):
             raise ValueError("authority work limit must be an integer from 1 to 256")
         self.work_limit = work_limit
+        self.recovery_owner = dict(recovery_owner) if recovery_owner is not None else None
         self.work_snapshot: dict[str, object] = {}
         self.metrics: dict[str, int | float] = {}
         self.cfg = cfg
         self.reservation_runtime_root = reservation_runtime_root or cfg.runtime_root
+        self._allows_projectless_reservations = self.reservation_runtime_root.resolve() == cfg.runtime_root.resolve()
         self._last_renewal: dict[str, float] = {}
         self._termination_deadlines: dict[tuple[str, str], float] = {}
         self._failures: dict[str, int] = {}
@@ -66,9 +79,10 @@ class AuthoritySupervisor:
         self._policy_load_failed = False
         self._refresh_policy()
         self._work = None
+        self._cleanup_traversal: ServiceTraversal | None = None
         capacity_paths = local_paths(self.reservation_runtime_root)
         self._capacity_scans = (EvidenceScan(capacity_paths["active"]), EvidenceScan(capacity_paths["cpu_active"]))
-        self._exit_scan = EvidenceScan(local_paths(cfg.runtime_root)["observations"])
+        self._capacity_turn = 0
 
     def tick_bounded(self, limit: int = 64) -> dict[str, object]:
         """Advance resumable discovery and supervision without a full inventory pass."""
@@ -87,7 +101,6 @@ class AuthoritySupervisor:
         """Release advisory cursors after this supervisor is no longer scheduled."""
         if self._work is not None:
             self._work.close()
-        self._exit_scan.close()
         for scan in self._capacity_scans:
             scan.close()
 
@@ -100,12 +113,16 @@ class AuthoritySupervisor:
             if self._work is None:
                 self._work = AuthorityWork(self)
             return
+        self._replay_terminal_cleanup()
         try:
+            self._remove_terminal_evidence()
             self._materialize_registrations()
         except OSError:
             self.reconcile_local_exit_evidence()
             raise
         for path in iter_json(local_paths(self.cfg.runtime_root)["processes"]):
+            if self._remove_terminal_attempt_evidence(path.stem):
+                continue
             process = read_json(path).get("process", {})
             if process.get("protocol_version") != 1:
                 continue
@@ -113,7 +130,7 @@ class AuthoritySupervisor:
             if isinstance(task_id, str):
                 self._reconcile_orphaned_process(process, load_task(self.cfg, task_id))
         for directory in local_paths(self.cfg.runtime_root)["termination_decisions"].glob("*"):
-            if directory.is_dir():
+            if directory.is_dir() and not self._remove_terminal_attempt_evidence(directory.name):
                 for decision in iter_json(directory):
                     value = read_json(decision).get("termination_decision", {})
                     if value.get("state") in {"signal_committed", "sigterm_sent", "sigkill_sent"}:
@@ -124,6 +141,7 @@ class AuthoritySupervisor:
         if self.work_limit is not None:
             self.work_snapshot = self.tick_bounded(self.work_limit)
             return
+        self._replay_terminal_cleanup()
         try:
             self._remove_terminal_evidence()
             self._materialize_registrations()
@@ -131,6 +149,8 @@ class AuthoritySupervisor:
             self.reconcile_local_exit_evidence()
             return
         for path in iter_json(local_paths(self.cfg.runtime_root)["processes"]):
+            if self._remove_terminal_attempt_evidence(path.stem):
+                continue
             process = read_json(path).get("process", {})
             if process.get("protocol_version") != 1:
                 continue
@@ -143,19 +163,27 @@ class AuthoritySupervisor:
 
     def reconcile_local_exit_evidence(self, *, limit: int | None = None) -> None:
         """Release verified finished local occupancy without reading shared Task truth."""
-        observations = (
-            iter_json(local_paths(self.cfg.runtime_root)["observations"])
-            if limit is None
-            else self._exit_scan.take(limit).paths
-        )
-        for observation in observations:
-            self._reconcile_local_exit_observation(observation, is_bounded=limit is not None)
+        paths = local_paths(self.cfg.runtime_root)
+        if limit is None:
+            for observation in iter_json(paths["observations"]):
+                self._reconcile_local_exit_observation(observation)
+            return
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("local capacity discovery limit must be a positive integer")
+        for identity in self._local_capacity_page("local-capacity", limit=limit):
+            if not self._owns_local_reservation(identity):
+                continue
+            attempt_id = identity.attempt_id
+            if not attempt_id or attempt_id in {".", ".."} or "/" in attempt_id or "\\" in attempt_id:
+                continue
+            self._reconcile_local_exit_observation(
+                paths["observations"] / f"{attempt_id}.json", reservation_identity=identity
+            )
 
     def _reconcile_local_exit_observation(
         self,
         observation: Path,
         *,
-        is_bounded: bool = False,
         reservation_identity: ReservationIdentity | None = None,
     ) -> None:
         paths = local_paths(self.cfg.runtime_root)
@@ -169,9 +197,7 @@ class AuthoritySupervisor:
             if not isinstance(process, dict):
                 raise ValueError("local process evidence must be an object")
             if process.get("attempt_id") == attempt_id:
-                self._release_finished_local_capacity(
-                    process, is_bounded=is_bounded, reservation_identity=reservation_identity
-                )
+                self._release_finished_local_capacity(process, reservation_identity=reservation_identity)
         except (OSError, KeyError, TypeError, ValueError):
             self._record_diagnostic({"attempt_id": attempt_id}, "local_capacity_reconciliation_unavailable")
 
@@ -179,7 +205,6 @@ class AuthoritySupervisor:
         self,
         process: dict[str, object],
         *,
-        is_bounded: bool = False,
         reservation_identity: ReservationIdentity | None = None,
     ) -> None:
         """Retain recovery evidence while releasing an identity-verified absent process."""
@@ -206,16 +231,8 @@ class AuthoritySupervisor:
             )
             if not is_valid:
                 return
-            if reservation_identity is None and (is_bounded or self._work is not None):
-                for identity in self._local_capacity_page(attempt_id):
-                    if identity.project_id not in {None, self.cfg.runtime_root.name}:
-                        continue
-                    candidate_id = identity.attempt_id
-                    if not candidate_id or candidate_id in {".", ".."} or "/" in candidate_id or "\\" in candidate_id:
-                        continue
-                    self._reconcile_local_exit_observation(
-                        paths["observations"] / f"{candidate_id}.json", reservation_identity=identity
-                    )
+            if reservation_identity is None and self._work is not None:
+                self.reconcile_local_exit_evidence(limit=8)
                 return
             identities = (
                 (reservation_identity,)
@@ -226,7 +243,7 @@ class AuthoritySupervisor:
                 )
             )
             for identity in identities:
-                if identity.project_id is not None and identity.project_id != self.cfg.runtime_root.name:
+                if not self._owns_local_reservation(identity):
                     continue
                 if (
                     identity.task_id == task_id
@@ -237,10 +254,22 @@ class AuthoritySupervisor:
         except (OSError, KeyError, TypeError, ValueError):
             self._record_diagnostic(process, "local_capacity_reconciliation_unavailable")
 
-    def _local_capacity_page(self, attempt_id: str) -> Iterable[ReservationIdentity]:
-        for scan in self._capacity_scans:
+    def _owns_local_reservation(self, identity: ReservationIdentity) -> bool:
+        return identity.project_id == self.cfg.runtime_root.name or (
+            identity.project_id is None and self._allows_projectless_reservations
+        )
+
+    def _local_capacity_page(self, attempt_id: str, *, limit: int = 8) -> Iterable[ReservationIdentity]:
+        turn = self._capacity_turn
+        self._capacity_turn = (turn + 1) % len(self._capacity_scans)
+        quota, remainder = divmod(limit, len(self._capacity_scans))
+        for offset in range(len(self._capacity_scans)):
+            budget = quota + (offset < remainder)
+            if not budget:
+                continue
+            scan = self._capacity_scans[(turn + offset) % len(self._capacity_scans)]
             try:
-                page = scan.take(4)
+                page = scan.take(budget)
             except OSError:
                 self._record_diagnostic({"attempt_id": attempt_id}, "local_reservation_unreadable")
                 continue
@@ -439,6 +468,13 @@ class AuthoritySupervisor:
             self._materialize_registration(path)
 
     def _materialize_registration(self, path: Path) -> None:
+        if self._work is None and self._remove_terminal_attempt_evidence(path.stem):
+            return
+        with evidence_write_guard(self.cfg.runtime_root, path.stem) as acquired:
+            if acquired:
+                self._materialize_registration_locked(path)
+
+    def _materialize_registration_locked(self, path: Path) -> None:
         registration = read_json(path).get("process_registration", {})
         if not isinstance(registration, dict):
             raise ValueError("local process registration must be an object")
@@ -469,6 +505,13 @@ class AuthoritySupervisor:
             self._materialize_unverified_intent(path)
 
     def _materialize_unverified_intent(self, path: Path) -> None:
+        if self._work is None and self._remove_terminal_attempt_evidence(path.stem):
+            return
+        with evidence_write_guard(self.cfg.runtime_root, path.stem) as acquired:
+            if acquired:
+                self._materialize_unverified_intent_locked(path)
+
+    def _materialize_unverified_intent_locked(self, path: Path) -> None:
         intent = read_json(path).get("launch_intent", {})
         if not isinstance(intent, dict):
             raise ValueError("local launch intent must be an object")
@@ -485,7 +528,7 @@ class AuthoritySupervisor:
             return
         if registration.exists():
             if self._work is not None:
-                self._materialize_registration(registration)
+                self._materialize_registration_locked(registration)
             return
         if self._wrapper_matches(intent):
             return
@@ -521,11 +564,11 @@ class AuthoritySupervisor:
         if not isinstance(task_id, str) or not isinstance(attempt_id, str) or not isinstance(token, int):
             return
         if self._has_terminal_attempt(task_id, attempt_id):
-            self._remove_attempt_evidence(attempt_id)
+            self._remove_terminal_attempt_evidence(attempt_id)
             return
         if self._reconcile_terminal_accounting(task_id, attempt_id):
             if self._has_terminal_attempt(task_id, attempt_id):
-                self._remove_attempt_evidence(attempt_id)
+                self._remove_terminal_attempt_evidence(attempt_id)
             return
         if process.get("observed_state") == "launch_unverifiable":
             self._record_diagnostic(process, "launch_unverifiable")
@@ -657,17 +700,13 @@ class AuthoritySupervisor:
             is_renamed_execution=True,
         )
 
-    def _reconcile_terminal_accounting(self, task_id: str, attempt_id: str) -> bool:
+    def _reconcile_terminal_accounting(
+        self, task_id: str, attempt_id: str, *, attempt_number: int | None = None
+    ) -> bool:
         """Retry reservation/accounting effects after terminal truth already committed."""
         try:
-            task = load_task(self.cfg, task_id)
-            if task.state.get("projection") not in {"succeeded", "failed", "cancelled"}:
-                return False
-            number = task.attempt_control.get("current_attempt_number")
-            if not isinstance(number, int):
-                return False
-            attempt = AttemptRecord.from_dict(read_json(attempt_path(self.cfg.shared_root, task_id, number)))
-            if attempt.attempt_id != attempt_id or attempt.phase not in {"succeeded", "failed", "cancelled"}:
+            attempt = self._terminal_attempt_for_cleanup(task_id, attempt_id, attempt_number=attempt_number)
+            if attempt is None:
                 return False
             reason = attempt.result.get("reason") or "terminal_accounting_reconciliation"
             if has_reservation(self.reservation_runtime_root, attempt.reservation_id):
@@ -840,18 +879,77 @@ class AuthoritySupervisor:
                 path = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
                 atomic_replace(path, {"process": process})
 
-    def _has_terminal_attempt(self, task_id: str, attempt_id: str) -> bool:
+    def _recorded_recovery_locator(self, attempt_id: str) -> dict | None:
+        if self._work is not None:
+            # Bounded supervision receives locators from background prefetch;
+            # it must never wait for index locks or pending redo on this thread.
+            return None
+        root = responsibility_root(self.cfg.runtime_root)
+        if not is_path_present(root):
+            return None
+        entry = Ledger(root).find(attempt_id)
+        return None if entry is None else recovery_locator(attempt_id, entry["payload"])
+
+    def _terminal_attempt_for_cleanup(
+        self, task_id: str, attempt_id: str, *, attempt_number: int | None = None
+    ) -> AttemptRecord | None:
+        """Resolve settled current or historical truth without scanning Attempts."""
+        task = load_task(self.cfg, task_id)
+        claim = task.claim_control.get("active_claim") or {}
+        if not isinstance(claim, dict) or claim.get("attempt_id") == attempt_id:
+            return None
+        current_id = task.attempt_control.get("current_attempt_id")
+        current_number = task.attempt_control.get("current_attempt_number")
+        number = current_number if attempt_number is None else attempt_number
+        # Scheduler identities encode their immutable number. An opaque historical
+        # identity may instead have a captured direct locator. Either hint must
+        # still match authoritative Task/Attempt truth below before it is used.
+        prefix = f"{task_id}-attempt-"
+        has_canonical_number = False
+        if attempt_id.startswith(prefix):
+            suffix = attempt_id[len(prefix) :]
+            if suffix.isascii() and suffix.isdecimal() and suffix == str(int(suffix)):
+                has_canonical_number = True
+                number = int(suffix)
+                if attempt_number is not None and number != attempt_number:
+                    return None
+        if not has_canonical_number and attempt_number is None:
+            locator = self._recorded_recovery_locator(attempt_id)
+            if locator is not None:
+                if locator["task_id"] not in (None, task_id):
+                    return None
+                if locator["attempt_number"] is not None:
+                    number = locator["attempt_number"]
+        if type(number) is not int or type(current_number) is not int or not 1 <= number <= current_number:
+            return None
+        if number == current_number:
+            # A terminal Attempt can precede its Task commit after a crash. Only
+            # committed Task terminal truth or a completed retry transition proves
+            # that this Attempt no longer owns the Task's terminal publication.
+            if claim or task.state.get("projection") not in {"succeeded", "failed", "cancelled", "queued"}:
+                return None
+            if current_id not in {None, attempt_id}:
+                return None
+            if task.state.get("projection") == "queued" and current_id is not None:
+                return None
+        next_number = task.attempt_control.get("next_attempt_number")
+        if type(next_number) is not int or number >= next_number:
+            return None
+        attempt = AttemptRecord.from_dict(read_json(attempt_path(self.cfg.shared_root, task_id, number)))
+        if (
+            attempt.task_id != task_id
+            or attempt.attempt_id != attempt_id
+            or attempt.attempt_number != number
+            or attempt.machine_name != self.cfg.machine_name
+            or attempt.phase not in {"succeeded", "failed", "cancelled"}
+        ):
+            return None
+        return attempt
+
+    def _has_terminal_attempt(self, task_id: str, attempt_id: str, *, attempt_number: int | None = None) -> bool:
         try:
-            task = load_task(self.cfg, task_id)
-            if task.state.get("projection") not in {"succeeded", "failed", "cancelled"}:
-                return False
-            if task.claim_control.get("active_claim"):
-                return False
-            number = task.attempt_control.get("current_attempt_number")
-            if not isinstance(number, int):
-                return False
-            attempt = AttemptRecord.from_dict(read_json(attempt_path(self.cfg.shared_root, task_id, number)))
-            if attempt.attempt_id != attempt_id or attempt.phase not in {"succeeded", "failed", "cancelled"}:
+            attempt = self._terminal_attempt_for_cleanup(task_id, attempt_id, attempt_number=attempt_number)
+            if attempt is None:
                 return False
             manifest = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
             try:
@@ -890,40 +988,124 @@ class AuthoritySupervisor:
         except (FileNotFoundError, OSError, RuntimeError, KeyError, TypeError, ValueError):
             return False
 
-    def _remove_attempt_evidence(self, attempt_id: str) -> None:
-        paths = local_paths(self.cfg.runtime_root)
-        if self._work is not None:
-            directory = paths["termination_decisions"] / attempt_id
-            scan = EvidenceScan(directory)
-            try:
-                page = scan.take(8)
-                for path in page.paths:
-                    path.unlink(missing_ok=True)
-                try:
-                    directory.rmdir()
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    # Leave identifying evidence until bounded decision cleanup finishes.
-                    return
-            finally:
-                scan.close()
-        for name in (
-            "processes",
-            "registrations",
-            "observations",
-            "launch_intents",
-            "wrappers",
-            "authority_diagnostics",
-        ):
-            (paths[name] / f"{attempt_id}.json").unlink(missing_ok=True)
-        if self._work is None:
-            shutil.rmtree(paths["termination_decisions"] / attempt_id, ignore_errors=True)
+    def _forget_attempt(self, attempt_id: str) -> None:
         for cache in (self._last_renewal, self._failures, self._states, self._lease_expiries):
             cache.pop(attempt_id, None)
         for key in list(self._termination_deadlines):
             if key[0] == attempt_id:
                 self._termination_deadlines.pop(key, None)
+
+    def _cleanup_request(
+        self, task_id: str, attempt_id: str, *, attempt_number: int | None = None
+    ) -> CleanupRequest | None:
+        """Retain proof before removing the last local recovery locator."""
+        validate_identifier(task_id, "task_id")
+        validate_identifier(attempt_id, "attempt_id")
+        if self._has_terminal_attempt(task_id, attempt_id, attempt_number=attempt_number):
+            attempt = self._terminal_attempt_for_cleanup(task_id, attempt_id, attempt_number=attempt_number)
+            if attempt is None:
+                return None
+            number = attempt.attempt_number
+            basis = "terminal_attempt"
+        else:
+            # Missing Task truth alone is never deletion proof. The existing
+            # permanent cleanup tombstone prevents identity reuse and records
+            # completed machine acknowledgements after resource reconciliation.
+            if (self.cfg.shared_root / "tasks" / f"{task_id}.json").exists():
+                return None
+            from .runtime.operation_store import locate_operation_path
+
+            try:
+                cleanup = read_json(locate_operation_path(self.cfg, "cleanup", task_id))["cleanup"]
+            except FileNotFoundError:
+                return None
+            if not isinstance(cleanup, dict):
+                return None
+            acknowledgements = cleanup.get("acknowledgements")
+            required = cleanup.get("required_machines")
+            if (
+                cleanup.get("task_id") != task_id
+                or cleanup.get("state") != "completed"
+                or not isinstance(cleanup.get("operation_id"), str)
+                or not cleanup["operation_id"]
+                or cleanup.get("terminal_state") not in {"succeeded", "failed", "cancelled"}
+                or not isinstance(cleanup.get("completed_at"), str)
+                or not cleanup["completed_at"]
+                or cleanup.get("pending_machines")
+                or not isinstance(required, list)
+                or any(not isinstance(machine, str) for machine in required)
+                or self.cfg.machine_name not in required
+                or not isinstance(acknowledgements, dict)
+                or any(
+                    not isinstance(acknowledgements.get(machine), dict)
+                    or not isinstance(acknowledgements[machine].get("acknowledged_at"), str)
+                    or not acknowledgements[machine]["acknowledged_at"]
+                    for machine in required
+                )
+            ):
+                return None
+            if any(
+                record.get("task_id") == task_id and record.get("project_id") in {None, self.cfg.runtime_root.name}
+                for record in reservation_snapshot(self.reservation_runtime_root).reservations
+            ):
+                return None
+            # Older cleanup acknowledgements did not retain wrapper identity.
+            # With Task/Attempt truth gone, the runner's final immutable write is
+            # needed to rule out a still-delayed writer whose files were removed.
+            try:
+                observation = read_json(local_paths(self.cfg.runtime_root)["observations"] / f"{attempt_id}.json")[
+                    "exit_observation"
+                ]
+            except FileNotFoundError:
+                return None
+            if (
+                not isinstance(observation, dict)
+                or observation.get("protocol_version", 1) != 1
+                or observation.get("attempt_id") != attempt_id
+                or observation.get("task_id") not in {None, task_id}
+                or type(observation.get("observed_exit_code")) is not int
+            ):
+                return None
+            prefix = f"{task_id}-attempt-"
+            suffix = attempt_id.removeprefix(prefix)
+            if attempt_id.startswith(prefix) and suffix.isascii() and suffix.isdecimal():
+                number = int(suffix)
+                if number < 1 or str(number) != suffix:
+                    return None
+                basis = "completed_task_cleanup"
+            else:
+                # An opaque ID cannot establish Task ownership through its name
+                # or advisory membership. Require the final local write to do so.
+                if observation.get("task_id") != task_id:
+                    return None
+                locator = self._recorded_recovery_locator(attempt_id)
+                if locator is not None and locator["task_id"] not in (None, task_id):
+                    return None
+                number = attempt_number if locator is None else locator["attempt_number"]
+                basis = "task_cleanup"
+        if not writers_are_quiescent(self.cfg.runtime_root, task_id, attempt_id):
+            return None
+        receipt = {"format": CLEANUP_FORMAT, "task_id": task_id, "attempt_id": attempt_id, "basis": basis}
+        if basis == "task_cleanup":
+            receipt["operation_id"] = cleanup["operation_id"]
+        return CleanupRequest(
+            attempt_id,
+            {"task_id": task_id, "attempt_number": number},
+            receipt,
+        )
+
+    def _cleanup_request_for_membership(self, entry: dict) -> CleanupRequest | None:
+        """Use a prefetched locator only to load and validate authoritative truth."""
+        if entry["stage"] != "active":
+            return None
+        attempt_id = validate_identifier(entry["identity"], "attempt_id")
+        locator = recovery_locator(attempt_id, entry["payload"])
+        task_id, number = locator["task_id"], locator["attempt_number"]
+        if task_id is None:
+            return self._cleanup_request_for_evidence(attempt_id, attempt_number=number)
+        if number is not None:
+            self._reconcile_terminal_accounting(task_id, attempt_id, attempt_number=number)
+        return self._cleanup_request(task_id, attempt_id, attempt_number=number)
 
     def _remove_terminal_evidence(self) -> None:
         paths = local_paths(self.cfg.runtime_root)
@@ -942,7 +1124,9 @@ class AuthoritySupervisor:
         for attempt_id in attempt_ids:
             self._remove_terminal_attempt_evidence(attempt_id)
 
-    def _remove_terminal_attempt_evidence(self, attempt_id: str) -> None:
+    def _cleanup_request_for_evidence(
+        self, attempt_id: str, *, attempt_number: int | None = None
+    ) -> CleanupRequest | None:
         paths = local_paths(self.cfg.runtime_root)
         task_id = None
         for name, record_key in (
@@ -965,10 +1149,68 @@ class AuthoritySupervisor:
             # Attempt IDs are intentionally derived from the Task ID.  This
             # keeps legacy observations bounded without scanning all Tasks.
             candidate, separator, _number = attempt_id.rpartition("-attempt-")
-            if separator and candidate and (self.cfg.shared_root / "tasks" / f"{candidate}.json").exists():
+            if separator and candidate:
                 task_id = candidate
-        if task_id is not None and self._has_terminal_attempt(task_id, attempt_id):
-            self._remove_attempt_evidence(attempt_id)
+        if task_id is None:
+            locator = self._recorded_recovery_locator(attempt_id)
+            task_id = None if locator is None else locator["task_id"]
+        if task_id is None:
+            return None
+        if attempt_number is not None:
+            self._reconcile_terminal_accounting(task_id, attempt_id, attempt_number=attempt_number)
+        return self._cleanup_request(task_id, attempt_id, attempt_number=attempt_number)
+
+    def _remove_terminal_attempt_evidence(self, attempt_id: str) -> bool:
+        """Return whether proven cleanup owns this candidate, even if still pending."""
+        if self._work is not None:
+            request = self._cleanup_request_for_evidence(attempt_id)
+            if request is not None and self._work.cleanup_responsibility(request):
+                self._forget_attempt(attempt_id)
+                return True
+            return False
+        request = None
+        try:
+            root = responsibility_root(self.cfg.runtime_root)
+            ledger = Ledger(root) if root.exists() else None
+            entry = ledger.find(attempt_id) if ledger is not None else None
+            request = CleanupRequest.from_entry(entry) if entry is not None else None
+            if request is None:
+                request = self._cleanup_request_for_evidence(attempt_id)
+            if request is None:
+                return False
+            if ledger is None:
+                with exclusive(self.cfg.runtime_root / "locks" / "responsibility-initialize.lock"):
+                    ledger = Ledger.open_or_create(root)
+            if complete_cleanup(ledger, self.cfg.runtime_root, request):
+                self._forget_attempt(attempt_id)
+            return True
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            self._record_diagnostic({"attempt_id": attempt_id}, "terminal_cleanup_unavailable", exc)
+            return request is not None
+
+    def _replay_terminal_cleanup(self) -> None:
+        """Service stored receipts even after all evidence and shared truth are gone."""
+        try:
+            if self._cleanup_traversal is None:
+                root = responsibility_root(self.cfg.runtime_root)
+                if not root.exists():
+                    return
+                self._cleanup_traversal = ServiceTraversal(Ledger(root))
+            entries = self._cleanup_traversal.take(limit=1)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            self._record_diagnostic({"attempt_id": "control-plane"}, "cleanup_replay_unavailable", exc)
+            return
+        for entry in entries:
+            try:
+                request = CleanupRequest.from_entry(entry)
+                if request is None:
+                    request = self._cleanup_request_for_membership(entry)
+                if request is not None and complete_cleanup(
+                    self._cleanup_traversal.ledger, self.cfg.runtime_root, request
+                ):
+                    self._forget_attempt(request.identity)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                self._record_diagnostic({"attempt_id": entry["identity"]}, "terminal_cleanup_unavailable", exc)
 
     def _renew_or_isolate(
         self, task_id: str, attempt_id: str, token: int, process: dict[str, object], *, has_attempt_lock: bool = False
@@ -1163,4 +1405,4 @@ class AuthoritySupervisor:
         if result.event:
             dispatch_task_lifecycle_hooks_noexcept(self.cfg, result.event)
         if can_remove_evidence:
-            self._remove_attempt_evidence(attempt_id)
+            self._remove_terminal_attempt_evidence(attempt_id)

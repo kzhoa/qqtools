@@ -14,10 +14,11 @@ from ..authority import AuthoritySupervisor as _AuthoritySupervisor
 from ..config_types import RootConfig
 from ..lease import load_lease_policy
 from ..legacy_agent import _visible_gpus
-from ..runtime.authority_scan import EvidenceScan
+from ..runtime.authority_scan import EvidenceScan, is_path_present
 from ..runtime.paths import local_paths
 from ..runtime.records import utc_now
 from ..runtime.resources.reservations import reservation_snapshot
+from ..runtime.responsibility_completion import COMPLETION_FILE
 from ..runtime.store import atomic_replace
 from ..runtime.work_budget import RuntimeDiagnostics, activate_diagnostics, diagnostic_increment
 from . import helpers as _helpers
@@ -25,6 +26,7 @@ from .context import MachineRuntime, ProjectBinding
 from .deadlines import advance_deadline
 from .helpers import _publish_project_snapshots, _read_pid
 from .progress_loop import ProgressObservationLoop
+from .recovery_capture import recovery_owner
 
 
 @contextmanager
@@ -172,6 +174,7 @@ class _MachineControlPlane:
             with _measure_authority_phase(sample, "registry"):
                 bindings = self._ordered_authority_bindings(self._supervised_bindings())
         except (OSError, RuntimeError, ValueError) as exc:
+            self._runtime.authority_ready_generations.clear()
             for supervisor in self._supervisors.values():
                 supervisor.cancel_pending_control()
             sample["observation_status"] = "registry_unavailable"
@@ -234,10 +237,15 @@ class _MachineControlPlane:
                         authority_interval = min(
                             authority_interval, policy.renew_interval_seconds, policy.ttl_seconds / 4
                         )
-                if not binding.enabled and not self._has_local_evidence(
-                    binding,
-                    cfg,
-                    ("processes", "registrations", "observations", "launch_intents", "termination_decisions"),
+                has_capture = is_path_present(cfg.runtime_root / COMPLETION_FILE)
+                if (
+                    not binding.enabled
+                    and not has_capture
+                    and not self._has_local_evidence(
+                        binding,
+                        cfg,
+                        ("processes", "registrations", "observations", "launch_intents", "termination_decisions"),
+                    )
                 ):
                     project_sample["observation_status"] = "disabled_no_local_process"
                     continue
@@ -251,7 +259,7 @@ class _MachineControlPlane:
                 if not is_eligible:
                     with _measure_authority_phase(project_sample, "eligibility_inventory"):
                         project_sample["eligibility_inventory_checks"] = 1
-                        has_local_process = self._has_local_process(binding, cfg)
+                        has_local_process = has_capture or self._has_local_process(binding, cfg)
                     if not has_local_process:
                         project_sample["observation_status"] = "ineligible_no_local_process"
                         self._reconcile_local_exits(binding, project_sample)
@@ -267,7 +275,10 @@ class _MachineControlPlane:
                 if supervisor is None:
                     with _measure_authority_phase(project_sample, "startup_recovery"):
                         supervisor = _AuthoritySupervisor(
-                            cfg, reservation_runtime_root=self._runtime.root, work_limit=256
+                            cfg,
+                            reservation_runtime_root=self._runtime.root,
+                            work_limit=256,
+                            recovery_owner=recovery_owner(self._runtime, binding),
                         )
                         supervisor.recover_startup()
                     self._supervisors[binding.project_id] = supervisor
@@ -292,6 +303,8 @@ class _MachineControlPlane:
                         self._runtime.authority_ready_generations[binding.project_id] = binding.registration_generation
                         if previous != binding.registration_generation and self._scheduler_wakeup is not None:
                             self._scheduler_wakeup.set()
+                    else:
+                        self._runtime.authority_ready_generations.pop(binding.project_id, None)
                 recovered_outage = self._outage_supervisors.pop(binding.project_id, None)
                 if recovered_outage is not None:
                     recovered_outage.close()
@@ -308,6 +321,7 @@ class _MachineControlPlane:
                 project_sample["error_type"] = type(exc).__name__
             finally:
                 if project_sample["observation_status"] != "tick_returned":
+                    self._runtime.authority_ready_generations.pop(binding.project_id, None)
                     pending_supervisor = self._supervisors.get(binding.project_id)
                     if pending_supervisor is not None:
                         pending_supervisor.cancel_pending_control()

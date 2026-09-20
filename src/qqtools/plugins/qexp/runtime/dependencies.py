@@ -8,9 +8,10 @@ from typing import Iterable, Iterator
 
 from .locks import group_lock, task_lock
 from .operation_store import operation_exists
-from .paths import shared_paths, submission_path
+from .paths import shared_paths
 from .records import TaskRecord, validate_identifier
 from .store import iter_json, read_json
+from .submission_control import read_submission_state
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,10 +50,9 @@ def is_committed_submission_task(cfg: object, task: TaskRecord) -> bool:
     if not operation_id:
         return False
     try:
-        submission = read_json(submission_path(cfg.shared_root, operation_id))["submission"]
+        return read_submission_state(cfg, operation_id) == "committed"
     except (FileNotFoundError, KeyError, TypeError, ValueError):
         return False
-    return submission.get("state") == "committed"
 
 
 def _check_no_cycle(tasks: dict[str, TaskRecord]) -> None:

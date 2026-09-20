@@ -70,6 +70,9 @@ class MachineUpgradeWorker:
 
     def stop(self) -> None:
         self._stop.set()
+        owner = getattr(self.runtime, "group_source_owner", None)
+        if owner is not None:
+            owner.shutdown()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
 

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
 from ...runtime.paths import shared_paths
+from ...runtime.protocol_compatibility import manifest_schema_digest as _manifest_schema_digest
+from ...runtime.protocol_compatibility import matches_released_bootstrap_schema
+from ...runtime.protocol_compatibility import matches_terminal_manifest_schema as _terminal_schema_matches
+from ...runtime.protocol_compatibility import snapshot_digest as _digest
 from ...runtime.records import utc_now
 from ...runtime.store import atomic_replace, read_json
 from .contracts import (
@@ -31,10 +33,6 @@ def _manifest_path(context: UpgradeContext):
     return shared_paths(context.cfg.shared_root)["upgrade"] / _MANIFEST_NAME
 
 
-def _digest(value: object) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _schema_protocol(schema: dict[str, Any]) -> str:
     value = schema.get("schema", {})
     protocol = value.get("protocol")
@@ -49,7 +47,7 @@ def _manifest_document(schema: dict[str, Any], *, protocol: str) -> dict[str, An
             "source_protocol": "schema-6",
             "target_protocol": UPGRADE_JOURNAL_METADATA_PROTOCOL,
             "protocol": protocol,
-            "schema_digest": _digest(schema),
+            "schema_digest": _manifest_schema_digest(schema),
             "created_at": utc_now(),
         }
     }
@@ -99,7 +97,7 @@ class UpgradeJournalMigration(MigrationPlugin):
             and value.get("target_protocol") == self.spec.target_protocol
             and value.get("protocol") == self.spec.target_protocol
             and _schema_protocol(schema) == self.spec.source_protocol
-            and value.get("schema_digest") == _digest(schema)
+            and _terminal_schema_matches(schema, value.get("schema_digest"))
         )
 
     def is_applicable_with_storage(self, cfg, storage: UpgradeStorage) -> bool:
@@ -121,6 +119,27 @@ class UpgradeJournalMigration(MigrationPlugin):
         except (OSError, KeyError, TypeError, ValueError, DeterministicUpgradeError):
             return False
         return True
+
+    def can_reconcile_terminal_state(self, context: UpgradeContext) -> bool:
+        item = context.journal["upgrade"]["migrations"][self.spec.name]
+        expected = {
+            "name": self.spec.name,
+            "source_protocol": self.spec.source_protocol,
+            "target_protocol": self.spec.target_protocol,
+            "state": "repair_required",
+            "phase": "audit",
+            "phase_index": 1,
+            "error": "upgrade protocol manifest protocol is stale",
+            "in_flight": False,
+            "completed_at": None,
+            "audit_passed": False,
+        }
+        if any(item.get(key) != value for key, value in expected.items()):
+            return False
+        manifest = context.storage.read_json(_manifest_path(context))["upgrade_protocol_manifest"]
+        schema = context.storage.read_json(_schema_path(context))
+        self._validate_terminal_manifest(schema, manifest)
+        return matches_released_bootstrap_schema(schema, manifest.get("schema_digest"))
 
     def expansion(self, context: UpgradeContext) -> PhaseResult:
         manifest_path = _manifest_path(context)
@@ -160,7 +179,7 @@ class UpgradeJournalMigration(MigrationPlugin):
             raise DeterministicUpgradeError("upgrade protocol manifest protocol is stale")
         if protocol != self.spec.source_protocol:
             raise DeterministicUpgradeError("upgrade protocol manifest is outside the migration boundary")
-        if manifest.get("schema_digest") != _digest(schema):
+        if manifest.get("schema_digest") != _manifest_schema_digest(schema):
             raise DeterministicUpgradeError("upgrade protocol manifest schema digest is stale")
         context.slice_budget.consume_records()
         usage = context.slice_budget.used(
@@ -214,7 +233,7 @@ class UpgradeJournalMigration(MigrationPlugin):
         if any(manifest.get(key) != value for key, value in expected.items()):
             raise DeterministicUpgradeError("upgrade protocol manifest metadata is invalid")
         schema_digest = _digest(schema)
-        if manifest.get("schema_digest") != schema_digest:
+        if manifest.get("schema_digest") != _manifest_schema_digest(schema):
             raise DeterministicUpgradeError("upgrade protocol manifest schema digest is stale")
         if manifest.get("protocol") != _schema_protocol(schema):
             raise DeterministicUpgradeError("upgrade protocol manifest protocol is stale")
@@ -330,7 +349,12 @@ class UpgradeJournalMigration(MigrationPlugin):
             raise DeterministicUpgradeError("upgrade protocol manifest terminal metadata is invalid")
         if _schema_protocol(schema) != self.spec.source_protocol:
             raise DeterministicUpgradeError("source schema protocol changed")
-        if manifest.get("schema_digest") != _digest(schema):
+        is_matching = (
+            _terminal_schema_matches(schema, manifest.get("schema_digest"))
+            if expected_protocol == self.spec.target_protocol
+            else manifest.get("schema_digest") == _manifest_schema_digest(schema)
+        )
+        if not is_matching:
             raise DeterministicUpgradeError("upgrade protocol manifest schema digest is stale")
 
     def repair_snapshot(self, context: UpgradeContext) -> dict[str, Any]:

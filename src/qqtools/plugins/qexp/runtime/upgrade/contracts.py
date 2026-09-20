@@ -254,6 +254,16 @@ class MigrationPlugin:
         """
         return self.terminal_invariant_holds(context.cfg)
 
+    def can_reconcile_terminal_state(self, context: UpgradeContext) -> bool:
+        """Opt in to recognizing an exact historical failure with proven target state.
+
+        The coordinator calls this under upgrade and schema exclusion, without
+        an explicit pause, repair transaction or in-flight slice. The default
+        never treats a blocked migration as complete. I/O uses context.storage.
+        """
+        del context
+        return False
+
     def phase(self, phase: MigrationPhase, context: UpgradeContext) -> PhaseResult:
         """Run one phase slice using the protocol-specific implementation."""
         handler = getattr(self, phase)

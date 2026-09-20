@@ -38,12 +38,23 @@ from .records import (
     validate_identifier,
 )
 from .store import atomic_replace, create_if_absent, read_json
+from .submission_control import publish_submission as _publish_submission
 from .tasks import save_task
 
 
 def _write_group_record(cfg: object, path: Path, data: dict[str, Any]) -> None:
     """Persist a Group through this module's patchable atomic writer."""
     atomic_replace(path, data)
+
+
+def _submission_atomic_writer(path: Path, value: dict[str, Any], **kwargs: Any) -> Any:
+    """Keep Submission publication writes observable through this module's writer."""
+    return atomic_replace(path, value, **kwargs)
+
+
+def publish_submission(cfg: object, operation: dict[str, Any]) -> None:
+    """Publish Submission truth through the control proof protocol."""
+    _publish_submission(cfg, operation, _atomic_writer=_submission_atomic_writer)
 
 
 @contextmanager
@@ -414,6 +425,9 @@ def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
         group["group"]["next_membership_sequence"] = max(
             group["group"]["next_membership_sequence"], max(sequences, default=0) + 1
         )
+        from .group_discovery.service import publish_submission_debt
+
+        publish_submission_debt(cfg.shared_root, group_name, submission["operation_id"])
         group["meta"]["revision"] += 1
         group["meta"]["updated_at"] = utc_now()
         group["group"]["pending_submission_commit"] = None
@@ -556,12 +570,12 @@ def submit_specs(
                 elif not precondition.get("exists") and not group_was_missing and not has_own_pending_commit:
                     operation["submission"]["state"] = "aborted"
                     operation["submission"]["failure_reason"] = f"Group {group_name!r} changed during submission."
-                    atomic_replace(submission_path(cfg.shared_root, operation_id), operation)
+                    publish_submission(cfg, operation)
                     raise RuntimeError(f"Group {group_name!r} changed during submission.")
                 if group["group"]["admission_state"] != "open":
                     operation["submission"]["state"] = "aborted"
                     operation["submission"]["failure_reason"] = f"Group {group_name!r} is sealed."
-                    atomic_replace(submission_path(cfg.shared_root, operation_id), operation)
+                    publish_submission(cfg, operation)
                     raise ValueError(f"Group {group_name!r} is sealed.")
                 planned_workers = _planned_worker_set(
                     group,
@@ -573,7 +587,7 @@ def submit_specs(
                     sequences = list(range(start, start + len(resolved)))
                     operation["submission"]["commit_plan"]["group_membership_sequences"] = sequences
                     operation["submission"]["state"] = "committing"
-                    atomic_replace(submission_path(cfg.shared_root, operation_id), operation)
+                    publish_submission(cfg, operation)
                 else:
                     sequences = operation["submission"]["commit_plan"]["group_membership_sequences"]
                 group["group"]["pending_submission_commit"] = {
@@ -671,7 +685,7 @@ def submit_specs(
             operation["submission"]["state"] = "committed"
             operation["submission"]["committed_at"] = utc_now()
             try:
-                atomic_replace(submission_path(cfg.shared_root, operation_id), operation)
+                publish_submission(cfg, operation)
             except Exception:
                 try:
                     persisted = read_json(submission_path(cfg.shared_root, operation_id))
@@ -717,7 +731,7 @@ def submit_specs(
                 raise
             operation["submission"]["state"] = "aborted"
             operation["submission"]["failure_reason"] = str(exc)
-            atomic_replace(submission_path(cfg.shared_root, operation_id), operation)
+            publish_submission(cfg, operation)
             if group_name:
                 with group_lock(cfg.shared_root, group_name):
                     group_file = group_path(cfg.shared_root, group_name)

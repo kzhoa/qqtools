@@ -390,6 +390,7 @@ class UpgradeCoordinator:
         """Create a journal only when a registered plugin applies to this root."""
         current = _load_journal(self.cfg)
         if current is not None:
+            current = self._reconcile_historical_terminal_state(current)
             upgrade = current["upgrade"]
             drifted = self._completed_migrations_with_drift(current)
             known_names = set(upgrade["migrations"])
@@ -439,6 +440,61 @@ class UpgradeCoordinator:
             if acquired:
                 _save_journal(self.cfg, journal)
         return _status_from_journal(self.cfg, _load_journal(self.cfg))
+
+    def _reconcile_historical_terminal_state(self, journal: dict[str, Any]) -> dict[str, Any]:
+        """Reconcile only a plugin-proven historical failure during writable discovery."""
+        active = self._next_active(journal["upgrade"])
+        if active is None or active.get("state") != "repair_required":
+            return journal
+        with exclusive(_upgrade_lock_path(self.cfg), blocking=False) as acquired:
+            if not acquired:
+                return journal
+            current = _load_journal(self.cfg)
+            if current is None:
+                return journal
+            upgrade = current["upgrade"]
+            active = self._next_active(upgrade)
+            if (
+                active is None
+                or active.get("state") != "repair_required"
+                or any(item.get("in_flight") for item in upgrade["migrations"].values())
+                or upgrade.get("repair") is not None
+                or upgrade["pause"].get("state") is not None
+                or _load_pause_intent(self.cfg) is not None
+            ):
+                return current
+            plugin = self.registry.get(active["name"])
+            if not self._prerequisites_satisfied(upgrade, plugin.spec):
+                return current
+            with schema_lock(self.cfg.shared_root, blocking=False) as has_schema_lock:
+                if not has_schema_lock:
+                    return current
+                try:
+                    with migration_json_io_guard():
+                        can_reconcile = plugin.can_reconcile_terminal_state(self._context(current, active))
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError, UpgradeError):
+                    return current
+                if not can_reconcile or _load_pause_intent(self.cfg) is not None:
+                    return current
+                previous_error = active.get("error")
+                active.update(
+                    {
+                        "state": "completed",
+                        "phase": plugin.spec.phases[-1],
+                        "phase_index": len(plugin.spec.phases) - 1,
+                        "completed_at": utc_now(),
+                        "fence_token": int(active.get("fence_token", 0)) + 1,
+                        "holder_id": self.holder_id,
+                        "error": None,
+                        "blocker": None,
+                        "next_retry_at": None,
+                        "next_probe_at": None,
+                        "admission_blocked": False,
+                        "detail": {"terminal_state_reconciled": True, "historical_error": previous_error},
+                    }
+                )
+                _save_journal(self.cfg, current)
+            return current
 
     def advance(self, *, force_retry: bool = False) -> dict[str, Any]:
         """Run at most one bounded phase slice and return durable project status."""

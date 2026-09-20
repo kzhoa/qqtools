@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Literal, Protocol
 
 from .config_types import RootConfig
 from .events import write_notification_diagnostic
 from .runtime.claims import archive_claim
+from .runtime.group_discovery.changes import record_task_change
 from .runtime.paths import attempt_path
 from .runtime.ready import retire_current_ready_generation
 from .runtime.records import AttemptRecord, TaskRecord, utc_now
@@ -79,6 +80,17 @@ class TaskLifecycleHook(Protocol):
     def handle(self, cfg: RootConfig, event: TaskLifecycleEvent) -> None: ...
 
 
+def _terminal_change_details(task: TaskRecord, transition: TerminalTransition) -> dict:
+    """Serialize terminal transition authority alongside cancellation context."""
+    details = asdict(transition)
+    details["allowed_task_phases"] = sorted(transition.allowed_task_phases)
+    details["allowed_attempt_phases"] = sorted(transition.allowed_attempt_phases)
+    for key in ("cancellation_operation_id", "terminate_running"):
+        if key in task.control:
+            details[key] = task.control[key]
+    return details
+
+
 def commit_terminal_transition_locked(
     cfg: RootConfig,
     task: TaskRecord,
@@ -135,25 +147,28 @@ def commit_terminal_transition_locked(
     finished_at = utc_now()
     attempt.phase = transition.phase
     attempt.result.update({"exit_code": transition.exit_code, "reason": transition.reason})
+    if transition.phase == "cancelled" and task.control.get("cancellation_operation_id"):
+        attempt.result["cancellation_operation_id"] = task.control["cancellation_operation_id"]
     attempt.timestamps["finished_at"] = finished_at
     if transition.termination_result is not None:
         attempt.termination.update({"acknowledged_at": finished_at, "result": transition.termination_result})
-    atomic_replace(path, attempt.to_dict())
-    if transition.claim_mode == "active" and active_claim:
-        archive_claim(cfg, task.task_id, active_claim, transition.reason)
-    task.claim_control["active_claim"] = None
-    task.claim_control["fencing_epoch"] = max(task.claim_control.get("fencing_epoch", 0), transition.fencing_token)
-    task.attempt_control["current_attempt_id"] = None
-    task.attempt_control["current_attempt_number"] = transition.attempt_number
-    task.state.update({"projection": transition.phase, "reason": transition.reason})
-    if transition.termination_result is not None:
-        task.control.update(
-            {"termination_acknowledged_at": finished_at, "termination_result": transition.termination_result}
-        )
-    task.meta["revision"] += 1
-    task.meta["updated_at"] = finished_at
-    save_task(cfg, task)
-    retire_current_ready_generation(cfg, task)
+    with record_task_change(cfg, task, "terminal", details=_terminal_change_details(task, transition)):
+        atomic_replace(path, attempt.to_dict())
+        if transition.claim_mode == "active" and active_claim:
+            archive_claim(cfg, task.task_id, active_claim, transition.reason)
+        task.claim_control["active_claim"] = None
+        task.claim_control["fencing_epoch"] = max(task.claim_control.get("fencing_epoch", 0), transition.fencing_token)
+        task.attempt_control["current_attempt_id"] = None
+        task.attempt_control["current_attempt_number"] = transition.attempt_number
+        task.state.update({"projection": transition.phase, "reason": transition.reason})
+        if transition.termination_result is not None:
+            task.control.update(
+                {"termination_acknowledged_at": finished_at, "termination_result": transition.termination_result}
+            )
+        task.meta["revision"] += 1
+        task.meta["updated_at"] = finished_at
+        save_task(cfg, task)
+        retire_current_ready_generation(cfg, task)
     execution_started_at = attempt.timestamps.get("process_created_at") or attempt.timestamps.get("running_at")
     project_id = None
     try:
@@ -195,17 +210,18 @@ def _commit_missing_attempt_transition(
     reservation_machine: str | None,
 ) -> TerminalCommitResult:
     finished_at = utc_now()
-    if active_claim:
-        archive_claim(cfg, task.task_id, active_claim, transition.reason)
-    task.claim_control["active_claim"] = None
-    task.claim_control["fencing_epoch"] = max(task.claim_control.get("fencing_epoch", 0), transition.fencing_token)
-    task.attempt_control["current_attempt_id"] = None
-    task.attempt_control["current_attempt_number"] = transition.attempt_number
-    task.state.update({"projection": transition.phase, "reason": transition.reason})
-    task.meta["revision"] += 1
-    task.meta["updated_at"] = finished_at
-    save_task(cfg, task)
-    retire_current_ready_generation(cfg, task)
+    with record_task_change(cfg, task, "terminal", details=_terminal_change_details(task, transition)):
+        if active_claim:
+            archive_claim(cfg, task.task_id, active_claim, transition.reason)
+        task.claim_control["active_claim"] = None
+        task.claim_control["fencing_epoch"] = max(task.claim_control.get("fencing_epoch", 0), transition.fencing_token)
+        task.attempt_control["current_attempt_id"] = None
+        task.attempt_control["current_attempt_number"] = transition.attempt_number
+        task.state.update({"projection": transition.phase, "reason": transition.reason})
+        task.meta["revision"] += 1
+        task.meta["updated_at"] = finished_at
+        save_task(cfg, task)
+        retire_current_ready_generation(cfg, task)
     return TerminalCommitResult("committed", None, reservation_id, reservation_machine)
 
 

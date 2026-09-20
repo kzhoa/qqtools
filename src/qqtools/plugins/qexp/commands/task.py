@@ -14,6 +14,7 @@ from ..runtime.availability import (
     apply_availability_transition,
 )
 from ..runtime.dependencies import is_committed_submission_task, normalize_dependency_ids, validate_group_dependencies
+from ..runtime.group_discovery.changes import record_task_change
 from ..runtime.locks import group_writer_lock, task_lock
 from ..runtime.operation_store import operation_exists
 from ..runtime.paths import attempt_path, shared_paths
@@ -147,59 +148,80 @@ def retry(cfg: RootConfig, task_id: str, *, acknowledge_duplicate_risk: bool = F
             current_path = attempt_path(cfg.shared_root, task_id, number)
             current = AttemptRecord.from_dict(read_json(current_path))
             if task.state["projection"] == "failed" and current.phase == "failed":
-                task.state = {"projection": "queued", "reason": None}
+                retry_mode = "failed"
             elif task.state["projection"] == "blocked" and current.phase == "orphaned":
-                superseded_at = utc_now()
-                task.claim_control["fencing_epoch"] += 1
-                from ..events import write_event
-
-                write_event(
-                    cfg,
-                    "orphan_superseded_by_retry",
-                    task_id=task_id,
-                    details={
-                        "attempt_id": current.attempt_id,
-                        "fencing_token": current.current_fencing_token,
-                        "operator": cfg.machine_name,
-                        "timestamp": superseded_at,
-                    },
-                )
-                task.state = {"projection": "queued", "reason": "orphan_superseded_by_retry"}
+                retry_mode = "orphaned"
             else:
                 raise ValueError(
                     "only a failed Task or a blocked Task with an orphaned current Attempt can be retried."
                 )
-            task.control.update(
-                {
-                    "cancellation_requested_at": None,
-                    "cancellation_operation_id": None,
-                    "terminate_running": False,
-                    "requested_by": None,
-                    "termination_acknowledged_at": None,
-                    "termination_result": None,
-                }
-            )
-            task.placement_runtime.update(
-                {
-                    "queue_scope": "home",
-                    "queued_home_at": utc_now(),
-                    "offered_at": None,
-                    "offer_reason": None,
-                    "offered_by": None,
-                }
-            )
-            task.attempt_control["current_attempt_id"] = None
-            old_generation, _ = prepare_ready_transition(cfg, task, "retry", reference=reference)
-            task.meta["revision"] += 1
-            task.meta["updated_at"] = utc_now()
-            save_task(cfg, task)
-            is_committed = True
-            commit_ready_publication(cfg, task)
-            retire_previous_ready_generation(cfg, old_generation, task)
-            return task
+            with record_task_change(
+                cfg,
+                task,
+                "retry",
+                details={"reserved_generation": reserved_generation},
+            ):
+                if retry_mode == "failed":
+                    task.state = {"projection": "queued", "reason": None}
+                else:
+                    superseded_at = utc_now()
+                    task.claim_control["fencing_epoch"] += 1
+                    from ..events import write_event
+
+                    write_event(
+                        cfg,
+                        "orphan_superseded_by_retry",
+                        task_id=task_id,
+                        details={
+                            "attempt_id": current.attempt_id,
+                            "fencing_token": current.current_fencing_token,
+                            "operator": cfg.machine_name,
+                            "timestamp": superseded_at,
+                        },
+                    )
+                    task.state = {"projection": "queued", "reason": "orphan_superseded_by_retry"}
+                task.control.update(
+                    {
+                        "cancellation_requested_at": None,
+                        "cancellation_operation_id": None,
+                        "terminate_running": False,
+                        "requested_by": None,
+                        "termination_acknowledged_at": None,
+                        "termination_result": None,
+                    }
+                )
+                task.placement_runtime.update(
+                    {
+                        "queue_scope": "home",
+                        "queued_home_at": utc_now(),
+                        "offered_at": None,
+                        "offer_reason": None,
+                        "offered_by": None,
+                    }
+                )
+                task.attempt_control["current_attempt_id"] = None
+                old_generation, _ = prepare_ready_transition(cfg, task, "retry", reference=reference)
+                task.meta["revision"] += 1
+                task.meta["updated_at"] = utc_now()
+                save_task(cfg, task)
+                is_committed = True
+                commit_ready_publication(cfg, task)
+                retire_previous_ready_generation(cfg, old_generation, task)
+                return task
     finally:
         if not is_committed:
-            discard_ready_generation(cfg, task_id, reserved_generation)
+            # A rename can commit Task truth before its durability call raises.
+            # Never retire the generation now named by authoritative truth.
+            try:
+                with authority_locks(cfg, initial):
+                    try:
+                        current_task = load_task(cfg, task_id)
+                    except FileNotFoundError:
+                        current_task = None
+                    if current_task is None or current_task.ready_generation != reserved_generation:
+                        discard_ready_generation(cfg, task_id, reserved_generation)
+            except (OSError, KeyError, TypeError, ValueError, RuntimeError):
+                pass
 
 
 def edit_dependencies(

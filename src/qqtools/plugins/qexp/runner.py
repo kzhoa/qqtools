@@ -14,21 +14,14 @@ from .config_types import RootConfig
 from .infrastructure.process import process_start_time_ticks as _process_start_time_ticks
 from .layout import load_root_config, shared_attempt_log_path
 from .runtime.authority_lock import authority_locks
-from .runtime.paths import local_paths
+from .runtime.paths import attempt_path, local_paths
 from .runtime.progress import prepare_progress_channel
 from .runtime.records import AttemptRecord, utc_now
+from .runtime.responsibility import require_launch_responsibility
 from .runtime.store import atomic_replace, create_if_absent, read_json
 from .runtime.tasks import load_task
 
 LOCAL_PROCESS_PROTOCOL_VERSION = 1
-
-
-def _load_attempt(cfg: RootConfig, task_id: str, attempt_id: str) -> AttemptRecord:
-    for path in (cfg.shared_root / "attempts" / task_id).glob("*.json"):
-        data = read_json(path)
-        if data["attempt"]["attempt_id"] == attempt_id:
-            return AttemptRecord.from_dict(data)
-    raise FileNotFoundError(f"Attempt {attempt_id!r} not found for Task {task_id!r}.")
 
 
 def registration_path(cfg: RootConfig, attempt_id: str) -> Path:
@@ -167,19 +160,23 @@ def run_attempt(
     """Start and observe a process without participating in execution authority."""
     del poll_interval
     task = load_task(cfg, task_id)
+    claim = task.claim_control.get("active_claim") or {}
+    if not _matches_launch_claim(claim, attempt_id, fencing_token, launch_id, cfg.machine_name):
+        raise RuntimeError("Attempt is not authorized to launch.")
+    number = claim.get("attempt_number")
+    require_launch_responsibility(cfg, task_id, attempt_id, number)
     with authority_locks(cfg, task):
         task = load_task(cfg, task_id)
-        attempt = _load_attempt(cfg, task_id, attempt_id)
+        attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task_id, number)))
         claim = task.claim_control.get("active_claim") or {}
         if (
-            attempt.current_fencing_token != fencing_token
+            attempt.task_id != task_id
+            or attempt.attempt_id != attempt_id
+            or attempt.current_fencing_token != fencing_token
             or attempt.phase != "starting"
             or attempt.authorization.get("launch_id") != launch_id
-            or claim.get("attempt_id") != attempt_id
-            or claim.get("fencing_token") != fencing_token
-            or claim.get("launch_id") != launch_id
-            or claim.get("machine_name") != cfg.machine_name
-            or claim.get("launch_state") != "starting"
+            or attempt.attempt_number != number
+            or not _matches_launch_claim(claim, attempt_id, fencing_token, launch_id, cfg.machine_name)
         ):
             raise RuntimeError("Attempt is not authorized to launch.")
         _publish_launch_intent(cfg, attempt, task)
@@ -228,6 +225,19 @@ def run_attempt(
         return_code = child.wait()
     _publish_exit_observation(cfg, attempt_id, return_code, task_id=task_id)
     return return_code
+
+
+def _matches_launch_claim(
+    claim: object, attempt_id: str, fencing_token: int, launch_id: str, machine_name: str
+) -> bool:
+    return (
+        isinstance(claim, dict)
+        and claim.get("attempt_id") == attempt_id
+        and claim.get("fencing_token") == fencing_token
+        and claim.get("launch_id") == launch_id
+        and claim.get("machine_name") == machine_name
+        and claim.get("launch_state") == "starting"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

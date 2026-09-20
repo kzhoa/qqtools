@@ -21,10 +21,12 @@ from ..layout import (
 )
 from ..legacy_agent import get_agent_status
 from ..machine_config import is_legacy_agent_project, save_machine_config
+from ..runtime.authority_scan import is_path_present, iter_evidence_files, validate_evidence_path
 from ..runtime.locks import exclusive
 from ..runtime.paths import local_paths
-from ..runtime.records import utc_now
-from ..runtime.store import atomic_replace, iter_json, read_json
+from ..runtime.records import utc_now, validate_identifier
+from ..runtime.responsibility_store import DurableIO
+from ..runtime.store import atomic_replace, read_json
 from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
 from .helpers import _active_machine_identity, _pid_start_time_ticks
 
@@ -191,55 +193,145 @@ def _save_migration_state(
 
 
 def _import_legacy_reservations(runtime: MachineRuntime, binding: ProjectBinding, cfg: RootConfig) -> None:
-    """Move legacy reservations without overwriting a possibly unrelated machine record."""
-    source_paths = local_paths(cfg.runtime_root)
-    source_lock = source_paths["locks"] / "gpu-reservations.lock"
-    if source_lock.resolve() == runtime.paths["reservation_lock"].resolve():
+    """Move CPU and GPU occupancy without changing machine capacity policy."""
+    if cfg.runtime_root.resolve() == runtime.root.resolve():
         raise RuntimeError("legacy and machine reservation roots must be different during migration.")
-    with exclusive(source_lock):
-        records: list[tuple[Path, Path, dict[str, Any]]] = []
-        for name in ("active", "provisional"):
-            for path in iter_json(source_paths[name]):
+    # The independent capacity domains must never nest their reservation locks.
+    for names, lock_name, released in (
+        (("active", "provisional"), "gpu-reservations.lock", "released"),
+        (("cpu_active", "cpu_provisional"), "cpu-lane.lock", "cpu_released"),
+    ):
+        _import_reservation_lane(runtime, binding, cfg, names, lock_name, released)
+
+
+def _import_reservation_lane(
+    runtime: MachineRuntime,
+    binding: ProjectBinding,
+    cfg: RootConfig,
+    names: tuple[str, str],
+    lock_name: str,
+    released: str,
+) -> None:
+    source_paths = local_paths(cfg.runtime_root)
+    io = DurableIO()
+    with exclusive(source_paths["locks"] / lock_name):
+        records: dict[Path, tuple[Path, dict[str, Any]]] = {}
+        source_ids = set()
+        for name in names:
+            for path in iter_evidence_files(source_paths[name], recursive=True):
+                if path.parent != source_paths[name]:
+                    raise RuntimeError(f"legacy reservation has an unexpected nested path: {path}")
+                if path.name in source_ids:
+                    raise RuntimeError(f"legacy reservation ID occurs in multiple phases: {path}")
+                source_ids.add(path.name)
+                if not validate_evidence_path(path, cfg.runtime_root):
+                    continue
                 value = read_json(path)
-                reservation = value.get("reservation", {})
+                reservation = value.get("reservation")
+                if not isinstance(reservation, dict) or reservation.get("reservation_id") != path.stem:
+                    raise RuntimeError(f"legacy reservation identity is malformed: {path}")
+                validate_identifier(reservation.get("task_id"), "task_id")
+                if (
+                    reservation.get("project_id") not in (None, binding.project_id)
+                    or reservation.get("shared_root") not in (None, str(cfg.shared_root))
+                    or reservation.get("machine_name") not in (None, cfg.machine_name)
+                ):
+                    raise RuntimeError(f"legacy reservation belongs to another project or machine: {path}")
+                if reservation.get("state") != ("active" if name == names[0] else "provisional"):
+                    raise RuntimeError(f"legacy reservation state does not match its directory: {path}")
+                if released == "cpu_released":
+                    if type(reservation.get("cpu_slots")) is not int or reservation["cpu_slots"] < 1:
+                        raise RuntimeError(f"legacy CPU reservation has invalid slots: {path}")
+                elif not isinstance(reservation.get("gpu_ids"), list) or any(
+                    type(gpu) is not int for gpu in reservation["gpu_ids"]
+                ):
+                    raise RuntimeError(f"legacy GPU reservation has invalid devices: {path}")
                 reservation.update(
-                    {
-                        "project_id": binding.project_id,
-                        "shared_root": str(cfg.shared_root),
-                        "machine_name": cfg.machine_name,
-                    }
+                    project_id=binding.project_id, shared_root=str(cfg.shared_root), machine_name=cfg.machine_name
                 )
-                records.append((path, runtime.paths[name] / path.name, value))
-        with exclusive(runtime.paths["reservation_lock"]):
-            imported_ids = {destination.name for _source, destination, _value in records}
-            imported_gpus = {
-                gpu_id
-                for _source, _destination, value in records
-                for gpu_id in value.get("reservation", {}).get("gpu_ids", [])
-            }
-            occupied_gpus = {
-                gpu_id
-                for name in ("active", "provisional")
-                for path in iter_json(runtime.paths[name])
-                if path.name not in imported_ids
-                for gpu_id in read_json(path).get("reservation", {}).get("gpu_ids", [])
-            }
+                records[runtime.paths[name] / path.name] = path, value
+        with exclusive(runtime.paths["locks"] / lock_name):
+            imported_ids = {path.name for path in records}
+            occupied_gpus = set()
+            for name in names:
+                for path in iter_evidence_files(runtime.paths[name], recursive=True):
+                    if path.parent != runtime.paths[name]:
+                        raise RuntimeError(f"machine reservation has an unexpected nested path: {path}")
+                    if not validate_evidence_path(path, runtime.root):
+                        continue
+                    value = read_json(path)
+                    if path.name in imported_ids:
+                        if path not in records or value != records[path][1]:
+                            raise RuntimeError(f"legacy reservation ID conflicts during migration: {path}")
+                    else:
+                        reservation = value.get("reservation")
+                        if (
+                            not isinstance(reservation, dict)
+                            or reservation.get("reservation_id") != path.stem
+                            or reservation.get("state") != ("active" if name == names[0] else "provisional")
+                        ):
+                            raise RuntimeError(f"machine reservation is malformed: {path}")
+                        validate_identifier(reservation.get("task_id"), "task_id")
+                        if released == "cpu_released" and (
+                            type(reservation.get("cpu_slots")) is not int or reservation["cpu_slots"] < 1
+                        ):
+                            raise RuntimeError(f"machine CPU reservation has invalid slots: {path}")
+                        if released == "released":
+                            gpus = reservation.get("gpu_ids")
+                            if not isinstance(gpus, list) or any(type(gpu) is not int for gpu in gpus):
+                                raise RuntimeError(f"machine reservation has invalid devices: {path}")
+                            occupied_gpus.update(gpus)
+            durable_targets = set()
+            retired_targets = set()
+            copies = []
+            for destination, (source, value) in records.items():
+                validate_evidence_path(destination, runtime.root)
+                released_path = runtime.paths[released] / destination.name
+                if validate_evidence_path(released_path, runtime.root):
+                    retained = read_json(released_path)
+                    receipt = retained.get("reservation")
+                    if not isinstance(receipt, dict):
+                        raise RuntimeError(f"legacy reservation release conflicts during migration: {released_path}")
+                    expected = {
+                        **value,
+                        "reservation": {
+                            **value["reservation"],
+                            "state": "released",
+                            "released_at": receipt.get("released_at"),
+                            "release_reason": receipt.get("release_reason"),
+                        },
+                    }
+                    if retained != expected or not isinstance(receipt.get("released_at"), str):
+                        raise RuntimeError(f"legacy reservation release conflicts during migration: {released_path}")
+                    durable_targets.add(released_path)
+                    # Release may have committed before its occupancy unlink.
+                    # The earlier destination check proved this is the exact copy.
+                    retired_targets.add(destination)
+                else:
+                    copies.append((destination, value))
+                    durable_targets.add(destination)
+            imported_gpus = {gpu for _destination, value in copies for gpu in value["reservation"].get("gpu_ids", [])}
             if imported_gpus.intersection(occupied_gpus):
                 raise RuntimeError(
-                    "legacy reservation GPUs conflict during migration; "
-                    "the project remains disabled and no reservation was released."
+                    "legacy reservation GPUs conflict during migration; the project remains disabled and no reservation was released."
                 )
-            for _source, destination, value in records:
-                if destination.exists() and read_json(destination) != value:
-                    raise RuntimeError(
-                        f"legacy reservation ID conflicts during migration: {destination.stem}; "
-                        "the project remains disabled and no reservation was released."
-                    )
-            for _source, destination, value in records:
-                if not destination.exists():
+            # Validate every conflict before copying or deleting any source in this lane.
+            for destination, value in copies:
+                if not is_path_present(destination):
                     atomic_replace(destination, value)
-            for source, _destination, _value in records:
-                source.unlink(missing_ok=True)
+            directories = {parent for target in durable_targets for parent in target.resolve().parents}
+            for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+                io.sync_directory(directory, "migration_reservation_destination")
+            for destination in retired_targets:
+                io.delete(destination, should_sync_directory=False)
+            for directory in {target.parent for target in retired_targets}:
+                io.sync_directory(directory, "migration_reservation_retired")
+            for source, _value in records.values():
+                io.delete(source, should_sync_directory=False)
+            # Retry also syncs an empty source after an interrupted unlink barrier.
+            for name in names:
+                if is_path_present(source_paths[name]):
+                    io.sync_directory(source_paths[name], "migration_reservation_source")
 
 
 def migrate_project(runtime: MachineRuntime | str | Path | None, cfg: RootConfig) -> ProjectBinding:

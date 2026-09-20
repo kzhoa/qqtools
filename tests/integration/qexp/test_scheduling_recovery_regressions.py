@@ -786,3 +786,489 @@ def test_scheduler_rejects_task_before_submission_commit(tmp_path: Path):
     operation["submission"]["state"] = "committing"
     atomic_replace(operation_path, operation)
     assert claim_task(cfg, task.task_id, [0]) is None
+
+
+@pytest.mark.parametrize("crash_point", ["barrier", "converging"])
+@pytest.mark.parametrize("phase", ["queued", "claimed", "authorized", "rejected"])
+@pytest.mark.parametrize("terminate_running", [False, True])
+@pytest.mark.parametrize("is_legacy_doctor", [False, True])
+def test_group_cancel_replays_after_crash_before_first_task(
+    tmp_path, monkeypatch, crash_point, phase, terminate_running, is_legacy_doctor
+):
+    from qqtools.plugins.qexp.commands import group as group_commands
+    from qqtools.plugins.qexp.runtime.paths import group_path
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "recover"], group="exp")
+    reservation_root = tmp_path / "doctor-reservations" if is_legacy_doctor else cfg.runtime_root
+    if phase != "queued":
+        attempt = claim_task(cfg, task.task_id, [0], reservation_runtime_root=reservation_root)
+        assert attempt is not None
+        if phase == "authorized":
+            assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+        elif phase == "rejected":
+            attempt_file = attempt_path(cfg.shared_root, task.task_id, 1)
+            value = read_json(attempt_file)
+            value["attempt"]["current_fencing_token"] += 1
+            atomic_replace(attempt_file, value)
+    before = load_task(cfg, task.task_id).to_dict()
+    write_operation = group_commands.write_active_operation
+    replace = group_commands.atomic_replace
+
+    def fail_after_operation(cfg, kind, operation_id, value):
+        result = write_operation(cfg, kind, operation_id, value)
+        if crash_point == "converging" and value["group_control"]["state"] == "converging":
+            raise OSError("interrupted before first Group member")
+        return result
+
+    def fail_after_barrier(path, value):
+        replace(path, value)
+        if crash_point == "barrier" and path == group_path(cfg.shared_root, "exp"):
+            raise OSError("interrupted before first Group member")
+
+    with monkeypatch.context() as crashing:
+        crashing.setattr(group_commands, "write_active_operation", fail_after_operation)
+        crashing.setattr(group_commands, "atomic_replace", fail_after_barrier)
+        with pytest.raises(OSError, match="interrupted before first Group member"):
+            group_control(cfg, "exp", "cancel", terminate_running=terminate_running)
+    assert load_task(cfg, task.task_id).to_dict() == before
+    later = submit(cfg, ["echo", "later"], group="exp")
+    other = submit(cfg, ["echo", "unrelated"])
+    group_data = read_json(group_path(cfg.shared_root, "exp"))
+    operation_id = group_data["cancellation_operation"]["operation_id"]
+
+    operation_path = cfg.shared_root / "operations/group-control" / f"{operation_id}.json"
+    if is_legacy_doctor:
+        active = active_operation_path(cfg, "group_control", operation_id)
+        atomic_replace(operation_path, read_json(active))
+        active.unlink()
+        assert not operation_path.is_symlink()
+        repair_result = repair_metadata(cfg, reservation_runtime_root=reservation_root)
+    else:
+        reconcile_group_cancel_operations(cfg)
+
+    current = load_task(cfg, task.task_id)
+    control = read_json(operation_path)["group_control"]
+    if phase == "rejected":
+        assert current.to_dict() == before
+        assert control["state"] == "blocked"
+        assert control["completed_at"] is None
+        assert reserved_gpu_ids(reservation_root) == {0}
+        if is_legacy_doctor:
+            assert operation_id in repair_result["blocked"]
+            assert operation_id not in repair_result["repaired"]
+    elif phase == "authorized":
+        assert current.state["projection"] == "running"
+        assert current.control["terminate_running"] is terminate_running
+        assert control["state"] == ("waiting_ack" if terminate_running else "completed")
+        if terminate_running:
+            assert current.control["cancellation_operation_id"] == operation_id
+    else:
+        assert current.state["projection"] == "cancelled"
+        assert current.control["cancellation_operation_id"] == operation_id
+        assert control["state"] == "completed"
+        if phase == "claimed":
+            stored = read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]
+            assert stored["phase"] == "cancelled"
+            assert not reserved_gpu_ids(reservation_root)
+    assert load_task(cfg, later.task_id).state["projection"] == "queued"
+    assert load_task(cfg, other.task_id).state["projection"] == "queued"
+
+
+def test_replaying_default_group_cancel_preserves_later_termination(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.commands import group as group_commands
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "running"], group="exp")
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    write_operation = group_commands.write_active_operation
+
+    def interrupted(cfg, kind, operation_id, value):
+        result = write_operation(cfg, kind, operation_id, value)
+        if value["group_control"]["state"] == "converging":
+            raise OSError("before default cancellation converged")
+        return result
+
+    with monkeypatch.context() as crashing:
+        crashing.setattr(group_commands, "write_active_operation", interrupted)
+        with pytest.raises(OSError, match="before default cancellation converged"):
+            group_control(cfg, "exp", "cancel")
+    terminating = group_control(cfg, "exp", "cancel", terminate_running=True)["cancellation_operation"]
+    requested = load_task(cfg, task.task_id).to_dict()
+    for _ in range(3):
+        reconcile_group_cancel_operations(cfg)
+    assert load_task(cfg, task.task_id).to_dict() == requested
+    assert requested["task"]["control"]["cancellation_operation_id"] == terminating["operation_id"]
+
+
+def test_group_cancel_missing_group_remains_durably_blocked(tmp_path):
+    from qqtools.plugins.qexp.runtime.paths import group_path
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "running"], group="exp")
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    control = group_control(cfg, "exp", "cancel", terminate_running=True)["cancellation_operation"]
+    before = load_task(cfg, task.task_id).to_dict()
+    group_path(cfg.shared_root, "exp").unlink()
+
+    result = reconcile_group_cancel_operations(cfg)
+
+    assert len(result) == 1
+    assert result[0]["blocked_reason"] == "group_missing"
+    path = active_operation_path(cfg, "group_control", control["operation_id"])
+    stored = read_json(path)["group_control"]
+    assert stored["state"] == "blocked"
+    assert stored["blocked_reason"] == "group_missing"
+    assert stored["completed_at"] is None
+    assert load_task(cfg, task.task_id).to_dict() == before
+
+
+def _enable_bound_worker_removal(cfg):
+    from qqtools.plugins.qexp.runtime.group_namespace import activate_group_authority_locked
+    from qqtools.plugins.qexp.runtime.locks import schema_lock
+
+    with schema_lock(cfg.shared_root):
+        path = cfg.shared_root / "schema/version.json"
+        value = read_json(path)
+        value["schema"]["required_capabilities"].append("local-recovery-v1")
+        atomic_replace(path, value)
+        assert activate_group_authority_locked(cfg)
+
+
+def _converge_worker_removal(cfg, control, *, state="completed"):
+    from qqtools.plugins.qexp.runtime.operation_store import locate_operation_path
+    from tests.helpers.qexp_discovery import discover_group
+
+    discover_group(cfg, control["group_name"])
+    for _ in range(100):
+        path = locate_operation_path(cfg, "group_control", control["operation_id"])
+        current = read_json(path)["group_control"]
+        if current["state"] == state:
+            return current
+        reconcile_group_cancel_operations(cfg)
+    raise AssertionError(f"Worker removal did not reach {state}: {current}")
+
+
+def test_worker_remove_recovers_crash_before_draining_publication(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.commands import worker_removal as group_commands
+    from qqtools.plugins.qexp.runtime.paths import group_path
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _enable_bound_worker_removal(cfg)
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "queued"], group="exp")
+    write_operation = group_commands.write_active_operation
+    operation_ids = []
+
+    def interrupted(cfg, kind, operation_id, value):
+        result = write_operation(cfg, kind, operation_id, value)
+        if value["group_control"]["operation_type"] == "worker_remove_v2":
+            operation_ids.append(operation_id)
+            raise OSError("before draining Group publication")
+        return result
+
+    with monkeypatch.context() as crashing:
+        crashing.setattr(group_commands, "write_active_operation", interrupted)
+        with pytest.raises(OSError, match="before draining Group publication"):
+            change_worker(cfg, "exp", "g1", "remove")
+    assert read_json(group_path(cfg.shared_root, "exp"))["group"]["worker_set"]["g1"]["state"] == "active"
+
+    _converge_worker_removal(cfg, {"group_name": "exp", "operation_id": operation_ids[0]}, state="waiting_ack")
+
+    group = read_json(group_path(cfg.shared_root, "exp"))
+    assert group["group"]["worker_set"]["g1"]["state"] == "draining"
+    operation = read_json(active_operation_path(cfg, "group_control", operation_ids[0]))["group_control"]
+    assert operation["state"] == "waiting_ack"
+    assert task.task_id in operation["blockers"]
+    assert load_task(cfg, task.task_id).state["projection"] == "queued"
+
+
+@pytest.mark.parametrize("should_drain_again", [False, True])
+@pytest.mark.parametrize("terminate_running", [False, True])
+def test_worker_remove_does_not_follow_reactivated_worker(tmp_path, should_drain_again, terminate_running):
+    from qqtools.plugins.qexp.runtime.paths import group_path
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _enable_bound_worker_removal(cfg)
+    _existing_group(cfg)
+    original = submit(cfg, ["echo", "old"], group="exp")
+    change_worker(cfg, "exp", "g1", "remove", terminate_running=terminate_running)
+    change_worker(cfg, "exp", "g1", "add")
+    cancel_task(cfg, original.task_id)
+    if terminate_running:
+        later = submit(cfg, ["echo", "new"], group="exp")
+        attempt = claim_task(cfg, later.task_id, [0])
+        assert attempt is not None
+        assert authorize_launch(cfg, later.task_id, attempt.attempt_id, attempt.current_fencing_token)
+        task_before = load_task(cfg, later.task_id).to_dict()
+    if should_drain_again:
+        change_worker(cfg, "exp", "g1", "drain")
+    before = read_json(group_path(cfg.shared_root, "exp"))["group"]["worker_set"]["g1"]
+
+    reconcile_group_cancel_operations(cfg)
+
+    after = read_json(group_path(cfg.shared_root, "exp"))["group"]["worker_set"]["g1"]
+    assert after == before
+    if terminate_running:
+        assert load_task(cfg, later.task_id).to_dict() == task_before
+
+
+def test_worker_remove_replays_when_final_group_publication_fails(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.commands import worker_removal as group_commands
+    from qqtools.plugins.qexp.runtime.paths import group_path
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _enable_bound_worker_removal(cfg)
+    _existing_group(cfg)
+    replace = group_commands.atomic_replace
+    path = group_path(cfg.shared_root, "exp")
+
+    def interrupted(target, value):
+        if target == path and value["group"]["worker_set"]["g1"]["state"] == "removing":
+            raise OSError("before removing Group publication")
+        return replace(target, value)
+
+    with monkeypatch.context() as crashing:
+        crashing.setattr(group_commands, "atomic_replace", interrupted)
+        with pytest.raises(OSError, match="before removing Group publication"):
+            change_worker(cfg, "exp", "g1", "remove")
+
+    reconcile_group_cancel_operations(cfg)
+
+    group = read_json(path)
+    assert group["group"]["worker_set"]["g1"]["state"] == "removing"
+    assert group["worker_control"]["state"] == "completed"
+
+
+def test_group_replay_maintenance_uses_explicit_reservation_backend(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.commands import group as group_commands
+    from qqtools.plugins.qexp.project_maintenance import maintain_project
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "claimed"], group="exp")
+    root = tmp_path / "reservations"
+    project_id = read_json(cfg.shared_root / "project/identity.json")["project"]["project_id"]
+    attempt = claim_task(cfg, task.task_id, [0], reservation_runtime_root=root, project_id=project_id)
+    assert attempt is not None
+    write_operation = group_commands.write_active_operation
+
+    def interrupted(cfg, kind, operation_id, value):
+        result = write_operation(cfg, kind, operation_id, value)
+        if value["group_control"]["state"] == "converging":
+            raise OSError("before member cancellation")
+        return result
+
+    with monkeypatch.context() as crashing:
+        crashing.setattr(group_commands, "write_active_operation", interrupted)
+        with pytest.raises(OSError, match="before member cancellation"):
+            group_control(cfg, "exp", "cancel", reservation_runtime_root=root)
+
+    maintain_project(cfg, reservation_runtime_root=root, project_id=project_id, should_reconcile_reservations=False)
+
+    assert load_task(cfg, task.task_id).state["projection"] == "cancelled"
+    assert not reserved_gpu_ids(root)
+
+
+@pytest.mark.parametrize("cut", ["draining", "converging", "removing", "archived"])
+def test_bound_worker_remove_replays_each_durable_boundary(tmp_path, monkeypatch, cut):
+    from qqtools.plugins.qexp.commands import worker_removal
+    from qqtools.plugins.qexp.runtime.paths import group_path
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _enable_bound_worker_removal(cfg)
+    _existing_group(cfg)
+    group_file = group_path(cfg.shared_root, "exp")
+    replace = worker_removal.atomic_replace
+    write = worker_removal.write_active_operation
+    archive = worker_removal.archive_operation
+
+    def interrupted_group(path, value):
+        replace(path, value)
+        if path == group_file and value["group"]["worker_set"]["g1"]["state"] == cut:
+            raise OSError("after durable boundary")
+
+    def interrupted_operation(cfg, kind, operation_id, value):
+        result = write(cfg, kind, operation_id, value)
+        if cut == value["group_control"]["state"]:
+            raise OSError("after durable boundary")
+        return result
+
+    def interrupted_archive(cfg, kind, operation_id, value):
+        if cut == "archived":
+            # A completed historical copy is durable but the active copy remains.
+            atomic_replace(cfg.shared_root / "operations/group-control" / f"{operation_id}.json", value)
+            raise OSError("after durable boundary")
+        return archive(cfg, kind, operation_id, value)
+
+    with monkeypatch.context() as crashing:
+        crashing.setattr(worker_removal, "atomic_replace", interrupted_group)
+        crashing.setattr(worker_removal, "write_active_operation", interrupted_operation)
+        crashing.setattr(worker_removal, "archive_operation", interrupted_archive)
+        with pytest.raises(OSError, match="after durable boundary"):
+            change_worker(cfg, "exp", "g1", "remove")
+    reconcile_group_cancel_operations(cfg)
+    group = read_json(group_file)
+    control = group["worker_control"]
+    assert group["group"]["worker_set"]["g1"]["state"] == "removing"
+    assert control["state"] == "completed"
+    assert not active_operation_path(cfg, "group_control", control["operation_id"]).exists()
+    assert (
+        read_json(cfg.shared_root / "operations/group-control" / f"{control['operation_id']}.json")["group_control"][
+            "state"
+        ]
+        == "completed"
+    )
+
+
+def test_bound_worker_remove_survives_role_and_quota_updates(tmp_path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _enable_bound_worker_removal(cfg)
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "queued"], group="exp")
+    first = change_worker(cfg, "exp", "g1", "remove")["worker_control"]
+    change_worker(cfg, "exp", "g1", "set", role="borrow", has_gpu_limit=True, gpu_limit_gpus=2)
+    cancel_task(cfg, task.task_id)
+    _converge_worker_removal(cfg, first)
+    group = show_group(cfg, "exp")
+    worker = group["group"]["worker_set"]["g1"]
+    assert worker["state"] == "removing"
+    assert worker["scheduling_role"] == "borrow"
+    assert worker["gpu_limit_gpus"] == 2
+    assert worker["removal_operation_id"] == first["operation_id"]
+    assert group["worker_control"]["state"] == "completed"
+
+
+def test_bound_worker_remove_reuses_operation_and_only_escalates(tmp_path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _enable_bound_worker_removal(cfg)
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "running"], group="exp")
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    first = change_worker(cfg, "exp", "g1", "remove")["worker_control"]
+    assert not load_task(cfg, task.task_id).control.get("terminate_running")
+    second = change_worker(cfg, "exp", "g1", "remove", terminate_running=True)["worker_control"]
+    _converge_worker_removal(cfg, second, state="waiting_ack")
+    for _ in range(10):
+        if load_task(cfg, task.task_id).control.get("terminate_running"):
+            break
+        reconcile_group_cancel_operations(cfg)
+    requested = load_task(cfg, task.task_id).to_dict()
+    third = change_worker(cfg, "exp", "g1", "remove")["worker_control"]
+    assert first["operation_id"] == second["operation_id"] == third["operation_id"]
+    assert second["terminate_running"] and third["terminate_running"]
+    assert requested["task"]["control"]["terminate_running"]
+    assert load_task(cfg, task.task_id).to_dict() == requested
+
+
+def test_bound_worker_removals_have_independent_ownership(tmp_path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _enable_bound_worker_removal(cfg)
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "queued"], group="exp")
+    first = change_worker(cfg, "exp", "g1", "remove")["worker_control"]
+    change_worker(cfg, "exp", "g2", "add")
+    second = change_worker(cfg, "exp", "g2", "remove")["worker_control"]
+    second = _converge_worker_removal(cfg, second)
+    assert second["state"] == "completed"
+    cancel_task(cfg, task.task_id)
+    _converge_worker_removal(cfg, first)
+    group = show_group(cfg, "exp")
+    for machine in ("g1", "g2"):
+        assert group["group"]["worker_set"][machine]["state"] == "removing"
+    assert group["worker_control"]["operation_id"] == second["operation_id"]
+    path = cfg.shared_root / "operations/group-control" / f"{first['operation_id']}.json"
+    assert read_json(path)["group_control"]["state"] == "completed"
+
+
+@pytest.mark.parametrize(
+    "field,value", [("worker_before", None), ("draining_state_epoch", True), ("terminate_running", 1)]
+)
+def test_bound_worker_remove_rejects_malformed_proof_without_effects(tmp_path, field, value):
+    from qqtools.plugins.qexp.runtime.paths import group_path
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _enable_bound_worker_removal(cfg)
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "queued"], group="exp")
+    control = change_worker(cfg, "exp", "g1", "remove")["worker_control"]
+    path = active_operation_path(cfg, "group_control", control["operation_id"])
+    operation = read_json(path)
+    operation["group_control"][field] = value
+    atomic_replace(path, operation)
+    group_before = group_path(cfg.shared_root, "exp").read_bytes()
+    task_before = load_task(cfg, task.task_id).to_dict()
+    reconcile_group_cancel_operations(cfg)
+    assert read_json(path)["group_control"]["blocked_reason"] == "worker_removal_proof_invalid"
+    assert group_path(cfg.shared_root, "exp").read_bytes() == group_before
+    assert load_task(cfg, task.task_id).to_dict() == task_before
+
+
+@pytest.mark.parametrize("cut_before_archive", [False, True])
+def test_explicit_drain_after_removing_allows_fresh_removal(tmp_path, monkeypatch, cut_before_archive):
+    from qqtools.plugins.qexp.commands import worker_removal
+    from qqtools.plugins.qexp.runtime.paths import group_path
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _enable_bound_worker_removal(cfg)
+    _existing_group(cfg)
+    with monkeypatch.context() as cut:
+        if cut_before_archive:
+
+            def interrupted(*_args, **_kwargs):
+                raise OSError("before archive")
+
+            cut.setattr(worker_removal, "archive_operation", interrupted)
+            with pytest.raises(OSError, match="before archive"):
+                change_worker(cfg, "exp", "g1", "remove")
+        else:
+            change_worker(cfg, "exp", "g1", "remove")
+    first = read_json(group_path(cfg.shared_root, "exp"))
+    assert first["group"]["worker_set"]["g1"]["state"] == "removing"
+    first_id = first["worker_control"]["operation_id"]
+    drained = change_worker(cfg, "exp", "g1", "drain")
+    assert drained["group"]["worker_set"]["g1"]["state"] == "draining"
+    assert "removal_operation_id" not in drained["group"]["worker_set"]["g1"]
+    reconcile_group_cancel_operations(cfg)
+    removed = change_worker(cfg, "exp", "g1", "remove")
+    assert removed["group"]["worker_set"]["g1"]["state"] == "removing"
+    assert removed["worker_control"]["state"] == "completed"
+    assert removed["worker_control"]["operation_id"] != first_id
+
+
+@pytest.mark.parametrize("phase", ["failed", "orphaned"])
+def test_repeated_removal_rechecks_tasks_retried_after_completion(tmp_path, phase):
+    from qqtools.plugins.qexp.commands.task import retry
+    from qqtools.plugins.qexp.scheduler import fail_attempt
+
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _enable_bound_worker_removal(cfg)
+    _existing_group(cfg)
+    task = submit(cfg, ["true"], group="exp")
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    if phase == "failed":
+        assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure")
+    else:
+        assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    first = change_worker(cfg, "exp", "g1", "remove")["worker_control"]
+    first = _converge_worker_removal(cfg, first)
+    assert first["state"] == "completed"
+    retried = retry(cfg, task.task_id)
+    assert retried.state["projection"] == "queued"
+    second = change_worker(cfg, "exp", "g1", "remove")
+    second["worker_control"] = _converge_worker_removal(cfg, second["worker_control"], state="waiting_ack")
+    assert second["worker_control"]["state"] == "waiting_ack"
+    assert second["worker_control"]["blockers"] == [task.task_id]
+    assert second["worker_control"]["operation_id"] != first["operation_id"]
+    assert second["group"]["worker_set"]["g1"]["state"] == "draining"

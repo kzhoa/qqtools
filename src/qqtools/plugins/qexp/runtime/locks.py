@@ -100,6 +100,23 @@ def schema_reader_lock(root: Path, *, blocking: bool = True) -> Iterator[bool]:
         yield acquired
 
 
+def _assert_writer_capabilities(cfg: object, *, require_narrow: bool) -> None:
+    """Validate all writer gates while holding the schema fence, before side effects."""
+    from ..layout import is_group_ready_members_root
+    from .ready.state import assert_ready_writer_compatible
+
+    try:
+        # This reads and validates the full required-capability set, not only
+        # the capability used to select shared versus exclusive locking.
+        is_group_ready_members_root(cfg)
+    except FileNotFoundError:
+        if not require_narrow:
+            # The broad primitive also fences initialization of an empty root.
+            return
+        raise RuntimeError("qexp root has no schema capability record; ordinary mutation is disabled.") from None
+    assert_ready_writer_compatible(cfg, require_schema_gate=require_narrow)
+
+
 @contextmanager
 def schema_writer_lock(cfg: object, *, blocking: bool = True, require_narrow: bool = False) -> Iterator[bool]:
     """Fence an authoritative writer against schema/capability mutation."""
@@ -134,6 +151,7 @@ def schema_writer_lock(cfg: object, *, blocking: bool = True, require_narrow: bo
     if is_schema_narrow_protocol_active(cfg):
         with schema_reader_lock(cfg.shared_root, blocking=blocking) as acquired:
             if acquired and is_schema_narrow_protocol_active(cfg):
+                _assert_writer_capabilities(cfg, require_narrow=require_narrow)
                 token = _schema_writer_roots.set(held_roots | {root})
                 try:
                     yield True
@@ -144,6 +162,14 @@ def schema_writer_lock(cfg: object, *, blocking: bool = True, require_narrow: bo
         if not acquired:
             yield False
             return
+        if require_narrow and not is_schema_narrow_protocol_active(cfg):
+            if not blocking:
+                yield False
+                return
+            raise RuntimeError(
+                "group-ready-members projection changed before writer admission; ordinary mutation is disabled."
+            )
+        _assert_writer_capabilities(cfg, require_narrow=require_narrow)
         token = _schema_writer_roots.set(held_roots | {root})
         try:
             yield True

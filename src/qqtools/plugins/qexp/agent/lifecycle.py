@@ -31,7 +31,10 @@ from ..machine_dispatch_plan import (
 )
 from ..machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from ..project_maintenance import maintain_project, reconcile_reservation
+from ..runtime.group_discovery.service import MachineGroupDiscoveryWorker
+from ..runtime.group_namespace import inspect_group_authority
 from ..runtime.locks import exclusive
+from ..runtime.observation.maintenance import MachineObservationWorker
 from ..runtime.paths import local_paths, shared_paths
 from ..runtime.ready import (
     ReadyProbeBudgetExhausted,
@@ -43,6 +46,7 @@ from ..runtime.ready import (
 )
 from ..runtime.ready.group_members import is_group_ready_member_projection_usable
 from ..runtime.records import TaskSpec, normalize_group_record, utc_now
+from ..runtime.recovery_admission import inspect_recovery_admission
 from ..runtime.resources.cpu_lane import cpu_reservation_snapshot
 from ..runtime.resources.reservations import (
     ReservationIdentity,
@@ -51,6 +55,7 @@ from ..runtime.resources.reservations import (
     reservation_snapshot,
 )
 from ..runtime.store import atomic_replace, iter_json, read_json
+from ..runtime.submission_control_maintenance import MachineSubmissionControlWorker
 from ..runtime.upgrade.machine import MachineUpgradeWorker, discover_registered_upgrades, inspect_registered_upgrades
 from ..runtime.work_budget import (
     DIAGNOSTIC_PUBLISH_INTERVAL_SECONDS,
@@ -85,6 +90,8 @@ from .helpers import (
     _read_pid,
 )
 from .project_admin import _stop_verified_legacy_agent, migrate_project
+from .recovery_capture import inspect_recovery_capture
+from .recovery_enrollment import RecoveryEnrollment
 
 
 def get_machine_agent_status(
@@ -114,6 +121,9 @@ def get_machine_agent_status(
             **binding.to_dict(),
             "state": machine_runtime.binding_state(binding),
             "eligibility": eligibility,
+            "recovery_enrollment": inspect_recovery_admission(machine_runtime, binding),
+            "recovery_capture": inspect_recovery_capture(machine_runtime, binding),
+            "group_authority": inspect_group_authority(binding.root_config()),
             "write_eligible": eligibility.get("write_eligible", False),
             "upgrade": next(
                 (
@@ -178,6 +188,10 @@ def run_machine_agent_loop(
     has_consumed_binding = False
     idle_since: float | None = None
     upgrade_worker: MachineUpgradeWorker | None = None
+    discovery_worker: MachineGroupDiscoveryWorker | None = None
+    observation_worker: MachineObservationWorker | None = None
+    submission_control_worker: MachineSubmissionControlWorker | None = None
+    recovery_enrollment = RecoveryEnrollment(machine_runtime)
 
     def request_stop(_signum: int, _frame: object) -> None:
         nonlocal stop, stop_reason
@@ -217,10 +231,22 @@ def run_machine_agent_loop(
                 scheduler_wakeup=scheduler_wakeup,
             )
             control_plane.start()
+            discovery_worker = MachineGroupDiscoveryWorker(machine_runtime)
+            discovery_worker.start()
+            observation_worker = MachineObservationWorker(machine_runtime)
+            observation_worker.start()
+            submission_control_worker = MachineSubmissionControlWorker(machine_runtime)
+            submission_control_worker.start()
             while not stop:
                 scheduler_wakeup.clear()
                 if stop:
                     break
+                try:
+                    recovery_enrollment.poll()
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    # Local registry failure is retried without occupying the
+                    # independent authority and heartbeat control loops.
+                    pass
                 try:
                     discovery = discover_registered_upgrades(machine_runtime)
                     if upgrade_worker is None or not upgrade_worker.is_alive:
@@ -233,7 +259,7 @@ def run_machine_agent_loop(
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     pass
                 try:
-                    with machine_runtime.migration_guard() as is_migration_clear:
+                    with machine_runtime.migration_read_guard() as is_migration_clear:
                         if is_migration_clear:
                             _dispatch.dispatch_machine_cycle_locked(
                                 machine_runtime,
@@ -263,7 +289,14 @@ def run_machine_agent_loop(
                         )
                 except OSError:
                     pass
-                if _machine_is_true_idle(machine_runtime, has_consumed_binding=has_consumed_binding):
+                try:
+                    # Dispatch can take a full multi-project cycle. Consume the
+                    # service's latest completion before deciding to stay alive.
+                    recovery_enrollment.poll()
+                    is_idle = _machine_is_true_idle(machine_runtime, has_consumed_binding=has_consumed_binding)
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    is_idle = False
+                if is_idle:
                     if idle_since is None:
                         idle_since = time.monotonic()
                     elif time.monotonic() - idle_since >= loop_interval:
@@ -274,6 +307,13 @@ def run_machine_agent_loop(
                     idle_since = None
                 scheduler_wakeup.wait(loop_interval)
         finally:
+            recovery_enrollment.stop()
+            if submission_control_worker is not None:
+                submission_control_worker.stop()
+            if observation_worker is not None:
+                observation_worker.stop()
+            if discovery_worker is not None:
+                discovery_worker.stop()
             if upgrade_worker is not None:
                 upgrade_worker.stop()
             if control_plane is not None:

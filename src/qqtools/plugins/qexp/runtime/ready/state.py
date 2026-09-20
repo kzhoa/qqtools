@@ -8,6 +8,12 @@ from typing import Any, Literal
 
 from ..locks import exclusive
 from ..paths import ready_state_path, shared_paths
+from ..protocol_compatibility import (
+    CURRENT_READY_WRITER_CAPABILITY,
+    READY_WRITER_CAPABILITY,
+    SUPPORTED_READY_WRITERS,
+    minimum_ready_writer,
+)
 from ..records import utc_now
 from ..store import atomic_replace, read_json
 from .diagnostics import (
@@ -21,7 +27,6 @@ from .diagnostics import (
 )
 
 READY_PROTOCOL_VERSION = 1
-READY_WRITER_CAPABILITY = "ready-v1"
 ReadyIndexState = Literal["absent", "building", "active", "degraded"]
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +64,14 @@ def ensure_ready_layout(cfg: object) -> None:
         )
 
 
+def minimum_ready_writer_capability(cfg: object) -> str:
+    """Recover the writer floor from durable activation metadata, not a projection."""
+    from ..group_namespace import has_group_authority_cutover
+
+    schema = read_json(schema_capability_path(cfg))["schema"]
+    return minimum_ready_writer(schema, has_group_cutover=has_group_authority_cutover(cfg.shared_root))
+
+
 def _activate_empty_ready_index(cfg: object, build_id: str) -> None:
     """Activate a new root's provably empty ready projection."""
     from .protocol import PRIMARY_READY_PROTOCOL_VERSION, projection_state_path
@@ -83,7 +96,7 @@ def _activate_empty_ready_index(cfg: object, build_id: str) -> None:
     record.update(
         {
             "state": "active",
-            "writer_capability": READY_WRITER_CAPABILITY,
+            "writer_capability": minimum_ready_writer_capability(cfg),
             "build": {
                 "build_id": build_id,
                 "phase": "completed",
@@ -124,7 +137,7 @@ def read_ready_index_state(cfg: object) -> ReadyIndexState:
             return "degraded"
         if current_state not in {"absent", "building", "active", "degraded"}:
             return "degraded"
-        if current_state in {"building", "active"} and record.get("writer_capability") != READY_WRITER_CAPABILITY:
+        if current_state in {"building", "active"} and record.get("writer_capability") not in SUPPORTED_READY_WRITERS:
             return "degraded"
         if not isinstance(record.get("degraded_reasons"), list) or not all(
             isinstance(reason, str) for reason in record["degraded_reasons"]
@@ -229,21 +242,36 @@ def install_writer_capability_gate(cfg: object) -> None:
 
 def assert_ready_writer_compatible(
     cfg: object,
-    writer_capability: str | None = READY_WRITER_CAPABILITY,
+    writer_capability: str | None = CURRENT_READY_WRITER_CAPABILITY,
+    *,
+    require_schema_gate: bool = True,
 ) -> None:
-    """Reject an incompatible writer before authoritative Task mutation."""
+    """Reject incompatible writers; only maintenance fencing may defer the schema gate.
+
+    Task persistence always checks the complete gate. Build/audit entry can check
+    writer identity alone so it can diagnose a missing schema marker; that does
+    not authorize Task mutation or allow an unknown ready writer revision.
+    """
     current_state = read_ready_index_state(cfg)
     if current_state == "absent":
+        try:
+            minimum_writer = minimum_ready_writer_capability(cfg)
+        except FileNotFoundError:
+            return
+        if minimum_writer == CURRENT_READY_WRITER_CAPABILITY:
+            raise RuntimeError("ready-v2 writer floor has no ready state; Task mutation is disabled.")
         return
     try:
         _value, record = read_state_record(cfg)
     except (AttributeError, FileNotFoundError, KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("ready index state is invalid; Task mutation is disabled.") from exc
     required = record.get("writer_capability")
-    if required != READY_WRITER_CAPABILITY or writer_capability != required:
+    if required not in SUPPORTED_READY_WRITERS or writer_capability not in {required, CURRENT_READY_WRITER_CAPABILITY}:
         raise RuntimeError(
             f"ready index requires writer capability {required!r}; writer declared {writer_capability!r}."
         )
+    if not require_schema_gate:
+        return
     try:
         schema = read_json(schema_capability_path(cfg))["schema"]
         capabilities = schema["writer_capabilities"]
@@ -252,7 +280,7 @@ def assert_ready_writer_compatible(
     if (
         not isinstance(capabilities, list)
         or not all(isinstance(item, str) for item in capabilities)
-        or READY_WRITER_CAPABILITY not in capabilities
+        or required not in capabilities
     ):
         raise RuntimeError("ready writer schema capability gate is incompatible.")
 

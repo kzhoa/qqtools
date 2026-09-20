@@ -11,8 +11,18 @@ from typing import Any
 
 from .config_types import RootConfig
 from .lease import default_lease_policy_document
+from .runtime.group_namespace import group_directory
 from .runtime.locks import exclusive, schema_lock
 from .runtime.paths import local_paths, machine_path, machine_registration_path, shared_log_path, shared_paths
+from .runtime.protocol_compatibility import (
+    CPU_LANE_CAPABILITY,
+    GROUP_READY_MEMBERS_CAPABILITY,
+    OBSERVATION_CAPABILITY,
+    READY_WRITER_CAPABILITY,
+    SUPPORTED_REQUIRED_CAPABILITIES,
+    TASK_DEPENDENCIES_CAPABILITY,
+)
+from .runtime.protocol_compatibility import LOCAL_RECOVERY_CAPABILITY as LOCAL_RECOVERY_CAPABILITY
 from .runtime.records import SCHEMA_VERSION, AttemptRecord, TaskRecord, utc_now
 from .runtime.store import atomic_replace, read_json
 
@@ -51,18 +61,7 @@ def read_schema_version(cfg: RootConfig) -> int | None:
     return version
 
 
-CPU_LANE_CAPABILITY = "cpu-lane-v1"
-TASK_DEPENDENCIES_CAPABILITY = "task-dependencies-v1"
-GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
-READY_WRITER_CAPABILITY = "ready-v1"
 _CPU_LANE_REQUIRED_ERROR = "qexp root requires cpu-lane-v1; complete conversion with qqtools 1.3.15."
-SUPPORTED_REQUIRED_CAPABILITIES = frozenset(
-    {
-        CPU_LANE_CAPABILITY,
-        TASK_DEPENDENCIES_CAPABILITY,
-        GROUP_READY_MEMBERS_CAPABILITY,
-    }
-)
 
 
 def _read_cpu_lane_capability(cfg: RootConfig, *, is_required: bool) -> bool:
@@ -135,7 +134,7 @@ def _validate_root_contract(cfg: RootConfig, *, should_require_cpu_lane: bool) -
         "schema",
         "project",
         "clock-observations",
-        "groups",
+        group_directory(cfg.shared_root).name,
         "tasks",
         "attempts",
         "operations",
@@ -165,6 +164,8 @@ def validate_root_contract(cfg: RootConfig) -> None:
 def ensure_shared_layout(cfg: RootConfig) -> None:
     paths = shared_paths(cfg.shared_root)
     for name, path in paths.items():
+        if name == "groups":
+            path = group_directory(cfg.shared_root)
         if name in {
             "lease_policy",
             "notifications",
@@ -186,6 +187,8 @@ def ensure_shared_layout(cfg: RootConfig) -> None:
 def ensure_machine_layout(cfg: RootConfig) -> None:
     paths = local_paths(cfg.runtime_root)
     for name, path in paths.items():
+        if name == "groups":
+            path = group_directory(cfg.shared_root)
         if name in {"clock_health", "lease_policy_cache", "cpu_policy"}:
             continue
         path.mkdir(parents=True, exist_ok=True)
@@ -216,6 +219,7 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                         CPU_LANE_CAPABILITY,
                         TASK_DEPENDENCIES_CAPABILITY,
                         GROUP_READY_MEMBERS_CAPABILITY,
+                        OBSERVATION_CAPABILITY,
                     ],
                     "writer_capabilities": [READY_WRITER_CAPABILITY],
                 }
@@ -230,6 +234,12 @@ def initialize_shared_root(cfg: RootConfig) -> None:
             from .runtime.ready.state import _activate_empty_ready_index
 
             _activate_empty_ready_index(cfg, uuid.uuid4().hex)
+            from .runtime.observation.projection import initialize_empty as initialize_observation_empty
+
+            initialize_observation_empty(cfg)
+            from .runtime.submission_control import initialize_empty as initialize_submission_control_empty
+
+            initialize_submission_control_empty(cfg)
     ensure_machine_layout(cfg)
     identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
     if not identity_path.exists():

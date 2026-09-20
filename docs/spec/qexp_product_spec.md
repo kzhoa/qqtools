@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-09
+updated_at: 2026-09-20
 archived_at:
 ---
 
@@ -816,6 +816,17 @@ qexp group machines remove <group> g5 --terminate-running
 qexp group machines list <group>
 ```
 
+After a rolling upgrade activates Group isolation, an unfinished removal created
+by an older release can report `blocked` with `legacy_worker_incarnation_unknown`.
+It cannot safely identify a worker that may have been reactivated since the
+request. Its Tasks, processes and resources remain untouched. If removal is still
+wanted, run `qexp group machines remove <group> <machine>` again, including
+`--terminate-running` only when termination is intended. New removal operations
+recover automatically after interruption and cannot follow a reactivated worker.
+The upgrade itself is automatic and preserves running training; it requires no
+per-project activation command.
+
+
 Adding a machine:
 
 - makes it eligible for compatible queued shared Tasks
@@ -848,8 +859,16 @@ unclaimable. In particular:
 - a `queued_home` spillover Task must be atomically offered, explicitly rehomed, or
   cancelled
 - an already `queued_shared` Task may remain when another claimable worker is still allowed
-  by its fallback constraint
+  by its fallback constraint and its static GPU quota can fit the Task; temporary
+  occupancy and Group pause do not count as structural stranding
+- queued availability changes remain allowed while the home worker is draining,
+  so sharing or offering work can resolve the blocker
 - forced removal does not bypass queued-work safety checks
+
+Removal can remain `converging` while background membership confirmation catches
+up. The CLI starts local background advancement after saving the request. It then
+reports blocking Task IDs or completes when current membership and changes have
+been checked; `--terminate-running` does not bypass this confirmation.
 
 Forced removal:
 
@@ -1538,3 +1557,42 @@ The target CLI also does not promise aliases for the old flat `list`, `inspect`,
 - mandatory cross-server log streaming
 - hostile multi-tenant authorization and isolation
 - backward compatibility or migration for Batch-era `.qexp` data
+
+## Indexed Task history pages
+
+`qexp task list --page-size N [--cursor TOKEN]` opts into Task-ID-ascending live
+pagination. `N` is 1–1000; a cursor without a page size uses 50. Explicit `--limit`
+cannot be combined with either pagination flag. Existing invocations retain their
+output, default limit, filter semantics and zero/negative-limit behavior.
+
+The Python entry point is `list_tasks_page(cfg, phase=None, group=None,
+page_size=50, cursor=None)` with keyword-only query options. Unfiltered, phase,
+Group and combined phase/Group queries have separate seekable index paths.
+Continuations must supply the same filters; empty filters mean unfiltered.
+Page size may change between requests.
+
+JSON pages contain `items`, `next_cursor`, `consistency: "live"`,
+`index_generation`, and `stop_reason` (`page_full`, `budget_exhausted`, or
+`exhausted`). Items retain the legacy Task summary and complete dependency fields.
+There is no exact count. Follow a non-null cursor even after an empty page.
+A full final page may require another request to discover the end.
+
+Each candidate is checked against current Task truth. A valid cursor chain returns
+a Task ID at most once; inserts or filter changes behind the cursor can be missed.
+Pages and dependency reads are not snapshots. Restarting traversal can repeat IDs;
+clients requiring restart deduplication retain previously observed IDs. Rebuilding
+the index expires cursors; ordinary Task mutations preserve its generation.
+
+Invalid arguments/cursors return exit 2. Expired cursors and unavailable indexes
+return exit 1. Paginated JSON failures contain only an `error` object with `code`
+and `message`; codes are `invalid_argument`, `invalid_cursor`, `cursor_expired`,
+`index_not_ready`, and `index_unavailable`. The Python `ObservationError` exposes
+these codes. Failures never masquerade as an empty successful page. Restart an
+expired traversal without a cursor; allow the global agent to finish background
+build/recovery for an unavailable index. Doctor exposes its lifecycle state and
+can request a rebuild after underlying damaged truth is repaired.
+
+The bounded path never falls back to scanning historical Tasks. Legacy unlimited
+listing, `top` and full Attempt detail retain their existing costs. Complete
+Task/dependency records can be large; index budgets do not promise a fixed latency
+independent of dependency fan-out or blocking storage I/O.

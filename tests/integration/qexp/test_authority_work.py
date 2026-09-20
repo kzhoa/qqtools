@@ -189,6 +189,10 @@ def test_malformed_registration_does_not_starve_healthy_terminal_work(tmp_path):
 
 
 def test_terminal_cleanup_removes_only_a_bounded_flat_decision_slice(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.runtime.responsibility import responsibility_root
+    from qqtools.plugins.qexp.runtime.responsibility_cleanup import CLEANUP_FORMAT, CleanupRequest, complete_cleanup
+    from qqtools.plugins.qexp.runtime.responsibility_store import Ledger
+
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     paths = local_paths(cfg.runtime_root)
     directory = paths["termination_decisions"] / "completed"
@@ -197,24 +201,27 @@ def test_terminal_cleanup_removes_only_a_bounded_flat_decision_slice(tmp_path, m
         (directory / f"{number}.json").write_text("{}")
     manifest = paths["processes"] / "completed.json"
     atomic_replace(manifest, {"process": {"attempt_id": "completed"}})
-    supervisor = AuthoritySupervisor(cfg, work_limit=64)
-    supervisor.recover_startup()
+    ledger = Ledger.open_or_create(responsibility_root(cfg.runtime_root))
+    request = CleanupRequest(
+        "completed",
+        {"task_id": "finished-task", "attempt_number": 1},
+        {"format": CLEANUP_FORMAT, "task_id": "finished-task", "attempt_id": "completed", "basis": "terminal_attempt"},
+    )
 
     def recursive(*_args, **_kwargs):
         pytest.fail("bounded cleanup recursively enumerated decisions")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.authority.shutil.rmtree", recursive)
-    try:
-        supervisor._remove_attempt_evidence("completed")
+    with monkeypatch.context() as patch:
+        patch.setattr("shutil.rmtree", recursive)
+        assert not complete_cleanup(ledger, cfg.runtime_root, request)
         assert len(list(directory.iterdir())) == 17
         assert manifest.exists()
+        assert ledger.lookup("completed")["cleanup_receipt"] == request.receipt
         for _ in range(3):
-            supervisor._remove_attempt_evidence("completed")
+            complete_cleanup(ledger, cfg.runtime_root, request)
         assert not directory.exists()
         assert not manifest.exists()
-    finally:
-        supervisor.close()
-        monkeypatch.undo()
+        assert ledger.find("completed") is None
 
 
 def test_unchanged_local_policy_and_state_avoid_writes_but_repair_damage(tmp_path, monkeypatch):
@@ -292,12 +299,14 @@ def test_active_service_remains_fair_during_arrivals_and_failed_cleanup(tmp_path
 
     supervisor = SimpleNamespace(
         cfg=SimpleNamespace(runtime_root=tmp_path / "runtime", shared_root=tmp_path / "shared"),
+        recovery_owner=None,
         metrics={},
         renewal_interval_seconds=1.0,
         _materialize_unverified_intent=lambda _path: None,
         _materialize_registrations=lambda **_kwargs: None,
         _supervise=supervise,
         _remove_terminal_attempt_evidence=failed_cleanup,
+        _cleanup_request_for_membership=lambda _entry: None,
         _record_diagnostic=lambda *_args: None,
     )
     work = authority_work.AuthorityWork(supervisor)
@@ -379,12 +388,14 @@ def test_valid_arrivals_do_not_evict_due_cached_attempts(tmp_path, monkeypatch):
     monkeypatch.setattr(authority_work, "time", SimpleNamespace(monotonic=lambda: now[0]))
     supervisor = SimpleNamespace(
         cfg=SimpleNamespace(runtime_root=tmp_path / "runtime", shared_root=tmp_path / "shared"),
+        recovery_owner=None,
         metrics={},
         renewal_interval_seconds=1.0,
         _materialize_unverified_intent=lambda _path: None,
         _materialize_registrations=lambda **_kwargs: None,
         _supervise=lambda process: service_turns[process["attempt_id"]].append(int(now[0])),
         _remove_terminal_attempt_evidence=lambda _attempt_id: None,
+        _cleanup_request_for_membership=lambda _entry: None,
         _record_diagnostic=lambda *_args: None,
     )
     work = authority_work.AuthorityWork(supervisor)
@@ -493,7 +504,8 @@ def test_capacity_discovery_progresses_across_more_than_256_attempts(tmp_path, m
         supervisor.close()
 
 
-def test_capacity_discovery_keeps_cpu_progress_when_gpu_scan_fails(tmp_path, monkeypatch):
+@pytest.mark.parametrize("is_outage", [False, True])
+def test_capacity_discovery_keeps_cpu_progress_when_gpu_scan_fails(tmp_path, monkeypatch, is_outage):
     from qqtools.plugins.qexp import authority
 
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
@@ -521,7 +533,10 @@ def test_capacity_discovery_keeps_cpu_progress_when_gpu_scan_fails(tmp_path, mon
     monkeypatch.setattr(authority.EvidenceScan, "take", failed_gpu)
     try:
         for _ in range(8):
-            supervisor._release_finished_local_capacity(process)
+            if is_outage:
+                supervisor.reconcile_local_exit_evidence(limit=8)
+            else:
+                supervisor._release_finished_local_capacity(process)
         assert not cpu_path.exists()
         assert gpu_path.exists()
         assert len(list(paths["cpu_active"].glob("*.json"))) == 17
@@ -616,5 +631,151 @@ def test_launch_intent_materializes_registration_without_waiting_for_inventory(t
         assert (paths["processes"] / intent.name).exists()
         assert read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]["phase"] == "running"
         assert not supervisor._work.is_startup_complete
+    finally:
+        supervisor.close()
+
+
+@pytest.mark.parametrize("limit", [1, 8])
+@pytest.mark.parametrize("history_count", [0, 1024])
+def test_outage_capacity_discovery_ignores_history_and_serves_both_lanes(tmp_path, monkeypatch, limit, history_count):
+    import os
+
+    from qqtools.plugins.qexp import authority
+    from qqtools.plugins.qexp.runtime.resources.cpu_lane import attach_cpu, reserve_cpu, set_cpu_lane_capacity
+
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    task, attempt = _registration(cfg)
+    _finish(cfg, attempt)
+    before = load_task(cfg, task.task_id).to_dict()
+    paths = local_paths(cfg.runtime_root)
+    set_cpu_lane_capacity(cfg.runtime_root, capacity=1)
+    cpu = reserve_cpu(
+        cfg.runtime_root,
+        task.task_id,
+        1,
+        attempt_id=attempt.attempt_id,
+        fencing_token=attempt.current_fencing_token,
+    )["reservation"]
+    attach_cpu(cfg.runtime_root, cpu["reservation_id"], attempt.attempt_id, attempt.current_fencing_token)
+    for number in range(history_count):
+        atomic_replace(paths["observations"] / f"settled-{number}.json", {"exit_observation": {}})
+    supervisor = AuthoritySupervisor(cfg)
+    original_take = authority.EvidenceScan.take
+    original_scandir = os.scandir
+    visited = []
+
+    def active_only(directory):
+        assert Path(directory) in {paths["active"], paths["cpu_active"]}
+        return original_scandir(directory)
+
+    def counted_take(scan, budget):
+        page = original_take(scan, budget)
+        visited.append(page.entries_visited)
+        return page
+
+    def unexpected_shared_access(*_args, **_kwargs):
+        pytest.fail("outage capacity release accessed shared Task truth")
+
+    try:
+        with monkeypatch.context() as guarded:
+            guarded.setattr(os, "scandir", active_only)
+            guarded.setattr(authority.EvidenceScan, "take", counted_take)
+            guarded.setattr(authority, "load_task", unexpected_shared_access)
+            for _ in range(2):
+                visited.clear()
+                supervisor.reconcile_local_exit_evidence(limit=limit)
+                assert sum(visited) <= limit
+        assert not (paths["active"] / f"{attempt.reservation_id}.json").exists()
+        assert not (paths["cpu_active"] / f"{cpu['reservation_id']}.json").exists()
+        assert load_task(cfg, task.task_id).to_dict() == before
+        assert (paths["registrations"] / f"{attempt.attempt_id}.json").exists()
+        assert (paths["observations"] / f"{attempt.attempt_id}.json").exists()
+        assert len(list(paths["observations"].glob("*.json"))) == history_count + 1
+    finally:
+        supervisor.close()
+
+
+@pytest.mark.parametrize("blocker", ["foreign_project", "fencing", "observation", "live_process", "missing_exit"])
+def test_outage_capacity_discovery_preserves_unverified_occupancy(tmp_path, monkeypatch, blocker):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    _task, attempt = _registration(cfg)
+    observation, value = _finish(cfg, attempt)
+    paths = local_paths(cfg.runtime_root)
+    reservation_path = paths["active"] / f"{attempt.reservation_id}.json"
+    reservation = read_json(reservation_path)
+    if blocker == "foreign_project":
+        reservation["reservation"]["project_id"] = "other-project"
+    elif blocker == "fencing":
+        reservation["reservation"]["fencing_token"] += 1
+    elif blocker == "observation":
+        value["exit_observation"]["attempt_id"] = "other-attempt"
+        atomic_replace(observation, value)
+    elif blocker == "missing_exit":
+        observation.unlink()
+    else:
+        monkeypatch.setattr("qqtools.plugins.qexp.scheduler._is_process_group_alive", lambda _pid: True)
+    atomic_replace(reservation_path, reservation)
+    supervisor = AuthoritySupervisor(cfg)
+    try:
+        supervisor.reconcile_local_exit_evidence(limit=8)
+        assert read_json(reservation_path) == reservation
+        assert (paths["registrations"] / f"{attempt.attempt_id}.json").exists()
+    finally:
+        supervisor.close()
+
+
+@pytest.mark.parametrize("lane", ["gpu", "cpu"])
+def test_outage_capacity_discovery_rejects_projectless_cross_project_collision(tmp_path, lane):
+    from dataclasses import replace
+
+    from qqtools.plugins.qexp.agent.context import MachineRuntime
+    from qqtools.plugins.qexp.runtime.resources.cpu_lane import attach_cpu, reserve_cpu, set_cpu_lane_capacity
+    from qqtools.plugins.qexp.runtime.resources.reservations import attach, reserve
+
+    runtime = MachineRuntime(tmp_path / "machine")
+    projects = []
+    for name in ("owner", "other"):
+        cfg = init_shared_root(tmp_path / name / ".qexp", "gpu-1", runtime_root=tmp_path / f"{name}-legacy")
+        binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+        cfg = replace(cfg, runtime_root=runtime.project_paths(binding.project_id)["root"])
+        paths = local_paths(cfg.runtime_root)
+        atomic_replace(
+            paths["registrations"] / "same-attempt.json",
+            {
+                "process_registration": {
+                    "task_id": "same-task",
+                    "attempt_id": "same-attempt",
+                    "fencing_token": 1,
+                    "process_group_id": 99999992,
+                    "process_group_start_time_ticks": 2,
+                }
+            },
+        )
+        projects.append(cfg)
+    other_paths = local_paths(projects[1].runtime_root)
+    atomic_replace(
+        other_paths["observations"] / "same-attempt.json",
+        {"exit_observation": {"task_id": "same-task", "attempt_id": "same-attempt", "observed_exit_code": 0}},
+    )
+    if lane == "gpu":
+        record = reserve(runtime.root, "same-task", [0])["reservation"]
+        attach(runtime.root, record["reservation_id"], "same-attempt", 1)
+    else:
+        set_cpu_lane_capacity(runtime.root, capacity=1)
+        record = reserve_cpu(runtime.root, "same-task", 1, attempt_id="same-attempt", fencing_token=1)["reservation"]
+        attach_cpu(runtime.root, record["reservation_id"], "same-attempt", 1)
+    active = local_paths(runtime.root)["active" if lane == "gpu" else "cpu_active"] / f"{record['reservation_id']}.json"
+    before = read_json(active)
+    supervisor = AuthoritySupervisor(projects[1], reservation_runtime_root=runtime.root)
+    try:
+        supervisor.reconcile_local_exit_evidence(limit=8)
+        assert read_json(active) == before
+        assert (other_paths["observations"] / "same-attempt.json").exists()
+        # Explicit identity still allows the owning partition's verified release.
+        before["reservation"]["project_id"] = projects[1].runtime_root.name
+        atomic_replace(active, before)
+        for _ in range(3):
+            supervisor.reconcile_local_exit_evidence(limit=8)
+        assert not active.exists()
     finally:
         supervisor.close()

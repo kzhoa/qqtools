@@ -127,12 +127,18 @@ def begin_ready_index_build(cfg: object, *, is_repair: bool = False) -> dict[str
                 if current_state == "active" or (current_state == "degraded" and not is_repair):
                     return record
                 if current_state in {"absent", "degraded"}:
+                    floor = state.minimum_ready_writer_capability(cfg)
+                    recorded = record.get("writer_capability")
+                    if recorded is not None and recorded not in state.SUPPORTED_READY_WRITERS:
+                        raise RuntimeError("ready repair cannot replace an unknown writer capability.")
                     state.install_writer_capability_gate(cfg)
                     build_id = uuid.uuid4().hex
                     if current_state == "degraded" and is_repair:
                         _reset_ready_projection_for_repair(cfg, build_id)
                     record["state"] = "building"
-                    record["writer_capability"] = state.READY_WRITER_CAPABILITY
+                    record["writer_capability"] = (
+                        floor if floor == state.CURRENT_READY_WRITER_CAPABILITY else recorded or floor
+                    )
                     record["build"] = {
                         "build_id": build_id,
                         "phase": "inventory",

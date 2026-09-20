@@ -511,3 +511,24 @@ def test_active_operation_enumeration_is_hard_bounded(tmp_path: Path):
     assert all(path.parent == active_directory for path in paths)
     assert len(next_paths) == 1
     assert not set(paths).intersection(next_paths)
+
+
+@pytest.mark.parametrize("kind", ["availability", "group_control", "cleanup"])
+@pytest.mark.parametrize("has_import_copy", [False, True])
+def test_active_operation_legacy_discovery_never_repeats_active_truth(tmp_path, kind, has_import_copy):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    key = "availability_operation" if kind == "availability" else kind
+    value = {key: {"state": "prepared"}}
+    active = write_active_operation(cfg, kind, "current", value)
+    archive = shared_paths(cfg.shared_root)[kind]
+    if has_import_copy:
+        # A crash during old-layout import can retain a regular old copy.
+        atomic_replace(archive / active.name, value)
+    else:
+        assert (archive / active.name).is_symlink()
+    legacy = archive / "legacy.json"
+    atomic_replace(legacy, value)
+
+    found = list(iter_active_operation_paths(cfg, kind, include_legacy=True))
+
+    assert found == [active, legacy]

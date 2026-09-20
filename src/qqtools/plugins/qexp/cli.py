@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import asdict
@@ -53,6 +54,7 @@ from .notification_config import (
     update_notifications,
     write_shared_feishu_webhook,
 )
+from .runtime.observation.api import ObservationError
 from .runtime.paths import shared_paths
 from .runtime.resources.cpu_lane import get_cpu_lane_policy, initialize_cpu_lane_capacity, set_cpu_lane_capacity
 from .runtime.store import iter_json, read_json
@@ -65,6 +67,88 @@ from .schema6_upgrade import (
     schema6_upgrade_status,
     start_schema6_upgrade,
 )
+
+
+class _PaginationParseError(RuntimeError):
+    """An argparse error that belongs to paginated JSON output."""
+
+
+_PAGINATION_JSON_PARSE_MODE = False
+
+
+class _QexpArgumentParser(argparse.ArgumentParser):
+    """Use structured parse errors only for the narrowly scoped page mode."""
+
+    def error(self, message: str) -> None:
+        if _PAGINATION_JSON_PARSE_MODE:
+            raise _PaginationParseError(message)
+        super().error(message)
+
+
+def _is_paginated_json_argv(argv: list[str]) -> bool:
+    """Return whether raw arguments select JSON task-list pagination."""
+    task_index = next(
+        (index for index in range(len(argv) - 1) if argv[index : index + 2] == ["task", "list"]),
+        None,
+    )
+    if task_index is None:
+        return False
+    has_pagination_flag = any(
+        item == "--page-size" or item.startswith("--page-size=") or item == "--cursor" or item.startswith("--cursor=")
+        for item in argv[task_index + 2 :]
+    )
+    if not has_pagination_flag:
+        return False
+    return any(
+        item == "--format=json" or (item == "--format" and index + 1 < len(argv) and argv[index + 1] == "json")
+        for index, item in enumerate(argv)
+    )
+
+
+def _parse_page_size(value: str | None) -> int:
+    """Parse a CLI page size so malformed values become ObservationErrors."""
+    if value is None:
+        return 50
+    try:
+        return int(value, 10)
+    except (TypeError, ValueError) as exc:
+        raise ObservationError("invalid_argument", "page_size must be an integer from 1 through 1000.", 2) from exc
+
+
+def _emit_observation_error(error: ObservationError, output_format: str) -> int:
+    """Render one stable observation error at the CLI boundary."""
+    if output_format == "json":
+        print(json.dumps({"error": {"code": error.code, "message": error.message}}))
+    else:
+        print(f"qexp: {error.message}", file=sys.stderr)
+    return error.exit_code
+
+
+def _emit_task_page(cfg: RootConfig, args: argparse.Namespace, page: dict[str, object], page_size: int) -> None:
+    """Render paginated task results and a shell-safe continuation command."""
+    if args.format == "json":
+        _emit("task-list", page, args.format)
+        return
+    _emit("task-list", page["items"], args.format)
+    print(f"Stop reason: {page['stop_reason']}")
+    next_cursor = page.get("next_cursor")
+    if next_cursor is None:
+        return
+    command = [
+        "qexp",
+        "--shared-root",
+        str(cfg.shared_root),
+        "--machine",
+        cfg.machine_name,
+        "task",
+        "list",
+    ]
+    if args.phase:
+        command.extend(("--phase", args.phase))
+    if args.group:
+        command.extend(("--group", args.group))
+    command.extend(("--page-size", str(page_size), "--cursor", str(next_cursor)))
+    print(f"Continue with: {shlex.join(command)}")
 
 
 def _add_output_format(parser: argparse.ArgumentParser) -> None:
@@ -173,7 +257,7 @@ def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[ob
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _QexpArgumentParser(
         description=(
             "qexp schema-6 experiment queue; --machine is local identity, --home-machine is Task "
             "placement, and Attempt machine is selected later by claim. qexp does not remotely "
@@ -351,7 +435,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_format(listing)
     listing.add_argument("--phase")
     listing.add_argument("--group")
-    listing.add_argument("--limit", type=int, default=50)
+    listing.add_argument("--limit", type=int, default=None)
+    listing.add_argument("--page-size", default=None)
+    listing.add_argument("--cursor", default=None)
     show = task_sub.add_parser("show")
     _add_output_format(show)
     show.add_argument("task_id")
@@ -563,7 +649,16 @@ def _upgrade_project_config(runtime: MachineRuntime, identifier: str):
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    global _PAGINATION_JSON_PARSE_MODE
+    _PAGINATION_JSON_PARSE_MODE = _is_paginated_json_argv(raw_argv)
+    try:
+        args = build_parser().parse_args(raw_argv)
+    except _PaginationParseError as exc:
+        print(json.dumps({"error": {"code": "invalid_argument", "message": str(exc)}}))
+        return 2
+    finally:
+        _PAGINATION_JSON_PARSE_MODE = False
     try:
         if args.command == "init":
             args.shared_root = args.init_shared_root or args.shared_root
@@ -1009,11 +1104,30 @@ def main(argv: list[str] | None = None) -> int:
                 result = task_commands.keep_local(cfg, args.task_id)
                 _emit("availability", result.to_dict(), args.format)
             elif args.task_action == "list":
-                _emit(
-                    "task-list",
-                    observer.list_tasks(cfg, phase=args.phase, group=args.group, limit=args.limit),
-                    args.format,
-                )
+                is_paginated = args.page_size is not None or args.cursor is not None
+                if is_paginated:
+                    if args.limit is not None:
+                        raise ObservationError(
+                            "invalid_argument",
+                            "--limit conflicts with --page-size and --cursor.",
+                            2,
+                        )
+                    page_size = _parse_page_size(args.page_size)
+                    page = observer.list_tasks_page(
+                        cfg,
+                        phase=args.phase,
+                        group=args.group,
+                        page_size=page_size,
+                        cursor=args.cursor,
+                    )
+                    _emit_task_page(cfg, args, page, page_size)
+                else:
+                    limit = 50 if args.limit is None else args.limit
+                    _emit(
+                        "task-list",
+                        observer.list_tasks(cfg, phase=args.phase, group=args.group, limit=limit),
+                        args.format,
+                    )
             elif args.task_action == "show":
                 _emit("task-show", observer.inspect_task(cfg, args.task_id), args.format)
             elif args.task_action == "logs":
@@ -1064,6 +1178,20 @@ def main(argv: list[str] | None = None) -> int:
                     "action": args.machine_action,
                     "worker_machine": args.worker_machine,
                 }
+                worker_control = result.get("worker_control") if isinstance(result, dict) else None
+                if (
+                    args.machine_action == "remove"
+                    and isinstance(worker_control, dict)
+                    and isinstance(worker_control.get("discovery"), dict)
+                    and worker_control.get("state") in {"preparing", "converging", "waiting_ack", "blocked"}
+                ):
+                    ensure_local_agent_active(cfg, reason="group-worker-remove", **get_lifecycle_kwargs())
+                    presentation.update(
+                        {
+                            "status": worker_control.get("state"),
+                            "reason": worker_control.get("blocked_reason"),
+                        }
+                    )
             else:
                 context = get_execution_context()
                 if args.group_action == "resume":
@@ -1075,9 +1203,33 @@ def main(argv: list[str] | None = None) -> int:
                     terminate_running=getattr(args, "terminate_running", False),
                     reservation_runtime_root=context.reservation_root,
                 )
+                if args.group_action == "cancel":
+                    control = result.get("cancellation_operation", {})
+                    if (
+                        isinstance(control, dict)
+                        and isinstance(control.get("discovery"), dict)
+                        and control.get("state") in {"preparing", "converging", "waiting_ack", "blocked"}
+                    ):
+                        ensure_local_agent_active(cfg, reason="group-cancel", **get_lifecycle_kwargs())
                 kind = "group-operation"
                 presentation = {**result, "action": args.group_action}
-            task_views = observer.list_tasks(cfg, limit=10**9) if args.format == "human" else None
+                if args.group_action == "cancel":
+                    control = result.get("cancellation_operation", {})
+                    pending_machines = control.get("pending_machine_acknowledgements", {})
+                    presentation.update(
+                        {
+                            "status": control.get("state"),
+                            "pending_machines": list(pending_machines.keys())
+                            if isinstance(pending_machines, dict)
+                            else [],
+                            "reason": control.get("blocked_reason"),
+                        }
+                    )
+            task_views = (
+                observer.list_tasks(cfg, limit=10**9)
+                if args.format == "human" and kind in {"group-list", "group-show"}
+                else None
+            )
             _emit(
                 kind,
                 presentation if args.format == "human" and presentation is not None else result,
@@ -1212,7 +1364,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             _emit("clean", result, args.format)
             return 0
-    except (ValueError, RuntimeError, FileNotFoundError) as exc:
+    except ObservationError as exc:
+        return _emit_observation_error(exc, getattr(args, "format", "human"))
+    except (ValueError, RuntimeError, OSError) as exc:
+        if (
+            args.command == "task"
+            and args.task_action == "list"
+            and (args.page_size is not None or args.cursor is not None)
+        ):
+            code = "invalid_argument" if isinstance(exc, ValueError) else "index_unavailable"
+            return _emit_observation_error(ObservationError(code, str(exc)), args.format)
+        if isinstance(exc, OSError) and not isinstance(exc, FileNotFoundError):
+            raise
         print(f"qexp: {exc}", file=sys.stderr)
         return 2
     return 0

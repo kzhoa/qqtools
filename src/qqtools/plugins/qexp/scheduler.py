@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,11 +34,15 @@ from .lease import (
 )
 from .lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
 from .runtime.authority_lock import authority_locks
+from .runtime.authority_scan import is_path_present
 from .runtime.claims import archive_claim
 from .runtime.dependencies import dependency_gate, dependency_locks
+from .runtime.group_cancellation import has_active_cancellation
+from .runtime.group_discovery.changes import record_task_change
+from .runtime.group_namespace import read_group
 from .runtime.locks import group_lock, schema_writer_lock, task_lock
 from .runtime.operation_store import operation_exists
-from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, submission_path
+from .runtime.paths import attempt_path, group_path, local_paths, shared_paths
 from .runtime.ready import (
     ReadyMarkerRef,
     advance_ready_index_build,
@@ -57,6 +61,7 @@ from .runtime.records import AttemptRecord, TaskRecord, TaskSpec, normalize_grou
 from .runtime.resources.cpu_lane import attach_cpu, has_active_cpu_reservation, release_cpu, reserve_cpu
 from .runtime.resources.reservations import ReservationIdentity, attach, release, reserve, reserve_admitted
 from .runtime.store import atomic_replace, iter_json, read_json
+from .runtime.submission_control import SubmissionControlUnavailable, read_submission_state
 from .runtime.tasks import load_task, save_task
 from .runtime.work_budget import AdaptiveBatchSizer, SliceBudget, diagnostic_increment, diagnostic_span
 
@@ -150,24 +155,30 @@ def _eligible(cfg: RootConfig, task: TaskRecord) -> bool:
     operation_id = task.submission_operation_id
     if not operation_id:
         return False
-    operation_file = submission_path(cfg.shared_root, operation_id)
-    if not operation_file.exists():
+    try:
+        submission_state = read_submission_state(cfg, operation_id)
+    except (FileNotFoundError, SubmissionControlUnavailable):
         return False
-    if read_json(operation_file).get("submission", {}).get("state") != "committed":
+    if submission_state != "committed":
         return False
     if not task.group_name:
         return task_machine_matches(task, cfg.machine_name)
-    group_file = group_path(cfg.shared_root, task.group_name)
-    return group_file.exists() and group_allows(read_json(group_file), task, cfg.machine_name)
+    try:
+        group = read_group(cfg.shared_root, task.group_name)
+        if has_active_cancellation(cfg, task, group):
+            return False
+        return group_allows(group, task, cfg.machine_name)
+    except FileNotFoundError:
+        return False
 
 
 def _task_worker_role(cfg: RootConfig, task: TaskRecord) -> str | None:
     if not task.group_name:
         return None
-    path = group_path(cfg.shared_root, task.group_name)
-    if not path.exists():
+    try:
+        group = read_group(cfg.shared_root, task.group_name)
+    except FileNotFoundError:
         return None
-    group = read_json(path)
     normalize_group_record(group)
     worker = group["group"]["worker_set"].get(cfg.machine_name)
     return worker.get("scheduling_role") if worker else None
@@ -209,7 +220,7 @@ def _claim(
         group: dict[str, Any] | None = None
         worker: dict[str, Any] | None = None
         if task.group_name:
-            group = read_json(group_path(cfg.shared_root, task.group_name))
+            group = read_group(cfg.shared_root, task.group_name)
             normalize_group_record(group)
             worker = group["group"]["worker_set"].get(cfg.machine_name)
             if worker is None:
@@ -306,35 +317,45 @@ def _claim(
             attempt.authorization["worker_scheduling_role"] = worker["scheduling_role"]
             attempt.authorization["gpu_limit_gpus"] = worker["gpu_limit_gpus"]
             attempt.authorization["admitted_as_borrow"] = worker["scheduling_role"] == "borrow"
-        task.claim_control.update({"fencing_epoch": token, "active_claim": claim})
-        task.attempt_control.update(
-            {
-                "current_attempt_id": attempt_id,
-                "current_attempt_number": attempt_number,
-                "next_attempt_number": attempt_number + 1,
-            }
-        )
-        task.state["projection"] = "running"
-        task.meta["revision"] += 1
-        task.meta["updated_at"] = utc_now()
-        save_task(cfg, task)
-        try:
-            atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
-            if task.spec.is_cpu_only:
-                attach_cpu(reservation_runtime_root, attempt.reservation_id, attempt.attempt_id, token)
-            else:
-                attach(reservation_runtime_root, attempt.reservation_id, attempt.attempt_id, token)
-        except Exception:
-            _release_claim_locked(
-                cfg,
-                task,
-                token,
-                "attempt_materialization_failed",
-                reservation_runtime_root=reservation_runtime_root,
+        with record_task_change(
+            cfg,
+            task,
+            "claim",
+            details={
+                "attempt_id": attempt_id,
+                "attempt_number": attempt_number,
+                "fencing_token": token,
+            },
+        ):
+            task.claim_control.update({"fencing_epoch": token, "active_claim": claim})
+            task.attempt_control.update(
+                {
+                    "current_attempt_id": attempt_id,
+                    "current_attempt_number": attempt_number,
+                    "next_attempt_number": attempt_number + 1,
+                }
             )
-            raise
-        retire_current_ready_generation(cfg, task)
-        return attempt
+            task.state["projection"] = "running"
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task)
+            try:
+                atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
+                if task.spec.is_cpu_only:
+                    attach_cpu(reservation_runtime_root, attempt.reservation_id, attempt.attempt_id, token)
+                else:
+                    attach(reservation_runtime_root, attempt.reservation_id, attempt.attempt_id, token)
+            except Exception:
+                _release_claim_locked(
+                    cfg,
+                    task,
+                    token,
+                    "attempt_materialization_failed",
+                    reservation_runtime_root=reservation_runtime_root,
+                )
+                raise
+            retire_current_ready_generation(cfg, task)
+            return attempt
 
 
 def _release_claim_locked(
@@ -348,13 +369,24 @@ def _release_claim_locked(
     claim = task.claim_control.get("active_claim") or {}
     if claim.get("fencing_token") != token:
         return
-    archive_claim(cfg, task.task_id, claim, reason)
-    task.claim_control["active_claim"] = None
-    task.attempt_control["current_attempt_id"] = None
-    task.state.update({"projection": "queued", "reason": reason})
-    task.meta["revision"] += 1
-    task.meta["updated_at"] = utc_now()
-    save_task(cfg, task)
+    with record_task_change(
+        cfg,
+        task,
+        "claim_loss",
+        details={
+            "expected_attempt_id": claim.get("attempt_id"),
+            "expected_fencing_token": token,
+            "transition": "claim_materialization_failed",
+            "reason": reason,
+        },
+    ):
+        archive_claim(cfg, task.task_id, claim, reason)
+        task.claim_control["active_claim"] = None
+        task.attempt_control["current_attempt_id"] = None
+        task.state.update({"projection": "queued", "reason": reason})
+        task.meta["revision"] += 1
+        task.meta["updated_at"] = utc_now()
+        save_task(cfg, task)
     reservation_root = reservation_runtime_root or cfg.runtime_root
     if task.spec.is_cpu_only:
         release_cpu(reservation_root, claim["reservation_id"], reason)
@@ -437,8 +469,8 @@ def claim_task(
 def _has_local_launch_evidence(cfg: RootConfig, attempt_id: str) -> bool:
     paths = local_paths(cfg.runtime_root)
     return any(
-        (paths[directory] / f"{attempt_id}.json").exists()
-        for directory in ("launch_intents", "registrations", "processes")
+        is_path_present(paths[directory] / f"{attempt_id}.json")
+        for directory in ("launch_intents", "registrations", "processes", "observations")
     )
 
 
@@ -484,9 +516,20 @@ def resume_starting_attempt(
             or attempt.current_fencing_token != fencing_token
             or attempt.machine_name != cfg.machine_name
             or attempt.phase not in {"claimed", "starting"}
+            or not isinstance(attempt.authorization, dict)
         ):
             return None
-        if task.control.get("cancellation_requested_at"):
+        launch_id = claim.get("launch_id")
+        has_committed_authorization = (
+            claim.get("launch_state") == "starting"
+            and attempt.phase == "starting"
+            and isinstance(launch_id, str)
+            and bool(launch_id)
+            and attempt.authorization.get("launch_id") == launch_id
+        )
+        if task.control.get("cancellation_requested_at") and (
+            not has_committed_authorization or task.control.get("terminate_running")
+        ):
             cancel_result = _cancel_prelaunch_locked(cfg, task, "cancelled_before_launch", {"claimed", "starting"})
         elif task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
             return None
@@ -494,31 +537,49 @@ def resume_starting_attempt(
             return None
         elif not _has_active_launch_reservation(task, claim, reservation_runtime_root):
             cancel_result = _cancel_prelaunch_locked(cfg, task, "launch_reservation_lost", {"claimed", "starting"})
-        elif task.group_name and not group_allows(
-            read_json(group_path(cfg.shared_root, task.group_name)), task, cfg.machine_name
-        ):
-            cancel_result = _cancel_prelaunch_locked(cfg, task, "worker_or_dispatch_changed", {"claimed", "starting"})
-        elif not (claim.get("authority_mode") != "bounded_lease" or clock_capability(cfg).is_healthy):
-            return None
         else:
-            has_committed_authorization = (
-                attempt.phase == "starting"
-                and isinstance(claim.get("launch_id"), str)
-                and attempt.authorization.get("launch_id") == claim.get("launch_id")
-            )
-            launch_id = claim["launch_id"] if has_committed_authorization else uuid.uuid4().hex
-            authorized_at = claim.get("launch_authorized_at") if has_committed_authorization else utc_now()
-            claim["launch_state"] = "starting"
-            claim["launch_id"] = launch_id
-            claim["launch_authorized_at"] = authorized_at
-            task.meta["revision"] += 1
-            task.meta["updated_at"] = authorized_at
-            save_task(cfg, task)
-            attempt.phase = "starting"
-            attempt.authorization["launch_id"] = launch_id
-            attempt.timestamps["launch_authorized_at"] = authorized_at
-            atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
-            return attempt
+            if task.group_name:
+                group = read_group(cfg.shared_root, task.group_name)
+                if has_active_cancellation(cfg, task, group, include_default=not has_committed_authorization):
+                    cancel_result = _cancel_prelaunch_locked(
+                        cfg, task, "group_cancelled_before_launch", {"claimed", "starting"}
+                    )
+                elif not has_committed_authorization and not group_allows(group, task, cfg.machine_name):
+                    cancel_result = _cancel_prelaunch_locked(
+                        cfg, task, "worker_or_dispatch_changed", {"claimed", "starting"}
+                    )
+            if cancel_result is None:
+                if not (claim.get("authority_mode") != "bounded_lease" or clock_capability(cfg).is_healthy):
+                    return None
+                launch_id = launch_id if has_committed_authorization else uuid.uuid4().hex
+                authorized_at = claim.get("launch_authorized_at") if has_committed_authorization else utc_now()
+                change_context = (
+                    nullcontext()
+                    if has_committed_authorization
+                    else record_task_change(
+                        cfg,
+                        task,
+                        "launch",
+                        details={
+                            "attempt_id": attempt_id,
+                            "attempt_number": attempt_number,
+                            "fencing_token": fencing_token,
+                            "launch_id": launch_id,
+                        },
+                    )
+                )
+                with change_context:
+                    claim["launch_state"] = "starting"
+                    claim["launch_id"] = launch_id
+                    claim["launch_authorized_at"] = authorized_at
+                    task.meta["revision"] += 1
+                    task.meta["updated_at"] = authorized_at
+                    save_task(cfg, task)
+                    attempt.phase = "starting"
+                    attempt.authorization["launch_id"] = launch_id
+                    attempt.timestamps["launch_authorized_at"] = authorized_at
+                    atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
+                return attempt
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
             _release_task_reservation(
@@ -595,8 +656,10 @@ def authorize_launch(
             elif not _has_active_launch_reservation(task, claim, reservation_runtime_root):
                 cancel_result = _cancel_prelaunch_locked(cfg, task, "launch_reservation_lost")
             elif task.group_name:
-                group = read_json(group_path(cfg.shared_root, task.group_name))
-                if not group_allows(group, task, cfg.machine_name):
+                group = read_group(cfg.shared_root, task.group_name)
+                if has_active_cancellation(cfg, task, group):
+                    cancel_result = _cancel_prelaunch_locked(cfg, task, "group_cancelled_before_launch")
+                elif not group_allows(group, task, cfg.machine_name):
                     cancel_result = _cancel_prelaunch_locked(cfg, task, "worker_or_dispatch_changed")
                 else:
                     claim["group_dispatch_epoch"] = group["group"]["dispatch_epoch"]
@@ -604,16 +667,27 @@ def authorize_launch(
             if cancel_result is None:
                 authorized_at = utc_now()
                 launch_id = uuid.uuid4().hex
-                claim["launch_state"] = "starting"
-                claim["launch_authorized_at"] = authorized_at
-                claim["launch_id"] = launch_id
-                task.meta["revision"] += 1
-                task.meta["updated_at"] = authorized_at
-                save_task(cfg, task)
-                attempt.phase = "starting"
-                attempt.authorization["launch_id"] = launch_id
-                attempt.timestamps["launch_authorized_at"] = authorized_at
-                atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
+                with record_task_change(
+                    cfg,
+                    task,
+                    "launch",
+                    details={
+                        "attempt_id": attempt_id,
+                        "attempt_number": attempt_number,
+                        "fencing_token": fencing_token,
+                        "launch_id": launch_id,
+                    },
+                ):
+                    claim["launch_state"] = "starting"
+                    claim["launch_authorized_at"] = authorized_at
+                    claim["launch_id"] = launch_id
+                    task.meta["revision"] += 1
+                    task.meta["updated_at"] = authorized_at
+                    save_task(cfg, task)
+                    attempt.phase = "starting"
+                    attempt.authorization["launch_id"] = launch_id
+                    attempt.timestamps["launch_authorized_at"] = authorized_at
+                    atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
             _release_task_reservation(
@@ -681,20 +755,28 @@ def cancel_task(
                 "requested_by": cfg.machine_name,
             }
         )
+        # Prelaunch cancellation has its own terminal recovery owner. An outer
+        # task_cancel record would block that owner at the ordered journal head.
         if claim and claim.get("launch_state") == "claimed":
             cancel_result = _cancel_prelaunch_locked(cfg, task, "cancelled_before_launch")
             has_saved_task = cancel_result is not None and cancel_result.outcome == "committed"
             result_task = load_task(cfg, task_id) if cancel_result is None else None
         else:
             result_task = None
-        if not claim and task.state["projection"] == "queued":
-            task.state.update({"projection": "cancelled", "reason": "cancelled_by_user"})
         if not has_saved_task:
-            task.meta["revision"] += 1
-            task.meta["updated_at"] = utc_now()
-            save_task(cfg, task)
-        if task.state["projection"] == "cancelled":
-            retire_current_ready_generation(cfg, task)
+            with record_task_change(
+                cfg,
+                task,
+                "task_cancel",
+                details={"terminate_running": terminate_running, "expected_effect": "task_cancel"},
+            ):
+                if not claim and task.state["projection"] == "queued":
+                    task.state.update({"projection": "cancelled", "reason": "cancelled_by_user"})
+                task.meta["revision"] += 1
+                task.meta["updated_at"] = utc_now()
+                save_task(cfg, task)
+                if task.state["projection"] == "cancelled":
+                    retire_current_ready_generation(cfg, task)
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
             _release_task_reservation(
@@ -818,6 +900,7 @@ def _run_dispatch_cycle(
                     attempt.attempt_id,
                     attempt.current_fencing_token,
                     "executor_launch_failed",
+                    should_require_unstarted=True,
                     reservation_runtime_root=reservation_runtime_root,
                 )
     ready_state = read_ready_index_state(cfg)
@@ -1012,6 +1095,7 @@ def _run_dispatch_cycle(
                     attempt.attempt_id,
                     attempt.current_fencing_token,
                     "executor_launch_failed",
+                    should_require_unstarted=True,
                     reservation_runtime_root=reservation_runtime_root,
                 )
             sizer.observe(max(1, time.monotonic_ns() - started_ns))
@@ -1127,6 +1211,7 @@ def _run_dispatch_cycle(
                 attempt.attempt_id,
                 attempt.current_fencing_token,
                 "executor_launch_failed",
+                should_require_unstarted=True,
                 reservation_runtime_root=reservation_runtime_root,
             )
     return launched
@@ -1376,61 +1461,83 @@ def expire_claim(
         holder_bound = claim.get("clock_error_bound_seconds")
         expires = claim.get("lease_expires_at")
         if not isinstance(holder_bound, (int, float)) or not isinstance(expires, str):
-            task.state.update({"projection": "blocked", "reason": "authority_mode_evidence_invalid"})
-            save_task(cfg, task)
-            return False
+            with record_task_change(
+                cfg,
+                task,
+                "claim_loss",
+                details={
+                    "expected_attempt_id": attempt_id,
+                    "expected_fencing_token": fencing_token,
+                    "is_invalid_evidence": True,
+                },
+            ):
+                task.state.update({"projection": "blocked", "reason": "authority_mode_evidence_invalid"})
+                task.meta["revision"] += 1
+                task.meta["updated_at"] = utc_now()
+                save_task(cfg, task)
+                return False
         reclaimer_bound = capability.observation.bound_at(time.monotonic())
         if datetime.now(timezone.utc) < reclaim_allowed_at(expires, holder_bound, reclaimer_bound):
             return False
         path = attempt_path(cfg.shared_root, task_id, task.attempt_control["current_attempt_number"])
         attempt = AttemptRecord.from_dict(read_json(path))
-        old_ready_generation = None
-        if claim.get("launch_state") == "claimed":
-            task.state.update({"projection": "queued", "reason": "lease_expired_before_launch"})
-            old_ready_generation, _ = prepare_ready_transition(cfg, task, "prelaunch_expiry")
-            attempt.phase = "cancelled"
-            attempt.result["reason"] = "lease_expired_before_launch"
-            _release_task_reservation(
-                task, reservation_runtime_root, claim["reservation_id"], "lease_expired_before_launch"
-            )
-        else:
-            attempt.phase = "orphaned"
-            attempt.result.update({"exit_code": None, "signal": None, "category": None, "reason": None})
-            decision_id = claim.get("termination_decision_id")
-            if isinstance(decision_id, str):
-                attempt.termination.update(
-                    {"decision_id": decision_id, "decision_token": claim.get("termination_decision_token")}
+        with record_task_change(
+            cfg,
+            task,
+            "claim_loss",
+            details={
+                "expected_attempt_id": attempt_id,
+                "expected_fencing_token": fencing_token,
+                "reserved_generation": task.ready_generation + 1 if claim.get("launch_state") == "claimed" else None,
+            },
+        ):
+            old_ready_generation = None
+            if claim.get("launch_state") == "claimed":
+                task.state.update({"projection": "queued", "reason": "lease_expired_before_launch"})
+                old_ready_generation, _ = prepare_ready_transition(cfg, task, "prelaunch_expiry")
+                attempt.phase = "cancelled"
+                attempt.result["reason"] = "lease_expired_before_launch"
+                _release_task_reservation(
+                    task, reservation_runtime_root, claim["reservation_id"], "lease_expired_before_launch"
                 )
-            attempt.timestamps["orphaned_at"] = utc_now()
-            task.state.update({"projection": "blocked", "reason": "orphaned_attempt_requires_recovery"})
-        if attempt.phase != "orphaned":
-            attempt.timestamps["finished_at"] = utc_now()
-        atomic_replace(path, attempt.to_dict())
-        archive_claim(cfg, task_id, claim, "lease_expired")
-        task.claim_control["active_claim"] = None
-        task.attempt_control["current_attempt_id"] = None
-        task.meta["revision"] += 1
-        task.meta["updated_at"] = utc_now()
-        save_task(cfg, task)
-        if old_ready_generation is not None:
-            commit_ready_publication(cfg, task)
-        if old_ready_generation is not None:
-            retire_previous_ready_generation(cfg, old_ready_generation, task)
-        if attempt.phase == "orphaned":
-            try:
-                write_event(
-                    cfg,
-                    "attempt_orphaned",
-                    task_id=task_id,
-                    details={
-                        "attempt_id": attempt_id,
-                        "fencing_token": fencing_token,
-                        "reason": "lease_expired_process_unknown",
-                    },
-                )
-            except OSError:
-                pass
-        return True
+            else:
+                attempt.phase = "orphaned"
+                attempt.result.update({"exit_code": None, "signal": None, "category": None, "reason": None})
+                decision_id = claim.get("termination_decision_id")
+                if isinstance(decision_id, str):
+                    attempt.termination.update(
+                        {"decision_id": decision_id, "decision_token": claim.get("termination_decision_token")}
+                    )
+                attempt.timestamps["orphaned_at"] = utc_now()
+                task.state.update({"projection": "blocked", "reason": "orphaned_attempt_requires_recovery"})
+            if attempt.phase != "orphaned":
+                attempt.timestamps["finished_at"] = utc_now()
+            atomic_replace(path, attempt.to_dict())
+            archive_claim(cfg, task_id, claim, "lease_expired")
+            task.claim_control["active_claim"] = None
+            task.attempt_control["current_attempt_id"] = None
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task)
+            if old_ready_generation is not None:
+                commit_ready_publication(cfg, task)
+            if old_ready_generation is not None:
+                retire_previous_ready_generation(cfg, old_ready_generation, task)
+            if attempt.phase == "orphaned":
+                try:
+                    write_event(
+                        cfg,
+                        "attempt_orphaned",
+                        task_id=task_id,
+                        details={
+                            "attempt_id": attempt_id,
+                            "fencing_token": fencing_token,
+                            "reason": "lease_expired_process_unknown",
+                        },
+                    )
+                except OSError:
+                    pass
+            return True
 
 
 def fail_attempt(
@@ -1441,7 +1548,14 @@ def fail_attempt(
     reason: str,
     *,
     reservation_runtime_root: Path | None = None,
+    should_require_unstarted: bool = False,
 ) -> bool:
+    """Commit failure; launch compensation must require absent local execution evidence.
+
+    The guarded check shares the runner's launch-intent authority fence. Evidence
+    or a foreign holder retains authority and capacity for owning-agent recovery.
+    Inaccessible evidence raises rather than being treated as proof of absence.
+    """
     reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
     result = None
@@ -1449,6 +1563,11 @@ def fail_attempt(
         task = load_task(cfg, task_id)
         claim = task.claim_control.get("active_claim") or {}
         if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
+            return False
+        if should_require_unstarted and (
+            claim.get("machine_name") != cfg.machine_name or _has_local_launch_evidence(cfg, attempt_id)
+        ):
+            diagnostic_increment("scheduler.launch_failure.deferred")
             return False
         result = commit_terminal_transition_locked(
             cfg,

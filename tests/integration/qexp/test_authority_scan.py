@@ -6,9 +6,75 @@ from types import SimpleNamespace
 import pytest
 
 from qqtools.plugins.qexp.runtime import authority_scan
-from qqtools.plugins.qexp.runtime.authority_scan import EvidenceScan
+from qqtools.plugins.qexp.runtime.authority_scan import EvidenceScan, is_path_present, iter_evidence_files
 
 pytestmark = pytest.mark.integration
+
+
+def test_strict_presence_only_accepts_missing_metadata_as_absence(tmp_path, monkeypatch):
+    target = tmp_path / "entry"
+    assert not is_path_present(target)
+    target.touch()
+    assert is_path_present(target)
+    original = Path.stat
+
+    def unavailable(path, **kwargs):
+        if path == target:
+            raise OSError("metadata I/O failure")
+        return original(path, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "stat", unavailable)
+        with pytest.raises(OSError, match="metadata I/O failure"):
+            is_path_present(target)
+
+
+def test_strict_import_scan_distinguishes_missing_and_invalid_lanes(tmp_path):
+    directory = tmp_path / "evidence"
+    assert list(iter_evidence_files(directory, recursive=True)) == []
+    directory.write_text("not a directory")
+    with pytest.raises(NotADirectoryError):
+        list(iter_evidence_files(directory, recursive=True))
+
+
+@pytest.mark.parametrize("is_directory", [False, True])
+def test_strict_import_scan_rejects_linked_evidence(tmp_path, is_directory):
+    directory = tmp_path / "evidence"
+    directory.mkdir()
+    target = tmp_path / "target"
+    if is_directory:
+        target.mkdir()
+    else:
+        target.write_text("{}")
+    (directory / "linked.json").symlink_to(target, target_is_directory=is_directory)
+    with pytest.raises(OSError, match="symlink"):
+        list(iter_evidence_files(directory, recursive=True))
+
+
+def test_strict_import_scan_preserves_nested_paths(tmp_path):
+    tmp_path = tmp_path / "evidence"
+    nested = tmp_path / "attempt" / "decisions"
+    nested.mkdir(parents=True)
+    files = {tmp_path / "root.json", nested / "decision.json"}
+    for path in files:
+        path.write_text("{}")
+    (tmp_path / "unrelated").write_text("ignored")
+    assert set(iter_evidence_files(tmp_path, recursive=True)) == files
+    assert list(iter_evidence_files(tmp_path)) == [tmp_path / "root.json"]
+
+
+def test_strict_import_scan_propagates_root_metadata_failure(tmp_path, monkeypatch):
+    original = Path.stat
+
+    def unavailable(path, **kwargs):
+        if path == tmp_path:
+            raise PermissionError("metadata inaccessible")
+        return original(path, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "stat", unavailable)
+        with pytest.raises(PermissionError, match="metadata inaccessible"):
+            list(iter_evidence_files(tmp_path))
 
 
 def _sweep(scan: EvidenceScan, limit: int) -> tuple[set[str], int]:

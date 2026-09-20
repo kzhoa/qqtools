@@ -9,6 +9,8 @@ from typing import Generator
 from ..config_types import RootConfig
 from ..lease import clock_capability, lease_expiry, load_lease_policy, persist_clock_observation
 from ..scheduler import _manifest_supervisor, authority_locks
+from .group_discovery.changes import record_task_change
+from .group_namespace import read_group
 from .paths import attempt_path, group_path, local_paths
 from .records import AttemptRecord, normalize_group_record, utc_now
 from .resources.reservations import retag
@@ -98,7 +100,7 @@ def recovery_steps(
                 reject("recovery_attempt_state_invalid")
                 return None
             if task.group_name:
-                group = read_json(group_path(cfg.shared_root, task.group_name))
+                group = read_group(cfg.shared_root, task.group_name)
                 normalize_group_record(group)
                 worker = group["group"]["worker_set"].get(cfg.machine_name)
                 if not worker or worker["state"] not in {"active", "draining"}:
@@ -125,58 +127,64 @@ def recovery_steps(
                 "provider": capability.observation.provider,
                 "observation_id": capability.observation.observation_id,
             }
-            if not retag(reservation_root, attempt.reservation_id, attempt_id, token):
-                reject("recovery_reservation_retag_failed")
-                return None
-            task.claim_control.update(
-                {
-                    "fencing_epoch": token,
-                    "active_claim": {
-                        "claim_id": attempt_id,
-                        "attempt_id": attempt_id,
-                        "attempt_number": number,
-                        "machine_name": cfg.machine_name,
-                        "reservation_id": attempt.reservation_id,
-                        "queue_origin": task.placement_runtime["queue_scope"],
+            with record_task_change(
+                cfg,
+                task,
+                "recovery",
+                details={"expected_attempt_id": attempt_id, "expired_token": expired_token},
+            ):
+                if not retag(reservation_root, attempt.reservation_id, attempt_id, token):
+                    reject("recovery_reservation_retag_failed")
+                    return None
+                task.claim_control.update(
+                    {
+                        "fencing_epoch": token,
+                        "active_claim": {
+                            "claim_id": attempt_id,
+                            "attempt_id": attempt_id,
+                            "attempt_number": number,
+                            "machine_name": cfg.machine_name,
+                            "reservation_id": attempt.reservation_id,
+                            "queue_origin": task.placement_runtime["queue_scope"],
+                            "fencing_token": token,
+                            "claimed_at": utc_now(),
+                            "authority_mode": "bounded_lease",
+                            "clock_error_bound_seconds": evidence["clock_error_bound_seconds"],
+                            "clock_provider": evidence["provider"],
+                            "clock_observation_id": evidence["observation_id"],
+                            "lease_expires_at": expires,
+                            "launch_state": "running",
+                            "launch_authorized_at": attempt.timestamps.get("launch_authorized_at"),
+                            "group_dispatch_epoch": attempt.authorization.get("group_dispatch_epoch"),
+                            "group_worker_set_epoch": attempt.authorization.get("group_worker_set_epoch"),
+                        },
+                    }
+                )
+                task.state.update({"projection": "running", "reason": "recovered_live_attempt"})
+                task.attempt_control["current_attempt_id"] = attempt_id
+                task.meta["revision"] += 1
+                task.meta["updated_at"] = utc_now()
+                attempt.current_fencing_token = token
+                if not is_partial_recovery:
+                    attempt.token_history.append(token)
+                attempt.phase = "running"
+                attempt.result.update({"exit_code": None, "signal": None, "category": None, "reason": None})
+                attempt.timestamps["finished_at"] = None
+                attempt.timestamps["recovered_at"] = utc_now()
+                attempt.lease.update({"renewed_at": utc_now(), "expires_at": expires, "clock_evidence": evidence})
+                atomic_replace(path, attempt.to_dict())
+                save_task(cfg, task)
+                manifest = dict(manifest)
+                manifest.update(
+                    {
                         "fencing_token": token,
-                        "claimed_at": utc_now(),
-                        "authority_mode": "bounded_lease",
-                        "clock_error_bound_seconds": evidence["clock_error_bound_seconds"],
-                        "clock_provider": evidence["provider"],
-                        "clock_observation_id": evidence["observation_id"],
-                        "lease_expires_at": expires,
-                        "launch_state": "running",
-                        "launch_authorized_at": attempt.timestamps.get("launch_authorized_at"),
-                        "group_dispatch_epoch": attempt.authorization.get("group_dispatch_epoch"),
-                        "group_worker_set_epoch": attempt.authorization.get("group_worker_set_epoch"),
-                    },
-                }
-            )
-            task.state.update({"projection": "running", "reason": "recovered_live_attempt"})
-            task.attempt_control["current_attempt_id"] = attempt_id
-            task.meta["revision"] += 1
-            task.meta["updated_at"] = utc_now()
-            attempt.current_fencing_token = token
-            if not is_partial_recovery:
-                attempt.token_history.append(token)
-            attempt.phase = "running"
-            attempt.result.update({"exit_code": None, "signal": None, "category": None, "reason": None})
-            attempt.timestamps["finished_at"] = None
-            attempt.timestamps["recovered_at"] = utc_now()
-            attempt.lease.update({"renewed_at": utc_now(), "expires_at": expires, "clock_evidence": evidence})
-            atomic_replace(path, attempt.to_dict())
-            save_task(cfg, task)
-            manifest = dict(manifest)
-            manifest.update(
-                {
-                    "fencing_token": token,
-                    "recovered_at": utc_now(),
-                    "observed_state": "running",
-                    "supervisor": _manifest_supervisor(manifest),
-                }
-            )
-            atomic_replace(manifest_path, {"process": manifest})
-            return token
+                        "recovered_at": utc_now(),
+                        "observed_state": "running",
+                        "supervisor": _manifest_supervisor(manifest),
+                    }
+                )
+                atomic_replace(manifest_path, {"process": manifest})
+                return token
 
 
 def recover_running_attempt(

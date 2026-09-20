@@ -43,6 +43,26 @@ def _isolated_visible_gpu(monkeypatch: pytest.MonkeyPatch, checkout_subprocess_e
 
 
 @pytest.fixture(autouse=True)
+def _subprocess_bounded_clock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The ordinary fixture patches only this pytest process. Provide the same
+    # bounded-clock prerequisite to the real agent and peer through their provider
+    # boundary; wall time, TTL and expiry/claim decisions remain production code.
+    clock_bin = tmp_path / "clock-bin"
+    clock_bin.mkdir()
+    chronyc = clock_bin / "chronyc"
+    chronyc.write_text(
+        "#!/bin/sh\ncat <<'CLOCK'\n"
+        "System time : 0.000001 seconds slow of NTP time\n"
+        "Root delay : 0.000002 seconds\n"
+        "Root dispersion : 0.000001 seconds\n"
+        "Skew : 0.001 ppm\n"
+        "Leap status : Normal\nCLOCK\n"
+    )
+    chronyc.chmod(0o755)
+    monkeypatch.setenv("PATH", str(clock_bin) + os.pathsep + os.environ["PATH"])
+
+
+@pytest.fixture(autouse=True)
 def _require_real_process_prerequisites() -> None:
     """Fail the lifecycle gate explicitly when its Linux/tmux boundary is unavailable."""
     if sys.platform != "linux":
@@ -639,14 +659,16 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
 @pytest.mark.parametrize("boundary", ["attempt", "task", "reservation"])
 @pytest.mark.parametrize("is_orphaned", [False, True])
 def test_li06_terminal_publication_is_idempotent(tmp_path: Path, boundary: str, is_orphaned: bool) -> None:
-    # The runner only needs to publish exit evidence before the crash boundary;
-    # a short real process keeps that prerequisite while avoiding idle wall time.
-    cfg, runtime, task, marker, process = _start_case(tmp_path, seconds=0.2)
+    # Hold the workload until the original agent has stopped so terminal truth
+    # cannot commit before the fault-injected agent reaches its boundary.
+    cfg, runtime, task, marker, process = _start_case(tmp_path, should_wait=True)
     crashing = None
     try:
         _wait_running(cfg, task.task_id, marker)
         attempt_id = load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
         stop_machine_agent(runtime)
+        assert load_task(cfg, task.task_id).state["projection"] == "running"
+        marker.with_suffix(".finish").touch()
         binding = runtime.load_registry()[1][0]
         paths = local_paths(runtime.project_paths(binding.project_id)["root"])
         observation = paths["observations"] / f"{attempt_id}.json"
@@ -714,6 +736,7 @@ run_machine_agent_loop(root, loop_interval=0.1, available_gpus=[0])
         assert attempt["result"]["exit_code"] == 0
         assert marker.read_text(encoding="utf-8") == "1"
     finally:
+        marker.with_suffix(".finish").touch()
         if crashing is not None and crashing.poll() is None:
             crashing.kill()
             crashing.wait(timeout=5)

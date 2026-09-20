@@ -152,6 +152,7 @@ def test_archive_discovery_reaches_valid_records_across_more_than_256_tasks(tmp_
     work = AuthorityWork(
         SimpleNamespace(
             cfg=cfg,
+            recovery_owner=None,
             _materialize_unverified_intent=lambda _path: None,
             _record_diagnostic=lambda *_args: failures.append(_args),
         )

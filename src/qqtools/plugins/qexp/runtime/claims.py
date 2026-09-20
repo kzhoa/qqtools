@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..config_types import RootConfig
+from .group_discovery.changes import record_task_change
 from .locks import task_writer_lock
 from .paths import shared_paths
 from .records import utc_now
@@ -79,13 +80,24 @@ def release_claim(cfg: RootConfig, task_id: str, fencing_token: int, reason: str
         claim = task.claim_control.get("active_claim") or {}
         if claim.get("fencing_token") != fencing_token:
             return False
-        archive_claim(cfg, task_id, claim, reason)
-        task.claim_control["active_claim"] = None
-        if task.state["projection"] == "running":
-            task.state.update({"projection": "blocked", "reason": reason})
-        task.meta["revision"] += 1
-        task.meta["updated_at"] = utc_now()
-        save_task(cfg, task)
+        with record_task_change(
+            cfg,
+            task,
+            "claim_loss",
+            details={
+                "expected_attempt_id": claim.get("attempt_id"),
+                "expected_fencing_token": claim["fencing_token"],
+                "transition": "release",
+                "reason": reason,
+            },
+        ):
+            archive_claim(cfg, task_id, claim, reason)
+            task.claim_control["active_claim"] = None
+            if task.state["projection"] == "running":
+                task.state.update({"projection": "blocked", "reason": reason})
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task)
         return True
 
 

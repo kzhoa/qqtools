@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from .paths import task_path
 from .records import TaskRecord
 from .store import atomic_replace, read_json
@@ -20,7 +22,28 @@ def load_task(cfg: object, task_id: str) -> TaskRecord:
 
 
 def save_task(cfg: object, task: TaskRecord) -> None:
+    from .observation.projection import publish_task
     from .ready import assert_ready_writer_compatible
 
     assert_ready_writer_compatible(cfg)
-    atomic_replace(task_path(cfg.shared_root, task.task_id), task.to_dict())
+    path = task_path(cfg.shared_root, task.task_id)
+    publish_task(cfg, task, lambda: atomic_replace(path, task.to_dict()))
+
+
+def _unlink_task_truth(cfg: object, task_id: str) -> None:
+    path = task_path(cfg.shared_root, task_id)
+    path.unlink(missing_ok=True)
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def delete_task(cfg: object, task_id: str) -> None:
+    """Durably delete Task truth and retire its observation memberships."""
+    from .observation.projection import delete_task_truth
+    from .ready import assert_ready_writer_compatible
+
+    assert_ready_writer_compatible(cfg)
+    delete_task_truth(cfg, task_id, lambda: _unlink_task_truth(cfg, task_id))

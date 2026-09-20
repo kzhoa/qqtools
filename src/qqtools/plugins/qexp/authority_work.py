@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Generator
@@ -11,6 +11,9 @@ from typing import TYPE_CHECKING, Callable, Generator
 from .runtime.authority_scan import EvidenceScan
 from .runtime.claim_archive_scan import ClaimArchiveDiscovery, is_pending_archive_clear
 from .runtime.paths import local_paths
+from .runtime.records import validate_identifier
+from .runtime.responsibility import ResponsibilityReader
+from .runtime.responsibility_cleanup import CleanupRequest
 from .runtime.store import read_json
 from .runtime.termination import attempt_control_lock
 from .runtime.work_budget import RuntimeDiagnostics, activate_diagnostics
@@ -41,6 +44,8 @@ class AuthorityWork:
         self.supervisor = supervisor
         self.diagnostics = RuntimeDiagnostics()
         self.paths = local_paths(supervisor.cfg.runtime_root)
+        self._responsibilities = ResponsibilityReader(supervisor.cfg.runtime_root, owner=supervisor.recovery_owner)
+        self._responsibility_turn = 0
         self._active: OrderedDict[str, None] = OrderedDict()
         self._pending_control: Generator[None, None, int | None] | None = None
         self._pending_attempt: str | None = None
@@ -55,6 +60,9 @@ class AuthorityWork:
         self._cleanup_turn = 0
         self._decision_scan: EvidenceScan | None = None
         self._decision_root: Path | None = None
+        self._decision_queue: deque[Path] = deque()
+        self._queued_decisions: set[Path] = set()
+        self._initial_decisions: set[Path] = set()
         self._cleanup_scans = [
             EvidenceScan(self.paths[name])
             for name in (
@@ -76,10 +84,18 @@ class AuthorityWork:
             ),
         }
         # Reserve half the service opportunities for already discovered Attempts.
-        # Every discovery/repair lane retains one turn in each twelve-step round.
+        # Every discovery/repair lane retains one turn in each fourteen-step round.
         self._order = tuple(
             name
-            for lane in ("registrations", "supervision", "observations", "intents", "termination", "cleanup")
+            for lane in (
+                "registrations",
+                "supervision",
+                "observations",
+                "intents",
+                "termination",
+                "cleanup",
+                "responsibilities",
+            )
             for name in ("active", lane)
         )
         self._cleanup_visited = 0
@@ -92,9 +108,19 @@ class AuthorityWork:
 
     @property
     def is_startup_complete(self) -> bool:
+        mode = self._responsibilities.discovery_mode
+        if mode in {"checking", "unavailable"}:
+            return False
+        if mode == "primary":
+            return (
+                self._pending_control is None
+                and self._responsibilities.is_initial_sweep_complete
+                and not self._initial_decisions
+            )
         return self._pending_control is None and all(lane.has_completed for lane in self._lanes.values())
 
     def close(self) -> None:
+        self._responsibilities.close()
         self.cancel_pending_control()
         self._archives.close()
         for lane in self._lanes.values():
@@ -107,8 +133,11 @@ class AuthorityWork:
     def is_control_pending(self, attempt_id: str) -> bool:
         return attempt_id == self._pending_attempt
 
-    def cancel_pending_control(self) -> None:
+    def cancel_pending_control(self, *, is_complete: bool = False) -> None:
         if self._pending_control is not None:
+            if not is_complete and self._responsibilities.discovery_mode == "primary":
+                self._responsibilities.invalidate_initial_sweep()
+                self._last_served.pop(self._pending_attempt, None)
             self._pending_control.close()
         self._pending_control = None
         self._pending_attempt = None
@@ -118,6 +147,8 @@ class AuthorityWork:
     def recover(self, process: dict[str, object]) -> None:
         """Queue at most one locked recovery inventory; other Attempts retry later."""
         if self._pending_control is not None:
+            if self._responsibilities.discovery_mode == "primary":
+                raise RuntimeError("recovery candidate deferred while another control is pending")
             return
         from .runtime.attempt_recovery import recovery_steps
 
@@ -144,6 +175,8 @@ class AuthorityWork:
                 self._pending_started = time.monotonic()
                 self._pending_kind = "supervision"
                 retained = True
+            elif self._responsibilities.discovery_mode == "primary":
+                raise RuntimeError("supervision candidate deferred while another control is pending")
         except StopIteration:
             pass
         finally:
@@ -160,7 +193,7 @@ class AuthorityWork:
                 return
             next(self._pending_control)
         except StopIteration:
-            self.cancel_pending_control()
+            self.cancel_pending_control(is_complete=True)
             if attempt_id in self._active:
                 self._last_served[attempt_id] = time.monotonic()
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -169,7 +202,7 @@ class AuthorityWork:
             self.supervisor._record_diagnostic({"attempt_id": attempt_id}, f"{kind}_failed", exc)
 
     def _intent(self, path: Path) -> None:
-        if path.stem != self._pending_attempt:
+        if path.stem != self._pending_attempt and not self._responsibilities.is_cleanup_pending(path.stem):
             self.supervisor._materialize_unverified_intent(path)
 
     def reconcile_archives(self, task_id: str) -> bool:
@@ -192,14 +225,14 @@ class AuthorityWork:
             self._active[attempt_id] = None
 
     def _registration(self, path: Path) -> None:
-        if path.stem == self._pending_attempt:
+        if path.stem == self._pending_attempt or self._responsibilities.is_cleanup_pending(path.stem):
             return
         self.supervisor._materialize_registrations(registration_paths=(path,), should_materialize_intents=False)
         if (self.paths["processes"] / path.name).exists():
             self._remember(path.stem)
 
     def _process(self, path: Path) -> None:
-        if path.stem == self._pending_attempt:
+        if path.stem == self._pending_attempt or self._responsibilities.is_cleanup_pending(path.stem):
             return
         now = time.monotonic()
         previous = self._last_served.get(path.stem)
@@ -214,8 +247,6 @@ class AuthorityWork:
         if not isinstance(attempt_id, str) or attempt_id != path.stem:
             return
         self._remember(attempt_id)
-        if attempt_id in self._active:
-            self._last_served[attempt_id] = now
         if previous is not None:
             self._maximum_service_gap = max(self._maximum_service_gap, now - previous)
         # Registration replay must succeed before shared finalization. In particular,
@@ -225,6 +256,8 @@ class AuthorityWork:
             if registration.exists():
                 self._registration(registration)
             self.supervisor._supervise(process)
+            if attempt_id in self._active:
+                self._last_served[attempt_id] = now
         except OSError as exc:
             self.supervisor._record_diagnostic(process, "shared_storage_unavailable", exc)
             self.supervisor._mark_shared_unavailable(process)
@@ -232,6 +265,8 @@ class AuthorityWork:
             raise
 
     def _observation(self, path: Path) -> None:
+        if self._responsibilities.is_cleanup_pending(path.stem):
+            return
         if path.stem == self._pending_attempt:
             if self._pending_kind != "recovery":
                 return
@@ -254,6 +289,21 @@ class AuthorityWork:
     def _termination(self, path: Path) -> None:
         # The outer lane hands off just one directory. Its nested records are
         # consumed on subsequent turns rather than eagerly expanding a tree.
+        if self._responsibilities.discovery_mode == "primary":
+            if path == self._decision_root or path in self._queued_decisions:
+                if not self._responsibilities.is_initial_sweep_complete:
+                    self._initial_decisions.add(path)
+                return
+            if self._decision_scan is not None:
+                if len(self._decision_queue) >= 256:
+                    raise RuntimeError("indexed termination discovery backlog is full")
+                self._decision_queue.append(path)
+                self._queued_decisions.add(path)
+                if not self._responsibilities.is_initial_sweep_complete:
+                    self._initial_decisions.add(path)
+                return
+            if not self._responsibilities.is_initial_sweep_complete:
+                self._initial_decisions.add(path)
         self._decision_root = path
         self._decision_scan = EvidenceScan(path)
 
@@ -267,13 +317,20 @@ class AuthorityWork:
                 raise ValueError("local termination decision must be an object")
             if self._pending_attempt is not None and value.get("attempt_id") == self._pending_attempt:
                 continue
+            if self._responsibilities.is_cleanup_pending(value.get("attempt_id")):
+                continue
             if value.get("state") in {"signal_committed", "sigterm_sent", "sigkill_sent"}:
                 with attempt_control_lock(self.supervisor.cfg, value["attempt_id"]):
                     self.supervisor._send_signals(value["attempt_id"], value["decision_id"])
         if page.is_complete:
             self._decision_scan.close()
+            self._initial_decisions.discard(self._decision_root)
             self._decision_scan = None
             self._decision_root = None
+            if self._decision_queue:
+                following = self._decision_queue.popleft()
+                self._queued_decisions.remove(following)
+                self._termination(following)
         return True
 
     def _active_step(self) -> None:
@@ -297,6 +354,58 @@ class AuthorityWork:
             if path.stem != self._pending_attempt:
                 self.supervisor._remove_terminal_attempt_evidence(path.stem)
 
+    def cleanup_responsibility(self, request: CleanupRequest) -> bool:
+        return self._responsibilities.cleanup(request)
+
+    def _responsibility_step(self) -> bool:
+        if self._pending_control is not None and self._responsibilities.discovery_mode == "primary":
+            # Preserve prefetched candidates until their semantic work can own
+            # the slot. Restarting traversal here can repeatedly rediscover the
+            # same long-running first member and starve every later member.
+            return False
+        entry = self._responsibilities.take()
+        if entry is None:
+            return False
+        try:
+            result = self._service_responsibility(entry)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            self._responsibilities.acknowledge(is_success=False, stage=entry["stage"])
+            raise
+        self._responsibilities.acknowledge()
+        return result
+
+    def _service_responsibility(self, entry: dict) -> bool:
+        attempt_id = validate_identifier(entry["identity"], "attempt_id")
+        if attempt_id == self._pending_attempt:
+            return True
+        cleanup = CleanupRequest.from_entry(entry)
+        if cleanup is None:
+            cleanup = self.supervisor._cleanup_request_for_membership(entry)
+        if cleanup is not None:
+            if self._responsibilities.cleanup(cleanup):
+                self.supervisor._forget_attempt(attempt_id)
+            return True
+        for name, operation in (
+            ("observations", self._observation),
+            ("registrations", self._registration),
+            ("processes", self._process),
+            ("launch_intents", self._intent),
+        ):
+            path = self.paths[name] / f"{attempt_id}.json"
+            if path.exists():
+                operation(path)
+                if name in {"registrations", "launch_intents"} and self._responsibilities.discovery_mode == "primary":
+                    manifest = self.paths["processes"] / path.name
+                    if manifest.exists():
+                        self._process(manifest)
+                break
+        if self._responsibilities.discovery_mode == "primary":
+            decisions = self.paths["termination_decisions"] / attempt_id
+            if decisions.exists():
+                self._termination(decisions)
+        self.supervisor._remove_terminal_attempt_evidence(attempt_id)
+        return True
+
     def tick(self, limit: int = 64) -> dict[str, object]:
         with activate_diagnostics(self.diagnostics):
             return self._tick(limit)
@@ -306,17 +415,25 @@ class AuthorityWork:
         if type(limit) is not int or limit < 1 or limit > 256:
             raise ValueError("authority work limit must be an integer from 1 to 256")
         self._slice_token = object()
+        if self._responsibilities.owner is not None:
+            self._responsibilities.poll()
+            if self._responsibilities.discovery_mode == "checking":
+                return self.snapshot()
+        is_primary = self._responsibilities.discovery_mode == "primary"
+        order = ("active", "responsibilities", "active", "termination") if is_primary else self._order
         completed_scans: set[EvidenceScan] = set()
         if self._pending_control is not None:
             self._control_step()
             limit -= 1
+        self._responsibility_turn = min(4, self._responsibility_turn + 1)
         for _ in range(limit):
-            name = self._order[self._turn]
-            self._turn = (self._turn + 1) % len(self._order)
+            self._turn %= len(order)
+            name = order[self._turn]
+            self._turn = (self._turn + 1) % len(order)
             if name == "active" and not self._active:
                 # Borrow only empty active turns; cached Attempts keep their share.
-                name = self._order[self._turn]
-                unfinished = [key for key, lane in self._lanes.items() if not lane.has_completed]
+                name = "responsibilities" if is_primary else order[self._turn]
+                unfinished = [] if is_primary else [key for key, lane in self._lanes.items() if not lane.has_completed]
                 if unfinished:
                     name = unfinished[self._startup_turn % len(unfinished)]
                     self._startup_turn += 1
@@ -328,6 +445,12 @@ class AuthorityWork:
                     self._active_step()
                 elif name == "cleanup":
                     self._cleanup_step()
+                elif name == "responsibilities":
+                    if is_primary or self._responsibility_turn == 4:
+                        self._responsibility_turn = 0
+                        self._responsibility_step()
+                elif name == "termination" and is_primary:
+                    self._termination_step()
                 elif name == "termination" and self._termination_step():
                     lane.visited += 1
                 else:
@@ -347,6 +470,10 @@ class AuthorityWork:
                         lane.has_sweep_error = False
                         lane.started_at = time.monotonic()
             except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                if is_primary and name == "termination" and self._decision_scan is not None:
+                    # A failed initial decision must be revisited before startup
+                    # can consume this directory's successful EOF.
+                    self._decision_scan.close()
                 if lane is not None:
                     lane.failures += 1
                     lane.has_sweep_error = True
@@ -354,6 +481,8 @@ class AuthorityWork:
                         lane.pending_since = time.monotonic()
                 elif name == "active":
                     self._active_failures += 1
+                elif name == "responsibilities":
+                    self._responsibilities.failures += 1
                 else:
                     self._cleanup_failures += 1
                 self.supervisor._record_diagnostic({"attempt_id": "control-plane"}, f"{name}_unavailable", exc)
@@ -366,6 +495,10 @@ class AuthorityWork:
         now = time.monotonic()
         return {
             "startup_complete": self.is_startup_complete,
+            "discovery_mode": self._responsibilities.discovery_mode,
+            "discovery_error": self._responsibilities.discovery_error,
+            "termination_backlog": len(self._decision_queue),
+            "responsibility_discovery_failures": self._responsibilities.failures,
             "pending_control_attempt": self._pending_attempt,
             "pending_control_kind": self._pending_kind,
             "control_pending_age_seconds": (

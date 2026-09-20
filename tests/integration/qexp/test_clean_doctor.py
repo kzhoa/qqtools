@@ -284,13 +284,24 @@ def test_clean_releases_proven_local_reservation_before_deleting_truth(tmp_path:
 
 
 def test_clean_waits_for_remote_machine_local_cleanup(tmp_path: Path):
+    from qqtools.plugins.qexp.runner import _publish_exit_observation
+
     shared_root = tmp_path / ".qexp"
     cfg1 = init_shared_root(shared_root, "gpu-1", runtime_root=tmp_path / "rt-1")
     cfg2 = init_shared_root(shared_root, "gpu-2", runtime_root=tmp_path / "rt-2")
     task = _failed_task(cfg1)
     manifest = cfg1.runtime_root / "processes" / "old-attempt.json"
     atomic_replace(
-        manifest, {"process": {"task_id": task.task_id, "attempt_id": "old-attempt", "observed_state": "exited"}}
+        manifest,
+        {
+            "process": {
+                "protocol_version": 1,
+                "task_id": task.task_id,
+                "attempt_id": "old-attempt",
+                "observed_state": "exited",
+                "process_group_id": 99999992,
+            }
+        },
     )
     log = shared_root / "logs" / task.task_id / "old-attempt.log"
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -302,6 +313,14 @@ def test_clean_waits_for_remote_machine_local_cleanup(tmp_path: Path):
     assert result["operations"][task.task_id]["pending_machines"] == ["gpu-1"]
     assert task_path(shared_root, task.task_id).exists()
     assert manifest.exists()
+    reconcile_cleanup_operations(cfg1)
+    # An exited label alone cannot prove that a delayed wrapper has finished.
+    assert task_path(shared_root, task.task_id).exists()
+    assert manifest.exists()
+    assert log.exists()
+    operation = read_json(shared_root / "operations" / "cleanup" / f"{task.task_id}.json")["cleanup"]
+    assert "gpu-1" not in operation["acknowledgements"]
+    _publish_exit_observation(cfg1, "old-attempt", 1, task_id=task.task_id)
     reconcile_cleanup_operations(cfg1)
     assert not task_path(shared_root, task.task_id).exists()
     assert not manifest.exists()

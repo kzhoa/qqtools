@@ -19,6 +19,9 @@ from ...lease import (
     persist_clock_observation,
     timed_offer_deadline_upper,
 )
+from ..authority_lock import authority_locks
+from ..group_discovery.changes import record_task_change
+from ..group_namespace import read_group
 from ..locks import group_lock, schema_writer_lock, task_lock
 from ..operation_store import (
     active_operation_path,
@@ -28,7 +31,7 @@ from ..operation_store import (
     operation_exists,
     write_active_operation,
 )
-from ..paths import group_path, shared_paths, submission_path
+from ..paths import group_path, shared_paths
 from ..ready import (
     commit_ready_publication,
     discard_ready_generation,
@@ -39,6 +42,7 @@ from ..ready import (
 )
 from ..records import SCHEMA_VERSION, TaskRecord, new_id, normalize_group_record, utc_now
 from ..store import atomic_replace, read_json
+from ..submission_control import SubmissionControlUnavailable, read_submission_state
 from ..tasks import load_task, save_task
 from . import offer_deadlines
 
@@ -201,14 +205,16 @@ def _submission_committed(cfg: RootConfig, task: TaskRecord) -> bool:
     operation_id = task.submission_operation_id
     if not operation_id:
         return False
-    path = submission_path(cfg.shared_root, operation_id)
-    return path.exists() and read_json(path).get("submission", {}).get("state") == "committed"
+    try:
+        return read_submission_state(cfg, operation_id) == "committed"
+    except (FileNotFoundError, SubmissionControlUnavailable):
+        return False
 
 
 def _group_data(cfg: RootConfig, task: TaskRecord) -> dict[str, Any] | None:
     if not task.group_name:
         return None
-    group = read_json(group_path(cfg.shared_root, task.group_name))
+    group = read_group(cfg.shared_root, task.group_name)
     normalize_group_record(group)
     return group
 
@@ -238,8 +244,10 @@ def _validate_common(cfg: RootConfig, task: TaskRecord, group: dict[str, Any] | 
         raise ValueError(f"Group {task.group_name!r} is being cancelled.")
     home = task.placement_policy["home_machine"]
     worker = group["group"]["worker_set"].get(home)
-    if not worker or worker.get("state") != "active":
-        raise ValueError(f"Task home machine {home!r} is not a claimable Group worker.")
+    # Existing queued work must be offerable while its home drains, otherwise
+    # the documented removal blocker cannot be resolved through placement.
+    if not worker or worker.get("state") not in {"active", "draining"}:
+        raise ValueError(f"Task home machine {home!r} is not an active or draining Group worker.")
 
 
 def _normalize_helpers(
@@ -565,36 +573,46 @@ def apply_availability_transition(
                         }
                     )
             if not idempotent:
-                try:
-                    ready_reference = reserve_ready_generation(
-                        cfg,
-                        task.task_id,
-                        task.ready_generation + 1,
-                        target_scope,
-                        task.placement_policy["home_machine"],
-                    )
-                except RuntimeError as exc:
-                    if "already has an in-progress writer" not in str(exc):
-                        raise
-                    task = load_task(cfg, request.task_id)
-                    group = _group_data(cfg, task)
-                    operation = _read_operation(cfg, operation_id)
-                    completed = _completed_operation_result(cfg, request, operation_id, operation, task, group)
-                    if completed is None:
-                        raise
-                    return completed
-                old_generation, _ = prepare_ready_transition(
+                reserved_generation = task.ready_generation + 1
+                with record_task_change(
                     cfg,
                     task,
-                    f"availability_{request.action}",
-                    reference=ready_reference,
-                )
-                task.meta["revision"] += 1
-                task.meta["updated_at"] = utc_now()
-                save_task(cfg, task)
-                is_ready_committed = True
-                commit_ready_publication(cfg, task)
-                retire_previous_ready_generation(cfg, old_generation, task)
+                    "availability",
+                    details={
+                        "reserved_generation": reserved_generation,
+                        "availability_operation_id": operation_id,
+                    },
+                ):
+                    try:
+                        ready_reference = reserve_ready_generation(
+                            cfg,
+                            task.task_id,
+                            reserved_generation,
+                            target_scope,
+                            task.placement_policy["home_machine"],
+                        )
+                    except RuntimeError as exc:
+                        if "already has an in-progress writer" not in str(exc):
+                            raise
+                        task = load_task(cfg, request.task_id)
+                        group = _group_data(cfg, task)
+                        operation = _read_operation(cfg, operation_id)
+                        completed = _completed_operation_result(cfg, request, operation_id, operation, task, group)
+                        if completed is None:
+                            raise
+                        return completed
+                    old_generation, _ = prepare_ready_transition(
+                        cfg,
+                        task,
+                        f"availability_{request.action}",
+                        reference=ready_reference,
+                    )
+                    task.meta["revision"] += 1
+                    task.meta["updated_at"] = utc_now()
+                    save_task(cfg, task)
+                    is_ready_committed = True
+                    commit_ready_publication(cfg, task)
+                    retire_previous_ready_generation(cfg, old_generation, task)
             offer_deadlines.sync_deadline_index(cfg, task)
             result = _make_result(request.action, task, group, operation_id, idempotent=idempotent)
             _write_audit_event(cfg, result, before, clock_proof)
@@ -629,7 +647,19 @@ def apply_availability_transition(
         raise
     finally:
         if ready_reference is not None and not is_ready_committed:
-            discard_ready_generation(cfg, ready_reference.task_id, ready_reference.generation)
+            # A Task rename may have committed before its durability call raised.
+            # Re-read authoritative truth under the full writer fence before deleting
+            # a reserved generation; uncertain reads retain the marker for recovery.
+            try:
+                with authority_locks(cfg, initial):
+                    try:
+                        current_task = load_task(cfg, request.task_id)
+                    except FileNotFoundError:
+                        current_task = None
+                    if current_task is None or current_task.ready_generation != ready_reference.generation:
+                        discard_ready_generation(cfg, ready_reference.task_id, ready_reference.generation)
+            except (OSError, KeyError, TypeError, ValueError, RuntimeError):
+                pass
 
 
 def reconcile_availability_operations(

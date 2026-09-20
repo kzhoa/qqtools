@@ -12,9 +12,11 @@ from .commands.group import reconcile_group_cancel_operations
 from .config_types import RootConfig
 from .layout import validate_root_contract
 from .lease import clock_capability
-from .lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
 from .runtime.availability import rebuild_deadline_indexes, reconcile_availability_operations
-from .runtime.locks import group_writer_lock, schema_lock, task_lock
+from .runtime.group_namespace import group_directory
+from .runtime.locks import group_writer_lock, schema_lock, schema_reader_lock
+from .runtime.observation.maintenance import ObservationMaintenance, request_rebuild
+from .runtime.observation.projection import inspect_observation, observation_path
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
 from .runtime.ready import (
     READY_BUILD_PAGE_SIZE,
@@ -24,7 +26,6 @@ from .runtime.ready import (
     read_ready_index_status,
     ready_task_projection_issue,
     repair_ready_index,
-    retire_current_ready_generation,
 )
 from .runtime.ready.group_members import (
     GROUP_MEMBER_PAGE_SIZE,
@@ -36,8 +37,13 @@ from .runtime.ready.group_members_rebuild import audit_group_ready_members, repa
 from .runtime.records import AttemptRecord, TaskRecord, normalize_group_record, utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.submission import finalize_submission_group
-from .runtime.tasks import load_task
+from .runtime.submission_control import control_paths, inspect_submission_control, request_control_rebuild
 from .runtime.termination import list_decisions
+
+_TASK_OBSERVATION_INSTRUCTIONS = (
+    "Paginated list unavailable until the global agent completes the background build; "
+    "doctor repair requests a rebuild on a damaged index."
+)
 
 
 def _cleaned_task_ids(cfg: RootConfig) -> set[str]:
@@ -125,7 +131,9 @@ def verify_integrity(
     paths = shared_paths(cfg.shared_root)
     cleaned = _cleaned_task_ids(cfg)
     submissions = _records_by_stem(paths["submissions"], "submission", issues, "submission_invalid")
-    group_records = _records_by_stem(paths["groups"], "group", issues, "group_invalid")
+    with schema_reader_lock(cfg.shared_root):
+        groups_root = group_directory(cfg.shared_root)
+        group_records = _records_by_stem(groups_root, "group", issues, "group_invalid")
     for name, group in group_records.items():
         try:
             normalize_group_record({"group": group})
@@ -133,7 +141,7 @@ def verify_integrity(
             _issue(
                 issues,
                 "group_worker_invalid",
-                paths["groups"] / f"{name}.json",
+                groups_root / f"{name}.json",
                 "high",
                 str(exc),
             )
@@ -439,12 +447,33 @@ def verify_integrity(
                 _issue(issues, "termination_decision_incomplete", decision_path, "high")
         except (OSError, ValueError):
             _issue(issues, "termination_decision_invalid", decision_path, "high")
-    is_complete = member_verification["state"] != "building"
-    is_healthy = not issues and member_verification["state"] == "completed"
     try:
         member_status = read_group_ready_members_state(cfg)
     except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
         member_status = {}
+    task_observation = inspect_observation(cfg)
+    observation_state = task_observation.get("state")
+    if observation_state == "degraded" or (
+        observation_state not in {"absent", "building"} and task_observation.get("dirty")
+    ):
+        _issue(
+            issues,
+            "task_observation_unavailable",
+            observation_path(cfg) / "state.json",
+            "low",
+            _TASK_OBSERVATION_INSTRUCTIONS,
+        )
+    submission_control = inspect_submission_control(cfg)
+    if submission_control["state"] == "unavailable":
+        _issue(
+            issues,
+            "submission_control_unavailable",
+            control_paths(cfg)["state"],
+            "low",
+            "Run doctor repair to restart background Submission visibility certification.",
+        )
+    is_complete = member_verification["state"] != "building"
+    is_healthy = not issues and member_verification["state"] == "completed"
     return {
         "schema_version": 6,
         "tasks_checked": checked,
@@ -466,6 +495,8 @@ def verify_integrity(
             "observation_id": capability.observation.observation_id if capability.observation else None,
             "scheduling_capability": "full" if capability.is_healthy else "local-safe",
         },
+        "task_observation": task_observation,
+        "submission_control": submission_control,
     }
 
 
@@ -528,117 +559,10 @@ def repair_metadata(
     rebuilt_deadline_indexes = rebuild_deadline_indexes(cfg)
     if rebuilt_deadline_indexes:
         repaired.append(f"offer_deadline_indexes:{rebuilt_deadline_indexes}")
-    group_controls = shared_paths(cfg.shared_root)["group_control"]
-    for path in iter_json(group_controls):
-        data = read_json(path)
-        control = data.get("group_control", {})
-        if control.get("operation_type") != "cancel" or control.get("state") not in {"converging", "waiting_ack"}:
-            continue
-        high_watermark = control["membership_high_watermark"]
-        group_name = control["group_name"]
-        post_commit_results = []
-        with group_writer_lock(cfg, group_name):
-            group_file = group_path(cfg.shared_root, group_name)
-            if not group_file.exists():
-                blocked.append(control["operation_id"])
-                continue
-            barriers = read_json(group_file)["group"].get("cancellation_barriers", [])
-            if not any(item["operation_id"] == control["operation_id"] for item in barriers):
-                control.update({"state": "blocked", "blocked_reason": "cancellation_barrier_missing"})
-                data["meta"]["revision"] += 1
-                atomic_replace(path, data)
-                blocked.append(control["operation_id"])
-                continue
-            for task_path_value in iter_json(shared_paths(cfg.shared_root)["tasks"]):
-                task = TaskRecord.from_dict(read_json(task_path_value))
-                if task.group_name != group_name or (task.group_membership_sequence or 0) > high_watermark:
-                    continue
-                with task_lock(cfg.shared_root, task.task_id):
-                    task = load_task(cfg, task.task_id)
-                    has_saved_task = False
-                    claim = task.claim_control.get("active_claim") or {}
-                    if task.state["projection"] == "queued" and not claim:
-                        task.state.update({"projection": "cancelled", "reason": "group_cancelled"})
-                    elif claim.get("launch_state") == "claimed":
-                        result = commit_terminal_transition_locked(
-                            cfg,
-                            task,
-                            TerminalTransition(
-                                task.task_id,
-                                claim["attempt_id"],
-                                task.attempt_control["current_attempt_number"],
-                                claim["fencing_token"],
-                                "cancelled",
-                                "group_cancelled_before_launch",
-                                None,
-                                frozenset({"running"}),
-                                frozenset({"claimed"}),
-                                "active",
-                                allow_missing_attempt=True,
-                            ),
-                        )
-                        post_commit_results.append(result)
-                        has_saved_task = result.outcome == "committed"
-                    elif task.state["projection"] == "running" and control["terminate_running"]:
-                        task.control.update(
-                            {
-                                "cancellation_requested_at": utc_now(),
-                                "cancellation_operation_id": control["operation_id"],
-                                "terminate_running": True,
-                                "requested_by": cfg.machine_name,
-                            }
-                        )
-                    if not has_saved_task:
-                        task.meta["revision"] += 1
-                        task.meta["updated_at"] = utc_now()
-                        from .runtime.tasks import save_task
-
-                        save_task(cfg, task)
-                    if task.state["projection"] == "cancelled":
-                        retire_current_ready_generation(cfg, task)
-        for result in post_commit_results:
-            if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
-                from .runtime.resources.reservations import release
-
-                release(
-                    reservation_runtime_root or cfg.runtime_root, result.reservation_id, "group_cancelled_before_launch"
-                )
-            if result.event:
-                dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
-        pending: dict[str, list[str]] = {}
-        acknowledged = 0
-        blocked_tasks = 0
-        for task_file in iter_json(shared_paths(cfg.shared_root)["tasks"]):
-            task = TaskRecord.from_dict(read_json(task_file))
-            if task.group_name != control["group_name"] or (task.group_membership_sequence or 0) > high_watermark:
-                continue
-            if task.control.get("termination_acknowledged_at"):
-                acknowledged += 1
-                continue
-            claim = task.claim_control.get("active_claim") or {}
-            if task.state["projection"] == "running" and control["terminate_running"]:
-                pending.setdefault(claim.get("machine_name") or task.placement_policy["home_machine"], []).append(
-                    task.task_id
-                )
-            elif task.state["projection"] == "blocked" and control["terminate_running"]:
-                blocked_tasks += 1
-        control["progress"]["termination_acknowledged"] = acknowledged
-        control["progress"]["blocked"] = blocked_tasks
-        control["pending_machine_acknowledgements"] = pending
-        if blocked_tasks:
-            control["state"] = "blocked"
-            control["blocked_reason"] = "orphaned_tasks_require_resolution"
-        elif not pending:
-            control["state"] = "completed"
-            control["completed_at"] = utc_now()
-        else:
-            control["state"] = "waiting_ack"
-        control["updated_at"] = utc_now()
-        data["meta"]["revision"] += 1
-        atomic_replace(path, data)
-        repaired.append(control["operation_id"])
-    for control in reconcile_group_cancel_operations(cfg):
-        if control["operation_id"] not in repaired:
+    for control in reconcile_group_cancel_operations(cfg, reservation_runtime_root=reservation_runtime_root):
+        if control["state"] != "completed":
+            blocked.append(control["operation_id"])
+        elif control["operation_id"] not in repaired:
             repaired.append(control["operation_id"])
     orphan_result = repair_orphans(cfg, reservation_runtime_root=reservation_runtime_root)
     repaired.extend(task_id for task_id in orphan_result["repaired"] if task_id not in repaired)
@@ -687,6 +611,35 @@ def repair_metadata(
         message = (
             "Member projection repair slice completed; rerun doctor repair while group_ready_members.state is building."
         )
+    task_observation: dict[str, Any] = {
+        "state": "degraded",
+        "generation": None,
+        "dirty": True,
+        "revision": None,
+    }
+    try:
+        task_observation = inspect_observation(cfg)
+        if task_observation.get("state") != "building" and (
+            task_observation.get("state") == "degraded" or task_observation.get("dirty")
+        ):
+            task_observation = request_rebuild(cfg)
+            maintenance = ObservationMaintenance(cfg)
+            try:
+                task_observation = maintenance.advance()
+            finally:
+                maintenance.close()
+    except (OSError, ValueError, RuntimeError):
+        blocked.append("task_observation")
+        task_observation = {**task_observation, "state": "degraded"}
+    submission_control = inspect_submission_control(cfg)
+    if submission_control["state"] == "unavailable":
+        try:
+            submission_control = request_control_rebuild(cfg)
+        except (OSError, ValueError, RuntimeError):
+            blocked.append("submission_control")
+        else:
+            if submission_control["state"] == "waiting":
+                blocked.append("submission_control")
     return {
         "repaired": repaired,
         "blocked": blocked,
@@ -706,6 +659,8 @@ def repair_metadata(
             },
         },
         "prior_degraded_reasons": prior_degraded_reasons,
+        "task_observation": task_observation,
+        "submission_control": submission_control,
         "message": message,
     }
 
@@ -773,6 +728,15 @@ def repair_orphans(cfg: RootConfig, *, reservation_runtime_root: Path | None = N
                 blocked.append({"task_id": task.task_id, "reason": "finalize_cas_rejected"})
         else:
             blocked.append({"task_id": task.task_id, "reason": f"process_identity_{evidence_state}"})
+    submission_control = inspect_submission_control(cfg)
+    if submission_control["state"] == "unavailable":
+        try:
+            submission_control = request_control_rebuild(cfg)
+        except (OSError, ValueError, RuntimeError):
+            blocked.append("submission_control")
+        else:
+            if submission_control["state"] == "waiting":
+                blocked.append("submission_control")
     return {
         "repaired": repaired,
         "blocked": blocked,

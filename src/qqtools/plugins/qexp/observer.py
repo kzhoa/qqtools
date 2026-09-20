@@ -8,6 +8,8 @@ from typing import Any
 
 from .config_types import RootConfig
 from .runtime.dependencies import dependency_gate
+from .runtime.group_namespace import group_directory, read_group
+from .runtime.locks import schema_reader_lock
 from .runtime.paths import group_path, machine_path, shared_paths, submission_path, task_path
 from .runtime.progress import inspect_progress
 from .runtime.records import TaskRecord, normalize_group_record
@@ -56,6 +58,20 @@ def list_tasks(
     return result[:limit]
 
 
+def list_tasks_page(
+    cfg: RootConfig,
+    *,
+    phase: str | None = None,
+    group: str | None = None,
+    page_size: int = 50,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """Return one live, indexed page of Task views."""
+    from .runtime.observation.api import list_tasks_page as _list_tasks_page
+
+    return _list_tasks_page(cfg, phase=phase, group=group, page_size=page_size, cursor=cursor)
+
+
 def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
     task = load_task(cfg, task_id)
     result = task.to_dict()
@@ -78,16 +94,17 @@ def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
 
 def list_groups(cfg: RootConfig) -> list[dict[str, Any]]:
     groups = []
-    for path in iter_json(shared_paths(cfg.shared_root)["groups"]):
-        group = read_json(path)
-        normalize_group_record(group)
-        groups.append(group)
+    with schema_reader_lock(cfg.shared_root):
+        for path in iter_json(group_directory(cfg.shared_root)):
+            group = read_json(path)
+            normalize_group_record(group)
+            groups.append(group)
     return groups
 
 
 def list_group_machines(cfg: RootConfig, name: str, *, reservation_runtime_root: Path | None = None) -> dict[str, Any]:
     """Return normalized Worker roles, usage, limits, and machine observations."""
-    group = read_json(group_path(cfg.shared_root, name))
+    group = read_group(cfg.shared_root, name)
     normalize_group_record(group)
     machines = []
     for machine, worker in sorted(group["group"]["worker_set"].items()):

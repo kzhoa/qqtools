@@ -207,6 +207,22 @@ class AgentMeasurements:
         fcntl.flock = self.wrap(fcntl.flock, "fcntl.flock")
         original_scandir = os.scandir
         measurements = self
+        original_open = os.open
+
+        def open_file(path, *args, **kwargs):
+            if not isinstance(path, int) and Path(path).name.startswith("settled-history-"):
+                measurements.observe("history.file_open", 0)
+            return original_open(path, *args, **kwargs)
+
+        os.open = open_file
+        original_path_open = Path.open
+
+        def path_open(path, *args, **kwargs):
+            if path.name.startswith("settled-history-"):
+                measurements.observe("history.file_open", 0)
+            return original_path_open(path, *args, **kwargs)
+
+        Path.open = path_open
 
         class Inventory:
             def __init__(self, entries):

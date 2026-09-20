@@ -915,6 +915,34 @@ def test_managed_launch_failure_releases_machine_reservation(tmp_path: Path) -> 
     assert reserved_gpu_ids(cfg.runtime_root) == set()
 
 
+@pytest.mark.parametrize("is_observing", [False, True])
+def test_pending_legacy_capture_does_not_suspend_compatible_dispatch(tmp_path, is_observing):
+    from contextlib import nullcontext
+
+    from qqtools.plugins.qexp.runtime.responsibility import responsibility_root
+    from qqtools.plugins.qexp.runtime.responsibility_capture import WriterCaptureCheckpoint
+    from qqtools.plugins.qexp.runtime.responsibility_store import Ledger
+
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    task = submit(cfg, ["echo", "ok"])
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    target = runtime.project_paths(binding.project_id)["root"]
+    atomic_replace(
+        runtime.migration_path(binding.project_id), {"migration": {"legacy_runtime_root": str(cfg.runtime_root)}}
+    )
+    ledger = Ledger.open_or_create(responsibility_root(target))
+    checkpoint = WriterCaptureCheckpoint(ledger, target, legacy_source=cfg.runtime_root)
+    with checkpoint.observe():
+        pass
+    # This isolated fixture owns lifecycle; exercise both durable retention and
+    # overlap with the short observation lock without another migration actor.
+    with checkpoint.observe() if is_observing else nullcontext():
+        results = dispatch_machine_cycle(runtime, available_gpus=[0], executor=_RecordingExecutor())
+    assert results == [{"project_id": binding.project_id, "launched": [task.task_id], "status": "dispatched"}]
+    assert reserved_gpu_ids(runtime.root) == {0}
+
+
 def test_machine_dispatch_isolates_unreadable_roots_and_publishes_project_views(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1471,7 +1499,7 @@ def test_machine_control_authority_is_not_blocked_by_slow_project_maintenance(
         def close(self) -> None:
             pass
 
-        def __init__(self, cfg, *, reservation_runtime_root, work_limit=64) -> None:
+        def __init__(self, cfg, *, reservation_runtime_root, work_limit=64, recovery_owner=None) -> None:
             del reservation_runtime_root
             self.work_limit = work_limit
             self.cfg = cfg
@@ -1535,7 +1563,7 @@ def test_machine_control_authority_survives_reservation_snapshot_failure(
         def close(self) -> None:
             pass
 
-        def __init__(self, _cfg, *, reservation_runtime_root, work_limit=64) -> None:
+        def __init__(self, _cfg, *, reservation_runtime_root, work_limit=64, recovery_owner=None) -> None:
             del reservation_runtime_root
             self.work_limit = work_limit
 
@@ -1745,6 +1773,10 @@ def test_machine_dispatch_waits_for_current_generation_authority_recovery(tmp_pa
         assert any(item["status"] == "authority_recovering" for item in result)
         assert executor.launched == []
         assert not load_task(cfg, task.task_id).claim_control.get("active_claim")
+        plane._run_authority_cycle()
+        assert binding.project_id not in runtime.authority_ready_generations
+        reader = plane._supervisors[binding.project_id]._work._responsibilities
+        assert reader._done is not None and reader._done.wait(5)
         plane._run_authority_cycle()
         assert runtime.authority_ready_generations[binding.project_id] == binding.registration_generation
         dispatch_machine_cycle_locked(runtime, available_gpus=[0], executor=executor, supervise=False)

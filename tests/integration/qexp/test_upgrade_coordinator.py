@@ -527,3 +527,152 @@ def test_phase_result_cannot_exceed_the_declared_record_budget(tmp_path: Path) -
     status = coordinator.advance()
     assert status["state"] == "repair_required"
     assert "record budget" in status["blockers"][0]
+
+
+@pytest.mark.parametrize("damage", [None, "schema", "unknown_writer"])
+def test_released_manifest_before_ready_bootstrap_is_recognized_exactly(tmp_path, damage):
+    from qqtools.plugins.qexp.runtime.upgrade.production import UpgradeJournalMigration, _digest
+
+    cfg = _config(tmp_path)
+    schema_path = cfg.shared_root / "schema/version.json"
+    schema = read_json(schema_path)
+    released_schema = {
+        "schema": {key: value for key, value in schema["schema"].items() if key != "writer_capabilities"}
+    }
+    # Released bootstrap predates the observation capability added by current init.
+    released_schema["schema"]["required_capabilities"] = [
+        item for item in released_schema["schema"]["required_capabilities"] if item != "task-observation-v1"
+    ]
+    path = cfg.shared_root / "operations/upgrades/protocol-manifest.json"
+    manifest = read_json(path)
+    manifest["upgrade_protocol_manifest"]["schema_digest"] = _digest(released_schema)
+    atomic_replace(path, manifest)
+    if damage == "schema":
+        schema["schema"]["created_at"] = "changed-base-schema"
+    elif damage == "unknown_writer":
+        schema["schema"]["writer_capabilities"].append("unknown-writer")
+    atomic_replace(schema_path, schema)
+    assert UpgradeJournalMigration().is_applicable(cfg) is (damage is not None)
+    if damage is None:
+        status = UpgradeCoordinator(cfg).discover()
+        assert not status["pending"] and not status["migration_blocked"]
+        assert read_json(path) == manifest
+
+
+@pytest.mark.parametrize(
+    "obstruction",
+    [
+        None,
+        "pause",
+        "pause_intent",
+        "repair",
+        "in_flight",
+        "schema",
+        "other_error",
+        "other_phase",
+        "schema_busy",
+        "upgrade_busy",
+        "pause_during_proof",
+    ],
+)
+def test_released_false_positive_journal_reconciles_only_proven_terminal_state(tmp_path, monkeypatch, obstruction):
+    from qqtools.plugins.qexp.runtime.upgrade import production
+
+    cfg = _config(tmp_path)
+    schema_path = cfg.shared_root / "schema/version.json"
+    schema = read_json(schema_path)
+    original = {"schema": {key: value for key, value in schema["schema"].items() if key != "writer_capabilities"}}
+    manifest_path = cfg.shared_root / "operations/upgrades/protocol-manifest.json"
+    manifest = read_json(manifest_path)
+    # Keep this source fingerprint faithful to the actual released bootstrap.
+    original["schema"]["required_capabilities"] = [
+        item for item in original["schema"]["required_capabilities"] if item != "task-observation-v1"
+    ]
+    manifest["upgrade_protocol_manifest"]["schema_digest"] = production._digest(original)
+    atomic_replace(manifest_path, manifest)
+    coordinator = UpgradeCoordinator(cfg)
+    # Reproduce the released peer's exact false-positive audit failure before
+    # deploying the current terminal recognizer. No corrupt target data is repaired.
+    with monkeypatch.context() as released:
+        released.setattr(
+            production, "_terminal_schema_matches", lambda value, fingerprint: fingerprint == production._digest(value)
+        )
+        assert coordinator.discover()["state"] == "runnable"
+        assert coordinator.advance()["phase"] == "audit"
+        assert coordinator.advance()["state"] == "repair_required"
+    path = shared_paths(cfg.shared_root)["upgrade_journal"]
+    journal = read_json(path)
+    item = journal["upgrade"]["migrations"]["upgrade-journal-v1"]
+    assert item["error"] == "upgrade protocol manifest protocol is stale"
+    original_fence = item["fence_token"]
+    if obstruction == "pause":
+        journal["upgrade"]["pause"] = {"state": "requested", "reason": "operator inspection"}
+    elif obstruction == "pause_intent":
+        atomic_replace(shared_paths(cfg.shared_root)["upgrade_pause_intent"], {"pause_intent": {"state": "requested"}})
+    elif obstruction == "repair":
+        journal["upgrade"]["repair"] = {"state": "planned", "repair_id": "operator-repair"}
+    elif obstruction == "in_flight":
+        item["in_flight"] = True
+    elif obstruction == "schema":
+        schema["schema"]["created_at"] = "changed"
+        atomic_replace(schema_path, schema)
+    elif obstruction == "other_error":
+        item["error"] = "an unrelated failure"
+    elif obstruction == "other_phase":
+        item["phase"], item["phase_index"] = "activation", 2
+    atomic_replace(path, journal)
+    before = path.read_bytes()
+    assert coordinator.status()["pending"]
+    assert path.read_bytes() == before  # Inspection must never perform recovery.
+    if obstruction == "pause_during_proof":
+        predicate = production.UpgradeJournalMigration.can_reconcile_terminal_state
+
+        def request_pause(plugin, context):
+            result = predicate(plugin, context)
+            assert result
+            context.storage.atomic_replace(
+                shared_paths(cfg.shared_root)["upgrade_pause_intent"], {"pause_intent": {"state": "requested"}}
+            )
+            return result
+
+        monkeypatch.setattr(production.UpgradeJournalMigration, "can_reconcile_terminal_state", request_pause)
+    if obstruction in {"schema_busy", "upgrade_busy"}:
+        from qqtools.plugins.qexp.runtime.paths import lock_path
+
+        locked_path = (
+            lock_path(cfg.shared_root, "schema")
+            if obstruction == "schema_busy"
+            else cfg.shared_root / "locks/upgrade.lock"
+        )
+        with exclusive(locked_path):
+            status = UpgradeCoordinator(cfg).discover()
+    else:
+        status = UpgradeCoordinator(cfg).discover()
+    if obstruction is not None:
+        assert status["pending"]
+        assert path.read_bytes() == before
+        return
+    assert not status["pending"] and not status["migration_blocked"]
+    after = read_json(path)["upgrade"]["migrations"]["upgrade-journal-v1"]
+    assert after["state"] == "completed" and after["completed_at"]
+    assert after["fence_token"] > original_fence
+    assert after["error"] is None and after["next_retry_at"] is None
+    assert read_json(manifest_path) == manifest
+    assert read_json(schema_path) == schema
+    completed = path.read_bytes()
+    assert not UpgradeCoordinator(cfg).discover()["pending"]
+    assert path.read_bytes() == completed
+
+
+def test_terminal_invariant_alone_cannot_reconcile_an_unrelated_failure(tmp_path):
+    cfg = _config(tmp_path)
+    coordinator = UpgradeCoordinator(cfg, registry=MigrationRegistry([_OnlinePlugin()]))
+    coordinator.discover()
+    path = shared_paths(cfg.shared_root)["upgrade_journal"]
+    journal = read_json(path)
+    item = journal["upgrade"]["migrations"]["test-online"]
+    item.update(state="repair_required", phase="audit", error="upgrade protocol manifest protocol is stale")
+    atomic_replace(path, journal)
+    before = path.read_bytes()
+    assert coordinator.discover()["migration_blocked"]
+    assert path.read_bytes() == before

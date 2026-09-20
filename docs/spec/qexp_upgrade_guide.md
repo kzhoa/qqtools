@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-06
+updated_at: 2026-09-20
 archived_at:
 ---
 
@@ -62,6 +62,14 @@ by strict 1.3.16 readers during a rolling deployment. Audit and activation verif
 version, capability, source and target metadata protocol, and schema digest. A future migration
 that changes a shared reader or writer contract must supply durable participant eligibility and
 enforceable writer exclusion before activation; this metadata migration is not that proof.
+The terminal manifest's schema digest covers the base schema and excludes only
+the independently fenced `local-recovery-v1` required capability. Its
+[admission protocol](qexp_local_responsibility.md#shared-admission-fence) waits for
+the coordinator's existing work to complete before publishing that capability.
+Audit evidence and repair plans still fingerprint the complete schema record;
+changes after audit or repair planning remain invalid, including a capability
+change outside the admission protocol. Unknown capabilities and changes to other
+schema fields are not excluded from manifest drift detection.
 Migration implementations must use the supplied upgrade storage facade for callback-owned JSON I/O;
 it rejects reads and writes that exceed the declared slice byte budget before the operation proceeds.
 
@@ -70,9 +78,16 @@ to an online coordinator migration by this guide.
 
 ## Do not treat every qqtools upgrade as an agent restart
 
-`qexp agent restart` is sufficient only when the target release does not introduce a new qexp
-root protocol or capability. Do not mix agent/client versions against the same project root during
-a protocol activation.
+Use the target protocol's documented activation procedure. An unchanged root
+protocol can use an agent restart; a new capability requires either an explicit
+upgrade or a qualified rolling admission protocol. The `local-recovery-v1`
+admission protocol automatically waits for every participant's prepared
+registration after package installation and global-agent restart. Its released
+writer qualification covers 1.3.17 and 1.3.18. Admission fencing alone does not
+certify local writer capture or activate history-independent discovery.
+
+For the historical drained transitions below, stop mixed-version agents and
+clients before protocol activation.
 
 Release 1.3.15 introduces the paired schema-6 capabilities `cpu-lane-v1` and
 `task-dependencies-v1`. Existing schema-6 roots require the explicit `schema6` upgrade procedure
@@ -191,3 +206,21 @@ qqtools 1.3.15.
 | `ready_index=degraded` or `marker corrupt` | Stop normal clients, run `doctor verify`, then `doctor repair`; restart only after the index is active. |
 | Existing schema-6 root moving to 1.3.15 | Drain all participants and run `upgrade schema6 check/start/attest/resume`. |
 | Existing schema-5 root | Drain it and run `qexp migrate --to-schema 6` before the schema-6 capability upgrade. |
+
+## Task history pagination
+
+After upgrading the package and restarting each machine's global agent, registered
+projects automatically prepare their Task observation indexes. Existing projects
+first satisfy the canonical Group/recovery writer boundary; running training
+continues. There is no mandatory per-project activation command. New projects
+initialize their empty index during `qexp init`.
+
+Use `qexp task list --page-size 50 --format json` for indexed pages. Preserve
+`--phase` and `--group` when following `next_cursor`. `index_not_ready` means the
+background build has not completed; legacy Task listing remains available with
+its original scan cost. `index_unavailable` means the query projection cannot
+currently establish completeness. Inspect `qexp doctor verify --format json` and
+its `task_observation` status. Interrupted publication is recovered automatically;
+after correcting damaged source data, `qexp doctor repair` requests another build.
+Do not remove required capabilities or downgrade writers to bypass the gate.
+A rebuild invalidates old cursors; restart explicitly without `--cursor`.

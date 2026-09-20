@@ -51,6 +51,7 @@ def plane_factory(monkeypatch, tmp_path):
         ]
         runtime = SimpleNamespace(
             root=tmp_path / "machine",
+            instance_id="runtime-instance",
             registration_status=lambda binding: {"state": "eligible"},
             binding_write_eligible=lambda binding, **kwargs: True,
             reactivate_binding=lambda binding: True,
@@ -326,6 +327,7 @@ def test_failed_local_reconciliation_keeps_supervising_other_projects(plane_fact
 def test_unavailable_registry_is_unknown_not_an_empty_success(plane_factory, monkeypatch):
     case = plane_factory()
     case.plane._run_authority_cycle()
+    assert case.runtime.authority_ready_generations
     existing = dict(case.plane._supervisors)
 
     def unavailable():
@@ -337,6 +339,7 @@ def test_unavailable_registry_is_unknown_not_an_empty_success(plane_factory, mon
     assert sample["observation_status"] == "registry_unavailable"
     assert sample["project_count"] is None
     assert case.plane._supervisors == existing
+    assert not case.runtime.authority_ready_generations
 
 
 def test_reservation_release_still_wakes_dispatch(plane_factory, monkeypatch):
@@ -644,3 +647,31 @@ def test_cadence_policy_read_failure_preserves_existing_supervision(plane_factor
     monkeypatch.setattr(control_plane, "load_lease_policy", fail_policy)
     fixture.plane._run_authority_cycle()
     assert ("a", "tick") in fixture.calls
+
+
+def test_discovery_readiness_loss_revokes_admission(plane_factory):
+    case = plane_factory(("a",))
+    case.plane._run_authority_cycle()
+    assert case.runtime.authority_ready_generations == {"a": "generation-1"}
+    case.created[0].work_snapshot = {"startup_complete": False, "discovery_mode": "unavailable"}
+    case.plane._run_authority_cycle()
+    assert case.runtime.authority_ready_generations == {}
+    case.created[0].work_snapshot = {"startup_complete": True, "discovery_mode": "primary"}
+    case.plane._run_authority_cycle()
+    assert case.runtime.authority_ready_generations == {"a": "generation-1"}
+
+
+def test_capture_hint_avoids_disabled_inventory_but_does_not_grant_readiness(plane_factory, monkeypatch):
+    from qqtools.plugins.qexp.runtime.responsibility_completion import COMPLETION_FILE
+
+    case = plane_factory(("a",))
+    case.bindings[0].enabled = False
+    root = case.runtime.project_paths("a")["root"]
+    root.mkdir(parents=True)
+    (root / COMPLETION_FILE).write_text("qualification belongs to the real supervisor")
+    monkeypatch.setattr(case.plane, "_has_local_evidence", lambda *_args: pytest.fail("enumerated disabled inventory"))
+    supervisor_class = control_plane._AuthoritySupervisor
+    monkeypatch.setattr(supervisor_class, "work_snapshot", {"startup_complete": False})
+    case.plane._run_authority_cycle()
+    assert ("a", "tick") in case.calls
+    assert case.runtime.authority_ready_generations == {}

@@ -8,8 +8,15 @@ from typing import Any
 
 from ..config_types import RootConfig
 from ..layout import is_group_ready_members_root
-from ..lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
+from ..lifecycle import (
+    TerminalCommitResult,
+    TerminalTransition,
+    commit_terminal_transition_locked,
+    dispatch_task_lifecycle_hooks_noexcept,
+)
 from ..runtime.claims import archive_claim
+from ..runtime.group_discovery.changes import record_task_change
+from ..runtime.group_namespace import has_group_authority_cutover, is_group_authority_isolated, read_group
 from ..runtime.locks import group_writer_lock, task_lock
 from ..runtime.operation_store import (
     active_operation_path,
@@ -41,12 +48,20 @@ from ..runtime.records import (
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.submission import finalize_submission_group
 from ..runtime.tasks import load_task, save_task
+from .group_cancel import advance_indexed_cancel, initialize_cancel_discovery
 from .task import has_cleanup_operation, is_cleanup_blocked, retry
+from .worker_removal import (
+    WORKER_REMOVE_TYPE,
+    begin_worker_removal_locked,
+    can_bind_worker_removal,
+    reconcile_worker_removal,
+)
 
 
 def _finalize_pending_submission_before_group_mutation(cfg: RootConfig, name: str, path: Path) -> None:
     """Finalize a committed submission before taking the Group mutation lock."""
     with group_writer_lock(cfg, name):
+        path = group_path(cfg.shared_root, name)
         if not path.exists():
             return
         data = read_json(path)
@@ -78,6 +93,7 @@ def group_control(
     _finalize_pending_submission_before_group_mutation(cfg, name, path)
     post_commit_results = []
     with group_writer_lock(cfg, name):
+        path = group_path(cfg.shared_root, name)
         data = read_json(path)
         group = data["group"]
         pending = group.get("pending_submission_commit")
@@ -86,6 +102,7 @@ def group_control(
             if not operation_path.exists() or read_json(operation_path)["submission"].get("state") != "committed":
                 raise RuntimeError(f"Group {name!r} has pending submission commit {pending['operation_id']!r}.")
             raise RuntimeError(f"Group {name!r} received a concurrent submission commit; retry the mutation.")
+        indexed_cancel = False
         if action == "cancel":
             operation_id = new_id()
             high_watermark = group["next_membership_sequence"] - 1
@@ -128,6 +145,9 @@ def group_control(
                     "blocked_reason": None,
                 },
             }
+            indexed_cancel = is_group_authority_isolated(cfg.shared_root)
+            if indexed_cancel:
+                initialize_cancel_discovery(cfg, operation["group_control"])
             write_active_operation(cfg, "group_control", operation_id, operation)
             group["cancellation_barriers"].append(
                 {
@@ -144,81 +164,42 @@ def group_control(
             operation["group_control"]["state"] = "converging"
             operation["group_control"]["updated_at"] = utc_now()
             write_active_operation(cfg, "group_control", operation_id, operation)
-            for task_file in iter_json(shared_paths(cfg.shared_root)["tasks"]):
-                task = TaskRecord.from_dict(read_json(task_file))
-                if task.group_name != name or (task.group_membership_sequence or 0) > high_watermark:
-                    continue
-                operation["group_control"]["progress"]["target_tasks"] += 1
-                with task_lock(cfg.shared_root, task.task_id):
-                    try:
-                        task = load_task(cfg, task.task_id)
-                    except FileNotFoundError:
-                        operation["group_control"]["progress"]["already_terminal"] += 1
+            if not indexed_cancel:
+                for task_file in iter_json(shared_paths(cfg.shared_root)["tasks"]):
+                    task = TaskRecord.from_dict(read_json(task_file))
+                    if task.group_name != name or (task.group_membership_sequence or 0) > high_watermark:
                         continue
-                    has_saved_task = False
-                    if is_cleanup_blocked(task) or has_cleanup_operation(cfg, task.task_id):
-                        operation["group_control"]["progress"]["already_terminal"] += 1
-                        continue
-                    claim = task.claim_control.get("active_claim") or {}
-                    if task.state["projection"] == "queued" and not claim:
-                        task.state.update({"projection": "cancelled", "reason": "group_cancelled"})
-                        operation["group_control"]["progress"]["queued_cancelled"] += 1
-                    elif claim.get("launch_state") == "claimed":
-                        result = commit_terminal_transition_locked(
-                            cfg,
-                            task,
-                            TerminalTransition(
-                                task.task_id,
-                                claim["attempt_id"],
-                                task.attempt_control["current_attempt_number"],
-                                claim["fencing_token"],
-                                "cancelled",
-                                "group_cancelled_before_launch",
-                                None,
-                                frozenset({"running"}),
-                                frozenset({"claimed"}),
-                                "active",
-                                allow_missing_attempt=True,
-                            ),
-                        )
-                        post_commit_results.append(result)
-                        has_saved_task = result.outcome == "committed"
-                        progress_key = "prelaunch_cancelled" if result.outcome == "committed" else "blocked"
-                        operation["group_control"]["progress"][progress_key] += 1
-                    elif task.state["projection"] == "running":
-                        task.control.update(
-                            {
-                                "cancellation_requested_at": utc_now(),
-                                "cancellation_operation_id": operation_id,
-                                "terminate_running": terminate_running,
-                                "requested_by": cfg.machine_name,
-                            }
-                        )
-                        if terminate_running:
+                    operation["group_control"]["progress"]["target_tasks"] += 1
+                    with task_lock(cfg.shared_root, task.task_id):
+                        try:
+                            task = load_task(cfg, task.task_id)
+                        except FileNotFoundError:
+                            operation["group_control"]["progress"]["already_terminal"] += 1
+                            continue
+                        progress_key, terminal = _apply_group_cancel_locked(cfg, task, operation["group_control"])
+                        if terminal is not None:
+                            post_commit_results.append(terminal)
+                        if progress_key is not None:
+                            operation["group_control"]["progress"][progress_key] += 1
+                        if progress_key == "termination_pending":
+                            claim = task.claim_control.get("active_claim") or {}
                             machine = claim.get("machine_name") or task.placement_policy["home_machine"]
                             operation["group_control"]["pending_machine_acknowledgements"].setdefault(
                                 machine, []
                             ).append(task.task_id)
-                            operation["group_control"]["progress"]["termination_pending"] += 1
-                        else:
-                            operation["group_control"]["progress"]["running_allowed"] += 1
-                    elif task.state["projection"] in {"succeeded", "failed", "cancelled"}:
-                        operation["group_control"]["progress"]["already_terminal"] += 1
-                    if not has_saved_task:
-                        task.meta["revision"] += 1
-                        task.meta["updated_at"] = utc_now()
-                        save_task(cfg, task)
-                    if task.state["projection"] == "cancelled":
-                        retire_current_ready_generation(cfg, task)
-            progress = operation["group_control"]["progress"]
-            if not terminate_running or progress["termination_pending"] == 0:
-                operation["group_control"].update({"state": "completed", "completed_at": utc_now()})
-            else:
-                operation["group_control"]["state"] = "waiting_ack"
-            operation["group_control"]["updated_at"] = utc_now()
-            atomic_replace(operation_path, operation)
-            if operation["group_control"]["state"] == "completed":
-                operation_path = archive_operation(cfg, "group_control", operation_id, operation)
+                progress = operation["group_control"]["progress"]
+                if progress["blocked"]:
+                    operation["group_control"].update(
+                        {"state": "blocked", "blocked_reason": "task_cancellation_requires_resolution"}
+                    )
+                elif not terminate_running or progress["termination_pending"] == 0:
+                    operation["group_control"].update({"state": "completed", "completed_at": utc_now()})
+                else:
+                    operation["group_control"]["state"] = "waiting_ack"
+                operation["group_control"]["updated_at"] = utc_now()
+                atomic_replace(operation_path, operation)
+                if operation["group_control"]["state"] == "completed":
+                    operation_path = archive_operation(cfg, "group_control", operation_id, operation)
             data["cancellation_operation"] = operation["group_control"]
         elif action == "seal":
             group["admission_state"] = "sealed"
@@ -236,25 +217,127 @@ def group_control(
         data["meta"]["updated_at"] = utc_now()
         atomic_replace(path, data)
         result_data = data
-    for result in post_commit_results:
-        if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
-            from ..runtime.resources.reservations import release
-
-            release(reservation_runtime_root, result.reservation_id, "group_cancelled_before_launch")
-        if result.event:
-            dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
+    if indexed_cancel:
+        advance_indexed_cancel(cfg, operation_path, reservation_runtime_root=reservation_runtime_root)
+        result_data = read_group(cfg.shared_root, name)
+        normalize_group_record(result_data)
+    _dispatch_group_terminal_results(cfg, post_commit_results, reservation_runtime_root)
     return result_data
 
 
+def _apply_group_cancel_locked(
+    cfg: RootConfig, task: TaskRecord, control: dict[str, Any]
+) -> tuple[str | None, TerminalCommitResult | None]:
+    """Apply one cancellation effect under the existing Group and Task locks."""
+    if is_cleanup_blocked(task) or has_cleanup_operation(cfg, task.task_id):
+        return "already_terminal", None
+    claim = task.claim_control.get("active_claim") or {}
+    if task.state["projection"] == "queued" and not claim:
+        with record_task_change(
+            cfg,
+            task,
+            "task_cancel",
+            details={"operation_id": control["operation_id"], "expected_effect": "queued_cancelled"},
+        ):
+            _set_group_cancel_request(cfg, task, control)
+            task.state.update({"projection": "cancelled", "reason": "group_cancelled"})
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task)
+            retire_current_ready_generation(cfg, task)
+        return "queued_cancelled", None
+    if claim.get("launch_state") == "claimed":
+        _set_group_cancel_request(cfg, task, control)
+        result = commit_terminal_transition_locked(
+            cfg,
+            task,
+            TerminalTransition(
+                task.task_id,
+                claim["attempt_id"],
+                task.attempt_control["current_attempt_number"],
+                claim["fencing_token"],
+                "cancelled",
+                "group_cancelled_before_launch",
+                None,
+                frozenset({"running"}),
+                frozenset({"claimed"}),
+                "active",
+                allow_missing_attempt=True,
+            ),
+        )
+        return ("prelaunch_cancelled" if result.outcome == "committed" else "blocked"), result
+    if task.state["projection"] == "running":
+        # Replaying an older default cancel must not downgrade a later termination.
+        if not task.control.get("terminate_running") and (
+            control["terminate_running"] or not task.control.get("cancellation_requested_at")
+        ):
+            with record_task_change(
+                cfg,
+                task,
+                "task_cancel",
+                details={"operation_id": control["operation_id"], "expected_effect": None},
+            ):
+                _set_group_cancel_request(cfg, task, control)
+                task.meta["revision"] += 1
+                task.meta["updated_at"] = utc_now()
+                save_task(cfg, task)
+        return ("termination_pending" if control["terminate_running"] else "running_allowed"), None
+    if task.state["projection"] in {"succeeded", "failed", "cancelled"}:
+        if task.state["projection"] == "cancelled":
+            retire_current_ready_generation(cfg, task)
+        return "already_terminal", None
+    return None, None
+
+
+def _set_group_cancel_request(cfg: RootConfig, task: TaskRecord, control: dict[str, Any]) -> None:
+    task.control.update(
+        {
+            "cancellation_requested_at": utc_now(),
+            "cancellation_operation_id": control["operation_id"],
+            "terminate_running": control["terminate_running"],
+            "requested_by": cfg.machine_name,
+        }
+    )
+
+
+def _dispatch_group_terminal_results(
+    cfg: RootConfig, results: list[TerminalCommitResult], reservation_runtime_root: Path | None = None
+) -> None:
+    """Release local prelaunch occupancy and notify only after authority locks."""
+    for result in results:
+        if result.reservation_id and result.reservation_machine_name == cfg.machine_name:
+            from ..agent.context import resolve_execution_context
+            from ..runtime.resources.reservations import release
+
+            root = reservation_runtime_root or resolve_execution_context(cfg).reservation_root
+            release(root, result.reservation_id, "group_cancelled_before_launch")
+        if result.event:
+            dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
+
+
 def reconcile_group_cancel_operations(
-    cfg: RootConfig, group_name: str | None = None, *, include_legacy: bool = True
+    cfg: RootConfig,
+    group_name: str | None = None,
+    *,
+    include_legacy: bool = True,
+    reservation_runtime_root: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Rebuild durable Group control operation status from current Task truth."""
+    """Replay unfinished Group control effects and reconcile their status."""
     reconciled: list[dict[str, Any]] = []
     for operation_path in iter_active_operation_paths(cfg, "group_control", include_legacy=include_legacy):
         operation = read_json(operation_path)
         control = operation.get("group_control", {})
         operation_type = control.get("operation_type")
+        if operation_type == WORKER_REMOVE_TYPE:
+            result = reconcile_worker_removal(
+                cfg,
+                operation_path,
+                group_name,
+                reservation_runtime_root=reservation_runtime_root,
+            )
+            if result is not None:
+                reconciled.append(result)
+            continue
         if operation_type == "worker_remove":
             result = _reconcile_worker_remove_operation(cfg, operation_path, operation, group_name)
             if result is not None:
@@ -262,14 +345,33 @@ def reconcile_group_cancel_operations(
             continue
         if operation_type != "cancel":
             continue
-        if control.get("state") not in {"converging", "waiting_ack", "blocked"}:
+        if control.get("state") not in {"preparing", "converging", "waiting_ack", "blocked"}:
             continue
         name = control.get("group_name")
         if not name or (group_name is not None and name != group_name):
             continue
+        if is_group_authority_isolated(cfg.shared_root):
+            result = advance_indexed_cancel(cfg, operation_path, reservation_runtime_root=reservation_runtime_root)
+            if result is not None:
+                reconciled.append(result)
+            continue
+        post_commit_results = []
         with group_writer_lock(cfg, name):
+            # The creator or another reconciler may have completed while we waited.
+            if not operation_path.exists():
+                continue
+            operation = read_json(operation_path)
+            control = operation.get("group_control", {})
+            if control.get("state") not in {"preparing", "converging", "waiting_ack", "blocked"}:
+                continue
             group_file = group_path(cfg.shared_root, name)
             if not group_file.exists():
+                control.update({"state": "blocked", "completed_at": None, "blocked_reason": "group_missing"})
+                control["updated_at"] = utc_now()
+                operation["meta"]["revision"] += 1
+                operation["meta"]["updated_at"] = utc_now()
+                atomic_replace(operation_path, operation)
+                reconciled.append(control)
                 continue
             group_data = read_json(group_file)
             normalize_group_record(group_data)
@@ -308,7 +410,20 @@ def reconcile_group_cancel_operations(
                     continue
                 target_tasks += 1
                 with task_lock(cfg.shared_root, candidate.task_id):
-                    task = load_task(cfg, candidate.task_id)
+                    try:
+                        task = load_task(cfg, candidate.task_id)
+                    except FileNotFoundError:
+                        already_terminal += 1
+                        continue
+                    if task.group_name != name or (task.group_membership_sequence or 0) > high_watermark:
+                        target_tasks -= 1
+                        continue
+                    progress_key, terminal = _apply_group_cancel_locked(cfg, task, control)
+                    if terminal is not None:
+                        post_commit_results.append(terminal)
+                    if progress_key == "blocked":
+                        blocked += 1
+                        continue
                 if task.control.get("termination_acknowledged_at"):
                     acknowledged += 1
                     continue
@@ -332,7 +447,11 @@ def reconcile_group_cancel_operations(
                 }
             )
             control["pending_machine_acknowledgements"] = pending
-            if not control["terminate_running"]:
+            if blocked and not control["terminate_running"]:
+                control.update(
+                    {"state": "blocked", "completed_at": None, "blocked_reason": "orphaned_tasks_require_resolution"}
+                )
+            elif not control["terminate_running"]:
                 control.update(
                     {
                         "state": "completed",
@@ -361,6 +480,7 @@ def reconcile_group_cancel_operations(
                 group_data["meta"]["updated_at"] = utc_now()
                 atomic_replace(group_file, group_data)
             reconciled.append(control)
+        _dispatch_group_terminal_results(cfg, post_commit_results, reservation_runtime_root)
     return reconciled
 
 
@@ -368,13 +488,40 @@ def _reconcile_worker_remove_operation(
     cfg: RootConfig, operation_path: Path, operation: dict[str, Any], group_name: str | None
 ) -> dict[str, Any] | None:
     control = operation.get("group_control", {})
-    if control.get("state") not in {"converging", "waiting_ack"}:
+    if control.get("state") not in {"converging", "waiting_ack", "blocked"}:
         return None
     name = control.get("group_name")
     machine = control.get("machine_name")
     if not name or not machine or (group_name is not None and name != group_name):
         return None
     with group_writer_lock(cfg, name):
+        if not operation_path.exists():
+            return None
+        operation = read_json(operation_path)
+        control = operation.get("group_control", {})
+        if control.get("state") not in {"converging", "waiting_ack", "blocked"}:
+            return None
+        if control.get("group_name") != name or control.get("machine_name") != machine:
+            return None
+        if has_group_authority_cutover(cfg.shared_root):
+            control.update(
+                state="blocked",
+                blocked_reason="legacy_worker_incarnation_unknown",
+                completed_at=None,
+                updated_at=utc_now(),
+            )
+            operation["meta"]["revision"] += 1
+            operation["meta"]["updated_at"] = utc_now()
+            group_file = group_path(cfg.shared_root, name)
+            if group_file.exists():
+                data = read_json(group_file)
+                if (data.get("worker_control") or {}).get("operation_id") == control["operation_id"]:
+                    data["worker_control"] = control
+                    data["meta"]["revision"] += 1
+                    data["meta"]["updated_at"] = utc_now()
+                    atomic_replace(group_file, data)
+            archive_operation(cfg, "group_control", control["operation_id"], operation)
+            return control
         group_file = group_path(cfg.shared_root, name)
         if not group_file.exists():
             return None
@@ -455,6 +602,7 @@ def _reconcile_worker_remove_operation(
 def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -> dict[str, Any]:
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
     with group_writer_lock(cfg, name):
+        path = group_path(cfg.shared_root, name)
         if path.exists():
             return read_json(path)
         data = new_group(name, cfg.machine_name)
@@ -473,7 +621,7 @@ def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -
 def show_group(cfg: RootConfig, name: str) -> dict[str, Any]:
     name = validate_group_name(name) or name
     reconcile_group_cancel_operations(cfg, name)
-    result = read_json(group_path(cfg.shared_root, name))
+    result = read_group(cfg.shared_root, name)
     normalize_group_record(result)
     return result
 
@@ -492,6 +640,7 @@ def change_worker(
     path = group_path(cfg.shared_root, validate_group_name(group_name) or group_name)
     _finalize_pending_submission_before_group_mutation(cfg, group_name, path)
     with group_writer_lock(cfg, group_name):
+        path = group_path(cfg.shared_root, group_name)
         if is_group_ready_members_root(cfg):
             assert_group_ready_members_writable(cfg)
         data = read_json(path)
@@ -529,6 +678,7 @@ def change_worker(
                         "state": "active",
                     }
                 )
+                current.pop("removal_operation_id", None)
                 current["state_epoch"] += 1
         elif machine not in workers:
             raise ValueError(f"machine {machine!r} is not a Worker Set member.")
@@ -557,10 +707,16 @@ def change_worker(
             if changed:
                 worker["state_epoch"] += 1
         elif action == "drain":
+            if workers[machine]["state"] == "removing":
+                workers[machine].pop("removal_operation_id", None)
             workers[machine]["state"] = "draining"
             workers[machine]["state_epoch"] += 1
             workers[machine]["drain_requested_at"] = utc_now()
         elif action == "remove":
+            if can_bind_worker_removal(cfg):
+                return begin_worker_removal_locked(cfg, data, machine, terminate_running=terminate_running)
+            if has_group_authority_cutover(cfg.shared_root):
+                raise RuntimeError("Group authority migration is incomplete; retry after automatic recovery")
             operation_id = new_id()
             workers[machine]["state"] = "draining"
             workers[machine]["state_epoch"] += 1

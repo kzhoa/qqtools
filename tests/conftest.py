@@ -272,12 +272,17 @@ def qexp_healthy_clock(monkeypatch):
         0.0,
     )
     capability = ClockCapability("healthy", "healthy", observation, ("chrony",))
-    monkeypatch.setattr("qqtools.plugins.qexp.lease.clock_capability", lambda *_args: capability)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler.clock_capability", lambda *_args: capability)
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.runtime.attempt_recovery.clock_capability",
-        lambda *_args: capability,
-    )
+    # Patch each imported binding: collection order must not select the host clock.
+    for module in (
+        "lease",
+        "scheduler",
+        "runtime.attempt_recovery",
+        "runtime.submission",
+        "runtime.availability.transitions",
+        "legacy_agent",
+        "doctor",
+    ):
+        monkeypatch.setattr(f"qqtools.plugins.qexp.{module}.clock_capability", lambda *_args: capability)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.scheduler.reclaim_allowed_at",
         lambda *_args: datetime.now(timezone.utc) - timedelta(seconds=1),

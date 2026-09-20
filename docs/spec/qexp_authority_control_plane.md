@@ -84,16 +84,18 @@ Selection rotates across:
 4. termination replay;
 5. terminal-evidence cleanup.
 
-The implementation uses seven lanes. Each twelve-step round alternates six active
+The implementation uses eight lanes. Each fourteen-step round alternates seven active
 turns with one turn each for registration, process, observation, intent,
-termination, and cleanup work. Thus a 64-step slice provides 32 active service
-opportunities and at least five opportunities for every other lane. A pending
+termination, cleanup, and local responsibility discovery. Thus a 64-step slice provides 32 active service
+opportunities and at least four opportunities for every other lane. A pending
 locked inventory consumes one step first, leaving at least 31 active opportunities. An error consumes
 its turn and advances discovery. If the active cache is empty, its turn is lent
 to an unfinished startup lane in rotating order, or to the following
 discovery/cleanup lane once startup completes. The total step limit is unchanged.
-A startup lane can receive up to 38 turns in a 64-step slice (150 in a 256-step
-slice); after startup, loans permit up to twelve turns per ordinary slice.
+A startup lane can receive up to 37 turns in a 64-step slice (147 in a 256-step
+slice); after startup, loans permit up to ten turns per ordinary slice. Advisory
+membership processing is capped at one candidate every four ticks and may replay
+one additional evidence record, without borrowing an active turn.
 Cached Attempts always retain their active share. `idle_steps_reassigned` counts these loans. Repeated failing
 records cannot prevent other
 lanes from receiving service. Registration replay must succeed before that

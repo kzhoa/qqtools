@@ -11,10 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from ..group_namespace import read_group
 from ..locks import exclusive, schema_lock, schema_writer_lock
-from ..paths import group_path, ready_state_path, shared_paths, submission_path, task_path
+from ..paths import group_path, ready_state_path, shared_paths, task_path
 from ..records import TaskRecord, normalize_group_record, utc_now, validate_identifier
 from ..store import atomic_replace, iter_json, read_json
+from ..submission_control import SubmissionControlUnavailable, read_submission_state
 from ..work_budget import SliceBudget
 from . import primary_candidates, routes, state
 from .diagnostics import ReadyDiagnostic, classification_diagnostic, diagnostic, exception_fields, safe_identifier
@@ -103,7 +105,7 @@ def _has_primary_ready_demand(cfg: object, task: TaskRecord) -> bool:
     """Return whether a marker can represent primary demand on this project."""
     if not task.group_name:
         return True
-    group = read_json(group_path(cfg.shared_root, task.group_name))
+    group = read_group(cfg.shared_root, task.group_name)
     normalize_group_record(group)
     workers = group["group"]["worker_set"]
     if task.placement_runtime["queue_scope"] == "home":
@@ -266,7 +268,7 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
         lane = marker.get("lane", "gpu")
         group_name = marker.get("group_name")
         if group_name:
-            group = read_json(group_path(cfg.shared_root, group_name))
+            group = read_group(cfg.shared_root, group_name)
             normalize_group_record(group)
             workers = group["group"]["worker_set"]
             if reference.queue_scope == "home":
@@ -699,11 +701,19 @@ def classify_ready_marker(
     operation_id = task.submission_operation_id
     if not operation_id:
         return _classification_result(cfg, reference, "corrupt", "submission_identity_missing", task)
-    operation_file = submission_path(cfg.shared_root, operation_id)
-    if not operation_file.exists():
-        return _classification_result(cfg, reference, "corrupt", "submission_missing", task)
     try:
-        submission_state = read_json(operation_file)["submission"]["state"]
+        submission_state = read_submission_state(cfg, operation_id)
+    except FileNotFoundError:
+        return _classification_result(cfg, reference, "corrupt", "submission_missing", task)
+    except SubmissionControlUnavailable as exc:
+        return _classification_result(
+            cfg,
+            reference,
+            "temporarily_unavailable",
+            "submission_control_unavailable",
+            task,
+            exception=exc,
+        )
     except (KeyError, OSError, TypeError, ValueError) as exc:
         return _classification_result(cfg, reference, "corrupt", "submission_invalid", task, exception=exc)
     if submission_state in {"preparing", "committing", "blocked"}:
@@ -713,11 +723,10 @@ def classify_ready_marker(
     if submission_state != "committed":
         return _classification_result(cfg, reference, "corrupt", "submission_state_invalid", task)
     if task.group_name:
-        path = group_path(cfg.shared_root, task.group_name)
-        if not path.exists():
-            return _classification_result(cfg, reference, "corrupt", "group_missing", task)
         try:
-            group = read_json(path)["group"]
+            group = read_group(cfg.shared_root, task.group_name)["group"]
+        except FileNotFoundError:
+            return _classification_result(cfg, reference, "corrupt", "group_missing", task)
         except (KeyError, OSError, TypeError, ValueError) as exc:
             return _classification_result(cfg, reference, "corrupt", "group_invalid", task, exception=exc)
         if group.get("dispatch_state") != "active":
