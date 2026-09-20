@@ -65,6 +65,34 @@ def test_only_due_guard_publishes_and_restart_uses_durable_deadline(registration
     assert len(publications) == 2
 
 
+def test_expired_idle_registration_reactivates_after_agent_restart(registration):
+    from qqtools.plugins.qexp.agent.control_plane import _MachineControlPlane
+
+    _, runtime, binding, path, now, _publications = registration
+    value = read_json(path)
+    value["registration"]["eligibility_expires_at"] = (now[0] - timedelta(seconds=1)).isoformat()
+    atomic_replace(path, value)
+
+    restarted = MachineRuntime(runtime.root)
+    restarted_binding = restarted.load_registry()[1][0]
+    plane = _MachineControlPlane(
+        restarted,
+        instance_id="test",
+        loop_interval=5,
+        started_at=now[0].isoformat(),
+        available_gpus=[],
+    )
+    try:
+        assert restarted.registration_status(restarted_binding)["state"] == "expired"
+        plane._run_authority_cycle()
+        status = restarted.registration_status(restarted_binding)
+        assert status["state"] == "eligible"
+        assert status["generation"] == binding.registration_generation
+        assert plane._authority_snapshot["projects"][0]["observation_status"] == "tick_returned"
+    finally:
+        plane.stop()
+
+
 @pytest.mark.parametrize("mutation", ["generation", "runtime_instance_id", "runtime_root", "expired", "malformed"])
 def test_fresh_guard_rejects_changed_authority_without_publication(registration, mutation):
     _, runtime, binding, path, now, publications = registration

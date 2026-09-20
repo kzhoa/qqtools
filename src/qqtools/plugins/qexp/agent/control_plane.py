@@ -135,6 +135,13 @@ class _MachineControlPlane:
     def _has_local_process(self, binding: ProjectBinding, cfg: RootConfig) -> bool:
         return self._has_local_evidence(binding, cfg, ("processes",))
 
+    def _has_local_convergence_evidence(self, binding: ProjectBinding, cfg: RootConfig) -> bool:
+        return self._has_local_evidence(
+            binding,
+            cfg,
+            ("registrations", "observations", "launch_intents", "termination_decisions"),
+        )
+
     def _ordered_authority_bindings(self, bindings: list[ProjectBinding]) -> list[ProjectBinding]:
         """Rotate the leading project without treating order as write eligibility.
 
@@ -241,11 +248,8 @@ class _MachineControlPlane:
                 if (
                     not binding.enabled
                     and not has_capture
-                    and not self._has_local_evidence(
-                        binding,
-                        cfg,
-                        ("processes", "registrations", "observations", "launch_intents", "termination_decisions"),
-                    )
+                    and not self._has_local_process(binding, cfg)
+                    and not self._has_local_convergence_evidence(binding, cfg)
                 ):
                     project_sample["observation_status"] = "disabled_no_local_process"
                     continue
@@ -260,7 +264,10 @@ class _MachineControlPlane:
                     with _measure_authority_phase(project_sample, "eligibility_inventory"):
                         project_sample["eligibility_inventory_checks"] = 1
                         has_local_process = has_capture or self._has_local_process(binding, cfg)
-                    if not has_local_process:
+                        can_reactivate_idle = False
+                        if not has_local_process and registration_status["state"] == "expired":
+                            can_reactivate_idle = not self._has_local_convergence_evidence(binding, cfg)
+                    if not has_local_process and not can_reactivate_idle:
                         project_sample["observation_status"] = "ineligible_no_local_process"
                         self._reconcile_local_exits(binding, project_sample)
                         continue
