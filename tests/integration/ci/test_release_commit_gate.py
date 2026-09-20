@@ -177,6 +177,58 @@ def test_metadata_correction_keeps_release_profile(monkeypatch, tmp_path):
     assert _git(root, "rev-parse", f"{release}^") == original
 
 
+def test_metadata_correction_can_follow_feature_fix(monkeypatch, tmp_path):
+    root, base = _release_repo(tmp_path)
+    _write_release_files(root, "1.3.19", "new fixes")
+    _git(root, "add", "CHANGELOG.md", "src/qqtools/version.py")
+    _git(root, "commit", "-m", "release: prepare v1.3.19")
+    extra = root / "src/qqtools/fix.py"
+    extra.write_text("fixed = True\n", encoding="utf-8")
+    _git(root, "add", str(extra.relative_to(root)))
+    _git(root, "commit", "-m", "fix release gate failure")
+    feature = _git(root, "rev-parse", "HEAD")
+    changelog = root / "CHANGELOG.md"
+    changelog.write_text(
+        changelog.read_text(encoding="utf-8").replace("new fixes", "new and corrected fixes"),
+        encoding="utf-8",
+    )
+    _git(root, "add", "CHANGELOG.md")
+    _git(root, "commit", "-m", "release: correct v1.3.19 notes")
+    correction = _git(root, "rev-parse", "HEAD")
+    monkeypatch.setattr(check_release_commit, "REPO_ROOT", root)
+
+    assert _classify(monkeypatch, root, feature, correction)["profile"] == "release"
+    assert (
+        check_release_commit.main(["validate", "--base-ref", feature, "--head-ref", correction, "--actor", "kzhoa"])
+        == 0
+    )
+    assert _git(root, "rev-parse", f"{feature}^^") == base
+
+
+def test_metadata_correction_rejects_historical_mixed_metadata_commit(monkeypatch, tmp_path):
+    root, _base = _release_repo(tmp_path)
+    _write_release_files(root, "1.3.19", "new fixes")
+    _git(root, "add", "CHANGELOG.md", "src/qqtools/version.py")
+    _git(root, "commit", "-m", "release: prepare v1.3.19")
+    changelog = root / "CHANGELOG.md"
+    changelog.write_text(changelog.read_text(encoding="utf-8") + "\nintermediate note\n", encoding="utf-8")
+    extra = root / "src/qqtools/fix.py"
+    extra.write_text("fixed = True\n", encoding="utf-8")
+    _git(root, "add", "CHANGELOG.md", str(extra.relative_to(root)))
+    _git(root, "commit", "-m", "mix release metadata and code")
+    mixed = _git(root, "rev-parse", "HEAD")
+    changelog.write_text(
+        changelog.read_text(encoding="utf-8").replace("new fixes", "corrected fixes"), encoding="utf-8"
+    )
+    _git(root, "add", "CHANGELOG.md")
+    _git(root, "commit", "-m", "release: correct v1.3.19 notes")
+    correction = _git(root, "rev-parse", "HEAD")
+    monkeypatch.setattr(check_release_commit, "REPO_ROOT", root)
+
+    with pytest.raises(check_release_commit.ReleaseCommitError, match="mixed metadata commit"):
+        check_release_commit.main(["validate", "--base-ref", mixed, "--head-ref", correction, "--actor", "kzhoa"])
+
+
 def test_release_validation_requires_owner(monkeypatch, tmp_path):
     root, base = _release_repo(tmp_path)
     _write_release_files(root, "1.3.19", "new fixes")

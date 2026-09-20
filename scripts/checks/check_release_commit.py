@@ -250,10 +250,6 @@ def _validate_release_series(base: str, head: str, target: Version) -> None:
         if parent is None:
             raise ReleaseCommitError(f"release series for {target} has no initial parent bump.")
         paths = _commit_paths(commit)
-        if not paths or not set(paths).issubset(RELEASE_PATHS):
-            raise ReleaseCommitError(
-                f"release series contains non-metadata commit {commit}; changed paths: {sorted(paths)}"
-            )
         commit_version = _version_at(commit)
         parent_version = _version_at(parent)
         if commit_version == target and commit_version > parent_version:
@@ -263,6 +259,11 @@ def _validate_release_series(base: str, head: str, target: Version) -> None:
             raise ReleaseCommitError(
                 f"release series commit {commit} has version {commit_version}; expected a correction for {target} "
                 "or an initial version bump."
+            )
+        changed = set(paths)
+        if changed.intersection(RELEASE_PATHS) and not changed.issubset(RELEASE_PATHS):
+            raise ReleaseCommitError(
+                f"release series contains a mixed metadata commit {commit}; changed paths: {sorted(paths)}"
             )
     raise ReleaseCommitError(f"release series does not reach an initial bump for {target}.")
 
