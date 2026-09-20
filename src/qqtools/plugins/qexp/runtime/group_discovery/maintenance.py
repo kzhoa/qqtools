@@ -25,8 +25,8 @@ from ..paths import shared_paths, submission_path
 from ..records import validate_group_name, validate_identifier
 from ..store import atomic_replace, read_json, read_json_limited, require_json_size
 from .coverage import GroupCoverage
+from .receipt import decode_receipt
 from .rechecks import GroupRechecks, RecheckPosition
-from .recovery import _decode_receipt
 from .source_revision import SourceRevision
 
 _MAX_RECORD_BYTES = 64 * 1024
@@ -732,7 +732,7 @@ class GroupMaintenance:
                 revision = _revision_from_value(raw.get("source_revision"))
                 if scratch != self._coverage.source_scratch(operation_id, revision=revision):
                     raise ValueError("source capture receipt does not match its scratch path")
-                receipt = _decode_receipt(
+                receipt = decode_receipt(
                     payload, submission_path(self._root, operation_id), operation_id, self._group, scratch
                 )
                 if receipt["status"] not in {"qualified", "irrelevant"}:
@@ -795,7 +795,7 @@ class GroupMaintenance:
     def _read_source_receipt(self, job: _SourceJob) -> dict[str, object]:
         path = job.scratch / "receipt.json"
         data = _read_bounded_file(path, _MAX_RECEIPT_BYTES)
-        receipt = _decode_receipt(
+        receipt = decode_receipt(
             data,
             submission_path(self._root, job.operation_id),
             job.operation_id,
