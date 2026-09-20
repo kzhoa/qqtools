@@ -161,6 +161,39 @@ class AuthoritySupervisor:
                 self._mark_shared_unavailable(process)
                 self._release_finished_local_capacity(process)
 
+    def service_process(self, process: dict[str, object]) -> None:
+        """Replay matching local registration evidence before supervising a process."""
+        attempt_id = process["attempt_id"]
+        registration = local_paths(self.cfg.runtime_root)["registrations"] / f"{attempt_id}.json"
+        try:
+            if registration.exists():
+                self._materialize_registrations(registration_paths=(registration,), should_materialize_intents=False)
+            self._supervise(process)
+        except OSError as exc:
+            self._record_diagnostic(process, "shared_storage_unavailable", exc)
+            self._mark_shared_unavailable(process)
+            self._release_finished_local_capacity(process)
+            raise
+
+    def prepare_observed_exit(self, observation_path: Path) -> Path | None:
+        """Prepare one observed exit candidate for bounded process service."""
+        paths = local_paths(self.cfg.runtime_root)
+        manifest = paths["processes"] / observation_path.name
+        if not manifest.exists():
+            registration = paths["registrations"] / observation_path.name
+            if registration.exists():
+                try:
+                    self._materialize_registrations(
+                        registration_paths=(registration,), should_materialize_intents=False
+                    )
+                except OSError:
+                    self._reconcile_local_exit_observation(observation_path)
+                    raise
+        if manifest.exists():
+            return manifest
+        self._reconcile_local_exit_observation(observation_path)
+        return None
+
     def reconcile_local_exit_evidence(self, *, limit: int | None = None) -> None:
         """Release verified finished local occupancy without reading shared Task truth."""
         paths = local_paths(self.cfg.runtime_root)
@@ -373,12 +406,13 @@ class AuthoritySupervisor:
         policy = self._policy
         expires = self._lease_expiries.get(attempt_id) or process.get("lease_expires_at")
         holder_bound = process.get("clock_error_bound_seconds")
-        if (
-            policy
-            and isinstance(expires, str)
-            and isinstance(holder_bound, (int, float))
-            and datetime.now(timezone.utc) >= holder_safe_deadline(expires, holder_bound)
-        ):
+        is_past_safe_deadline = False
+        if policy and isinstance(expires, str) and isinstance(holder_bound, (int, float)):
+            try:
+                is_past_safe_deadline = datetime.now(timezone.utc) >= holder_safe_deadline(expires, holder_bound)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        if is_past_safe_deadline:
             self._set_authority_state(process, "isolated")
         else:
             self._set_authority_state(process, "suspect")

@@ -169,6 +169,139 @@ def test_failed_registration_replay_retains_exit_evidence_and_releases_local_cap
         supervisor.close()
 
 
+@pytest.mark.parametrize("failure", [None, "registration", "supervision"])
+def test_process_service_owns_registration_replay_and_outage_follow_through(tmp_path, monkeypatch, failure):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    supervisor = AuthoritySupervisor(cfg, work_limit=64)
+    process = {"attempt_id": "service-attempt"}
+    registration = local_paths(cfg.runtime_root)["registrations"] / "service-attempt.json"
+    atomic_replace(registration, {"process_registration": {}})
+    error = OSError(f"{failure} unavailable")
+    calls = []
+
+    def materialize(**kwargs):
+        calls.append(("registration", kwargs))
+        if failure == "registration":
+            raise error
+
+    def supervise(value):
+        calls.append(("supervision", value))
+        if failure == "supervision":
+            raise error
+
+    monkeypatch.setattr(supervisor, "_materialize_registrations", materialize)
+    monkeypatch.setattr(supervisor, "_supervise", supervise)
+    monkeypatch.setattr(supervisor, "_record_diagnostic", lambda *args: calls.append(("diagnostic", args)))
+    monkeypatch.setattr(supervisor, "_mark_shared_unavailable", lambda value: calls.append(("unavailable", value)))
+    monkeypatch.setattr(supervisor, "_release_finished_local_capacity", lambda value: calls.append(("release", value)))
+    try:
+        if failure is None:
+            supervisor.service_process(process)
+        else:
+            with pytest.raises(OSError) as raised:
+                supervisor.service_process(process)
+            assert raised.value is error
+        assert calls[0] == (
+            "registration",
+            {"registration_paths": (registration,), "should_materialize_intents": False},
+        )
+        if failure == "registration":
+            assert [name for name, _value in calls] == ["registration", "diagnostic", "unavailable", "release"]
+        elif failure == "supervision":
+            assert [name for name, _value in calls] == [
+                "registration",
+                "supervision",
+                "diagnostic",
+                "unavailable",
+                "release",
+            ]
+        else:
+            assert calls == [
+                (
+                    "registration",
+                    {"registration_paths": (registration,), "should_materialize_intents": False},
+                ),
+                ("supervision", process),
+            ]
+    finally:
+        supervisor.close()
+
+
+def test_process_service_preserves_outage_failure_with_malformed_lease_evidence(tmp_path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    supervisor = AuthoritySupervisor(cfg, work_limit=64)
+    process = {
+        "attempt_id": "damaged-lease-attempt",
+        "lease_expires_at": "not-a-timestamp",
+        "clock_error_bound_seconds": 1.0,
+    }
+    error = OSError("shared publication unavailable")
+    released = []
+
+    def unavailable(_process):
+        raise error
+
+    monkeypatch.setattr(supervisor, "_supervise", unavailable)
+    monkeypatch.setattr(supervisor, "_release_finished_local_capacity", released.append)
+    try:
+        with pytest.raises(OSError) as raised:
+            supervisor.service_process(process)
+        assert raised.value is error
+        assert supervisor._states[process["attempt_id"]] == "suspect"
+        assert released == [process]
+    finally:
+        supervisor.close()
+
+
+def test_observed_exit_preparation_materializes_one_matching_registration(tmp_path):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    task, attempt = _registration(cfg)
+    observation, _evidence = _finish(cfg, attempt)
+    paths = local_paths(cfg.runtime_root)
+    manifest = paths["processes"] / observation.name
+    supervisor = AuthoritySupervisor(cfg, work_limit=64)
+    try:
+        assert not manifest.exists()
+        assert supervisor.prepare_observed_exit(observation) == manifest
+        assert manifest.exists()
+        assert load_task(cfg, task.task_id).state["projection"] == "running"
+    finally:
+        supervisor.close()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_observed_exit_preparation_reconciles_missing_manifest(tmp_path, monkeypatch, failure):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    paths = local_paths(cfg.runtime_root)
+    observation = paths["observations"] / "missing-manifest.json"
+    atomic_replace(observation, {"exit_observation": {"attempt_id": observation.stem}})
+    error = OSError("registration replay unavailable")
+    calls = []
+    if failure:
+        atomic_replace(paths["registrations"] / observation.name, {"process_registration": {}})
+
+        def unavailable(**_kwargs):
+            calls.append("registration")
+            raise error
+
+        monkeypatch.setattr(
+            AuthoritySupervisor, "_materialize_registrations", lambda self, **kwargs: unavailable(**kwargs)
+        )
+    supervisor = AuthoritySupervisor(cfg, work_limit=64)
+    monkeypatch.setattr(supervisor, "_reconcile_local_exit_observation", lambda path: calls.append(("reconcile", path)))
+    try:
+        if failure:
+            with pytest.raises(OSError) as raised:
+                supervisor.prepare_observed_exit(observation)
+            assert raised.value is error
+            assert calls == ["registration", ("reconcile", observation)]
+        else:
+            assert supervisor.prepare_observed_exit(observation) is None
+            assert calls == [("reconcile", observation)]
+    finally:
+        supervisor.close()
+
+
 def test_malformed_registration_does_not_starve_healthy_terminal_work(tmp_path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     task, attempt = _registration(cfg)
@@ -304,7 +437,7 @@ def test_active_service_remains_fair_during_arrivals_and_failed_cleanup(tmp_path
         renewal_interval_seconds=1.0,
         _materialize_unverified_intent=lambda _path: None,
         _materialize_registrations=lambda **_kwargs: None,
-        _supervise=supervise,
+        service_process=supervise,
         _remove_terminal_attempt_evidence=failed_cleanup,
         _cleanup_request_for_membership=lambda _entry: None,
         _record_diagnostic=lambda *_args: None,
@@ -393,7 +526,7 @@ def test_valid_arrivals_do_not_evict_due_cached_attempts(tmp_path, monkeypatch):
         renewal_interval_seconds=1.0,
         _materialize_unverified_intent=lambda _path: None,
         _materialize_registrations=lambda **_kwargs: None,
-        _supervise=lambda process: service_turns[process["attempt_id"]].append(int(now[0])),
+        service_process=lambda process: service_turns[process["attempt_id"]].append(int(now[0])),
         _remove_terminal_attempt_evidence=lambda _attempt_id: None,
         _cleanup_request_for_membership=lambda _entry: None,
         _record_diagnostic=lambda *_args: None,

@@ -249,20 +249,9 @@ class AuthorityWork:
         self._remember(attempt_id)
         if previous is not None:
             self._maximum_service_gap = max(self._maximum_service_gap, now - previous)
-        # Registration replay must succeed before shared finalization. In particular,
-        # publication outages retain evidence even when local capacity can be released.
-        try:
-            registration = self.paths["registrations"] / path.name
-            if registration.exists():
-                self._registration(registration)
-            self.supervisor._supervise(process)
-            if attempt_id in self._active:
-                self._last_served[attempt_id] = now
-        except OSError as exc:
-            self.supervisor._record_diagnostic(process, "shared_storage_unavailable", exc)
-            self.supervisor._mark_shared_unavailable(process)
-            self.supervisor._release_finished_local_capacity(process)
-            raise
+        self.supervisor.service_process(process)
+        if attempt_id in self._active:
+            self._last_served[attempt_id] = now
 
     def _observation(self, path: Path) -> None:
         if self._responsibilities.is_cleanup_pending(path.stem):
@@ -271,20 +260,10 @@ class AuthorityWork:
             if self._pending_kind != "recovery":
                 return
             self.cancel_pending_control()
-        manifest = self.paths["processes"] / path.name
-        if not manifest.exists():
-            registration = self.paths["registrations"] / path.name
-            if registration.exists():
-                try:
-                    self._registration(registration)
-                except OSError:
-                    self.supervisor._reconcile_local_exit_observation(path)
-                    raise
-        if manifest.exists():
+        manifest = self.supervisor.prepare_observed_exit(path)
+        if manifest is not None:
             self._last_served.pop(path.stem, None)
             self._process(manifest)
-        else:
-            self.supervisor._reconcile_local_exit_observation(path)
 
     def _termination(self, path: Path) -> None:
         # The outer lane hands off just one directory. Its nested records are
