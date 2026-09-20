@@ -474,6 +474,27 @@ def _has_local_launch_evidence(cfg: RootConfig, attempt_id: str) -> bool:
     )
 
 
+def _persist_starting_pair_locked(
+    cfg: RootConfig,
+    task: TaskRecord,
+    attempt: AttemptRecord,
+    *,
+    launch_id: str,
+    authorized_at: str,
+) -> None:
+    claim = task.claim_control["active_claim"]
+    claim["launch_state"] = "starting"
+    claim["launch_id"] = launch_id
+    claim["launch_authorized_at"] = authorized_at
+    task.meta["revision"] += 1
+    task.meta["updated_at"] = authorized_at
+    save_task(cfg, task)
+    attempt.phase = "starting"
+    attempt.authorization["launch_id"] = launch_id
+    attempt.timestamps["launch_authorized_at"] = authorized_at
+    atomic_replace(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number), attempt.to_dict())
+
+
 def resume_starting_attempt(
     cfg: RootConfig,
     task_id: str,
@@ -483,9 +504,13 @@ def resume_starting_attempt(
 ) -> AttemptRecord | None:
     reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
+    if task.task_id != task_id:
+        return None
     cancel_result = None
     with authority_locks(cfg, task):
         task = load_task(cfg, task_id)
+        if task.task_id != task_id:
+            return None
         claim = task.claim_control.get("active_claim") or {}
         attempt_id = claim.get("attempt_id")
         attempt_number = task.attempt_control.get("current_attempt_number")
@@ -495,7 +520,7 @@ def resume_starting_attempt(
             or claim.get("machine_name") != cfg.machine_name
             or claim.get("launch_state") not in {"claimed", "starting"}
             or not isinstance(attempt_id, str)
-            or not isinstance(attempt_number, int)
+            or type(attempt_number) is not int
             or not isinstance(fencing_token, int)
             or _has_local_launch_evidence(cfg, attempt_id)
         ):
@@ -512,7 +537,10 @@ def resume_starting_attempt(
         except (FileNotFoundError, KeyError, ValueError):
             return None
         if (
-            attempt.attempt_id != attempt_id
+            attempt.task_id != task_id
+            or type(attempt.attempt_number) is not int
+            or attempt.attempt_number != attempt_number
+            or attempt.attempt_id != attempt_id
             or attempt.current_fencing_token != fencing_token
             or attempt.machine_name != cfg.machine_name
             or attempt.phase not in {"claimed", "starting"}
@@ -569,16 +597,13 @@ def resume_starting_attempt(
                     )
                 )
                 with change_context:
-                    claim["launch_state"] = "starting"
-                    claim["launch_id"] = launch_id
-                    claim["launch_authorized_at"] = authorized_at
-                    task.meta["revision"] += 1
-                    task.meta["updated_at"] = authorized_at
-                    save_task(cfg, task)
-                    attempt.phase = "starting"
-                    attempt.authorization["launch_id"] = launch_id
-                    attempt.timestamps["launch_authorized_at"] = authorized_at
-                    atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
+                    _persist_starting_pair_locked(
+                        cfg,
+                        task,
+                        attempt,
+                        launch_id=launch_id,
+                        authorized_at=authorized_at,
+                    )
                 return attempt
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
@@ -604,6 +629,8 @@ def authorize_launch(
 ) -> bool:
     reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
     task = load_task(cfg, task_id)
+    if task.task_id != task_id:
+        return False
     cancel_result = None
 
     @contextmanager
@@ -619,6 +646,8 @@ def authorize_launch(
             return False
         with authority_locks(cfg, task):
             task = load_task(cfg, task_id)
+            if task.task_id != task_id:
+                return False
             claim = task.claim_control.get("active_claim") or {}
             if claim.get("machine_name") != cfg.machine_name:
                 return False
@@ -633,14 +662,17 @@ def authorize_launch(
             if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
                 return False
             attempt_number = task.attempt_control.get("current_attempt_number")
-            if not isinstance(attempt_number, int):
+            if type(attempt_number) is not int:
                 return False
             try:
                 attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task_id, attempt_number)))
             except (FileNotFoundError, KeyError, ValueError):
                 return False
             if (
-                attempt.attempt_id != attempt_id
+                attempt.task_id != task_id
+                or type(attempt.attempt_number) is not int
+                or attempt.attempt_number != attempt_number
+                or attempt.attempt_id != attempt_id
                 or attempt.current_fencing_token != fencing_token
                 or attempt.machine_name != cfg.machine_name
             ):
@@ -678,16 +710,13 @@ def authorize_launch(
                         "launch_id": launch_id,
                     },
                 ):
-                    claim["launch_state"] = "starting"
-                    claim["launch_authorized_at"] = authorized_at
-                    claim["launch_id"] = launch_id
-                    task.meta["revision"] += 1
-                    task.meta["updated_at"] = authorized_at
-                    save_task(cfg, task)
-                    attempt.phase = "starting"
-                    attempt.authorization["launch_id"] = launch_id
-                    attempt.timestamps["launch_authorized_at"] = authorized_at
-                    atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
+                    _persist_starting_pair_locked(
+                        cfg,
+                        task,
+                        attempt,
+                        launch_id=launch_id,
+                        authorized_at=authorized_at,
+                    )
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
             _release_task_reservation(

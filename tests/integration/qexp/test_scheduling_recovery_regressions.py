@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+import qqtools.plugins.qexp.scheduler as scheduler_module
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.authority import AuthoritySupervisor
 from qqtools.plugins.qexp.commands.group import (
@@ -27,6 +28,7 @@ from qqtools.plugins.qexp.scheduler import (
     claim_task,
     expire_claim,
     reconcile_running_tasks,
+    resume_starting_attempt,
     run_dispatch_cycle,
 )
 from tests.helpers.qexp.clock import set_offer_evaluation_time
@@ -82,6 +84,241 @@ def test_scheduler_commits_launch_gate_before_starting_runner(tmp_path: Path):
     )
     AuthoritySupervisor(cfg).tick()
     assert load_task(cfg, task.task_id).state["projection"] == "succeeded"
+
+
+def test_fresh_launch_persists_matching_starting_pair_in_order(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    original_revision = load_task(cfg, task.task_id).meta["revision"]
+    path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    launch_id = "fresh-launch-id"
+    authorized_at = "2026-09-20T12:34:56Z"
+    writes = []
+    original_save_task = scheduler_module.save_task
+    original_atomic_replace = scheduler_module.atomic_replace
+
+    def record_task_write(cfg_arg, task_arg):
+        original_save_task(cfg_arg, task_arg)
+        stored_attempt = AttemptRecord.from_dict(read_json(path))
+        writes.append(("task", task_arg.claim_control["active_claim"].copy(), stored_attempt.phase))
+
+    def record_attempt_write(target, value):
+        original_atomic_replace(target, value)
+        if target == path:
+            writes.append(("attempt", value["attempt"]["authorization"].copy(), value["attempt"]["phase"]))
+
+    monkeypatch.setattr(scheduler_module, "save_task", record_task_write)
+    monkeypatch.setattr(scheduler_module, "atomic_replace", record_attempt_write)
+    monkeypatch.setattr(scheduler_module, "utc_now", lambda: authorized_at)
+    monkeypatch.setattr(scheduler_module.uuid, "uuid4", lambda: type("LaunchId", (), {"hex": launch_id})())
+
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+
+    stored_task = load_task(cfg, task.task_id)
+    stored_attempt = AttemptRecord.from_dict(read_json(path))
+    claim = stored_task.claim_control["active_claim"]
+    assert [write[0] for write in writes] == ["task", "attempt"]
+    assert writes[0][2] == "claimed"
+    assert claim["launch_state"] == stored_attempt.phase == "starting"
+    assert claim["launch_id"] == stored_attempt.authorization["launch_id"] == launch_id
+    assert claim["launch_authorized_at"] == stored_attempt.timestamps["launch_authorized_at"] == authorized_at
+    assert stored_task.meta["revision"] == original_revision + 1
+    assert stored_task.meta["updated_at"] == authorized_at
+
+
+@pytest.mark.parametrize("identity", ["attempt", "token"])
+def test_fresh_launch_rejects_mismatched_attempt_identity(tmp_path: Path, identity: str):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    task_before = load_task(cfg, task.task_id).to_dict()
+    attempt_file = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    attempt_before = read_json(attempt_file)
+
+    attempt_id = "different-attempt" if identity == "attempt" else attempt.attempt_id
+    fencing_token = attempt.current_fencing_token + 1 if identity == "token" else attempt.current_fencing_token
+
+    assert not authorize_launch(cfg, task.task_id, attempt_id, fencing_token)
+    assert load_task(cfg, task.task_id).to_dict() == task_before
+    assert read_json(attempt_file) == attempt_before
+
+
+@pytest.mark.parametrize(
+    ("field", "mismatched_value"),
+    [
+        ("task_id", "different-task"),
+        ("attempt_number", "../../tasks/unrelated"),
+        ("attempt_number", True),
+        ("attempt_number", 1.0),
+    ],
+)
+def test_fresh_launch_rejects_mismatched_embedded_attempt_path(
+    tmp_path: Path,
+    field: str,
+    mismatched_value: object,
+):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    attempt_file = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    damaged_attempt = read_json(attempt_file)
+    damaged_attempt["attempt"][field] = mismatched_value
+    atomic_replace(attempt_file, damaged_attempt)
+    task_before = load_task(cfg, task.task_id).to_dict()
+
+    assert not authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    assert load_task(cfg, task.task_id).to_dict() == task_before
+    assert read_json(attempt_file) == damaged_attempt
+    assert not (cfg.shared_root / "tasks" / "unrelated.json").exists()
+    assert {path.name for path in attempt_file.parent.iterdir()} == {attempt_file.name}
+
+
+def test_fresh_launch_rejects_mismatched_embedded_task_path(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    task_file = cfg.shared_root / "tasks" / f"{task.task_id}.json"
+    damaged_task = read_json(task_file)
+    damaged_task["task"]["task_id"] = "different-task"
+    atomic_replace(task_file, damaged_task)
+    attempt_file = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    attempt_before = read_json(attempt_file)
+
+    assert not authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    assert read_json(task_file) == damaged_task
+    assert read_json(attempt_file) == attempt_before
+    assert not (cfg.shared_root / "tasks" / "different-task.json").exists()
+    assert not (cfg.shared_root / "attempts" / "different-task").exists()
+
+
+def test_committed_starting_recovery_preserves_pair_and_write_order(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    before = load_task(cfg, task.task_id)
+    original_claim = before.claim_control["active_claim"].copy()
+    original_revision = before.meta["revision"]
+    path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    writes = []
+    original_save_task = scheduler_module.save_task
+    original_atomic_replace = scheduler_module.atomic_replace
+
+    def record_task_write(cfg_arg, task_arg):
+        original_save_task(cfg_arg, task_arg)
+        writes.append("task")
+
+    def record_attempt_write(target, value):
+        original_atomic_replace(target, value)
+        if target == path:
+            writes.append("attempt")
+
+    monkeypatch.setattr(scheduler_module, "save_task", record_task_write)
+    monkeypatch.setattr(scheduler_module, "atomic_replace", record_attempt_write)
+
+    resumed = resume_starting_attempt(cfg, task.task_id)
+
+    assert resumed is not None
+    stored_task = load_task(cfg, task.task_id)
+    stored_attempt = AttemptRecord.from_dict(read_json(path))
+    claim = stored_task.claim_control["active_claim"]
+    assert writes == ["task", "attempt"]
+    assert claim["launch_id"] == stored_attempt.authorization["launch_id"] == original_claim["launch_id"]
+    assert (
+        claim["launch_authorized_at"]
+        == stored_attempt.timestamps["launch_authorized_at"]
+        == original_claim["launch_authorized_at"]
+    )
+    assert stored_task.meta["revision"] == original_revision + 1
+    assert stored_task.meta["updated_at"] == original_claim["launch_authorized_at"]
+
+
+@pytest.mark.parametrize(
+    ("field", "mismatched_value"),
+    [
+        ("task_id", "different-task"),
+        ("attempt_number", "../../tasks/unrelated"),
+        ("attempt_number", True),
+        ("attempt_number", 1.0),
+    ],
+)
+def test_starting_recovery_rejects_mismatched_embedded_attempt_path(
+    tmp_path: Path,
+    field: str,
+    mismatched_value: object,
+):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    attempt_file = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    damaged_attempt = read_json(attempt_file)
+    damaged_attempt["attempt"][field] = mismatched_value
+    atomic_replace(attempt_file, damaged_attempt)
+    task_before = load_task(cfg, task.task_id).to_dict()
+
+    assert resume_starting_attempt(cfg, task.task_id) is None
+    assert load_task(cfg, task.task_id).to_dict() == task_before
+    assert read_json(attempt_file) == damaged_attempt
+    assert not (cfg.shared_root / "tasks" / "unrelated.json").exists()
+    assert {path.name for path in attempt_file.parent.iterdir()} == {attempt_file.name}
+
+
+def test_starting_recovery_rejects_mismatched_embedded_task_path(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    task_file = cfg.shared_root / "tasks" / f"{task.task_id}.json"
+    damaged_task = read_json(task_file)
+    damaged_task["task"]["task_id"] = "different-task"
+    atomic_replace(task_file, damaged_task)
+    attempt_file = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    attempt_before = read_json(attempt_file)
+
+    assert resume_starting_attempt(cfg, task.task_id) is None
+    assert read_json(task_file) == damaged_task
+    assert read_json(attempt_file) == attempt_before
+    assert not (cfg.shared_root / "tasks" / "different-task.json").exists()
+    assert not (cfg.shared_root / "attempts" / "different-task").exists()
+
+
+def test_launch_authorization_replays_after_task_write_interruption(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    original_save_task = scheduler_module.save_task
+
+    def interrupt_task_write(*args, **kwargs):
+        raise OSError("simulated Task write interruption")
+
+    monkeypatch.setattr(scheduler_module, "save_task", interrupt_task_write)
+    with pytest.raises(OSError, match="Task write interruption"):
+        authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+
+    assert load_task(cfg, task.task_id).claim_control["active_claim"]["launch_state"] == "claimed"
+    assert AttemptRecord.from_dict(read_json(path)).phase == "claimed"
+    monkeypatch.setattr(scheduler_module, "save_task", original_save_task)
+
+    executor = RecordingExecutor()
+    assert run_dispatch_cycle(cfg, available_gpus=[0], executor=executor) == [task.task_id]
+    assert [launched.attempt_id for launched in executor.attempts] == [attempt.attempt_id]
+    stored_task = load_task(cfg, task.task_id)
+    stored_attempt = AttemptRecord.from_dict(read_json(path))
+    claim = stored_task.claim_control["active_claim"]
+    assert claim["launch_state"] == stored_attempt.phase == "starting"
+    assert claim["launch_id"] == stored_attempt.authorization["launch_id"]
+    assert claim["launch_authorized_at"] == stored_attempt.timestamps["launch_authorized_at"]
 
 
 def test_dispatch_resumes_starting_attempt_after_authorization_write_crash(tmp_path: Path, monkeypatch):

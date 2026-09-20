@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,7 @@ from qqtools.plugins.qexp.runtime.resources.reservations import (
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
-from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
+from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, resume_starting_attempt
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -173,6 +174,36 @@ def test_starting_recovery_uses_exact_active_reservation(tmp_path: Path) -> None
     assert counters["recovery.starting.checked"] == 1
     assert counters["recovery.starting.launched"] == 1
     assert counters["scheduler.work.skipped_no_capacity"] == 1
+
+
+def test_starting_recovery_rejects_mismatched_active_reservation(tmp_path: Path) -> None:
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1")
+    task = submit(cfg, ["echo", "recover"], working_dir=work_dir)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    attempt = claim_task(
+        cfg,
+        task.task_id,
+        [0],
+        reservation_runtime_root=runtime.root,
+        project_id=binding.project_id,
+    )
+    assert attempt is not None
+    reservation = ReservationIdentity.from_record(active_reservations(runtime.root)[0])
+    task_before = load_task(cfg, task.task_id).to_dict()
+
+    assert (
+        resume_starting_attempt(
+            cfg,
+            task.task_id,
+            reservation_runtime_root=runtime.root,
+            expected_reservation=replace(reservation, reservation_id="different-reservation"),
+        )
+        is None
+    )
+    assert load_task(cfg, task.task_id).to_dict() == task_before
 
 
 def test_reservation_verification_error_is_fail_closed_and_project_isolated(
