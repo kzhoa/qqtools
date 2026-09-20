@@ -410,7 +410,10 @@ def test_agent_start_starts_the_registered_global_agent(tmp_path: Path, monkeypa
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.start_local_agent",
-        lambda *_args, **_kwargs: ("started", {"agent_state": "active", "pid": 4321}),
+        lambda *_args, **_kwargs: (
+            "started",
+            {"agent_state": "active", "pid": 4321, "is_running": True},
+        ),
     )
 
     assert main([*_base_args(cfg), "--machine-runtime-root", str(runtime.root), "agent", "start", "--format=json"]) == 0
@@ -458,7 +461,15 @@ def test_agent_run_reports_foreground_start(tmp_path: Path, monkeypatch, capsys)
     def run_foreground(cfg, *, reason, on_started, machine_runtime=None):
         assert machine_runtime.root == runtime.root
         received.append(reason)
-        on_started({"machine_name": cfg.machine_name, "agent_state": "active", "pid": 123, "is_running": True})
+        on_started(
+            {
+                "machine_name": cfg.machine_name,
+                "agent_state": "active",
+                "pid": 123,
+                "is_running": True,
+                "machine_runtime_root": str(runtime.root),
+            }
+        )
 
     monkeypatch.setattr("qqtools.plugins.qexp.cli.run_local_agent_foreground", run_foreground)
 
@@ -921,7 +932,14 @@ def test_legacy_project_requires_explicit_migration(tmp_path: Path, capsys) -> N
 
 def test_global_agent_status_and_stop_do_not_require_project_context(tmp_path: Path, monkeypatch, capsys) -> None:
     runtime_root = tmp_path / "machine-runtime"
-    machine_status = {"agent_state": "active", "is_running": True, "pid": 4321, "projects": []}
+    machine_status = {
+        "agent_state": "active",
+        "is_running": True,
+        "pid": 4321,
+        "registry_revision": 1,
+        "projects": [],
+        "upgrade": {"projects": []},
+    }
     monkeypatch.setattr("qqtools.plugins.qexp.cli.get_machine_agent_status", lambda _runtime: machine_status)
     monkeypatch.setattr("qqtools.plugins.qexp.cli.stop_machine_agent", lambda _runtime: True)
 

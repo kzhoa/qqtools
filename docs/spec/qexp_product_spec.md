@@ -1240,6 +1240,12 @@ and an evidenced unavailable observation. Available timestamps show both absolut
 and relative age. JSON preserves the legacy `available|unavailable` status while adding the
 richer observation state and bounded reason. Retry never displays an older Attempt's report.
 
+Finite structured commands collect one canonical result before selecting JSON or human
+presentation. JSON serializes that result without presentation wrappers. Human rendering may
+derive labels and summaries only from the same result; it does not perform additional Task-history
+queries. Group and machine output retains its summary labels but displays `-` when the canonical,
+bounded observation result does not contain that summary.
+
 Group output should show:
 
 - admission and dispatch controls

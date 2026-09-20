@@ -358,3 +358,144 @@ def test_batch_prepared_notice_precedes_task_staging(tmp_path: Path):
 
     result = batch_submit(cfg, manifest, on_prepared=on_prepared)
     assert observed == [(result.operation_id, result.idempotency_key)]
+
+
+def test_agent_project_list_human_and_json_share_the_registry_result(tmp_path: Path, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    runtime_root = tmp_path / "machine-runtime"
+    runtime = MachineRuntime(runtime_root)
+    binding, _created = runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
+    base = ["--machine-runtime-root", str(runtime_root), "agent", "list-projects"]
+
+    assert main(base) == 0
+    human = capsys.readouterr().out
+    assert human.splitlines()[0].startswith("Project ID")
+    assert binding.project_id in human
+    assert str(cfg.shared_root) in human
+    assert cfg.machine_name in human
+
+    assert main([*base, "--format=json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["action"] == "project_list"
+    assert payload["projects"][0]["project_id"] == binding.project_id
+    assert "kind" not in payload
+    assert "payload" not in payload
+    assert "presentation" not in payload
+
+
+def test_empty_agent_project_list_human_output_uses_fixed_message(tmp_path: Path, capsys):
+    runtime_root = tmp_path / "machine-runtime"
+
+    assert main(["--machine-runtime-root", str(runtime_root), "agent", "list-projects"]) == 0
+    assert capsys.readouterr().out == "No results.\n"
+
+
+def test_cpu_lane_human_and_json_share_the_policy_result(tmp_path: Path, capsys):
+    runtime_root = tmp_path / "machine-runtime"
+    base = ["--machine-runtime-root", str(runtime_root), "agent", "cpu-lane"]
+
+    assert main([*base, "set", "--capacity", "4"]) == 0
+    human = capsys.readouterr().out
+    assert "Capacity: 4" in human
+    assert "Revision: 1" in human
+
+    assert main([*base, "show", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"cpu_lane": {"capacity": 4, "revision": 1}}
+
+
+@pytest.mark.parametrize("action", ["coordinate", "retry"])
+def test_machine_upgrade_advance_human_reads_flat_projects_and_json_is_unchanged(
+    tmp_path: Path, monkeypatch, capsys, action: str
+):
+    result = {
+        "projects": [
+            {
+                "project_id": "flat-project",
+                "phase": "audit",
+                "state": "runnable",
+                "pending": True,
+                "admission_blocked": False,
+                "blockers": ["waiting"],
+            }
+        ],
+        "slices": 1,
+        "pending_project_ids": ["flat-project"],
+        "worker_state": "runnable",
+        "discovery_source": "machine_registry",
+    }
+    calls = 0
+
+    def fake_advance(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return result
+
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.advance_registered_upgrades", fake_advance)
+    base = ["--machine-runtime-root", str(tmp_path / "machine-runtime"), "agent", "upgrade", action]
+
+    assert main(base) == 0
+    human = capsys.readouterr().out
+    assert "flat-project" in human
+    assert "audit" in human
+    assert "runnable" in human
+    assert "waiting" in human
+
+    assert main([*base, "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out) == result
+    assert calls == 2
+
+
+def test_machine_upgrade_status_human_reads_nested_projects_and_json_is_unchanged(tmp_path: Path, monkeypatch, capsys):
+    result = {
+        "projects": [
+            {
+                "project_id": "nested-project",
+                "upgrade": {
+                    "phase": "backfill",
+                    "state": "pending",
+                    "pending": True,
+                    "admission_blocked": False,
+                    "blockers": [],
+                },
+            }
+        ],
+        "inaccessible_projects": [],
+        "aggregate_state": "pending",
+        "pending_project_ids": ["nested-project"],
+        "all_roots_complete": False,
+        "discovery_source": "machine_registry",
+        "discovery_boundary": "locally_registered_bindings",
+    }
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.inspect_registered_upgrades", lambda _runtime: result)
+    base = ["--machine-runtime-root", str(tmp_path / "machine-runtime"), "agent", "upgrade", "status"]
+
+    assert main(base) == 0
+    human = capsys.readouterr().out
+    assert "nested-project" in human
+    assert "backfill" in human
+    assert "pending" in human
+
+    assert main([*base, "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out) == result
+
+
+def test_group_and_machine_human_output_do_not_query_task_history_for_presentation(tmp_path: Path, monkeypatch, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "demo", ["gpu-1"])
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("human presentation must not perform a Task history query")
+
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.observer.list_tasks", fail_if_called)
+    base = _base_args(cfg)
+
+    assert main([*base, "group", "list"]) == 0
+    group_list = capsys.readouterr().out
+    assert "demo" in group_list
+    assert main([*base, "group", "show", "demo"]) == 0
+    group_show = capsys.readouterr().out
+    assert "Task summary: -" in group_show
+    assert "Queue summary: -" in group_show
+    assert main([*base, "machines"]) == 0
+    machines = capsys.readouterr().out
+    assert machines == "No results.\n" or "Task summary" in machines.splitlines()[0]

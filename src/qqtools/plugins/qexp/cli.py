@@ -43,7 +43,7 @@ from .commands import logs as log_commands
 from .commands import task as task_commands
 from .config_types import RootConfig
 from .doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
-from .formatter import render
+from .formatter import CliOutput, OutputKind, render
 from .layout import clear_context, load_context, load_root_config, migrate_schema5_to_schema6, save_context
 from .lease import LeasePolicy, load_lease_policy, save_lease_policy
 from .legacy_agent import get_agent_status
@@ -127,39 +127,33 @@ def _emit_observation_error(error: ObservationError, output_format: str) -> int:
 
 def _emit_task_page(cfg: RootConfig, args: argparse.Namespace, page: dict[str, object], page_size: int) -> None:
     """Render paginated task results and a shell-safe continuation command."""
-    if args.format == "json":
-        _emit("task-list", page, args.format)
-        return
-    _emit("task-list", page["items"], args.format)
-    print(f"Stop reason: {page['stop_reason']}")
+    presentation: dict[str, object] = {}
     next_cursor = page.get("next_cursor")
-    if next_cursor is None:
-        return
-    command = [
-        "qexp",
-        "--shared-root",
-        str(cfg.shared_root),
-        "--machine",
-        cfg.machine_name,
-        "task",
-        "list",
-    ]
-    if args.phase:
-        command.extend(("--phase", args.phase))
-    if args.group:
-        command.extend(("--group", args.group))
-    command.extend(("--page-size", str(page_size), "--cursor", str(next_cursor)))
-    print(f"Continue with: {shlex.join(command)}")
+    if args.format == "human" and next_cursor is not None:
+        command = [
+            "qexp",
+            "--shared-root",
+            str(cfg.shared_root),
+            "--machine",
+            cfg.machine_name,
+            "task",
+            "list",
+        ]
+        if args.phase:
+            command.extend(("--phase", args.phase))
+        if args.group:
+            command.extend(("--group", args.group))
+        command.extend(("--page-size", str(page_size), "--cursor", str(next_cursor)))
+        presentation["continuation_command"] = shlex.join(command)
+    _emit(CliOutput(OutputKind.TASK_PAGE, page, presentation), args.format)
 
 
 def _add_output_format(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--format", choices=("human", "json"), default="human")
 
 
-def _emit(
-    kind: str, result: object, output_format: str, *, tasks: list[dict] | None = None, flush: bool = False
-) -> None:
-    print(render(kind, result, output_format, tasks=tasks or ()), flush=flush)
+def _emit(output: CliOutput[object], output_format: str, *, flush: bool = False) -> None:
+    print(render(output, output_format), flush=flush)
 
 
 def _machine_assertion(args: argparse.Namespace) -> str | None:
@@ -735,7 +729,13 @@ def main(argv: list[str] | None = None) -> int:
                     result = advance_registered_upgrades(runtime, force_discovery=True)
                 else:
                     result = UpgradeCoordinator(_upgrade_project_config(runtime, project)).advance(force_retry=True)
-                _emit("upgrade", result, args.format)
+                _emit(
+                    CliOutput(
+                        OutputKind.UPGRADE_PROJECT if project is not None else OutputKind.UPGRADE_ADVANCE,
+                        result,
+                    ),
+                    args.format,
+                )
                 return 0
             if not args.shared_root:
                 raise ValueError("schema-6 upgrade requires an explicit --shared-root.")
@@ -745,36 +745,42 @@ def main(argv: list[str] | None = None) -> int:
             if args.upgrade_feature == "schema6":
                 if args.schema6_upgrade_action == "check":
                     _emit(
-                        "schema6-upgrade",
-                        check_schema6_upgrade(
-                            cfg,
-                            capabilities=args.capabilities,
-                            machine_runtime_root=args.machine_runtime_root,
+                        CliOutput(
+                            OutputKind.SCHEMA6_UPGRADE,
+                            check_schema6_upgrade(
+                                cfg,
+                                capabilities=args.capabilities,
+                                machine_runtime_root=args.machine_runtime_root,
+                            ),
                         ),
                         args.format,
                     )
                     return 0
                 if args.schema6_upgrade_action == "status":
-                    _emit("schema6-upgrade", schema6_upgrade_status(cfg), args.format)
+                    _emit(CliOutput(OutputKind.SCHEMA6_UPGRADE, schema6_upgrade_status(cfg)), args.format)
                     return 0
                 if args.schema6_upgrade_action == "start":
                     _emit(
-                        "schema6-upgrade",
-                        start_schema6_upgrade(
-                            cfg,
-                            capabilities=args.capabilities,
-                            machine_runtime_root=args.machine_runtime_root,
+                        CliOutput(
+                            OutputKind.SCHEMA6_UPGRADE,
+                            start_schema6_upgrade(
+                                cfg,
+                                capabilities=args.capabilities,
+                                machine_runtime_root=args.machine_runtime_root,
+                            ),
                         ),
                         args.format,
                     )
                     return 0
                 if args.schema6_upgrade_action == "resume":
                     _emit(
-                        "schema6-upgrade",
-                        resume_schema6_upgrade(
-                            cfg,
-                            activation_id=args.activation_id,
-                            machine_runtime_root=args.machine_runtime_root,
+                        CliOutput(
+                            OutputKind.SCHEMA6_UPGRADE,
+                            resume_schema6_upgrade(
+                                cfg,
+                                activation_id=args.activation_id,
+                                machine_runtime_root=args.machine_runtime_root,
+                            ),
                         ),
                         args.format,
                     )
@@ -782,12 +788,14 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.confirm_clients_stopped or not args.machine:
                     raise ValueError("attest requires --machine and --confirm-clients-stopped.")
                 _emit(
-                    "schema6-upgrade",
-                    attest_schema6_upgrade(
-                        cfg,
-                        activation_id=args.activation_id,
-                        machine_name=args.machine,
-                        machine_runtime_root=args.machine_runtime_root,
+                    CliOutput(
+                        OutputKind.SCHEMA6_UPGRADE,
+                        attest_schema6_upgrade(
+                            cfg,
+                            activation_id=args.activation_id,
+                            machine_name=args.machine,
+                            machine_runtime_root=args.machine_runtime_root,
+                        ),
                     ),
                     args.format,
                 )
@@ -804,8 +812,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.show:
                 context = load_context()
                 _emit(
-                    "context",
-                    {"shared_root": context["shared_root"] if context else None},
+                    CliOutput(
+                        OutputKind.CONTEXT,
+                        {"shared_root": context["shared_root"] if context else None},
+                    ),
                     args.format or "human",
                 )
                 return 0
@@ -826,47 +836,64 @@ def main(argv: list[str] | None = None) -> int:
         }:
             runtime = MachineRuntime(args.machine_runtime_root)
             if args.agent_action == "status":
-                _emit("agent", {"action": "status", **get_machine_agent_status(runtime)}, args.format)
+                _emit(
+                    CliOutput(OutputKind.AGENT_STATUS, {"action": "status", **get_machine_agent_status(runtime)}),
+                    args.format,
+                )
             elif args.agent_action == "list-projects":
                 _emit(
-                    "agent",
-                    {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]},
+                    CliOutput(
+                        OutputKind.AGENT_PROJECT_LIST,
+                        {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]},
+                    ),
                     args.format,
                 )
             elif args.agent_action == "disable-project":
                 binding = set_project_enabled(runtime, args.project, False)
-                _emit("agent", {"action": "project_disabled", **binding.to_dict()}, args.format)
+                _emit(
+                    CliOutput(OutputKind.AGENT_OPERATION, {"action": "project_disabled", **binding.to_dict()}),
+                    args.format,
+                )
             elif args.agent_action == "enable-project":
                 binding = enable_project(runtime, args.project)
                 _emit(
-                    "agent",
-                    {
-                        "action": "project_enabled",
-                        **binding.to_dict(),
-                        "message": "Project registration checks passed; new task admission is enabled.",
-                    },
+                    CliOutput(
+                        OutputKind.AGENT_OPERATION,
+                        {
+                            "action": "project_enabled",
+                            **binding.to_dict(),
+                            "message": "Project registration checks passed; new task admission is enabled.",
+                        },
+                    ),
                     args.format,
                 )
             elif args.agent_action == "remove-project":
                 binding = unregister_project(runtime, args.project)
-                _emit("agent", {"action": "project_removed", **binding.to_dict()}, args.format)
+                _emit(
+                    CliOutput(OutputKind.AGENT_OPERATION, {"action": "project_removed", **binding.to_dict()}),
+                    args.format,
+                )
             elif args.agent_action == "stop":
                 stopped = stop_machine_agent(runtime)
                 _emit(
-                    "agent",
-                    {"action": "stopped" if stopped else "already_stopped", **get_machine_agent_status(runtime)},
+                    CliOutput(
+                        OutputKind.AGENT_OPERATION,
+                        {"action": "stopped" if stopped else "already_stopped", **get_machine_agent_status(runtime)},
+                    ),
                     args.format,
                 )
             else:
                 process = restart_machine_agent(runtime)
                 _emit(
-                    "agent",
-                    {
-                        "action": "restarted",
-                        **get_machine_agent_status(runtime),
-                        "pid": process.pid,
-                        "previous_pid": getattr(process, "previous_pid", None),
-                    },
+                    CliOutput(
+                        OutputKind.AGENT_OPERATION,
+                        {
+                            "action": "restarted",
+                            **get_machine_agent_status(runtime),
+                            "pid": process.pid,
+                            "previous_pid": getattr(process, "previous_pid", None),
+                        },
+                    ),
                     args.format,
                 )
             return 0
@@ -879,14 +906,23 @@ def main(argv: list[str] | None = None) -> int:
                     result = inspect_registered_upgrades(runtime)
                 else:
                     result = UpgradeCoordinator(_upgrade_project_config(runtime, project)).status()
-                _emit("upgrade", result, args.format)
+                _emit(
+                    CliOutput(
+                        OutputKind.UPGRADE_REGISTRY_STATUS if project is None else OutputKind.UPGRADE_PROJECT,
+                        result,
+                    ),
+                    args.format,
+                )
                 return 0
             if action in {"retry", "coordinate"}:
                 if project is None:
                     result = advance_registered_upgrades(runtime, force_discovery=True)
                 else:
                     result = UpgradeCoordinator(_upgrade_project_config(runtime, project)).advance(force_retry=True)
-                _emit("upgrade", result, args.format)
+                _emit(
+                    CliOutput(OutputKind.UPGRADE_ADVANCE if project is None else OutputKind.UPGRADE_PROJECT, result),
+                    args.format,
+                )
                 return 0
             cfg = _upgrade_project_config(runtime, project)
             coordinator = UpgradeCoordinator(cfg)
@@ -902,7 +938,10 @@ def main(argv: list[str] | None = None) -> int:
                 result = coordinator.validate_repair(args.repair_id)
             else:
                 result = coordinator.resume()
-            _emit("upgrade", result, args.format)
+            output_kind = (
+                OutputKind.UPGRADE_REPAIR if action in {"plan", "apply", "validate"} else OutputKind.UPGRADE_PROJECT
+            )
+            _emit(CliOutput(output_kind, result, {"action": action}), args.format)
             return 0
         if args.command == "agent" and args.agent_action == "cpu-lane":
             runtime = MachineRuntime(args.machine_runtime_root)
@@ -911,7 +950,7 @@ def main(argv: list[str] | None = None) -> int:
                 policy = set_cpu_lane_capacity(runtime.root, capacity=args.capacity)
             else:
                 policy = get_cpu_lane_policy(runtime.root)
-            _emit("agent", {"cpu_lane": policy.to_dict}, args.format)
+            _emit(CliOutput(OutputKind.CPU_LANE, {"cpu_lane": policy.to_dict}), args.format)
             return 0
         cfg, execution_context = _resolve_cfg(args, require_binding=_requires_verified_binding(args))
 
@@ -924,18 +963,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "config":
             if args.config_action == "progress":
                 if args.progress_action == "show":
-                    _emit("progress-policy", show_progress_policy(cfg), args.format)
+                    _emit(CliOutput(OutputKind.PROGRESS_POLICY, show_progress_policy(cfg)), args.format)
                     return 0
                 _emit(
-                    "progress-policy",
-                    set_progress_policy(cfg, _parse_progress_interval_argument(args.interval_seconds)),
+                    CliOutput(
+                        OutputKind.PROGRESS_POLICY,
+                        set_progress_policy(cfg, _parse_progress_interval_argument(args.interval_seconds)),
+                    ),
                     args.format,
                 )
                 return 0
             if args.config_action != "notifications":
                 raise ValueError("unknown config action")
             if args.notifications_action == "show":
-                _emit("notifications", load_notifications(cfg), args.format)
+                _emit(CliOutput(OutputKind.NOTIFICATIONS, load_notifications(cfg)), args.format)
                 return 0
             if args.notifications_action == "set":
                 if args.enabled and args.disabled:
@@ -949,7 +990,7 @@ def main(argv: list[str] | None = None) -> int:
                         "enabled": args.enabled,
                     },
                 )
-                _emit("notifications", value, args.format)
+                _emit(CliOutput(OutputKind.NOTIFICATIONS, value), args.format)
                 return 0
             if args.provider_action == "set":
                 if args.provider != "feishu":
@@ -1002,12 +1043,12 @@ def main(argv: list[str] | None = None) -> int:
                 value = update_notifications(cfg, update_provider)
                 if shared_webhook is not None:
                     write_shared_feishu_webhook(cfg, shared_webhook)
-                _emit("notifications", value, args.format)
+                _emit(CliOutput(OutputKind.NOTIFICATIONS, value), args.format)
                 return 0
         if args.command == "lease-policy" or (args.command == "config" and args.config_action == "lease"):
             current = load_lease_policy(cfg)
             if args.lease_policy_action == "show":
-                _emit("lease-policy", {"lease_policy": asdict(current)}, args.format)
+                _emit(CliOutput(OutputKind.LEASE_POLICY, {"lease_policy": asdict(current)}), args.format)
                 return 0
             has_active_claim = any(
                 bool(data.get("task", {}).get("claim_control", {}).get("active_claim"))
@@ -1033,7 +1074,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             updated = LeasePolicy(**values)
             save_lease_policy(cfg, updated)
-            _emit("lease-policy", {"lease_policy": values}, args.format)
+            _emit(CliOutput(OutputKind.LEASE_POLICY, {"lease_policy": values}), args.format)
             return 0
         if args.command == "submit":
             if not args.no_activate:
@@ -1072,15 +1113,17 @@ def main(argv: list[str] | None = None) -> int:
                 idempotency_key=args.idempotency_key,
                 on_prepared=print_prepared,
             )
-            _emit("batch-submit", values.to_dict(), args.format)
+            _emit(CliOutput(OutputKind.BATCH_SUBMIT, values.to_dict()), args.format)
             return 0
         if args.command == "task":
             if args.task_action == "dependencies":
                 if args.dependencies_action == "show":
                     task_value = task_commands.load_task(cfg, args.task_id)
                     _emit(
-                        "dependencies",
-                        {"task_id": task_value.task_id, "depends_on_task_ids": task_value.depends_on_task_ids},
+                        CliOutput(
+                            OutputKind.DEPENDENCIES,
+                            {"task_id": task_value.task_id, "depends_on_task_ids": task_value.depends_on_task_ids},
+                        ),
                         args.format,
                     )
                 else:
@@ -1088,8 +1131,10 @@ def main(argv: list[str] | None = None) -> int:
                         cfg, args.task_id, args.depends_on, action=args.dependencies_action
                     )
                     _emit(
-                        "dependencies",
-                        {"task_id": task_value.task_id, "depends_on_task_ids": task_value.depends_on_task_ids},
+                        CliOutput(
+                            OutputKind.DEPENDENCIES,
+                            {"task_id": task_value.task_id, "depends_on_task_ids": task_value.depends_on_task_ids},
+                        ),
                         args.format,
                     )
                 return 0
@@ -1103,15 +1148,17 @@ def main(argv: list[str] | None = None) -> int:
                     and not task_value.control.get("termination_acknowledged_at")
                 )
                 _emit(
-                    "task-operation",
-                    {
-                        "task_id": task_value.task_id,
-                        "task_state": task_value.state["projection"],
-                        "owning_machine": claim.get("machine_name") or task_value.placement_policy["home_machine"],
-                        "operation_state": "waiting_ack" if is_pending else "completed",
-                        "pending_acknowledgement": is_pending,
-                        "termination_acknowledged_at": task_value.control.get("termination_acknowledged_at"),
-                    },
+                    CliOutput(
+                        OutputKind.TASK_OPERATION,
+                        {
+                            "task_id": task_value.task_id,
+                            "task_state": task_value.state["projection"],
+                            "owning_machine": claim.get("machine_name") or task_value.placement_policy["home_machine"],
+                            "operation_state": "waiting_ack" if is_pending else "completed",
+                            "pending_acknowledgement": is_pending,
+                            "termination_acknowledged_at": task_value.control.get("termination_acknowledged_at"),
+                        },
+                    ),
                     args.format,
                 )
             elif args.task_action == "retry":
@@ -1125,7 +1172,7 @@ def main(argv: list[str] | None = None) -> int:
             elif args.task_action == "offer":
                 ensure_local_agent_active(cfg, reason="task-offer", **get_lifecycle_kwargs())
                 result = task_commands.offer(cfg, args.task_id)
-                _emit("availability", result.to_dict(), args.format)
+                _emit(CliOutput(OutputKind.AVAILABILITY, result.to_dict()), args.format)
             elif args.task_action == "share":
                 after_seconds = _duration_seconds(args.after) if args.after is not None else None
                 ensure_local_agent_active(cfg, reason="task-share", **get_lifecycle_kwargs())
@@ -1135,11 +1182,11 @@ def main(argv: list[str] | None = None) -> int:
                     after_seconds=after_seconds,
                     helper_machines=_split_machine_list(args.helper_machines),
                 )
-                _emit("availability", result.to_dict(), args.format)
+                _emit(CliOutput(OutputKind.AVAILABILITY, result.to_dict()), args.format)
             elif args.task_action == "keep-local":
                 ensure_local_agent_active(cfg, reason="task-keep-local", **get_lifecycle_kwargs())
                 result = task_commands.keep_local(cfg, args.task_id)
-                _emit("availability", result.to_dict(), args.format)
+                _emit(CliOutput(OutputKind.AVAILABILITY, result.to_dict()), args.format)
             elif args.task_action == "list":
                 is_paginated = args.page_size is not None or args.cursor is not None
                 if is_paginated:
@@ -1161,12 +1208,14 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     limit = 50 if args.limit is None else args.limit
                     _emit(
-                        "task-list",
-                        observer.list_tasks(cfg, phase=args.phase, group=args.group, limit=limit),
+                        CliOutput(
+                            OutputKind.TASK_LIST,
+                            observer.list_tasks(cfg, phase=args.phase, group=args.group, limit=limit),
+                        ),
                         args.format,
                     )
             elif args.task_action == "show":
-                _emit("task-show", observer.inspect_task(cfg, args.task_id), args.format)
+                _emit(CliOutput(OutputKind.TASK_SHOW, observer.inspect_task(cfg, args.task_id)), args.format)
             elif args.task_action == "logs":
                 print(log_commands.read_logs(cfg, args.task_id), end="")
             return 0
@@ -1174,21 +1223,21 @@ def main(argv: list[str] | None = None) -> int:
             presentation = None
             if args.group_action == "create":
                 result = group_commands.create_group(cfg, args.name, args.workers)
-                kind = "group-operation"
-                presentation = {**result, "action": "create"}
+                kind = OutputKind.GROUP_OPERATION
+                presentation = {"action": "create"}
             elif args.group_action == "list":
                 result = observer.list_groups(cfg)
-                kind = "group-list"
+                kind = OutputKind.GROUP_LIST
             elif args.group_action == "show":
                 result = group_commands.show_group(cfg, args.name)
-                kind = "group-show"
+                kind = OutputKind.GROUP_SHOW
             elif args.group_action == "retry-failed":
                 ensure_local_agent_active(cfg, reason="group-retry-failed", **get_lifecycle_kwargs())
                 result = {
                     "task_ids": [task_value.task_id for task_value in group_commands.group_retry_failed(cfg, args.name)]
                 }
-                kind = "group-operation"
-                presentation = {**result, "action": "retry-failed", "name": args.name, "status": "completed"}
+                kind = OutputKind.GROUP_OPERATION
+                presentation = {"action": "retry-failed", "name": args.name, "status": "completed"}
             elif args.group_action == "machines":
                 if args.machine_action == "list":
                     result = observer.list_group_machines(
@@ -1196,7 +1245,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.group_name,
                         reservation_runtime_root=execution_context.reservation_root,
                     )
-                    _emit("group-machines", result, args.format)
+                    _emit(CliOutput(OutputKind.GROUP_MACHINES, result), args.format)
                     return 0
                 gpu_limit_gpus = getattr(args, "gpu_limit_gpus", None)
                 result = group_commands.change_worker(
@@ -1209,9 +1258,8 @@ def main(argv: list[str] | None = None) -> int:
                     gpu_limit_gpus=None if gpu_limit_gpus in {None, "unlimited"} else gpu_limit_gpus,
                     has_gpu_limit=gpu_limit_gpus is not None,
                 )
-                kind = "group-operation"
+                kind = OutputKind.GROUP_OPERATION
                 presentation = {
-                    **result,
                     "action": args.machine_action,
                     "worker_machine": args.worker_machine,
                 }
@@ -1248,8 +1296,8 @@ def main(argv: list[str] | None = None) -> int:
                         and control.get("state") in {"preparing", "converging", "waiting_ack", "blocked"}
                     ):
                         ensure_local_agent_active(cfg, reason="group-cancel", **get_lifecycle_kwargs())
-                kind = "group-operation"
-                presentation = {**result, "action": args.group_action}
+                kind = OutputKind.GROUP_OPERATION
+                presentation = {"action": args.group_action}
                 if args.group_action == "cancel":
                     control = result.get("cancellation_operation", {})
                     pending_machines = control.get("pending_machine_acknowledgements", {})
@@ -1262,16 +1310,9 @@ def main(argv: list[str] | None = None) -> int:
                             "reason": control.get("blocked_reason"),
                         }
                     )
-            task_views = (
-                observer.list_tasks(cfg, limit=10**9)
-                if args.format == "human" and kind in {"group-list", "group-show"}
-                else None
-            )
             _emit(
-                kind,
-                presentation if args.format == "human" and presentation is not None else result,
+                CliOutput(kind, result, presentation or {}),
                 args.format,
-                tasks=task_views,
             )
             return 0
         if args.command == "agent":
@@ -1307,7 +1348,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 if not registration.binding.enabled:
                     result["enable_command"] = _enable_command(runtime, registration.binding)
-                _emit("agent", result, args.format)
+                _emit(CliOutput(OutputKind.AGENT_OPERATION, result), args.format)
                 return 0
             if args.agent_action == "migrate-project":
                 binding = migrate_project(runtime, cfg)
@@ -1318,56 +1359,72 @@ def main(argv: list[str] | None = None) -> int:
                     if path.resolve() != cfg.shared_root
                 ]
                 _emit(
-                    "agent",
-                    {"action": "project_migrated", **binding.to_dict(), **status, "migration_candidates": siblings},
+                    CliOutput(
+                        OutputKind.AGENT_OPERATION,
+                        {"action": "project_migrated", **binding.to_dict(), **status, "migration_candidates": siblings},
+                    ),
                     args.format,
                 )
                 return 0
             if args.agent_action == "list-projects":
                 _emit(
-                    "agent",
-                    {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]},
+                    CliOutput(
+                        OutputKind.AGENT_PROJECT_LIST,
+                        {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]},
+                    ),
                     args.format,
                 )
                 return 0
             if args.agent_action == "disable-project":
                 binding = set_project_enabled(runtime, args.project, False)
-                _emit("agent", {"action": "project_disabled", **binding.to_dict()}, args.format)
+                _emit(
+                    CliOutput(OutputKind.AGENT_OPERATION, {"action": "project_disabled", **binding.to_dict()}),
+                    args.format,
+                )
                 return 0
             if args.agent_action == "remove-project":
                 binding = unregister_project(runtime, args.project)
-                _emit("agent", {"action": "project_removed", **binding.to_dict()}, args.format)
+                _emit(
+                    CliOutput(OutputKind.AGENT_OPERATION, {"action": "project_removed", **binding.to_dict()}),
+                    args.format,
+                )
                 return 0
             if args.agent_action == "status":
-                _emit("agent", {"action": "status", **get_machine_agent_status(runtime)}, args.format)
+                _emit(
+                    CliOutput(OutputKind.AGENT_STATUS, {"action": "status", **get_machine_agent_status(runtime)}),
+                    args.format,
+                )
                 return 0
             if args.agent_action == "start":
                 action, status = start_local_agent(
                     cfg, reason="manual_start", require_eligible_work=False, machine_runtime=runtime
                 )
-                _emit("agent", {"action": action, **status}, args.format)
+                _emit(CliOutput(OutputKind.AGENT_OPERATION, {"action": action, **status}), args.format)
             elif args.agent_action == "run":
                 run_local_agent_foreground(
                     cfg,
                     reason="manual_run",
-                    on_started=lambda status: _emit("agent", {"action": "running", **status}, args.format, flush=True),
+                    on_started=lambda status: _emit(
+                        CliOutput(OutputKind.AGENT_OPERATION, {"action": "running", **status}),
+                        args.format,
+                        flush=True,
+                    ),
                     machine_runtime=runtime,
                 )
             elif args.agent_action == "restart":
                 action, status = restart_local_agent(cfg, machine_runtime=runtime)
-                _emit("agent", {"action": action, **status}, args.format)
+                _emit(CliOutput(OutputKind.AGENT_OPERATION, {"action": action, **status}), args.format)
             elif args.agent_action == "stop":
                 action, status = stop_local_agent(cfg, machine_runtime=runtime)
-                _emit("agent", {"action": action, **status}, args.format)
+                _emit(CliOutput(OutputKind.AGENT_OPERATION, {"action": action, **status}), args.format)
             return 0
         if args.command == "top":
             result = observer.top_view(cfg, all_machines=True)
-            _emit("top", result, args.format, tasks=result["tasks"] if args.format == "human" else None)
+            _emit(CliOutput(OutputKind.TOP, result), args.format)
             return 0
         if args.command == "machines":
             result = observer.list_machines(cfg)
-            task_views = observer.list_tasks(cfg, limit=10**9) if args.format == "human" else None
-            _emit("machines", result, args.format, tasks=task_views)
+            _emit(CliOutput(OutputKind.MACHINES, result), args.format)
             return 0
         if args.command == "doctor":
             context = get_execution_context()
@@ -1385,7 +1442,8 @@ def main(argv: list[str] | None = None) -> int:
                     max_work_items=args.max_work_items,
                 )
             )
-            _emit("doctor", result, args.format)
+            output_kind = OutputKind.DOCTOR_VERIFY if args.action == "verify" else OutputKind.DOCTOR_REPAIR
+            _emit(CliOutput(output_kind, result), args.format)
             return resolve_verify_exit_code(result, strict=args.strict)
         if args.command == "clean":
             context = get_execution_context()
@@ -1399,7 +1457,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_work_items=args.max_work_items,
                 reservation_runtime_root=context.reservation_root,
             )
-            _emit("clean", result, args.format)
+            _emit(CliOutput(OutputKind.CLEAN, result), args.format)
             return 0
     except ObservationError as exc:
         return _emit_observation_error(exc, getattr(args, "format", "human"))
