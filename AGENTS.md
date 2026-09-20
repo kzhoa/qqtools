@@ -47,6 +47,13 @@ fast-forward. `main` must remain an ancestor of `dev`. Never merge a feature
 directly into `main` or force-push either public branch as part of promotion.
 Pull requests are optional for owner-driven development.
 
+After all release contents have reached `dev`, the repository owner may commit
+version-release metadata directly to `dev` under the standard administrator
+release procedure. Each such commit is limited to
+`src/qqtools/version.py` and `CHANGELOG.md`; it does not authorize direct code,
+configuration, test, or workflow changes. The exact pushed SHA must pass complete
+Dev Preflight before release promotion begins.
+
 The owner may explicitly choose an [administrator manual release](.github/publish.md)
 instead of the normal promotion route below. This exception permits a directly
 prepared release and dev reconciliation, but preserves validation gates,
@@ -61,8 +68,9 @@ understandable without private documents.
 
 ## Feature promotion
 
-Before changing `dev`, the feature must contain current `dev`, and the candidate
-tree with `.dev/**` removed must pass governance and complete preflight in the
+Except for the owner-only version-release metadata commit defined above, before
+changing `dev` the feature must contain current `dev`, and the candidate tree
+with `.dev/**` removed must pass governance and complete preflight in the
 configured promotion workflow before `dev` advances.
 Create one squash commit with current `dev` as parent, attest that exact commit
 through the trusted promotion workflow, and delete the feature only after a
@@ -102,6 +110,9 @@ complete preflight against the exact candidate and pass before `dev` advances.
 Release additionally requires the configured installed-artifact gate. A known
 baseline failure may be investigated during development but does not waive a
 mandatory gate. Post-push checks never replace candidate validation.
+The documented owner-only release metadata exception deliberately validates its
+exact `dev` SHA after push and blocks `dev`-to-`main` promotion until that run
+succeeds.
 Do not weaken assertions, hide failures, or skip required lifecycle coverage.
 
 ## Workflow governance

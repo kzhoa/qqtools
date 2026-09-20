@@ -151,17 +151,19 @@ by tree or commit message. Version-tag publishing keeps its own exact-wheel gate
 Use this procedure after all features intended for a release have been promoted
 to `dev`. Patch, minor, and major releases use the same delivery path. Select an
 unused `X.Y.Z` version later than the current source version according to the
-release's compatibility scope. The standard route adds the version metadata
-through a release feature, promotes the resulting `dev` commit to `main`, and
-publishes that exact commit by tag.
+release's compatibility scope. The repository owner adds the version metadata
+directly to `dev`, waits for complete preflight evidence for that exact commit,
+promotes it to `main`, and publishes it by tag. This narrow release exception
+does not permit other direct changes to `dev`.
 
 1. **Freeze and inspect the release contents.** Fetch current `main`, `dev`, and
    tags. Confirm that every intended feature is present on `dev`, unrelated work
    is excluded, and current `main` is an ancestor of `dev`. Review the commits
    and user-visible changes since the previous release. Do not start publication
    while another change is being promoted to `dev`.
-2. **Validate before changing the version.** From a clean, committed checkout of
-   current `dev`, inspect and resolve the target release's compatibility
+2. **Validate before changing the version.** Use a clean, committed checkout that
+   exactly matches current remote `dev`. Record that commit SHA, inspect and
+   resolve the target release's compatibility
    obligations using [compatibility governance](compatibility-governance.md#commands),
    then run with Python 3.13:
 
@@ -174,29 +176,35 @@ publishes that exact commit by tag.
    version, so run it before applying the version bump. A failure blocks the
    release; resolve it and repeat the check against the updated committed
    candidate.
-3. **Create the release feature.** Create `feature/release-X.Y.Z` from the exact
-   validated `dev` commit. Update `src/qqtools/version.py` to `X.Y.Z`, add a
+3. **Commit the release metadata directly to `dev`.** Update
+   `src/qqtools/version.py` to `X.Y.Z`, add a
    nonempty `## vX.Y.Z` section below `## Unreleased` in `CHANGELOG.md`, and move
    the applicable unreleased notes into it. Review the release notes against all
-   commits being published.
-   Run the normal pre-promotion checks, then commit the release metadata with a
-   `promote:` subject and push the feature branch, for example:
+   commits being published. This owner-only exception permits exactly those two
+   files in the commit. Fetch remote `dev` again before committing; if it no
+   longer matches the validated SHA, rebuild and revalidate from the new head.
+   Commit and push with owner credentials, without a `promote:` subject:
 
    ```bash
-   git switch --create feature/release-X.Y.Z origin/dev
-   # Update src/qqtools/version.py and CHANGELOG.md, then run the required checks.
+   release_base=VALIDATED_DEV_SHA
+   git fetch --no-tags origin main dev
+   test "$(git rev-parse HEAD)" = "$release_base"
+   test "$(git rev-parse origin/dev)" = "$release_base"
    git add src/qqtools/version.py CHANGELOG.md
-   git commit -m "promote: release vX.Y.Z"
-   git push -u origin feature/release-X.Y.Z
+   test "$(git diff --cached --name-only | sort)" = \
+     "$(printf '%s\n' CHANGELOG.md src/qqtools/version.py)"
+   git commit -m "release: prepare vX.Y.Z"
+   git push origin HEAD:dev
    ```
 
-   If the exact version and changelog commit is already on `dev`, do not create a
-   duplicate release feature; verify that commit and continue with the next step.
-4. **Wait for promotion to `dev`.** The feature-promotion workflow runs complete
-   preflight, creates one squash commit on the current `dev`, records promotion
-   provenance, pushes the result, and deletes the feature branch. Confirm that
-   the workflow succeeded and record the resulting `dev` commit SHA. A branch
-   push or accepted workflow run alone does not mean promotion succeeded.
+   Do not include code, configuration, tests, workflows, `.dev/**`, or any other
+   file. Such changes require the normal feature-promotion path.
+4. **Wait for complete Dev Preflight.** Record the pushed release commit SHA and
+   wait for its `dev-preflight.yml` push run. Because a direct release commit has
+   no feature-promotion provenance, the workflow runs complete preflight for that
+   exact SHA. Do not begin `dev`-to-`main` promotion until the run succeeds. If it
+   fails, keep the release blocked; code fixes must use feature promotion, and any
+   permitted metadata correction creates a new SHA that must pass again.
 5. **Promote the release commit to `main`.** Dispatch the governed release from
    that current `dev` commit with owner credentials:
 

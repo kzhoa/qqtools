@@ -121,7 +121,11 @@ provenance-only Dev Preflight push run is not reusable preflight evidence, so th
 release runs the complete source gate. Main push artifact CI may reuse the
 release artifact jobs under the
 [evidence rules](development-workflow.md#reusing-gate-evidence).
-Post-push checks are not substitutes for these pre-promotion gates.
+Post-push checks are not substitutes for these pre-promotion gates. The sole
+exception is the standard administrator release's owner-only commit limited to
+`src/qqtools/version.py` and `CHANGELOG.md`: release preflight runs before the
+version bump, then the direct `dev` push must obtain complete Dev Preflight
+evidence for its exact SHA before `dev`-to-`main` promotion can begin.
 
 Ordinary main/PR artifact CI validates installed wheels using the matrix in its
 stable workflow. Canonical Python runs `artifact-e2e`; the other configured
