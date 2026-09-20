@@ -62,9 +62,14 @@ locally and is recommended, but is required locally only when an explicit task
 or risk-specific policy says so.
 
 The successful operation creates one squash commit whose parent is current
-`dev`, pushes it to `dev`, and only then deletes the disposable feature branch.
-The `dev` push triggers post-promotion verification. That verification does not
-replace the candidate gate. Never merge a feature directly into `main`.
+`dev`, generates GitHub OIDC/Sigstore provenance for a deterministic manifest
+binding that commit, tree, parent, source feature SHA/ref, and promotion run,
+then pushes it to `dev` and deletes the disposable feature branch. The `dev`
+push reconstructs the manifest and verifies its repository, signer workflow,
+workflow/source digest, source ref, and GitHub-hosted runner identity. Valid
+provenance avoids repeating the complete feature gate. Missing, malformed, or
+unverifiable provenance falls back to complete preflight. Never merge a feature
+directly into `main`.
 
 Once the promotion workflow run is accepted, the local terminal or agent session
 does not need to remain open. Retain the run URL and candidate SHA for inspection.
@@ -88,8 +93,9 @@ gh workflow run repository-governance.yml --ref dev -f operation=promote-dev-to-
 ```
 
 The exact `dev` commit must pass repository preflight and installed-artifact E2E.
-The release preflight reuses the recent Dev Preflight push run for that SHA,
-waiting for it to finish if necessary; it does not cancel and restart that run.
+The release preflight reuses a recent complete Dev Preflight push run for that
+SHA, waiting for it to finish if necessary; a provenance-only promotion run is
+not complete preflight evidence, so release executes the full source gate.
 If `dev` advances during validation, the operation must abort and be dispatched
 again. Current `main` must be an ancestor of the validated commit; promotion
 fast-forwards `main` to that same commit. Do not create another squash commit,
@@ -112,7 +118,9 @@ of rebuilding and retesting the same commit.
 
 Reuse accepts only `kzhoa`-requested and `kzhoa`-rerun executions on `dev`, created
 within the last 24 hours, for the identical commit SHA. Preflight evidence comes
-from `dev-preflight.yml` push runs; artifact evidence comes from
+from `dev-preflight.yml` push runs whose CPU preflight job actually completed;
+an attested promotion whose duplicate job was skipped deliberately selects fresh
+release execution. Artifact evidence comes from
 `repository-governance.yml` release dispatches and must include all three Python
 smoke jobs and the Python 3.13 installed E2E job. Evidence jobs must finish
 successfully; skipped jobs are not evidence. The run attempt is fixed while
@@ -125,6 +133,10 @@ GitHub API, selects full execution. Each selector writes its evidence run/attemp
 URL or fresh-execution decision to the Actions summary. Gate-result jobs require
 successful evidence or every fresh job, preventing skipped dependencies from
 turning a release green.
+
+Promotion provenance is not test evidence. It proves that the trusted workflow
+created and attested the exact squash result after its feature candidate gate;
+it cannot satisfy the later exact-`dev` release gate.
 
 This is commit-result reuse within a bounded time window, not a dependency lock:
 external package indexes and runner images may change during that window. Code,

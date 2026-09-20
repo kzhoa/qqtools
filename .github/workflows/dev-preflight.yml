@@ -20,8 +20,62 @@ on:
 permissions:
   contents: read
   actions: read
+  attestations: read
 
 jobs:
+  promotion-provenance:
+    name: Trusted promotion provenance
+    runs-on: ubuntu-latest
+    outputs:
+      attested: ${{ steps.verify.outputs.attested || 'false' }}
+    steps:
+      - name: Check out repository
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct promotion subject
+        id: candidate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        env:
+          PREVIOUS_DEV_SHA: ${{ github.event.before }}
+          PROVENANCE_PATH: ${{ runner.temp }}/qqtools-promotion-provenance.json
+        run: |
+          if ! python3 scripts/ci/promotion_provenance.py \
+            --commit "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --expected-parent "$PREVIOUS_DEV_SHA" \
+            --output "$PROVENANCE_PATH" \
+            --github-output "$GITHUB_OUTPUT"
+          then
+            echo "No valid promotion provenance marker; complete preflight is required."
+          fi
+
+      - name: Verify GitHub promotion attestation
+        id: verify
+        if: steps.candidate.outputs.valid == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROVENANCE_PATH: ${{ runner.temp }}/qqtools-promotion-provenance.json
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+          SOURCE_REF: ${{ steps.candidate.outputs.source_ref }}
+        run: |
+          signer_workflow="$GITHUB_REPOSITORY/.github/workflows/repository-governance.yml"
+          if gh attestation verify "$PROVENANCE_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$signer_workflow" \
+            --signer-digest "$SOURCE_SHA" \
+            --source-digest "$SOURCE_SHA" \
+            --source-ref "$SOURCE_REF" \
+            --deny-self-hosted-runners
+          then
+            echo "attested=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Promotion attestation was not verified; running complete preflight."
+            echo "attested=false" >> "$GITHUB_OUTPUT"
+          fi
+
   select-evidence:
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -38,8 +92,10 @@ jobs:
         run: python3 scripts/ci/reuse_gate.py
 
   preflight:
-    needs: select-evidence
-    if: needs.select-evidence.outputs.reused != 'true'
+    needs: [promotion-provenance, select-evidence]
+    if: >-
+      needs.select-evidence.outputs.reused != 'true' &&
+      needs.promotion-provenance.outputs.attested != 'true'
     name: CPU-only preflight (Python 3.13)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -76,18 +132,21 @@ jobs:
 
   gate-result:
     if: always()
-    needs: [select-evidence, preflight]
+    needs: [promotion-provenance, select-evidence, preflight]
     runs-on: ubuntu-latest
     steps:
       - name: Require successful evidence or fresh gates
         env:
           EVIDENCE_RESULT: ${{ needs.select-evidence.result }}
+          PROVENANCE_RESULT: ${{ needs.promotion-provenance.result }}
           REUSED: ${{ needs.select-evidence.outputs.reused }}
+          ATTESTED: ${{ needs.promotion-provenance.outputs.attested }}
           FRESH_RESULTS: ${{ needs.preflight.result }}
         run: |
           set -euo pipefail
           [[ "$EVIDENCE_RESULT" == "success" ]] || exit 1
-          if [[ "$REUSED" != "true" ]]; then
+          [[ "$PROVENANCE_RESULT" == "success" ]] || exit 1
+          if [[ "$REUSED" != "true" && "$ATTESTED" != "true" ]]; then
             [[ -n "$FRESH_RESULTS" ]] || exit 1
             for result in $FRESH_RESULTS; do
               [[ "$result" == "success" ]] || exit 1

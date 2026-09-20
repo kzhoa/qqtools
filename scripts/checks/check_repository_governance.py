@@ -10,6 +10,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AGENTS_PATH = REPO_ROOT / "AGENTS.md"
+CODEOWNERS_PATH = REPO_ROOT / ".github" / "CODEOWNERS"
 WORKFLOW_ROOT = REPO_ROOT / ".github" / "workflows"
 
 REQUIRED_MARKERS = (
@@ -40,6 +41,13 @@ ALLOWED_WORKFLOWS = {
 }
 
 PUBLIC_BRANCHES = {"dev", "main"}
+REQUIRED_CODEOWNERS = (
+    "/AGENTS.md @kzhoa",
+    "/.github/CODEOWNERS @kzhoa",
+    "/.github/workflows/ @kzhoa",
+    "/scripts/checks/check_repository_governance.py @kzhoa",
+    "/scripts/ci/promotion_provenance.py @kzhoa",
+)
 
 
 def _current_branch() -> str | None:
@@ -103,6 +111,15 @@ def main() -> int:
     )
     if workflow_rule not in content:
         errors.append("AGENTS.md must retain the explicit owner-approval rule for workflow changes")
+
+    try:
+        codeowners = CODEOWNERS_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        errors.append(f"could not read .github/CODEOWNERS: {exc}")
+    else:
+        for entry in REQUIRED_CODEOWNERS:
+            if entry not in codeowners.splitlines():
+                errors.append(f".github/CODEOWNERS must retain protected entry: {entry}")
 
     workflow_names = _workflow_names()
     missing_workflows = sorted(ALLOWED_WORKFLOWS - workflow_names)

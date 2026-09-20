@@ -64,9 +64,11 @@ understandable without private documents.
 Before changing `dev`, the feature must contain current `dev`, and the candidate
 tree with `.dev/**` removed must pass governance and complete preflight in the
 configured promotion workflow before `dev` advances.
-Create one squash commit with current `dev` as parent; delete the feature only
-after a successful push. Dev Preflight then verifies the promoted commit; release may reuse that exact
-commit's successful evidence under the development workflow rules.
+Create one squash commit with current `dev` as parent, attest that exact commit
+through the trusted promotion workflow, and delete the feature only after a
+successful push. Dev Preflight verifies promotion provenance without repeating
+the successful feature gate. Before release, the exact `dev` commit must obtain
+complete preflight evidence under the development workflow rules.
 Reserve `promote:` commit subjects for ready-to-integrate promotion requests.
 
 ## Dev release promotion
@@ -129,8 +131,9 @@ Do not rewrite protected tests or specs to accommodate a regression.
 
 ## Protected governance surface
 
-`AGENTS.md`, `.github/CODEOWNERS`, `.github/workflows/**`, and
-`scripts/checks/check_repository_governance.py` are owner-controlled.
+`AGENTS.md`, `.github/CODEOWNERS`, `.github/workflows/**`,
+`scripts/checks/check_repository_governance.py`, and
+`scripts/ci/promotion_provenance.py` are owner-controlled.
 
 Only GitHub actor `kzhoa` may intentionally modify this protected governance surface.
 

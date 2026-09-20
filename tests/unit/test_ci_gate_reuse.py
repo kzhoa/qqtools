@@ -68,6 +68,15 @@ def test_all_required_jobs_must_finish():
     assert reuse_gate.gate_state([{**success, "status": "in_progress", "conclusion": None}], ("a",)) == "pending"
 
 
+def test_attested_promotion_is_not_reusable_preflight_evidence():
+    jobs = [
+        {"name": reuse_gate.PROMOTION_PROVENANCE_JOB, "status": "completed", "conclusion": "success"},
+        {"name": reuse_gate.GATES["preflight"][0], "status": "completed", "conclusion": "skipped"},
+    ]
+    assert reuse_gate.is_attested_promotion_without_preflight(jobs, reuse_gate.GATES["preflight"])
+    assert not reuse_gate.is_attested_promotion_without_preflight(jobs[:1], reuse_gate.GATES["preflight"])
+
+
 def setup_api(monkeypatch, runs, states):
     for key, value in ENV.items():
         monkeypatch.setenv(key, value)
@@ -103,6 +112,16 @@ def test_reruns_and_cancelled_sources_fail(monkeypatch, run):
 
 def test_no_candidate_requires_fresh_gate(monkeypatch):
     setup_api(monkeypatch, [], [])
+    assert reuse_gate.find_evidence("preflight") is None
+
+
+def test_attested_dev_push_selects_fresh_release_preflight(monkeypatch):
+    run = run_fixture()
+    jobs = [
+        {"name": reuse_gate.PROMOTION_PROVENANCE_JOB, "status": "completed", "conclusion": "success"},
+        {"name": reuse_gate.GATES["preflight"][0], "status": "completed", "conclusion": "skipped"},
+    ]
+    setup_api(monkeypatch, [run], [run, {"jobs": jobs}])
     assert reuse_gate.find_evidence("preflight") is None
 
 

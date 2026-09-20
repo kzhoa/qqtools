@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -124,6 +126,66 @@ def test_release_push_preserves_validated_sha_and_ancestry(tmp_path: Path, state
         assert after == before
 
 
+def test_prepare_promotion_builds_attested_subject_for_exact_squash_commit(tmp_path: Path) -> None:
+    jobs = yaml.safe_load((ROOT / ".github/workflows/repository-governance.yml").read_text())["jobs"]
+    prepare = next(step for step in jobs["promote-feature"]["steps"] if step["name"] == "Prepare promotion")
+    remote = tmp_path / "remote.git"
+    repo = tmp_path / "checkout"
+
+    def git(*args: str, cwd: Path = tmp_path) -> str:
+        return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+    git("init", "--bare", str(remote))
+    git("init", "-b", "dev", str(repo))
+    git("config", "user.name", "Test", cwd=repo)
+    git("config", "user.email", "test@example.invalid", cwd=repo)
+    script = repo / "scripts/ci/promotion_provenance.py"
+    script.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts/ci/promotion_provenance.py", script)
+    (repo / "base.txt").write_text("base\n")
+    git("add", ".", cwd=repo)
+    git("commit", "-m", "base", cwd=repo)
+    parent = git("rev-parse", "HEAD", cwd=repo)
+    git("remote", "add", "origin", str(remote), cwd=repo)
+    git("push", "origin", "dev", cwd=repo)
+    git("switch", "-c", "feat/example", cwd=repo)
+    (repo / "feature.txt").write_text("feature\n")
+    git("add", ".", cwd=repo)
+    git("commit", "-m", "promote: feature", cwd=repo)
+    source = git("rev-parse", "HEAD", cwd=repo)
+    output = tmp_path / "github-output"
+    provenance = tmp_path / "qqtools-promotion-provenance.json"
+
+    result = subprocess.run(
+        ["bash", "-c", prepare["run"]],
+        cwd=repo,
+        env={
+            **os.environ,
+            "BRANCH": "feat/example",
+            "ACTOR": "kzhoa",
+            "HEAD_MESSAGE": "promote: feature",
+            "SOURCE_SHA": source,
+            "PROMOTION_RUN": "123",
+            "PROMOTION_ATTEMPT": "1",
+            "REPOSITORY": "kzhoa/qqtools",
+            "PROVENANCE_PATH": str(provenance),
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    promoted = values["commit_sha"]
+    subject = json.loads(provenance.read_text())
+    assert subject["target_commit"] == promoted
+    assert subject["target_parent"] == parent
+    assert subject["target_tree"] == git("rev-parse", f"{promoted}^{{tree}}", cwd=repo)
+    assert subject["source_commit"] == source
+    assert subject["source_ref"] == "refs/heads/feat/example"
+
+
 @pytest.mark.parametrize("workflow", ["dev-preflight.yml", "ci.yml"])
 @pytest.mark.parametrize(
     ("evidence", "reused", "fresh", "success"),
@@ -141,9 +203,35 @@ def test_gate_result_requires_evidence_or_all_fresh_jobs(workflow, evidence, reu
     jobs = yaml.safe_load((ROOT / ".github/workflows" / workflow).read_text())["jobs"]
     result = subprocess.run(
         ["bash", "-c", jobs["gate-result"]["steps"][0]["run"]],
-        env={**os.environ, "EVIDENCE_RESULT": evidence, "REUSED": reused, "FRESH_RESULTS": fresh},
+        env={
+            **os.environ,
+            "EVIDENCE_RESULT": evidence,
+            "PROVENANCE_RESULT": "success",
+            "REUSED": reused,
+            "ATTESTED": "false",
+            "FRESH_RESULTS": fresh,
+        },
         capture_output=True,
         text=True,
         check=False,
     )
     assert (result.returncode == 0) is success
+
+
+def test_attested_dev_promotion_does_not_require_fresh_preflight() -> None:
+    jobs = yaml.safe_load((ROOT / ".github/workflows/dev-preflight.yml").read_text())["jobs"]
+    result = subprocess.run(
+        ["bash", "-c", jobs["gate-result"]["steps"][0]["run"]],
+        env={
+            **os.environ,
+            "EVIDENCE_RESULT": "success",
+            "PROVENANCE_RESULT": "success",
+            "REUSED": "false",
+            "ATTESTED": "true",
+            "FRESH_RESULTS": "skipped",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -3,3 +3,4 @@
 /.github/CODEOWNERS @kzhoa
 /.github/workflows/ @kzhoa
 /scripts/checks/check_repository_governance.py @kzhoa
+/scripts/ci/promotion_provenance.py @kzhoa

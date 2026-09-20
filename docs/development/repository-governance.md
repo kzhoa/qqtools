@@ -8,8 +8,10 @@ This guide explains protected changes and publication boundaries. Use
 
 The protected surface consists of root `AGENTS.md`, `.github/CODEOWNERS`, every
 file under `.github/workflows/`, and
-`scripts/checks/check_repository_governance.py`. Owner `kzhoa` retains authority
-over these files.
+`scripts/checks/check_repository_governance.py`. The promotion provenance helper
+`scripts/ci/promotion_provenance.py` is also protected because it executes inside
+the credentialed promotion job and reconstructs the subject trusted by Dev
+Preflight. Owner `kzhoa` retains authority over these files.
 
 An explicit owner request to change a protected file authorizes an agent to
 prepare those local edits on the owner's behalf. Approval is scoped to that
@@ -73,6 +75,14 @@ This credential permits approved workflow-file changes and allows dev/main pushe
 to trigger their normal post-promotion workflows. GitHub's built-in token cannot
 perform workflow-file updates, and its pushes do not trigger push workflows.
 Credential possession does not replace explicit owner approval for workflow edits.
+
+Feature promotion also requests GitHub's short-lived OIDC identity to create a
+Sigstore attestation for a deterministic manifest binding the final squash
+commit, tree, parent, source feature SHA/ref, and workflow run. This does not add
+another repository secret. The `dev` workflow trusts the provenance only when
+GitHub verifies the expected repository, signer workflow and digest, source
+digest/ref, and GitHub-hosted runner. Commit messages and the owner PAT alone are
+not accepted as provenance. Verification failure runs complete preflight.
 
 Retain normal candidate validation, `.dev/**` stripping, ancestry checks, and
 equality between the validated candidate tree and published tree. Follow the

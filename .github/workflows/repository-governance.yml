@@ -53,7 +53,7 @@ jobs:
             changed="$(git diff --name-only "$BEFORE" "$AFTER")"
           fi
 
-          protected='^(AGENTS\.md|\.github/CODEOWNERS|\.github/workflows/.*|scripts/checks/check_repository_governance\.py)$'
+          protected='^(AGENTS\.md|\.github/CODEOWNERS|\.github/workflows/.*|scripts/checks/check_repository_governance\.py|scripts/ci/promotion_provenance\.py)$'
           if printf '%s\n' "$changed" | grep -Eq "$protected"; then
             echo "Only repository owner kzhoa may modify the protected governance surface."
             printf '%s\n' "$changed" | grep -E "$protected" || true
@@ -69,6 +69,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      attestations: read
     uses: ./.github/workflows/dev-preflight.yml
     with:
       strip_dev_state: true
@@ -84,6 +85,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     concurrency:
       group: feature-promotion-to-dev
       cancel-in-progress: false
@@ -121,6 +124,11 @@ jobs:
           BRANCH: ${{ github.ref_name }}
           ACTOR: ${{ github.actor }}
           HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+          SOURCE_SHA: ${{ github.sha }}
+          PROMOTION_RUN: ${{ github.run_id }}
+          PROMOTION_ATTEMPT: ${{ github.run_attempt }}
+          REPOSITORY: ${{ github.repository }}
+          PROVENANCE_PATH: ${{ runner.temp }}/qqtools-promotion-provenance.json
         run: |
           set -euo pipefail
           git fetch origin dev
@@ -131,7 +139,7 @@ jobs:
             exit 1
           fi
 
-          protected='^(AGENTS\.md|\.github/CODEOWNERS|\.github/workflows/.*|scripts/checks/check_repository_governance\.py)$'
+          protected='^(AGENTS\.md|\.github/CODEOWNERS|\.github/workflows/.*|scripts/checks/check_repository_governance\.py|scripts/ci/promotion_provenance\.py)$'
           if [[ "$ACTOR" != "kzhoa" ]] && git diff --name-only "$dev_sha"...HEAD | grep -Eq "$protected"; then
             echo "Only repository owner kzhoa may promote protected governance changes."
             git diff --name-only "$dev_sha"...HEAD | grep -E "$protected" || true
@@ -156,10 +164,23 @@ jobs:
 
           git config user.name "qq"
           git config user.email "qq@x1q.cc"
-          commit_sha="$(printf '%s\n\nPromoted-from: %s\n' "$squash_subject" "$BRANCH" | git commit-tree "$tree_sha" -p "$dev_sha")"
+          commit_sha="$(printf '%s\n\nPromoted-from: %s\nPromotion-source: %s\nPromotion-run: %s\nPromotion-attempt: %s\nPromotion-provenance: github-attestation-v1\n' \
+            "$squash_subject" "$BRANCH" "$SOURCE_SHA" "$PROMOTION_RUN" "$PROMOTION_ATTEMPT" | \
+            git commit-tree "$tree_sha" -p "$dev_sha")"
+
+          python3 scripts/ci/promotion_provenance.py \
+            --commit "$commit_sha" \
+            --repository "$REPOSITORY" \
+            --expected-parent "$dev_sha" \
+            --output "$PROVENANCE_PATH"
 
           echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Attest exact promotion commit
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/qqtools-promotion-provenance.json
 
       - name: Advance dev with squash commit
         env:
@@ -198,6 +219,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      attestations: read
     uses: ./.github/workflows/dev-preflight.yml
     with:
       reuse_existing: true
@@ -295,6 +317,7 @@ jobs:
               path === 'AGENTS.md' ||
               path === '.github/CODEOWNERS' ||
               path === 'scripts/checks/check_repository_governance.py' ||
+              path === 'scripts/ci/promotion_provenance.py' ||
               path.startsWith('.github/workflows/');
 
             const protectedChanges = files.filter((file) =>

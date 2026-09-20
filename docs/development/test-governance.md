@@ -113,11 +113,14 @@ continues, but it does not waive a mandatory integration or release gate.
 
 The configured feature-promotion workflow must run complete preflight against
 the exact candidate with `.dev/**` removed and must not change `dev` unless it
-succeeds. A subsequent Dev Preflight run verifies the push. Promotion from `dev`
-to `main` validates repository preflight and installed-artifact E2E against the
-exact `dev` commit before the fast-forward. A release may reuse recent successful
-Dev Preflight evidence for that same SHA, and main push artifact CI may reuse the
-release artifact jobs, under the [evidence rules](development-workflow.md#reusing-gate-evidence).
+succeeds. It attests the resulting squash commit through GitHub OIDC/Sigstore;
+the `dev` push verifies that provenance instead of repeating the identical source
+gate. Promotion from `dev` to `main` validates repository preflight and
+installed-artifact E2E against the exact `dev` commit before the fast-forward. A
+provenance-only Dev Preflight push run is not reusable preflight evidence, so the
+release runs the complete source gate. Main push artifact CI may reuse the
+release artifact jobs under the
+[evidence rules](development-workflow.md#reusing-gate-evidence).
 Post-push checks are not substitutes for these pre-promotion gates.
 
 Ordinary main/PR artifact CI validates installed wheels using the matrix in its

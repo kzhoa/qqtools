@@ -20,6 +20,7 @@ GATES = {
         "artifact-e2e-dev-release / artifact e2e (Python 3.13)",
     ),
 }
+PROMOTION_PROVENANCE_JOB = "Trusted promotion provenance"
 
 
 def eligible_run(run: dict, gate: str, env: dict, now: datetime) -> bool:
@@ -48,6 +49,19 @@ def gate_state(jobs: list[dict], required: tuple[str, ...]) -> str:
     ):
         return "passed"
     return "pending"
+
+
+def is_attested_promotion_without_preflight(jobs: list[dict], required: tuple[str, ...]) -> bool:
+    """Return whether a trusted promotion intentionally skipped the source gate."""
+    provenance = [job for job in jobs if job["name"] == PROMOTION_PROVENANCE_JOB]
+    selected = [job for job in jobs if job["name"] in required]
+    return (
+        len(provenance) == 1
+        and provenance[0]["status"] == "completed"
+        and provenance[0]["conclusion"] == "success"
+        and {job["name"] for job in selected} == set(required)
+        and all(job["status"] == "completed" and job["conclusion"] == "skipped" for job in selected)
+    )
 
 
 def get_json(path: str) -> dict:
@@ -81,6 +95,9 @@ def find_evidence(gate: str) -> str | None:
             raise RuntimeError(f"Evidence workflow did not succeed: {run['html_url']}")
         if state == "passed":
             return f"{run['html_url']}/attempts/{attempt}"
+        if gate == "preflight" and is_attested_promotion_without_preflight(jobs, GATES[gate]):
+            print("Dev push used promotion provenance only; running a fresh release preflight.", flush=True)
+            return None
         if state == "failed" or current["status"] == "completed":
             raise RuntimeError(f"Gate evidence is unsuccessful: {run['html_url']}")
         if time.monotonic() >= deadline:
