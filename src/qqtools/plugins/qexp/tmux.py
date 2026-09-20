@@ -69,13 +69,14 @@ def _safe_get(query_list, **kwargs):
         return None
 
 
-def ensure_managed_session(
+def _ensure_managed_session(
     session_name: str,
     role: str,
     *,
     initial_window_name: str,
     start_directory: str | None = None,
-):
+    initial_command: str | None = None,
+) -> tuple[object, bool]:
     server = _get_server()
     session = _safe_get(server.sessions, session_name=session_name)
     if session is None:
@@ -86,9 +87,11 @@ def ensure_managed_session(
         }
         if start_directory is not None:
             kwargs["start_directory"] = start_directory
+        if initial_command is not None:
+            kwargs["window_command"] = initial_command
         session = server.new_session(**kwargs)
         _mark_session_role(session, role)
-        return session
+        return session, True
 
     existing_role = _get_session_role(session)
     if existing_role != role:
@@ -96,6 +99,22 @@ def ensure_managed_session(
             f"tmux session '{session_name}' already exists but is not owned by qexp "
             f"(expected role={role!r}, found role={existing_role!r})."
         )
+    return session, False
+
+
+def ensure_managed_session(
+    session_name: str,
+    role: str,
+    *,
+    initial_window_name: str,
+    start_directory: str | None = None,
+):
+    session, _created = _ensure_managed_session(
+        session_name,
+        role,
+        initial_window_name=initial_window_name,
+        start_directory=start_directory,
+    )
     return session
 
 
@@ -145,21 +164,37 @@ def create_window_for_task(
     task_id: str,
     session_name: str = TMUX_SESSION_EXPERIMENTS,
     start_directory: str | None = None,
+    initial_command: str | None = None,
 ) -> str:
+    window_name = task_id[:48]
     if session_name == TMUX_SESSION_EXPERIMENTS:
-        session = ensure_experiments_session(start_directory=start_directory)
+        session, created = _ensure_managed_session(
+            TMUX_SESSION_EXPERIMENTS,
+            QQTOOLS_SESSION_ROLE_EXPERIMENTS,
+            initial_window_name=window_name if initial_command is not None else "shell",
+            start_directory=start_directory,
+            initial_command=initial_command,
+        )
     else:
-        session = ensure_managed_session(
+        session, created = _ensure_managed_session(
             session_name,
             QQTOOLS_SESSION_ROLE_EXPERIMENTS,
-            initial_window_name="shell",
+            initial_window_name=window_name if initial_command is not None else "shell",
             start_directory=start_directory,
+            initial_command=initial_command,
         )
 
-    window_name = task_id[:48]
+    if created and initial_command is not None:
+        window = _safe_get(session.windows, window_name=window_name)
+        if window is None:
+            raise RuntimeError("tmux session did not expose its initial observer window")
+        return str(window.window_id)
+
     kwargs = {"window_name": window_name, "attach": False}
     if start_directory is not None:
         kwargs["start_directory"] = start_directory
+    if initial_command is not None:
+        kwargs["window_shell"] = initial_command
     window = session.new_window(**kwargs)
     return str(window.window_id)
 

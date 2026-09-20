@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager
 
 from ..config_types import RootConfig
-from ..executor import Executor
+from ..executor import Executor, append_launch_failure_diagnostic, launch_failure_handle, launch_failure_reason
 from ..layout import machine_state_path
 from ..machine_config import load_machine_policy
 from ..machine_state import publish_machine_snapshots
@@ -59,6 +59,8 @@ def _read_pid(runtime: MachineRuntime) -> int | None:
 
 def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool) -> bool:
     """Retain unfinished recovery and reservations before on-demand idle exit."""
+    if getattr(runtime, "pending_launch_handoffs", {}):
+        return False
     if getattr(runtime, "upgrade_pending_projects", set()):
         return False
     if getattr(runtime, "recovery_enrollment_pending_projects", set()):
@@ -320,6 +322,9 @@ def _recover_starting_reservations(
     readable: dict[str, RootConfig],
     reservations: tuple[dict[str, Any], ...],
     executor: Executor,
+    *,
+    excluded_pending: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset(),
+    launch_recovered: Callable[[RootConfig, str, Any, str], None] | None = None,
 ) -> dict[str, list[str]]:
     """Recover starting Attempts from exact active-reservation identities."""
     launched: dict[str, list[str]] = {}
@@ -333,6 +338,9 @@ def _recover_starting_reservations(
             cfg = readable.get(identity.project_id or "")
             if cfg is None or identity.attempt_id is None or identity.fencing_token is None:
                 diagnostic_increment("recovery.starting.ineligible_reservation")
+                continue
+            if (identity.project_id, identity.attempt_id) in excluded_pending:
+                diagnostic_increment("recovery.starting.pending_handoff")
                 continue
             diagnostic_increment("recovery.starting.checked")
             try:
@@ -348,21 +356,43 @@ def _recover_starting_reservations(
             if attempt is None:
                 continue
             try:
-                executor.launch_attempt(cfg, identity.task_id, attempt)
+                if launch_recovered is None:
+                    executor.launch_attempt(cfg, identity.task_id, attempt)
+                else:
+                    launch_recovered(cfg, identity.task_id, attempt, identity.project_id or "")
                 launched.setdefault(identity.project_id or "", []).append(identity.task_id)
                 diagnostic_increment("recovery.starting.launched")
-            except Exception:
+            except Exception as exc:
                 diagnostic_increment("recovery.starting.launch_failed")
+                append_launch_failure_diagnostic(cfg, identity.task_id, attempt.attempt_id, exc)
                 try:
-                    fail_attempt(
+                    did_fail = fail_attempt(
                         cfg,
                         identity.task_id,
                         attempt.attempt_id,
                         attempt.current_fencing_token,
-                        "executor_launch_failed",
+                        launch_failure_reason(exc),
                         should_require_unstarted=True,
                         reservation_runtime_root=runtime.root,
                     )
-                except (KeyError, OSError, RuntimeError, ValueError):
+                except (KeyError, OSError, RuntimeError, ValueError) as compensation_error:
                     diagnostic_increment("recovery.starting.compensation_errors")
+                    append_launch_failure_diagnostic(
+                        cfg,
+                        identity.task_id,
+                        attempt.attempt_id,
+                        compensation_error,
+                    )
+                else:
+                    handle = launch_failure_handle(exc)
+                    if did_fail and handle is not None:
+                        try:
+                            executor.cleanup_launch(handle)
+                        except Exception as cleanup_error:
+                            append_launch_failure_diagnostic(
+                                cfg,
+                                identity.task_id,
+                                attempt.attempt_id,
+                                cleanup_error,
+                            )
     return launched

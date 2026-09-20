@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -56,6 +58,26 @@ def test_executor_publishes_durable_membership_before_runner_creation(tmp_path):
     assert len(spawned) == 1
     # The projection itself never advances the Attempt's authority or launches.
     assert read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]["phase"] == "starting"
+
+
+def test_executor_reaps_direct_runner_child(tmp_path):
+    cfg, task, attempt = prepared(tmp_path)
+    children = []
+
+    def spawn(_argv, **_kwargs):
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        children.append(process)
+        intent = local_paths(cfg.runtime_root)["launch_intents"] / f"{attempt.attempt_id}.json"
+        intent.parent.mkdir(parents=True, exist_ok=True)
+        intent.touch()
+        return process
+
+    Executor(tmux_available=lambda: False, spawn_runner=spawn).launch_attempt(cfg, task.task_id, attempt)
+
+    deadline = time.monotonic() + 2
+    while children[0].returncode is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert children[0].returncode == 0
 
 
 @pytest.mark.parametrize("has_tmux", [False, True])

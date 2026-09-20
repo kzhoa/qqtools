@@ -13,7 +13,7 @@ from typing import Any, Callable, ContextManager, Iterator
 from .config_types import RootConfig
 from .domain.policies import group_allows, task_machine_matches
 from .events import write_diagnostic_event, write_event
-from .executor import Executor
+from .executor import Executor, append_launch_failure_diagnostic, launch_failure_handle, launch_failure_reason
 from .infrastructure.clock import clock_evidence as _clock_evidence
 from .infrastructure.process import terminate_process_group as _terminate_process_group
 from .lease import (
@@ -887,16 +887,29 @@ def _run_dispatch_cycle(
             try:
                 executor.launch_attempt(cfg, task.task_id, attempt)
                 launched.append(task.task_id)
-            except Exception:
-                fail_attempt(
+            except Exception as exc:
+                reason = launch_failure_reason(exc)
+                append_launch_failure_diagnostic(cfg, task.task_id, attempt.attempt_id, exc)
+                if fail_attempt(
                     cfg,
                     task.task_id,
                     attempt.attempt_id,
                     attempt.current_fencing_token,
-                    "executor_launch_failed",
+                    reason,
                     should_require_unstarted=True,
                     reservation_runtime_root=reservation_runtime_root,
-                )
+                ):
+                    handle = launch_failure_handle(exc)
+                    if handle is not None:
+                        try:
+                            executor.cleanup_launch(handle)
+                        except Exception as cleanup_error:
+                            append_launch_failure_diagnostic(
+                                cfg,
+                                task.task_id,
+                                attempt.attempt_id,
+                                cleanup_error,
+                            )
     ready_state = read_ready_index_state(cfg)
     if (available or available_cpu_slots) and project_id is None and ready_state in {"absent", "building"}:
         advance_ready_index_build(cfg)
@@ -1082,16 +1095,29 @@ def _run_dispatch_cycle(
                         available_cpu_slots += task.spec.requested_cpus or 0
                     else:
                         available = gpus + available
-            except Exception:
-                fail_attempt(
+            except Exception as exc:
+                reason = launch_failure_reason(exc)
+                append_launch_failure_diagnostic(cfg, task.task_id, attempt.attempt_id, exc)
+                if fail_attempt(
                     cfg,
                     task.task_id,
                     attempt.attempt_id,
                     attempt.current_fencing_token,
-                    "executor_launch_failed",
+                    reason,
                     should_require_unstarted=True,
                     reservation_runtime_root=reservation_runtime_root,
-                )
+                ):
+                    handle = launch_failure_handle(exc)
+                    if handle is not None:
+                        try:
+                            executor.cleanup_launch(handle)
+                        except Exception as cleanup_error:
+                            append_launch_failure_diagnostic(
+                                cfg,
+                                task.task_id,
+                                attempt.attempt_id,
+                                cleanup_error,
+                            )
             sizer.observe(max(1, time.monotonic_ns() - started_ns))
             if max_new_claims is not None and new_claims >= max_new_claims:
                 break
@@ -1198,16 +1224,29 @@ def _run_dispatch_cycle(
                 continue
             executor.launch_attempt(cfg, task.task_id, authorized)
             launched.append(task.task_id)
-        except Exception:
-            fail_attempt(
+        except Exception as exc:
+            reason = launch_failure_reason(exc)
+            append_launch_failure_diagnostic(cfg, task.task_id, attempt.attempt_id, exc)
+            if fail_attempt(
                 cfg,
                 task.task_id,
                 attempt.attempt_id,
                 attempt.current_fencing_token,
-                "executor_launch_failed",
+                reason,
                 should_require_unstarted=True,
                 reservation_runtime_root=reservation_runtime_root,
-            )
+            ):
+                handle = launch_failure_handle(exc)
+                if handle is not None:
+                    try:
+                        executor.cleanup_launch(handle)
+                    except Exception as cleanup_error:
+                        append_launch_failure_diagnostic(
+                            cfg,
+                            task.task_id,
+                            attempt.attempt_id,
+                            cleanup_error,
+                        )
     return launched
 
 

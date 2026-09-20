@@ -149,10 +149,10 @@ The primary deployment assumes:
 - machine identities are registered explicitly and are administratively trusted
 - processes, PIDs, local launch backend state, GPU reservations, and wrapper state remain local
 
-The runtime is primarily designed for machines where `tmux` is available and can serve as
-the interactive launch backend. When `tmux` is unavailable, the runtime may launch local
-detached processes directly as a degraded compatibility path. The runtime contract does not
-guarantee equal observability, ergonomics, or performance for that non-`tmux` path.
+The agent launches runners directly with its current environment. When `tmux` is available, it
+provides non-authoritative interactive log observation after durable runner handoff. Execution,
+fencing, and recovery do not depend on tmux availability or shell initialization; installations
+without tmux retain the same execution contract with reduced interactive observability.
 
 qexp does not snapshot source code. A Task executes the files visible on its execution
 machine at launch time.
@@ -996,6 +996,23 @@ materializes only a `launch_unverifiable` manifest, retains the reservation, and
 local diagnostic. It must not automatically release, recover, retry, or signal that Attempt.
 Programs that explicitly leave the guardian process group (`setsid()` / `setpgid()`) are outside
 this guarantee and require cgroup-level containment to govern.
+
+The agent directly creates the runner with its current environment and the configured project
+working directory, without routing runner startup through a shell or the tmux server environment.
+Runner bootstrap output is appended to the Attempt log. After durable handoff, an available tmux
+session receives a non-authoritative log-observer window; observer failure cannot revoke an accepted
+runner. The project launch-handoff policy supplies a
+finite 1-to-300-second observation budget, defaulting to 10 seconds, which is frozen for each
+initiated runner. The machine agent retains each unconfirmed handoff in process-local state and
+polls it across bounded dispatch cycles; it never sleeps for this budget while holding scheduler
+authority. The reservation remains occupied, starting recovery excludes the pending Attempt, and
+the agent wake-up deadline is no later than the earliest pending handoff deadline. On agent restart,
+ordinary starting recovery may replay the launch, while the immutable launch-intent publication
+fence prevents two runners from accepting the same authorization. On expiry, the owner rechecks
+local evidence under the launch authority fence.
+It may commit an unstarted failure, release capacity, and clean the exact launch container only
+when no launch intent, process registration, process manifest, or exit observation exists. If
+evidence exists or cannot be verified, recovery retains authority and capacity for that Attempt.
 
 Reconciliation distinguishes three outcomes:
 

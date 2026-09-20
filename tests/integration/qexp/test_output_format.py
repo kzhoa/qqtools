@@ -101,6 +101,64 @@ def test_progress_policy_cli_accepts_large_finite_interval(tmp_path: Path, capsy
     assert json.loads(capsys.readouterr().out)["interval_seconds"] == 1e308
 
 
+def test_launch_handoff_policy_cli_reports_default_and_configured_value(tmp_path: Path, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    base = _base_args(cfg)
+
+    assert main([*base, "config", "launch-handoff", "show", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "timeout_seconds": 10,
+        "source": "default",
+        "applies_to": "new_launches",
+    }
+
+    assert (
+        main(
+            [
+                *base,
+                "config",
+                "launch-handoff",
+                "set",
+                "--timeout-seconds",
+                "12.5",
+                "--format=json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {
+        "timeout_seconds": 12.5,
+        "source": "configured",
+        "applies_to": "new_launches",
+    }
+
+    assert main([*base, "config", "launch-handoff", "show"]) == 0
+    human = capsys.readouterr().out
+    assert "Timeout seconds: 12.5" in human
+    assert "Source: configured" in human
+    assert "Applies to: new_launches" in human
+
+
+@pytest.mark.parametrize("value", ["0", "0.5", "301", "nan", "inf", "-inf"])
+def test_launch_handoff_policy_cli_rejects_invalid_timeout(tmp_path: Path, capsys, value: str):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+
+    assert (
+        main(
+            [
+                *_base_args(cfg),
+                "config",
+                "launch-handoff",
+                "set",
+                f"--timeout-seconds={value}",
+                "--format=json",
+            ]
+        )
+        == 2
+    )
+    assert "timeout" in capsys.readouterr().err.lower()
+
+
 @pytest.mark.parametrize("value", ["0", "0.5", "nan", "inf", "-inf"])
 def test_progress_policy_cli_rejects_invalid_interval(tmp_path: Path, capsys, value: str):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")

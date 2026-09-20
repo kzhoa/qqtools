@@ -14,7 +14,13 @@ from typing import Any, Callable, ContextManager
 
 from ..authority import AuthoritySupervisor
 from ..config_types import RootConfig
-from ..executor import Executor, LaunchHandoff
+from ..executor import (
+    Executor,
+    ExecutorLaunchHandoffTimeout,
+    LaunchHandle,
+    LaunchHandoff,
+    append_launch_failure_diagnostic,
+)
 from ..layout import load_machine_record, load_root_config, machine_state_path, runtime_pid_path
 from ..legacy_agent import _visible_gpus, get_agent_status
 from ..machine_config import is_legacy_agent_project, load_machine_policy, save_machine_config
@@ -95,59 +101,226 @@ class _PendingLaunchHandoff:
     fencing_token: int
     project_id: str
     handoff: LaunchHandoff
+    handle: LaunchHandle | None = None
+    compensation_committed: bool = False
+    retry_not_before: float = 0.0
+    retry_failures: int = 0
 
 
 class _LaunchHandoffBatch:
-    """Initiate machine-cycle launches before jointly awaiting runner handoffs."""
+    """Track runner handoffs without blocking a machine dispatch cycle.
 
-    def __init__(self, executor: Executor, runtime_root: Path) -> None:
+    A runner can be alive and authorized while its launch-intent publication is
+    delayed by local startup work.  The reservation is deliberately retained
+    during that interval; the machine agent polls the durable intent once per
+    cycle and only compensates after the bounded deadline expires.
+    """
+
+    def __init__(self, executor: Executor, runtime: MachineRuntime | str | Path) -> None:
         self._executor = executor
-        self._runtime_root = runtime_root
+        if not isinstance(runtime, (str, Path)) and hasattr(runtime, "pending_launch_handoffs"):
+            self._runtime = runtime
+            self._runtime_root = Path(runtime.root)
+        else:
+            # Keep the old construction seam useful for focused callers that
+            # only exercise a batch in isolation.  Machine dispatch always
+            # passes MachineRuntime, which is what provides cross-cycle state.
+            self._runtime = None
+            self._runtime_root = Path(runtime)
         self._pending: list[_PendingLaunchHandoff] = []
+
+    @property
+    def _pending_store(self) -> dict[tuple[str, str], _PendingLaunchHandoff]:
+        if self._runtime is None:
+            return {}
+        return self._runtime.pending_launch_handoffs
+
+    def _pending_items(self) -> list[_PendingLaunchHandoff]:
+        """Return persistent and compatibility-local records exactly once."""
+        items: list[_PendingLaunchHandoff] = []
+        seen: set[tuple[str, str]] = set()
+        for pending in (*self._pending_store.values(), *self._pending):
+            key = (pending.project_id, pending.attempt_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(pending)
+        return items
+
+    def _remember(self, pending: _PendingLaunchHandoff) -> None:
+        key = (pending.project_id, pending.attempt_id)
+        if key in self._pending_store or any(
+            item.project_id == pending.project_id and item.attempt_id == pending.attempt_id for item in self._pending
+        ):
+            raise RuntimeError(f"launch handoff is already pending for {key!r}")
+        if self._runtime is not None:
+            self._runtime.pending_launch_handoffs[key] = pending
+        self._pending.append(pending)
+
+    def _remove(self, pending: _PendingLaunchHandoff) -> None:
+        key = (pending.project_id, pending.attempt_id)
+        if self._runtime is not None and self._runtime.pending_launch_handoffs.get(key) is pending:
+            del self._runtime.pending_launch_handoffs[key]
+        self._pending = [item for item in self._pending if item is not pending]
+
+    def _replace(self, pending: _PendingLaunchHandoff) -> None:
+        key = (pending.project_id, pending.attempt_id)
+        if self._runtime is not None and self._runtime.pending_launch_handoffs.get(key) is not None:
+            self._runtime.pending_launch_handoffs[key] = pending
+        self._pending = [pending if (item.project_id, item.attempt_id) == key else item for item in self._pending]
+
+    def _defer_retry(self, pending: _PendingLaunchHandoff, now: float) -> None:
+        failures = pending.retry_failures + 1
+        delay = min(5.0, 0.1 * (2 ** min(failures - 1, 6)))
+        self._replace(replace(pending, retry_not_before=now + delay, retry_failures=failures))
 
     def launch(self, cfg: RootConfig, task_id: str, attempt: Any, project_id: str) -> None:
         initiate = getattr(self._executor, "initiate_attempt", None)
         if initiate is None:
             self._executor.launch_attempt(cfg, task_id, attempt)
             return
+        key = (project_id, attempt.attempt_id)
+        if key in self._pending_store or any(
+            item.project_id == project_id and item.attempt_id == attempt.attempt_id for item in self._pending
+        ):
+            raise RuntimeError(f"launch handoff is already pending for {key!r}")
         with diagnostic_span("executor.launch.initiate"):
-            _, handoff = initiate(cfg, task_id, attempt)
-        self._pending.append(
-            _PendingLaunchHandoff(
-                cfg,
-                task_id,
-                attempt.attempt_id,
-                attempt.current_fencing_token,
-                project_id,
-                handoff,
-            )
+            handle, handoff = initiate(cfg, task_id, attempt)
+        if not isinstance(handle, LaunchHandle):
+            candidate = getattr(handoff, "handle", None)
+            handle = candidate if isinstance(candidate, LaunchHandle) else None
+        pending = _PendingLaunchHandoff(
+            cfg,
+            task_id,
+            attempt.attempt_id,
+            attempt.current_fencing_token,
+            project_id,
+            handoff,
+            handle,
         )
+        self._remember(pending)
 
-    def finish(self, result_by_project: dict[str, dict[str, Any]]) -> None:
-        if not self._pending:
+    def poll(self, result_by_project: dict[str, dict[str, Any]] | None = None) -> None:
+        """Poll pending handoffs once, never sleeping or waiting on a child."""
+        pending_items = self._pending_items()
+        if not pending_items:
             return
-        with diagnostic_span("executor.launch.handoff_batch"):
-            failures = self._executor.wait_for_launch_handoffs([pending.handoff for pending in self._pending])
-        for pending in self._pending:
-            failure = failures.get(pending.handoff)
-            if failure is None:
+        for pending in pending_items:
+            now = time.monotonic()
+            if now < pending.retry_not_before:
                 continue
-            fail_attempt(
-                pending.cfg,
-                pending.task_id,
-                pending.attempt_id,
-                pending.fencing_token,
-                "executor_launch_failed",
-                should_require_unstarted=True,
-                reservation_runtime_root=self._runtime_root,
+            if pending.compensation_committed:
+                handle = pending.handle
+                if handle is None:
+                    self._remove(pending)
+                    continue
+                try:
+                    self._executor.cleanup_launch(handle)
+                except Exception as exc:
+                    append_launch_failure_diagnostic(pending.cfg, pending.task_id, pending.attempt_id, exc)
+                    self._defer_retry(pending, now)
+                    continue
+                self._remove(pending)
+                self._record_result_failure(
+                    pending,
+                    ExecutorLaunchHandoffTimeout("launch cleanup completed after compensation"),
+                    result_by_project,
+                )
+                continue
+            try:
+                published = pending.handoff.intent_path.exists()
+            except Exception as exc:
+                append_launch_failure_diagnostic(pending.cfg, pending.task_id, pending.attempt_id, exc)
+                self._defer_retry(pending, now)
+                continue
+            if published:
+                attach_observer = getattr(self._executor, "attach_observer", None)
+                if pending.handle is not None and callable(attach_observer):
+                    try:
+                        attach_observer(pending.cfg, pending.task_id, pending.attempt_id, pending.handle)
+                    except Exception as exc:
+                        append_launch_failure_diagnostic(pending.cfg, pending.task_id, pending.attempt_id, exc)
+                self._remove(pending)
+                continue
+
+            try:
+                is_expired = now >= pending.handoff.deadline
+            except Exception as exc:
+                append_launch_failure_diagnostic(pending.cfg, pending.task_id, pending.attempt_id, exc)
+                self._defer_retry(pending, now)
+                continue
+            if not is_expired:
+                continue
+
+            handle = pending.handle
+            if not isinstance(handle, LaunchHandle):
+                candidate = getattr(pending.handoff, "handle", None)
+                handle = candidate if isinstance(candidate, LaunchHandle) else None
+            if pending.handle is None and handle is not None:
+                pending = replace(pending, handle=handle)
+                self._replace(pending)
+            timeout = ExecutorLaunchHandoffTimeout(
+                f"runner did not publish launch intent for {pending.attempt_id!r}",
+                handle=handle,
             )
-            launched = result_by_project[pending.project_id]["launched"]
-            if pending.task_id in launched:
-                launched.remove(pending.task_id)
-            item = result_by_project[pending.project_id]
-            item["status"] = "error"
-            item["error"] = str(failure)
-        self._pending.clear()
+            append_launch_failure_diagnostic(pending.cfg, pending.task_id, pending.attempt_id, timeout)
+            try:
+                did_fail = fail_attempt(
+                    pending.cfg,
+                    pending.task_id,
+                    pending.attempt_id,
+                    pending.fencing_token,
+                    "executor_launch_handoff_timeout",
+                    should_require_unstarted=True,
+                    reservation_runtime_root=self._runtime_root,
+                )
+            except Exception as exc:
+                append_launch_failure_diagnostic(pending.cfg, pending.task_id, pending.attempt_id, exc)
+                self._defer_retry(pending, now)
+                continue
+            if not did_fail:
+                # Evidence or authority changed after the timeout.  Leave the
+                # live attempt to normal recovery and never kill its handle.
+                self._remove(pending)
+                continue
+            if handle is None:
+                self._remove(pending)
+                self._record_result_failure(pending, timeout, result_by_project)
+                continue
+            try:
+                self._executor.cleanup_launch(handle)
+            except Exception as exc:
+                # Compensation committed, but exact resource cleanup did not.
+                # Retain the record and retry cleanup in a later cycle without
+                # attempting fail_attempt a second time.
+                append_launch_failure_diagnostic(pending.cfg, pending.task_id, pending.attempt_id, exc)
+                pending = replace(pending, compensation_committed=True)
+                self._replace(pending)
+                self._defer_retry(pending, now)
+                continue
+            self._remove(pending)
+            self._record_result_failure(pending, timeout, result_by_project)
+
+    def _record_result_failure(
+        self,
+        pending: _PendingLaunchHandoff,
+        failure: BaseException,
+        result_by_project: dict[str, dict[str, Any]] | None,
+    ) -> None:
+        if result_by_project is None:
+            return
+        item = result_by_project.get(pending.project_id)
+        if item is None:
+            return
+        launched = item.get("launched", [])
+        if pending.task_id in launched:
+            launched.remove(pending.task_id)
+        item["status"] = "error"
+        item["error"] = str(failure)
+
+    def finish(self, result_by_project: dict[str, dict[str, Any]] | None = None) -> None:
+        """Compatibility alias for one non-blocking poll."""
+        self.poll(result_by_project)
 
 
 @dataclass(frozen=True, slots=True)
@@ -637,9 +810,15 @@ def _dispatch_machine_cycle_locked(
     publish_snapshots: bool = True,
 ) -> list[dict[str, Any]]:
     executor = executor or Executor()
-    launch_batch = _LaunchHandoffBatch(executor, runtime.root)
+    launch_batch = _LaunchHandoffBatch(executor, runtime)
     runtime.last_cycle_had_demand = False
     runtime.last_cycle_consumed_binding = False
+    # Poll handoffs before registry/recovery work, including the no-binding
+    # case. A pending reservation must not keep an idle agent alive forever
+    # without making progress on its bounded launch deadline.
+    launch_batch.poll()
+    if getattr(runtime, "pending_launch_handoffs", {}):
+        runtime.last_cycle_had_demand = True
     with diagnostic_span("machine.registry.load"):
         _, registered = runtime.load_registry()
     supervised = [
@@ -752,15 +931,26 @@ def _dispatch_machine_cycle_locked(
                 }
             )
     executor = executor or Executor()
+    # A deadline may have elapsed while maintenance and reservation
+    # reconciliation ran. Poll once more immediately before starting
+    # recovery, then exclude any still-pending identity from relaunch.
+    launch_batch.poll()
     with diagnostic_span("machine.reservations.snapshot"):
         snapshot = reconcile_snapshot(runtime.root)
+    pending_identities = (
+        runtime.pending_launch_identities()
+        if hasattr(runtime, "pending_launch_identities")
+        else set(getattr(runtime, "pending_launch_handoffs", {}))
+    )
     recovered = _recover_starting_reservations(
         runtime,
         dispatchable,
         snapshot.active,
         executor,
+        excluded_pending=pending_identities,
+        launch_recovered=launch_batch.launch,
     )
-    runtime.last_cycle_had_demand = bool(results) or any(recovered.values())
+    runtime.last_cycle_had_demand = runtime.last_cycle_had_demand or bool(results) or any(recovered.values())
     with diagnostic_span("machine.reservations.snapshot"):
         snapshot = reconcile_snapshot(runtime.root)
     visible = (

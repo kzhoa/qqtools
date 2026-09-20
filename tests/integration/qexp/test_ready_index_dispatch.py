@@ -54,20 +54,16 @@ class _RecordingExecutor:
 
 
 class _BatchedRecordingExecutor(_RecordingExecutor):
-    def __init__(self, *, should_fail_first: bool = False) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.waited_attempt_ids: list[str] = []
-        self.should_fail_first = should_fail_first
 
     def initiate_attempt(self, cfg, task_id, attempt):
         self.launched.append(task_id)
         return "runner", LaunchHandoff(attempt.attempt_id, cfg.runtime_root / "unused", float("inf"))
 
     def wait_for_launch_handoffs(self, handoffs):
-        self.waited_attempt_ids = [handoff.attempt_id for handoff in handoffs]
-        if self.should_fail_first:
-            return {handoffs[0]: RuntimeError("handoff failed")}
-        return {}
+        raise AssertionError(f"machine launch handoffs must never block: {handoffs!r}")
 
 
 def _borrow_project(tmp_path: Path, work: Path):
@@ -1440,12 +1436,13 @@ def test_project_round_robin_fairness_survives_dynamic_binding(tmp_path: Path) -
 
     result_by_project = {item["project_id"]: item for item in results}
     assert executor.launched == [projects[1][1].task_id, projects[0][1].task_id]
-    assert len(executor.waited_attempt_ids) == 2
+    assert executor.waited_attempt_ids == []
+    assert len(runtime.pending_launch_handoffs) == 2
     assert all(result_by_project[binding.project_id]["launched"] == [task.task_id] for _cfg, task, binding in projects)
     assert runtime.load_cursor() == projects[1][2].project_id
 
 
-def test_machine_dispatch_attributes_batched_handoff_failure(tmp_path: Path) -> None:
+def test_machine_dispatch_keeps_unconfirmed_handoff_pending(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
     runtime = MachineRuntime(tmp_path / "machine-runtime")
@@ -1457,7 +1454,7 @@ def test_machine_dispatch_attributes_batched_handoff_failure(tmp_path: Path) -> 
     results = dispatch_machine_cycle_locked(
         runtime,
         available_gpus=[0],
-        executor=_BatchedRecordingExecutor(should_fail_first=True),
+        executor=_BatchedRecordingExecutor(),
         supervise=False,
         publish_snapshots=False,
     )
@@ -1465,11 +1462,11 @@ def test_machine_dispatch_attributes_batched_handoff_failure(tmp_path: Path) -> 
     result_by_project = {item["project_id"]: item for item in results}
     assert result_by_project[binding.project_id] == {
         "project_id": binding.project_id,
-        "launched": [],
-        "status": "error",
-        "error": "handoff failed",
+        "launched": [task.task_id],
+        "status": "dispatched",
     }
+    assert len(runtime.pending_launch_handoffs) == 1
     assert (
         read_json(shared_paths(cfg.shared_root)["tasks"] / f"{task.task_id}.json")["task"]["state"]["projection"]
-        == "failed"
+        == "running"
     )

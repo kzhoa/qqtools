@@ -42,6 +42,7 @@ class _FakeSession:
         self.windows_list = [_FakeWindow("@base", "shell")]
         self.windows = _FakeCollection(self.windows_list, "window_name")
         self.last_window_start_directory = None
+        self.last_window_shell = None
 
     def show_option(self, _name: str):
         return self._role
@@ -54,8 +55,10 @@ class _FakeSession:
         window_name: str,
         attach: bool = False,
         start_directory: str | None = None,
+        window_shell: str | None = None,
     ):
         self.last_window_start_directory = start_directory
+        self.last_window_shell = window_shell
         window = _FakeWindow(f"@{len(self.windows_list) + 1}", window_name)
         self.windows_list.append(window)
         return window
@@ -68,6 +71,7 @@ class _FakeServer:
         self.sessions = _FakeCollection(self.sessions_list, "session_name")
         self.windows = _FakeCollection(self.windows_list, "window_id")
         self.last_session_start_directory = None
+        self.last_session_window_command = None
 
     def new_session(
         self,
@@ -75,8 +79,10 @@ class _FakeServer:
         window_name: str,
         detached: bool = True,
         start_directory: str | None = None,
+        window_command: str | None = None,
     ):
         self.last_session_start_directory = start_directory
+        self.last_session_window_command = window_command
         session = _FakeSession(session_name)
         session.windows_list = [_FakeWindow("@new", window_name)]
         session.windows = _FakeCollection(session.windows_list, "window_name")
@@ -121,8 +127,25 @@ def test_create_window_for_task_uses_custom_session(monkeypatch):
         "task-demo",
         session_name="custom",
         start_directory="/tmp/project",
+        initial_command="exec /usr/bin/python -m example",
     )
 
     assert window_id == "@2"
     assert session.windows_list[-1].window_name == "task-demo"
     assert session.last_window_start_directory == "/tmp/project"
+    assert session.last_window_shell == "exec /usr/bin/python -m example"
+
+
+def test_create_window_uses_initial_command_when_creating_session(monkeypatch):
+    server = _FakeServer()
+    monkeypatch.setattr(tmux, "_get_server", lambda: server)
+
+    window_id = tmux.create_window_for_task(
+        "task-demo",
+        start_directory="/tmp/project",
+        initial_command="exec tail -F attempt.log",
+    )
+
+    assert window_id == "@new"
+    assert server.last_session_window_command == "exec tail -F attempt.log"
+    assert server.sessions_list[0].windows_list[0].window_name == "task-demo"

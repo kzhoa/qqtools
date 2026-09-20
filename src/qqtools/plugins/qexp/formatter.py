@@ -44,6 +44,7 @@ class OutputKind(str, Enum):
     BATCH_SUBMIT = "batch-submit"
     CONTEXT = "context"
     PROGRESS_POLICY = "progress-policy"
+    LAUNCH_HANDOFF_POLICY = "launch-handoff-policy"
     NOTIFICATIONS = "notifications"
     LEASE_POLICY = "lease-policy"
     DOCTOR_VERIFY = "doctor-verify"
@@ -585,6 +586,17 @@ def _render_progress_policy(result: Mapping[str, Any], _presentation: Mapping[st
     )
 
 
+def _render_launch_handoff_policy(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _details(
+        (
+            ("Timeout seconds", result.get("timeout_seconds")),
+            ("Source", result.get("source")),
+            ("Applies to", result.get("applies_to")),
+        ),
+        (("Timing", "The timeout is frozen for each new runner launch."),),
+    )
+
+
 def _render_named_operation(result: Mapping[str, Any], default_action: str) -> str:
     action = result.get("action", default_action)
     status = result.get("status", result.get("state", "completed"))
@@ -939,6 +951,12 @@ def _validate_progress_policy(result: Any) -> None:
         _required(value, key, "progress-policy payload")
 
 
+def _validate_launch_handoff_policy(result: Any) -> None:
+    value = _mapping(result, "launch-handoff-policy payload")
+    for key in ("timeout_seconds", "source", "applies_to"):
+        _required(value, key, "launch-handoff-policy payload")
+
+
 def _validate_notifications(result: Any) -> None:
     value = _mapping(result, "notifications payload")
     _required_bool(value, "enabled", "notifications payload")
@@ -1006,6 +1024,10 @@ _REGISTRY: dict[OutputKind, _OutputContract] = {
     OutputKind.BATCH_SUBMIT: _OutputContract(_validate_batch_submit, _render_batch_submit),
     OutputKind.CONTEXT: _OutputContract(_validate_context, _render_context),
     OutputKind.PROGRESS_POLICY: _OutputContract(_validate_progress_policy, _render_progress_policy),
+    OutputKind.LAUNCH_HANDOFF_POLICY: _OutputContract(
+        _validate_launch_handoff_policy,
+        _render_launch_handoff_policy,
+    ),
     OutputKind.NOTIFICATIONS: _OutputContract(_validate_notifications, _render_notifications),
     OutputKind.LEASE_POLICY: _OutputContract(_validate_lease_policy, _render_lease_policy),
     OutputKind.DOCTOR_VERIFY: _OutputContract(_validate_doctor_verify, _render_doctor),

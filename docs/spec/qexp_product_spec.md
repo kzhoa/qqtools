@@ -149,10 +149,11 @@ It is local-first:
 - process, PID, local launch backend, and GPU reservation remain machine-local; qexp-captured
   Attempt stdout/stderr logs are shared for cross-machine inspection
 
-`tmux` is the primary interactive launch and observation backend that qexp is designed to
-work with. qexp also permits degraded operation when `tmux` is unavailable by launching
-local detached processes directly, but feature depth and performance commitments are made
-for the `tmux` path first.
+qexp launches each runner directly from the local agent with an explicit working directory and
+the agent's current environment. When `tmux` is available, qexp creates a non-authoritative
+Attempt-log observer window after the runner accepts the durable handoff. Execution does not
+depend on tmux or interactive-shell readiness; without tmux, the runner and shared log retain the
+same lifecycle semantics while interactive observation is unavailable.
 
 It may optionally cooperate across machines:
 
@@ -1432,12 +1433,23 @@ are exposed through Task/Group JSON, events, and `doctor` only.
 - `qexp machines`
 - `qexp config progress show`
 - `qexp config progress set --interval-seconds <seconds>`
+- `qexp config launch-handoff show`
+- `qexp config launch-handoff set --timeout-seconds <seconds>`
 
 The progress policy defaults to 30 seconds and accepts finite values greater than or equal
 to 1. It applies to subsequent launches and retries, while an already-running Attempt keeps
 the policy frozen at launch. A larger interval reduces progress-related local and shared
 filesystem writes at the cost of freshness; it is not a visibility deadline or a quota on
 arbitrary application I/O.
+
+The launch-handoff policy defaults to 10 seconds and accepts finite values from 1 through
+300 seconds. It applies to subsequent launch and retry Attempts and is frozen when the local
+runner is initiated. The budget covers durable publication of the runner's launch intent; it
+does not cover CUDA initialization, application startup, or first progress. A timeout initiates
+locked compensation but does not prove that execution is absent. Existing local launch evidence
+retains the reservation for recovery. Machine-agent scheduling remains available to other projects
+while handoffs are pending; pending Attempts keep their reservations until confirmation or fenced
+compensation.
 
 ### 16.2 Task Commands
 

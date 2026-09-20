@@ -126,6 +126,12 @@ class MachineRuntime:
         self.upgrade_next_pass_at = 0.0
         self.upgrade_admission_blocked_projects: set[str] = set()
         self.supervisor_generations: dict[str, str | None] = {}
+        # A direct runner may need more than one scheduler cycle to publish its
+        # durable launch intent.  Keep those handoffs in process memory while
+        # the machine reservation remains authoritative.  The dispatch layer
+        # owns the record shape; this map deliberately stores opaque values so
+        # context.py does not depend on the executor implementation.
+        self.pending_launch_handoffs: dict[tuple[str, str], Any] = {}
         self.group_source_owner = GroupSourceOwner()
         self.registration = MachineRegistration(
             self.root,
@@ -700,6 +706,29 @@ class MachineRuntime:
 
     def save_cursor(self, project_id: str | None) -> None:
         atomic_replace(self.paths["cursor"], {"cursor": {"next_project_id": project_id, "updated_at": utc_now()}})
+
+    def pending_launch_identities(self) -> set[tuple[str, str]]:
+        """Return pending ``(project_id, attempt_id)`` handoff identities."""
+        return set(self.pending_launch_handoffs)
+
+    def pending_launch_wait_seconds(self, maximum: float) -> float:
+        """Bound an agent sleep by the earliest in-process handoff deadline."""
+        if maximum < 0:
+            raise ValueError("maximum wait must not be negative")
+        if not self.pending_launch_handoffs:
+            return maximum
+        now = time.monotonic()
+        earliest: float | None = None
+        for pending in self.pending_launch_handoffs.values():
+            handoff = getattr(pending, "handoff", pending)
+            deadline = getattr(handoff, "deadline", None)
+            if isinstance(deadline, (int, float)):
+                retry_not_before = getattr(pending, "retry_not_before", 0.0)
+                wake_at = max(deadline, retry_not_before) if isinstance(retry_not_before, (int, float)) else deadline
+                earliest = wake_at if earliest is None else min(earliest, wake_at)
+        if earliest is None:
+            return maximum
+        return min(maximum, max(0.0, earliest - now))
 
     def execution_context(self, cfg: RootConfig) -> ExecutionContext:
         """Pair project operations with the shared machine reservation backend when registered."""

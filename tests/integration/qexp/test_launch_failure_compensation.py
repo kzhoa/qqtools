@@ -121,7 +121,7 @@ def test_batched_handoff_failure_retains_existing_launch_evidence(tmp_path, lane
 
     class FailedHandoff:
         def wait_for_launch_handoffs(self, _handoffs):
-            return {handoff: RuntimeError("handoff failed")}
+            raise AssertionError("machine launch handoffs must never block")
 
     batch = dispatch_loop._LaunchHandoffBatch(FailedHandoff(), cfg.runtime_root)
     batch._pending.append(
@@ -134,7 +134,7 @@ def test_batched_handoff_failure_retains_existing_launch_evidence(tmp_path, lane
     assert load_task(cfg, task.task_id).state["projection"] == "running"
     assert_reserved(cfg, task)
     assert path.exists()
-    assert result["project"]["status"] == "error"
+    assert result["project"]["status"] == "dispatched"
 
 
 def test_failure_before_intent_prevents_delayed_runner_and_replay(tmp_path):

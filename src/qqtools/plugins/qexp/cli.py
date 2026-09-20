@@ -44,6 +44,11 @@ from .commands import task as task_commands
 from .config_types import RootConfig
 from .doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
 from .formatter import CliOutput, OutputKind, render
+from .launch_policy import (
+    set_launch_handoff_policy,
+    show_launch_handoff_policy,
+    validate_launch_handoff_timeout_seconds,
+)
 from .layout import clear_context, load_context, load_root_config, migrate_schema5_to_schema6, save_context
 from .lease import LeasePolicy, load_lease_policy, save_lease_policy
 from .legacy_agent import get_agent_status
@@ -183,6 +188,7 @@ def _requires_verified_binding(args: argparse.Namespace) -> bool:
             getattr(args, "notifications_action", None) == "set"
             or getattr(args, "provider_action", None) == "set"
             or getattr(args, "progress_action", None) == "set"
+            or getattr(args, "launch_handoff_action", None) == "set"
         )
     if args.command == "lease-policy":
         return args.lease_policy_action == "set"
@@ -364,6 +370,16 @@ def build_parser() -> argparse.ArgumentParser:
     progress_set = progress_config_sub.add_parser("set")
     _add_output_format(progress_set)
     progress_set.add_argument("--interval-seconds", required=True)
+    launch_handoff_config = config_sub.add_parser(
+        "launch-handoff",
+        help="Configure the runner launch-handoff timeout.",
+    )
+    launch_handoff_sub = launch_handoff_config.add_subparsers(dest="launch_handoff_action", required=True)
+    launch_handoff_show = launch_handoff_sub.add_parser("show")
+    _add_output_format(launch_handoff_show)
+    launch_handoff_set = launch_handoff_sub.add_parser("set")
+    _add_output_format(launch_handoff_set)
+    launch_handoff_set.add_argument("--timeout-seconds", required=True)
     provider = notifications_sub.add_parser("provider")
     provider_sub = provider.add_subparsers(dest="provider_action", required=True)
     provider_set = provider_sub.add_parser("set")
@@ -620,6 +636,21 @@ def _parse_progress_interval_argument(value: str) -> int | float:
         except ValueError as exc:
             raise ValueError("--interval-seconds must be a finite number of at least 1 second.") from exc
     return validate_interval_seconds(parsed)
+
+
+def _parse_launch_handoff_timeout_argument(value: str) -> int | float:
+    """Parse a launch timeout so malformed values become a specific ValueError."""
+    text = value.strip()
+    if not text:
+        raise ValueError("--timeout-seconds requires a finite number from 1 through 300 seconds.")
+    try:
+        parsed: int | float = int(text, 10)
+    except ValueError:
+        try:
+            parsed = float(text)
+        except ValueError as exc:
+            raise ValueError("--timeout-seconds must be a finite number from 1 through 300 seconds.") from exc
+    return validate_launch_handoff_timeout_seconds(parsed)
 
 
 def _gpu_limit_gpus(value: str) -> int | str:
@@ -969,6 +1000,21 @@ def main(argv: list[str] | None = None) -> int:
                     CliOutput(
                         OutputKind.PROGRESS_POLICY,
                         set_progress_policy(cfg, _parse_progress_interval_argument(args.interval_seconds)),
+                    ),
+                    args.format,
+                )
+                return 0
+            if args.config_action == "launch-handoff":
+                if args.launch_handoff_action == "show":
+                    _emit(CliOutput(OutputKind.LAUNCH_HANDOFF_POLICY, show_launch_handoff_policy(cfg)), args.format)
+                    return 0
+                _emit(
+                    CliOutput(
+                        OutputKind.LAUNCH_HANDOFF_POLICY,
+                        set_launch_handoff_policy(
+                            cfg,
+                            _parse_launch_handoff_timeout_argument(args.timeout_seconds),
+                        ),
                     ),
                     args.format,
                 )

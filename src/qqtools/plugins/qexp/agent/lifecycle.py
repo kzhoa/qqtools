@@ -305,7 +305,9 @@ def run_machine_agent_loop(
                         continue
                 else:
                     idle_since = None
-                scheduler_wakeup.wait(loop_interval)
+                pending_wait = getattr(machine_runtime, "pending_launch_wait_seconds", None)
+                wait_seconds = pending_wait(loop_interval) if callable(pending_wait) else loop_interval
+                scheduler_wakeup.wait(wait_seconds)
         finally:
             recovery_enrollment.stop()
             if submission_control_worker is not None:
