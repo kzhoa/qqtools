@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v1.3.19
+
+- feat: separate qexp active responsibility from indexed Task history, with resumable local and
+  Group discovery, bounded history pagination, fair maintenance, and crash-safe upgrade boundaries.
+- feat: improve qexp and qpipeline live-progress reporting with bounded producers, terminal-state
+  retention, clearer inspection output, and hardened concurrent writer cleanup.
+- fix: bound qexp authority and recovery work, renew registrations independently, preserve useful
+  terminal evidence, and avoid redundant advisory-state writes.
+- fix: automatically reactivate expired qexp project registrations even when the local agent has
+  no tasks, restoring renewal without requiring manual re-registration.
+- chore: consolidate feature and release validation into distinct exact-commit GitHub Actions gates
+  and document the standard administrator release path.
+
 ## v1.3.18
 
 - fix: roll back a rejected qexp legacy-migration registration attempt before fencing its stale
