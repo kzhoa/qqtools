@@ -324,6 +324,21 @@ def _render_human(kind: str, result: Any, *, tasks: Sequence[Mapping[str, Any]])
         )
     if kind == "context":
         return f"shared_root: {result.get('shared_root') or '<not set>'}"
+    if kind == "progress-policy":
+        return _details(
+            (
+                ("Interval seconds", result.get("interval_seconds")),
+                ("Source", result.get("source")),
+                ("Applies to", result.get("applies_to")),
+            ),
+            (
+                (
+                    "Timing",
+                    "Shorter intervals show fresh reports sooner but increase filesystem I/O; "
+                    "longer intervals reduce I/O and may delay visibility.",
+                ),
+            ),
+        )
     if kind in {"doctor", "clean", "notifications", "lease-policy"}:
         action = result.get("action", kind)
         status = result.get("status", result.get("state", "completed"))

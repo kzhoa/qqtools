@@ -333,10 +333,23 @@ class RunningAgent:
         model: nn.Module,
         loaders: list[tuple[Optional[str], DataLoader]],
         stage: Stage,
+        model_variant: Literal["standard", "ema"] = "standard",
     ) -> Optional[StageEvaluation]:
         loader_results: list[LoaderEvaluation] = []
         grouped_metrics: Dict[str, Dict[str, Any]] = {}
-        for loader_name, data_loader in loaders:
+        for loader_index, (loader_name, data_loader) in enumerate(loaders):
+            self.observers.dispatch(
+                "evaluation_started",
+                EvaluationStartedFact(
+                    epoch=self.state.epoch,
+                    global_step=self.state.global_step,
+                    total_batches=len(data_loader),
+                    evaluation_stage=stage.value,
+                    loader_name=loader_name,
+                    loader_index=(None if len(loaders) == 1 and loader_name is None else loader_index),
+                    model_variant=model_variant,
+                ),
+            )
             metrics = self._evaluate_loader(model=model, data_loader=data_loader, stage=stage)
             loader_results.append(LoaderEvaluation(name=loader_name, metrics=metrics))
             if loader_name is not None:
@@ -361,7 +374,7 @@ class RunningAgent:
     ) -> ModelEvaluation:
         stages = []
         for loaders, stage in ((val_loaders, Stage.VAL), (test_loaders, Stage.TEST)):
-            stage_result = self._evaluate_loader_group(model, loaders, stage)
+            stage_result = self._evaluate_loader_group(model, loaders, stage, model_variant)
             if stage_result is not None:
                 stages.append(stage_result)
         return ModelEvaluation(variant=model_variant, stages=tuple(stages))
@@ -417,7 +430,12 @@ class RunningAgent:
         )
 
         with self._ema_offload_ctx(model=base_model, use_ema=use_ema) as eval_model:
-            stage_result = self._evaluate_loader_group(eval_model, [(loader_name, prepared_loader)], stage)
+            stage_result = self._evaluate_loader_group(
+                eval_model,
+                [(loader_name, prepared_loader)],
+                stage,
+                "ema" if use_ema else "standard",
+            )
             assert stage_result is not None
             return EvaluationResult(
                 models=(ModelEvaluation(variant="ema" if use_ema else "standard", stages=(stage_result,)),)
@@ -531,16 +549,6 @@ class RunningAgent:
     def _run_evaluation_and_update(self) -> EarlyStopDecision:
         val_loaders, test_loaders = self._resolve_evaluation_loaders()
         val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(val_loaders, test_loaders)
-        total_eval_batches = sum(len(loader) for _, loader in (*val_loaders, *test_loaders))
-
-        self.observers.dispatch(
-            "evaluation_started",
-            EvaluationStartedFact(
-                epoch=self.state.epoch,
-                global_step=self.state.global_step,
-                total_batches=total_eval_batches,
-            ),
-        )
 
         interval_metrics = self.interval_avg_bank.gather_average(self.config.distributed)
         self.interval_avg_bank = AvgBank()

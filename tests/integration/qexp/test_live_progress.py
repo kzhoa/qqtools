@@ -12,6 +12,7 @@ from qqtools.plugins.qexp.authority import AuthoritySupervisor
 from qqtools.plugins.qexp.commands.cleanup import clean
 from qqtools.plugins.qexp.commands.task import retry
 from qqtools.plugins.qexp.observer import inspect_task
+from qqtools.plugins.qexp.progress_policy import set_progress_policy
 from qqtools.plugins.qexp.runner import run_attempt
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.progress import ProgressProjector, local_progress_path, shared_progress_path
@@ -33,7 +34,7 @@ def projector(cfg):
     return ProgressProjector(cfg, registration_generation=_TEST_GENERATION)
 
 
-def launch(cfg, task, monkeypatch, *, code=0, payload=None):
+def launch(cfg, task, monkeypatch, *, code=0, payload=None, expected_interval="30"):
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
@@ -52,6 +53,7 @@ def launch(cfg, task, monkeypatch, *, code=0, payload=None):
     def popen(*args, **kwargs):
         envs.append(kwargs["env"])
         assert kwargs["env"]["QEXP_PROGRESS_PATH"] == str(local_progress_path(cfg.runtime_root, attempt.attempt_id))
+        assert kwargs["env"]["QEXP_PROGRESS_INTERVAL_SECONDS"] == expected_interval
         assert "QEXP_PROGRESS_FD" not in kwargs["env"]
         if payload is not None:
             replace_advisory_snapshot(Path(kwargs["env"]["QEXP_PROGRESS_PATH"]), payload)
@@ -86,6 +88,7 @@ def report(current=3, update_id="update-1"):
 def test_short_command_final_report_survives_normal_evidence_cleanup(cfg, monkeypatch):
     monkeypatch.setenv("QEXP_PROGRESS_PATH", "/must-not-be-inherited")
     monkeypatch.setenv("QEXP_PROGRESS_FD", "99")
+    monkeypatch.setenv("QEXP_PROGRESS_INTERVAL_SECONDS", "1")
     task = submit(cfg, ["echo", "ok"])
     attempt, _ = launch(cfg, task, monkeypatch, payload=report())
     assert not (cfg.runtime_root / "process-registrations" / f"{attempt.attempt_id}.json").exists()
@@ -103,7 +106,12 @@ def test_retry_never_displays_previous_attempt_as_current(cfg, monkeypatch):
     task = submit(cfg, ["echo", "ok"])
     old, _ = launch(cfg, task, monkeypatch, code=1, payload=report(7))
     retry(cfg, task.task_id)
-    assert inspect_task(cfg, task.task_id)["progress"]["status"] == "unavailable"
+    pending = inspect_task(cfg, task.task_id)["progress"]
+    assert pending == {
+        "status": "unavailable",
+        "observation_state": "pending",
+        "reason": "not_started",
+    }
     new, _ = launch(cfg, task, monkeypatch, payload=report(2, "new-update"))
     assert old.attempt_id != new.attempt_id
     p = projector(cfg)
@@ -113,6 +121,20 @@ def test_retry_never_displays_previous_attempt_as_current(cfg, monkeypatch):
     assert view["attempt_id"] == new.attempt_id
     assert view["progress"]["current"] == 2
     assert not shared_progress_path(cfg.shared_root, task.task_id, old.attempt_id).exists()
+
+
+def test_retry_resolves_fresh_project_progress_policy(cfg, monkeypatch):
+    set_progress_policy(cfg, 60)
+    task = submit(cfg, ["echo", "ok"])
+    first, _ = launch(cfg, task, monkeypatch, code=1, expected_interval="60")
+    first_context = read_json(cfg.runtime_root / "progress-contexts" / f"{first.attempt_id}.json")
+    assert first_context["interval_seconds"] == 60
+
+    retry(cfg, task.task_id)
+    set_progress_policy(cfg, 90)
+    second, _ = launch(cfg, task, monkeypatch, expected_interval="90")
+    second_context = read_json(cfg.runtime_root / "progress-contexts" / f"{second.attempt_id}.json")
+    assert second_context["interval_seconds"] == 90
 
 
 def test_inspector_rejects_stale_token(cfg, monkeypatch):
@@ -125,10 +147,20 @@ def test_inspector_rejects_stale_token(cfg, monkeypatch):
     value = read_json(path)
     value["fencing_token"] += 1
     replace_advisory_snapshot(path, value)
-    assert inspect_task(cfg, task.task_id)["progress"]["status"] == "unavailable"
+    rejected = inspect_task(cfg, task.task_id)["progress"]
+    assert rejected["status"] == "unavailable"
+    assert rejected["observation_state"] == "unavailable"
+    assert rejected["reason"] == "identity_mismatch"
 
 
-@pytest.mark.parametrize("payload", [None, {"protocol_version": 1000}, {"metrics": {"loss": 1.0}}])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {"protocol_version": 1000},
+        {"metrics": {"loss": 1.0}},
+    ],
+)
 def test_missing_or_malformed_progress_does_not_fail_task(cfg, monkeypatch, payload):
     task = submit(cfg, ["echo", "ok"])
     launch(cfg, task, monkeypatch, payload=payload)
@@ -138,6 +170,44 @@ def test_missing_or_malformed_progress_does_not_fail_task(cfg, monkeypatch, payl
     view = inspect_task(cfg, task.task_id)
     assert view["task"]["state"]["projection"] == "succeeded"
     assert view["progress"]["status"] == "unavailable"
+    assert view["progress"]["observation_state"] == "no_report"
+    assert view["progress"]["reason"] == "no_snapshot"
+
+
+def test_reader_classifies_malformed_shared_snapshot(cfg, monkeypatch):
+    task = submit(cfg, ["echo", "ok"])
+    attempt, _ = launch(cfg, task, monkeypatch, payload=report())
+    p = projector(cfg)
+    p.tick()
+    p.close()
+    path = shared_progress_path(cfg.shared_root, task.task_id, attempt.attempt_id)
+    replace_advisory_snapshot(path, {"protocol_version": 1000})
+
+    observation = inspect_task(cfg, task.task_id)["progress"]
+
+    assert observation["status"] == "unavailable"
+    assert observation["observation_state"] == "unavailable"
+    assert observation["reason"] == "invalid_snapshot"
+
+
+def test_terminal_inspection_is_read_only_and_preserves_observed_timestamp(cfg, monkeypatch):
+    task = submit(cfg, ["echo", "ok"])
+    attempt, _ = launch(cfg, task, monkeypatch, payload=report())
+    p = projector(cfg)
+    p.tick()
+    p.close()
+
+    shared = shared_progress_path(cfg.shared_root, task.task_id, attempt.attempt_id)
+    before = (shared.stat().st_ino, shared.stat().st_size, shared.stat().st_mtime_ns)
+    first = inspect_task(cfg, task.task_id)["progress"]
+    second = inspect_task(cfg, task.task_id)["progress"]
+    after = (shared.stat().st_ino, shared.stat().st_size, shared.stat().st_mtime_ns)
+
+    assert first == second
+    assert first["observation_state"] == "available"
+    assert first["progress"]["current"] == 3
+    assert first["reported_at"] == second["reported_at"]
+    assert before == after
 
 
 def test_cleanup_removes_progress_sidecars(cfg, monkeypatch):
@@ -198,6 +268,54 @@ def test_real_guardian_inherits_channel_and_runs_public_api(cfg, monkeypatch):
     p.close()
     assert inspect_task(cfg, task.task_id)["progress"]["progress"]["current"] == 3
     assert read_logs(cfg, task.task_id).strip() == "done"
+
+
+def test_unchanged_qpipeline_command_reaches_task_show_progress(cfg, monkeypatch):
+    if not sys.platform.startswith("linux"):
+        pytest.skip("qexp process guardian requires Linux")
+    source_root = str(Path(__file__).resolve().parents[3] / "src")
+    monkeypatch.setenv("PYTHONPATH", source_root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    fixture = Path(__file__).resolve().parents[2] / "fixtures" / "qexp_progress_qpipeline.py"
+    task = submit(cfg, [sys.executable, str(fixture)])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    launch_id = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"][
+        "authorization"
+    ]["launch_id"]
+
+    class BoundedChild:
+        def __init__(self, *args, **kwargs):
+            self.child = subprocess.Popen(*args, **kwargs)
+            self.pid = self.child.pid
+
+        def wait(self):
+            try:
+                return self.child.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.pid, 9)
+                self.child.wait(timeout=5)
+                raise
+
+    assert (
+        run_attempt(
+            cfg,
+            task.task_id,
+            attempt.attempt_id,
+            attempt.current_fencing_token,
+            launch_id,
+            popen_factory=BoundedChild,
+        )
+        == 0
+    )
+    AuthoritySupervisor(cfg).tick()
+    p = projector(cfg)
+    p.tick()
+    p.close()
+    view = inspect_task(cfg, task.task_id)
+
+    assert view["progress"]["observation_state"] == "available"
+    assert view["progress"]["progress"]["stage"] == "train"
+    assert "Epoch 1" in view["progress"]["progress"]["message"]
 
 
 def test_progress_loop_is_separate_and_stop_is_bounded(monkeypatch, tmp_path):

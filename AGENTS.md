@@ -62,7 +62,8 @@ understandable without private documents.
 ## Feature promotion
 
 Before changing `dev`, the feature must contain current `dev`, and the candidate
-tree with `.dev/**` removed must pass governance and complete preflight.
+tree with `.dev/**` removed must pass governance and complete preflight in the
+configured promotion workflow before `dev` advances.
 Create one squash commit with current `dev` as parent; delete the feature only
 after a successful push. Dev Preflight then verifies the promoted commit; release may reuse that exact
 commit's successful evidence under the development workflow rules.
@@ -90,8 +91,12 @@ actual results. Add or update effective regression coverage for executable
 behavior defects fixed in the task; use applicable static checks for documents.
 Record unrelated defects without expanding scope automatically.
 
-Before integration, governance, `ruff check src tests scripts`,
-`ruff format --check src tests scripts`, and complete preflight must pass.
+Before requesting integration, run governance, `ruff check src tests scripts`,
+`ruff format --check src tests scripts`, and relevant focused tests locally.
+Running `./scripts/dev preflight` locally is recommended, and may be required by
+an explicit task or risk-specific policy, but it is not a universal local
+prerequisite for feature promotion. The configured promotion workflow must run
+complete preflight against the exact candidate and pass before `dev` advances.
 Release additionally requires the configured installed-artifact gate. A known
 baseline failure may be investigated during development but does not waive a
 mandatory gate. Post-push checks never replace candidate validation.

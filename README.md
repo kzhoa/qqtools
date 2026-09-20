@@ -356,6 +356,37 @@ Because qpipeline enforces a stable entry contract, it pairs perfectly with qexp
 qexp submit -- python entry.py --config configs/train.yaml
 ```
 
+When qexp launches a standard qpipeline training script, live progress is connected
+automatically. The script does not need a callback, reporter, progress path, or qpipeline
+configuration change. Inspect the existing Task while it runs:
+
+```bash
+qexp task show TASK_ID
+```
+
+```text
+Progress status: available
+Stage: validation
+Progress: 20/100 batch (20.0%)
+Message: Dataset B · EMA · Epoch 4/10
+Progress reported: 2026-09-18 16:00:25 UTC (35s ago)
+```
+
+Progress reporting defaults to one update every 30 seconds. A project with many concurrent
+Tasks can trade freshness for lower local and shared filesystem write pressure:
+
+```bash
+qexp config progress show
+qexp config progress set --interval-seconds 60
+```
+
+The setting applies to subsequent launches and retries; already-running Attempts keep the
+interval resolved when they launched. The interval controls write frequency, not a visibility
+deadline: producer, agent, scan, and filesystem delays can make an update visible later. Generic
+Python applications can use `qqtools.qexp.progress.update()` directly, while custom producers may
+atomically replace the injected `QEXP_PROGRESS_PATH` progress-v1 mailbox and honor
+`QEXP_PROGRESS_INTERVAL_SECONDS`. Progress remains advisory and never controls Task execution.
+
 For one-off runtime config edits, `qpipeline` also supports dotted CLI overrides after normal
 parser handling:
 

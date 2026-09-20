@@ -5,6 +5,7 @@ import pytest
 import qqtools.plugins.qpipeline.runner.runner_utils.progress as progress_module
 from qqtools.plugins.qpipeline.runner.contracts import (
     EpochStartedFact,
+    EvaluationStartedFact,
     EventListenerBindings,
     ObserverBindings,
     ProgressTickFact,
@@ -53,6 +54,32 @@ def test_best_effort_observer_disables_only_the_failed_callback():
     bindings.dispatch("progress_tick", fact)
 
     assert calls == [1, 1]
+
+
+def test_evaluation_boundary_context_is_additive_and_optional():
+    legacy = EvaluationStartedFact(epoch=2, global_step=10, total_batches=4)
+    contextual = EvaluationStartedFact(
+        epoch=2,
+        global_step=10,
+        total_batches=4,
+        evaluation_stage="val",
+        loader_name="ood",
+        loader_index=1,
+        model_variant="ema",
+    )
+
+    assert (
+        legacy.evaluation_stage,
+        legacy.loader_name,
+        legacy.loader_index,
+        legacy.model_variant,
+    ) == (None, None, None, None)
+    assert (
+        contextual.evaluation_stage,
+        contextual.loader_name,
+        contextual.loader_index,
+        contextual.model_variant,
+    ) == ("val", "ood", 1, "ema")
 
 
 def test_local_protected_boundary_reraises_original_error():

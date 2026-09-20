@@ -54,6 +54,7 @@ from .notification_config import (
     update_notifications,
     write_shared_feishu_webhook,
 )
+from .progress_policy import set_progress_policy, show_progress_policy, validate_interval_seconds
 from .runtime.observation.api import ObservationError
 from .runtime.paths import shared_paths
 from .runtime.resources.cpu_lane import get_cpu_lane_policy, initialize_cpu_lane_capacity, set_cpu_lane_capacity
@@ -184,7 +185,11 @@ def _requires_verified_binding(args: argparse.Namespace) -> bool:
     if args.command in {"submit", "batch-submit", "clean"}:
         return True
     if args.command == "config":
-        return getattr(args, "notifications_action", None) == "set" or getattr(args, "provider_action", None) == "set"
+        return (
+            getattr(args, "notifications_action", None) == "set"
+            or getattr(args, "provider_action", None) == "set"
+            or getattr(args, "progress_action", None) == "set"
+        )
     if args.command == "lease-policy":
         return args.lease_policy_action == "set"
     if args.command == "task":
@@ -358,6 +363,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_format(notifications_set)
     notifications_set.add_argument("--enabled", action="store_true")
     notifications_set.add_argument("--disabled", action="store_true")
+    progress_config = config_sub.add_parser("progress", help="Configure advisory progress reporting frequency.")
+    progress_config_sub = progress_config.add_subparsers(dest="progress_action", required=True)
+    progress_show = progress_config_sub.add_parser("show")
+    _add_output_format(progress_show)
+    progress_set = progress_config_sub.add_parser("set")
+    _add_output_format(progress_set)
+    progress_set.add_argument("--interval-seconds", required=True)
     provider = notifications_sub.add_parser("provider")
     provider_sub = provider.add_subparsers(dest="provider_action", required=True)
     provider_set = provider_sub.add_parser("set")
@@ -599,6 +611,21 @@ def _duration_seconds(value: str) -> int:
         raise ValueError("duration must use an explicit s, m, or h unit, for example 10m.")
     amount = int(matched.group(1))
     return amount * {"s": 1, "m": 60, "h": 3600}[matched.group(2)]
+
+
+def _parse_progress_interval_argument(value: str) -> int | float:
+    """Parse the policy value while retaining integer JSON/text output."""
+    text = value.strip()
+    if not text:
+        raise ValueError("--interval-seconds requires a finite number of at least 1 second.")
+    try:
+        parsed: int | float = int(text, 10)
+    except ValueError:
+        try:
+            parsed = float(text)
+        except ValueError as exc:
+            raise ValueError("--interval-seconds must be a finite number of at least 1 second.") from exc
+    return validate_interval_seconds(parsed)
 
 
 def _gpu_limit_gpus(value: str) -> int | str:
@@ -895,6 +922,16 @@ def main(argv: list[str] | None = None) -> int:
             return {"machine_runtime": execution_context.machine_runtime}
 
         if args.command == "config":
+            if args.config_action == "progress":
+                if args.progress_action == "show":
+                    _emit("progress-policy", show_progress_policy(cfg), args.format)
+                    return 0
+                _emit(
+                    "progress-policy",
+                    set_progress_policy(cfg, _parse_progress_interval_argument(args.interval_seconds)),
+                    args.format,
+                )
+                return 0
             if args.config_action != "notifications":
                 raise ValueError("unknown config action")
             if args.notifications_action == "show":

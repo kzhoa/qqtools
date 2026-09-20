@@ -1233,6 +1233,13 @@ qexp machines
 `show` is the only ordinary single-resource observation verb. The target CLI does not
 define a parallel `inspect` spelling.
 
+`task show` includes optional Attempt-scoped application progress. Progress is advisory:
+it cannot renew a lease, change a claim, determine Task health, or publish completion.
+Human output distinguishes pending execution, no accepted report, an available snapshot,
+and an evidenced unavailable observation. Available timestamps show both absolute UTC time
+and relative age. JSON preserves the legacy `available|unavailable` status while adding the
+richer observation state and bounded reason. Retry never displays an older Attempt's report.
+
 Group output should show:
 
 - admission and dispatch controls
@@ -1417,6 +1424,14 @@ are exposed through Task/Group JSON, events, and `doctor` only.
 - `qexp batch-submit`
 - `qexp top`
 - `qexp machines`
+- `qexp config progress show`
+- `qexp config progress set --interval-seconds <seconds>`
+
+The progress policy defaults to 30 seconds and accepts finite values greater than or equal
+to 1. It applies to subsequent launches and retries, while an already-running Attempt keeps
+the policy frozen at launch. A larger interval reduces progress-related local and shared
+filesystem writes at the cost of freshness; it is not a visibility deadline or a quota on
+arbitrary application I/O.
 
 ### 16.2 Task Commands
 
@@ -1539,6 +1554,8 @@ The target CLI also does not promise aliases for the old flat `list`, `inspect`,
   restart.
 - [ ] Remote process operations are performed only by the owning agent.
 - [ ] qexp records scheduling facts, not training semantics.
+- [ ] Application progress remains Attempt-scoped and advisory; its project reporting policy
+  is frozen per launch and never changes execution authority or running Attempts.
 - [ ] Product and runtime specs identify unimplemented target behavior explicitly.
 
 ## 18. Explicit Non-Goals

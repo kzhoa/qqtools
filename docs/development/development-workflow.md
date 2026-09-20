@@ -53,13 +53,23 @@ that prefix merely to save work or request a review.
 Promotion is a governed repository operation. The feature must contain the
 current `dev` head. The promotion candidate excludes `.dev/**`; governance and
 the complete shared preflight must pass against that candidate before `dev`
-changes. `./scripts/dev preflight` is the standard local gate; the configured
-promotion workflow also validates the candidate before advancing `dev`.
+changes. The configured promotion workflow is authoritative for that complete
+candidate gate and must not advance `dev` when it fails. Before requesting
+promotion, run governance, `ruff check src tests scripts`,
+`ruff format --check src tests scripts`, and relevant focused tests locally.
+`./scripts/dev preflight` remains the standard way to run the complete gate
+locally and is recommended, but is required locally only when an explicit task
+or risk-specific policy says so.
 
 The successful operation creates one squash commit whose parent is current
 `dev`, pushes it to `dev`, and only then deletes the disposable feature branch.
 The `dev` push triggers post-promotion verification. That verification does not
 replace the candidate gate. Never merge a feature directly into `main`.
+
+Once the promotion workflow run is accepted, the local terminal or agent session
+does not need to remain open. Retain the run URL and candidate SHA for inspection.
+An accepted run means validation was submitted, not that promotion succeeded;
+gate failure must leave `dev` unchanged.
 
 Protected governance changes require the owner under the root contract. Workflow
 changes additionally require explicit approval for the current task. Automatic

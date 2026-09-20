@@ -1,6 +1,8 @@
+import math
 import os
 import threading
 import time
+from collections import Counter
 
 import pytest
 
@@ -11,7 +13,13 @@ from qqtools.qexp._progress_protocol import read_advisory_snapshot
 @pytest.fixture(autouse=True)
 def clean_reporter(monkeypatch):
     progress.flush(timeout=0)
-    for name in ("RANK", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "QEXP_PROGRESS_PATH"):
+    for name in (
+        "RANK",
+        "SLURM_PROCID",
+        "OMPI_COMM_WORLD_RANK",
+        "QEXP_PROGRESS_PATH",
+        "QEXP_PROGRESS_INTERVAL_SECONDS",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(progress, "_reporter", None)
     yield
@@ -21,6 +29,15 @@ def clean_reporter(monkeypatch):
 def test_noop_outside_qexp():
     assert progress.update(stage="train", current=1) is False
     assert progress._reporter is None
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "0.5", "nan", "inf", "-inf", "garbage"])
+def test_missing_or_malformed_environment_interval_uses_safe_default(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("QEXP_PROGRESS_INTERVAL_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("QEXP_PROGRESS_INTERVAL_SECONDS", value)
+    assert progress._environment_interval() == 30.0
 
 
 def test_final_flush_and_full_replacement(tmp_path):
@@ -132,6 +149,91 @@ def test_blocked_storage_keeps_a_bounded_latest_slot(tmp_path, monkeypatch):
     assert writes == [0, 1000]
 
 
+def test_identical_update_during_slow_initial_write_is_not_rewritten(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    writes = []
+
+    def blocked(path, value, **kwargs):
+        writes.append(value["current"])
+        entered.set()
+        release.wait(2)
+
+    monkeypatch.setattr(progress, "replace_advisory_snapshot", blocked)
+    reporter = progress._Reporter(tmp_path / "progress.json", interval_seconds=1)
+    assert reporter.update(stage="train", current=1)
+    assert entered.wait(1)
+    for _ in range(100):
+        assert reporter.update(stage="train", current=1)
+    release.set()
+    reporter.close(timeout=1)
+    assert writes == [1]
+
+
+def test_slow_ordinary_write_preserves_phase_without_shortening_minimum_spacing(tmp_path, monkeypatch):
+    clock = [0.0]
+    completions = []
+    written = threading.Event()
+
+    def slow_write(path, value, **kwargs):
+        clock[0] += 5
+        completions.append(clock[0])
+        written.set()
+
+    monkeypatch.setattr(progress.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(progress, "replace_advisory_snapshot", slow_write)
+    reporter = progress._Reporter(tmp_path / "progress.json", interval_seconds=30)
+    assert reporter.update(stage="train", current=1)
+    assert written.wait(1)
+    while reporter._last_written_key is None:
+        time.sleep(0.001)
+
+    written.clear()
+    clock[0] = reporter._next_due
+    assert reporter.update(stage="train", current=2)
+    assert written.wait(1)
+    while reporter._last_written_key[-4] != 2:
+        time.sleep(0.001)
+
+    assert reporter._next_due >= completions[-1] + 30
+    phase_remainder = (reporter._next_due - (completions[0] + 30 + progress._path_offset(reporter.path, 30))) % 30
+    assert math.isclose(phase_remainder, 0.0, abs_tol=1e-9) or math.isclose(phase_remainder, 30.0, abs_tol=1e-9)
+    reporter.close(timeout=1)
+
+
+def test_large_finite_interval_keeps_writer_alive_and_final_flushes(tmp_path, monkeypatch):
+    writes = []
+    first = threading.Event()
+
+    def capture(path, value, **kwargs):
+        writes.append(value["current"])
+        first.set()
+
+    monkeypatch.setattr(progress, "replace_advisory_snapshot", capture)
+    reporter = progress._Reporter(tmp_path / "progress.json", interval_seconds=1e308)
+    assert reporter.update(stage="train", current=1)
+    assert first.wait(1)
+    assert reporter.update(stage="train", current=2)
+    time.sleep(0.02)
+    assert reporter._thread is not None and reporter._thread.is_alive()
+    reporter.close(timeout=1)
+    assert writes == [1, 2]
+
+
+@pytest.mark.parametrize("interval", [30.0, 60.0])
+def test_producer_path_phases_bound_synthetic_scale_bursts(tmp_path, interval):
+    bursts = Counter()
+    for index in range(1000):
+        path = tmp_path / f"attempt-{index}" / "latest.json"
+        deadline = interval + progress._path_offset(path, interval)
+        writes = 0
+        while deadline < 11 * interval:
+            bursts[int(deadline)] += 1
+            writes += 1
+            deadline = progress._next_deadline(deadline, deadline, interval)
+        assert writes == 10
+    assert max(bursts.values()) <= 2 * math.ceil(1000 / interval)
+
+
 def test_close_does_not_wait_unbounded_for_state_lock(tmp_path):
     reporter = progress._Reporter(tmp_path / "progress.json")
     assert reporter._lock.acquire(blocking=False)
@@ -159,3 +261,45 @@ def test_normal_updates_are_coalesced(tmp_path, monkeypatch):
         reporter.update(stage="train", current=i)
     reporter.close(timeout=1)
     assert writes == [0, 100]
+
+
+def test_stage_changes_wait_for_interval_and_close_flushes_once(tmp_path, monkeypatch):
+    writes = []
+    first = threading.Event()
+
+    def capture(path, value, **kwargs):
+        writes.append((value["stage"], value["current"]))
+        first.set()
+
+    monkeypatch.setattr(progress, "replace_advisory_snapshot", capture)
+    reporter = progress._Reporter(tmp_path / "progress.json", interval_seconds=1)
+    reporter.update(stage="train", current=1)
+    assert first.wait(1)
+    for index in range(100):
+        reporter.update(stage=f"stage-{index}", current=index)
+    time.sleep(0.2)
+    assert writes == [("train", 1)]
+
+    reporter.close(timeout=1)
+    reporter.close(timeout=1)
+    assert writes == [("train", 1), ("stage-99", 99)]
+
+
+def test_identical_updates_do_not_create_ordinary_rewrites(tmp_path, monkeypatch):
+    writes = []
+    first = threading.Event()
+
+    def capture(path, value, **kwargs):
+        writes.append(value)
+        first.set()
+
+    monkeypatch.setattr(progress, "replace_advisory_snapshot", capture)
+    reporter = progress._Reporter(tmp_path / "progress.json", interval_seconds=1)
+    assert reporter.update(stage="train", current=1, total=10, unit="step", message="same")
+    assert first.wait(1)
+    for _ in range(100):
+        assert reporter.update(stage="train", current=1, total=10, unit="step", message="same")
+    time.sleep(1.1)
+    reporter.close(timeout=1)
+
+    assert len(writes) == 1

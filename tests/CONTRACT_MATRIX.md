@@ -15,6 +15,7 @@ obvious from the test directory. Every linked test must exist; `Pending` is an e
 | qexp expanded seed and crash-point matrix | [Unit](unit/qexp/test_architecture_stress.py) | local preflight | covered |
 | qexp protected installed workflows | [installed E2E](e2e/qexp/test_compatibility_contract.py) | artifact E2E / release | covered |
 | qexp agent lifecycle independence and restart reconciliation | [real-process Integration](integration/qexp/test_agent_lifecycle_independence.py), [installed workflow](e2e/qexp/test_agent_lifecycle_independence.py) | qexp-integration / installed E2E | covered: latest acceptance evidence in [qexp_lifecycle_acceptance.md](../docs/spec/qexp_lifecycle_acceptance.md) |
+| qexp Attempt-scoped live progress, reporting policy, and transparent qPipeline integration | [Policy Unit](unit/qexp/test_progress_policy.py), [Projection Unit](unit/qexp/test_progress_projector.py), [real-process Integration](integration/qexp/test_live_progress.py), [CLI contract](integration/qexp/test_output_format.py) | qexp-unit / qexp-integration / local preflight | covered |
 | qexp live indexed Task pagination and publication recovery | [Integration](integration/qexp/test_task_observation.py), [bounded index access](integration/qexp/test_task_observation_tree.py), [CLI contract](integration/qexp/test_task_observation_cli.py) | [installed CLI](e2e/qexp/test_task_pagination.py) | covered |
 
 ## Maintenance rule

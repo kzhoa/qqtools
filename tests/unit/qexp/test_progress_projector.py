@@ -76,13 +76,13 @@ def test_message_reports_without_advancing(channel):
     c.send("one", message="a")
     p.observe("a1")
     first = read_advisory_snapshot(c.shared)
-    c.clock[0] = 5
+    c.clock[0] = p._entries["a1"]["cache_next_due"]
     c.send("two", message="b")
     p.observe("a1")
     second = read_advisory_snapshot(c.shared)
     assert second["reported_at"] != first["reported_at"]
     assert second["advanced_at"] == first["advanced_at"]
-    c.clock[0] = 10
+    c.clock[0] = p._entries["a1"]["cache_next_due"]
     c.send("three", current=2)
     p.observe("a1")
     assert read_advisory_snapshot(c.shared)["advanced_at"] != first["advanced_at"]
@@ -91,31 +91,83 @@ def test_message_reports_without_advancing(channel):
 def test_shared_writes_are_coalesced_and_stage_bursts_bounded(channel, monkeypatch):
     c = channel
     p = c.projector()
-    writes = []
+    writes = {"cache": [], "shared": []}
     original = runtime.replace_advisory_snapshot
+    cache = c.cfg.runtime_root / "progress-observed" / "a1.json"
 
     def record(path, value, **kwargs):
         if path == c.shared:
-            writes.append(c.clock[0])
+            writes["shared"].append(c.clock[0])
+        elif path == cache:
+            writes["cache"].append(c.clock[0])
         return original(path, value, **kwargs)
 
     monkeypatch.setattr(runtime, "replace_advisory_snapshot", record)
-    for i in range(101):
-        c.clock[0] = i / 20
-        c.send(f"update-{i}", current=i, total=200)
+    for i in range(26):
+        c.clock[0] = i * 4
+        c.send(f"update-{i}", current=i, total=5000)
         p.observe("a1")
-    assert writes == [0, 5]
-    writes.clear()
+    for output_writes in writes.values():
+        assert output_writes[0] == 0
+        assert all(b - a >= 30 - 1e-9 for a, b in zip(output_writes, output_writes[1:]))
+    writes = {"cache": [], "shared": []}
     for i in range(1, 101):
-        c.clock[0] = 5 + i / 20
+        c.clock[0] = 100 + i / 20
         c.send(f"stage-{i}", stage=f"stage-{i}")
         p.observe("a1")
-    assert len(writes) <= 5
-    assert all(b - a >= 1 for a, b in zip(writes, writes[1:]))
+    assert writes == {"cache": [], "shared": []}
 
 
-def test_stage_change_does_not_wait_normal_five_seconds(channel):
+def test_stage_change_waits_for_configured_interval(channel):
     c = channel
+    p = c.projector()
+    c.send("one")
+    p.observe("a1")
+    c.clock[0] = 1
+    c.send("two", stage="validation", current=None, total=None)
+    p.observe("a1")
+    assert read_advisory_snapshot(c.shared)["progress"]["stage"] == "train"
+    c.clock[0] = p._entries["a1"]["cache_next_due"]
+    p.observe("a1")
+    assert read_advisory_snapshot(c.shared)["progress"]["stage"] == "validation"
+
+
+def test_slow_cache_and_shared_writes_preserve_phase_and_minimum_spacing(channel, monkeypatch):
+    c = channel
+    p = c.projector()
+    c.send("one")
+    p.observe("a1")
+    c.send("two", current=2)
+    c.clock[0] = p._entries["a1"]["cache_next_due"]
+    cache = c.cfg.runtime_root / "progress-observed" / "a1.json"
+    original = runtime.replace_advisory_snapshot
+    completed = {}
+
+    def slow(path, value, **kwargs):
+        if path == cache:
+            c.clock[0] += 5
+            completed["cache"] = c.clock[0]
+        elif path == c.shared:
+            c.clock[0] += 7
+            completed["shared"] = c.clock[0]
+        return original(path, value, **kwargs)
+
+    monkeypatch.setattr(runtime, "replace_advisory_snapshot", slow)
+    p.observe("a1")
+
+    state = p._entries["a1"]
+    assert state["cache_next_due"] >= completed["cache"] + 30
+    assert state["shared_next_due"] >= completed["shared"] + 30
+
+
+def test_context_without_policy_fields_keeps_legacy_stage_acceleration(channel):
+    c = channel
+    context = c.cfg.runtime_root / "progress-contexts" / "a1.json"
+    value = read_advisory_snapshot(context)
+    value.pop("reporting_policy_version")
+    value.pop("interval_seconds")
+    replace_advisory_snapshot(context, value)
+
     p = c.projector()
     c.send("one")
     p.observe("a1")
@@ -132,7 +184,10 @@ def test_fencing_recovery_preserves_freshness(channel):
     first = read_advisory_snapshot(c.shared)
     c.clock[0] = 100
     c.flags["fencing_token"] = 2
-    c.projector().observe("a1")
+    restarted = c.projector()
+    restarted.observe("a1")
+    c.clock[0] = restarted._entries["a1"]["shared_next_due"]
+    restarted.observe("a1")
     second = read_advisory_snapshot(c.shared)
     assert second["fencing_token"] == 2
     assert second["reported_at"] == first["reported_at"]
@@ -147,7 +202,10 @@ def test_registration_generation_fences_old_projection_without_fabricating_fresh
     first = read_advisory_snapshot(c.shared)
     assert first["registration_generation"] == "generation-1"
     c.clock[0] = 10
-    c.projector("generation-2").observe("a1")
+    restarted = c.projector("generation-2")
+    restarted.observe("a1")
+    c.clock[0] = restarted._entries["a1"]["shared_next_due"]
+    restarted.observe("a1")
     second = read_advisory_snapshot(c.shared)
     assert second["registration_generation"] == "generation-2"
     assert second["reported_at"] == first["reported_at"]
@@ -199,14 +257,40 @@ def test_projection_failure_recovers_latest_state(channel, monkeypatch):
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(runtime, "replace_advisory_snapshot", fail_shared)
-    c.clock[0] = 5
+    c.clock[0] = p._entries["a1"]["cache_next_due"]
     c.send("two", current=2)
     p.observe("a1")
     assert read_advisory_snapshot(c.shared)["progress"]["current"] == 1
     monkeypatch.setattr(runtime, "replace_advisory_snapshot", original)
-    c.clock[0] = 10
-    c.projector().observe("a1")
+    c.clock[0] = p._entries["a1"]["shared_next_due"]
+    p.observe("a1")
     assert read_advisory_snapshot(c.shared)["progress"]["current"] == 2
+
+
+def test_terminal_cache_and_shared_failures_retry_without_publishing_uncheckpointed_time(channel, monkeypatch):
+    c = channel
+    p = c.projector()
+    c.send("final", current=10)
+    c.flags["terminal"] = True
+    cache = c.cfg.runtime_root / "progress-observed" / "a1.json"
+    original = runtime.replace_advisory_snapshot
+    failures = {cache: 1, c.shared: 1}
+
+    def fail_once(path, value, **kwargs):
+        if failures.get(path, 0):
+            failures[path] -= 1
+            raise OSError("temporary")
+        return original(path, value, **kwargs)
+
+    monkeypatch.setattr(runtime, "replace_advisory_snapshot", fail_once)
+    p.observe("a1")
+    assert not c.shared.exists()
+    p.observe("a1")
+    assert cache.exists()
+    assert not c.shared.exists()
+    p.observe("a1")
+    assert read_advisory_snapshot(c.shared)["progress"]["current"] == 10
+    assert not (c.cfg.runtime_root / "progress-contexts" / "a1.json").exists()
 
 
 def test_bad_payload_preserves_last_good_value_and_bounded_diagnostic(channel):
@@ -214,11 +298,12 @@ def test_bad_payload_preserves_last_good_value_and_bounded_diagnostic(channel):
     p = c.projector()
     c.send("one")
     p.observe("a1")
+    first = read_advisory_snapshot(c.shared)
     path = runtime.local_progress_path(c.cfg.runtime_root, "a1")
     path.write_bytes(b"x" * 10000)
     for _ in range(100):
         p.observe("a1")
-    assert read_advisory_snapshot(c.shared)["progress"]["current"] == 1
+    assert read_advisory_snapshot(c.shared) == first
     assert len(list((c.cfg.runtime_root / "progress-diagnostics").iterdir())) == 1
 
 
@@ -307,7 +392,10 @@ def test_shared_cleanup_waits_for_projection_and_wins(channel, monkeypatch):
 
 
 def test_zero_total_and_missing_progress_formatting():
-    assert runtime.progress_details({}) == (("Progress", "unavailable"),)
+    assert runtime.progress_details({}) == (
+        ("Progress status", "unavailable"),
+        ("Progress", "unavailable"),
+    )
     details = dict(
         runtime.progress_details(
             {
@@ -328,6 +416,33 @@ def test_zero_total_and_missing_progress_formatting():
     )
     assert details["Progress"] == "0/0 step"
     assert details["Progress reported"] == "unknown"
+
+    pending = dict(
+        runtime.progress_details(
+            {
+                "progress": {
+                    "status": "unavailable",
+                    "observation_state": "pending",
+                    "reason": "not_started",
+                }
+            }
+        )
+    )
+    assert pending == {"Progress status": "pending", "Progress": "pending (not started)"}
+
+
+def test_human_timestamps_include_absolute_utc_and_controlled_relative_age(monkeypatch):
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 9, 18, 16, 1, 0, tzinfo=timezone.utc)
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(runtime, "datetime", FrozenDatetime)
+    assert runtime._timestamp_with_age("2026-09-18T16:00:25Z") == ("2026-09-18 16:00:25 UTC (35s ago)")
+    assert runtime._timestamp_with_age("2026-09-18T16:01:25+00:00") == (
+        "2026-09-18 16:01:25 UTC (unknown (clock difference))"
+    )
 
 
 def test_cleanup_race_cannot_resurrect_local_observation(channel, monkeypatch):
@@ -357,7 +472,9 @@ def test_corrupt_restore_does_not_prevent_new_report(channel, field, value):
     bad = read_advisory_snapshot(local)
     bad[field] = value
     replace_advisory_snapshot(local, bad)
-    c.clock[0] = 5
+    restarted = c.projector()
+    restarted.observe("a1")
+    c.clock[0] = restarted._entries["a1"]["cache_next_due"]
     c.send("two", current=2)
-    c.projector().observe("a1")
+    restarted.observe("a1")
     assert read_advisory_snapshot(c.shared)["progress"]["current"] == 2

@@ -8,10 +8,12 @@ releases a resource.
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,30 @@ _IDENTITY = (
     "wrapper_start_time_ticks",
 )
 _TERMINAL = frozenset(("succeeded", "failed", "cancelled"))
+_DEFAULT_PROGRESS_INTERVAL_SECONDS = 30
+_POLICY_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressChannel:
+    """Frozen local channel returned after one successful context provision."""
+
+    path: str
+    interval_seconds: int | float | None
+
+    def __str__(self) -> str:
+        return self.path
+
+    def __fspath__(self) -> str:
+        return self.path
+
+
+def _valid_interval(value: Any) -> int | float:
+    if type(value) not in (int, float) or value < 1:
+        raise ValueError("progress interval_seconds must be a finite number of at least 1 second")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("progress interval_seconds must be a finite number of at least 1 second")
+    return value
 
 
 def _now() -> str:
@@ -59,6 +85,30 @@ def _progress_lock_path(shared_root: Path, task_id: str) -> Path:
 
 def _local_path(cfg: Any, directory: str, attempt_id: str) -> Path:
     return Path(cfg.runtime_root) / directory / f"{identifier(attempt_id)}.json"
+
+
+def record_progress_diagnostic(cfg: Any, attempt_id: str, reason: str) -> None:
+    """Best-effort bounded policy/launch diagnostic after context creation."""
+    try:
+        context_path = _local_path(cfg, "progress-contexts", attempt_id)
+        if not context_path.exists():
+            return
+        path = _local_path(cfg, "progress-diagnostics", attempt_id)
+        try:
+            previous = read_advisory_snapshot(path)
+            elapsed = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(previous["at"].replace("Z", "+00:00"))
+            ).total_seconds()
+            if elapsed < 60:
+                return
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        replace_advisory_snapshot(
+            path,
+            {"attempt_id": attempt_id, "reason": str(reason)[:160], "at": _now()},
+        )
+    except Exception:
+        pass
 
 
 def has_local_progress_mailbox(runtime_root: Path) -> bool:
@@ -85,7 +135,8 @@ def prepare_progress_channel(
     attempt: Any,
     *,
     wrapper_start_time_ticks: int | None,
-) -> str | None:
+    interval_seconds: int | float = _DEFAULT_PROGRESS_INTERVAL_SECONDS,
+) -> ProgressChannel | None:
     """Provision only machine-local advisory state for one authorized launch.
 
     This function deliberately performs no shared-root I/O. It is called after
@@ -95,8 +146,11 @@ def prepare_progress_channel(
     try:
         if type(wrapper_start_time_ticks) is not int:
             return None
+        frozen_interval = _valid_interval(interval_seconds)
         context = {
             "protocol_version": 1,
+            "reporting_policy_version": _POLICY_VERSION,
+            "interval_seconds": frozen_interval,
             "task_id": task.task_id,
             "attempt_id": attempt.attempt_id,
             "attempt_number": attempt.attempt_number,
@@ -111,9 +165,23 @@ def prepare_progress_channel(
             (Path(cfg.runtime_root) / directory).mkdir(parents=True, exist_ok=True)
         context_path = _local_path(cfg, "progress-contexts", attempt.attempt_id)
         if context_path.exists():
-            return None
+            existing = read_advisory_snapshot(context_path)
+            try:
+                existing_interval = _valid_interval(existing.get("interval_seconds"))
+            except ValueError:
+                return None
+            if (
+                existing.get("protocol_version") != 1
+                or existing.get("reporting_policy_version") != _POLICY_VERSION
+                or any(existing.get(key) != context.get(key) for key in _IDENTITY)
+            ):
+                # Existing malformed or mismatched context is evidence that
+                # this launch cannot safely reuse the channel.  Never replace
+                # runner-owned identity evidence in place.
+                return None
+            return ProgressChannel(str(path), existing_interval)
         replace_advisory_snapshot(context_path, context)
-        return str(path)
+        return ProgressChannel(str(path), frozen_interval)
     except Exception:
         return None
 
@@ -237,6 +305,69 @@ def _signature(value: dict[str, Any] | None) -> tuple[Any, ...] | None:
     )
 
 
+def _payload_observation_key(value: dict[str, Any]) -> tuple[Any, ...]:
+    payload = value.get("progress", value)
+    return tuple(payload.get(name) for name in ("stage", "current", "total", "unit", "message"))
+
+
+def _mailbox_signature(path: Path) -> tuple[int, int, int, int] | None:
+    """Return a cheap regular-file witness; ``None`` means metadata is ambiguous."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    import stat
+
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _attempt_offset(attempt_id: str, interval: float) -> float:
+    import hashlib
+
+    digest = hashlib.sha256(attempt_id.encode("utf-8")).digest()
+    fraction = int.from_bytes(digest[:8], "big") / 2**64
+    return fraction * interval
+
+
+def _initial_deadline(attempt_id: str, now: float, interval: float) -> float:
+    """Defer at least one interval and spread subsequent ordinary work."""
+    return now + interval + _attempt_offset(attempt_id, interval)
+
+
+def _next_deadline(deadline: float, now: float, interval: float) -> float:
+    """Advance on the existing phase while skipping every missed slot."""
+    if not math.isfinite(deadline):
+        return float("inf")
+    target = now + interval
+    if not math.isfinite(target):
+        return float("inf")
+    ratio = (target - deadline) / interval
+    rounded = round(ratio)
+    steps = max(
+        1,
+        rounded if math.isclose(ratio, rounded, rel_tol=1e-12, abs_tol=1e-12) else math.ceil(ratio),
+    )
+    candidate = deadline + steps * interval
+    if not math.isfinite(candidate):
+        return float("inf")
+    return max(candidate, target)
+
+
+def _context_interval(context: dict[str, Any]) -> float | None:
+    fields = ("reporting_policy_version", "interval_seconds")
+    if not any(field in context for field in fields):
+        return None
+    if context.get("reporting_policy_version") != _POLICY_VERSION:
+        raise ValueError("unsupported progress reporting policy version")
+    value = _valid_interval(context.get("interval_seconds"))
+    try:
+        return float(value)
+    except OverflowError:
+        return float("inf")
+
+
 class ProgressProjector:
     """Bounded latest-only ingestion owned by one machine registration generation."""
 
@@ -299,7 +430,7 @@ class ProgressProjector:
         if not context_path.exists():
             path.unlink(missing_ok=True)
 
-    def _diagnostic(self, attempt_id: str, reason: str) -> None:
+    def _diagnostic(self, attempt_id: str, reason: str, *, interval: float | None = None) -> None:
         try:
             context_path = _local_path(self.cfg, "progress-contexts", attempt_id)
             if not context_path.exists():
@@ -310,7 +441,8 @@ class ProgressProjector:
                 elapsed = (
                     datetime.now(timezone.utc) - datetime.fromisoformat(previous["at"].replace("Z", "+00:00"))
                 ).total_seconds()
-                if previous.get("reason") == reason and elapsed < 60:
+                spacing = max(60.0, interval or 0.0)
+                if elapsed < spacing:
                     return
             except (OSError, ValueError, KeyError, TypeError):
                 pass
@@ -322,7 +454,7 @@ class ProgressProjector:
         except Exception:
             pass
 
-    def _restore(self, attempt_id: str, binding: dict[str, Any]) -> dict[str, Any]:
+    def _restore(self, attempt_id: str, binding: dict[str, Any], *, interval: float | None = None) -> dict[str, Any]:
         """Restore freshness locally across agent-generation changes without trusting stale shared writers."""
         shared_path = shared_progress_path(self.cfg.shared_root, binding["task_id"], attempt_id)
         local_latest = None
@@ -348,7 +480,25 @@ class ProgressProjector:
             pass
         values = [value for value in (local_latest, shared_latest) if value is not None]
         latest = max(values, key=lambda item: item["sequence"]) if values else None
-        return {"latest": latest, "published": shared_latest, "last_write": float("-inf")}
+        if interval is None:
+            return {"latest": latest, "published": shared_latest, "last_write": float("-inf")}
+        restored = latest is not None
+        now = self._clock()
+        deferred = _initial_deadline(attempt_id, now, interval) if restored else float("-inf")
+        return {
+            "latest": latest,
+            "published": shared_latest,
+            "candidate": None,
+            "mailbox_signature": None,
+            "cache_next_due": deferred,
+            "shared_next_due": deferred,
+            "cache_initial_available": not restored,
+            "shared_initial_available": not restored,
+            "cache_final_available": True,
+            "shared_final_available": True,
+            "interval": interval,
+            "last_write": float("-inf"),
+        }
 
     def _retire(self, attempt_id: str) -> None:
         self._entries.pop(attempt_id, None)
@@ -363,6 +513,155 @@ class ProgressProjector:
             except OSError:
                 pass
 
+    def _projection_for_payload(
+        self,
+        payload: dict[str, Any],
+        latest: dict[str, Any] | None,
+        binding: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = self._wall_clock()
+        advanced = latest is None or semantic_key(payload) != semantic_key(latest["progress"])
+        return {
+            "protocol_version": 1,
+            **{key: binding[key] for key in _IDENTITY},
+            "registration_generation": binding["registration_generation"],
+            "fencing_token": binding["fencing_token"],
+            "source_update_id": payload["update_id"],
+            "sequence": 1 if latest is None else latest["sequence"] + 1,
+            "reported_at": now,
+            "advanced_at": now if advanced else latest["advanced_at"],
+            "progress": {key: item for key, item in payload.items() if key not in {"protocol_version", "update_id"}},
+        }
+
+    def _observe_policy(
+        self,
+        attempt_id: str,
+        context_path: Path,
+        context: dict[str, Any],
+        binding: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        """Observe and publish a policy-context Attempt with independent cadences."""
+        interval = state["interval"]
+        mailbox = local_progress_path(self.cfg.runtime_root, attempt_id)
+        signature = _mailbox_signature(mailbox)
+        signature_changed = signature is None or signature != state.get("mailbox_signature")
+        if signature_changed:
+            try:
+                payload = validate_payload(read_advisory_snapshot(mailbox, max_bytes=MAX_PAYLOAD_BYTES))
+            except FileNotFoundError:
+                payload = None
+            except (OSError, ValueError, TypeError, RecursionError):
+                state["mailbox_signature"] = None
+                self._diagnostic(attempt_id, "invalid_payload", interval=interval)
+                payload = None
+            else:
+                state["mailbox_signature"] = signature
+            if payload is not None:
+                latest = state["latest"]
+                if latest is None:
+                    state["candidate"] = payload
+                elif payload["update_id"] == latest["source_update_id"] or _payload_observation_key(
+                    payload
+                ) == _payload_observation_key(latest):
+                    state["candidate"] = None
+                else:
+                    state["candidate"] = payload
+
+        candidate = state.get("candidate")
+        latest = state["latest"]
+        if candidate is not None and latest is not None:
+            if candidate["update_id"] == latest["source_update_id"] or _payload_observation_key(
+                candidate
+            ) == _payload_observation_key(latest):
+                state["candidate"] = None
+                candidate = None
+
+        now = self._clock()
+        if candidate is not None:
+            if binding["terminal"]:
+                due = state["cache_final_available"]
+            else:
+                due = state["cache_initial_available"] or now >= state["cache_next_due"]
+            if due:
+                accepted = self._projection_for_payload(candidate, latest, binding)
+                try:
+                    self._write_local("progress-observed", attempt_id, accepted)
+                except OSError:
+                    self._diagnostic(attempt_id, "observation_cache_unavailable", interval=interval)
+                    return
+                state["latest"] = accepted
+                state["candidate"] = None
+                state["cache_initial_available"] = False
+                if binding["terminal"]:
+                    state["cache_final_available"] = False
+                succeeded_at = self._clock()
+                if math.isfinite(state["cache_next_due"]):
+                    state["cache_next_due"] = _next_deadline(state["cache_next_due"], succeeded_at, interval)
+                else:
+                    state["cache_next_due"] = _initial_deadline(attempt_id, succeeded_at, interval)
+                latest = accepted
+
+        if latest is None:
+            if binding["terminal"]:
+                self._retire(attempt_id)
+            return
+
+        # Generation/fencing transitions alter provenance but never fabricate
+        # reported_at or advanced_at.  A deferred republish preserves evidence.
+        latest = {
+            **latest,
+            "fencing_token": binding["fencing_token"],
+            "registration_generation": self._registration_generation,
+        }
+        state["latest"] = latest
+        published = state["published"]
+        if _signature(published) == _signature(latest):
+            if binding["terminal"]:
+                self._retire(attempt_id)
+            return
+        now = self._clock()
+        if binding["terminal"]:
+            due = state["shared_final_available"]
+        else:
+            due = state["shared_initial_available"] or now >= state["shared_next_due"]
+        if not due:
+            return
+
+        # This advisory lock is deliberately outside qexp's Task/Attempt
+        # authority lock order. Cleanup uses the same lock after marking the
+        # Task as cleaning, so stale projection writes cannot recreate it.
+        with exclusive(_progress_lock_path(self.cfg.shared_root, binding["task_id"]), blocking=False) as acquired:
+            if not acquired:
+                return
+            current_binding = self._binding(context)
+            if current_binding is None or not context_path.exists():
+                self._retire(attempt_id)
+                return
+            if (
+                current_binding["fencing_token"] != binding["fencing_token"]
+                or current_binding["registration_generation"] != self._registration_generation
+            ):
+                return
+            shared_path = shared_progress_path(self.cfg.shared_root, binding["task_id"], attempt_id)
+            try:
+                shared_path.parent.mkdir(parents=True, exist_ok=True)
+                replace_advisory_snapshot(shared_path, latest)
+            except OSError:
+                self._diagnostic(attempt_id, "projection_unavailable", interval=interval)
+                return
+        state["published"] = latest
+        state["shared_initial_available"] = False
+        if binding["terminal"]:
+            state["shared_final_available"] = False
+        succeeded_at = self._clock()
+        if math.isfinite(state["shared_next_due"]):
+            state["shared_next_due"] = _next_deadline(state["shared_next_due"], succeeded_at, interval)
+        else:
+            state["shared_next_due"] = _initial_deadline(attempt_id, succeeded_at, interval)
+        if binding["terminal"]:
+            self._retire(attempt_id)
+
     def observe(self, attempt_id: str) -> None:
         """Observe one context. Public only to keep single-attempt tests deterministic."""
         context_path = _local_path(self.cfg, "progress-contexts", attempt_id)
@@ -373,17 +672,21 @@ class ProgressProjector:
             or context.get("attempt_id") != attempt_id
         ):
             raise ValueError("invalid progress context")
+        interval = _context_interval(context)
         binding = self._binding(context)
         if binding is None:
             self._retire(attempt_id)
             return
         state = self._entries.get(attempt_id)
         if state is None:
-            state = self._restore(attempt_id, binding)
+            state = self._restore(attempt_id, binding, interval=interval)
             self._entries[attempt_id] = state
             if len(self._entries) > 4096:
                 self._entries.popitem(last=False)
         self._entries.move_to_end(attempt_id)
+        if interval is not None:
+            self._observe_policy(attempt_id, context_path, context, binding, state)
+            return
         latest = state["latest"]
         try:
             payload = validate_payload(
@@ -482,59 +785,104 @@ def _running_registration_generation(cfg: Any, machine_name: str) -> str:
 
 
 def inspect_progress(cfg: Any, task: Any) -> dict[str, Any]:
-    """Join running by current ID and terminal history by its preserved number."""
+    """Return evidence-based progress state without writing any observation state."""
     from .paths import attempt_path
     from .records import AttemptRecord
     from .store import read_json
 
-    unavailable = {"status": "unavailable"}
-    try:
-        if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
-            return unavailable
-        number = task.attempt_control.get("current_attempt_number")
-        if type(number) is not int:
-            return unavailable
-        attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task.task_id, number)))
-        task_terminal = task.state["projection"] in _TERMINAL
-        current_attempt_id = task.attempt_control.get("current_attempt_id")
-        if task_terminal:
-            if attempt.phase not in _TERMINAL or current_attempt_id not in {None, attempt.attempt_id}:
-                return unavailable
-            attempt_id = attempt.attempt_id
-        else:
-            if current_attempt_id is None or attempt.attempt_id != current_attempt_id:
-                return unavailable
-            attempt_id = current_attempt_id
-        identity = {
-            "task_id": task.task_id,
-            "attempt_id": attempt_id,
-            "attempt_number": number,
-            "machine_name": attempt.machine_name,
-            "launch_id": attempt.authorization.get("launch_id"),
-            "wrapper_pid": attempt.process.get("wrapper_pid"),
-            "wrapper_start_time_ticks": attempt.process.get("wrapper_start_time_ticks"),
-            "fencing_token": attempt.current_fencing_token,
+    def result(state: str, reason: str | None, value: dict[str, Any] | None = None) -> dict[str, Any]:
+        output: dict[str, Any] = {
+            "status": "available" if state == "available" else "unavailable",
+            "observation_state": state,
+            "reason": reason,
         }
-        if task_terminal:
-            value = _validate_projection(
-                read_advisory_snapshot(shared_progress_path(cfg.shared_root, task.task_id, attempt_id)),
-                identity,
-                require_token=True,
-            )
-        else:
+        if value is not None:
+            output.update(value)
+        return output
+
+    projection = task.state.get("projection")
+    current_attempt_id = task.attempt_control.get("current_attempt_id")
+    if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
+        return result("unavailable", "cleanup")
+    if projection == "queued" and current_attempt_id is None:
+        return result("pending", "not_started")
+    number = task.attempt_control.get("current_attempt_number")
+    if type(number) is not int:
+        return result("unavailable", "identity_mismatch")
+
+    try:
+        attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task.task_id, number)))
+    except FileNotFoundError:
+        return result("unavailable", "read_failed")
+    except (OSError, ValueError, TypeError, KeyError):
+        return result("unavailable", "invalid_snapshot")
+
+    task_terminal = projection in _TERMINAL
+    if task_terminal:
+        if attempt.phase not in _TERMINAL or current_attempt_id not in {None, attempt.attempt_id}:
+            return result("unavailable", "identity_mismatch")
+        attempt_id = attempt.attempt_id
+    else:
+        if projection != "running" or current_attempt_id is None or attempt.attempt_id != current_attempt_id:
+            return result("unavailable", "identity_mismatch")
+        attempt_id = current_attempt_id
+        claim = task.claim_control.get("active_claim") or {}
+        if (
+            attempt.phase not in {"starting", "running"}
+            or claim.get("attempt_id") != attempt_id
+            or claim.get("fencing_token") != attempt.current_fencing_token
+            or claim.get("machine_name") != attempt.machine_name
+        ):
+            return result("unavailable", "identity_mismatch")
+
+    identity = {
+        "task_id": task.task_id,
+        "attempt_id": attempt_id,
+        "attempt_number": number,
+        "machine_name": attempt.machine_name,
+        "launch_id": attempt.authorization.get("launch_id"),
+        "wrapper_pid": attempt.process.get("wrapper_pid"),
+        "wrapper_start_time_ticks": attempt.process.get("wrapper_start_time_ticks"),
+        "fencing_token": attempt.current_fencing_token,
+    }
+    if task_terminal:
+        require_generation = False
+    else:
+        try:
             generation = _running_registration_generation(cfg, attempt.machine_name)
-            identity["registration_generation"] = generation
-            value = _validate_projection(
-                read_advisory_snapshot(shared_progress_path(cfg.shared_root, task.task_id, attempt_id)),
-                identity,
-                require_token=True,
-                require_generation=True,
-            )
-            if _running_registration_generation(cfg, attempt.machine_name) != generation:
-                return unavailable
-        return {"status": "available", **value}
+        except (FileNotFoundError, OSError):
+            return result("unavailable", "read_failed")
+        except (ValueError, TypeError, KeyError):
+            return result("unavailable", "identity_mismatch")
+        identity["registration_generation"] = generation
+        require_generation = True
+    try:
+        value = _validate_projection(
+            read_advisory_snapshot(shared_progress_path(cfg.shared_root, task.task_id, attempt_id)),
+            identity,
+            require_token=True,
+            require_generation=require_generation,
+        )
+    except FileNotFoundError:
+        return result("no_report", "no_snapshot")
+    except OSError:
+        return result("unavailable", "read_failed")
+    except ValueError as exc:
+        message = str(exc)
+        if any(token in message for token in ("identity", "fencing", "superseded", "registration")):
+            return result("unavailable", "identity_mismatch")
+        return result("unavailable", "invalid_snapshot")
     except Exception:
-        return unavailable
+        return result("unavailable", "unknown")
+    if not task_terminal:
+        try:
+            if _running_registration_generation(cfg, attempt.machine_name) != identity["registration_generation"]:
+                return result("unavailable", "identity_mismatch")
+        except (FileNotFoundError, OSError):
+            return result("unavailable", "read_failed")
+        except (ValueError, TypeError, KeyError):
+            return result("unavailable", "identity_mismatch")
+    return result("available", None, value)
 
 
 def _age(stamp: str) -> str:
@@ -551,11 +899,36 @@ def _age(stamp: str) -> str:
         return "unknown"
 
 
+def _timestamp_with_age(stamp: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return "unknown"
+        absolute = parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        return f"{absolute} ({_age(stamp)})"
+    except (ValueError, TypeError, AttributeError):
+        return "unknown"
+
+
 def progress_details(result: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
     """Human-only presentation; missing observations never break task show."""
     observation = result.get("progress") or {}
     if observation.get("status") != "available":
-        return (("Progress", "unavailable"),)
+        reason = observation.get("reason")
+        explanations = {
+            "not_started": "pending (not started)",
+            "no_snapshot": "unavailable (no report yet)",
+            "invalid_snapshot": "unavailable (invalid snapshot)",
+            "read_failed": "unavailable (read failed)",
+            "identity_mismatch": "unavailable (identity mismatch)",
+            "cleanup": "unavailable (cleanup in progress)",
+            "unknown": "unavailable (unknown)",
+        }
+        state = observation.get("observation_state", "unavailable")
+        return (
+            ("Progress status", state),
+            ("Progress", explanations.get(reason, "unavailable")),
+        )
     payload = observation["progress"]
     current, total = payload.get("current"), payload.get("total")
     count = "unknown" if current is None else str(current)
@@ -566,11 +939,12 @@ def progress_details(result: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
     if current is not None and total is not None and total > 0:
         count += f" ({100 * current / total:.1f}%)"
     return (
+        ("Progress status", "available"),
         ("Stage", payload["stage"]),
         ("Progress", count),
         ("Message", payload.get("message")),
-        ("Progress reported", _age(observation["reported_at"])),
-        ("Progress advanced", _age(observation["advanced_at"])),
+        ("Progress reported", _timestamp_with_age(observation["reported_at"])),
+        ("Progress advanced", _timestamp_with_age(observation["advanced_at"])),
     )
 
 

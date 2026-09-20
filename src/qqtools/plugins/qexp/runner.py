@@ -13,9 +13,10 @@ from pathlib import Path
 from .config_types import RootConfig
 from .infrastructure.process import process_start_time_ticks as _process_start_time_ticks
 from .layout import load_root_config, shared_attempt_log_path
+from .progress_policy import canonical_interval_seconds, resolve_progress_policy
 from .runtime.authority_lock import authority_locks
 from .runtime.paths import attempt_path, local_paths
-from .runtime.progress import prepare_progress_channel
+from .runtime.progress import prepare_progress_channel, record_progress_diagnostic
 from .runtime.records import AttemptRecord, utc_now
 from .runtime.responsibility import require_launch_responsibility
 from .runtime.store import atomic_replace, create_if_absent, read_json
@@ -181,22 +182,35 @@ def run_attempt(
             raise RuntimeError("Attempt is not authorized to launch.")
         _publish_launch_intent(cfg, attempt, task)
 
-    # Progress is optional advisory state. Local provisioning is deliberately
-    # outside launch authority locks and never touches the shared progress tree.
-    progress_path = None
+    # Progress is optional advisory state. Policy resolution and local
+    # provisioning are deliberately outside launch authority locks and never
+    # touch the shared progress tree.
+    progress_policy = resolve_progress_policy(cfg)
+    progress_channel = None
     try:
-        progress_path = prepare_progress_channel(
-            cfg, task, attempt, wrapper_start_time_ticks=_process_start_time_ticks(os.getpid())
+        progress_channel = prepare_progress_channel(
+            cfg,
+            task,
+            attempt,
+            wrapper_start_time_ticks=_process_start_time_ticks(os.getpid()),
+            interval_seconds=progress_policy["interval_seconds"],
         )
     except Exception:
         pass
+    if progress_channel is not None and progress_policy.get("diagnostic_reason"):
+        record_progress_diagnostic(cfg, attempt.attempt_id, progress_policy["diagnostic_reason"])
 
     environment = os.environ.copy()
     # Never let a nested submission inherit another Attempt's channel.
     environment.pop("QEXP_PROGRESS_PATH", None)
     environment.pop("QEXP_PROGRESS_FD", None)
-    if progress_path is not None:
-        environment["QEXP_PROGRESS_PATH"] = progress_path
+    environment.pop("QEXP_PROGRESS_INTERVAL_SECONDS", None)
+    if progress_channel is not None:
+        environment["QEXP_PROGRESS_PATH"] = progress_channel.path
+        if progress_channel.interval_seconds is not None:
+            environment["QEXP_PROGRESS_INTERVAL_SECONDS"] = canonical_interval_seconds(
+                progress_channel.interval_seconds
+            )
     if task.spec.is_cpu_only:
         environment["CUDA_VISIBLE_DEVICES"] = ""
     elif attempt.assigned_gpus:

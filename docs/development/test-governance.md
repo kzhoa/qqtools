@@ -102,17 +102,23 @@ be used to omit a configured candidate gate.
 extra arguments. It requires Python 3.13, Linux, and system tmux. Missing
 prerequisites must fail explicitly; do not skip real lifecycle coverage.
 
+Before requesting feature promotion, run repository governance,
+`ruff check src tests scripts`, `ruff format --check src tests scripts`, and all
+relevant focused tests locally. A local `./scripts/dev preflight` run is
+recommended for broad or high-risk changes and may be required by an explicit
+task or policy, but it is not a universal local prerequisite for promotion.
+
 A pre-existing baseline failure may be documented and investigated while work
 continues, but it does not waive a mandatory integration or release gate.
 
-Feature promotion validates the candidate with `.dev/**` removed before changing
-`dev`. A subsequent Dev Preflight run verifies the push. Promotion from `dev` to
-`main` validates repository preflight and installed-artifact E2E against the
+The configured feature-promotion workflow must run complete preflight against
+the exact candidate with `.dev/**` removed and must not change `dev` unless it
+succeeds. A subsequent Dev Preflight run verifies the push. Promotion from `dev`
+to `main` validates repository preflight and installed-artifact E2E against the
 exact `dev` commit before the fast-forward. A release may reuse recent successful
 Dev Preflight evidence for that same SHA, and main push artifact CI may reuse the
 release artifact jobs, under the [evidence rules](development-workflow.md#reusing-gate-evidence).
-Post-push checks are not substitutes
-for these pre-promotion gates.
+Post-push checks are not substitutes for these pre-promotion gates.
 
 Ordinary main/PR artifact CI validates installed wheels using the matrix in its
 stable workflow. Canonical Python runs `artifact-e2e`; the other configured

@@ -102,6 +102,10 @@ class EvaluationStartedFact:
     epoch: int
     global_step: int
     total_batches: int
+    evaluation_stage: Optional[Literal["val", "test"]] = None
+    loader_name: Optional[str] = None
+    loader_index: Optional[int] = None
+    model_variant: Optional[Literal["standard", "ema"]] = None
 
 
 @dataclass(kw_only=True, frozen=True, slots=True)

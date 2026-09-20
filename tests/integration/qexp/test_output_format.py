@@ -57,6 +57,69 @@ def test_task_list_defaults_to_human_and_json_is_explicit(tmp_path: Path, capsys
     ]
 
 
+def test_progress_policy_cli_reports_default_and_configured_value(tmp_path: Path, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    base = _base_args(cfg)
+
+    assert main([*base, "config", "progress", "show", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "interval_seconds": 30,
+        "source": "default",
+        "applies_to": "new_launches",
+    }
+
+    assert main([*base, "config", "progress", "set", "--interval-seconds", "60", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "interval_seconds": 60,
+        "source": "configured",
+        "applies_to": "new_launches",
+    }
+
+    assert main([*base, "config", "progress", "show"]) == 0
+    human = capsys.readouterr().out
+    assert "Interval seconds: 60" in human
+    assert "Source: configured" in human
+    assert "Applies to: new_launches" in human
+    assert "filesystem" in human.lower()
+
+
+def test_progress_policy_cli_accepts_large_finite_interval(tmp_path: Path, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    assert (
+        main(
+            [
+                *_base_args(cfg),
+                "config",
+                "progress",
+                "set",
+                "--interval-seconds=1e308",
+                "--format=json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["interval_seconds"] == 1e308
+
+
+@pytest.mark.parametrize("value", ["0", "0.5", "nan", "inf", "-inf"])
+def test_progress_policy_cli_rejects_invalid_interval(tmp_path: Path, capsys, value: str):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+
+    assert (
+        main(
+            [
+                *_base_args(cfg),
+                "config",
+                "progress",
+                "set",
+                f"--interval-seconds={value}",
+            ]
+        )
+        == 2
+    )
+    assert "interval" in capsys.readouterr().err.lower()
+
+
 def test_task_list_json_reports_dependency_gate(tmp_path: Path, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     create_group(cfg, "demo", ["gpu-1"])

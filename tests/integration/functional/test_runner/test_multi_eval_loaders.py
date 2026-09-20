@@ -3,11 +3,12 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
 from qqtools.plugins.qpipeline import Stage
 from qqtools.plugins.qpipeline.runner import agent as agent_module
 from qqtools.plugins.qpipeline.runner.agent import RunningAgent
-from qqtools.plugins.qpipeline.runner.contracts import EvaluationCommittedFact
+from qqtools.plugins.qpipeline.runner.contracts import EvaluationCommittedFact, ObserverBindings
 from qqtools.plugins.qpipeline.runner.runner_utils.best_model import BestMetricSnapshot
 from qqtools.plugins.qpipeline.runner.runner_utils.eval_formatter import EvalFormatter, EvalSummaryObserver
 from qqtools.plugins.qpipeline.runner.runner_utils.evaluation import (
@@ -24,7 +25,7 @@ from qqtools.plugins.qpipeline.runner.runner_utils.types import RunConfig, Runni
 from .conftest import SimpleModel, SimpleTask
 
 
-def _make_agent(task, *, distributed=False):
+def _make_agent(task, *, distributed=False, observers=None):
     model = SimpleModel(input_dim=10)
     return RunningAgent(
         model=model,
@@ -33,7 +34,41 @@ def _make_agent(task, *, distributed=False):
         optimizer=torch.optim.Adam(model.parameters(), lr=1.0e-3),
         config=RunConfig(device=torch.device("cpu"), distributed=distributed),
         device=torch.device("cpu"),
+        observers=observers,
     )
+
+
+def test_evaluation_boundaries_identify_each_loader_and_model_before_ticks():
+    task = SimpleTask(num_samples=40)
+    task.val_loader = {"dataset-a": task.val_loader, "dataset-b": task.test_loader}
+    events = []
+    observers = ObserverBindings()
+    observers.bind("evaluation_started", lambda fact: events.append(("start", fact)))
+    observers.bind("progress_tick", lambda fact: events.append(("tick", fact)))
+    observers.freeze()
+    agent = _make_agent(task, observers=observers)
+
+    agent._evaluate_model(agent.model, *agent._resolve_evaluation_loaders(), "standard")
+
+    starts = [fact for kind, fact in events if kind == "start"]
+    assert [fact.evaluation_stage for fact in starts] == ["val", "val", "test"]
+    assert [fact.loader_name for fact in starts] == ["dataset-a", "dataset-b", None]
+    assert [fact.loader_index for fact in starts] == [0, 1, None]
+    assert {fact.model_variant for fact in starts} == {"standard"}
+    assert events[0] == ("start", starts[0])
+    for index, (kind, fact) in enumerate(events):
+        if kind == "tick" and getattr(fact.stage, "value", fact.stage) == "val":
+            assert any(prior_kind == "start" for prior_kind, _ in events[:index])
+
+    empty = DataLoader(TensorDataset(torch.empty(0, 10), torch.empty(0, 1)), batch_size=4)
+    events.clear()
+    agent._evaluate_model(agent.model, [(None, empty)], [], "ema")
+    assert len(events) == 1
+    kind, boundary = events[0]
+    assert kind == "start"
+    assert boundary.model_variant == "ema"
+    assert boundary.loader_index is None
+    assert boundary.total_batches == 0
 
 
 def test_multi_loader_evaluation_preserves_order_and_uses_stage_score():
