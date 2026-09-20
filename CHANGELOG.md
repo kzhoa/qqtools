@@ -12,6 +12,8 @@
   terminal evidence, and avoid redundant advisory-state writes.
 - fix: automatically reactivate expired qexp project registrations even when the local agent has
   no tasks, restoring renewal without requiring manual re-registration.
+- fix: accelerate qualified qexp startup recovery and preserve foreign legacy-named reservations
+  during project migration, keeping lifecycle convergence and cross-project capacity isolated.
 - chore: consolidate feature and release validation into distinct exact-commit GitHub Actions gates
   and document the standard administrator release path.
 
