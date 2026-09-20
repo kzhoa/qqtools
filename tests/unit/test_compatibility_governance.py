@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-from scripts import release_preflight
 from scripts.checks.check_compatibility_registry import RegistryError, Version, check_release, load_registry
 
 
@@ -271,84 +270,3 @@ def test_planned_future_item_passes_an_earlier_release(tmp_path: Path) -> None:
     item = load_registry(registry, tmp_path)[0]
 
     check_release((item,), Version.parse("2.9.0", "target"))
-
-
-def test_preflight_runs_compatibility_gate_before_expensive_checks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    order: list[str] = []
-    commands: list[tuple[tuple[str, ...], dict[str, object]]] = []
-    monkeypatch.setattr(release_preflight, "_require_clean_head", lambda: order.append("clean"))
-    monkeypatch.setattr(release_preflight, "_check_target_version", lambda target: order.append("target"))
-    monkeypatch.setattr(release_preflight, "_check_compatibility", lambda target: order.append("compatibility"))
-    monkeypatch.setattr(release_preflight, "_check_lazy_export_stubs", lambda: order.append("stubs"))
-    monkeypatch.setattr(
-        release_preflight,
-        "_run",
-        lambda *args, **kwargs: commands.append((args, kwargs)),
-    )
-
-    assert release_preflight.main(["--target-version", "1.3.13"]) == 0
-    assert order == ["clean", "target", "compatibility", "stubs"]
-    assert commands == [
-        ((release_preflight.sys.executable, "-m", "tox", "run", "-e", "unit"), {}),
-        ((release_preflight.sys.executable, "-m", "tox", "run", "-e", "integration"), {}),
-        ((release_preflight.sys.executable, "-m", "tox", "run", "-e", "qexp-integration"), {}),
-    ]
-
-
-def test_preflight_stops_when_compatibility_gate_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    order: list[str] = []
-    monkeypatch.setattr(release_preflight, "_require_clean_head", lambda: order.append("clean"))
-    monkeypatch.setattr(release_preflight, "_check_target_version", lambda target: order.append("target"))
-
-    def fail_compatibility(target: Version) -> None:
-        order.append("compatibility")
-        raise RuntimeError("compatibility gate failed")
-
-    monkeypatch.setattr(release_preflight, "_check_compatibility", fail_compatibility)
-    monkeypatch.setattr(release_preflight, "_check_lazy_export_stubs", lambda: order.append("stubs"))
-
-    with pytest.raises(RuntimeError, match="compatibility gate failed"):
-        release_preflight.main(["--target-version", "1.3.13"])
-    assert order == ["clean", "target", "compatibility"]
-
-
-def test_preflight_rejects_non_future_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        release_preflight,
-        "_current_version",
-        lambda: Version.parse("1.3.12", "current"),
-    )
-
-    with pytest.raises(RuntimeError, match="must be later"):
-        release_preflight._check_target_version(Version.parse("1.3.12", "target"))
-
-
-def test_preflight_rejects_non_exact_target_version() -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        release_preflight.main(["--target-version", "1.3"])
-
-    assert exc_info.value.code == 2
-
-
-@pytest.mark.parametrize("failed_environment", ["unit", "integration", "qexp-integration"])
-def test_release_preflight_stops_at_first_failed_suite(monkeypatch, failed_environment):
-    import subprocess
-
-    for name in ("_require_clean_head", "_check_target_version", "_check_compatibility", "_check_lazy_export_stubs"):
-        monkeypatch.setattr(release_preflight, name, lambda *args: None)
-    calls = []
-
-    def run(*args):
-        calls.append(args[-1])
-        if args[-1] == failed_environment:
-            raise subprocess.CalledProcessError(1, args)
-
-    monkeypatch.setattr(release_preflight, "_run", run)
-    with pytest.raises(subprocess.CalledProcessError):
-        release_preflight.main(["--target-version", "1.3.13"])
-    environments = ["unit", "integration", "qexp-integration"]
-    assert calls == environments[: environments.index(failed_environment) + 1]

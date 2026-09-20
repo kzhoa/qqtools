@@ -16,6 +16,11 @@ on:
         required: false
         type: boolean
         default: false
+      profile:
+        description: Validation profile (auto classifies dev pushes; feature or release selects explicitly)
+        required: false
+        type: string
+        default: auto
 
 permissions:
   contents: read
@@ -23,6 +28,50 @@ permissions:
   attestations: read
 
 jobs:
+  classify_profile:
+    name: Classify preflight profile
+    runs-on: ubuntu-latest
+    outputs:
+      profile: ${{ steps.classify.outputs.profile }}
+      base_ref: ${{ steps.classify.outputs.base_ref }}
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Classify release metadata
+        id: classify
+        env:
+          REQUESTED_PROFILE: ${{ inputs.profile || 'auto' }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BEFORE: ${{ github.event.before || '' }}
+          HEAD_REF: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$REQUESTED_PROFILE" in
+            auto|feature|release) ;;
+            *) echo "profile must be auto, feature, or release"; exit 1 ;;
+          esac
+          if [[ "$REQUESTED_PROFILE" == "release" ]]; then
+            base_ref="$(git rev-parse HEAD^)"
+            echo "profile=release" >> "$GITHUB_OUTPUT"
+            echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          elif [[ "$REQUESTED_PROFILE" == "feature" ]]; then
+            base_ref="$(git rev-parse HEAD^)"
+            echo "profile=feature" >> "$GITHUB_OUTPUT"
+            echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/heads/dev" ]]; then
+            python3 scripts/checks/check_release_commit.py classify \
+              --base-ref "$EVENT_BEFORE" \
+              --head-ref "$HEAD_REF" \
+              --github-output "$GITHUB_OUTPUT"
+          else
+            base_ref="$(git rev-parse HEAD^)"
+            echo "profile=feature" >> "$GITHUB_OUTPUT"
+            echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          fi
+
   promotion-provenance:
     name: Trusted promotion provenance
     runs-on: ubuntu-latest
@@ -77,6 +126,7 @@ jobs:
           fi
 
   select-evidence:
+    needs: classify_profile
     runs-on: ubuntu-latest
     timeout-minutes: 25
     outputs:
@@ -87,22 +137,25 @@ jobs:
         id: evidence
         env:
           GH_TOKEN: ${{ github.token }}
-          GATE: preflight
+          GATE: ${{ needs.classify_profile.outputs.profile == 'release' && 'release-preflight' || 'feature-preflight' }}
           ALLOW_REUSE: ${{ inputs.reuse_existing && 'true' || 'false' }}
         run: python3 scripts/ci/reuse_gate.py
 
   preflight:
-    needs: [promotion-provenance, select-evidence]
+    needs: [classify_profile, promotion-provenance, select-evidence]
     if: >-
       needs.select-evidence.outputs.reused != 'true' &&
-      needs.promotion-provenance.outputs.attested != 'true'
-    name: CPU-only preflight (Python 3.13)
+      (needs.classify_profile.outputs.profile == 'release' ||
+      needs.promotion-provenance.outputs.attested != 'true')
+    name: ${{ needs.classify_profile.outputs.profile == 'release' && 'Release preflight (Python 3.13)' || 'CPU-only preflight (Python 3.13)' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Strip feature-local state from promotion candidate
         if: inputs.strip_dev_state
@@ -128,25 +181,46 @@ jobs:
           python -c "import libtmux, lmdb, prompt_toolkit, sklearn; print('required preflight dependencies available')"
 
       - name: Run shared preflight gates in CI tox shell
-        run: python -m tox run -e preflight-ci
+        env:
+          PROFILE: ${{ needs.classify_profile.outputs.profile }}
+          RELEASE_BASE: ${{ needs.classify_profile.outputs.base_ref }}
+          RELEASE_HEAD: ${{ github.sha }}
+          RELEASE_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [[ "$PROFILE" == "release" ]]; then
+            python -m tox run -e preflight-ci -- \
+              --profile release \
+              --release-base "$RELEASE_BASE" \
+              --release-head "$RELEASE_HEAD" \
+              --release-actor "$RELEASE_ACTOR"
+          else
+            python -m tox run -e preflight-ci -- --profile feature
+          fi
 
   gate-result:
     if: always()
-    needs: [promotion-provenance, select-evidence, preflight]
+    needs: [classify_profile, promotion-provenance, select-evidence, preflight]
     runs-on: ubuntu-latest
     steps:
       - name: Require successful evidence or fresh gates
         env:
           EVIDENCE_RESULT: ${{ needs.select-evidence.result }}
+          CLASSIFICATION_RESULT: ${{ needs.classify_profile.result }}
           PROVENANCE_RESULT: ${{ needs.promotion-provenance.result }}
           REUSED: ${{ needs.select-evidence.outputs.reused }}
+          PROFILE: ${{ needs.classify_profile.outputs.profile }}
           ATTESTED: ${{ needs.promotion-provenance.outputs.attested }}
           FRESH_RESULTS: ${{ needs.preflight.result }}
         run: |
           set -euo pipefail
+          [[ "$CLASSIFICATION_RESULT" == "success" ]] || exit 1
           [[ "$EVIDENCE_RESULT" == "success" ]] || exit 1
           [[ "$PROVENANCE_RESULT" == "success" ]] || exit 1
-          if [[ "$REUSED" != "true" && "$ATTESTED" != "true" ]]; then
+          if [[ "$REUSED" != "true" ]]; then
+            if [[ "$PROFILE" == "feature" && "$ATTESTED" == "true" ]]; then
+              exit 0
+            fi
             [[ -n "$FRESH_RESULTS" ]] || exit 1
             for result in $FRESH_RESULTS; do
               [[ "$result" == "success" ]] || exit 1

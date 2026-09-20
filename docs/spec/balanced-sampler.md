@@ -150,14 +150,15 @@ an implementation cleanup.
    Also run the existing dataset/global-ordering tests if their shared code changes.
    Resolve every other due registry item reported by the release check independently;
    clearing this sampler item alone does not guarantee a passing release gate.
-6. Commit the cleanup candidate, then run
-   `python scripts/release_preflight.py --target-version 1.4.0` from a clean worktree
-   **before** bumping the source version to 1.4.0. Only after it passes, finalize the
-   version/changelog release commit and tag as described in the publish pipeline.
+6. Commit the cleanup candidate and confirm its normal feature gate. Before bumping
+   the source version to 1.4.0, inspect
+   `python scripts/checks/check_compatibility_registry.py plan --release-version 1.4.0`.
+   Finalize the version/changelog release commit only after every due action is resolved;
+   its exact SHA must pass the release-profile Dev Preflight before promotion and tagging.
 
 The gate verifies lifecycle state and marker cleanup, not the semantic removal of every
 legacy path. Code review and rejection tests remain required. The tag publish workflow
-does not repeat this local compatibility gate.
+does not repeat the source compatibility gate.
 
 ```python
 from torch.utils.data import DataLoader

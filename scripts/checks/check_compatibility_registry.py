@@ -357,7 +357,7 @@ def _candidate_marker_paths(repo_root: Path) -> tuple[Path, ...]:
         if result.returncode != 0:
             details = result.stderr.strip()
             raise RegistryError(f"could not list compatibility marker files: {details}")
-        return tuple(Path(line) for line in result.stdout.splitlines() if line)
+        return tuple(Path(line) for line in result.stdout.splitlines() if line and (repo_root / line).is_file())
     paths = []
     for relative_root in MARKER_ROOTS:
         root = repo_root / relative_root

@@ -44,11 +44,12 @@ def run_fixture(**updates):
     ],
 )
 def test_ineligible_evidence(updates):
-    assert not reuse_gate.eligible_run(run_fixture(**updates), "preflight", ENV, NOW)
+    assert not reuse_gate.eligible_run(run_fixture(**updates), "feature-preflight", ENV, NOW)
 
 
 def test_gate_sources_are_distinct():
-    assert reuse_gate.eligible_run(run_fixture(), "preflight", ENV, NOW)
+    assert reuse_gate.eligible_run(run_fixture(), "feature-preflight", ENV, NOW)
+    assert reuse_gate.eligible_run(run_fixture(), "release-preflight", ENV, NOW)
     assert not reuse_gate.eligible_run(run_fixture(), "artifact", ENV, NOW)
     assert reuse_gate.eligible_run(
         run_fixture(path=".github/workflows/repository-governance.yml", event="workflow_dispatch"), "artifact", ENV, NOW
@@ -71,10 +72,10 @@ def test_all_required_jobs_must_finish():
 def test_attested_promotion_is_not_reusable_preflight_evidence():
     jobs = [
         {"name": reuse_gate.PROMOTION_PROVENANCE_JOB, "status": "completed", "conclusion": "success"},
-        {"name": reuse_gate.GATES["preflight"][0], "status": "completed", "conclusion": "skipped"},
+        {"name": reuse_gate.GATES["feature-preflight"][0], "status": "completed", "conclusion": "skipped"},
     ]
-    assert reuse_gate.is_attested_promotion_without_preflight(jobs, reuse_gate.GATES["preflight"])
-    assert not reuse_gate.is_attested_promotion_without_preflight(jobs[:1], reuse_gate.GATES["preflight"])
+    assert reuse_gate.is_attested_promotion_without_preflight(jobs, reuse_gate.GATES["feature-preflight"])
+    assert not reuse_gate.is_attested_promotion_without_preflight(jobs[:1], reuse_gate.GATES["feature-preflight"])
 
 
 def setup_api(monkeypatch, runs, states):
@@ -94,42 +95,67 @@ def setup_api(monkeypatch, runs, states):
 
 def test_waits_for_running_gate(monkeypatch):
     run = run_fixture(status="in_progress", conclusion=None)
-    name = reuse_gate.GATES["preflight"][0]
+    name = reuse_gate.GATES["feature-preflight"][0]
     setup_api(
         monkeypatch,
         [run],
         [run, {"jobs": []}, run_fixture(), {"jobs": [{"name": name, "status": "completed", "conclusion": "success"}]}],
     )
-    assert reuse_gate.find_evidence("preflight").endswith("/10/attempts/1")
+    assert reuse_gate.find_evidence("feature-preflight").endswith("/10/attempts/1")
 
 
 @pytest.mark.parametrize("run", [run_fixture(run_attempt=2), run_fixture(conclusion="cancelled")])
 def test_reruns_and_cancelled_sources_fail(monkeypatch, run):
     setup_api(monkeypatch, [run_fixture()], [run, {"jobs": []}])
     with pytest.raises(RuntimeError):
-        reuse_gate.find_evidence("preflight")
+        reuse_gate.find_evidence("feature-preflight")
 
 
 def test_no_candidate_requires_fresh_gate(monkeypatch):
     setup_api(monkeypatch, [], [])
-    assert reuse_gate.find_evidence("preflight") is None
+    assert reuse_gate.find_evidence("feature-preflight") is None
 
 
 def test_attested_dev_push_selects_fresh_release_preflight(monkeypatch):
     run = run_fixture()
     jobs = [
         {"name": reuse_gate.PROMOTION_PROVENANCE_JOB, "status": "completed", "conclusion": "success"},
-        {"name": reuse_gate.GATES["preflight"][0], "status": "completed", "conclusion": "skipped"},
+        {"name": reuse_gate.GATES["feature-preflight"][0], "status": "completed", "conclusion": "skipped"},
     ]
     setup_api(monkeypatch, [run], [run, {"jobs": jobs}])
-    assert reuse_gate.find_evidence("preflight") is None
+    assert reuse_gate.find_evidence("feature-preflight") is None
+
+
+def test_attested_feature_promotion_does_not_satisfy_release_preflight(monkeypatch):
+    run = run_fixture()
+    jobs = [
+        {"name": reuse_gate.PROMOTION_PROVENANCE_JOB, "status": "completed", "conclusion": "success"},
+        {"name": reuse_gate.GATES["release-preflight"][0], "status": "completed", "conclusion": "skipped"},
+    ]
+    setup_api(monkeypatch, [run], [run, {"jobs": jobs}])
+    with pytest.raises(RuntimeError, match="unsuccessful"):
+        reuse_gate.find_evidence("release-preflight")
+
+
+def test_successful_feature_job_does_not_satisfy_release_preflight(monkeypatch):
+    run = run_fixture()
+    jobs = [
+        {
+            "name": reuse_gate.GATES["feature-preflight"][0],
+            "status": "completed",
+            "conclusion": "success",
+        }
+    ]
+    setup_api(monkeypatch, [run], [run, {"jobs": jobs}])
+    with pytest.raises(RuntimeError, match="unsuccessful"):
+        reuse_gate.find_evidence("release-preflight")
 
 
 def test_latest_failure_does_not_fall_back_to_older_success(monkeypatch):
     latest = run_fixture(id=11, conclusion="failure")
     setup_api(monkeypatch, [run_fixture(), latest], [latest, {"jobs": []}])
     with pytest.raises(RuntimeError):
-        reuse_gate.find_evidence("preflight")
+        reuse_gate.find_evidence("feature-preflight")
 
 
 def test_api_unavailable_selects_full_execution(monkeypatch, tmp_path):
@@ -138,7 +164,7 @@ def test_api_unavailable_selects_full_execution(monkeypatch, tmp_path):
     output = tmp_path / "output"
     summary = tmp_path / "summary"
     monkeypatch.setenv("ALLOW_REUSE", "true")
-    monkeypatch.setenv("GATE", "preflight")
+    monkeypatch.setenv("GATE", "release-preflight")
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
 
@@ -157,4 +183,4 @@ def test_wait_timeout_fails_instead_of_starting_duplicate_gate(monkeypatch):
     clock = iter([0, 1201])
     monkeypatch.setattr(reuse_gate.time, "monotonic", lambda: next(clock))
     with pytest.raises(RuntimeError, match="Timed out"):
-        reuse_gate.find_evidence("preflight")
+        reuse_gate.find_evidence("feature-preflight")

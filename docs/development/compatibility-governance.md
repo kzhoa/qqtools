@@ -278,14 +278,11 @@ removal required for items that still exist at a target release. `check` fails w
 registered item is in the wrong lifecycle state for that target or remains registered past its purge
 version. It intentionally does not reconstruct or validate already-cleaned historical items.
 
-The release operator must inspect `plan`, resolve every due action, commit the candidate, and run:
-
-```bash
-python scripts/release_preflight.py --target-version X.Y.Z
-```
-
-Release validation must succeed from a clean committed checkout without private pitches, ADRs, local
-notes, or other ignored planning files.
+The release operator must inspect `plan`, resolve every due action, and commit the version and
+changelog metadata under the standard administrator release procedure. The exact pushed `dev` SHA
+must then pass the release-profile Dev Preflight, which runs `check` for the committed source version.
+Release validation must succeed without private pitches, ADRs, local notes, or other ignored planning
+files.
 
 ## Public versus private documentation
 

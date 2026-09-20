@@ -14,8 +14,8 @@ describes promotion; [developer tooling](developer-tooling.md) describes setup.
   command manifest. Local and CI setup must run the same gate.
 - [CONTRACT_MATRIX.md](../../tests/CONTRACT_MATRIX.md) maps public behavior to
   regression evidence. Coverage alone does not prove a public contract.
-- The stable workflows and [release_preflight.py](../../scripts/release_preflight.py)
-  define installed-artifact and versioned-release validation.
+- The stable workflows and exact-SHA release profile define installed-artifact
+  and versioned-release validation.
 
 Historical main-first ADRs are background, not an alternative to the current
 feature/dev/main contract. Investigate and repair drift between current policy
@@ -123,9 +123,10 @@ release artifact jobs under the
 [evidence rules](development-workflow.md#reusing-gate-evidence).
 Post-push checks are not substitutes for these pre-promotion gates. The sole
 exception is the standard administrator release's owner-only commit limited to
-`src/qqtools/version.py` and `CHANGELOG.md`: release preflight runs before the
-version bump, then the direct `dev` push must obtain complete Dev Preflight
-evidence for its exact SHA before `dev`-to-`main` promotion can begin.
+`src/qqtools/version.py` and `CHANGELOG.md`: compatibility planning runs before
+the version bump, then the direct `dev` push must obtain complete release-profile
+Dev Preflight evidence for its exact SHA before `dev`-to-`main` promotion can
+begin.
 
 Ordinary main/PR artifact CI validates installed wheels using the matrix in its
 stable workflow. Canonical Python runs `artifact-e2e`; the other configured
@@ -137,10 +138,11 @@ shared preflight, including the dev and promotion workflows.
 Installed tests clear `PYTHONPATH` and reject checkout `src/` imports. Use these
 lanes for affected public delivery boundaries and whenever policy requires them.
 
-For a versioned release, `scripts/release_preflight.py --target-version X.Y.Z`
-requires a clean committed candidate, checks compatibility and export contracts,
-and runs Unit, general Integration, and complete qexp Integration. Tagged
-publishing separately runs `release-e2e` against the selected wheel before
+For a versioned release, Dev Preflight recognizes the owner-only metadata commit
+and runs the release source profile against its exact SHA. That profile checks
+version and changelog consistency, compatibility and export contracts, static and
+governance rules, Unit, general Integration, and complete qexp Integration.
+Tagged publishing separately runs `release-e2e` against the selected wheel before
 publication. These distinct gates cannot substitute for one another.
 
 ## qexp resource and lifecycle protection

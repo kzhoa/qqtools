@@ -1,11 +1,11 @@
 ---
 doc_type: adr
 adr_id: ADR-0001
-status: accepted
-updated_at: 2026-08-31
+status: superseded
+updated_at: 2026-09-20
 archived_at:
 supersedes: []
-superseded_by:
+superseded_by: ADR-0003
 ---
 
 # ADR-0001: Govern Compatibility Through the Local Release Preflight

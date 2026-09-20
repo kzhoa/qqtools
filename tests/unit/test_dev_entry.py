@@ -73,7 +73,7 @@ def test_non_313_runner_fails_before_commands(monkeypatch, capsys):
 
     monkeypatch.setattr(run_preflight, "sys", SimpleNamespace(version_info=Version((3, 12)), stderr=sys.stderr))
     monkeypatch.setattr(run_preflight, "COMMANDS", (("must-not-run",),))
-    assert run_preflight.main() == 1
+    assert run_preflight.main([]) == 1
     assert "./scripts/dev preflight" in capsys.readouterr().err
 
 
@@ -82,6 +82,49 @@ def test_platform_prerequisites(monkeypatch, platform, tmux, expected):
     monkeypatch.setattr(run_preflight, "sys", SimpleNamespace(version_info=(3, 13), platform=platform))
     monkeypatch.setattr(run_preflight.shutil, "which", lambda _: tmux)
     assert expected in run_preflight.check_prerequisites()
+
+
+def test_release_profile_uses_exact_release_validator_and_full_qexp(monkeypatch):
+    commands = []
+    monkeypatch.setattr(run_preflight, "check_prerequisites", lambda: None)
+    monkeypatch.setattr(
+        run_preflight.subprocess,
+        "run",
+        lambda command, **kwargs: commands.append(command) or SimpleNamespace(returncode=0),
+    )
+
+    assert (
+        run_preflight.main(
+            [
+                "--profile",
+                "release",
+                "--release-base",
+                "base",
+                "--release-head",
+                "head",
+                "--release-actor",
+                "kzhoa",
+            ]
+        )
+        == 0
+    )
+
+    rendered = [" ".join(command) for command in commands]
+    validator = next(index for index, command in enumerate(rendered) if "check_release_commit.py validate" in command)
+    common = next(index for index, command in enumerate(rendered) if "ruff check" in command)
+    full_qexp = next(index for index, command in enumerate(rendered) if "qexp_integration_gate.py" in command)
+    assert validator < common < full_qexp
+    assert "--budget-seconds 600" in rendered[full_qexp]
+    assert not any("--lifecycle-gate=representative" in command for command in rendered)
+
+
+def test_release_profile_requires_release_identity(monkeypatch):
+    monkeypatch.setattr(run_preflight, "check_prerequisites", lambda: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_preflight.main(["--profile", "release"])
+
+    assert exc_info.value.code == 2
 
 
 def test_existing_incompatible_ide_environment_is_preserved(entry, monkeypatch, tmp_path, capsys):

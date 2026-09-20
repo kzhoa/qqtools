@@ -92,10 +92,11 @@ Dispatch the existing governance workflow from current `dev`:
 gh workflow run repository-governance.yml --ref dev -f operation=promote-dev-to-main
 ```
 
-The exact `dev` commit must pass repository preflight and installed-artifact E2E.
-The release preflight reuses a recent complete Dev Preflight push run for that
-SHA, waiting for it to finish if necessary; a provenance-only promotion run is
-not complete preflight evidence, so release executes the full source gate.
+The exact `dev` commit must pass the release source profile and installed-artifact
+E2E. The release gate reuses a recent complete release-profile Dev Preflight push
+run for that SHA, waiting for it to finish if necessary. Feature-profile and
+provenance-only runs are not release evidence, so missing release evidence causes
+the complete release source profile to execute.
 If `dev` advances during validation, the operation must abort and be dispatched
 again. Current `main` must be an ancestor of the validated commit; promotion
 fast-forwards `main` to that same commit. Do not create another squash commit,
@@ -117,10 +118,10 @@ of rebuilding and retesting the same commit.
 ## Reusing gate evidence
 
 Reuse accepts only `kzhoa`-requested and `kzhoa`-rerun executions on `dev`, created
-within the last 24 hours, for the identical commit SHA. Preflight evidence comes
-from `dev-preflight.yml` push runs whose CPU preflight job actually completed;
-an attested promotion whose duplicate job was skipped deliberately selects fresh
-release execution. Artifact evidence comes from
+within the last 24 hours, for the identical commit SHA. Feature and release source
+evidence are distinct jobs in `dev-preflight.yml`; a release accepts only a
+completed release-profile job. An attested feature promotion whose duplicate job
+was skipped is not release evidence. Artifact evidence comes from
 `repository-governance.yml` release dispatches and must include all three Python
 smoke jobs and the Python 3.13 installed E2E job. Evidence jobs must finish
 successfully; skipped jobs are not evidence. The run attempt is fixed while
@@ -161,21 +162,18 @@ does not permit other direct changes to `dev`.
    is excluded, and current `main` is an ancestor of `dev`. Review the commits
    and user-visible changes since the previous release. Do not start publication
    while another change is being promoted to `dev`.
-2. **Validate before changing the version.** Use a clean, committed checkout that
+2. **Plan compatibility before changing the version.** Use a clean, committed checkout that
    exactly matches current remote `dev`. Record that commit SHA, inspect and
    resolve the target release's compatibility
    obligations using [compatibility governance](compatibility-governance.md#commands),
-   then run with Python 3.13:
+   then run:
 
    ```bash
    python scripts/checks/check_compatibility_registry.py plan --release-version X.Y.Z
-   python scripts/release_preflight.py --target-version X.Y.Z
    ```
 
-   `release_preflight.py` requires the target to be later than the current source
-   version, so run it before applying the version bump. A failure blocks the
-   release; resolve it and repeat the check against the updated committed
-   candidate.
+   Resolve every due action before applying the version bump. The exact release
+   commit will enforce the compatibility state in CI.
 3. **Commit the release metadata directly to `dev`.** Update
    `src/qqtools/version.py` to `X.Y.Z`, add a
    nonempty `## vX.Y.Z` section below `## Unreleased` in `CHANGELOG.md`, and move
@@ -201,10 +199,13 @@ does not permit other direct changes to `dev`.
    file. Such changes require the normal feature-promotion path.
 4. **Wait for complete Dev Preflight.** Record the pushed release commit SHA and
    wait for its `dev-preflight.yml` push run. Because a direct release commit has
-   no feature-promotion provenance, the workflow runs complete preflight for that
-   exact SHA. Do not begin `dev`-to-`main` promotion until the run succeeds. If it
-   fails, keep the release blocked; code fixes must use feature promotion, and any
-   permitted metadata correction creates a new SHA that must pass again.
+   no feature-promotion provenance, the workflow selects the release profile for
+   that exact SHA. It validates the version, changelog, compatibility registry,
+   export stubs, static and governance checks, Unit, general Integration, and
+   complete qexp Integration. Do not begin `dev`-to-`main` promotion until the run
+   succeeds. If it fails, keep the release blocked; code fixes must use feature
+   promotion, and any permitted metadata correction creates a new SHA that must
+   pass again.
 5. **Promote the release commit to `main`.** Dispatch the governed release from
    that current `dev` commit with owner credentials:
 

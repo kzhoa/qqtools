@@ -13,6 +13,7 @@ thread state from the rest of the unit suite.
 
 from __future__ import annotations
 
+import argparse
 import shutil
 import subprocess
 import sys
@@ -54,6 +55,8 @@ COMMANDS: tuple[tuple[str, ...], ...] = (
     ),
 )
 
+COMMON_COMMANDS: tuple[tuple[str, ...], ...] = COMMANDS[:-4]
+
 
 def check_prerequisites() -> str | None:
     if sys.version_info[:2] != (3, 13):
@@ -68,12 +71,50 @@ def check_prerequisites() -> str | None:
     return None
 
 
-def main() -> int:
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=("feature", "release"), default="feature")
+    parser.add_argument("--release-base")
+    parser.add_argument("--release-head")
+    parser.add_argument("--release-actor")
+    return parser
+
+
+def _commands(
+    profile: str,
+    release_base: str | None,
+    release_head: str | None,
+    release_actor: str | None,
+) -> tuple[tuple[str, ...], ...]:
+    if profile == "feature":
+        return COMMANDS
+    if not all((release_base, release_head, release_actor)):
+        _parser().error("--profile release requires --release-base, --release-head, and --release-actor")
+    return (
+        (
+            PYTHON,
+            "scripts/checks/check_release_commit.py",
+            "validate",
+            "--base-ref",
+            release_base,
+            "--head-ref",
+            release_head,
+            "--actor",
+            release_actor,
+        ),
+        *COMMON_COMMANDS,
+        (PYTHON, "scripts/qexp_integration_gate.py", "--budget-seconds", "600"),
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    commands = _commands(args.profile, args.release_base, args.release_head, args.release_actor)
     error = check_prerequisites()
     if error:
         print(error, file=sys.stderr)
         return 1
-    for command in COMMANDS:
+    for command in commands:
         print(f"+ {' '.join(command)}", flush=True)
         completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
         if completed.returncode != 0:

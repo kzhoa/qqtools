@@ -143,6 +143,7 @@ Do not rewrite protected tests or specs to accommodate a regression.
 ## Protected governance surface
 
 `AGENTS.md`, `.github/CODEOWNERS`, `.github/workflows/**`,
+`scripts/checks/check_release_commit.py`,
 `scripts/checks/check_repository_governance.py`, and
 `scripts/ci/promotion_provenance.py` are owner-controlled.
 

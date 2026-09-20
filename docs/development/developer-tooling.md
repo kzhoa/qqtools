@@ -142,8 +142,8 @@ requires it. The redundant `base` lane and automatic `cleanup` lane are removed;
 validation preserves `tmp/` diagnostics instead of deleting them afterward.
 The unused pytest-cov dependency and obsolete pip-cache override are removed;
 tox-uv uses the uv cache settings described above.
-The release preflight script invokes tox through its current Python interpreter,
-so it does not require a separate global tox executable on PATH.
+The CI release profile uses the same shared Python runner as ordinary preflight
+and replaces representative qexp coverage with the complete qexp integration gate.
 `release-e2e` inherits the installed E2E environment and still accepts
 `--installpkg` for the exact wheel selected by publishing.
 

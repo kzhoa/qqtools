@@ -70,6 +70,13 @@ def test_promotion_provenance_helper_is_owner_protected() -> None:
     assert "/scripts/ci/promotion_provenance.py @kzhoa" in codeowners
 
 
+def test_release_commit_gate_is_owner_protected() -> None:
+    governance = _workflow("repository-governance.yml")
+
+    assert "scripts/checks/check_release_commit\\.py" in governance
+    assert "path === 'scripts/checks/check_release_commit.py'" in governance
+
+
 def test_dev_release_runs_both_gates_and_fast_forwards_exact_validated_sha() -> None:
     governance = _workflow("repository-governance.yml")
     ordinary_ci = _workflow("ci.yml")
@@ -78,11 +85,25 @@ def test_dev_release_runs_both_gates_and_fast_forwards_exact_validated_sha() -> 
     assert "preflight-dev-release:" in governance
     assert "artifact-e2e-dev-release:" in governance
     assert "uses: ./.github/workflows/dev-preflight.yml" in governance
+    assert "profile: release" in governance
     assert "uses: ./.github/workflows/ci.yml" in governance
     assert 'if [[ "$dev_sha" != "$EXPECTED_DEV_SHA" ]]' in governance
     assert 'git merge-base --is-ancestor "$main_sha" "$dev_sha"' in governance
     assert 'git push origin "$dev_sha:refs/heads/main"' in governance
     assert "--force" not in governance
+
+
+def test_dev_preflight_selects_distinct_feature_and_release_profiles() -> None:
+    preflight = _workflow("dev-preflight.yml")
+
+    assert "check_release_commit.py classify" in preflight
+    assert "feature-preflight" in preflight
+    assert "release-preflight" in preflight
+    assert "Release preflight (Python 3.13)" in preflight
+    assert "--profile" in preflight
+    assert "--release-base" in preflight
+    assert "--release-head" in preflight
+    assert "--release-actor" in preflight
 
 
 def test_publish_rejects_tags_that_are_not_reachable_from_main() -> None:

@@ -25,27 +25,29 @@ for protected files and credentials.
 
    ```bash
    python scripts/checks/check_compatibility_registry.py plan --release-version X.Y.Z
-   python scripts/release_preflight.py --target-version X.Y.Z
    ```
 
-   The release script requires a clean committed worktree, checks compatibility
-   and export stubs, and runs Unit, general Integration, and complete qexp
-   Integration. Fix failures and repeat before creating the release commit.
+   Resolve every due compatibility action before creating the release commit.
 3. **Create and validate the release commit.** Update
    `src/qqtools/version.py` and finalize the nonempty `## vX.Y.Z` section in
    `CHANGELOG.md`. Commit these together. Remove any `.dev/**` from the candidate
    before validation. Run the complete source gate and installed-artifact gate
    on this final committed candidate:
 
+   With `RELEASE_PARENT_SHA` replaced by the release commit's parent, run:
+
    ```bash
+   python scripts/checks/check_release_commit.py validate \
+     --base-ref RELEASE_PARENT_SHA --head-ref HEAD --actor kzhoa
    ./scripts/dev preflight
+   python -m tox run -e qexp-integration
    tox run -e artifact-e2e
    ```
 
    Use the configured development environment for tox. Record the candidate SHA
    and successful results. Any subsequent candidate changes invalidate affected
-   evidence. Do not rerun `release_preflight.py` with an already-applied target:
-   that script intentionally requires the target to exceed the current version.
+   evidence. The manual route runs ordinary preflight and complete qexp separately;
+   the standard administrator route combines them in the CI release profile.
 4. **Publish the validated history with owner credentials.** Re-fetch and check
    that the remote refs have not changed since preparation; if they have, rebuild
    the affected candidate and repeat its gates. Update `main` by fast-forward to

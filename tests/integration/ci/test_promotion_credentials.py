@@ -205,8 +205,10 @@ def test_gate_result_requires_evidence_or_all_fresh_jobs(workflow, evidence, reu
         ["bash", "-c", jobs["gate-result"]["steps"][0]["run"]],
         env={
             **os.environ,
+            "CLASSIFICATION_RESULT": "success",
             "EVIDENCE_RESULT": evidence,
             "PROVENANCE_RESULT": "success",
+            "PROFILE": "feature",
             "REUSED": reused,
             "ATTESTED": "false",
             "FRESH_RESULTS": fresh,
@@ -224,8 +226,10 @@ def test_attested_dev_promotion_does_not_require_fresh_preflight() -> None:
         ["bash", "-c", jobs["gate-result"]["steps"][0]["run"]],
         env={
             **os.environ,
+            "CLASSIFICATION_RESULT": "success",
             "EVIDENCE_RESULT": "success",
             "PROVENANCE_RESULT": "success",
+            "PROFILE": "feature",
             "REUSED": "false",
             "ATTESTED": "true",
             "FRESH_RESULTS": "skipped",
@@ -235,3 +239,24 @@ def test_attested_dev_promotion_does_not_require_fresh_preflight() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_attested_feature_promotion_cannot_skip_release_preflight() -> None:
+    jobs = yaml.safe_load((ROOT / ".github/workflows/dev-preflight.yml").read_text())["jobs"]
+    result = subprocess.run(
+        ["bash", "-c", jobs["gate-result"]["steps"][0]["run"]],
+        env={
+            **os.environ,
+            "CLASSIFICATION_RESULT": "success",
+            "EVIDENCE_RESULT": "success",
+            "PROVENANCE_RESULT": "success",
+            "REUSED": "false",
+            "PROFILE": "release",
+            "ATTESTED": "true",
+            "FRESH_RESULTS": "skipped",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0

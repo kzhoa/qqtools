@@ -12,7 +12,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 GATES = {
-    "preflight": ("CPU-only preflight (Python 3.13)",),
+    "feature-preflight": ("CPU-only preflight (Python 3.13)",),
+    "release-preflight": ("Release preflight (Python 3.13)",),
     "artifact": (
         "artifact-e2e-dev-release / artifact smoke (Python 3.11)",
         "artifact-e2e-dev-release / artifact smoke (Python 3.12)",
@@ -25,8 +26,9 @@ PROMOTION_PROVENANCE_JOB = "Trusted promotion provenance"
 
 def eligible_run(run: dict, gate: str, env: dict, now: datetime) -> bool:
     """Accept only recent owner runs from the expected dev gate, excluding this run."""
-    workflow = "dev-preflight.yml" if gate == "preflight" else "repository-governance.yml"
-    event = "push" if gate == "preflight" else "workflow_dispatch"
+    source_gate = gate in {"feature-preflight", "release-preflight"}
+    workflow = "dev-preflight.yml" if source_gate else "repository-governance.yml"
+    event = "push" if source_gate else "workflow_dispatch"
     return (
         str(run["id"]) != env["GITHUB_RUN_ID"]
         and run["head_sha"] == env["GITHUB_SHA"]
@@ -95,8 +97,8 @@ def find_evidence(gate: str) -> str | None:
             raise RuntimeError(f"Evidence workflow did not succeed: {run['html_url']}")
         if state == "passed":
             return f"{run['html_url']}/attempts/{attempt}"
-        if gate == "preflight" and is_attested_promotion_without_preflight(jobs, GATES[gate]):
-            print("Dev push used promotion provenance only; running a fresh release preflight.", flush=True)
+        if gate == "feature-preflight" and is_attested_promotion_without_preflight(jobs, GATES[gate]):
+            print("Dev push used promotion provenance only; running a fresh feature preflight.", flush=True)
             return None
         if state == "failed" or current["status"] == "completed":
             raise RuntimeError(f"Gate evidence is unsuccessful: {run['html_url']}")
