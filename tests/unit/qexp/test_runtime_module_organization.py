@@ -21,6 +21,14 @@ OLD_RUNTIME_IMPORTS = {
     "runtime.cpu_lane",
     "runtime.group_members",
 }
+OLD_PRIMARY_PROBE_FIELDS = {
+    "primary_probe_cursors",
+    "primary_probe_revisions",
+    "primary_probe_complete",
+    "primary_probe_pending_routes",
+    "primary_probe_recheck_cursors",
+    "primary_probe_recheck_round_cursors",
+}
 
 
 def _import_modules(path: Path) -> set[str]:
@@ -62,3 +70,17 @@ def test_runtime_packages_export_owner_objects_without_private_names() -> None:
     assert qexp.CpuLanePolicy is cpu_lane.CpuLanePolicy
     assert qexp.get_cpu_lane_policy is cpu_lane.get_cpu_lane_policy
     assert qexp.set_cpu_lane_capacity is cpu_lane.set_cpu_lane_capacity
+
+
+def test_primary_probe_state_is_only_mutated_by_its_owner() -> None:
+    production_root = PROJECT_ROOT / "src/qqtools/plugins/qexp"
+    offenders: list[str] = []
+    for path in production_root.rglob("*.py"):
+        if path.name == "dispatch_probe.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in OLD_PRIMARY_PROBE_FIELDS:
+                offenders.append(f"{path.relative_to(PROJECT_ROOT)}:{node.lineno}:{node.attr}")
+
+    assert offenders == []

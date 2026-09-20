@@ -32,10 +32,10 @@ from ..runtime.paths import (
     machine_runtime_paths,
     shared_paths,
 )
-from ..runtime.ready import ReadyCursor
 from ..runtime.records import utc_now
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.work_budget import AdaptiveBatchSizer, diagnostic_increment, diagnostic_observe_ns
+from .dispatch_probe import PrimaryProbeSession
 
 MACHINE_RUNTIME_ENV = "QEXP_MACHINE_RUNTIME_ROOT"
 REGISTRY_VERSION = 1
@@ -209,19 +209,7 @@ class MachineRuntime:
         self.paths = machine_runtime_paths(self.root)
         self.last_diagnostic_publish_ns: int | None = None
         self.ready_batch_sizers: dict[str, AdaptiveBatchSizer] = {}
-        self.primary_probe_cursors: dict[tuple[str, ...], ReadyCursor | None] = {}
-        self.primary_probe_revisions: dict[tuple[str, ...], int] = {}
-        self.primary_probe_complete: dict[tuple[str, ...], bool] = {}
-        # Finish each route once per probe round, even when the budget spans calls.
-        self.primary_probe_pending_routes: dict[str, set[tuple[str, str, str]]] = {}
-        # A temporarily unavailable marker can become claimable without an index
-        # revision change.  Keep its position separately from scan completion:
-        # dependency waiting is not resource demand and must not deny borrowing.
-        self.primary_probe_recheck_cursors: dict[tuple[str, str, str], ReadyCursor | None] = {}
-        # The next dependency route to revisit after every route has completed
-        # its baseline scan.  Advancing one route at a time prevents an early
-        # project from exhausting each slice before later projects are scanned.
-        self.primary_probe_recheck_round_cursors: dict[str, tuple[str, str, str]] = {}
+        self.primary_probe = PrimaryProbeSession()
         # Set by the most recent bounded dispatch cycle for on-demand idle exit.
         self.last_cycle_had_demand = True
         # Set when the current process validates and consumes a current binding.

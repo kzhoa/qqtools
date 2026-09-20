@@ -189,7 +189,7 @@ def test_primary_probe_retains_dependency_recheck_across_budgeted_batches(
         runtime, {binding.project_id: cfg}, {binding.project_id: cfg}, [0], [0], limited
     )
     assert incomplete.state == "unresolved"
-    assert route_key in runtime.primary_probe_recheck_cursors
+    assert runtime.primary_probe.route(route_key).recheck is not None
 
     completed = machine_agent._probe_primary_demand(
         runtime,
@@ -200,7 +200,7 @@ def test_primary_probe_retains_dependency_recheck_across_budgeted_batches(
         SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
     )
     assert completed.state == "no_primary_demand"
-    assert runtime.primary_probe_complete[route_key]
+    assert runtime.primary_probe.route(route_key).is_complete
 
     claimable = ReadyClassificationResult("claimable", "eligible_truth", first_task)
     monkeypatch.setattr(machine_agent, "classify_ready_marker", lambda *_args: claimable)
@@ -582,6 +582,33 @@ def test_borrow_admission_grant_is_invalidated_by_primary_revision(
         )
 
 
+def test_failed_borrow_grant_verification_invalidates_probe_session(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    _activate_ready(cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    readable = {binding.project_id: cfg}
+    probe = machine_agent._probe_primary_demand(
+        runtime,
+        readable,
+        readable,
+        [0],
+        [0],
+        SliceBudget(WorkBudgetPolicy(), clock_ns=lambda: 0),
+    )
+    assert probe.state == "no_primary_demand"
+    bump_primary_ready_revision(cfg, "shared", cfg.machine_name)
+
+    grant = machine_agent._build_borrow_admission_grant(runtime, readable, probe, set(readable))
+
+    assert grant is None
+    for scope in ("shared", "home"):
+        route = runtime.primary_probe.route((binding.project_id, scope, "gpu"))
+        assert route.cursor is None
+        assert route.revision is None
+        assert not route.is_complete
+
+
 def test_borrow_marker_changes_do_not_advance_primary_revision(
     tmp_path: Path,
 ) -> None:
@@ -933,8 +960,8 @@ def test_primary_probe_rechecks_completed_shared_scope_before_borrow(
     assert executor.launched == []
     assert borrow_task.task_id not in executor.launched
     shared_probe_key = (binding.project_id, "shared", "gpu")
-    assert runtime.primary_probe_complete[shared_probe_key] is False
-    assert runtime.primary_probe_cursors[shared_probe_key] is None
+    assert runtime.primary_probe.route(shared_probe_key).is_complete is False
+    assert runtime.primary_probe.route(shared_probe_key).cursor is None
 
 
 def test_primary_aggregation_waiting_blocks_borrow_admission(tmp_path: Path) -> None:
