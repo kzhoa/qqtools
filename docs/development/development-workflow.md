@@ -146,17 +146,97 @@ verification use PR CI or the release dispatch, which always executes artifact
 tests. Feature and squash commits remain separate candidates and are not equated
 by tree or commit message. Version-tag publishing keeps its own exact-wheel gate.
 
-## Prepare a versioned release
+## Standard administrator version release
 
-Inspect the target release's compatibility obligations and resolve due actions
-using [compatibility governance](compatibility-governance.md#commands). Run
-`scripts/release_preflight.py --target-version X.Y.Z` with Python 3.13 from a
-clean, committed candidate before creating the release version commit; the
-target must be later than the current source version.
+Use this procedure after all features intended for a release have been promoted
+to `dev`. Patch, minor, and major releases use the same delivery path. Select an
+unused `X.Y.Z` version later than the current source version according to the
+release's compatibility scope. The standard route adds the version metadata
+through a release feature, promotes the resulting `dev` commit to `main`, and
+publishes that exact commit by tag.
 
-Release changes normally follow the same feature/dev/main flow. The owner may
-instead authorize the [administrator manual release procedure](../../.github/publish.md),
-which retains validation gates and public-history invariants while allowing a
-directly prepared release candidate and reconciliation into dev. Tags must reference
-commits reachable from `main`. Tagged publishing validates the exact selected
-wheel through `release-e2e`; a source test result does not replace that gate.
+1. **Freeze and inspect the release contents.** Fetch current `main`, `dev`, and
+   tags. Confirm that every intended feature is present on `dev`, unrelated work
+   is excluded, and current `main` is an ancestor of `dev`. Review the commits
+   and user-visible changes since the previous release. Do not start publication
+   while another change is being promoted to `dev`.
+2. **Validate before changing the version.** From a clean, committed checkout of
+   current `dev`, inspect and resolve the target release's compatibility
+   obligations using [compatibility governance](compatibility-governance.md#commands),
+   then run with Python 3.13:
+
+   ```bash
+   python scripts/checks/check_compatibility_registry.py plan --release-version X.Y.Z
+   python scripts/release_preflight.py --target-version X.Y.Z
+   ```
+
+   `release_preflight.py` requires the target to be later than the current source
+   version, so run it before applying the version bump. A failure blocks the
+   release; resolve it and repeat the check against the updated committed
+   candidate.
+3. **Create the release feature.** Create `feature/release-X.Y.Z` from the exact
+   validated `dev` commit. Update `src/qqtools/version.py` to `X.Y.Z`, add a
+   nonempty `## vX.Y.Z` section below `## Unreleased` in `CHANGELOG.md`, and move
+   the applicable unreleased notes into it. Review the release notes against all
+   commits being published.
+   Run the normal pre-promotion checks, then commit the release metadata with a
+   `promote:` subject and push the feature branch, for example:
+
+   ```bash
+   git switch --create feature/release-X.Y.Z origin/dev
+   # Update src/qqtools/version.py and CHANGELOG.md, then run the required checks.
+   git add src/qqtools/version.py CHANGELOG.md
+   git commit -m "promote: release vX.Y.Z"
+   git push -u origin feature/release-X.Y.Z
+   ```
+
+   If the exact version and changelog commit is already on `dev`, do not create a
+   duplicate release feature; verify that commit and continue with the next step.
+4. **Wait for promotion to `dev`.** The feature-promotion workflow runs complete
+   preflight, creates one squash commit on the current `dev`, records promotion
+   provenance, pushes the result, and deletes the feature branch. Confirm that
+   the workflow succeeded and record the resulting `dev` commit SHA. A branch
+   push or accepted workflow run alone does not mean promotion succeeded.
+5. **Promote the release commit to `main`.** Dispatch the governed release from
+   that current `dev` commit with owner credentials:
+
+   ```bash
+   gh workflow run repository-governance.yml --ref dev -f operation=promote-dev-to-main
+   ```
+
+   This workflow validates the exact `dev` commit with repository preflight and
+   installed-artifact E2E, verifies that `main` is its ancestor, and fast-forwards
+   `main` to it. It aborts if `dev` advances during validation. Confirm the run
+   succeeded and that remote `main` points to the recorded release commit before
+   creating a tag; otherwise investigate or dispatch again from the new intended
+   `dev` head.
+6. **Tag the validated commit.** Create an annotated `vX.Y.Z` tag on the recorded
+   release commit and push only that tag:
+
+   ```bash
+   release_tag=vX.Y.Z
+   release_commit=VALIDATED_COMMIT_SHA
+   git fetch origin main dev
+   test -z "$(git ls-remote --tags origin "refs/tags/$release_tag")"
+   test "$(git rev-parse origin/main)" = "$release_commit"
+   git merge-base --is-ancestor "$release_commit" origin/dev
+   git tag -a "$release_tag" "$release_commit" -m "Release $release_tag"
+   git push origin "refs/tags/$release_tag"
+   ```
+
+   Stop if the tag already exists, `main` differs from the validated commit, or
+   that commit is not an ancestor of `dev`. Never move a published tag.
+7. **Verify publication.** The tag starts `publish.yml`, which checks that the
+   tagged commit is reachable from `main` and that the tag, package version, and
+   changelog agree. It builds the distributions, runs `release-e2e` against the
+   exact wheel, creates the GitHub Release, and publishes to PyPI. Confirm the
+   workflow, release assets, release notes, and both PyPI distributions before
+   declaring the release complete. If publication fails, inspect which outputs
+   already exist and follow the
+   [same-version retry rules](../../.github/publish.md#retry-a-failed-release-with-the-same-version);
+   never reuse a version accepted by PyPI.
+
+The repository owner may explicitly choose the
+[administrator manual release procedure](../../.github/publish.md) when the
+normal feature-to-`dev`-to-`main` path is unsuitable. That is an exception for a
+particular release, not the standard version-release procedure.
