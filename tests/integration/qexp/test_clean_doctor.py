@@ -18,6 +18,7 @@ from qqtools.plugins.qexp.runtime.availability import migrate_legacy_deadline_in
 from qqtools.plugins.qexp.runtime.claims import reconcile_claim_archives
 from qqtools.plugins.qexp.runtime.locks import group_lock, task_lock
 from qqtools.plugins.qexp.runtime.paths import attempt_path, group_path, shared_paths, task_path
+from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
 from qqtools.plugins.qexp.runtime.records import SCHEMA_VERSION, new_id, utc_now
 from qqtools.plugins.qexp.runtime.resources.reservations import attach, reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -657,7 +658,43 @@ def test_doctor_reports_corrupt_cross_truth_without_crashing(tmp_path: Path):
     assert "group_invalid" in codes
 
 
-def test_repair_orphan_keeps_blocked_on_identity_mismatch(tmp_path: Path):
+def test_doctor_does_not_probe_process_for_mismatched_attempt_identity(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    attempt_file = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    attempt_data = read_json(attempt_file)
+    attempt_data["attempt"]["process"].update({"process_group_id": 4321, "process_group_start_time_ticks": 111})
+    atomic_replace(attempt_file, attempt_data)
+    atomic_replace(
+        cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json",
+        {
+            "process": {
+                "task_id": task.task_id,
+                "attempt_id": "other-attempt",
+                "fencing_token": attempt.current_fencing_token,
+                "process_group_id": 4321,
+                "process_group_start_time_ticks": 111,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.doctor.inspect_group_identity",
+        lambda *_args: pytest.fail("mismatched Attempt identity must stop before process inspection"),
+    )
+
+    codes = {issue["code"] for issue in verify_integrity(cfg)["issues"]}
+
+    assert "process_manifest_attempt_mismatch" in codes
+
+
+@pytest.mark.parametrize(
+    ("evidence_reason", "diagnostic"),
+    [("identity_mismatch", "process_identity_mismatch"), ("read_failed", "process_identity_unverifiable")],
+)
+def test_repair_orphan_keeps_blocked_on_unknown_identity(tmp_path: Path, monkeypatch, evidence_reason, diagnostic):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     attempt = claim_task(cfg, task.task_id, [0])
@@ -675,17 +712,22 @@ def test_repair_orphan_keeps_blocked_on_identity_mismatch(tmp_path: Path):
                 "task_id": task.task_id,
                 "attempt_id": attempt.attempt_id,
                 "fencing_token": attempt.current_fencing_token,
-                "process_group_id": 222,
-                "process_group_start_time_ticks": 20,
+                "process_group_id": 222 if evidence_reason == "identity_mismatch" else 111,
+                "process_group_start_time_ticks": 20 if evidence_reason == "identity_mismatch" else 10,
             }
         },
     )
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    if evidence_reason != "identity_mismatch":
+        evidence = ProcessEvidence(state="unknown", reason=evidence_reason)
+        monkeypatch.setattr("qqtools.plugins.qexp.scheduler.inspect_group_identity", lambda *_args: evidence)
+        monkeypatch.setattr("qqtools.plugins.qexp.doctor.inspect_group_identity", lambda *_args: evidence)
     reconcile_running_tasks(cfg)
     assert load_task(cfg, task.task_id).state["projection"] == "blocked"
     assert reserved_gpu_ids(cfg.runtime_root) == {0}
+    assert diagnostic in {issue["code"] for issue in verify_integrity(cfg)["issues"]}
     result = repair_orphans(cfg)
-    assert result["blocked"] == [{"task_id": task.task_id, "reason": "process_identity_mismatch"}]
+    assert result["blocked"] == [{"task_id": task.task_id, "reason": diagnostic}]
     assert load_task(cfg, task.task_id).state["projection"] == "blocked"
     assert reserved_gpu_ids(cfg.runtime_root) == {0}
 
@@ -715,8 +757,10 @@ def test_repair_orphan_finalizes_identity_matched_absent_process(tmp_path: Path,
         },
     )
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_start_time_ticks", lambda pid: None)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._is_process_group_alive", lambda pid: False)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.doctor.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="absent"),
+    )
     result = repair_orphans(cfg)
     assert result["repaired"] == [task.task_id]
     assert load_task(cfg, task.task_id).state["projection"] == "failed"

@@ -6,13 +6,15 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import cancel, retry
+from qqtools.plugins.qexp.infrastructure.process import ProcessIdentityRead
+from qqtools.plugins.qexp.runtime import process_evidence
 from qqtools.plugins.qexp.runtime.paths import attempt_path, shared_paths
+from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence, inspect_wrapper_identity
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
 from qqtools.plugins.qexp.runtime.resources.reservations import reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import (
-    _manifest_supervisor,
     _terminate_process_group,
     authorize_launch,
     claim_task,
@@ -153,7 +155,10 @@ def test_agent_does_not_acknowledge_unconfirmed_termination(tmp_path: Path, monk
         },
     )
     cancel(cfg, task.task_id)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *args: "alive")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="alive"),
+    )
     monkeypatch.setattr("qqtools.plugins.qexp.scheduler._terminate_process_group", lambda pid: False)
     monkeypatch.setattr("qqtools.plugins.qexp.scheduler.renew_attempt_lease", lambda *args: True)
     reconcile_running_tasks(cfg)
@@ -183,7 +188,10 @@ def test_agent_acknowledges_termination_only_after_process_disappears(tmp_path: 
         },
     )
     cancel(cfg, task.task_id)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *args: "alive")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="alive"),
+    )
     monkeypatch.setattr("qqtools.plugins.qexp.scheduler._terminate_process_group", lambda pid: True)
     reconcile_running_tasks(cfg)
     stored = load_task(cfg, task.task_id)
@@ -213,7 +221,10 @@ def test_agent_finalizes_missing_recovered_process_and_releases_gpu(tmp_path: Pa
             }
         },
     )
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *args: "absent")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="absent"),
+    )
     reconcile_running_tasks(cfg)
     stored = load_task(cfg, task.task_id)
     assert stored.state == {"projection": "failed", "reason": "process_exited_without_status"}
@@ -232,10 +243,19 @@ def test_agent_termination_escalates_when_sigterm_does_not_stop_process(monkeypa
 
 
 def test_reused_wrapper_pid_is_not_treated_as_runner(monkeypatch):
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._is_process_alive", lambda pid: True)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_start_time_ticks", lambda pid: 222)
+    monkeypatch.setattr(
+        process_evidence,
+        "read_process_identity",
+        lambda _pid: ProcessIdentityRead(state="present", start_time_ticks=222),
+    )
+    monkeypatch.setattr(
+        process_evidence,
+        "read_process_presence",
+        lambda *_args, **_kwargs: pytest.fail("reused wrapper identity must stop before presence probe"),
+    )
     manifest = {"wrapper_pid": 4321, "wrapper_start_time_ticks": 111}
-    assert _manifest_supervisor(manifest) == "agent"
+    evidence = inspect_wrapper_identity(manifest)
+    assert evidence == ProcessEvidence(state="unknown", reason="identity_mismatch")
 
 
 def test_reused_process_group_pid_is_not_renewed_or_signalled(tmp_path: Path, monkeypatch):
@@ -263,10 +283,15 @@ def test_reused_process_group_pid_is_not_renewed_or_signalled(tmp_path: Path, mo
             }
         },
     )
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_start_time_ticks", lambda pid: 222)
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.scheduler._is_process_group_alive",
-        lambda pid: pytest.fail("reused process group must not be probed or signalled"),
+        process_evidence,
+        "read_process_identity",
+        lambda _pid: ProcessIdentityRead(state="present", start_time_ticks=222),
+    )
+    monkeypatch.setattr(
+        process_evidence,
+        "read_process_presence",
+        lambda *_args, **_kwargs: pytest.fail("reused process group must not be probed or signalled"),
     )
     monkeypatch.setattr(
         "qqtools.plugins.qexp.scheduler.renew_attempt_lease",
@@ -274,3 +299,42 @@ def test_reused_process_group_pid_is_not_renewed_or_signalled(tmp_path: Path, mo
     )
     reconcile_running_tasks(cfg)
     assert load_task(cfg, task.task_id).state["projection"] == "running"
+
+
+def test_mismatched_manifest_attempt_never_uses_current_attempt_process_evidence(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    attempt_data = read_json(path)
+    attempt_data["attempt"]["process"].update({"process_group_id": 4321, "process_group_start_time_ticks": 111})
+    atomic_replace(path, attempt_data)
+    atomic_replace(
+        cfg.runtime_root / "processes" / "stale-attempt.json",
+        {
+            "process": {
+                "task_id": task.task_id,
+                "attempt_id": "stale-attempt",
+                "fencing_token": attempt.current_fencing_token,
+                "process_group_id": 4321,
+                "process_group_start_time_ticks": 111,
+                "observed_state": "running",
+                "supervisor": "agent",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: pytest.fail("mismatched Attempt identity must stop before process inspection"),
+    )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler._terminate_process_group",
+        lambda _pid: pytest.fail("mismatched Attempt identity must never authorize a signal"),
+    )
+
+    reconcile_running_tasks(cfg)
+
+    assert load_task(cfg, task.task_id).state["projection"] == "running"
+    assert reserved_gpu_ids(cfg.runtime_root) == {0}

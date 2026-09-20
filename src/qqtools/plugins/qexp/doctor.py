@@ -18,6 +18,7 @@ from .runtime.locks import group_writer_lock, schema_lock, schema_reader_lock
 from .runtime.observation.maintenance import ObservationMaintenance, request_rebuild
 from .runtime.observation.projection import inspect_observation, observation_path
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
+from .runtime.process_evidence import ProcessEvidence, inspect_group_identity
 from .runtime.ready import (
     READY_BUILD_PAGE_SIZE,
     mark_ready_index_degraded,
@@ -64,6 +65,12 @@ def _issue(issues: list[dict[str, Any]], code: str, path: Any, severity: str, me
     if message:
         issue["message"] = message
     issues.append(issue)
+
+
+def _process_identity_issue(evidence: ProcessEvidence) -> str | None:
+    if evidence.state != "unknown":
+        return None
+    return "process_identity_mismatch" if evidence.reason == "identity_mismatch" else "process_identity_unverifiable"
 
 
 def _records_by_stem(
@@ -423,7 +430,8 @@ def verify_integrity(
             _issue(issues, "process_manifest_attempt_missing", manifest_path, "critical")
             continue
         attempt = AttemptRecord.from_dict(read_json(attempt_file))
-        if process.get("attempt_id") != attempt.attempt_id:
+        matches_attempt = process.get("attempt_id") == attempt.attempt_id
+        if not matches_attempt:
             _issue(issues, "process_manifest_attempt_mismatch", manifest_path, "critical")
         if process.get("fencing_token") not in attempt.token_history:
             _issue(issues, "process_manifest_token_unknown", manifest_path, "critical")
@@ -433,11 +441,10 @@ def verify_integrity(
             or attempt.machine_name != claim.get("machine_name")
         ):
             _issue(issues, "holder_bound_machine_mismatch", manifest_path, "critical")
-        from .scheduler import _process_evidence_state
-
-        evidence_state = _process_evidence_state(attempt, process)
-        if evidence_state in {"mismatch", "unverifiable"}:
-            _issue(issues, f"process_identity_{evidence_state}", manifest_path, "high")
+        if matches_attempt:
+            evidence_issue = _process_identity_issue(inspect_group_identity(attempt.process, process))
+            if evidence_issue is not None:
+                _issue(issues, evidence_issue, manifest_path, "high")
     for decision_path in list_decisions(cfg):
         try:
             decision = read_json(decision_path).get("termination_decision", {})
@@ -667,7 +674,7 @@ def repair_metadata(
 
 def repair_orphans(cfg: RootConfig, *, reservation_runtime_root: Path | None = None) -> dict[str, Any]:
     from .runtime.attempt_recovery import recover_running_attempt
-    from .scheduler import _process_evidence_state, finalize_orphaned_attempt
+    from .scheduler import finalize_orphaned_attempt
 
     repaired: list[str] = []
     blocked: list[dict[str, str]] = []
@@ -695,8 +702,8 @@ def repair_orphans(cfg: RootConfig, *, reservation_runtime_root: Path | None = N
         if process.get("task_id") != task.task_id or process.get("attempt_id") != attempt.attempt_id:
             blocked.append({"task_id": task.task_id, "reason": "process_identity_mismatch"})
             continue
-        evidence_state = _process_evidence_state(attempt, process)
-        if evidence_state == "alive":
+        evidence = inspect_group_identity(attempt.process, process)
+        if evidence.state == "alive":
             token = recover_running_attempt(
                 cfg,
                 task.task_id,
@@ -709,7 +716,7 @@ def repair_orphans(cfg: RootConfig, *, reservation_runtime_root: Path | None = N
                 repaired.append(task.task_id)
             else:
                 blocked.append({"task_id": task.task_id, "reason": "recovery_cas_rejected"})
-        elif evidence_state == "absent":
+        elif evidence.state == "absent":
             is_terminated = bool(task.control.get("terminate_running"))
             if finalize_orphaned_attempt(
                 cfg,
@@ -727,7 +734,12 @@ def repair_orphans(cfg: RootConfig, *, reservation_runtime_root: Path | None = N
             else:
                 blocked.append({"task_id": task.task_id, "reason": "finalize_cas_rejected"})
         else:
-            blocked.append({"task_id": task.task_id, "reason": f"process_identity_{evidence_state}"})
+            blocked.append(
+                {
+                    "task_id": task.task_id,
+                    "reason": _process_identity_issue(evidence) or "process_identity_unverifiable",
+                }
+            )
     submission_control = inspect_submission_control(cfg)
     if submission_control["state"] == "unavailable":
         try:

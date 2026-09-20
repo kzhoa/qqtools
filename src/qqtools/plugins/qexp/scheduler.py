@@ -15,9 +15,6 @@ from .domain.policies import group_allows, task_machine_matches
 from .events import write_diagnostic_event, write_event
 from .executor import Executor
 from .infrastructure.clock import clock_evidence as _clock_evidence
-from .infrastructure.process import is_process_alive as _is_process_alive
-from .infrastructure.process import is_process_group_alive as _is_process_group_alive
-from .infrastructure.process import process_start_time_ticks as _process_start_time_ticks
 from .infrastructure.process import terminate_process_group as _terminate_process_group
 from .lease import (
     AuthorityResolution,
@@ -43,6 +40,7 @@ from .runtime.group_namespace import read_group
 from .runtime.locks import group_lock, schema_writer_lock, task_lock
 from .runtime.operation_store import operation_exists
 from .runtime.paths import attempt_path, group_path, local_paths, shared_paths
+from .runtime.process_evidence import inspect_group_identity, inspect_wrapper_identity
 from .runtime.ready import (
     ReadyMarkerRef,
     advance_ready_index_build,
@@ -108,39 +106,6 @@ class _BorrowAdmissionGrant:
 
 def _reservation_root(cfg: RootConfig, value: Path | None = None) -> Path:
     return value if value is not None else cfg.runtime_root
-
-
-def _manifest_supervisor(data: dict[str, Any]) -> str:
-    wrapper_pid = data.get("wrapper_pid")
-    expected_start = data.get("wrapper_start_time_ticks")
-    is_runner = (
-        _is_process_alive(wrapper_pid)
-        and expected_start is not None
-        and _process_start_time_ticks(wrapper_pid) == expected_start
-    )
-    return "runner" if is_runner else "agent"
-
-
-def _process_evidence_state(attempt: AttemptRecord, data: dict[str, Any]) -> str:
-    """Classify local process evidence without conflating mismatch and absence."""
-    recorded_group = attempt.process.get("process_group_id")
-    manifest_group = data.get("process_group_id")
-    if not manifest_group or not recorded_group:
-        return "unverifiable"
-    if recorded_group != manifest_group:
-        return "mismatch"
-    expected_start = data.get("process_group_start_time_ticks")
-    recorded_start = attempt.process.get("process_group_start_time_ticks")
-    if expected_start is None or recorded_start is None:
-        return "unverifiable"
-    if recorded_start != expected_start:
-        return "mismatch"
-    current_start = _process_start_time_ticks(manifest_group)
-    if current_start == expected_start:
-        return "alive" if _is_process_group_alive(manifest_group) else "unverifiable"
-    if current_start is not None:
-        return "mismatch"
-    return "unverifiable" if _is_process_group_alive(manifest_group) else "absent"
 
 
 def _eligible(cfg: RootConfig, task: TaskRecord) -> bool:
@@ -1773,7 +1738,11 @@ def reconcile_running_tasks(
                 path = attempt_path(cfg.shared_root, task_id, number)
                 if path.exists():
                     attempt = AttemptRecord.from_dict(read_json(path))
-            evidence_state = _process_evidence_state(attempt, data) if attempt is not None else "unverifiable"
+            evidence_state = (
+                inspect_group_identity(attempt.process, data).state
+                if attempt is not None and attempt.attempt_id == attempt_id
+                else "unknown"
+            )
             if task.state["projection"] == "blocked" and evidence_state == "alive":
                 from .runtime.attempt_recovery import recover_running_attempt
 
@@ -1813,7 +1782,7 @@ def reconcile_running_tasks(
                             "fencing_token": attempt.current_fencing_token,
                             "recovered_at": utc_now(),
                             "observed_state": "running",
-                            "supervisor": _manifest_supervisor(data),
+                            "supervisor": ("runner" if inspect_wrapper_identity(data).state == "alive" else "agent"),
                         }
                     )
                     atomic_replace(manifest, {"process": data})
@@ -1822,19 +1791,23 @@ def reconcile_running_tasks(
                 if pid and evidence_state == "alive":
                     _terminate_process_group(pid)
             continue
-        supervisor = _manifest_supervisor(data)
+        supervisor = "runner" if inspect_wrapper_identity(data).state == "alive" else "agent"
         if data.get("supervisor") != supervisor:
             data["supervisor"] = supervisor
             atomic_replace(manifest, {"process": data})
         if supervisor != "agent":
+            continue
+        if isinstance(claim.get("termination_decision_id"), str):
+            if _continue_committed_termination(cfg, task_id, attempt_id, token):
+                reconciled.append(task_id)
             continue
         number = task.attempt_control.get("current_attempt_number")
         if number is None:
             continue
         path = attempt_path(cfg.shared_root, task_id, number)
         attempt = AttemptRecord.from_dict(read_json(path))
-        evidence_state = _process_evidence_state(attempt, data)
-        if evidence_state in {"mismatch", "unverifiable"}:
+        evidence_state = inspect_group_identity(attempt.process, data).state
+        if evidence_state == "unknown":
             continue
         pid = data.get("process_group_id")
         is_process_alive = evidence_state == "alive"

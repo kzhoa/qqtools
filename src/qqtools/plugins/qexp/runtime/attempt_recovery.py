@@ -8,10 +8,11 @@ from typing import Generator
 
 from ..config_types import RootConfig
 from ..lease import clock_capability, lease_expiry, load_lease_policy, persist_clock_observation
-from ..scheduler import _manifest_supervisor, authority_locks
+from ..scheduler import authority_locks
 from .group_discovery.changes import record_task_change
 from .group_namespace import read_group
 from .paths import attempt_path, group_path, local_paths
+from .process_evidence import inspect_group_identity, inspect_wrapper_identity
 from .records import AttemptRecord, normalize_group_record, utc_now
 from .resources.reservations import retag
 from .store import atomic_replace, read_json
@@ -86,11 +87,9 @@ def recovery_steps(
             if attempt.termination.get("decision_id"):
                 return None
             if cooperative:
-                from ..scheduler import _process_evidence_state
-
                 if (local_paths(cfg.runtime_root)["observations"] / f"{attempt_id}.json").exists():
                     return None
-                if _process_evidence_state(attempt, manifest) != "alive":
+                if inspect_group_identity(attempt.process, manifest).state != "alive":
                     reject("recovery_process_not_alive")
                     return None
             is_partial_recovery = attempt.phase == "running" and attempt.current_fencing_token > expired_token
@@ -180,7 +179,7 @@ def recovery_steps(
                         "fencing_token": token,
                         "recovered_at": utc_now(),
                         "observed_state": "running",
-                        "supervisor": _manifest_supervisor(manifest),
+                        "supervisor": ("runner" if inspect_wrapper_identity(manifest).state == "alive" else "agent"),
                     }
                 )
                 atomic_replace(manifest_path, {"process": manifest})

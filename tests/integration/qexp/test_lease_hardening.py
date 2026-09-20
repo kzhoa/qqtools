@@ -9,6 +9,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp import layout as qexp_layout
 from qqtools.plugins.qexp.commands.group import create_group
+from qqtools.plugins.qexp.infrastructure.process import process_start_time_ticks as _process_start_time_ticks
 from qqtools.plugins.qexp.layout import load_root_config, migrate_schema5_to_schema6
 from qqtools.plugins.qexp.lease import (
     ClockCapability,
@@ -19,6 +20,7 @@ from qqtools.plugins.qexp.lease import (
 )
 from qqtools.plugins.qexp.runtime.attempt_recovery import recover_running_attempt
 from qqtools.plugins.qexp.runtime.paths import attempt_path
+from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.termination import (
     commit_local_unavailable,
@@ -29,7 +31,6 @@ from qqtools.plugins.qexp.runtime.termination import (
     update_decision,
 )
 from qqtools.plugins.qexp.scheduler import (
-    _process_start_time_ticks,
     authorize_launch,
     claim_task,
     commit_shared_termination,
@@ -130,7 +131,10 @@ def test_committed_termination_is_completed_by_agent_and_blocks_recovery(tmp_pat
             }
         },
     )
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *_args: "alive")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="unknown", reason="read_failed"),
+    )
     monkeypatch.setattr("qqtools.plugins.qexp.runtime.termination._matches_process_group", lambda *_args: False)
     reconcile_running_tasks(cfg)
     stored = read_json(

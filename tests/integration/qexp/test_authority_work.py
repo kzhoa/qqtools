@@ -7,6 +7,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.authority import AuthoritySupervisor
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths
+from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
 from qqtools.plugins.qexp.runtime.records import utc_now
 from qqtools.plugins.qexp.runtime.resources.reservations import active_reservations
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -122,6 +123,9 @@ def test_bounded_materialization_and_offline_completion_survive_restart(tmp_path
     finally:
         supervisor.close()
     _finish(cfg, attempt)
+    unknown = ProcessEvidence(state="unknown", reason="read_failed")
+    monkeypatch.setattr("qqtools.plugins.qexp.authority.inspect_group_identity", lambda *_args: unknown)
+    monkeypatch.setattr("qqtools.plugins.qexp.authority.inspect_local_group_identity", lambda *_args: unknown)
     restarted = AuthoritySupervisor(cfg, work_limit=1)
     try:
         restarted.recover_startup()
@@ -768,6 +772,30 @@ def test_launch_intent_materializes_registration_without_waiting_for_inventory(t
         supervisor.close()
 
 
+def test_uncertain_wrapper_does_not_suppress_unverified_launch_materialization(tmp_path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    _task, attempt = _registration(cfg)
+    paths = local_paths(cfg.runtime_root)
+    registration_path = paths["registrations"] / f"{attempt.attempt_id}.json"
+    registration = read_json(registration_path)["process_registration"]
+    intent = paths["launch_intents"] / f"{attempt.attempt_id}.json"
+    atomic_replace(intent, {"launch_intent": registration})
+    registration_path.unlink()
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.authority.inspect_wrapper_identity",
+        lambda *_args: ProcessEvidence(state="unknown", reason="read_failed"),
+    )
+    supervisor = AuthoritySupervisor(cfg)
+    try:
+        supervisor._materialize_unverified_intent(intent)
+        process = read_json(paths["processes"] / intent.name)["process"]
+        assert process["observed_state"] == "launch_unverifiable"
+        assert process["supervisor"] == "agent"
+        assert active_reservations(cfg.runtime_root)
+    finally:
+        supervisor.close()
+
+
 @pytest.mark.parametrize("limit", [1, 8])
 @pytest.mark.parametrize("history_count", [0, 1024])
 def test_outage_capacity_discovery_ignores_history_and_serves_both_lanes(tmp_path, monkeypatch, limit, history_count):
@@ -828,7 +856,9 @@ def test_outage_capacity_discovery_ignores_history_and_serves_both_lanes(tmp_pat
         supervisor.close()
 
 
-@pytest.mark.parametrize("blocker", ["foreign_project", "fencing", "observation", "live_process", "missing_exit"])
+@pytest.mark.parametrize(
+    "blocker", ["foreign_project", "fencing", "observation", "live_process", "unknown_process", "missing_exit"]
+)
 def test_outage_capacity_discovery_preserves_unverified_occupancy(tmp_path, monkeypatch, blocker):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     _task, attempt = _registration(cfg)
@@ -845,8 +875,16 @@ def test_outage_capacity_discovery_preserves_unverified_occupancy(tmp_path, monk
         atomic_replace(observation, value)
     elif blocker == "missing_exit":
         observation.unlink()
-    else:
-        monkeypatch.setattr("qqtools.plugins.qexp.scheduler._is_process_group_alive", lambda _pid: True)
+    elif blocker == "live_process":
+        monkeypatch.setattr(
+            "qqtools.plugins.qexp.authority.inspect_group_identity",
+            lambda *_args: ProcessEvidence(state="alive"),
+        )
+    elif blocker == "unknown_process":
+        monkeypatch.setattr(
+            "qqtools.plugins.qexp.authority.inspect_group_identity",
+            lambda *_args: ProcessEvidence(state="unknown", reason="read_failed"),
+        )
     atomic_replace(reservation_path, reservation)
     supervisor = AuthoritySupervisor(cfg)
     try:

@@ -11,6 +11,7 @@ from qqtools.plugins.qexp.commands.task import retry
 from qqtools.plugins.qexp.runtime.group_discovery.service import GroupDiscoveryService
 from qqtools.plugins.qexp.runtime.operation_store import locate_operation_path
 from qqtools.plugins.qexp.runtime.paths import group_path, task_path
+from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
 from qqtools.plugins.qexp.runtime.store import read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, fail_attempt
@@ -343,7 +344,10 @@ def test_terminating_cancel_waits_for_runtime_ack_and_consumes_terminal_change(t
     pending = control(cfg, operation_id)
     assert pending["state"] == "waiting_ack"
     assert pending["pending_machine_acknowledgements"] == {cfg.machine_name: [task.task_id]}
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *args: "absent")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="absent"),
+    )
     reconcile_running_tasks(cfg)
     completed = finish(cfg, operation_id)
     assert completed["pending_machine_acknowledgements"] == {}

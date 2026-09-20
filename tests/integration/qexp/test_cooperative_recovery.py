@@ -9,6 +9,7 @@ from qqtools.plugins.qexp.authority import AuthoritySupervisor
 from qqtools.plugins.qexp.lease import ClockCapability
 from qqtools.plugins.qexp.runtime.attempt_recovery import recovery_steps
 from qqtools.plugins.qexp.runtime.paths import local_paths
+from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.runtime.termination import attempt_control_lock
@@ -38,7 +39,10 @@ def _orphan(tmp_path, monkeypatch):
     directory = paths["termination_decisions"] / attempt.attempt_id
     for index in range(17):
         atomic_replace(directory / f"{index}.json", {"termination_decision": {"state": "superseded"}})
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *_args: "alive")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.runtime.attempt_recovery.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="alive"),
+    )
     return cfg, task, attempt, process
 
 
@@ -79,7 +83,10 @@ def test_recovery_revalidates_after_yield_and_releases_lock(tmp_path, monkeypatc
                 lambda *_args: ClockCapability("unavailable", "test_clock_lost"),
             )
         elif change == "process":
-            monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *_args: "absent")
+            monkeypatch.setattr(
+                "qqtools.plugins.qexp.runtime.attempt_recovery.inspect_group_identity",
+                lambda *_args: ProcessEvidence(state="absent"),
+            )
         elif change == "manifest":
             process["fencing_token"] += 1
             atomic_replace(

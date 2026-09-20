@@ -18,6 +18,7 @@ from qqtools.plugins.qexp.runner import run_attempt
 from qqtools.plugins.qexp.runtime.attempt_recovery import recover_running_attempt
 from qqtools.plugins.qexp.runtime.operation_store import active_operation_path, write_active_operation
 from qqtools.plugins.qexp.runtime.paths import attempt_path
+from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
 from qqtools.plugins.qexp.runtime.resources.reservations import reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -473,7 +474,10 @@ def test_blocked_orphan_with_missing_process_finalizes_and_releases_gpu(tmp_path
     assert orphaned.phase == "orphaned"
     assert orphaned.timestamps["orphaned_at"] is not None
     assert orphaned.timestamps["finished_at"] is None
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *args: "absent")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="absent"),
+    )
     reconcile_running_tasks(cfg)
     stored = load_task(cfg, task.task_id)
     assert stored.state == {"projection": "failed", "reason": "process_exited_without_status"}
@@ -543,7 +547,10 @@ def test_partial_recovery_finalize_preserves_monotonic_fencing_epoch(tmp_path: P
     attempt_data["attempt"]["current_fencing_token"] = recovered_token
     attempt_data["attempt"]["token_history"].append(recovered_token)
     atomic_replace(path, attempt_data)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *args: "absent")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="absent"),
+    )
     reconcile_running_tasks(cfg)
     stored = load_task(cfg, task.task_id)
     assert stored.state["projection"] == "failed"
@@ -576,7 +583,10 @@ def test_reconcile_finishes_recovery_when_manifest_write_was_interrupted(tmp_pat
     manifest["process"]["fencing_token"] = attempt.current_fencing_token
     atomic_replace(manifest_path, manifest)
     calls: list[tuple[int, int]] = []
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *args: "alive")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="alive"),
+    )
     monkeypatch.setattr(
         "qqtools.plugins.qexp.infrastructure.process.os.killpg", lambda pid, sig: calls.append((pid, sig))
     )
@@ -620,8 +630,10 @@ def test_authority_restart_finishes_interrupted_recovery(tmp_path: Path, monkeyp
     record["attempt"]["process"].update(process_group_id=9876, process_group_start_time_ticks=123)
     atomic_replace(stored_path, record)
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, old_token)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_start_time_ticks", lambda _: 123)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._is_process_group_alive", lambda _: True)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.authority.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="alive"),
+    )
 
     class RecoveryCrash(BaseException):
         pass
@@ -649,14 +661,19 @@ def test_authority_restart_finishes_interrupted_recovery(tmp_path: Path, monkeyp
     new_token = read_json(stored_path)["attempt"]["current_fencing_token"]
     assert new_token > old_token
     with monkeypatch.context() as mismatch:
-        mismatch.setattr("qqtools.plugins.qexp.scheduler._process_start_time_ticks", lambda _: 456)
+        mismatch.setattr(
+            "qqtools.plugins.qexp.authority.inspect_group_identity",
+            lambda *_args: ProcessEvidence(state="unknown", reason="identity_mismatch"),
+        )
         rejected = AuthoritySupervisor(cfg)
         rejected.recover_startup()
         rejected.tick()
         assert read_json(path)["process"]["fencing_token"] == old_token
     if exit_code is not None:
-        monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_start_time_ticks", lambda _: None)
-        monkeypatch.setattr("qqtools.plugins.qexp.scheduler._is_process_group_alive", lambda _: False)
+        monkeypatch.setattr(
+            "qqtools.plugins.qexp.authority.inspect_group_identity",
+            lambda *_args: ProcessEvidence(state="absent"),
+        )
         observation_path = cfg.runtime_root / "process-observations" / f"{attempt.attempt_id}.json"
         observation = {
             "protocol_version": 1,
@@ -788,7 +805,10 @@ def test_agent_supervises_recovered_child_without_runner(tmp_path: Path, monkeyp
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     assert recover_running_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     renewed: list[int] = []
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *args: "alive")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="alive"),
+    )
     monkeypatch.setattr(
         "qqtools.plugins.qexp.scheduler.renew_attempt_lease", lambda *args: renewed.append(args[3]) or True
     )
@@ -981,7 +1001,10 @@ def test_agent_reconciliation_completes_group_cancel_operation(tmp_path: Path, m
     )
     group = group_control(cfg, "exp", "cancel", terminate_running=True)
     operation_id = group["cancellation_operation"]["operation_id"]
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *args: "absent")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="absent"),
+    )
     reconcile_running_tasks(cfg)
     reconcile_group_cancel_operations(cfg)
     operation_path = cfg.shared_root / "operations" / "group-control" / f"{operation_id}.json"
@@ -1010,7 +1033,10 @@ def test_group_show_reconciles_waiting_cancel_operation(tmp_path: Path, monkeypa
         },
     )
     group_control(cfg, "exp", "cancel", terminate_running=True)
-    monkeypatch.setattr("qqtools.plugins.qexp.scheduler._process_evidence_state", lambda *args: "absent")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.scheduler.inspect_group_identity",
+        lambda *_args: ProcessEvidence(state="absent"),
+    )
     reconcile_running_tasks(cfg)
     assert show_group(cfg, "exp")["cancellation_operation"]["state"] == "completed"
 

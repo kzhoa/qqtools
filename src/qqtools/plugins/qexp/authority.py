@@ -17,6 +17,7 @@ from .runtime.authority_scan import EvidenceScan, is_path_present
 from .runtime.claims import archive_claim, reconcile_claim_archives
 from .runtime.locks import exclusive
 from .runtime.paths import attempt_path, local_paths
+from .runtime.process_evidence import inspect_group_identity, inspect_local_group_identity, inspect_wrapper_identity
 from .runtime.records import AttemptRecord, utc_now, validate_identifier
 from .runtime.resources.reservations import (
     ReservationIdentity,
@@ -241,8 +242,6 @@ class AuthoritySupervisor:
         reservation_identity: ReservationIdentity | None = None,
     ) -> None:
         """Retain recovery evidence while releasing an identity-verified absent process."""
-        from .scheduler import _is_process_group_alive, _process_start_time_ticks
-
         task_id, attempt_id = process.get("task_id"), process.get("attempt_id")
         if not isinstance(task_id, str) or not isinstance(attempt_id, str):
             return
@@ -257,7 +256,7 @@ class AuthoritySupervisor:
             group = registration["process_group_id"]
             if not isinstance(group, int) or group <= 0:
                 return
-            if _process_start_time_ticks(group) is not None or _is_process_group_alive(group):
+            if inspect_group_identity(registration, process).state != "absent":
                 return
             is_valid, _code = self._read_exit_observation(
                 paths["observations"] / f"{attempt_id}.json", task_id, attempt_id, process
@@ -580,14 +579,8 @@ class AuthoritySupervisor:
 
     @staticmethod
     def _wrapper_matches(intent: dict[str, object]) -> bool:
-        pid = intent.get("wrapper_pid")
-        start = intent.get("wrapper_start_time_ticks")
-        if not isinstance(pid, int) or not isinstance(start, int):
-            return False
         try:
-            from .scheduler import _process_start_time_ticks
-
-            return _process_start_time_ticks(pid) == start
+            return inspect_wrapper_identity(intent).state == "alive"
         except (FileNotFoundError, OSError, ValueError):
             return False
 
@@ -694,16 +687,13 @@ class AuthoritySupervisor:
         if observation.exists():
             is_valid, exit_code = self._read_exit_observation(observation, task_id, attempt_id, process)
             return (exit_code, False) if is_valid else None
-        from .scheduler import _is_process_group_alive, _process_start_time_ticks
-
         group = process.get("process_group_id")
         if (
             isinstance(group, int)
             and group > 0
             and process.get("process_group_start_time_ticks") is not None
             and not self._wrapper_matches(process)
-            and _process_start_time_ticks(group) is None
-            and not _is_process_group_alive(group)
+            and inspect_local_group_identity(process).state == "absent"
         ):
             self._record_diagnostic(process, "exit_observation_missing")
             return None
@@ -846,9 +836,8 @@ class AuthoritySupervisor:
 
         try:
             from .runtime.attempt_recovery import recover_running_attempt
-            from .scheduler import _process_evidence_state
 
-            if _process_evidence_state(attempt, process) != "alive":
+            if inspect_group_identity(attempt.process, process).state != "alive":
                 return
             if self._work is not None:
                 self._work.recover(process)
@@ -869,8 +858,6 @@ class AuthoritySupervisor:
 
     def _repair_recovered_manifest(self, process: dict[str, object], task_id: str, attempt_id: str) -> None:
         """Finish local publication after shared recovery committed."""
-        from .scheduler import _process_evidence_state
-
         with attempt_control_lock(self.cfg, attempt_id):
             task = load_task(self.cfg, task_id)
             with authority_locks(self.cfg, task):
@@ -902,7 +889,7 @@ class AuthoritySupervisor:
                     has_valid_observation, _ = self._read_exit_observation(
                         observation_path, task_id, attempt_id, process
                     )
-                if not has_valid_observation and _process_evidence_state(attempt, process) != "alive":
+                if not has_valid_observation and inspect_group_identity(attempt.process, process).state != "alive":
                     return
                 process.update(
                     fencing_token=attempt.current_fencing_token,
