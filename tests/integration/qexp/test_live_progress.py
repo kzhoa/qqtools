@@ -1,5 +1,6 @@
 """Repository-level lifecycle tests for the optional live-progress sidecar."""
 
+import json
 import os
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from qqtools.plugins.qexp import init_shared_root, read_logs, submit
 from qqtools.plugins.qexp.authority import AuthoritySupervisor
 from qqtools.plugins.qexp.commands.cleanup import clean
 from qqtools.plugins.qexp.commands.task import retry
+from qqtools.plugins.qexp.formatter import CliOutput, OutputKind, render
 from qqtools.plugins.qexp.observer import inspect_task
 from qqtools.plugins.qexp.progress_policy import set_progress_policy
 from qqtools.plugins.qexp.runner import run_attempt
@@ -106,12 +108,15 @@ def test_retry_never_displays_previous_attempt_as_current(cfg, monkeypatch):
     task = submit(cfg, ["echo", "ok"])
     old, _ = launch(cfg, task, monkeypatch, code=1, payload=report(7))
     retry(cfg, task.task_id)
-    pending = inspect_task(cfg, task.task_id)["progress"]
+    pending_view = inspect_task(cfg, task.task_id)
+    pending = pending_view["progress"]
     assert pending == {
         "status": "unavailable",
         "observation_state": "pending",
         "reason": "not_started",
     }
+    assert json.loads(render(CliOutput(OutputKind.TASK_SHOW, pending_view), "json")) == pending_view
+    assert set(pending) == {"status", "observation_state", "reason"}
     new, _ = launch(cfg, task, monkeypatch, payload=report(2, "new-update"))
     assert old.attempt_id != new.attempt_id
     p = projector(cfg)
@@ -208,6 +213,111 @@ def test_terminal_inspection_is_read_only_and_preserves_observed_timestamp(cfg, 
     assert first["progress"]["current"] == 3
     assert first["reported_at"] == second["reported_at"]
     assert before == after
+
+
+def test_query_normalizes_optional_payload_fields_and_formatter_keeps_json_canonical(cfg, monkeypatch):
+    task = submit(cfg, ["echo", "ok"])
+    launch(
+        cfg,
+        task,
+        monkeypatch,
+        payload={"protocol_version": 1, "update_id": "minimal", "stage": "train"},
+    )
+    p = projector(cfg)
+    p.tick()
+    p.close()
+    view = inspect_task(cfg, task.task_id)
+    observation = view["progress"]
+
+    assert set(observation) == {
+        "status",
+        "observation_state",
+        "reason",
+        "protocol_version",
+        "task_id",
+        "attempt_id",
+        "attempt_number",
+        "machine_name",
+        "launch_id",
+        "wrapper_pid",
+        "wrapper_start_time_ticks",
+        "registration_generation",
+        "fencing_token",
+        "source_update_id",
+        "sequence",
+        "reported_at",
+        "advanced_at",
+        "progress",
+    }
+    assert observation["progress"] == {
+        "stage": "train",
+        "current": None,
+        "total": None,
+        "unit": None,
+        "message": None,
+    }
+    assert "Progress status: available" in render(CliOutput(OutputKind.TASK_SHOW, view), "human")
+
+    def fail_if_formatted(*_args, **_kwargs):
+        raise AssertionError("JSON rendering invoked human progress formatting")
+
+    monkeypatch.setattr("qqtools.plugins.qexp.formatter.format_progress_details", fail_if_formatted)
+    assert json.loads(render(CliOutput(OutputKind.TASK_SHOW, view), "json")) == view
+
+
+def test_running_query_rejects_registration_replacement_and_keeps_nullable_identity(cfg, monkeypatch):
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    attempt_record = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"]
+    snapshot = {
+        "protocol_version": 1,
+        "task_id": task.task_id,
+        "attempt_id": attempt.attempt_id,
+        "attempt_number": attempt.attempt_number,
+        "machine_name": attempt.machine_name,
+        "launch_id": attempt_record["authorization"]["launch_id"],
+        "wrapper_pid": None,
+        "wrapper_start_time_ticks": None,
+        "registration_generation": "generation-1",
+        "fencing_token": attempt.current_fencing_token,
+        "source_update_id": "update-1",
+        "sequence": 1,
+        "reported_at": "2026-09-20T00:00:00Z",
+        "advanced_at": "2026-09-20T00:00:00Z",
+        "progress": {"stage": "train", "current": 1},
+    }
+    replace_advisory_snapshot(shared_progress_path(cfg.shared_root, task.task_id, attempt.attempt_id), snapshot)
+    generations = iter(("generation-1", "generation-2"))
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.runtime.progress._running_registration_generation",
+        lambda *_args: next(generations),
+    )
+
+    observation = inspect_task(cfg, task.task_id)["progress"]
+
+    assert observation == {
+        "status": "unavailable",
+        "observation_state": "unavailable",
+        "reason": "identity_mismatch",
+    }
+
+
+def test_terminal_query_does_not_require_current_registration_generation(cfg, monkeypatch):
+    task = submit(cfg, ["echo", "ok"])
+    launch(cfg, task, monkeypatch, payload=report())
+    p = projector(cfg)
+    p.tick()
+    p.close()
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.runtime.progress._running_registration_generation",
+        lambda *_args: pytest.fail("terminal progress queried the current registration"),
+    )
+
+    observation = inspect_task(cfg, task.task_id)["progress"]
+
+    assert observation["observation_state"] == "available"
 
 
 def test_cleanup_removes_progress_sidecars(cfg, monkeypatch):

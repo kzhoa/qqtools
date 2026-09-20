@@ -28,6 +28,7 @@ from qqtools.qexp._progress_protocol import (
 )
 
 from .locks import exclusive
+from .progress_types import ProgressObservation
 
 _LOCAL_DIRS = ("progress", "progress-contexts", "progress-observed", "progress-diagnostics")
 _IDENTITY = (
@@ -784,13 +785,13 @@ def _running_registration_generation(cfg: Any, machine_name: str) -> str:
     return generation
 
 
-def inspect_progress(cfg: Any, task: Any) -> dict[str, Any]:
+def inspect_progress(cfg: Any, task: Any) -> ProgressObservation:
     """Return evidence-based progress state without writing any observation state."""
     from .paths import attempt_path
     from .records import AttemptRecord
     from .store import read_json
 
-    def result(state: str, reason: str | None, value: dict[str, Any] | None = None) -> dict[str, Any]:
+    def result(state: str, reason: str | None, value: dict[str, Any] | None = None) -> ProgressObservation:
         output: dict[str, Any] = {
             "status": "available" if state == "available" else "unavailable",
             "observation_state": state,
@@ -883,69 +884,6 @@ def inspect_progress(cfg: Any, task: Any) -> dict[str, Any]:
         except (ValueError, TypeError, KeyError):
             return result("unavailable", "identity_mismatch")
     return result("available", None, value)
-
-
-def _age(stamp: str) -> str:
-    try:
-        seconds = (datetime.now(timezone.utc) - datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds()
-        if seconds < 0:
-            return "unknown (clock difference)"
-        if seconds < 60:
-            return f"{int(seconds)}s ago"
-        if seconds < 3600:
-            return f"{int(seconds // 60)}m ago"
-        return f"{int(seconds // 3600)}h ago"
-    except (ValueError, TypeError, AttributeError):
-        return "unknown"
-
-
-def _timestamp_with_age(stamp: str) -> str:
-    try:
-        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            return "unknown"
-        absolute = parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        return f"{absolute} ({_age(stamp)})"
-    except (ValueError, TypeError, AttributeError):
-        return "unknown"
-
-
-def progress_details(result: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
-    """Human-only presentation; missing observations never break task show."""
-    observation = result.get("progress") or {}
-    if observation.get("status") != "available":
-        reason = observation.get("reason")
-        explanations = {
-            "not_started": "pending (not started)",
-            "no_snapshot": "unavailable (no report yet)",
-            "invalid_snapshot": "unavailable (invalid snapshot)",
-            "read_failed": "unavailable (read failed)",
-            "identity_mismatch": "unavailable (identity mismatch)",
-            "cleanup": "unavailable (cleanup in progress)",
-            "unknown": "unavailable (unknown)",
-        }
-        state = observation.get("observation_state", "unavailable")
-        return (
-            ("Progress status", state),
-            ("Progress", explanations.get(reason, "unavailable")),
-        )
-    payload = observation["progress"]
-    current, total = payload.get("current"), payload.get("total")
-    count = "unknown" if current is None else str(current)
-    if total is not None:
-        count += f"/{total}"
-    if payload.get("unit"):
-        count += f" {payload['unit']}"
-    if current is not None and total is not None and total > 0:
-        count += f" ({100 * current / total:.1f}%)"
-    return (
-        ("Progress status", "available"),
-        ("Stage", payload["stage"]),
-        ("Progress", count),
-        ("Message", payload.get("message")),
-        ("Progress reported", _timestamp_with_age(observation["reported_at"])),
-        ("Progress advanced", _timestamp_with_age(observation["advanced_at"])),
-    )
 
 
 def _unlink_record(path: Path, removed: list[str]) -> None:

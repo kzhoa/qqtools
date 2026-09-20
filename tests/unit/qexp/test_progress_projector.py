@@ -391,60 +391,6 @@ def test_shared_cleanup_waits_for_projection_and_wins(channel, monkeypatch):
     assert not c.shared.parent.exists()
 
 
-def test_zero_total_and_missing_progress_formatting():
-    assert runtime.progress_details({}) == (
-        ("Progress status", "unavailable"),
-        ("Progress", "unavailable"),
-    )
-    details = dict(
-        runtime.progress_details(
-            {
-                "progress": {
-                    "status": "available",
-                    "reported_at": "bad",
-                    "advanced_at": "bad",
-                    "progress": {
-                        "stage": "train",
-                        "current": 0,
-                        "total": 0,
-                        "unit": "step",
-                        "message": None,
-                    },
-                }
-            }
-        )
-    )
-    assert details["Progress"] == "0/0 step"
-    assert details["Progress reported"] == "unknown"
-
-    pending = dict(
-        runtime.progress_details(
-            {
-                "progress": {
-                    "status": "unavailable",
-                    "observation_state": "pending",
-                    "reason": "not_started",
-                }
-            }
-        )
-    )
-    assert pending == {"Progress status": "pending", "Progress": "pending (not started)"}
-
-
-def test_human_timestamps_include_absolute_utc_and_controlled_relative_age(monkeypatch):
-    class FrozenDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            value = cls(2026, 9, 18, 16, 1, 0, tzinfo=timezone.utc)
-            return value if tz is None else value.astimezone(tz)
-
-    monkeypatch.setattr(runtime, "datetime", FrozenDatetime)
-    assert runtime._timestamp_with_age("2026-09-18T16:00:25Z") == ("2026-09-18 16:00:25 UTC (35s ago)")
-    assert runtime._timestamp_with_age("2026-09-18T16:01:25+00:00") == (
-        "2026-09-18 16:01:25 UTC (unknown (clock difference))"
-    )
-
-
 def test_cleanup_race_cannot_resurrect_local_observation(channel, monkeypatch):
     c = channel
     c.send("one")

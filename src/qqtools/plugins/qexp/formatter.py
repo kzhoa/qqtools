@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Generic, TypedDict, TypeVar
 
-from .runtime.progress import progress_details
+from .progress_format import format_progress_details
 
 
 class OutputKind(str, Enum):
@@ -288,7 +288,7 @@ def _render_task_show(result: Mapping[str, Any], _presentation: Mapping[str, obj
             ("Reason", state.get("reason")),
             ("Dependency gate", result.get("dependency_gate")),
         ),
-        progress_details(result),
+        format_progress_details(result.get("progress")),
     )
 
 
