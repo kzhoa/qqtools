@@ -265,10 +265,15 @@ def _import_reservation_lane(
                             raise RuntimeError(f"legacy reservation ID conflicts during migration: {path}")
                     else:
                         reservation = value.get("reservation")
-                        if (
-                            not isinstance(reservation, dict)
-                            or reservation.get("reservation_id") != path.stem
-                            or reservation.get("state") != ("active" if name == names[0] else "provisional")
+                        if not isinstance(reservation, dict):
+                            raise RuntimeError(f"machine reservation is malformed: {path}")
+                        reservation_id = validate_identifier(reservation.get("reservation_id"), "reservation_id")
+                        project_id = reservation.get("project_id")
+                        is_foreign = isinstance(project_id, str) and project_id != binding.project_id
+                        if is_foreign:
+                            validate_identifier(project_id, "project_id")
+                        if (reservation_id != path.stem and not is_foreign) or reservation.get("state") != (
+                            "active" if name == names[0] else "provisional"
                         ):
                             raise RuntimeError(f"machine reservation is malformed: {path}")
                         validate_identifier(reservation.get("task_id"), "task_id")

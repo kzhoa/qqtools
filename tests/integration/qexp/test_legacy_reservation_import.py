@@ -79,6 +79,31 @@ def test_migration_moves_both_capacity_domains_without_changing_cpu_policy(tmp_p
         reserve_cpu(runtime.root, "new-task", 1)
 
 
+def test_migration_preserves_foreign_legacy_named_reservation(tmp_path):
+    cfg, runtime, source, destination = migration_fixture(tmp_path, False, True)
+    unrelated = runtime.paths["active"] / "unrelated.json"
+    atomic_replace(
+        unrelated,
+        {
+            "reservation": {
+                "reservation_id": "unrelated-reservation",
+                "project_id": "unrelated-project",
+                "gpu_ids": [1],
+                "state": "active",
+                "task_id": "unrelated-task",
+            }
+        },
+    )
+    before = unrelated.read_bytes()
+
+    assert migrate_project(runtime, cfg).enabled
+
+    assert unrelated.read_bytes() == before
+    assert not source.exists() and destination.exists()
+    with pytest.raises(ValueError, match="already reserved"):
+        reserve(runtime.root, "new-task", [1], project_id="new-project")
+
+
 @pytest.mark.parametrize("is_cpu", [False, True])
 @pytest.mark.parametrize("boundary", ["destination", "source"])
 def test_directory_barrier_failure_retains_recoverable_occupancy(tmp_path, monkeypatch, is_cpu, boundary):

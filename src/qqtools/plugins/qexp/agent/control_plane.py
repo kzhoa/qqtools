@@ -28,6 +28,8 @@ from .helpers import _publish_project_snapshots, _read_pid
 from .progress_loop import ProgressObservationLoop
 from .recovery_capture import recovery_owner
 
+STARTUP_AUTHORITY_POLL_SECONDS = 1.0
+
 
 @contextmanager
 def _measure_authority_phase(sample: dict[str, Any], phase: str) -> Iterator[None]:
@@ -312,6 +314,8 @@ class _MachineControlPlane:
                             self._scheduler_wakeup.set()
                     else:
                         self._runtime.authority_ready_generations.pop(binding.project_id, None)
+                        if supervisor.work_snapshot.get("discovery_mode") == "primary":
+                            authority_interval = min(authority_interval, STARTUP_AUTHORITY_POLL_SECONDS)
                 recovered_outage = self._outage_supervisors.pop(binding.project_id, None)
                 if recovered_outage is not None:
                     recovered_outage.close()

@@ -1594,6 +1594,53 @@ def test_machine_control_authority_survives_reservation_snapshot_failure(
     assert is_ticked.is_set()
 
 
+def test_machine_control_rechecks_incomplete_startup_before_normal_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+
+    class RecordingSupervisor:
+        work_snapshot = {"startup_complete": False, "discovery_mode": "primary"}
+
+        def __init__(self, _cfg, *, reservation_runtime_root, work_limit=64, recovery_owner=None) -> None:
+            del reservation_runtime_root, recovery_owner
+            self.work_limit = work_limit
+
+        @property
+        def renewal_interval_seconds(self) -> float:
+            return 30.0
+
+        def recover_startup(self) -> None:
+            return None
+
+        def tick(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def cancel_pending_control(self) -> None:
+            return None
+
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.control_plane._AuthoritySupervisor", RecordingSupervisor)
+    plane = _MachineControlPlane(
+        runtime,
+        instance_id="test-agent",
+        loop_interval=5.0,
+        started_at="2026-01-01T00:00:00Z",
+        available_gpus=[],
+    )
+    try:
+        assert plane._run_authority_cycle() == 1.0
+        supervisor = plane._supervisors[next(iter(plane._supervisors))]
+        supervisor.work_snapshot = {"startup_complete": True, "discovery_mode": "primary"}
+        assert plane._run_authority_cycle() == 5.0
+    finally:
+        plane.stop()
+
+
 def test_restart_and_activation_share_one_lifecycle_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     barrier = Barrier(3)
