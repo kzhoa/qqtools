@@ -7,15 +7,21 @@ import argparse
 import ast
 import re
 import subprocess
+import sys
 from pathlib import Path
 
-try:
-    from scripts.checks.check_compatibility_registry import RegistryError, Version, check_release, load_registry
-except ModuleNotFoundError:  # Direct script execution adds scripts/ rather than the repo root.
-    from checks.check_compatibility_registry import RegistryError, Version, check_release, load_registry
-
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.checks.check_compatibility_registry import (  # noqa: E402, I001
+    RegistryError,
+    Version,
+    check_release,
+    load_registry,
+)
+
+
 VERSION_PATH = Path("src/qqtools/version.py")
 CHANGELOG_PATH = Path("CHANGELOG.md")
 RELEASE_PATHS = frozenset((CHANGELOG_PATH.as_posix(), VERSION_PATH.as_posix()))

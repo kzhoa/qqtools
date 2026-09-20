@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from scripts.checks import check_release_commit
+
+
+def test_release_checker_supports_documented_direct_execution():
+    result = subprocess.run(
+        [sys.executable, "scripts/checks/check_release_commit.py", "--help"],
+        cwd=check_release_commit.REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def _git(root: Path, *args: str) -> str:
