@@ -323,19 +323,19 @@ def test_launch_authorization_revalidates_registration_write_guard(tmp_path: Pat
 def test_interrupted_registration_is_rolled_back_before_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
-    save_registry = runtime._save_registry
+    save_registry = runtime.registration.save_registry_locked
 
     def fail_registry_write(_revision, _bindings) -> None:
         raise OSError("injected registry publication failure")
 
-    monkeypatch.setattr(runtime, "_save_registry", fail_registry_write)
+    monkeypatch.setattr(runtime.registration, "save_registry_locked", fail_registry_write)
     with pytest.raises(OSError, match="registry publication failure"):
         runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
 
     assert runtime.paths["registration_transaction"].exists()
     assert (cfg.shared_root / "machines" / cfg.machine_name / "registration.json").exists()
 
-    monkeypatch.setattr(runtime, "_save_registry", save_registry)
+    monkeypatch.setattr(runtime.registration, "save_registry_locked", save_registry)
     binding, is_added = runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
 
     assert is_added
@@ -1897,7 +1897,7 @@ def test_ineligible_registration_only_exit_releases_capacity_without_shared_muta
 def test_registration_renewal_diagnostics_measure_completed_publication(tmp_path, monkeypatch, is_reactivation):
     from datetime import datetime, timedelta, timezone
 
-    from qqtools.plugins.qexp.agent import context
+    from qqtools.plugins.qexp.agent import registration as registration_owner
     from qqtools.plugins.qexp.lease import load_lease_policy
     from qqtools.plugins.qexp.runtime.work_budget import RuntimeDiagnostics, activate_diagnostics
 
@@ -1916,7 +1916,7 @@ def test_registration_renewal_diagnostics_measure_completed_publication(tmp_path
         def now(cls, tz=None):
             return now
 
-    monkeypatch.setattr(context, "datetime", FixedDateTime)
+    monkeypatch.setattr(registration_owner, "datetime", FixedDateTime)
     policy = load_lease_policy(cfg)
     diagnostics = RuntimeDiagnostics()
     with activate_diagnostics(diagnostics):
@@ -1949,7 +1949,7 @@ def test_registration_renewal_diagnostics_measure_completed_publication(tmp_path
     due = read_json(path)
     due["registration"]["eligibility_expires_at"] = (now + timedelta(seconds=100)).isoformat()
     atomic_replace(path, due)
-    monkeypatch.setattr(context, "save_machine_registration", failed_save)
+    monkeypatch.setattr(registration_owner, "save_machine_registration", failed_save)
     failed = RuntimeDiagnostics()
     with activate_diagnostics(failed):
         assert not runtime.binding_write_eligible(binding, renew=True)

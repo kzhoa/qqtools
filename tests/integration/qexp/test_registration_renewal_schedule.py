@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
-from qqtools.plugins.qexp.agent import context
+from qqtools.plugins.qexp.agent import registration as registration_owner
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.lease import LeasePolicy, save_lease_policy
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -26,9 +26,9 @@ def registration(tmp_path, monkeypatch):
         def now(cls, tz=None):
             return now[0]
 
-    monkeypatch.setattr(context, "datetime", FixedDateTime)
+    monkeypatch.setattr(registration_owner, "datetime", FixedDateTime)
     monkeypatch.setattr(
-        context,
+        registration_owner,
         "lease_expiry",
         lambda policy: (now[0] + timedelta(seconds=policy.ttl_seconds)).replace(microsecond=0).isoformat(),
     )
@@ -36,13 +36,13 @@ def registration(tmp_path, monkeypatch):
     value["registration"]["eligibility_expires_at"] = (now[0] + timedelta(seconds=120)).isoformat()
     atomic_replace(path, value)
     publications = []
-    save = context.save_machine_registration
+    save = registration_owner.save_machine_registration
 
     def record_save(cfg, value):
         publications.append(value)
         save(cfg, value)
 
-    monkeypatch.setattr(context, "save_machine_registration", record_save)
+    monkeypatch.setattr(registration_owner, "save_machine_registration", record_save)
     return cfg, runtime, binding, path, now, publications
 
 

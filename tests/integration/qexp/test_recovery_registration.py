@@ -6,7 +6,8 @@ from dataclasses import replace
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
-from qqtools.plugins.qexp.agent.context import RECOVERY_REGISTRATION_PROTOCOL, MachineRuntime
+from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.registration import RECOVERY_REGISTRATION_PROTOCOL
 from qqtools.plugins.qexp.layout import load_machine_record, load_machine_registration, save_machine_record
 from qqtools.plugins.qexp.runtime.responsibility_store import DurableIO
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -47,7 +48,7 @@ def test_preparation_preserves_authority_and_retry_does_not_republish(registered
     def unexpected_write(*args, **kwargs):
         pytest.fail("already prepared registration must not be republished")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.agent.context.save_machine_registration", unexpected_write)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.registration.save_machine_registration", unexpected_write)
     assert prepare(runtime, binding)
 
 
@@ -143,7 +144,7 @@ def test_rebinding_reactivation_and_adoption_preserve_protocol_floor(registered,
     atomic_replace(path, record)
     assert runtime.reactivate_binding(binding)
     assert read_json(path)["registration"]["version"] == 2
-    runtime._supersede_registration(binding, "replacement")
+    runtime.registration._supersede_registration(binding, "replacement")
     replacement = MachineRuntime(tmp_path / "replacement")
     adopted, _added = replacement.ensure_binding(cfg.shared_root, cfg.machine_name, adopt_existing=True)
     stored = read_json(path)["registration"]
@@ -178,7 +179,7 @@ def test_old_transaction_is_replayed_and_durably_retired_before_preparation(regi
     runtime, binding, cfg, path = registered
     revision, bindings = runtime.load_registry()
     old = load_machine_registration(cfg)
-    runtime._save_registration_transaction(
+    runtime.registration._save_registration_transaction(
         revision=revision, bindings=bindings, registrations=[(cfg, old)], machine_records=[]
     )
     damaged = read_json(path)
@@ -199,7 +200,7 @@ def test_old_transaction_is_replayed_and_durably_retired_before_preparation(regi
     assert prepare(runtime, binding)
     assert barriers == [runtime.root]
     with runtime.registry_guard():
-        runtime._rollback_registration_transaction()
+        runtime.registration.rollback_pending_locked()
     assert read_json(path)["registration"]["version"] == 2
 
 
@@ -225,7 +226,7 @@ def test_failed_retirement_barrier_does_not_publish_protocol_and_retry_syncs(reg
 def test_process_crash_retries_preparation_without_restoring_old_protocol(registered, boundary):
     runtime, binding, cfg, path = registered
     revision, bindings = runtime.load_registry()
-    runtime._save_registration_transaction(
+    runtime.registration._save_registration_transaction(
         revision=revision,
         bindings=bindings,
         registrations=[(cfg, load_machine_registration(cfg))],
@@ -233,10 +234,10 @@ def test_process_crash_retries_preparation_without_restoring_old_protocol(regist
     )
     pid = os.fork()
     if pid == 0:
-        from qqtools.plugins.qexp.agent import context
+        from qqtools.plugins.qexp.agent import registration as registration_owner
 
         sync = DurableIO.sync_directory
-        save = context.save_machine_registration
+        save = registration_owner.save_machine_registration
 
         def interrupted_sync(self, directory, label):
             if boundary == "retired_old_transaction" and label == "recovery_registration":
@@ -249,7 +250,7 @@ def test_process_crash_retries_preparation_without_restoring_old_protocol(regist
                 os._exit(41)
 
         DurableIO.sync_directory = interrupted_sync
-        context.save_machine_registration = interrupted_save
+        registration_owner.save_machine_registration = interrupted_save
         try:
             prepare(runtime, binding)
         finally:
@@ -260,7 +261,7 @@ def test_process_crash_retries_preparation_without_restoring_old_protocol(regist
     assert prepare(restarted, binding)
     assert not restarted.paths["registration_transaction"].exists()
     with restarted.registry_guard():
-        restarted._rollback_registration_transaction()
+        restarted.registration.rollback_pending_locked()
     stored = read_json(path)["registration"]
     assert stored["version"] == 2
     assert stored["generation"] == binding.registration_generation
@@ -270,7 +271,7 @@ def test_process_crash_retries_preparation_without_restoring_old_protocol(regist
 def test_scheduler_does_not_release_authority_during_preparation(registered, monkeypatch):
     from threading import Event, Thread
 
-    from qqtools.plugins.qexp.agent import context
+    from qqtools.plugins.qexp.agent import registration as registration_owner
 
     runtime, binding, _cfg, path = registered
     acquired = Event()
@@ -281,7 +282,7 @@ def test_scheduler_does_not_release_authority_during_preparation(registered, mon
     finish_publication = Event()
     errors = []
     prepared = []
-    save = context.save_machine_registration
+    save = registration_owner.save_machine_registration
 
     def slow_save(cfg, value):
         if value["registration"]["version"] == 2:
@@ -307,7 +308,7 @@ def test_scheduler_does_not_release_authority_during_preparation(registered, mon
         except BaseException as exc:
             errors.append(exc)
 
-    monkeypatch.setattr(context, "save_machine_registration", slow_save)
+    monkeypatch.setattr(registration_owner, "save_machine_registration", slow_save)
     owner_thread = Thread(target=owner)
     worker_thread = Thread(target=worker)
     owner_thread.start()
@@ -338,10 +339,10 @@ def test_scheduler_does_not_release_authority_during_preparation(registered, mon
 
 
 def test_visible_protocol_after_failed_publication_requires_retry_barrier(registered, monkeypatch):
-    from qqtools.plugins.qexp.agent import context
+    from qqtools.plugins.qexp.agent import registration as registration_owner
 
     runtime, binding, _cfg, path = registered
-    save = context.save_machine_registration
+    save = registration_owner.save_machine_registration
     sync = DurableIO.sync_directory
 
     def uncertain_save(cfg, value):
@@ -349,7 +350,7 @@ def test_visible_protocol_after_failed_publication_requires_retry_barrier(regist
         if value["registration"]["version"] == 2:
             raise OSError("publication durability is uncertain")
 
-    monkeypatch.setattr(context, "save_machine_registration", uncertain_save)
+    monkeypatch.setattr(registration_owner, "save_machine_registration", uncertain_save)
     with pytest.raises(OSError, match="durability is uncertain"):
         prepare(runtime, binding)
     assert read_json(path)["registration"]["version"] == 2

@@ -72,6 +72,43 @@ def test_runtime_packages_export_owner_objects_without_private_names() -> None:
     assert qexp.set_cpu_lane_capacity is cpu_lane.set_cpu_lane_capacity
 
 
+def test_registration_owner_is_composed_once_and_context_reexports_contract(tmp_path: Path) -> None:
+    from qqtools.plugins.qexp.agent.bindings import ProjectBinding as OwnedProjectBinding
+    from qqtools.plugins.qexp.agent.context import RECOVERY_REGISTRATION_PROTOCOL as context_recovery_protocol
+    from qqtools.plugins.qexp.agent.context import RECOVERY_REGISTRATION_VERSION as context_recovery_version
+    from qqtools.plugins.qexp.agent.context import MachineRuntime, ProjectBinding
+    from qqtools.plugins.qexp.agent.registration import (
+        RECOVERY_REGISTRATION_PROTOCOL,
+        RECOVERY_REGISTRATION_VERSION,
+        MachineRegistration,
+    )
+
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+
+    assert ProjectBinding is OwnedProjectBinding
+    assert context_recovery_version == RECOVERY_REGISTRATION_VERSION
+    assert context_recovery_protocol == RECOVERY_REGISTRATION_PROTOCOL
+    assert isinstance(runtime.registration, MachineRegistration)
+
+
+def test_registration_modules_do_not_import_runtime_composition_or_dispatch() -> None:
+    agent_root = PROJECT_ROOT / "src/qqtools/plugins/qexp/agent"
+    forbidden = {
+        "context",
+        "dispatch_probe",
+        "control_plane",
+        "lifecycle",
+        "qqtools.plugins.qexp.agent.context",
+        "qqtools.plugins.qexp.agent.dispatch_probe",
+        "qqtools.plugins.qexp.agent.control_plane",
+        "qqtools.plugins.qexp.agent.lifecycle",
+    }
+
+    for name in ("bindings.py", "registration.py"):
+        imports = _import_modules(agent_root / name)
+        assert not imports & forbidden, f"{name} imports runtime composition or dispatch: {sorted(imports & forbidden)}"
+
+
 def test_primary_probe_state_is_only_mutated_by_its_owner() -> None:
     production_root = PROJECT_ROOT / "src/qqtools/plugins/qexp"
     offenders: list[str] = []

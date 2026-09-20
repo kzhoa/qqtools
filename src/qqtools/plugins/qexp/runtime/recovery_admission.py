@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..agent.registration import RECOVERY_REGISTRATION_VERSION
 from ..config_types import RootConfig
 from ..layout import LOCAL_RECOVERY_CAPABILITY, load_machine_record, load_machine_registration, validate_root_contract
 from .locks import schema_lock
@@ -17,7 +18,8 @@ from .upgrade.framework import UpgradeCoordinator
 from .upgrade.production import UpgradeJournalMigration
 
 if TYPE_CHECKING:
-    from ..agent.context import MachineRuntime, ProjectBinding
+    from ..agent.bindings import ProjectBinding
+    from ..agent.context import MachineRuntime
 
 
 @dataclass(frozen=True)
@@ -36,8 +38,6 @@ def _upgrade_blocker(cfg: RootConfig) -> str | None:
 
 
 def _participants(runtime: MachineRuntime, binding: ProjectBinding, cfg: RootConfig) -> tuple[list[Path], list[str]]:
-    from ..agent.context import RECOVERY_REGISTRATION_VERSION
-
     directories = []
     blockers = []
     with os.scandir(shared_paths(cfg.shared_root)["machines"]) as entries:
@@ -77,7 +77,7 @@ def _participants(runtime: MachineRuntime, binding: ProjectBinding, cfg: RootCon
             try:
                 if not isinstance(record, dict):
                     raise ValueError("missing registration")
-                runtime._validate_registration_record(record, binding.project_id, peer)
+                runtime.registration.validate_registration_record(record, binding.project_id, peer)
             except (RuntimeError, ValueError):
                 blockers.append(f"invalid_registration:{entry.name}")
                 continue
@@ -105,8 +105,6 @@ def fence_recovery_admission(runtime: MachineRuntime, binding: ProjectBinding) -
     a registration/schema lock inversion. This inventories machine metadata only;
     it neither scans execution history nor certifies any local capture.
     """
-    from ..agent.context import RECOVERY_REGISTRATION_VERSION
-
     if runtime._scheduler_authority_pid != os.getpid():
         raise RuntimeError("recovery admission fencing requires machine scheduler authority")
     with runtime._scheduler_authority_gate:
@@ -153,8 +151,6 @@ def fence_recovery_admission(runtime: MachineRuntime, binding: ProjectBinding) -
 
 def inspect_recovery_admission(runtime: MachineRuntime, binding: ProjectBinding) -> dict:
     """Read an advisory enrollment snapshot without activating or repairing state."""
-    from ..agent.context import RECOVERY_REGISTRATION_VERSION
-
     try:
         cfg = binding.root_config()
         status = runtime.registration_status(binding)
