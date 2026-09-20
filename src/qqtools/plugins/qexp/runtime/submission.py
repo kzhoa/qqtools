@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
-from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_task_dependencies_root
-from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
+from ..layout import is_cpu_lane_root, is_group_ready_members_root
 from .availability import remove_deadline_index, sync_deadline_index
-from .dependencies import normalize_dependency_ids, validate_group_dependencies
+from .dependencies import validate_group_dependencies
 from .locks import group_lock, group_writer_lock, idempotency_lock, schema_writer_lock, task_lock, task_locks
 from .operation_store import operation_exists
-from .paths import group_path, idempotency_path, machine_path, shared_paths, submission_path, task_path
+from .paths import group_path, idempotency_path, submission_path, task_path
 from .ready import (
     assert_ready_writer_compatible,
     commit_ready_publication,
@@ -28,10 +25,8 @@ from .ready import (
 from .ready.group_members import assert_group_ready_members_writable
 from .records import (
     TaskRecord,
-    TaskSpec,
     new_group,
     new_id,
-    new_submission,
     new_worker_member,
     normalize_group_record,
     utc_now,
@@ -39,6 +34,19 @@ from .records import (
 )
 from .store import atomic_replace, create_if_absent, read_json
 from .submission_control import publish_submission as _publish_submission
+from .submission_plan import (
+    SubmissionPlan,
+    _planned_worker_set,
+    _task_spec,
+    _thaw,
+    _validate_group_precondition,
+    _validate_placement_against_workers,
+    decode_submission_plan,
+    encode_submission_plan,
+    normalize_submission_request,
+    prepare_submission_plan,
+    semantic_digest,
+)
 from .tasks import save_task
 
 
@@ -105,213 +113,6 @@ def _submission_result(tasks: Iterable[TaskRecord], submission: dict[str, Any]) 
     )
 
 
-def semantic_digest(request: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _worker_additions(
-    worker_set: dict[str, dict[str, Any]] | list[str] | None,
-) -> dict[str, dict[str, Any]]:
-    if worker_set is None:
-        return {}
-    if isinstance(worker_set, list):
-        seen: set[str] = set()
-        for index, machine in enumerate(worker_set):
-            validate_identifier(machine, f"worker_set[{index}]")
-            if machine in seen:
-                raise ValueError(f"worker_set must not contain duplicate machine {machine!r}.")
-            seen.add(machine)
-        worker_set = {machine: {"scheduling_role": "primary", "gpu_limit_gpus": None} for machine in worker_set}
-    if not isinstance(worker_set, dict):
-        raise ValueError("worker_set must be a Worker declaration mapping.")
-    additions: dict[str, dict[str, Any]] = {}
-    for machine, declaration in worker_set.items():
-        validate_identifier(machine, f"worker_set.{machine}")
-        if machine in additions:
-            raise ValueError(f"worker_set must not contain duplicate machine {machine!r}.")
-        if not isinstance(declaration, dict):
-            raise ValueError(f"worker_set.{machine} must be a mapping.")
-        role = declaration.get("scheduling_role", "primary")
-        if "borrow_limit_gpus" in declaration:
-            raise ValueError(f"worker_set.{machine} has obsolete borrow_limit_gpus.")
-        limit = declaration.get("gpu_limit_gpus")
-        if role not in {"primary", "borrow"}:
-            raise ValueError(f"worker_set.{machine}.scheduling_role is invalid.")
-        if limit is not None and (type(limit) is not int or limit <= 0):
-            raise ValueError(f"worker_set.{machine}.gpu_limit_gpus must be positive or null.")
-        additions[machine] = {
-            "scheduling_role": role,
-            "gpu_limit_gpus": limit,
-        }
-    return additions
-
-
-def _resolved_home(value: str | None, submitting_machine: str) -> str:
-    home = "current" if value is None else value
-    if home == "current":
-        return submitting_machine
-    validate_identifier(home, "home_machine")
-    return home
-
-
-def _canonical_specs(specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    canonical = []
-    for raw in specs:
-        item = dict(raw)
-        item["home_machine"] = item.get("home_machine", "current")
-        canonical.append(item)
-    return canonical
-
-
-def _resolved_specs(specs: list[dict[str, Any]], submitting_machine: str) -> list[dict[str, Any]]:
-    result = []
-    seen: set[str] = set()
-    for raw in specs:
-        command = raw.get("command")
-        if not isinstance(command, list) or not command or any(not isinstance(item, str) for item in command):
-            raise ValueError("command must be a non-empty list of strings.")
-        task_id = raw.get("task_id") or new_id()
-        if task_id in seen:
-            raise ValueError(f"duplicate task_id {task_id!r} in submission.")
-        seen.add(task_id)
-        home_machine = _resolved_home(raw.get("home_machine"), submitting_machine)
-        result.append(
-            {
-                "task_id": task_id,
-                "name": raw.get("name"),
-                "home_machine": home_machine,
-                "command": list(command),
-                "working_directory": raw.get("working_directory", str(Path.cwd())),
-                "requested_gpus": raw.get("requested_gpus", 1),
-                "requested_cpus": raw.get("requested_cpus"),
-                "sharing_mode": raw.get("sharing_mode", "private"),
-                "fallback_machines": raw.get("fallback_machines", "group"),
-                "offer_after_seconds": raw.get("offer_after_seconds"),
-                "depends_on_task_ids": normalize_dependency_ids(raw.get("depends_on_task_ids")),
-            }
-        )
-    return result
-
-
-def _canonical_resolved_specs(operation: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return a submission's canonical resolved Task specifications."""
-    try:
-        resolved = operation["submission"]["resolved_context"]["task_specs"]
-    except (KeyError, TypeError) as exc:
-        raise RuntimeError("submission operation has an invalid canonical task context.") from exc
-    if not isinstance(resolved, list) or any(
-        not isinstance(item, dict) or "depends_on_task_ids" not in item for item in resolved
-    ):
-        raise RuntimeError(
-            "submission operation predates the canonical task-dependencies-v1 protocol; "
-            "recovery requires qqtools 1.3.15."
-        )
-    return resolved
-
-
-def _validate_target_machine_record(cfg: Any, machine_name: str) -> None:
-    """Require a current-generation shared Project record for a remote home machine."""
-    identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
-    try:
-        identity = read_json(identity_path)["project"]
-        stable_id = identity["project_id"]
-        identity_root = Path(identity["shared_root"]).expanduser().resolve()
-    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError(f"qexp project identity is malformed: {identity_path}") from exc
-    if not isinstance(stable_id, str) or not stable_id or identity_root != cfg.shared_root:
-        raise RuntimeError("project identity does not match the canonical shared root.")
-
-    record_path = machine_path(cfg.shared_root, machine_name)
-    if not record_path.exists():
-        raise ValueError(f"home machine {machine_name!r} has no current-generation Project machine record.")
-    try:
-        record = read_json(record_path)
-        machine = record["machine"]
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"home machine {machine_name!r} has an invalid Project machine record.") from exc
-    if not isinstance(machine, dict):
-        raise ValueError(f"home machine {machine_name!r} has an invalid Project machine record.")
-    if (
-        machine.get("machine_name") != machine_name
-        or machine.get("project_id") != stable_id
-        or machine.get("shared_root") != str(cfg.shared_root)
-        or machine.get("agent_runtime") != "machine"
-    ):
-        raise ValueError(f"home machine {machine_name!r} does not have a current-generation Project machine record.")
-
-
-def _active_workers(group: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    normalize_group_record(group)
-    return {
-        machine: worker for machine, worker in group["group"]["worker_set"].items() if worker.get("state") == "active"
-    }
-
-
-def _planned_worker_set(
-    group: dict[str, Any] | None, additions: dict[str, dict[str, Any]]
-) -> dict[str, dict[str, Any]]:
-    active_workers = _active_workers(group) if group else {}
-    all_workers = group["group"]["worker_set"] if group else {}
-    planned = dict(active_workers)
-    for machine, declaration in additions.items():
-        worker = all_workers.get(machine)
-        if worker is not None and worker.get("state") != "active":
-            raise ValueError(f"machine {machine!r} is not a claimable Group worker.")
-        planned.setdefault(
-            machine,
-            {
-                "state": "active",
-                **declaration,
-                "state_epoch": 0,
-                "added_by_operation": None,
-            },
-        )
-    return planned
-
-
-def _validate_placement_against_workers(
-    resolved: list[dict[str, Any]], *, group_name: str | None, planned_workers: dict[str, dict[str, Any]]
-) -> None:
-    for item in resolved:
-        home = item["home_machine"]
-        if group_name is None:
-            if item["sharing_mode"] != "private":
-                raise ValueError("ungrouped tasks must use private placement.")
-            continue
-        if home not in planned_workers:
-            raise ValueError(f"tasks home_machine {home!r} is not an active worker in Group {group_name!r}.")
-        if item["sharing_mode"] == "private":
-            continue
-        fallback = item["fallback_machines"]
-        if fallback == "group":
-            continue
-        for machine in fallback:
-            if machine not in planned_workers:
-                raise ValueError(
-                    f"tasks fallback_machines contains {machine!r}, which is not an active "
-                    f"worker in Group {group_name!r}."
-                )
-
-
-def _group_precondition(group: dict[str, Any] | None) -> dict[str, Any]:
-    if group is None:
-        return {"exists": False, "revision": None, "worker_set_epoch": None}
-    return {
-        "exists": True,
-        "revision": group["meta"]["revision"],
-        "worker_set_epoch": group["group"]["worker_set_epoch"],
-    }
-
-
-def _validate_group_precondition(group: dict[str, Any], precondition: dict[str, Any], group_name: str) -> None:
-    if group["group"]["admission_state"] != "open":
-        raise ValueError(f"Group {group_name!r} is sealed.")
-    if group["meta"]["revision"] != precondition["revision"]:
-        raise RuntimeError(f"Group {group_name!r} changed during submission.")
-    if group["group"]["worker_set_epoch"] != precondition["worker_set_epoch"]:
-        raise RuntimeError(f"Group {group_name!r} Worker Set changed during submission.")
-
-
 def _reject_cleanup_tombstones(cfg: Any, resolved: list[dict[str, Any]]) -> None:
     for item in resolved:
         if operation_exists(cfg, "cleanup", item["task_id"]):
@@ -338,24 +139,6 @@ def _task_matches_resolved(
     )
 
 
-def _task_spec(item: dict[str, Any], *, is_canonical: bool) -> TaskSpec:
-    requested_gpus = item["requested_gpus"]
-    requested_cpus = item.get("requested_cpus")
-    if requested_gpus == 0:
-        if not is_canonical:
-            raise ValueError("CPU-only tasks require a canonical CPU-lane root.")
-        return TaskSpec(item["command"], item["working_directory"], 0, requested_cpus, "cpu")
-    if requested_cpus is not None:
-        raise ValueError("GPU tasks cannot declare requested_cpus.")
-    return TaskSpec(
-        item["command"],
-        item["working_directory"],
-        requested_gpus,
-        None,
-        "gpu" if is_canonical else None,
-    )
-
-
 def _new_task_from_resolved(
     item: dict[str, Any],
     *,
@@ -379,22 +162,17 @@ def _new_task_from_resolved(
     )
 
 
-def _remove_operation_added_workers(group: dict[str, Any], operation: dict[str, Any]) -> bool:
-    additions = operation["submission"]["resolved_context"].get("worker_set_additions", [])
+def _remove_operation_added_workers(group: dict[str, Any], operation_id: str, plan: SubmissionPlan) -> bool:
+    additions = plan.worker_set_additions
     removed_worker = False
     for machine in dict.fromkeys(additions):
         worker = group["group"]["worker_set"].get(machine)
-        if worker and worker.get("added_by_operation") == operation["submission"]["operation_id"]:
+        if worker and worker.get("added_by_operation") == operation_id:
             del group["group"]["worker_set"][machine]
             removed_worker = True
     if removed_worker:
         group["group"]["worker_set_epoch"] += 1
     return removed_worker
-
-
-def _operation_created_group(operation: dict[str, Any]) -> bool:
-    """Return whether this submission owns creation of its target Group."""
-    return operation["submission"]["resolved_context"].get("create_group") is True
 
 
 def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
@@ -434,6 +212,269 @@ def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
         _write_group_record(cfg, group_file, group)
 
 
+def _plan_specs(plan: SubmissionPlan) -> list[dict[str, Any]]:
+    """Return independent mutable task specifications from an immutable plan."""
+    return [_thaw(item) for item in plan.task_specs]
+
+
+def _validate_operation_plan(operation: dict[str, Any], plan: SubmissionPlan) -> None:
+    try:
+        persisted_plan = decode_submission_plan(operation)
+    except (RuntimeError, ValueError, TypeError) as exc:
+        raise RuntimeError("submission operation has invalid immutable plan truth.") from exc
+    if persisted_plan != plan:
+        raise RuntimeError("submission operation immutable context does not match its execution plan.")
+
+
+def _load_plan_tasks(cfg: Any, plan: SubmissionPlan) -> list[TaskRecord]:
+    try:
+        return [TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id))) for task_id in plan.task_ids]
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("committed submission has missing Task truth; run qexp doctor repair.") from exc
+
+
+def _execute_submission_locked(
+    cfg: Any,
+    operation: dict[str, Any],
+    plan: SubmissionPlan,
+    *,
+    on_prepared: Callable[[str, str], None] | None = None,
+) -> SubmissionResult:
+    """Execute a prepared operation while the schema and idempotency fences are held."""
+    _validate_operation_plan(operation, plan)
+    submission = operation["submission"]
+    state = submission["state"]
+    if state == "committed":
+        tasks = _load_plan_tasks(cfg, plan)
+        finalize_submission_group(cfg, submission)
+        return _submission_result(tasks, submission)
+    if state == "aborted":
+        raise RuntimeError(f"submission operation was aborted: {submission['failure_reason']}")
+    if state == "blocked":
+        raise RuntimeError(f"submission operation is blocked: {submission['failure_reason']}")
+
+    resolved = _plan_specs(plan)
+    operation_id = plan.operation_id
+    group_name = plan.target_group
+    is_canonical = is_cpu_lane_root(cfg)
+
+    if group_name:
+        with group_lock(cfg.shared_root, group_name):
+            group_file = group_path(cfg.shared_root, group_name)
+            group_was_missing = not group_file.exists()
+            if group_was_missing:
+                if not plan.create_group:
+                    raise RuntimeError(f"Group {group_name!r} disappeared during submission.")
+                group = new_group(group_name, plan.original_submitting_machine)
+            else:
+                group = read_json(group_file)
+                normalize_group_record(group)
+            precondition = plan.group_precondition
+            pending = group["group"].get("pending_submission_commit") or {}
+            has_own_pending_commit = pending.get("operation_id") == operation_id
+            if pending and not has_own_pending_commit:
+                raise RuntimeError(f"Group {group_name!r} has pending submission commit {pending['operation_id']!r}.")
+            if precondition.get("exists") and not has_own_pending_commit:
+                _validate_group_precondition(group, precondition, group_name)
+            elif not precondition.get("exists") and not group_was_missing and not has_own_pending_commit:
+                operation["submission"]["state"] = "aborted"
+                operation["submission"]["failure_reason"] = f"Group {group_name!r} changed during submission."
+                publish_submission(cfg, operation)
+                raise RuntimeError(f"Group {group_name!r} changed during submission.")
+            if group["group"]["admission_state"] != "open":
+                operation["submission"]["state"] = "aborted"
+                operation["submission"]["failure_reason"] = f"Group {group_name!r} is sealed."
+                publish_submission(cfg, operation)
+                raise ValueError(f"Group {group_name!r} is sealed.")
+            additions = _thaw(plan.worker_set_additions)
+            planned_workers = _planned_worker_set(group, additions)
+            _validate_placement_against_workers(resolved, group_name=group_name, planned_workers=planned_workers)
+            if operation["submission"]["commit_plan"]["group_membership_sequences"] is None:
+                start = group["group"]["next_membership_sequence"]
+                sequences = list(range(start, start + len(resolved)))
+                operation["submission"]["commit_plan"]["group_membership_sequences"] = sequences
+                operation["submission"]["state"] = "committing"
+                publish_submission(cfg, operation)
+            else:
+                sequences = operation["submission"]["commit_plan"]["group_membership_sequences"]
+            group["group"]["pending_submission_commit"] = {
+                "operation_id": operation_id,
+                "membership_sequences": sequences,
+                "worker_set_additions": additions,
+            }
+            workers = group["group"]["worker_set"]
+            previous_workers = {worker_name: dict(worker) for worker_name, worker in workers.items()}
+            projection_routes = primary_projection_routes_for_group(cfg, group_name)
+            added_workers: list[dict[str, Any]] = []
+            added_worker_machines: list[str] = []
+            for machine in dict.fromkeys(additions):
+                declaration = additions[machine]
+                if machine not in workers:
+                    worker = new_worker_member(
+                        scheduling_role=declaration["scheduling_role"],
+                        gpu_limit_gpus=declaration["gpu_limit_gpus"],
+                        added_by_operation=operation_id,
+                    )
+                    workers[machine] = worker
+                    added_workers.append(worker)
+                    added_worker_machines.append(machine)
+            if added_workers:
+                group["group"]["worker_set_epoch"] += 1
+                for worker in added_workers:
+                    worker["state_epoch"] = group["group"]["worker_set_epoch"]
+            group["meta"]["revision"] += 1
+            group["meta"]["updated_at"] = utc_now()
+            if added_worker_machines:
+                routes = projection_routes + [
+                    (scope, machine) for machine in added_worker_machines for scope in ("shared", "home")
+                ]
+                with primary_route_update_transaction(cfg, routes):
+                    _write_group_record(cfg, group_file, group)
+                    sync_primary_ready_group(cfg, group_name, previous_workers=previous_workers)
+            else:
+                _write_group_record(cfg, group_file, group)
+    else:
+        sequences = [None] * len(resolved)
+
+    staged: list[TaskRecord] = []
+    commit_durable = False
+
+    def stage_and_commit() -> None:
+        """Validate and publish one submission while its Group cannot change."""
+        nonlocal commit_durable
+        candidates = [
+            _new_task_from_resolved(
+                item,
+                group_name=group_name,
+                operation_id=operation_id,
+                is_canonical=is_canonical,
+            )
+            for item in resolved
+        ]
+        validate_group_dependencies(cfg, group_name, candidates)
+        for sequence, item in zip(sequences, resolved):
+            path = task_path(cfg.shared_root, item["task_id"])
+            _reject_cleanup_tombstones(cfg, [item])
+            if path.exists():
+                current = TaskRecord.from_dict(read_json(path))
+                if not _task_matches_resolved(current, item, operation_id, group_name):
+                    raise ValueError(f"Task {item['task_id']!r} already exists with different truth.")
+                if current.ready_generation == 0:
+                    old_generation, _ = prepare_ready_transition(cfg, current, "submission_resume")
+                    current.meta["revision"] += 1
+                    current.meta["updated_at"] = utc_now()
+                    save_task(cfg, current)
+                    commit_ready_publication(cfg, current)
+                    retire_previous_ready_generation(cfg, old_generation, current)
+                sync_deadline_index(cfg, current)
+                staged.append(current)
+                continue
+            task = _new_task_from_resolved(
+                item,
+                group_name=group_name,
+                operation_id=operation_id,
+                is_canonical=is_canonical,
+            )
+            task.group_membership_sequence = sequence
+            old_generation, _ = prepare_ready_transition(
+                cfg,
+                task,
+                "submission_stage",
+                target_revision=task.meta["revision"],
+            )
+            save_task(cfg, task)
+            commit_ready_publication(cfg, task)
+            retire_previous_ready_generation(cfg, old_generation, task)
+            sync_deadline_index(cfg, task)
+            staged.append(task)
+        operation["submission"]["state"] = "committed"
+        operation["submission"]["committed_at"] = utc_now()
+        try:
+            publish_submission(cfg, operation)
+        except Exception:
+            try:
+                persisted = read_json(submission_path(cfg.shared_root, operation_id))
+            except (OSError, ValueError):
+                raise
+            if persisted.get("submission", {}).get("state") != "committed":
+                raise
+        commit_durable = True
+
+    try:
+        # Preserve the prepared callback's existing contract: malformed dependency
+        # requests fail before callers observe preparation.  It cannot serve as the
+        # authoritative check because it runs outside the publication transaction.
+        prepared_candidates = [
+            _new_task_from_resolved(
+                item,
+                group_name=group_name,
+                operation_id=operation_id,
+                is_canonical=is_canonical,
+            )
+            for item in resolved
+        ]
+        if group_name:
+            with group_lock(cfg.shared_root, group_name):
+                validate_group_dependencies(cfg, group_name, prepared_candidates)
+        else:
+            validate_group_dependencies(cfg, None, prepared_candidates)
+        if on_prepared:
+            on_prepared(operation_id, operation["submission"]["idempotency_key"])
+        # Validation and publication must be one Group-linearized operation. Otherwise a
+        # prerequisite can begin cleanup between the final check and Task creation.
+        if group_name:
+            with group_lock(cfg.shared_root, group_name):
+                with task_locks(cfg.shared_root, list(plan.task_ids)):
+                    stage_and_commit()
+        else:
+            with task_locks(cfg.shared_root, list(plan.task_ids)):
+                stage_and_commit()
+        finalize_submission_group(cfg, operation["submission"])
+        return _submission_result(staged, operation["submission"])
+    except Exception as exc:
+        if commit_durable:
+            raise
+        operation["submission"]["state"] = "aborted"
+        operation["submission"]["failure_reason"] = str(exc)
+        publish_submission(cfg, operation)
+        if group_name:
+            with group_lock(cfg.shared_root, group_name):
+                group_file = group_path(cfg.shared_root, group_name)
+                if group_file.exists():
+                    group = read_json(group_file)
+                    normalize_group_record(group)
+                    has_pending_commit = (group["group"].get("pending_submission_commit") or {}).get(
+                        "operation_id"
+                    ) == operation_id
+                    if has_pending_commit and plan.create_group:
+                        group_file.unlink()
+                    else:
+                        removed_worker = _remove_operation_added_workers(group, operation_id, plan)
+                        if has_pending_commit or removed_worker:
+                            group["group"]["pending_submission_commit"] = None
+                            group["meta"]["revision"] += 1
+                            group["meta"]["updated_at"] = utc_now()
+                            _write_group_record(cfg, group_file, group)
+        for item in resolved:
+            task_id = item["task_id"]
+            path = task_path(cfg.shared_root, task_id)
+            with task_lock(cfg.shared_root, task_id):
+                try:
+                    current = TaskRecord.from_dict(read_json(path))
+                except FileNotFoundError:
+                    remove_deadline_index(cfg, task_id)
+                    continue
+                if current.submission_operation_id == operation_id:
+                    remove_deadline_index(cfg, task_id)
+                    try:
+                        delete_ready_marker(cfg, task_id, current.ready_generation)
+                    except (OSError, KeyError, TypeError, ValueError):
+                        pass
+                    assert_ready_writer_compatible(cfg)
+                    path.unlink(missing_ok=True)
+        raise
+
+
 def submit_specs(
     cfg: Any,
     specs: list[dict[str, Any]],
@@ -444,327 +485,37 @@ def submit_specs(
     worker_set: list[str] | None = None,
     on_prepared: Callable[[str, str], None] | None = None,
 ) -> SubmissionResult:
-    if not specs:
-        raise ValueError("submission must contain at least one task.")
-    worker_additions = _worker_additions(worker_set)
-    normalized = {
-        "group": group_name,
-        "tasks": _canonical_specs(specs),
-        "worker_set": {machine: worker_additions[machine] for machine in sorted(worker_additions)},
-    }
-    raw_digest = semantic_digest(normalized)
+    request = normalize_submission_request(specs, group_name=group_name, kind=kind, worker_set=worker_set)
     key = idempotency_key or new_id()
+    if not isinstance(key, str):
+        raise ValueError("idempotency_key must be a string or null.")
+    raw_digest = request.raw_request_digest
     mapping_path = idempotency_path(cfg.shared_root, semantic_digest({"project": str(cfg.shared_root), "key": key}))
-    is_canonical = is_cpu_lane_root(cfg)
-    is_dependencies_canonical = is_task_dependencies_root(cfg)
     with _submission_protocol_lock(cfg, mapping_path.stem):
-        existing = mapping_path.exists()
-        if existing:
-            operation_id = read_json(mapping_path)["operation_id"]
-            operation = read_json(submission_path(cfg.shared_root, operation_id))
-            submission = operation["submission"]
+        if mapping_path.exists():
+            mapping = read_json(mapping_path)
+            mapped_operation_id = mapping.get("operation_id") if isinstance(mapping, dict) else None
+            try:
+                validate_identifier(mapped_operation_id, "idempotency mapping operation_id")
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("idempotency mapping has an invalid operation_id.") from exc
+            operation = read_json(submission_path(cfg.shared_root, mapped_operation_id))
+            submission = operation.get("submission") if isinstance(operation, dict) else None
+            if not isinstance(submission, dict):
+                raise RuntimeError("mapped submission operation is invalid.")
+            if submission.get("operation_id") != mapped_operation_id:
+                raise RuntimeError("mapped operation_id does not match persisted submission operation_id.")
+            if submission.get("idempotency_key") != key:
+                raise RuntimeError("persisted idempotency_key does not match requested key.")
+            if "raw_request_digest" not in submission:
+                raise RuntimeError("persisted submission raw_request_digest is missing.")
             if submission["raw_request_digest"] != raw_digest:
                 raise IdempotencyConflict("idempotency key was already used with different semantic input.")
-            resolved = _canonical_resolved_specs(operation)
-            submission = operation["submission"]
-            if submission["state"] == "committed":
-                try:
-                    tasks = [
-                        TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id)))
-                        for task_id in submission["resolved_context"]["task_ids"]
-                    ]
-                except FileNotFoundError as exc:
-                    raise RuntimeError("committed submission has missing Task truth; run qexp doctor repair.") from exc
-                finalize_submission_group(cfg, submission)
-                return _submission_result(tasks, submission)
-            if submission["state"] == "aborted":
-                raise RuntimeError(f"submission operation was aborted: {submission['failure_reason']}")
-            group_name = submission["target_group"]
-            operation_id = submission["operation_id"]
+            plan = decode_submission_plan(operation)
         else:
-            resolved = _resolved_specs(specs, cfg.machine_name)
-            if not is_dependencies_canonical and any(item["depends_on_task_ids"] for item in resolved):
-                raise ValueError("Task dependencies require an activated task-dependencies-v1 root.")
-            for item in resolved:
-                _task_spec(item, is_canonical=is_canonical)
-            for machine in sorted(
-                {item["home_machine"] for item in resolved if item["home_machine"] != cfg.machine_name}
-            ):
-                _validate_target_machine_record(cfg, machine)
-            group_precondition = _group_precondition(None)
-            planned_workers: dict[str, dict[str, Any]] = {}
-            if group_name:
-                with group_lock(cfg.shared_root, group_name):
-                    if is_group_ready_members_root(cfg):
-                        assert_group_ready_members_writable(cfg)
-                    group_file = group_path(cfg.shared_root, group_name)
-                    group = read_json(group_file) if group_file.exists() else None
-                    if group is not None:
-                        normalize_group_record(group)
-                    if group is not None and group["group"]["admission_state"] != "open":
-                        raise ValueError(f"Group {group_name!r} is sealed.")
-                    group_precondition = _group_precondition(group)
-                if group is None and kind == "single":
-                    raise ValueError(f"Group {group_name!r} does not exist; create it with 'qexp group create'.")
-                if group is None and not worker_additions:
-                    raise ValueError(
-                        f"Group {group_name!r} does not exist; batch-submit requires a non-empty "
-                        "manifest group.workers declaration."
-                    )
-                planned_workers = _planned_worker_set(group, worker_additions)
-                _validate_placement_against_workers(resolved, group_name=group_name, planned_workers=planned_workers)
-            else:
-                _validate_placement_against_workers(resolved, group_name=None, planned_workers={cfg.machine_name: {}})
-            if any(item["offer_after_seconds"] is not None for item in resolved):
-                capability = clock_capability(cfg)
-                if not capability.is_healthy or capability.observation is None:
-                    raise ValueError("timed offer requires a healthy clock capability; use an immediate share instead.")
-                persist_clock_observation(cfg, capability.observation)
-                for item in resolved:
-                    if item["offer_after_seconds"] is not None:
-                        deadline, proof = new_timed_offer_proof(capability.observation, item["offer_after_seconds"])
-                        item["offer_eligible_at"] = deadline
-                        item["offer_clock_evidence"] = proof
-            _reject_cleanup_tombstones(cfg, resolved)
-            context = {
-                "task_ids": [item["task_id"] for item in resolved],
-                "task_specs": resolved,
-                "create_group": bool(group_name and not group_precondition["exists"]),
-                "worker_set_additions": worker_additions,
-                "group_precondition": group_precondition,
-                "planned_worker_set": sorted(planned_workers),
-            }
-            operation_id = new_id()
-            operation = new_submission(
-                operation_id=operation_id,
-                kind=kind,
-                key=key,
-                raw_digest=raw_digest,
-                machine=cfg.machine_name,
-                target_group=group_name,
-                resolved_context=context,
-            )
-            create_if_absent(submission_path(cfg.shared_root, operation_id), operation)
-            create_if_absent(mapping_path, {"operation_id": operation_id})
-
-        if group_name:
-            with group_lock(cfg.shared_root, group_name):
-                group_file = group_path(cfg.shared_root, group_name)
-                group_was_missing = not group_file.exists()
-                if group_was_missing:
-                    if not _operation_created_group(operation):
-                        raise RuntimeError(f"Group {group_name!r} disappeared during submission.")
-                    group = new_group(group_name, cfg.machine_name)
-                else:
-                    group = read_json(group_file)
-                    normalize_group_record(group)
-                precondition = operation["submission"]["resolved_context"].get("group_precondition") or {}
-                pending = group["group"].get("pending_submission_commit") or {}
-                has_own_pending_commit = pending.get("operation_id") == operation_id
-                if pending and not has_own_pending_commit:
-                    raise RuntimeError(
-                        f"Group {group_name!r} has pending submission commit {pending['operation_id']!r}."
-                    )
-                if precondition.get("exists") and not has_own_pending_commit:
-                    _validate_group_precondition(group, precondition, group_name)
-                elif not precondition.get("exists") and not group_was_missing and not has_own_pending_commit:
-                    operation["submission"]["state"] = "aborted"
-                    operation["submission"]["failure_reason"] = f"Group {group_name!r} changed during submission."
-                    publish_submission(cfg, operation)
-                    raise RuntimeError(f"Group {group_name!r} changed during submission.")
-                if group["group"]["admission_state"] != "open":
-                    operation["submission"]["state"] = "aborted"
-                    operation["submission"]["failure_reason"] = f"Group {group_name!r} is sealed."
-                    publish_submission(cfg, operation)
-                    raise ValueError(f"Group {group_name!r} is sealed.")
-                planned_workers = _planned_worker_set(
-                    group,
-                    operation["submission"]["resolved_context"].get("worker_set_additions", {}),
-                )
-                _validate_placement_against_workers(resolved, group_name=group_name, planned_workers=planned_workers)
-                if operation["submission"]["commit_plan"]["group_membership_sequences"] is None:
-                    start = group["group"]["next_membership_sequence"]
-                    sequences = list(range(start, start + len(resolved)))
-                    operation["submission"]["commit_plan"]["group_membership_sequences"] = sequences
-                    operation["submission"]["state"] = "committing"
-                    publish_submission(cfg, operation)
-                else:
-                    sequences = operation["submission"]["commit_plan"]["group_membership_sequences"]
-                group["group"]["pending_submission_commit"] = {
-                    "operation_id": operation_id,
-                    "membership_sequences": sequences,
-                    "worker_set_additions": operation["submission"]["resolved_context"].get("worker_set_additions", []),
-                }
-                workers = group["group"]["worker_set"]
-                previous_workers = {worker_name: dict(worker) for worker_name, worker in workers.items()}
-                projection_routes = primary_projection_routes_for_group(cfg, group_name)
-                added_workers: list[dict[str, Any]] = []
-                added_worker_machines: list[str] = []
-                for machine in dict.fromkeys(
-                    operation["submission"]["resolved_context"].get("worker_set_additions", {})
-                ):
-                    declaration = operation["submission"]["resolved_context"]["worker_set_additions"][machine]
-                    if machine not in workers:
-                        worker = new_worker_member(
-                            scheduling_role=declaration["scheduling_role"],
-                            gpu_limit_gpus=declaration["gpu_limit_gpus"],
-                            added_by_operation=operation_id,
-                        )
-                        workers[machine] = worker
-                        added_workers.append(worker)
-                        added_worker_machines.append(machine)
-                if added_workers:
-                    group["group"]["worker_set_epoch"] += 1
-                    for worker in added_workers:
-                        worker["state_epoch"] = group["group"]["worker_set_epoch"]
-                group["meta"]["revision"] += 1
-                group["meta"]["updated_at"] = utc_now()
-                if added_worker_machines:
-                    routes = projection_routes + [
-                        (scope, machine) for machine in added_worker_machines for scope in ("shared", "home")
-                    ]
-                    with primary_route_update_transaction(cfg, routes):
-                        _write_group_record(cfg, group_file, group)
-                        sync_primary_ready_group(cfg, group_name, previous_workers=previous_workers)
-                else:
-                    _write_group_record(cfg, group_file, group)
-        else:
-            sequences = [None] * len(resolved)
-
-        staged: list[TaskRecord] = []
-        commit_durable = False
-
-        def stage_and_commit() -> None:
-            """Validate and publish one submission while its Group cannot change."""
-            nonlocal commit_durable
-            candidates = [
-                _new_task_from_resolved(
-                    item,
-                    group_name=group_name,
-                    operation_id=operation_id,
-                    is_canonical=is_canonical,
-                )
-                for item in resolved
-            ]
-            validate_group_dependencies(cfg, group_name, candidates)
-            for sequence, item in zip(sequences, resolved):
-                path = task_path(cfg.shared_root, item["task_id"])
-                _reject_cleanup_tombstones(cfg, [item])
-                if path.exists():
-                    current = TaskRecord.from_dict(read_json(path))
-                    if not _task_matches_resolved(current, item, operation_id, group_name):
-                        raise ValueError(f"Task {item['task_id']!r} already exists with different truth.")
-                    if current.ready_generation == 0:
-                        old_generation, _ = prepare_ready_transition(cfg, current, "submission_resume")
-                        current.meta["revision"] += 1
-                        current.meta["updated_at"] = utc_now()
-                        save_task(cfg, current)
-                        commit_ready_publication(cfg, current)
-                        retire_previous_ready_generation(cfg, old_generation, current)
-                    sync_deadline_index(cfg, current)
-                    staged.append(current)
-                    continue
-                task = _new_task_from_resolved(
-                    item,
-                    group_name=group_name,
-                    operation_id=operation_id,
-                    is_canonical=is_canonical,
-                )
-                task.group_membership_sequence = sequence
-                old_generation, _ = prepare_ready_transition(
-                    cfg,
-                    task,
-                    "submission_stage",
-                    target_revision=task.meta["revision"],
-                )
-                save_task(cfg, task)
-                commit_ready_publication(cfg, task)
-                retire_previous_ready_generation(cfg, old_generation, task)
-                sync_deadline_index(cfg, task)
-                staged.append(task)
-            operation["submission"]["state"] = "committed"
-            operation["submission"]["committed_at"] = utc_now()
-            try:
-                publish_submission(cfg, operation)
-            except Exception:
-                try:
-                    persisted = read_json(submission_path(cfg.shared_root, operation_id))
-                except (OSError, ValueError):
-                    raise
-                if persisted.get("submission", {}).get("state") != "committed":
-                    raise
-            commit_durable = True
-
-        try:
-            # Preserve the prepared callback's existing contract: malformed dependency
-            # requests fail before callers observe preparation.  It cannot serve as the
-            # authoritative check because it runs outside the publication transaction.
-            prepared_candidates = [
-                _new_task_from_resolved(
-                    item,
-                    group_name=group_name,
-                    operation_id=operation_id,
-                    is_canonical=is_canonical,
-                )
-                for item in resolved
-            ]
-            if group_name:
-                with group_lock(cfg.shared_root, group_name):
-                    validate_group_dependencies(cfg, group_name, prepared_candidates)
-            else:
-                validate_group_dependencies(cfg, None, prepared_candidates)
-            if on_prepared:
-                on_prepared(operation_id, operation["submission"]["idempotency_key"])
-            # Validation and publication must be one Group-linearized operation. Otherwise a
-            # prerequisite can begin cleanup between the final check and Task creation.
-            if group_name:
-                with group_lock(cfg.shared_root, group_name):
-                    with task_locks(cfg.shared_root, [item["task_id"] for item in resolved]):
-                        stage_and_commit()
-            else:
-                with task_locks(cfg.shared_root, [item["task_id"] for item in resolved]):
-                    stage_and_commit()
-            finalize_submission_group(cfg, operation["submission"])
-            return _submission_result(staged, operation["submission"])
-        except Exception as exc:
-            if commit_durable:
-                raise
-            operation["submission"]["state"] = "aborted"
-            operation["submission"]["failure_reason"] = str(exc)
-            publish_submission(cfg, operation)
-            if group_name:
-                with group_lock(cfg.shared_root, group_name):
-                    group_file = group_path(cfg.shared_root, group_name)
-                    if group_file.exists():
-                        group = read_json(group_file)
-                        normalize_group_record(group)
-                        has_pending_commit = (group["group"].get("pending_submission_commit") or {}).get(
-                            "operation_id"
-                        ) == operation_id
-                        if has_pending_commit and _operation_created_group(operation):
-                            group_file.unlink()
-                        else:
-                            removed_worker = _remove_operation_added_workers(group, operation)
-                            if has_pending_commit or removed_worker:
-                                group["group"]["pending_submission_commit"] = None
-                                group["meta"]["revision"] += 1
-                                group["meta"]["updated_at"] = utc_now()
-                                _write_group_record(cfg, group_file, group)
-            for item in operation["submission"]["resolved_context"].get("task_specs", []):
-                task_id = item["task_id"]
-                path = task_path(cfg.shared_root, task_id)
-                with task_lock(cfg.shared_root, task_id):
-                    try:
-                        current = TaskRecord.from_dict(read_json(path))
-                    except FileNotFoundError:
-                        remove_deadline_index(cfg, task_id)
-                        continue
-                    if current.submission_operation_id == operation_id:
-                        remove_deadline_index(cfg, task_id)
-                        try:
-                            delete_ready_marker(cfg, task_id, current.ready_generation)
-                        except (OSError, KeyError, TypeError, ValueError):
-                            pass
-                        assert_ready_writer_compatible(cfg)
-                        path.unlink(missing_ok=True)
-            raise
+            plan = prepare_submission_plan(cfg, request, idempotency_key=key)
+            operation = encode_submission_plan(plan)
+            _reject_cleanup_tombstones(cfg, _plan_specs(plan))
+            create_if_absent(submission_path(cfg.shared_root, plan.operation_id), operation)
+            create_if_absent(mapping_path, {"operation_id": plan.operation_id})
+        return _execute_submission_locked(cfg, operation, plan, on_prepared=on_prepared)

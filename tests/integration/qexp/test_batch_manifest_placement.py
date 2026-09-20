@@ -8,6 +8,7 @@ from qqtools.plugins.qexp import batch_submit, init_shared_root
 from qqtools.plugins.qexp.commands.group import change_worker, create_group, group_control
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
+from qqtools.plugins.qexp.runtime import submission_plan
 from qqtools.plugins.qexp.runtime.paths import group_path, submission_path, task_path
 from qqtools.plugins.qexp.runtime.store import read_json
 
@@ -113,7 +114,7 @@ tasks:
 
 def test_submission_rejects_obsolete_worker_limit_field():
     with pytest.raises(ValueError, match="obsolete borrow_limit_gpus"):
-        submission_runtime._worker_additions(
+        submission_plan._worker_additions(
             {
                 "gpu-1": {
                     "scheduling_role": "borrow",

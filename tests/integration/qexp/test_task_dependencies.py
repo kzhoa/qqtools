@@ -1,3 +1,5 @@
+import hashlib
+import json
 from multiprocessing import get_context
 from pathlib import Path
 
@@ -119,6 +121,86 @@ def test_dependency_submission_holds_group_lock_through_task_publication(
     assert observed_locks == [False]
 
 
+def test_submission_callback_runs_outside_group_lock(tmp_path: Path) -> None:
+    cfg = _group_config(tmp_path)
+    observed_locks: list[bool] = []
+
+    def observe_callback(_operation_id: str, _key: str) -> None:
+        context = get_context("fork")
+        receiving, sending = context.Pipe(duplex=False)
+        process = context.Process(target=_probe_group_lock, args=(cfg.shared_root, "experiment", sending))
+        process.start()
+        sending.close()
+        assert receiving.poll(5)
+        observed_locks.append(receiving.recv())
+        process.join(5)
+        assert process.exitcode == 0
+
+    submission_runtime.submit_specs(
+        cfg,
+        [{"task_id": "child", "command": ["echo", "child"], "depends_on_task_ids": []}],
+        group_name="experiment",
+        on_prepared=observe_callback,
+    )
+
+    assert observed_locks == [True]
+
+
+def test_dependency_rejection_precedes_callback(tmp_path: Path) -> None:
+    cfg = _group_config(tmp_path)
+    callback_calls = 0
+
+    def observe_callback(_operation_id: str, _key: str) -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+
+    with pytest.raises(ValueError, match="dependency"):
+        submission_runtime.submit_specs(
+            cfg,
+            [
+                {
+                    "task_id": "child",
+                    "command": ["echo", "child"],
+                    "depends_on_task_ids": ["missing-parent"],
+                }
+            ],
+            group_name="experiment",
+            on_prepared=observe_callback,
+        )
+
+    assert callback_calls == 0
+
+
+def test_dependencies_are_rechecked_after_callback_mutation(tmp_path: Path) -> None:
+    cfg = _group_config(tmp_path)
+    parent = submit(cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path)
+    callback_calls = 0
+
+    def remove_parent(_operation_id: str, _key: str) -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+        cancel(cfg, parent.task_id)
+        clean(cfg, task_id=parent.task_id)
+
+    with pytest.raises(ValueError, match="dependency"):
+        submission_runtime.submit_specs(
+            cfg,
+            [
+                {
+                    "task_id": "child",
+                    "command": ["echo", "child"],
+                    "depends_on_task_ids": [parent.task_id],
+                }
+            ],
+            group_name="experiment",
+            on_prepared=remove_parent,
+        )
+
+    assert callback_calls == 1
+    with pytest.raises(FileNotFoundError):
+        load_task(cfg, "child")
+
+
 def test_dependency_edits_require_activated_dependency_capability(tmp_path: Path) -> None:
     cfg = _group_config(tmp_path)
     parent = submit(cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path)
@@ -160,6 +242,10 @@ def test_legacy_dependency_submission_replay_is_rejected(tmp_path: Path) -> None
     operation_path = cfg.shared_root / "operations" / "submissions" / f"{first.operation_id}.json"
     operation = read_json(operation_path)
     del operation["submission"]["resolved_context"]["task_specs"][0]["depends_on_task_ids"]
+    context = operation["submission"]["resolved_context"]
+    operation["submission"]["resolved_context_digest"] = hashlib.sha256(
+        json.dumps(context, sort_keys=True).encode()
+    ).hexdigest()
     atomic_replace(operation_path, operation)
 
     with pytest.raises(RuntimeError, match="predates the canonical task-dependencies-v1 protocol"):

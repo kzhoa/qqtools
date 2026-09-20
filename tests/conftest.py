@@ -277,7 +277,7 @@ def qexp_healthy_clock(monkeypatch):
         "lease",
         "scheduler",
         "runtime.attempt_recovery",
-        "runtime.submission",
+        "runtime.submission_plan",
         "runtime.availability.transitions",
         "legacy_agent",
         "doctor",

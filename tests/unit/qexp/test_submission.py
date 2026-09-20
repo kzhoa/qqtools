@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from qqtools.plugins.qexp.runtime.submission import _resolved_specs
+from qqtools.plugins.qexp.runtime.submission_plan import _resolved_specs
 
 
 def test_resolved_specs_rejects_string_command() -> None:

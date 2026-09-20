@@ -9,7 +9,7 @@ from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.lease import ClockCapability, ClockObservation, LeasePolicy, clock_capability
-from qqtools.plugins.qexp.runtime import submission as submission_runtime
+from qqtools.plugins.qexp.runtime import submission_plan
 from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
@@ -160,7 +160,7 @@ def test_submission_persists_raw_creator_observation_for_timed_offer(tmp_path: P
     create_group(cfg, "g")
     observation = _observation("chrony", -0.2, 0.2)
     monkeypatch.setattr(
-        submission_runtime,
+        submission_plan,
         "clock_capability",
         lambda _cfg: ClockCapability("healthy", "healthy", observation, ("chrony",)),
     )
