@@ -804,6 +804,16 @@ def assign_window_to_ranks(
         raise ValueError(f"batch_size must be positive, got {batch_size}")
 
     costs = _normalize_sample_costs(sample_costs)
+    return _assign_window_to_ranks_validated(window_indices, costs, world_size, batch_size)
+
+
+def _assign_window_to_ranks_validated(
+    window_indices: np.ndarray | list[int],
+    costs: np.ndarray,
+    world_size: int,
+    batch_size: int,
+) -> list[list[int]]:
+    """Assign a window with validated costs and positive world/batch sizes."""
     window = np.asarray(window_indices, dtype=np.int64)
     if window.ndim != 1:
         raise ValueError(f"window_indices must be 1D, got shape {window.shape}")

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- fix: validate balanced sampler costs once per window-based plan instead of once per window,
+  preserving window index checks and rejecting invalid shared costs on epoch rebuilds.
+
 ## v1.3.19
 
 - feat: separate qexp active responsibility from indexed Task history, with resumable local and

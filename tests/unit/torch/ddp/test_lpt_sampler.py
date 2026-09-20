@@ -18,7 +18,7 @@ def test_lpt_builds_once_and_epoch_changes_only_step_and_rank_traversal(monkeypa
         raise AssertionError("LPT batches must not be repartitioned or globally reordered")
 
     monkeypatch.setattr(qbs, "_plan_rank_batches", counted_build)
-    monkeypatch.setattr(qbs, "assign_window_to_ranks", unexpected_assignment)
+    monkeypatch.setattr(qbs, "_assign_window_to_ranks_validated", unexpected_assignment)
     monkeypatch.setattr(qbs, "compute_global_even_sort_order", unexpected_assignment)
     costs = np.arange(128, dtype=float)
     samplers = [

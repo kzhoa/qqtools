@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+import qqtools.data.qbalance as qb
 from qqtools.data import assign_window_to_ranks, compute_global_even_sort_order, validate_balance_strategy
 
 
@@ -104,8 +105,31 @@ def test_assign_window_to_ranks_uses_locality_for_equal_loads():
         {"window_indices": [[0]], "sample_costs": [1.0], "world_size": 1, "batch_size": 1},
         {"window_indices": [1], "sample_costs": [1.0], "world_size": 1, "batch_size": 1},
         {"window_indices": [0], "sample_costs": [np.nan], "world_size": 1, "batch_size": 1},
+        {"window_indices": [0], "sample_costs": [np.inf], "world_size": 1, "batch_size": 1},
+        {"window_indices": [0], "sample_costs": [-1.0], "world_size": 1, "batch_size": 1},
+        {"window_indices": [-1], "sample_costs": [1.0], "world_size": 1, "batch_size": 1},
     ],
 )
 def test_assign_window_to_ranks_rejects_invalid_inputs(kwargs):
     with pytest.raises(ValueError):
         assign_window_to_ranks(**kwargs)
+
+
+@pytest.mark.parametrize("window", [[[0]], [[]], [-1], [4]])
+def test_validated_assignment_still_rejects_invalid_windows(window):
+    with pytest.raises(ValueError, match="window_indices"):
+        qb._assign_window_to_ranks_validated(window, np.ones(4), 2, 2)
+
+
+@pytest.mark.parametrize("window", [[], [0], [3, 0, 1], [0, 1, 2, 3], [0, 0, 1, 1]])
+def test_validated_assignment_preserves_results_without_cost_validation(monkeypatch, window):
+    costs = np.asarray([9.0, 8.0, 7.0, 6.0])
+    expected = assign_window_to_ranks(window, costs, 2, 2)
+
+    def unexpected_validation(*args, **kwargs):
+        pytest.fail("Internal assignment must not validate sample costs")
+
+    monkeypatch.setattr(qb, "_normalize_sample_costs", unexpected_validation)
+    monkeypatch.setattr(qb.np, "isfinite", unexpected_validation)
+
+    assert qb._assign_window_to_ranks_validated(window, costs, 2, 2) == expected

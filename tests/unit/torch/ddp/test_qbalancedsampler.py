@@ -32,6 +32,52 @@ def _rank_plans(sample_costs, **kwargs):
     ]
 
 
+@pytest.mark.parametrize("total", [16, 160])
+@pytest.mark.parametrize("should_shuffle", [False, True])
+def test_window_plan_validates_full_costs_once(monkeypatch, total, should_shuffle):
+    _mock_dist(monkeypatch)
+    costs = np.arange(total, dtype=np.float64)
+    checked_sizes = []
+    original_isfinite = np.isfinite
+
+    def counted_isfinite(values, *args, **kwargs):
+        checked_sizes.append(np.size(values))
+        return original_isfinite(values, *args, **kwargs)
+
+    monkeypatch.setattr(np, "isfinite", counted_isfinite)
+    with pytest.warns(FutureWarning):
+        sampler = BalancedDistributedSampler(
+            costs, batch_size=4, rank=0, world_size=4, shuffle=should_shuffle, strategy="v3"
+        )
+    # One constructor validation and one plan validation, regardless of window count.
+    assert checked_sizes == [total, total]
+    checked_sizes.clear()
+    sampler._plan_cache._build_rank_local_plan(1)
+    assert checked_sizes == [total]
+
+
+@pytest.mark.parametrize("sampler_type", [BalancedDistributedSampler, BalancedBatchSampler])
+@pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])
+@pytest.mark.parametrize("invalid_cost, message", [(np.nan, "finite"), (-1.0, "non-negative")])
+def test_epoch_rebuild_rejects_mutated_shared_costs(monkeypatch, sampler_type, strategy, invalid_cost, message):
+    _mock_dist(monkeypatch)
+    costs = np.arange(32, dtype=np.float64)
+    with pytest.warns(FutureWarning):
+        sampler = sampler_type(costs, batch_size=2, rank=0, world_size=2, shuffle=True, strategy=strategy)
+    sampler.set_epoch(1)
+    previous_plan = list(sampler)
+    costs[-1] = invalid_cost
+
+    with pytest.raises(ValueError, match=message):
+        sampler.set_epoch(2)
+
+    assert list(sampler) == previous_plan
+    assert sampler._plan_cache.epoch == 1
+    costs[-1] = 31.0
+    sampler.set_epoch(2)
+    assert sampler._plan_cache.epoch == 2
+
+
 @pytest.mark.parametrize("strategy", ["v1", "v2", "v3", "lpt"])
 def test_sampler_covers_each_sample_once_across_ranks_without_padding(
     monkeypatch,

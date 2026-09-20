@@ -10,9 +10,9 @@ from torch.utils.data import BatchSampler, Sampler
 
 from qqtools.data.qbalance import (
     _LPT_STRATEGIES,
+    _assign_window_to_ranks_validated,
     _normalize_lpt_strategy,
     _plan_rank_batches,
-    assign_window_to_ranks,
     compute_global_even_sort_order,
     validate_balance_strategy,
 )
@@ -162,10 +162,13 @@ class _BalancedPlanCache:
                 seed=self.seed + epoch,
                 strategy=self.strategy,
             )
-        elif self.sample_order is None:
-            global_order = np.arange(total, dtype=np.int64)
         else:
-            global_order = self.sample_order.copy()
+            # Shuffled plans validate costs in compute_global_even_sort_order above.
+            _normalize_sample_costs(self.sample_costs)
+            if self.sample_order is None:
+                global_order = np.arange(total, dtype=np.int64)
+            else:
+                global_order = self.sample_order.copy()
 
         if global_chunk_size > 0:
             remainder = total % global_chunk_size
@@ -184,9 +187,9 @@ class _BalancedPlanCache:
         rank_chunks: list[np.ndarray] = []
         for start in range(0, int(global_order.shape[0]), global_chunk_size):
             window = global_order[start : start + global_chunk_size]
-            assignment = assign_window_to_ranks(
+            assignment = _assign_window_to_ranks_validated(
                 window_indices=window,
-                sample_costs=self.sample_costs,
+                costs=self.sample_costs,
                 world_size=self.world_size,
                 batch_size=self.batch_size,
             )
