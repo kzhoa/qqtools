@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v1.3.20
+
+- feat: launch qexp runners directly with the agent environment and project working directory,
+  using tmux only as an optional post-handoff log observer; add a configurable, bounded launch
+  handoff timeout with fenced recovery and capacity retention for uncertain starts.
+- fix: derive finite qexp JSON and human output from one canonical bounded result, preventing
+  presentation-only history reads and keeping summaries consistent when observations are absent.
 - fix: validate balanced sampler costs once per window-based plan instead of once per window,
   preserving window index checks and rejecting invalid shared costs on epoch rebuilds.
 
