@@ -72,6 +72,8 @@ def local_paths(root: Path) -> dict[str, Path]:
         "events": root / "events",
         "clock_health": root / "agent" / "clock-health.json",
         "lease_policy_cache": root / "agent" / "lease-policy.json",
+        "gpu_policy_observation": root / "agent" / "gpu-policy-observation.json",
+        "gpu_policy_warnings": root / "agent" / "gpu-policy-warnings.json",
         "termination_decisions": root / "termination-decisions",
         "maintenance_cursors": root / "maintenance-cursors",
         "locks": root / "locks",
@@ -152,6 +154,9 @@ def machine_runtime_paths(root: Path) -> dict[str, Path]:
         "projects": root / "projects",
         "upgrades": root / "upgrades",
         "diagnostics": root / "diagnostics",
+        "gpu_policy": root / "gpu-policy.json",
+        "gpu_policy_observation": root / "agent" / "gpu-policy-observation.json",
+        "gpu_policy_warnings": root / "agent" / "gpu-policy-warnings.json",
     }
 
 

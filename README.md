@@ -142,6 +142,26 @@ qexp agent status
 qexp agent stop
 ```
 
+The MachineRuntime also owns one persistent GPU allowlist shared by every registered project.
+Change it while the agent is running; no restart is required:
+
+```bash
+qexp agent gpus show
+qexp agent gpus set --visible 0,2,3
+qexp agent gpus set --none
+qexp agent gpus reset
+```
+
+`set --none` intentionally disables new GPU work, while CPU-lane work remains independent.
+`reset` returns to the agent's inherited nonempty `QEXP_VISIBLE_GPUS` value or automatic discovery.
+Removing a GPU drains existing qexp reservations there instead of terminating their Attempts.
+Configured IDs missing from local discovery stay configured but are not admitted, and status/show
+report an actionable warning. `unreserved` means only “not reserved by qexp”; qexp does not detect
+external CUDA processes or physical GPU utilization.
+
+Upgrade qexp and restart each machine's global agent before relying on this policy. Downgrading to
+an older policy-unaware agent can expose GPUs again because the older agent ignores the policy file.
+
 `qexp init` automatically registers a new project with the machine agent. `qexp agent add-project`
 is an operations command for restoring a removed or lost current-generation registration; it is not
 part of normal setup. Older per-project-agent metadata must use `qexp agent migrate-project`.

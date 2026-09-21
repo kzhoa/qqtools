@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from .config_types import RootConfig
 from .layout import machine_state_path
@@ -29,6 +29,7 @@ def publish_machine_snapshots(
     idle_since_at: str | None,
     stop_reason: str | None = None,
     reservation_summaries: Iterable[dict[str, object]] | None = None,
+    gpu_policy: Mapping[str, object] | None = None,
 ) -> None:
     """Publish machine-owned advisory state without affecting scheduling authority."""
     with exclusive(local_paths(cfg.runtime_root)["locks"] / "machine-snapshot.lock"):
@@ -46,6 +47,7 @@ def publish_machine_snapshots(
             idle_since_at=idle_since_at,
             stop_reason=stop_reason,
             reservation_summaries=reservation_summaries,
+            gpu_policy=gpu_policy,
         )
 
 
@@ -64,6 +66,7 @@ def _write_machine_snapshots(
     idle_since_at: str | None,
     stop_reason: str | None = None,
     reservation_summaries: Iterable[dict[str, object]] | None = None,
+    gpu_policy: Mapping[str, object] | None = None,
 ) -> None:
     """Write snapshots while the local machine-snapshot lock is held."""
     now = utc_now()
@@ -71,6 +74,7 @@ def _write_machine_snapshots(
     visible = sorted(set(visible_gpu_ids))
     reserved = sorted(set(reserved_gpu_ids))
     reservations = list(reservation_summaries or [])
+    policy = dict(gpu_policy or {})
     agent = {
         "agent": {
             "machine_name": cfg.machine_name,
@@ -89,6 +93,8 @@ def _write_machine_snapshots(
             "idle_since_at": idle_since_at,
             "active_attempt_ids": attempts,
             "stop_reason": stop_reason,
+            "gpu_policy": policy,
+            "warnings": list(policy.get("warnings", [])),
         }
     }
     gpu = {
@@ -99,6 +105,16 @@ def _write_machine_snapshots(
             "reserved_gpu_ids": reserved,
             "free_gpu_ids": [gpu_id for gpu_id in visible if gpu_id not in reserved],
             "active_attempt_ids": attempts,
+            "gpu_policy": policy,
+            "policy_revision": policy.get("revision"),
+            "policy_mode": policy.get("mode"),
+            "policy_source": policy.get("source"),
+            "configured_gpu_ids": policy.get("configured_gpu_ids"),
+            "discovered_gpu_ids": policy.get("discovered_gpu_ids"),
+            "discovery_status": policy.get("discovery_status"),
+            "visible_status": policy.get("visible_status"),
+            "draining_gpu_ids": policy.get("draining_gpu_ids", []),
+            "warnings": list(policy.get("warnings", [])),
         }
     }
     summary = {
@@ -131,6 +147,8 @@ def _write_machine_snapshots(
                 }
                 for item in reservations
             ],
+            "gpu_policy": policy,
+            "warnings": list(policy.get("warnings", [])),
         }
     }
     replace_snapshot_if_changed(machine_state_path(cfg, "agent.json"), agent)
@@ -150,6 +168,7 @@ def publish_machine_stop_snapshot(
     started_at: str,
     idle_since_at: str | None,
     stop_reason: str,
+    gpu_policy: Mapping[str, object] | None = None,
 ) -> bool:
     """Publish a stop snapshot only when this agent still owns the machine view."""
     with exclusive(local_paths(cfg.runtime_root)["locks"] / "machine-snapshot.lock"):
@@ -174,5 +193,6 @@ def publish_machine_stop_snapshot(
             started_at=started_at,
             idle_since_at=idle_since_at,
             stop_reason=stop_reason,
+            gpu_policy=gpu_policy,
         )
     return True

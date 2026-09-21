@@ -12,8 +12,16 @@ from typing import Any
 from ..authority import AuthoritySupervisor
 from ..authority import AuthoritySupervisor as _AuthoritySupervisor
 from ..config_types import RootConfig
+from ..gpu_policy import (
+    GpuDiscovery,
+    GpuPolicyView,
+    GpuReservationPolicy,
+    discover_gpu_inventory,
+    parse_environment_gpu_ids,
+    persist_gpu_policy_observation,
+    resolve_gpu_policy,
+)
 from ..lease import load_lease_policy
-from ..legacy_agent import _visible_gpus
 from ..runtime.authority_scan import EvidenceScan, is_path_present
 from ..runtime.paths import local_paths
 from ..runtime.records import utc_now
@@ -61,7 +69,7 @@ class _MachineControlPlane:
         self._instance_id = instance_id
         self._loop_interval = loop_interval
         self._started_at = started_at
-        self._visible_gpus = list(available_gpus) if available_gpus is not None else None
+        self._available_gpus = list(available_gpus) if available_gpus is not None else None
         self._scheduler_wakeup = scheduler_wakeup
         self._registry_revision: int | None = None
         self._stop_event = threading.Event()
@@ -90,7 +98,6 @@ class _MachineControlPlane:
 
     def start(self) -> None:
         """Publish initial liveness before starting the control loops."""
-        self._refresh_visible_gpus()
         self._publish_heartbeat()
         self._authority_thread.start()
         self._heartbeat_thread.start()
@@ -409,15 +416,29 @@ class _MachineControlPlane:
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
             return None
 
-    def _refresh_visible_gpus(self) -> None:
-        if self._visible_gpus is not None:
-            return
-        try:
-            bindings = self._supervised_bindings()
-            if bindings:
-                self._visible_gpus = _visible_gpus(_helpers._binding_config(self._runtime, bindings[0]))
-        except (OSError, RuntimeError, ValueError):
-            return
+    def _gpu_policy_view(self, reserved_gpu_ids: set[int]) -> GpuPolicyView:
+        """Resolve current policy without holding reservation or shared-project locks."""
+        if self._available_gpus is None:
+            discovery = discover_gpu_inventory()
+        else:
+            injected = tuple(sorted(set(self._available_gpus)))
+            discovery = GpuDiscovery(injected, "empty" if not injected else "available", "injected")
+        environment_gpu_ids, environment_status = parse_environment_gpu_ids()
+        reservation_policy = GpuReservationPolicy(discovery, environment_gpu_ids, environment_status)
+        view = resolve_gpu_policy(
+            self._runtime.root,
+            discovery=discovery,
+            environment_gpu_ids=environment_gpu_ids,
+            environment_status=environment_status,
+        ).with_reservations(reserved_gpu_ids)
+        persist_gpu_policy_observation(
+            self._runtime,
+            instance_id=self._instance_id,
+            pid=_read_pid(self._runtime),
+            view=view,
+            policy=reservation_policy,
+        )
+        return view
 
     def _publish_heartbeat(self) -> None:
         diagnostics = RuntimeDiagnostics()
@@ -440,7 +461,6 @@ class _MachineControlPlane:
             self._publish_authority_diagnostics()
 
     def _publish_project_heartbeats(self) -> str:
-        self._refresh_visible_gpus()
         try:
             bindings = self._supervised_bindings()
         except (OSError, RuntimeError, ValueError):
@@ -471,16 +491,24 @@ class _MachineControlPlane:
             # Persisted capacity records can have invalid container/field shapes.
             # Retain them and retry next cycle; do not advertise empty capacity.
             return "capacity_unavailable"
+        reserved_gpu_ids = {
+            gpu_id for reservation in reservations for gpu_id in reservation.get("gpu_ids", []) if type(gpu_id) is int
+        }
+        try:
+            gpu_policy = self._gpu_policy_view(reserved_gpu_ids)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+            return "gpu_policy_unavailable"
         try:
             _publish_project_snapshots(
                 readable,
                 instance_id=self._instance_id,
                 pid=_read_pid(self._runtime),
-                visible=self._visible_gpus or [],
+                visible=list(gpu_policy.visible_gpu_ids or ()),
                 reservations=reservations,
                 heartbeat_interval_seconds=self._loop_interval,
                 started_at=self._started_at,
                 write_guard=write_guard,
+                gpu_policy=gpu_policy,
             )
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
             return "publication_unavailable"

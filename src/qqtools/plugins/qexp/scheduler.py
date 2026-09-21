@@ -14,6 +14,7 @@ from .config_types import RootConfig
 from .domain.policies import group_allows, task_machine_matches
 from .events import write_diagnostic_event, write_event
 from .executor import Executor, append_launch_failure_diagnostic, launch_failure_handle, launch_failure_reason
+from .gpu_policy import GpuReservationPolicy
 from .infrastructure.clock import clock_evidence as _clock_evidence
 from .infrastructure.process import terminate_process_group as _terminate_process_group
 from .lease import (
@@ -172,6 +173,7 @@ def _claim(
     project_id: str | None,
     admission_role: str | None,
     borrow_admission_grant: _BorrowAdmissionGrant | None,
+    gpu_policy: GpuReservationPolicy | None,
 ) -> AttemptRecord | None:
     task = load_task(cfg, task_id)
     if task.placement_policy["home_machine"] != cfg.machine_name and not _eligible(cfg, task):
@@ -227,6 +229,7 @@ def _claim(
                 fencing_token=token,
                 shared_root=str(cfg.shared_root),
                 admitted_as_borrow=worker["scheduling_role"] == "borrow",
+                gpu_policy=gpu_policy,
             )
         else:
             reservation = reserve(
@@ -238,6 +241,7 @@ def _claim(
                 project_id=project_id,
                 shared_root=str(cfg.shared_root),
                 machine_name=cfg.machine_name,
+                gpu_policy=gpu_policy,
             )
         attempt = AttemptRecord.claimed(
             task,
@@ -403,6 +407,7 @@ def claim_task(
     project_id: str | None = None,
     admission_role: str | None = None,
     borrow_admission_grant: _BorrowAdmissionGrant | None = None,
+    gpu_policy: GpuReservationPolicy | None = None,
 ) -> AttemptRecord | None:
     task = load_task(cfg, task_id)
     if task.placement_policy["home_machine"] != cfg.machine_name and not _eligible(cfg, task):
@@ -428,6 +433,7 @@ def claim_task(
         project_id=project_id,
         admission_role=admission_role,
         borrow_admission_grant=borrow_admission_grant,
+        gpu_policy=gpu_policy,
     )
 
 
@@ -817,6 +823,7 @@ def run_dispatch_cycle(
     batch_sizer: AdaptiveBatchSizer | None = None,
     inspected_ready: set[tuple[str, str, str]] | None = None,
     lane: str | None = None,
+    gpu_policy: GpuReservationPolicy | None = None,
 ) -> list[str]:
     with diagnostic_span("run_dispatch_cycle"):
         return _run_dispatch_cycle(
@@ -840,6 +847,7 @@ def run_dispatch_cycle(
             batch_sizer=batch_sizer,
             inspected_ready=inspected_ready,
             lane=lane,
+            gpu_policy=gpu_policy,
         )
 
 
@@ -865,6 +873,7 @@ def _run_dispatch_cycle(
     batch_sizer: AdaptiveBatchSizer | None = None,
     inspected_ready: set[tuple[str, str, str]] | None = None,
     lane: str | None = None,
+    gpu_policy: GpuReservationPolicy | None = None,
 ) -> list[str]:
     if lane not in {None, "cpu", "gpu"}:
         raise ValueError("lane must be cpu, gpu, or None.")
@@ -1035,6 +1044,7 @@ def _run_dispatch_cycle(
                                 project_id=project_id,
                                 admission_role=admission_role,
                                 borrow_admission_grant=borrow_admission_grant,
+                                gpu_policy=gpu_policy,
                             )
                 else:
                     if before_claim is not None and not before_claim():
@@ -1052,6 +1062,7 @@ def _run_dispatch_cycle(
                             project_id=project_id,
                             admission_role=admission_role,
                             borrow_admission_grant=borrow_admission_grant,
+                            gpu_policy=gpu_policy,
                         )
             except ValueError:
                 if task.spec.is_cpu_only:
@@ -1169,6 +1180,7 @@ def _run_dispatch_cycle(
                         project_id=project_id,
                         admission_role=admission_role,
                         borrow_admission_grant=borrow_admission_grant,
+                        gpu_policy=gpu_policy,
                     )
             else:
                 if before_claim is not None and not before_claim():
@@ -1185,6 +1197,7 @@ def _run_dispatch_cycle(
                     project_id=project_id,
                     admission_role=admission_role,
                     borrow_admission_grant=borrow_admission_grant,
+                    gpu_policy=gpu_policy,
                 )
         except ValueError:
             if task.spec.is_cpu_only:

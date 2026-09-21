@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
 from typing import Any
 
 from .config_types import RootConfig
+from .gpu_policy import discover_gpu_inventory, parse_gpu_id_list
 from .layout import runtime_pid_path
 from .lease import clock_capability
 
@@ -41,21 +40,19 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _visible_gpus(cfg: RootConfig) -> list[int]:
+    """Return the legacy visible helper result for compatibility callers.
+
+    Machine dispatch uses :func:`discover_gpu_inventory` directly so a raw
+    inventory observation is never short-circuited by the environment policy.
+    """
     value = os.environ.get("QEXP_VISIBLE_GPUS", "")
     if value:
-        return [int(item) for item in value.split(",") if item.strip()]
-    if shutil.which("nvidia-smi"):
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], check=False, capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            return [int(item.strip()) for item in result.stdout.splitlines() if item.strip()]
-    try:
-        import torch
-
-        return list(range(torch.cuda.device_count()))
-    except Exception:
-        return []
+        try:
+            return list(parse_gpu_id_list(value))
+        except ValueError:
+            return []
+    discovery = discover_gpu_inventory()
+    return list(discovery.gpu_ids or ())
 
 
 def run_agent_loop(*_args: object, **_kwargs: object) -> None:

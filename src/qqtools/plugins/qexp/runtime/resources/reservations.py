@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from ...gpu_policy import GpuReservationPolicy, validate_gpu_reservation
 from ..locks import exclusive
 from ..paths import local_paths
 from ..records import new_id, utc_now
@@ -143,8 +144,14 @@ def _reserve_locked(
     worker_state_epoch: int | None,
     admitted_as_borrow: bool,
     enforce_gpu_limit: bool,
+    gpu_policy: GpuReservationPolicy | None = None,
 ) -> dict[str, Any]:
     _expire_provisionals(paths)
+    if gpu_policy is not None:
+        # The caller obtained discovery and inherited-environment observations
+        # before taking this lock.  Validation only rereads the local policy;
+        # it never probes hardware or touches shared project truth here.
+        validate_gpu_reservation(paths["locks"].parent, gpu_ids, gpu_policy)
     active = _reservation_values(paths["active"])
     provisional = [value for value in _reservation_values(paths["provisional"]) if not _is_expired(value)]
     if {gpu for value in active + provisional for gpu in value["reservation"]["gpu_ids"]}.intersection(gpu_ids):
@@ -209,6 +216,7 @@ def reserve(
     group_worker_set_epoch: int | None = None,
     worker_state_epoch: int | None = None,
     admitted_as_borrow: bool = False,
+    gpu_policy: GpuReservationPolicy | None = None,
 ) -> dict[str, Any]:
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
@@ -228,6 +236,7 @@ def reserve(
             worker_state_epoch=worker_state_epoch,
             admitted_as_borrow=admitted_as_borrow,
             enforce_gpu_limit=False,
+            gpu_policy=gpu_policy,
         )
 
 
@@ -247,6 +256,7 @@ def reserve_admitted(
     fencing_token: int | None = None,
     shared_root: str | None = None,
     admitted_as_borrow: bool = True,
+    gpu_policy: GpuReservationPolicy | None = None,
 ) -> dict[str, Any]:
     """Atomically reserve GPUs after Group/Task admission authorization."""
     paths = local_paths(runtime_root)
@@ -267,6 +277,7 @@ def reserve_admitted(
             worker_state_epoch=worker_state_epoch,
             admitted_as_borrow=admitted_as_borrow,
             enforce_gpu_limit=True,
+            gpu_policy=gpu_policy,
         )
 
 

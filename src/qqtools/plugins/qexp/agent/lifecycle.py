@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -15,6 +17,7 @@ from typing import Any, Callable, ContextManager
 from ..authority import AuthoritySupervisor
 from ..config_types import RootConfig
 from ..executor import Executor
+from ..gpu_policy import show_gpu_policy
 from ..layout import load_machine_record, load_root_config, machine_state_path, runtime_pid_path
 from ..legacy_agent import _visible_gpus, get_agent_status
 from ..machine_config import is_legacy_agent_project, load_machine_policy, save_machine_config
@@ -149,6 +152,25 @@ def get_machine_agent_status(
                 f"The example logical name {replacement_name!r} is illustrative; verify its availability before use."
             )
         projects.append(project)
+    try:
+        gpu_policy = show_gpu_policy(machine_runtime)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        gpu_policy = {
+            "mode": "auto",
+            "source": "unavailable",
+            "revision": 0,
+            "configured_gpu_ids": None,
+            "discovered_gpu_ids": None,
+            "visible_gpu_ids": None,
+            "undiscovered_configured_gpu_ids": None,
+            "reserved_gpu_ids": [],
+            "unreserved_gpu_ids": None,
+            "draining_gpu_ids": [],
+            "discovery_status": "unavailable",
+            "visible_status": "unavailable",
+            "warnings": [{"reason": "gpu_policy_unavailable", "message": "GPU policy status is unavailable."}],
+            "agent_running": running,
+        }
     return {
         "machine_runtime_root": str(machine_runtime.root),
         "agent_state": "active" if running else "stopped",
@@ -158,6 +180,8 @@ def get_machine_agent_status(
         "registry_revision": revision,
         "projects": projects,
         "upgrade": upgrade,
+        "gpu_policy": gpu_policy,
+        "warnings": list(gpu_policy.get("warnings", [])),
     }
 
 
@@ -192,6 +216,7 @@ def run_machine_agent_loop(
     observation_worker: MachineObservationWorker | None = None
     submission_control_worker: MachineSubmissionControlWorker | None = None
     recovery_enrollment = RecoveryEnrollment(machine_runtime)
+    emitted_gpu_warning_fingerprint: str | None = None
 
     def request_stop(_signum: int, _frame: object) -> None:
         nonlocal stop, stop_reason
@@ -279,6 +304,25 @@ def run_machine_agent_loop(
                     # A transient shared-root failure must not stop supervision of other projects.
                     pass
                 try:
+                    gpu_status = show_gpu_policy(machine_runtime)
+                    gpu_warnings = gpu_status.get("warnings", [])
+                    if gpu_warnings:
+                        fingerprint = json.dumps(
+                            {
+                                "revision": gpu_status.get("revision"),
+                                "discovered": gpu_status.get("discovered_gpu_ids"),
+                                "warnings": gpu_warnings,
+                            },
+                            sort_keys=True,
+                        )
+                        if fingerprint != emitted_gpu_warning_fingerprint:
+                            message = gpu_warnings[0].get("message") if isinstance(gpu_warnings[0], dict) else None
+                            if isinstance(message, str) and message:
+                                print(f"Warning: {message}", file=sys.stderr, flush=True)
+                            emitted_gpu_warning_fingerprint = fingerprint
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    pass
+                try:
                     if has_consumed_binding:
                         _publish_process_status(
                             machine_runtime,
@@ -328,6 +372,10 @@ def run_machine_agent_loop(
                 )
                 if is_active_identity:
                     try:
+                        gpu_policy_snapshot = show_gpu_policy(machine_runtime)
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                        gpu_policy_snapshot = None
+                    try:
                         reservations = list(reservation_snapshot(machine_runtime.root).reservations)
                         reserved = sorted({gpu_id for item in reservations for gpu_id in item.get("gpu_ids", [])})
                     except (KeyError, OSError, ValueError):
@@ -346,12 +394,17 @@ def run_machine_agent_loop(
                                         instance_id=instance_id,
                                         pid=None,
                                         agent_mode=load_machine_policy(cfg).agent_mode,
-                                        visible_gpu_ids=_visible_gpus(cfg),
+                                        visible_gpu_ids=(
+                                            gpu_policy_snapshot.get("visible_gpu_ids") or []
+                                            if gpu_policy_snapshot is not None
+                                            else _visible_gpus(cfg)
+                                        ),
                                         reserved_gpu_ids=reserved,
                                         heartbeat_interval_seconds=loop_interval,
                                         started_at=started_at,
                                         idle_since_at=None if reserved else utc_now(),
                                         stop_reason=stop_reason or "stopped",
+                                        gpu_policy=gpu_policy_snapshot,
                                     )
                         except (OSError, RuntimeError, ValueError):
                             continue

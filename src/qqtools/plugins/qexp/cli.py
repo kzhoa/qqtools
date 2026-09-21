@@ -44,6 +44,7 @@ from .commands import task as task_commands
 from .config_types import RootConfig
 from .doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
 from .formatter import CliOutput, OutputKind, render
+from .gpu_policy import parse_gpu_id_list, reset_gpu_policy, set_gpu_policy, show_gpu_policy
 from .launch_policy import (
     set_launch_handoff_policy,
     show_launch_handoff_policy,
@@ -528,6 +529,19 @@ def build_parser() -> argparse.ArgumentParser:
     cpu_lane_set = cpu_lane_sub.add_parser("set")
     _add_output_format(cpu_lane_set)
     cpu_lane_set.add_argument("--capacity", type=int, required=True)
+    gpus = agent_sub.add_parser("gpus", help="Inspect or change the machine GPU admission policy.")
+    gpus_sub = gpus.add_subparsers(dest="gpu_action", required=True)
+    gpu_show = gpus_sub.add_parser("show")
+    _add_output_format(gpu_show)
+    gpu_set = gpus_sub.add_parser("set")
+    _add_output_format(gpu_set)
+    gpu_set_values = gpu_set.add_mutually_exclusive_group(required=True)
+    gpu_set_values.add_argument("--visible")
+    gpu_set_values.add_argument("--none", action="store_true")
+    gpu_set.add_argument("--expected-revision", type=int)
+    gpu_reset = gpus_sub.add_parser("reset")
+    _add_output_format(gpu_reset)
+    gpu_reset.add_argument("--expected-revision", type=int)
     agent_sub.choices["add-project"].add_argument(
         "--adopt-existing",
         action="store_true",
@@ -982,6 +996,22 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 policy = get_cpu_lane_policy(runtime.root)
             _emit(CliOutput(OutputKind.CPU_LANE, {"cpu_lane": policy.to_dict}), args.format)
+            return 0
+        if args.command == "agent" and args.agent_action == "gpus":
+            runtime = MachineRuntime(args.machine_runtime_root)
+            runtime.ensure_layout()
+            if args.gpu_action == "show":
+                result = show_gpu_policy(runtime)
+            elif args.gpu_action == "reset":
+                result = reset_gpu_policy(runtime, expected_revision=args.expected_revision)
+            else:
+                configured = () if args.none else parse_gpu_id_list(args.visible)
+                result = set_gpu_policy(
+                    runtime,
+                    configured,
+                    expected_revision=args.expected_revision,
+                )
+            _emit(CliOutput(OutputKind.GPU_POLICY, result), args.format)
             return 0
         cfg, execution_context = _resolve_cfg(args, require_binding=_requires_verified_binding(args))
 

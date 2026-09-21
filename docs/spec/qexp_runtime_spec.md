@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-20
+updated_at: 2026-09-21
 archived_at:
 ---
 
@@ -936,6 +936,41 @@ Rules:
 - active reservations remain until terminal process reconciliation or verified cleanup
 - releasing an already released reservation succeeds idempotently
 - `unreserved` means visible GPU capacity not reserved by qexp, not physically idle GPUs
+
+#### Machine GPU policy record and admission fence
+
+The MachineRuntime stores its permanent local GPU admission policy at:
+
+```text
+<machine-runtime-root>/gpu-policy.json
+```
+
+The version-1 record contains `schema_version`, monotonic `revision`, `mode` (`auto` or
+`explicit`), sorted unique nonnegative `configured_gpu_ids` for explicit mode, and `updated_at`.
+Reset persists an auto-mode revision with null configured IDs, so compare-and-swap revisions remain
+monotonic while environment or discovery fallback is active. Writes use atomic replacement while
+holding `gpu-reservations.lock`. Strict readers reject malformed or unsupported records and fail
+closed for new GPU admission; they never reinterpret a bad explicit policy as automatic discovery.
+
+The effective source precedence is persisted explicit policy, the agent process's nonempty
+`QEXP_VISIBLE_GPUS`, then raw local discovery. Raw discovery does not consult the environment
+allowlist. A configured source admits only its intersection with a successful discovery result.
+Invalid environment policy or unavailable discovery leaves GPU admission unavailable while CPU
+admission, supervision, terminal reconciliation, and repair observation continue.
+
+Candidate selection is advisory. Every provisional GPU reservation holds `gpu-reservations.lock`,
+rereads the current local policy, resolves it against the raw discovery and inherited-environment
+observation obtained before locking, and rejects requested IDs outside the resulting visible set
+before writing. Discovery, PyTorch import, and shared Project I/O never occur under this lock. The
+policy write and this reservation check are the linearization points: after a successful removal,
+no later-linearized reservation contains the removed GPU. Earlier provisional and active
+reservations remain valid and continue through their normal attachment, recovery, and release
+protocols.
+
+Machine GPU snapshots add policy revision, mode and source, configured and discovered IDs,
+discovery and visibility status, draining IDs, and bounded warnings. Existing
+`visible_gpu_ids`, `reserved_gpu_ids`, and `free_gpu_ids` retain their meanings. These snapshots
+remain advisory and cannot authorize admission.
 
 Terminal Task cleanup uses `operations/cleanup/<task-id>.json` as authoritative coordination
 truth. The Task record also carries `control.cleanup_operation_id` and
@@ -2415,6 +2450,20 @@ Before claiming new work, an agent:
 5. reconciles provisional and active reservations after authority work completes
 6. publishes fresh agent and GPU snapshots
 7. starts normal claim scanning
+
+Before step 7, every start, restart, and foreground run obtains raw GPU inventory and validates an
+explicit persisted or inherited allowlist. Configured IDs absent from a successful inventory do
+not prevent startup: only the discovered intersection is visible, and a durable
+`configured_gpu_ids_not_discovered` warning reports the revision, sets, and repair commands. A
+discovery failure reports validation unavailable without classifying every configured ID as
+missing. Warning emission is deduplicated by policy revision and discovery fingerprint, while
+status and `agent gpus show` retain the current warning until the mismatch clears.
+
+The policy record is a permanent additive MachineRuntime format. The supported upgrade path is a
+machine-by-machine package upgrade and global-agent restart; running Attempts retain their existing
+runner and reservation ownership. Downgrading to a policy-unaware agent is unsafe because that
+older agent ignores `gpu-policy.json` and may expose GPUs through its legacy environment/discovery
+path. No temporary compatibility reader or downgrade guard is provided.
 
 ## 18. Events and Derived Data
 

@@ -36,6 +36,7 @@ class OutputKind(str, Enum):
     AGENT_STATUS = "agent-status"
     AGENT_PROJECT_LIST = "agent-project-list"
     CPU_LANE = "cpu-lane"
+    GPU_POLICY = "gpu-policy"
     UPGRADE_REGISTRY_STATUS = "upgrade-registry-status"
     UPGRADE_ADVANCE = "upgrade-advance"
     UPGRADE_PROJECT = "upgrade-project"
@@ -382,17 +383,25 @@ def _render_group_machines(result: Mapping[str, Any], _presentation: Mapping[str
 def _machine_values(item: Mapping[str, Any], tasks: Sequence[Mapping[str, Any]] = ()) -> tuple[Any, ...]:
     machine = item.get("machine", {}).get("machine_name")
     state = item.get("state", {})
-    agent = state.get("agent", {})
+    agent_record = state.get("agent", {})
+    agent = agent_record.get("agent", agent_record)
+    gpu_record = state.get("gpu", {})
+    gpu = gpu_record.get("gpu", gpu_record)
+    policy = gpu.get("gpu_policy", {})
     task_summary = item.get("task_summary")
     if task_summary is None and tasks:
         task_summary = _task_summary(tasks, machine=machine)
     return (
         machine,
         state.get("freshness"),
-        state.get("gpu", {}).get("visible"),
-        state.get("gpu", {}).get("reserved"),
-        state.get("gpu", {}).get("unreserved"),
-        agent.get("agent_state"),
+        gpu.get("visible_gpu_ids", gpu.get("visible")),
+        gpu.get("reserved_gpu_ids", gpu.get("reserved")),
+        gpu.get("free_gpu_ids", gpu.get("unreserved")),
+        policy.get("source"),
+        policy.get("mode"),
+        policy.get("draining_gpu_ids"),
+        policy.get("warnings"),
+        agent.get("observed_state", agent.get("agent_state")),
         task_summary,
         item.get("reason"),
     )
@@ -407,6 +416,10 @@ def _render_machines(result: Any, _presentation: Mapping[str, object]) -> str:
             "GPU visible",
             "GPU reserved",
             "GPU unreserved",
+            "GPU source",
+            "GPU mode",
+            "GPU draining",
+            "GPU warnings",
             "Agent state",
             "Task summary",
             "Reason",
@@ -423,6 +436,10 @@ def _render_top(result: Mapping[str, Any], _presentation: Mapping[str, object]) 
             "GPU visible",
             "GPU reserved",
             "GPU unreserved",
+            "GPU source",
+            "GPU mode",
+            "GPU draining",
+            "GPU warnings",
             "Agent state",
             "Task summary",
             "Reason",
@@ -445,6 +462,8 @@ def _render_agent_operation(result: Mapping[str, Any], _presentation: Mapping[st
             ("Shared root", result.get("shared_root")),
             ("Enable command", result.get("enable_command")),
             ("Reason", result.get("reason")),
+            ("GPU policy", result.get("gpu_policy")),
+            ("Warnings", result.get("warnings", ())),
         ),
     )
 
@@ -460,6 +479,8 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
             ("PID", result["pid"]),
             ("Registry revision", result["registry_revision"]),
             ("Registered projects", len(projects)),
+            ("GPU policy", result.get("gpu_policy")),
+            ("Warnings", result.get("warnings", ())),
             ("Pending upgrades", pending),
             ("Waiting for first registration", result.get("waiting_for_first_registration")),
         ),
@@ -487,6 +508,29 @@ def _render_agent_project_list(result: Mapping[str, Any], _presentation: Mapping
 def _render_cpu_lane(result: CpuLanePayload, _presentation: Mapping[str, object]) -> str:
     lane = result["cpu_lane"]
     return _details((("Capacity", lane["capacity"]), ("Revision", lane["revision"])))
+
+
+def _render_gpu_policy(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _details(
+        (
+            ("Mode", result.get("mode")),
+            ("Source", result.get("source")),
+            ("Revision", result.get("revision")),
+            ("Previous revision", result.get("previous_revision")),
+            ("Current revision", result.get("current_revision")),
+            ("Configured GPUs", result.get("configured_gpu_ids")),
+            ("Discovered GPUs", result.get("discovered_gpu_ids")),
+            ("Visible GPUs", result.get("visible_gpu_ids")),
+            ("Reserved GPUs", result.get("reserved_gpu_ids")),
+            ("Unreserved GPUs", result.get("unreserved_gpu_ids")),
+            ("Draining GPUs", result.get("draining_gpu_ids")),
+            ("Entered draining GPUs", result.get("entered_draining_gpu_ids")),
+            ("Discovery status", result.get("discovery_status")),
+            ("Visible status", result.get("visible_status")),
+            ("Warnings", result.get("warnings")),
+            ("Agent running", result.get("agent_running")),
+        )
+    )
 
 
 def _upgrade_rows(projects: Sequence[Mapping[str, Any]], *, nested: bool) -> list[tuple[Any, ...]]:
@@ -877,6 +921,10 @@ def _validate_agent_status(result: Any) -> None:
         _validate_project(project, f"agent-status payload.projects[{index}]")
     upgrade = _required_mapping(value, "upgrade", "agent-status payload")
     _validate_upgrade_registry(upgrade)
+    if "gpu_policy" in value:
+        _validate_gpu_policy(value["gpu_policy"])
+    if "warnings" in value:
+        _sequence(value["warnings"], "agent-status payload.warnings")
 
 
 def _validate_cpu_lane(result: Any) -> None:
@@ -884,6 +932,49 @@ def _validate_cpu_lane(result: Any) -> None:
     lane = _required_mapping(value, "cpu_lane", "cpu-lane payload")
     _required_int(lane, "capacity", "cpu-lane payload.cpu_lane")
     _required_int(lane, "revision", "cpu-lane payload.cpu_lane")
+
+
+def _validate_gpu_policy(result: Any) -> None:
+    value = _mapping(result, "gpu-policy payload")
+    for key in (
+        "mode",
+        "source",
+        "revision",
+        "configured_gpu_ids",
+        "discovered_gpu_ids",
+        "visible_gpu_ids",
+        "undiscovered_configured_gpu_ids",
+        "reserved_gpu_ids",
+        "unreserved_gpu_ids",
+        "draining_gpu_ids",
+        "discovery_status",
+        "visible_status",
+        "warnings",
+        "agent_running",
+    ):
+        _required(value, key, "gpu-policy payload")
+    if value["mode"] not in {"auto", "explicit"}:
+        raise ValueError("gpu-policy payload.mode is invalid")
+    if value["source"] not in {"discovery", "environment", "persisted", "pending", "unavailable"}:
+        raise ValueError("gpu-policy payload.source is invalid")
+    if type(value["revision"]) is not int or value["revision"] < 0:
+        raise TypeError("gpu-policy payload.revision must be a nonnegative integer")
+    for key in (
+        "configured_gpu_ids",
+        "discovered_gpu_ids",
+        "visible_gpu_ids",
+        "undiscovered_configured_gpu_ids",
+        "reserved_gpu_ids",
+        "unreserved_gpu_ids",
+        "draining_gpu_ids",
+    ):
+        ids = value[key]
+        if ids is not None:
+            values = _sequence(ids, f"gpu-policy payload.{key}")
+            if any(type(item) is not int or item < 0 for item in values):
+                raise TypeError(f"gpu-policy payload.{key} must contain nonnegative integers")
+    _sequence(value["warnings"], "gpu-policy payload.warnings")
+    _required_bool(value, "agent_running", "gpu-policy payload")
 
 
 def _validate_upgrade_registry(result: Any) -> None:
@@ -1016,6 +1107,7 @@ _REGISTRY: dict[OutputKind, _OutputContract] = {
     OutputKind.AGENT_STATUS: _OutputContract(_validate_agent_status, _render_agent_status),
     OutputKind.AGENT_PROJECT_LIST: _OutputContract(_validate_agent_project_list, _render_agent_project_list),
     OutputKind.CPU_LANE: _OutputContract(_validate_cpu_lane, _render_cpu_lane),
+    OutputKind.GPU_POLICY: _OutputContract(_validate_gpu_policy, _render_gpu_policy),
     OutputKind.UPGRADE_REGISTRY_STATUS: _OutputContract(_validate_upgrade_registry, _render_upgrade_registry),
     OutputKind.UPGRADE_ADVANCE: _OutputContract(_validate_upgrade_advance, _render_upgrade_advance),
     OutputKind.UPGRADE_PROJECT: _OutputContract(_validate_upgrade_project, _render_upgrade_project),

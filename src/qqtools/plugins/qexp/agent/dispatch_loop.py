@@ -21,8 +21,15 @@ from ..executor import (
     LaunchHandoff,
     append_launch_failure_diagnostic,
 )
+from ..gpu_policy import (
+    GpuDiscovery,
+    GpuReservationPolicy,
+    parse_environment_gpu_ids,
+    persist_gpu_policy_observation,
+    resolve_gpu_policy,
+)
 from ..layout import load_machine_record, load_root_config, machine_state_path, runtime_pid_path
-from ..legacy_agent import _visible_gpus, get_agent_status
+from ..legacy_agent import get_agent_status
 from ..machine_config import is_legacy_agent_project, load_machine_policy, save_machine_config
 from ..machine_dispatch_plan import (
     MachineDispatchSnapshot,
@@ -647,6 +654,42 @@ def _build_borrow_admission_grant(
     return grant
 
 
+def _observe_gpu_policy(
+    runtime: MachineRuntime,
+    *,
+    available_gpus: list[int] | None,
+    instance_id: str,
+    reserved_gpu_ids: set[int] | frozenset[int] = frozenset(),
+) -> tuple[GpuReservationPolicy, Any]:
+    """Obtain one bounded raw observation and persist its effective policy view."""
+    if available_gpus is not None:
+        injected = tuple(sorted(set(available_gpus)))
+        discovery = GpuDiscovery(injected, "empty" if not injected else "available", "injected")
+    else:
+        from ..gpu_policy import discover_gpu_inventory
+
+        discovery = discover_gpu_inventory()
+    environment_gpu_ids, environment_status = parse_environment_gpu_ids()
+    reservation_policy = GpuReservationPolicy(discovery, environment_gpu_ids, environment_status)
+    policy_view = resolve_gpu_policy(
+        runtime.root,
+        discovery=discovery,
+        environment_gpu_ids=environment_gpu_ids,
+        environment_status=environment_status,
+    ).with_reservations(reserved_gpu_ids)
+    try:
+        persist_gpu_policy_observation(
+            runtime,
+            instance_id=instance_id,
+            pid=_read_pid(runtime),
+            view=policy_view,
+            policy=reservation_policy,
+        )
+    except (OSError, RuntimeError, ValueError, TypeError):
+        diagnostic_increment("gpu_policy.observation_unavailable")
+    return reservation_policy, policy_view
+
+
 def dispatch_machine_cycle_locked(
     runtime: MachineRuntime,
     *,
@@ -713,6 +756,7 @@ def _dispatch_admission_layer(
     borrow_admission_grant: _BorrowAdmissionGrant | None = None,
     lane: str,
     admission_blocked_project_ids: set[str] | frozenset[str] = frozenset(),
+    gpu_policy: GpuReservationPolicy | None = None,
 ) -> tuple[list[int], int, ProjectBinding | None]:
     """Run one fair admission layer and return remaining GPUs and last winner."""
     inspected_ready: set[tuple[str, str, str, str]] = set()
@@ -762,6 +806,7 @@ def _dispatch_admission_layer(
                         batch_sizer=batch_sizers[binding.project_id],
                         inspected_ready=inspected_ready,
                         lane=lane,
+                        gpu_policy=gpu_policy,
                     )
                 result_by_project[binding.project_id]["launched"].extend(launched)
                 if claimed_task_ids:
@@ -843,6 +888,15 @@ def _dispatch_machine_cycle_locked(
                     break
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 continue
+        try:
+            _observe_gpu_policy(
+                runtime,
+                available_gpus=available_gpus,
+                instance_id=instance_id,
+                reserved_gpu_ids=reservation_snapshot(runtime.root).reserved_gpu_ids,
+            )
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            pass
         return []
     readable: dict[str, RootConfig] = {}
     readable_bindings: dict[str, ProjectBinding] = {}
@@ -953,13 +1007,13 @@ def _dispatch_machine_cycle_locked(
     runtime.last_cycle_had_demand = runtime.last_cycle_had_demand or bool(results) or any(recovered.values())
     with diagnostic_span("machine.reservations.snapshot"):
         snapshot = reconcile_snapshot(runtime.root)
-    visible = (
-        list(available_gpus)
-        if available_gpus is not None
-        else _visible_gpus(next(iter(readable.values())))
-        if readable
-        else []
+    reservation_policy, policy_view = _observe_gpu_policy(
+        runtime,
+        available_gpus=available_gpus,
+        instance_id=instance_id,
+        reserved_gpu_ids=snapshot.reserved_gpu_ids,
     )
+    visible = list(policy_view.visible_gpu_ids or ())
     free = [gpu_id for gpu_id in visible if gpu_id not in snapshot.reserved_gpu_ids]
     cpu_policy, cpu_reservations = cpu_reservation_snapshot(runtime.root)
     free_cpu_slots = cpu_policy.capacity - sum(item.get("cpu_slots", 0) for item in cpu_reservations)
@@ -1085,6 +1139,7 @@ def _dispatch_machine_cycle_locked(
                 borrow_admission_grant=(borrow_admission_grant if admission_role == "borrow" else None),
                 lane=lane,
                 admission_blocked_project_ids=set(upgrade_blocked),
+                gpu_policy=reservation_policy,
             )
             if lane == "gpu":
                 free = lane_gpus
@@ -1105,6 +1160,7 @@ def _dispatch_machine_cycle_locked(
             pid=_read_pid(runtime),
             visible=visible,
             reservations=reservations,
+            gpu_policy=policy_view,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
             started_at=started_at,
             write_guard=lambda project_id: runtime.binding_write_guard(readable_bindings[project_id]),

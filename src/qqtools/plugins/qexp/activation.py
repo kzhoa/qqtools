@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Callable
 
 from .agent.context import MachineRuntime, ProjectBinding
@@ -72,7 +73,13 @@ def ensure_local_agent_active(cfg: RootConfig, *, reason: str, machine_runtime: 
     runtime = machine_runtime or MachineRuntime()
     if runtime.matching_binding(cfg) is None:
         raise _registration_error(cfg)
-    is_started, _status = _ensure_machine_agent_started(runtime)
+    is_started, status = _ensure_machine_agent_started(runtime)
+    if is_started:
+        warnings = status.get("warnings", [])
+        if warnings and isinstance(warnings[0], dict):
+            message = warnings[0].get("message")
+            if isinstance(message, str) and message:
+                print(f"Warning: {message}", file=sys.stderr)
     return is_started
 
 

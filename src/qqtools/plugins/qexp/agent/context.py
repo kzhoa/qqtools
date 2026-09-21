@@ -174,6 +174,8 @@ class MachineRuntime:
             self.paths[name].mkdir(parents=True, exist_ok=True)
         self.paths["cpu_policy"].parent.mkdir(parents=True, exist_ok=True)
         self.paths["cursor"].parent.mkdir(parents=True, exist_ok=True)
+        self.paths["gpu_policy_observation"].parent.mkdir(parents=True, exist_ok=True)
+        self.paths["gpu_policy_warnings"].parent.mkdir(parents=True, exist_ok=True)
         if not self.paths["identity"].exists():
             atomic_replace(self.paths["identity"], {"machine_runtime": {"instance_id": uuid.uuid4().hex}})
 

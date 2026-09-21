@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-20
+updated_at: 2026-09-21
 archived_at:
 ---
 
@@ -467,6 +467,42 @@ deterministic unweighted round-robin over enabled bindings sorted by stable proj
 layer is considered before borrow; a project with no eligible candidate, no fitting capacity, or a
 failed project-level claim does not block the remainder of its layer. Project-level eligibility and
 fenced claim protocols remain the final authority.
+
+### 6.7 Machine GPU Admission Policy
+
+One MachineRuntime owns one persistent GPU admission policy shared by every registered Project.
+Operators inspect and change it without project context:
+
+```bash
+qexp agent gpus show
+qexp agent gpus set --visible 0,2,3
+qexp agent gpus set --none
+qexp agent gpus reset
+```
+
+`set --visible` accepts a strict comma-separated list of unique, nonnegative integer device IDs.
+`set --none` deliberately permits no GPU work. `reset` removes the explicit override and exposes
+the agent's inherited `QEXP_VISIBLE_GPUS` value when nonempty, otherwise automatic discovery.
+`--expected-revision` is available on `set` and `reset` for compare-and-swap automation.
+
+The operator-facing sets are:
+
+- **configured GPUs**: IDs in an explicit persisted or inherited allowlist;
+- **discovered GPUs**: IDs returned by the local hardware inventory;
+- **visible GPUs**: configured intersect discovered for an allowlist, or discovered in automatic
+  mode;
+- **reserved GPUs**: IDs held by active or unexpired provisional qexp reservations; and
+- **draining GPUs**: reserved IDs that are no longer visible.
+
+Removing a GPU stops later admission but does not signal, migrate, restart, or rewrite an already
+authorized Attempt. Its reservation remains authoritative until ordinary terminal reconciliation
+or verified cleanup releases it. Adding a discovered GPU makes it eligible on the next scheduling
+cycle. `unreserved` continues to mean visible and not reserved by qexp; it does not prove physical
+idleness or account for processes outside qexp.
+
+The policy is machine-local static admission configuration, not Project truth, a physical GPU
+utilization detector, or a Group Worker Set control. Every Project bound to the MachineRuntime
+observes the same policy.
 
 ## 7. No Public Batch Entity
 
@@ -1373,6 +1409,10 @@ qexp agent disable-project <project-id-or-root>
 qexp agent remove-project <project-id-or-root>
 qexp agent start
 qexp agent status
+qexp agent gpus show
+qexp agent gpus set --visible 0,2,3
+qexp agent gpus set --none
+qexp agent gpus reset
 ```
 
 `qexp init` initializes and registers every new Project before it returns successfully. Ordinary
@@ -1487,6 +1527,9 @@ or `invalid`; each reason is an object containing the prerequisite `task_id` and
 - `qexp agent restart`
 - `qexp agent stop`
 - `qexp agent status`
+- `qexp agent gpus show`
+- `qexp agent gpus set --visible <ids> | --none [--expected-revision <revision>]`
+- `qexp agent gpus reset [--expected-revision <revision>]`
 - `qexp agent add-project | list-projects`
 - `qexp agent disable-project | remove-project <project-id-or-root>`
 - `qexp agent migrate-project`

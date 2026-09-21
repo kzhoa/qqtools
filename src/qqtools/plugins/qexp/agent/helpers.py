@@ -6,10 +6,11 @@ import os
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, ContextManager
+from typing import Any, Callable, ContextManager, Mapping
 
 from ..config_types import RootConfig
 from ..executor import Executor, append_launch_failure_diagnostic, launch_failure_handle, launch_failure_reason
+from ..gpu_policy import GpuPolicyView
 from ..layout import machine_state_path
 from ..machine_config import load_machine_policy
 from ..machine_state import publish_machine_snapshots
@@ -207,6 +208,7 @@ def _publish_project_snapshots(
     heartbeat_interval_seconds: float = 5.0,
     started_at: str | None = None,
     write_guard: Callable[[str], ContextManager[bool]] | None = None,
+    gpu_policy: GpuPolicyView | Mapping[str, object] | None = None,
 ) -> None:
     """Publish each readable project's view of the shared machine reservation state."""
     reserved = sorted({gpu_id for item in reservations for gpu_id in item.get("gpu_ids", [])})
@@ -223,6 +225,7 @@ def _publish_project_snapshots(
                 project_id=project_id,
                 heartbeat_interval_seconds=heartbeat_interval_seconds,
                 started_at=started_at,
+                gpu_policy=gpu_policy,
             )
             continue
         with write_guard(project_id) as is_eligible:
@@ -237,6 +240,7 @@ def _publish_project_snapshots(
                     project_id=project_id,
                     heartbeat_interval_seconds=heartbeat_interval_seconds,
                     started_at=started_at,
+                    gpu_policy=gpu_policy,
                 )
 
 
@@ -251,6 +255,7 @@ def _publish_project_snapshot(
     project_id: str,
     heartbeat_interval_seconds: float,
     started_at: str,
+    gpu_policy: GpuPolicyView | Mapping[str, object] | None = None,
 ) -> None:
     """Publish one project snapshot while the caller holds any required write fence."""
     attempts = [item.get("attempt_id") for item in reservations if item.get("project_id") == project_id]
@@ -269,6 +274,11 @@ def _publish_project_snapshot(
             except (OSError, ValueError):
                 pass
     try:
+        policy_value = (
+            gpu_policy.with_reservations(reserved).to_dict()
+            if isinstance(gpu_policy, GpuPolicyView)
+            else dict(gpu_policy or {})
+        )
         publish_machine_snapshots(
             cfg,
             instance_id=instance_id,
@@ -282,6 +292,7 @@ def _publish_project_snapshot(
             heartbeat_interval_seconds=heartbeat_interval_seconds,
             started_at=started_at,
             idle_since_at=idle_since_at,
+            gpu_policy=policy_value,
         )
     except OSError:
         return
