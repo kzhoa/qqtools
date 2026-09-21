@@ -67,6 +67,9 @@ def test_readers_share_storage_and_close_independently(root, first_to_close):
         original.close()
 
 
+@pytest.mark.filterwarnings(
+    r"ignore:This process .* is multi-threaded, use of fork\(\) may lead to deadlocks in the child\.:DeprecationWarning"
+)
 @pytest.mark.parametrize("method", multiprocessing.get_all_start_methods())
 def test_child_reopens_parent_readers_without_invalidating_parent(root, method):
     dataset = _Dataset(root)

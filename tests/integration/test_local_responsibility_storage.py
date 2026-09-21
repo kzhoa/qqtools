@@ -271,7 +271,7 @@ def crash_child(root, case, identity, boundary, is_replay=False):
 
 
 def run_child(target, *args):
-    child = multiprocessing.get_context("fork").Process(target=target, args=args)
+    child = multiprocessing.get_context("forkserver").Process(target=target, args=args)
     child.start()
     try:
         child.join(15)
@@ -422,7 +422,8 @@ def test_concurrent_publishers_have_one_membership_per_identity(tmp_path):
     ledger = Ledger.create(tmp_path / "ledger")
     names = identities(80)
     children = [
-        multiprocessing.get_context("fork").Process(target=writer_child, args=(ledger.root, names)) for _ in range(4)
+        multiprocessing.get_context("forkserver").Process(target=writer_child, args=(ledger.root, names))
+        for _ in range(4)
     ]
     try:
         for child in children:
@@ -823,7 +824,10 @@ def initialize_and_publish(root, identity):
 def test_concurrent_first_publishers_share_one_initialized_store(tmp_path):
     root = tmp_path / "ledger"
     children = [
-        multiprocessing.get_context("fork").Process(target=initialize_and_publish, args=(root, f"attempt-{number}"))
+        multiprocessing.get_context("forkserver").Process(
+            target=initialize_and_publish,
+            args=(root, f"attempt-{number}"),
+        )
         for number in range(4)
     ]
     try:
