@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -21,6 +22,7 @@ from .activation import (
     start_local_agent,
     stop_local_agent,
 )
+from .agent.config import agent_config_payload, set_agent_config
 from .agent.context import ExecutionContext, MachineRuntime
 from .agent.lifecycle import (
     ensure_machine_agent_started,
@@ -36,6 +38,17 @@ from .agent.project_admin import (
     register_project,
     set_project_enabled,
     unregister_project,
+)
+from .agent.readiness import capture_readiness_snapshot, evaluate_readiness, wait_for_readiness
+from .agent.setup import (
+    get_agent_config,
+    initialize_machine,
+    initialize_project,
+    list_projects,
+    machine_init_facts,
+    register_projects,
+    remove_project,
+    set_project_enablement,
 )
 from .commands import cleanup
 from .commands import group as group_commands
@@ -54,7 +67,6 @@ from .launch_policy import (
 from .layout import clear_context, load_context, load_root_config, migrate_schema5_to_schema6, save_context
 from .lease import LeasePolicy, load_lease_policy, save_lease_policy
 from .legacy_agent import get_agent_status
-from .machine_config import init_shared_root, load_machine_policy
 from .notification_config import (
     DEFAULT_WEBHOOK_ENV,
     load_notifications,
@@ -221,9 +233,9 @@ def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[ob
         except ValueError as exc:
             if str(exc).startswith("no local project binding exists"):
                 raise ValueError(
-                    f"{exc} To join this machine for the first time, run 'qexp init'; "
+                    f"{exc} To join this machine for the first time, run 'qexp project register <PATH>'; "
                     "to restore a missing current-generation binding, run "
-                    "'qexp agent add-project'."
+                    "'qexp project register <PATH>'."
                 ) from exc
             raise
         verified_machine = execution_context.cfg.machine_name
@@ -273,9 +285,9 @@ def build_parser() -> argparse.ArgumentParser:
             "start a target agent."
         ),
         epilog=(
-            "To join a new machine to an existing project, run: qexp --shared-root "
-            "<project/.qexp> --machine <local-machine> init. qexp use only saves local CLI context; "
-            "it does not initialize or register a project."
+            "Machine setup is: qexp init --machine NAME. Shared Project creation is: "
+            "qexp project init PATH; local enrollment is: qexp project register PATH. "
+            "qexp use only saves local CLI context."
         ),
     )
     parser.add_argument("--shared-root", help="Locate the shared project control root.")
@@ -288,17 +300,43 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser(
         "init",
-        help="Initialize a project or join this machine to an existing project.",
+        help="Initialize or replace this machine runtime.",
         description=(
-            "Initialize a new shared project or join this machine to an existing project. "
-            "It creates or updates this machine's Project record, registers the project with "
-            "the local machine agent, and saves CLI context. It does not start the agent."
+            "Initialize or replace the local machine identity and global agent policy. "
+            "Project creation and enrollment are separate: use 'qexp project init' and "
+            "'qexp project register'."
         ),
     )
     init.add_argument("--shared-root", dest="init_shared_root")
     init.add_argument("--machine", dest="init_machine")
-    init.add_argument("--agent-mode", choices=["on_demand", "daemon"], default="on_demand")
+    init.add_argument("--agent-mode", choices=["on_demand", "daemon"])
+    init.add_argument("--detach-old-runtime", action="store_true")
+    init.add_argument("--yes", action="store_true")
+    _add_output_format(init)
     init.add_argument("--cpu-lane-capacity", type=int)
+
+    project = commands.add_parser(
+        "project",
+        help="Create shared Projects and manage local machine enrollment.",
+        description="Project init creates shared truth; project register/list/enable/disable/remove manage local enrollment.",
+    )
+    project_sub = project.add_subparsers(dest="project_action", required=True)
+    project_init = project_sub.add_parser("init", help="Create shared Project truth without enrollment.")
+    _add_output_format(project_init)
+    project_init.add_argument("path", nargs="?")
+    project_register = project_sub.add_parser("register", help="Enroll explicit Projects or saved inventory entries.")
+    _add_output_format(project_register)
+    project_register.add_argument("paths", nargs="*")
+    project_register.add_argument("--from-pool", action="store_true")
+    project_register.add_argument("--machine", dest="project_machine")
+    project_register.add_argument("--name-source", choices=("default", "explicit"))
+    for project_action in ("list",):
+        project_list_parser = project_sub.add_parser(project_action)
+        _add_output_format(project_list_parser)
+    for project_action in ("enable", "disable", "remove"):
+        project_selector = project_sub.add_parser(project_action)
+        _add_output_format(project_selector)
+        project_selector.add_argument("selector")
     migrate = commands.add_parser("migrate")
     migrate.add_argument("--to-schema", type=int, required=True)
     upgrade = commands.add_parser("upgrade")
@@ -359,6 +397,23 @@ def build_parser() -> argparse.ArgumentParser:
             ):
                 _lp.add_argument("--" + _arg, type=_typ)
             _lp.add_argument("--clock-provider-priority")
+    config_agent = config_sub.add_parser("agent", help="Configure the machine-global agent.")
+    config_agent_sub = config_agent.add_subparsers(dest="agent_config_action", required=True)
+    config_agent_show = config_agent_sub.add_parser("show")
+    _add_output_format(config_agent_show)
+    config_agent_set = config_agent_sub.add_parser("set")
+    _add_output_format(config_agent_set)
+    config_agent_set.add_argument("--name")
+    config_agent_set.add_argument("--agent-mode", choices=("daemon", "on_demand"))
+    # Machine-global configuration also has the public verb-first spelling.
+    config_show = config_sub.add_parser("show")
+    _add_output_format(config_show)
+    config_show.add_argument("config_target", choices=("agent",))
+    config_set = config_sub.add_parser("set")
+    _add_output_format(config_set)
+    config_set.add_argument("config_target", choices=("agent",))
+    config_set.add_argument("--name")
+    config_set.add_argument("--agent-mode", choices=("daemon", "on_demand"))
     notifications = config_sub.add_parser("notifications")
     notifications_sub = notifications.add_subparsers(dest="notifications_action", required=True)
     notifications_show = notifications_sub.add_parser("show")
@@ -584,6 +639,10 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         action = agent_sub.add_parser(name)
         _add_output_format(action)
+    agent_sub.choices["start"].add_argument("--timeout", type=float, default=30.0)
+    agent_sub.choices["name"] = agent_sub.add_parser("name", help="Show or change the machine-global agent name.")
+    _add_output_format(agent_sub.choices["name"])
+    agent_sub.choices["name"].add_argument("--set-to", dest="set_to")
     cpu_lane = agent_sub.add_parser("cpu-lane")
     cpu_lane_sub = cpu_lane.add_subparsers(dest="cpu_lane_action", required=True)
     cpu_lane_show = cpu_lane_sub.add_parser("show")
@@ -870,35 +929,161 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _validate_continuous_options(args)
         if args.command == "init":
-            args.shared_root = args.init_shared_root or args.shared_root
-            args.machine = args.init_machine or args.machine
-            if not args.shared_root or not args.machine:
-                raise ValueError("init requires --shared-root and --machine.")
-            cfg = init_shared_root(
-                Path(args.shared_root),
-                args.machine,
-                agent_mode=args.agent_mode,
-                runtime_root=Path(args.runtime_root) if args.runtime_root else None,
-            )
+            # QQTOOLS-COMPAT-0014: the former project-bound init spelling is
+            # retained only as a bounded diagnostic during the transition.
+            if args.init_shared_root or args.shared_root or args.runtime_root or args.cpu_lane_capacity is not None:
+                print(
+                    "qexp: QQTOOLS-COMPAT-0014: qexp init is machine-only. "
+                    "Use 'qexp project init PATH' to create shared Project truth, then "
+                    "'qexp project register PATH --machine NAME' to enroll it.",
+                    file=sys.stderr,
+                )
+                return 2
+            target_name = args.init_machine or args.machine
+            if not target_name:
+                raise ValueError("init requires explicit --machine NAME.")
             runtime = MachineRuntime(args.machine_runtime_root)
-            runtime.ensure_layout()
-            if args.cpu_lane_capacity is not None:
-                initialize_cpu_lane_capacity(runtime.root, capacity=args.cpu_lane_capacity)
-            elif not runtime.paths["cpu_policy"].exists():
-                initialize_cpu_lane_capacity(runtime.root, capacity=0)
-            try:
-                register_project(MachineRuntime(args.machine_runtime_root), cfg.shared_root, cfg.machine_name)
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise RuntimeError(
-                    "qexp project initialized but was not registered with the machine agent; "
-                    f"resolve the registration error and run 'qexp agent add-project': {exc}"
-                ) from exc
-            _try_save_context(str(cfg.shared_root))
-            print("Project initialized.")
-            print("Machine registration completed.")
-            print("Agent is not running.")
-            print("Run: qexp agent start")
+            facts = machine_init_facts(runtime)
+            confirmed = bool(args.yes)
+            expected_old_runtime_id = None
+            if args.detach_old_runtime and facts.get("old_runtime_id"):
+                print(
+                    "WARNING: --detach-old-runtime preserves old local evidence in an isolated archive "
+                    "without completing recovery or changing shared Tasks, claims, or registrations.",
+                    file=sys.stderr,
+                )
+            if facts.get("old_runtime_id") and not confirmed:
+                if args.format == "json":
+                    raise RuntimeError("machine identity replacement requires --yes when --format=json is selected.")
+                isatty = getattr(sys.stdin, "isatty", None)
+                if not callable(isatty) or not isatty():
+                    raise RuntimeError("machine identity replacement requires --yes in noninteractive input.")
+                print("Machine identity replacement will:", file=sys.stderr)
+                print(f"  old runtime ID: {facts.get('old_runtime_id')}", file=sys.stderr)
+                print(f"  current name: {facts.get('current_name') or '-'}", file=sys.stderr)
+                print(f"  requested name: {target_name}", file=sys.stderr)
+                print(
+                    f"  requested mode: {args.agent_mode or facts.get('current_agent_mode') or 'daemon'}",
+                    file=sys.stderr,
+                )
+                print(f"  obligations: {facts.get('obligations') or 'none'}", file=sys.stderr)
+                print("  this creates a new runtime ID and replaces local authority.", file=sys.stderr)
+                print(
+                    f"  shell-safe command: qexp init --machine {shlex.quote(target_name)} --yes",
+                    file=sys.stderr,
+                )
+                answer = input("Continue? [y/N] ")
+                if answer.strip().lower() not in {"y", "yes"}:
+                    raise RuntimeError("machine identity replacement cancelled; no state was changed.")
+                confirmed = True
+                expected_old_runtime_id = facts["old_runtime_id"]
+            result = initialize_machine(
+                runtime,
+                target_name,
+                agent_mode=args.agent_mode,
+                detach_old_runtime=args.detach_old_runtime,
+                confirmed=confirmed,
+                expected_old_runtime_id=expected_old_runtime_id,
+            )
+            _emit(CliOutput(OutputKind.MACHINE_INIT, result), args.format)
             return 0
+        if args.command == "project":
+            runtime = MachineRuntime(args.machine_runtime_root)
+            if args.project_action == "init":
+                result = initialize_project(args.path)
+                _emit(CliOutput(OutputKind.PROJECT_OPERATION, result), args.format)
+                return 0
+            if args.project_action == "register":
+                project_machine = args.project_machine
+                if project_machine is not None and args.machine is not None and project_machine != args.machine:
+                    raise ValueError("project register --machine conflicts with the global --machine assertion.")
+                if project_machine is None:
+                    project_machine = args.machine
+                result = register_projects(
+                    runtime,
+                    args.paths,
+                    from_pool=args.from_pool,
+                    machine_name=project_machine,
+                    name_source=args.name_source,
+                )
+                _emit(CliOutput(OutputKind.PROJECT_REGISTER, result), args.format)
+                statuses = [item.get("status") for item in result.get("projects", ())]
+                return 0 if not statuses or all(item in {"registered", "disabled"} for item in statuses) else 2
+            if args.project_action == "list":
+                _emit(CliOutput(OutputKind.PROJECT_LIST, list_projects(runtime)), args.format)
+                return 0
+            if args.project_action == "remove":
+                result = remove_project(runtime, args.selector)
+            else:
+                result = set_project_enablement(runtime, args.selector, args.project_action == "enable")
+            _emit(CliOutput(OutputKind.PROJECT_OPERATION, result), args.format)
+            return 0
+        if args.command == "config" and (
+            args.config_action == "agent" or (args.config_action in {"show", "set"} and args.config_target == "agent")
+        ):
+            runtime = MachineRuntime(args.machine_runtime_root)
+            config_action = args.agent_config_action if args.config_action == "agent" else args.config_action
+            if config_action == "show":
+                result = get_agent_config(runtime)
+            else:
+                if args.name is None and args.agent_mode is None:
+                    raise ValueError("config set agent requires --name or --agent-mode.")
+                set_agent_config(runtime, name=args.name, agent_mode=args.agent_mode)
+                result = get_agent_config(runtime)
+            _emit(CliOutput(OutputKind.AGENT_CONFIG, result), args.format)
+            return 0
+        if args.command == "agent" and args.agent_action == "name":
+            runtime = MachineRuntime(args.machine_runtime_root)
+            if args.set_to is not None:
+                set_agent_config(runtime, name=args.set_to)
+            result = agent_config_payload(runtime)
+            _emit(CliOutput(OutputKind.AGENT_CONFIG, result), args.format)
+            return 0
+        if args.command == "agent" and args.agent_action in {
+            "add-project",
+            "list-projects",
+            "enable-project",
+            "disable-project",
+            "remove-project",
+        }:
+            # QQTOOLS-COMPAT-0014: retired executing routes fail before any
+            # runtime/configuration resolution or state creation.
+            replacement = {
+                "add-project": "qexp project register PATH",
+                "list-projects": "qexp project list",
+                "enable-project": "qexp project enable SELECTOR",
+                "disable-project": "qexp project disable SELECTOR",
+                "remove-project": "qexp project remove SELECTOR",
+            }[args.agent_action]
+            print(
+                f"qexp: QQTOOLS-COMPAT-0014: retired command; use '{replacement}'.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.command == "agent" and args.agent_action in {"start", "run"}:
+            runtime = MachineRuntime(args.machine_runtime_root)
+            if args.agent_action == "start" and (
+                isinstance(args.timeout, bool) or not math.isfinite(args.timeout) or args.timeout <= 0
+            ):
+                raise ValueError("agent start timeout must be a positive finite number of seconds.")
+            snapshot = capture_readiness_snapshot(runtime)
+            _registry_revision, current_bindings = runtime.load_registry()
+            registered_ids = {binding.project_id for binding in current_bindings if binding.enabled}
+            if not snapshot["project_ids"] or not registered_ids.intersection(snapshot["project_ids"]):
+                result = evaluate_readiness(runtime, snapshot)
+                _emit(CliOutput(OutputKind.AGENT_READINESS, result), args.format)
+                return 2
+            if args.agent_action == "run":
+                from .agent.lifecycle import run_machine_agent_loop
+
+                run_machine_agent_loop(runtime)
+                return 0
+            ready = evaluate_readiness(runtime, snapshot)
+            if not ready["ready"]:
+                ensure_machine_agent_started(runtime)
+                ready = wait_for_readiness(runtime, snapshot, timeout_seconds=args.timeout)
+            _emit(CliOutput(OutputKind.AGENT_READINESS, ready), args.format)
+            return 0 if ready["ready"] else 2
         if args.command == "migrate":
             if not args.shared_root or not args.machine:
                 raise ValueError("migrate requires --shared-root and --machine.")

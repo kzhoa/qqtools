@@ -82,6 +82,25 @@ def jrun(args: list[str], *, env: dict[str, str]) -> object:
     return json.loads(text) if text else None
 
 
+def initialize_machine_project(common: list[str], *, env: dict[str, str], agent_mode: str | None = None) -> None:
+    """Initialize one machine and enroll the Project selected by an E2E command prefix."""
+    shared_root = _single_argument_value(common, "--shared-root")
+    machine = _single_argument_value(common, "--machine")
+    if shared_root is None or machine is None:
+        raise ValueError("E2E setup requires --shared-root and --machine")
+    machine_runtime_root = _single_argument_value(common, "--machine-runtime-root")
+    prefix = ["qexp"]
+    if machine_runtime_root is not None:
+        prefix.extend(("--machine-runtime-root", machine_runtime_root))
+    init = [*prefix, "init", "--machine", machine]
+    if agent_mode is not None:
+        init.extend(("--agent-mode", agent_mode))
+    run(init, env=env)
+    project_root = str(Path(shared_root).resolve().parent)
+    run([*prefix, "project", "init", project_root], env=env)
+    run([*prefix, "project", "register", project_root], env=env)
+
+
 def wait_for(predicate, *, timeout: float, label: str) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

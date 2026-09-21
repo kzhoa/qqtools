@@ -43,7 +43,7 @@ def managed_project_agent_status(
 def _registration_error(cfg: RootConfig) -> RuntimeError:
     if is_legacy_agent_project(cfg):
         return RuntimeError("legacy project metadata detected; run 'qexp agent migrate-project'.")
-    return RuntimeError("project is not registered; run 'qexp agent add-project'.")
+    return RuntimeError("project is not registered; run 'qexp project register <PATH>'.")
 
 
 def _ensure_machine_agent_started(

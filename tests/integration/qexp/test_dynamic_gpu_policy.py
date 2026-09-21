@@ -99,10 +99,12 @@ def test_removed_reserved_gpu_drains_without_releasing_reservation(tmp_path, mon
 def test_running_agent_applies_policy_without_pid_change(tmp_path, monkeypatch) -> None:
     from qqtools.plugins.qexp.agent.context import MachineRuntime
     from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status, start_machine_agent, stop_machine_agent
+    from qqtools.plugins.qexp.agent.setup import initialize_machine
     from qqtools.plugins.qexp.gpu_policy import set_gpu_policy, show_gpu_policy
 
     monkeypatch.delenv("QEXP_VISIBLE_GPUS", raising=False)
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
     process = start_machine_agent(runtime, available_gpus=[0, 1], loop_interval=0.05)
     try:
         original_pid = process.pid
@@ -124,10 +126,12 @@ def test_running_agent_applies_policy_without_pid_change(tmp_path, monkeypatch) 
 def test_startup_retains_actionable_missing_gpu_warning(tmp_path, monkeypatch) -> None:
     from qqtools.plugins.qexp.agent.context import MachineRuntime
     from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status, start_machine_agent, stop_machine_agent
+    from qqtools.plugins.qexp.agent.setup import initialize_machine
     from qqtools.plugins.qexp.gpu_policy import set_gpu_policy, show_gpu_policy
 
     monkeypatch.delenv("QEXP_VISIBLE_GPUS", raising=False)
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
     set_gpu_policy(runtime, (12, 1))
     process = start_machine_agent(runtime, available_gpus=[0, 1], loop_interval=0.05)
     try:

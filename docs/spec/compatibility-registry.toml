@@ -1,4 +1,63 @@
-next_id = 12
+next_id = 15
+
+[[items]]
+id = "QQTOOLS-COMPAT-0012"
+component = "qexp.machine-project-inventory"
+kind = "local_state"
+status = "compatibility_active"
+summary = "Migrate version-1 machine registries into the separate Project inventory without inferring registration-name provenance."
+introduced_in = "1.3.22"
+legacy_removed_in = "1.3.23"
+transition_purged_in = "1.3.24"
+marker = "QQTOOLS-COMPAT-0012"
+owner = "qexp.agent.setup"
+verification = ["tests/integration/qexp/test_machine_enrollment.py"]
+normal_level = "L1"
+recovery_level = "L1"
+source_versions = ["1.3.21"]
+target_version = "1.3.22"
+mixed_version_range = ["1.3.21-1.3.22"]
+normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
+machine_status_command = "qexp project list"
+recovery_command = "qexp project register PROJECT --name-source default|explicit"
+workload_continuity = true
+interruption_budget_seconds = 1.0
+
+[[items]]
+id = "QQTOOLS-COMPAT-0013"
+component = "qexp.global-agent-residency"
+kind = "local_state"
+status = "compatibility_active"
+summary = "Migrate per-binding agent residency into one revisioned machine-global agent policy."
+introduced_in = "1.3.22"
+legacy_removed_in = "1.3.23"
+transition_purged_in = "1.3.24"
+marker = "QQTOOLS-COMPAT-0013"
+owner = "qexp.agent.config"
+verification = ["tests/integration/qexp/test_machine_enrollment.py"]
+normal_level = "L1"
+recovery_level = "L1"
+source_versions = ["1.3.21"]
+target_version = "1.3.22"
+mixed_version_range = ["1.3.21-1.3.22"]
+normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
+machine_status_command = "qexp agent status"
+recovery_command = "qexp config set agent --agent-mode daemon|on_demand"
+workload_continuity = true
+interruption_budget_seconds = 1.0
+
+[[items]]
+id = "QQTOOLS-COMPAT-0014"
+component = "qexp.enrollment-cli-cutover"
+kind = "cli"
+status = "compatibility_active"
+summary = "Retain bounded non-executing diagnostics for retired Project-bound init and agent Project-management spellings."
+introduced_in = "1.3.22"
+legacy_removed_in = "1.3.23"
+transition_purged_in = "1.3.24"
+marker = "QQTOOLS-COMPAT-0014"
+owner = "qexp.cli"
+verification = ["tests/integration/qexp/test_machine_enrollment.py"]
 
 [[items]]
 # Publicly committed implementation intent begins here. Private exploration and design records are

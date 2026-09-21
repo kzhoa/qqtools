@@ -10,6 +10,46 @@ archived_at:
 This guide is for an existing qexp project rooted at `PROJECT_ROOT` (for example,
 `/mnt/share/myproject/.qexp`). Run commands with its explicit shared-root path.
 
+## Upgrade to machine setup and Project enrollment
+
+Release 1.3.22 separates machine identity from shared Project creation and local enrollment. After
+upgrading the package, restart the global agent once. The runtime imports version-1 registry
+bindings into its Project pool without changing their effective names or shared registration
+generations. Imported names have unresolved provenance; existing bindings continue operating, but
+future re-enrollment requires one explicit decision per Project:
+
+```bash
+qexp project register /path/to/project --name-source default
+qexp project register /path/to/aliased-project --name-source explicit
+```
+
+Inspect the result with `qexp project list`. Do not infer the source merely because a Project name
+equals the current global agent name.
+
+For a blank environment, create the machine identity, create or verify shared Project truth, enroll,
+and start the agent as separate steps:
+
+```bash
+qexp init --machine gpu2 --agent-mode daemon
+qexp project init /projects/example
+qexp project register /projects/example
+qexp agent start
+```
+
+For a copied image whose old runtime remains another environment's responsibility, explicitly
+detach and then reconcile only the saved inventory:
+
+```bash
+qexp init --machine gpu3 --detach-old-runtime --yes
+qexp project register --from-pool
+qexp agent start
+```
+
+This is a fresh-start procedure, not an idempotent bootstrap: every successful `init` replaces the
+runtime identity. Retry a failed register or start step without repeating init. Do not detach the
+only recovery copy of unfinished work; ordinary initialization requires the original runtime to
+finish terminal publication, claim archival, reservation release, and recovery cleanup first.
+
 ## Machine-rolling coordinator for supported future protocols
 
 For a release covered by the machine-rolling coordinator contract, the normal operation on each

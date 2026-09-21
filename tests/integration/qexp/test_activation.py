@@ -12,11 +12,11 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
-def test_unregistered_current_project_requires_explicit_add(tmp_path: Path) -> None:
+def test_unregistered_current_project_requires_explicit_registration(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
 
-    with pytest.raises(RuntimeError, match="qexp agent add-project"):
+    with pytest.raises(RuntimeError, match="qexp project register"):
         ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime)
 
 

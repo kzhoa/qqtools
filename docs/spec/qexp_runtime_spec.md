@@ -196,17 +196,23 @@ saved-context machine/runtime fields, `--runtime-root`, and identity assertions 
 those values. Read-only project commands may observe shared truth without a local binding.
 
 The local CLI context is only a canonical `shared_root` locator. Unknown legacy machine/runtime
-fields do not participate in resolution. Without a binding, `agent add-project` and
-`agent migrate-project` require an explicit machine input; `migrate-project` may receive an
-explicit custom legacy runtime. They never select ordinary execution or reservation authority.
+fields do not participate in resolution. `project register --machine NAME` accepts one explicit
+Project. The legacy `agent migrate-project` workflow requires explicit machine input and may
+receive an explicit custom legacy runtime. Neither path selects ordinary execution or reservation
+authority before a verified binding exists.
 
-`MachineRuntime` owns the registry, scheduler and registry locks, one unified GPU reservation
-set, global-agent PID/status, round-robin cursor, and project-ID-partitioned local process,
+`MachineRuntime` owns a versioned Project inventory distinct from its effective binding registry,
+one random current runtime generation, revisioned global agent configuration, scheduler/registry/
+lifecycle locks, one unified GPU reservation set, global-agent PID/status, round-robin cursor, and
+project-ID-partitioned local process,
 launch, observation, termination, and recovery records. It does not own or duplicate Task,
 Group, Attempt, claim, lease, log, or terminal truth.
 
-A registry binding contains `project_id`, canonical `shared_root`, project-local `machine_name`,
-`enabled`, a registration generation, and the local machine-runtime instance identity.
+A Project inventory entry contains `project_id`, canonical `shared_root`, operator enablement,
+`name_source = default | explicit | unresolved`, and an optional explicit override. A registry
+binding contains the same stable identity and path, its frozen effective project-local
+`machine_name`, enablement, a registration generation, and current runtime identity. Inventory is
+reusable intent and never proves current registration authority.
 The effective runtime identity combines the runtime-local random identity with the current Linux
 host identity. Copying only a machine-runtime directory to another host therefore cannot renew its
 registration generation; uncertain continuity must use explicit adoption after eligibility expires.
@@ -228,15 +234,18 @@ termination decisions, and pending local convergence evidence are absent.
 After shared terminal truth commits, the agent consumes the corresponding process,
 registration, observation, launch-intent, and completed termination records. Successful removal
 deletes the binding's disposable project runtime partition before removing the registry entry.
-`qexp init` registers new-generation projects with the global agent before reporting success.
-`qexp agent add-project` may restore an absent current-generation binding while the global agent is
-running, including atomically replacing a superseded local binding with an available logical name
-and creating its machine record for a known shared project. Reusing
-an owned logical name requires `--adopt-existing`; `qexp agent enable-project` revalidates current
-registration authority before enabling new admission. A project whose machine metadata predates
-the global runtime must use `qexp agent migrate-project`; the migration creates a disabled binding,
-stops only a verified old agent, imports local reservations and evidence, then enables the binding
-after the durable handoff.
+`qexp init --machine NAME` publishes a new runtime generation only after a versioned replacement
+transaction has recorded the reset policy, staged configuration/inventory, old/new IDs, archive,
+and obligation summary. Existing-generation evidence is moved into an immutable archive and never
+supervised by the new generation. The current-generation pointer is the atomic publication boundary;
+an interrupted transition resumes the recorded target and rejects a different target or policy.
+
+`qexp project register` resolves confirmed inventory intent and may create or renew only the
+current runtime's shared registration. It never uses the recovery-adoption path for image-clone
+expansion. Legacy registry bindings become inventory entries with `name_source=unresolved`; their
+current authority remains usable, but re-enrollment requires one-Project source confirmation.
+`project enable` revalidates current registration authority before enabling admission. Legacy
+Project metadata continues to require the distinct migration workflow.
 
 ## 4. Runtime Invariants
 
@@ -850,7 +859,8 @@ Required fields include:
 In shared mode, machine identity is explicit:
 
 ```bash
-qexp init --shared-root /path/to/project/.qexp --machine gpu2a
+qexp init --machine gpu2a
+qexp project register /path/to/project
 ```
 
 ### 8.8 Agent and Snapshot Truth
@@ -2438,7 +2448,7 @@ a pass. Current evidence and remaining acceptance work are recorded in
 
 ### 17.1 On-Demand Mode
 
-Default behavior:
+When the machine-global policy is `on_demand`:
 
 - local submission starts the current machine's agent when it has eligible local work
 - the agent polls or watches eligible local/shared work
@@ -2446,9 +2456,8 @@ Default behavior:
 - provisional reservations, active processes, pending termination, and repair work prevent
   idle exit
 
-The global policy considers all enabled bindings: any daemon binding keeps the process active.
-With only on-demand bindings, true idleness must remain proven for a full loop interval before
-exit. Unresolved demand or a failed maintenance pass is not proof of idleness. Empty startup
+True idleness must remain proven for a full loop interval before exit. Project enablement never
+changes the global policy. Unresolved demand or a failed maintenance pass is not proof of idleness. Empty startup
 waits for a successfully processed binding; merely reading an unreadable binding does not consume
 that wait. After successful consumption, later registry emptiness does not re-enter startup wait.
 
@@ -2461,7 +2470,8 @@ qexp agent start
 qexp agent run
 ```
 
-`agent start` always starts a detached agent, regardless of configured mode. `agent run` keeps
+`agent start` ensures a detached agent, waits for current-generation readiness, and does not
+restart a healthy process. `agent run` keeps
 the agent in the current terminal for debugging. Both modes auto-start after local submission;
 they differ only in whether true idleness ends the agent process.
 

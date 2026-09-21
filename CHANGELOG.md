@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- feat: separate qexp machine initialization, shared Project creation, local enrollment, and agent
+  activation; add reusable Project inventory, guarded runtime detachment, mutable global agent
+  naming, daemon-default residency, and readiness-aware idempotent startup.
+- breaking: replace Project-bound `init` and agent-namespaced Project management with explicit
+  `project init/register/list/enable/disable/remove` workflows. Release 1.3.22 retains only bounded
+  non-executing migration diagnostics for the retired spellings.
 - feat: make qexp-created tmux log observers a project option disabled by default, with durable
   per-Task and batch submission overrides while preserving detached execution and live viewers.
 

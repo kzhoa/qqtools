@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from qexp_e2e import ensure_site_packages_import, make_env, run, stop_agent
+from qexp_e2e import ensure_site_packages_import, initialize_machine_project, make_env, run, stop_agent
 
 pytestmark = [pytest.mark.e2e, pytest.mark.host_exclusive]
 
@@ -26,8 +26,8 @@ def test_installed_wheel_allows_one_default_host_authority(tmp_path) -> None:
     first = _common(base, "first")
     second = _common(base, "second")
     try:
-        run([*first, "init", "--agent-mode", "daemon"], env=env)
-        run([*second, "init", "--agent-mode", "daemon"], env=env)
+        initialize_machine_project(first, env=env, agent_mode="daemon")
+        initialize_machine_project(second, env=env, agent_mode="daemon")
         run([*first, "agent", "start"], env=env)
 
         rejected = run([*second, "agent", "start"], env=env, check=False)

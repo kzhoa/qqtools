@@ -5,6 +5,7 @@ import subprocess
 from qexp_e2e import (
     TASK_TERMINAL_TIMEOUT_SECONDS,
     ensure_site_packages_import,
+    initialize_machine_project,
     is_machine_agent_running,
     jrun,
     make_env,
@@ -29,7 +30,7 @@ def test_installed_wheel_agent_completes_task(tmp_path):
         str(runtime_root),
     ]
     try:
-        run([*common, "init", "--agent-mode", "daemon"], env=env)
+        initialize_machine_project(common, env=env, agent_mode="daemon")
         started = subprocess.run(
             [*common, "agent", "start"],
             env=env,

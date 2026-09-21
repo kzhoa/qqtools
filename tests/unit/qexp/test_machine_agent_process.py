@@ -7,10 +7,12 @@ import pytest
 
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.process import spawn_machine_agent_process
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 
 
 def test_machine_agent_default_stderr_captures_startup_errors_without_a_pipe(tmp_path: Path, monkeypatch) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
     captured: dict[str, object] = {}
 
     class FakeProcess:
@@ -38,6 +40,7 @@ def test_machine_agent_default_stderr_captures_startup_errors_without_a_pipe(tmp
 
 def test_machine_agent_startup_error_includes_child_failure(tmp_path: Path, monkeypatch) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
 
     class FakeProcess:
         pid = 123
@@ -58,6 +61,7 @@ def test_machine_agent_startup_error_includes_child_failure(tmp_path: Path, monk
 
 def test_machine_agent_process_accepts_explicit_loop_interval(tmp_path: Path, monkeypatch) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
     captured: dict[str, object] = {}
 
     class FakeProcess:

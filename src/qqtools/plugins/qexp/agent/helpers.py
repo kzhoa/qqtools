@@ -26,6 +26,7 @@ from ..runtime.resources.reservations import (
 from ..runtime.store import atomic_replace, iter_json, read_json, replace_snapshot_if_changed
 from ..runtime.work_budget import diagnostic_increment, diagnostic_span
 from ..scheduler import fail_attempt, resume_starting_attempt
+from .config import load_agent_config
 from .context import MachineRuntime, ProjectBinding
 
 
@@ -73,6 +74,12 @@ def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool
     if not has_consumed_binding:
         # Startup waits until the current process has validated and consumed a binding.
         return False
+    # Residency is machine-global.  Per-binding legacy metadata remains useful
+    # for migration, but it must not decide whether this current agent exits.
+    try:
+        global_policy = load_agent_config(runtime)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return False
     for binding in bindings:
         try:
             with closing(runtime.iter_recovery_blockers(binding, should_use_capture=True)) as blockers:
@@ -87,7 +94,7 @@ def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool
                 for name in ("availability_active", "group_control_active", "cleanup_active")
             ):
                 return False
-            if not load_machine_policy(cfg).exit_when_idle:
+            if not global_policy.exit_when_idle:
                 return False
             if getattr(runtime, "last_cycle_had_demand", True):
                 return False
@@ -129,20 +136,35 @@ def _publish_process_status(
     start_ticks: int,
     waiting_for_first_registration: bool,
     state: str = "active",
+    runtime_id: str | None = None,
+    configured_agent_mode: str | None = None,
+    observed_agent_mode: str | None = None,
+    policy_revision_requested: int | None = None,
+    policy_revision_acknowledged: int | None = None,
+    inventory_revision: int | None = None,
+    reconciled_project_ids: list[str] | None = None,
+    ready: bool | None = None,
 ) -> None:
     """Publish live process identity and its process-local registration wait state."""
-    replace_snapshot_if_changed(
-        runtime.paths["agent"] / "status.json",
-        {
-            "machine_agent": {
-                "instance_id": instance_id,
-                "pid": pid if state == "active" else None,
-                "pid_start_time_ticks": start_ticks,
-                "state": state,
-                "waiting_for_first_registration": waiting_for_first_registration if state == "active" else False,
-            }
-        },
-    )
+    machine_agent: dict[str, Any] = {
+        "instance_id": instance_id,
+        "pid": pid if state == "active" else None,
+        "pid_start_time_ticks": start_ticks,
+        "state": state,
+        "waiting_for_first_registration": waiting_for_first_registration if state == "active" else False,
+    }
+    optional = {
+        "runtime_id": runtime_id,
+        "configured_agent_mode": configured_agent_mode,
+        "observed_agent_mode": observed_agent_mode,
+        "policy_revision_requested": policy_revision_requested,
+        "policy_revision_acknowledged": policy_revision_acknowledged,
+        "inventory_revision": inventory_revision,
+        "reconciled_project_ids": reconciled_project_ids,
+        "ready": ready,
+    }
+    machine_agent.update({key: value for key, value in optional.items() if value is not None})
+    replace_snapshot_if_changed(runtime.paths["agent"] / "status.json", {"machine_agent": machine_agent})
 
 
 def _binding_config(runtime: MachineRuntime, binding: ProjectBinding) -> RootConfig:

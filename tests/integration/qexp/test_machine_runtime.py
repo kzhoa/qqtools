@@ -29,6 +29,7 @@ from qqtools.plugins.qexp.agent.lifecycle import (
     start_machine_agent,
     stop_machine_agent,
 )
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.commands.cleanup import clean
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import cancel, submit
@@ -1248,6 +1249,7 @@ def test_background_machine_agent_publishes_pid_only_after_acquiring_authority(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
     source_root = Path(__file__).parents[3] / "src"
     monkeypatch.setenv("PYTHONPATH", str(source_root))
 
@@ -1266,6 +1268,7 @@ def test_background_machine_agent_publishes_pid_only_after_acquiring_authority(
 
 def test_first_registration_wait_is_consumed_without_dispatching_work(tmp_path: Path) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
     script = """
 import sys
 from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
@@ -1643,6 +1646,7 @@ def test_machine_control_rechecks_incomplete_startup_before_normal_interval(
 
 def test_restart_and_activation_share_one_lifecycle_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
     barrier = Barrier(3)
     state = {"is_running": False, "active_calls": 0, "max_active_calls": 0, "next_pid": 1000}
     errors: list[Exception] = []
@@ -1710,6 +1714,7 @@ def test_restart_waits_for_old_agent_process_after_identity_is_cleared(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
     source_root = Path(__file__).parents[3] / "src"
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(source_root)
@@ -1787,7 +1792,7 @@ with runtime.scheduler_authority(blocking=True):
 
 def test_machine_agent_ignores_a_reused_or_stale_pid_record(tmp_path: Path) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
-    runtime.ensure_layout()
+    initialize_machine(runtime, "gpu-1")
     runtime.paths["pid"].write_text(str(os.getpid()), encoding="utf-8")
     atomic_replace(
         runtime.paths["agent"] / "status.json",

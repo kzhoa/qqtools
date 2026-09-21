@@ -3,13 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp import AGENT_MODE_DAEMON, init_shared_root, submit
+from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.commands.group import create_group
-from qqtools.plugins.qexp.layout import load_context, load_root_config, runtime_pid_path
+from qqtools.plugins.qexp.layout import load_context, runtime_pid_path
 from qqtools.plugins.qexp.legacy_agent import get_agent_status
-from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, expire_claim, fail_attempt
 
@@ -116,7 +115,8 @@ def test_help_explains_existing_project_machine_join_and_context_only_use(capsys
 
     assert exc_info.value.code == 0
     top_level_output = " ".join(capsys.readouterr().out.split())
-    assert "To join a new machine to an existing project" in top_level_output
+    assert "qexp init --machine NAME" in top_level_output
+    assert "qexp project register PATH" in top_level_output
     assert "qexp use only saves local CLI" in top_level_output
 
     with pytest.raises(SystemExit) as exc_info:
@@ -124,7 +124,8 @@ def test_help_explains_existing_project_machine_join_and_context_only_use(capsys
 
     assert exc_info.value.code == 0
     init_output = " ".join(capsys.readouterr().out.split())
-    assert "registers the project with the local machine agent" in init_output
+    assert "local machine identity and global agent policy" in init_output
+    assert "qexp project register" in init_output
 
     with pytest.raises(SystemExit) as exc_info:
         main(["use", "--help"])
@@ -133,152 +134,6 @@ def test_help_explains_existing_project_machine_join_and_context_only_use(capsys
     use_output = " ".join(capsys.readouterr().out.split())
     assert "does not initialize a shared root" in use_output
     assert "or register the project with the local machine agent" in use_output
-
-
-def test_init_succeeds_when_context_save_fails(tmp_path: Path, monkeypatch, capsys):
-    root = tmp_path / ".qexp"
-    runtime_root = tmp_path / "rt"
-
-    def fail_save_context(*args, **kwargs):
-        raise OSError(30, "Read-only file system", "/readonly/.qqtools/qexp-context.json")
-
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.save_context", fail_save_context)
-
-    assert (
-        main(
-            [
-                "--shared-root",
-                str(root),
-                "--machine",
-                "gpu-1",
-                "--runtime-root",
-                str(runtime_root),
-                "--machine-runtime-root",
-                str(tmp_path / "machine-runtime"),
-                "init",
-            ]
-        )
-        == 0
-    )
-
-    captured = capsys.readouterr()
-    assert captured.out.strip().splitlines() == [
-        "Project initialized.",
-        "Machine registration completed.",
-        "Agent is not running.",
-        "Run: qexp agent start",
-    ]
-    assert "initialized successfully, but failed to save CLI context" in captured.err
-    cfg = load_root_config(root, "gpu-1", runtime_root, require_initialized=True)
-    assert cfg.shared_root == root.resolve()
-
-
-def test_init_registers_project_with_machine_agent(tmp_path: Path, capsys):
-    root = tmp_path / ".qexp"
-    runtime_root = tmp_path / "rt"
-    machine_runtime_root = tmp_path / "machine-runtime"
-    args = [
-        "--shared-root",
-        str(root),
-        "--machine",
-        "gpu-1",
-        "--runtime-root",
-        str(runtime_root),
-        "--machine-runtime-root",
-        str(machine_runtime_root),
-        "init",
-    ]
-
-    assert main(args) == 0
-    assert main(args) == 0
-
-    cfg = load_root_config(root, "gpu-1", runtime_root, require_initialized=True)
-    _, bindings = MachineRuntime(machine_runtime_root).load_registry()
-    assert len(bindings) == 1
-    assert bindings[0].shared_root == cfg.shared_root
-    assert bindings[0].machine_name == "gpu-1"
-
-
-def test_init_rejects_project_legacy_metadata_without_overwriting_it(tmp_path: Path, capsys):
-    root = tmp_path / ".qexp"
-    runtime_root = tmp_path / "legacy-runtime"
-    cfg = init_shared_root(root, "gpu-1", runtime_root=runtime_root)
-    record_path = cfg.shared_root / "machines" / cfg.machine_name / "machine.json"
-    record = json.loads(record_path.read_text(encoding="utf-8"))
-    record["machine"].pop("agent_runtime")
-    record_path.write_text(json.dumps(record), encoding="utf-8")
-
-    assert (
-        main(
-            [
-                "--shared-root",
-                str(root),
-                "--machine",
-                "gpu-2",
-                "--runtime-root",
-                str(runtime_root),
-                "init",
-            ]
-        )
-        == 2
-    )
-
-    assert "qexp agent migrate-project" in capsys.readouterr().err
-    assert json.loads(record_path.read_text(encoding="utf-8")) == record
-    assert not (cfg.shared_root / "machines" / "gpu-2").exists()
-
-
-def test_init_allows_project_local_machine_names_in_one_runtime(tmp_path: Path):
-    machine_runtime_root = tmp_path / "machine-runtime"
-    for project, machine_name in (("first", "a"), ("second", "b")):
-        assert (
-            main(
-                [
-                    "--shared-root",
-                    str(tmp_path / project / ".qexp"),
-                    "--machine",
-                    machine_name,
-                    "--machine-runtime-root",
-                    str(machine_runtime_root),
-                    "init",
-                ]
-            )
-            == 0
-        )
-
-    _, bindings = MachineRuntime(machine_runtime_root).load_registry()
-    assert {(binding.shared_root.parent.name, binding.machine_name) for binding in bindings} == {
-        ("first", "a"),
-        ("second", "b"),
-    }
-
-
-def test_init_reports_recoverable_registration_failure(tmp_path: Path, monkeypatch, capsys):
-    saved_contexts = []
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.register_project",
-        lambda *_args: (_ for _ in ()).throw(OSError("machine runtime unavailable")),
-    )
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli._try_save_context",
-        lambda *args: saved_contexts.append(args),
-    )
-
-    assert (
-        main(
-            [
-                "--shared-root",
-                str(tmp_path / ".qexp"),
-                "--machine",
-                "gpu-1",
-                "init",
-            ]
-        )
-        == 2
-    )
-
-    assert saved_contexts == []
-    assert "initialized but was not registered" in capsys.readouterr().err
 
 
 def test_use_still_fails_when_context_save_fails(tmp_path: Path, monkeypatch):
@@ -365,59 +220,8 @@ def test_unbound_context_allows_reads_but_mutations_explain_join_and_recovery(
     assert main(["task", "list", "--format=json"]) == 0
     assert main(["submit", "--no-activate", "--", "echo", "blocked"]) == 2
     error = capsys.readouterr().err
-    assert "qexp init" in error
-    assert "qexp agent add-project" in error
+    assert "qexp project register" in error
     assert not list((cfg.shared_root / "tasks").glob("*.json"))
-
-
-def test_agent_add_project_requires_explicit_identity_without_a_binding(tmp_path: Path, monkeypatch, capsys) -> None:
-    context_path = tmp_path / "context.json"
-    monkeypatch.setattr("qqtools.plugins.qexp.layout._CONTEXT_PATH", context_path)
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
-    context_path.write_text(json.dumps({"shared_root": str(cfg.shared_root), "machine": "gpu-1"}), encoding="utf-8")
-    runtime_root = tmp_path / "machine-runtime"
-
-    assert main(["--machine-runtime-root", str(runtime_root), "agent", "add-project", "--format=json"]) == 2
-    assert "require --machine or QEXP_MACHINE" in capsys.readouterr().err
-    assert (
-        main(
-            [
-                "--machine",
-                "gpu-1",
-                "--machine-runtime-root",
-                str(runtime_root),
-                "agent",
-                "add-project",
-                "--format=json",
-            ]
-        )
-        == 0
-    )
-    assert json.loads(capsys.readouterr().out)["action"] == "project_added"
-
-
-def test_agent_start_starts_the_registered_global_agent(tmp_path: Path, monkeypatch, capsys):
-    cfg = init_shared_root(
-        tmp_path / ".qexp",
-        "gpu-1",
-        agent_mode=AGENT_MODE_DAEMON,
-        runtime_root=tmp_path / "rt",
-    )
-
-    from qqtools.plugins.qexp.agent.context import MachineRuntime
-
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
-    runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.start_local_agent",
-        lambda *_args, **_kwargs: (
-            "started",
-            {"agent_state": "active", "pid": 4321, "is_running": True},
-        ),
-    )
-
-    assert main([*_base_args(cfg), "--machine-runtime-root", str(runtime.root), "agent", "start", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out)["action"] == "started"
 
 
 def test_submit_requires_explicit_project_registration(tmp_path: Path, capsys):
@@ -441,7 +245,7 @@ def test_submit_requires_explicit_project_registration(tmp_path: Path, capsys):
         "ok",
     ]
     assert main(args) == 2
-    assert "qexp agent add-project" in capsys.readouterr().err
+    assert "qexp project register" in capsys.readouterr().err
 
 
 def test_agent_start_rejects_removed_background_flag(tmp_path: Path):
@@ -458,24 +262,15 @@ def test_agent_run_reports_foreground_start(tmp_path: Path, monkeypatch, capsys)
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     received = []
 
-    def run_foreground(cfg, *, reason, on_started, machine_runtime=None):
+    def run_foreground(machine_runtime):
         assert machine_runtime.root == runtime.root
-        received.append(reason)
-        on_started(
-            {
-                "machine_name": cfg.machine_name,
-                "agent_state": "active",
-                "pid": 123,
-                "is_running": True,
-                "machine_runtime_root": str(runtime.root),
-            }
-        )
+        received.append("manual_run")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.run_local_agent_foreground", run_foreground)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle.run_machine_agent_loop", run_foreground)
 
     assert main([*_base_args(cfg), "--machine-runtime-root", str(runtime.root), "agent", "run", "--format=json"]) == 0
     assert received == ["manual_run"]
-    assert json.loads(capsys.readouterr().out)["action"] == "running"
+    assert capsys.readouterr().out == ""
 
 
 def test_agent_start_rejects_legacy_persistent_flag(tmp_path: Path):
@@ -649,257 +444,11 @@ def test_agent_restart_returns_structured_status(tmp_path: Path, monkeypatch, ca
     assert payload["previous_pid"] == 432
 
 
-def test_agent_add_project_is_explicit_and_machine_agent_prefix_is_not_public(tmp_path: Path, capsys) -> None:
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime_root = tmp_path / "machine-runtime"
-    args = [
-        "--shared-root",
-        str(cfg.shared_root),
-        "--machine",
-        cfg.machine_name,
-        "--runtime-root",
-        str(cfg.runtime_root),
-        "--machine-runtime-root",
-        str(runtime_root),
-    ]
-
-    assert main([*args, "agent", "add-project", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out)["action"] == "project_added"
-    assert main([*args, "agent", "add-project", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out)["action"] == "project_already_registered"
-    with pytest.raises(SystemExit):
-        main(["machine-agent", "status"])
-
-
-def test_machine_agent_status_branches_before_project_configuration(tmp_path: Path, capsys) -> None:
+def test_machine_agent_status_rejects_an_uninitialized_runtime(tmp_path: Path, capsys) -> None:
     runtime_root = tmp_path / "machine-runtime"
 
-    assert main(["--machine-runtime-root", str(runtime_root), "agent", "status", "--format=json"]) == 0
-
-    output = json.loads(capsys.readouterr().out)
-    assert output["machine_runtime_root"] == str(runtime_root.resolve())
-    assert output["projects"] == []
-
-
-def test_agent_project_registry_commands(tmp_path: Path, capsys) -> None:
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime_root = tmp_path / "machine-runtime"
-    base = [
-        "--shared-root",
-        str(cfg.shared_root),
-        "--machine",
-        cfg.machine_name,
-        "--runtime-root",
-        str(cfg.runtime_root),
-        "--machine-runtime-root",
-        str(runtime_root),
-        "agent",
-    ]
-
-    assert main([*base, "add-project", "--format=json"]) == 0
-    added = json.loads(capsys.readouterr().out)
-    assert added["project_id"]
-
-    assert main(["--machine-runtime-root", str(runtime_root), "agent", "list-projects", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out)["projects"][0]["state"] == "enabled"
-
-    assert (
-        main(
-            [
-                "--machine-runtime-root",
-                str(runtime_root),
-                "agent",
-                "disable-project",
-                added["project_id"],
-                "--format=json",
-            ]
-        )
-        == 0
-    )
-    assert json.loads(capsys.readouterr().out)["enabled"] is False
-
-    assert (
-        main(
-            [
-                "--machine-runtime-root",
-                str(runtime_root),
-                "agent",
-                "remove-project",
-                added["project_id"],
-                "--format=json",
-            ]
-        )
-        == 0
-    )
-    assert json.loads(capsys.readouterr().out)["action"] == "project_removed"
-
-
-def test_agent_add_project_reports_disabled_state_and_enable_command(tmp_path: Path, capsys) -> None:
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime_root = tmp_path / "machine-runtime"
-    runtime = MachineRuntime(runtime_root)
-    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    runtime.set_enabled(binding.project_id, False)
-    base = [
-        "--shared-root",
-        str(cfg.shared_root),
-        "--machine",
-        cfg.machine_name,
-        "--runtime-root",
-        str(cfg.runtime_root),
-        "--machine-runtime-root",
-        str(runtime_root),
-        "agent",
-    ]
-
-    assert main([*base, "add-project", "--format=json"]) == 0
-    repeated = json.loads(capsys.readouterr().out)
-    assert repeated["action"] == "project_already_registered"
-    assert repeated["shared_root"] == str(cfg.shared_root)
-    assert repeated["message"] == (
-        "Project is already registered and remains disabled. Registration checks passed; "
-        "new task admission is disabled."
-    )
-    assert repeated["enable_command"].startswith("qexp --machine-runtime-root ")
-    assert binding.project_id in repeated["enable_command"]
-
-    assert main([*base, "enable-project", binding.project_id, "--format=json"]) == 0
-    enabled = json.loads(capsys.readouterr().out)
-    assert enabled["action"] == "project_enabled"
-    assert enabled["enabled"] is True
-
-
-def test_agent_add_project_can_create_a_new_logical_name_without_init(tmp_path: Path, capsys) -> None:
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime_root = tmp_path / "machine-runtime"
-    assert (
-        main(
-            [
-                "--shared-root",
-                str(cfg.shared_root),
-                "--machine",
-                "gpu-2",
-                "--runtime-root",
-                str(tmp_path / "gpu-2-runtime"),
-                "--machine-runtime-root",
-                str(runtime_root),
-                "agent",
-                "add-project",
-                "--format=json",
-            ]
-        )
-        == 0
-    )
-
-    result = json.loads(capsys.readouterr().out)
-    assert result["action"] == "project_added"
-    assert result["machine_name"] == "gpu-2"
-    assert (cfg.shared_root / "machines" / "gpu-2" / "machine.json").exists()
-
-
-def test_agent_add_project_recovery_replaces_a_superseded_local_binding(tmp_path: Path, capsys) -> None:
-    from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
-
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime_root = tmp_path / "machine-runtime"
-    runtime = MachineRuntime(runtime_root)
-    original = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
-    registration = read_json(registration_path)["registration"]
-    registration["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
-    atomic_replace(registration_path, {"registration": registration})
-    MachineRuntime(tmp_path / "replacement-runtime").add_binding(
-        cfg.shared_root,
-        cfg.machine_name,
-        adopt_existing=True,
-    )
-    assert runtime.registration_status(original)["state"] == "superseded"
-
-    result = main(
-        [
-            "--shared-root",
-            str(cfg.shared_root),
-            "--machine",
-            "gpu-1-replacement",
-            "--machine-runtime-root",
-            str(runtime_root),
-            "agent",
-            "add-project",
-            "--format=json",
-        ]
-    )
-
-    output = json.loads(capsys.readouterr().out)
-    assert result == 0
-    assert output["action"] == "project_added"
-    assert output["machine_name"] == "gpu-1-replacement"
-    assert runtime.load_registry()[1][0].machine_name == "gpu-1-replacement"
-
-
-def test_agent_add_project_adoption_reports_replaced_generation(tmp_path: Path, capsys) -> None:
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime_root = tmp_path / "machine-runtime"
-    runtime = MachineRuntime(runtime_root)
-    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
-    registration = read_json(registration_path)["registration"]
-    registration["runtime_instance_id"] = "uncertain-runtime"
-    registration["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
-    atomic_replace(registration_path, {"registration": registration})
-
-    assert (
-        main(
-            [
-                "--shared-root",
-                str(cfg.shared_root),
-                "--machine",
-                cfg.machine_name,
-                "--machine-runtime-root",
-                str(runtime_root),
-                "agent",
-                "add-project",
-                "--adopt-existing",
-                "--format=json",
-            ]
-        )
-        == 0
-    )
-    captured = capsys.readouterr()
-    assert binding.registration_generation in captured.err
-    assert "previous environment will lose automatic access" in captured.err
-    result = json.loads(captured.out)
-    assert result["action"] == "project_already_registered"
-    assert result["message"].startswith("Project registration ownership was adopted")
-
-
-def test_agent_project_add_can_register_while_scheduler_is_running(tmp_path: Path, capsys) -> None:
-    from qqtools.plugins.qexp.agent.context import MachineRuntime
-
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime_root = tmp_path / "machine-runtime"
-    runtime = MachineRuntime(runtime_root)
-    base = [
-        "--shared-root",
-        str(cfg.shared_root),
-        "--machine",
-        cfg.machine_name,
-        "--runtime-root",
-        str(cfg.runtime_root),
-        "--machine-runtime-root",
-        str(runtime_root),
-        "agent",
-    ]
-
-    with runtime.scheduler_authority(blocking=True):
-        result = main(
-            [
-                *base,
-                "add-project",
-            ]
-        )
-
-    assert result == 0
-    assert runtime.load_registry()[1]
+    assert main(["--machine-runtime-root", str(runtime_root), "agent", "status", "--format=json"]) == 2
+    assert "qexp init --machine NAME" in capsys.readouterr().err
 
 
 def test_read_only_task_list_does_not_initialize_machine_runtime(
@@ -917,7 +466,7 @@ def test_read_only_task_list_does_not_initialize_machine_runtime(
     assert not machine_runtime_root.exists()
 
 
-def test_legacy_project_requires_explicit_migration(tmp_path: Path, capsys) -> None:
+def test_legacy_project_requires_explicit_migration(tmp_path: Path, monkeypatch, capsys) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime_root = tmp_path / "machine-runtime"
     record_path = cfg.shared_root / "machines" / cfg.machine_name / "machine.json"
@@ -925,9 +474,13 @@ def test_legacy_project_requires_explicit_migration(tmp_path: Path, capsys) -> N
     record["machine"].pop("agent_runtime")
     record_path.write_text(json.dumps(record), encoding="utf-8")
     base = [*_base_args(cfg), "--machine-runtime-root", str(runtime_root), "agent"]
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_machine_agent_started",
+        lambda _runtime: (None, {}),
+    )
 
-    assert main([*base, "start"]) == 2
-    assert "qexp agent migrate-project" in capsys.readouterr().err
+    assert main([*base, "start", "--timeout", "0.1"]) == 2
+    assert "legacy_project_requires_migration" in capsys.readouterr().out
 
 
 def test_global_agent_status_and_stop_do_not_require_project_context(tmp_path: Path, monkeypatch, capsys) -> None:

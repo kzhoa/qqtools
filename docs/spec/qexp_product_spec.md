@@ -87,14 +87,15 @@ pitch or delivery change description, with explicit approval.
   allow the real runner to finish, then start the agent and observe the original Task/Attempt
   terminal outcome without manual repair or a successor launch.
 
-- New project activation: `qexp init -> qexp agent start`
-- New project submission: `qexp init -> qexp submit -- <command>`
+- New project activation: `qexp init --machine NAME -> qexp project init -> qexp project register -> qexp agent start`
+- New project submission: `qexp init --machine NAME -> qexp project init -> qexp project register -> qexp submit -- <command>`
 - Legacy project migration: `qexp agent migrate-project`
 
-`init` succeeds only after it initializes the project, writes the current machine configuration,
-and registers the current-generation binding; it does not start an agent. `agent start` starts
-the global agent only for an existing binding. It neither initializes nor registers a project and
-must not require `add-project` in the new-project workflow.
+`init --machine NAME` initializes or deliberately replaces only the local MachineRuntime identity
+and global agent configuration. `project init [PATH]` creates shared Project truth, and `project
+register PATH...` enrolls existing Projects in the current runtime. None of these commands starts
+the agent. `agent start` requires at least one enabled, registered Project and waits for current
+generation readiness; it never initializes or enrolls a Project.
 
 Unless `--no-activate` is supplied, `submit` activates the local agent for an existing binding
 and submitted work eventually converges through its normal scheduling lifecycle. `--no-activate`
@@ -107,8 +108,58 @@ write eligibility expires; local PID or runtime-path observations cannot shorten
 failed migration must not mark the project migrated or release or overwrite resources belonging to
 another project.
 
-`add-project` is an operations command for restoring a missing or removed current-generation
-binding; it is not part of new-project setup.
+The retired `agent add-project`, `list-projects`, `enable-project`, `disable-project`, and
+`remove-project` spellings do not forward to the new operations. During their registered
+compatibility window they fail with migration guidance to the corresponding `project` command.
+
+## Machine setup, Project enrollment, and image reuse
+
+One local MachineRuntime owns one random runtime ID, one mutable global `agent.name`, one global
+residency policy, one Project inventory, and one resource authority. Project-specific registration
+names do not create additional GPU or CPU pools. Names are administrative assertions rather than
+host attestations.
+
+`qexp init --machine NAME [--agent-mode daemon|on_demand]` always means fresh machine setup. The
+first invocation creates an identity without prompting. Replacing an existing identity, including
+with the same name, requires interactive confirmation or `--yes`, creates a new runtime ID, keeps
+configuration and inventory, and isolates old bindings and runtime evidence. It never changes
+shared registrations, Tasks, claims, or reservations. Verified or ambiguous live local execution
+always blocks replacement. Ordinary replacement also requires all recovery and terminal-publication
+obligations to be settled.
+
+`--detach-old-runtime` is an explicit recovery-responsibility exception for a copied environment.
+It permits unresolved evidence to be preserved in an isolated archive when local execution is
+known not to be live. It does not finalize work, release resources, adopt ownership, or prove that
+another recovery environment exists. The warning and structured result identify the old and new
+runtime IDs, archive, and unresolved obligations. A new runtime never consumes the archive.
+
+`qexp project init [PATH]` creates only shared Project truth and preserves a valid existing Project.
+`qexp project register PATH...` and `qexp project register --from-pool` enroll existing Projects
+without creating them or starting an agent. The saved inventory is distinct from effective
+bindings and records stable Project ID, canonical path, enablement, and whether the registration
+name follows the global default, is explicit, or has unresolved legacy provenance. Existing
+bindings keep their frozen effective names. A missing mount or name conflict is an entry-specific
+failure and does not roll back successful entries.
+
+`project list` reports inventory-only, registered, disabled, and conflicting entries. `project
+remove ID_OR_PATH` removes an inventory-only entry without mounting or reading the Project. A
+current binding retains its existing disable, recovery, reservation, and process-safety checks.
+Removal and pool enrollment serialize so a stale selection cannot recreate a removed entry.
+
+`qexp agent name` reads `agent.name`; `qexp agent name --set-to NAME` and `qexp config set agent
+--name NAME` update the same locked global value without changing the runtime ID or existing
+bindings. New default-source registrations use the current name. The default residency for a new
+runtime is `daemon`; `on_demand` is explicit. Legacy per-binding modes migrate once: any enabled
+daemon binding selects daemon, otherwise enabled bindings select on-demand; stored bindings are the
+fallback and an empty inventory selects daemon.
+
+`agent start` is detached and idempotent. Its positive `--timeout` defaults to 30 seconds. Success
+requires a fresh response from the current runtime generation, acknowledgement of the requested
+policy revision, and authority validation plus an initial scheduler reconciliation for every
+enabled inventory entry captured by the invocation. Disabled entries are intentionally inactive;
+an enabled inventory-only or conflicting entry prevents readiness. Timeout is non-destructive and
+reports every selected Project's reason. `agent run` remains foreground; stop and restart preserve
+runner and recovery independence.
 
 Recommended reading order:
 
@@ -218,8 +269,8 @@ code visible at execution time. qexp does not freeze the source tree.
 
 ### 4.2 Why Users SSH and Submit Repeatedly
 
-Agents use on-demand mode by default because users do not want an unnecessary permanent
-service on every research machine.
+New machines use daemon mode by default. Operators who do not want a persistent service select
+`on_demand` explicitly.
 
 After a long period without qexp submissions, agents are likely to have exited. qexp does
 not promise remote wake-up. The user therefore needs to SSH into each intended machine and
@@ -824,8 +875,8 @@ limit below current usage reports `over_limit` and blocks later admission withou
 work. All writes and outputs use `gpu_limit_gpus`. A borrow Worker is persisted as
 `scheduling_role: borrow, state: active`; `draining` and `removing` remain non-claimable.
 
-An enabled local project binding is required on every target machine. `qexp init` creates the
-normal binding; `qexp agent add-project` restores a missing binding. Submitting on one machine
+An enabled local project binding is required on every target machine. `qexp project register`
+creates or restores the binding. Submitting on one machine
 does not wake another machine's on-demand agent. A running target agent observes later Group
 truth changes without re-registration.
 
@@ -1368,7 +1419,8 @@ decision rather than an execution-safety boundary.
 Shared mode requires an explicit machine name:
 
 ```bash
-qexp init --shared-root /path/to/project/.qexp --machine gpu2a
+qexp init --machine gpu2a
+qexp project register /path/to/project
 ```
 
 The machine name identifies a project-local logical worker; it does not identify a physical server.
@@ -1383,37 +1435,39 @@ compatibility assertions only; a mismatch fails before project mutation and sugg
 
 `qexp use --shared-root <project/.qexp>` is a local default-project selector. It writes only a
 canonical `shared_root`; it does not validate or register the Project, create a machine record, or
-select machine identity. `qexp init` remains the normal path that joins a machine and writes its
-binding. `qexp use` rejects machine/runtime inputs. With no binding, `agent add-project` and
-`agent migrate-project` require explicit `--machine` or `QEXP_MACHINE`; only `migrate-project`
-may additionally receive an explicit custom legacy runtime.
+select machine identity. `qexp project register` is the normal enrollment path. `qexp use` rejects
+machine/runtime inputs. `project register --machine NAME` accepts one explicit Project; the legacy
+`agent migrate-project` workflow still requires explicit machine identity and may receive an
+explicit custom legacy runtime.
 
 `qexp submit --home-machine <name>` selects Task placement independently. `current` and omission
 resolve to the verified local machine. A remote home needs valid current-generation shared Project
 machine metadata, but qexp does not remotely activate its agent or transfer project files.
 
-### 15.3 On-Demand Agent by Default
+### 15.3 Global Agent Residency
 
 Default behavior:
 
 - local work submission automatically starts the current machine's agent when needed, unless the
   submit invocation uses `--no-activate`
 - `on_demand` agents exit after true idleness; `daemon` agents remain active
-- A global agent remains active if any enabled binding opts into daemon mode. Binding order does
-  not select the policy. When all enabled bindings are on-demand, unresolved demand, maintenance
-  errors, or local execution evidence prevent idle exit.
+- one machine-global policy selects daemon or on-demand behavior for every binding; enabling or
+  disabling a Project does not change it
+- in on-demand mode, unresolved demand, maintenance errors, or local execution evidence prevent
+  idle exit
 - qexp does not remotely wake other machines
 
-Daemon mode is opt-in:
+Daemon mode is the default; on-demand is explicit:
 
 ```bash
-qexp init --shared-root /path/to/project/.qexp --machine gpu2a --agent-mode daemon
+qexp init --machine gpu2a --agent-mode daemon
+qexp project register /path/to/project
 qexp agent start
 ```
 
-`agent start` always starts a detached process. Use `qexp agent run` for foreground debugging.
-`init` initializes the project, records machine configuration, and registers its binding; it does
-not start a long-lived process.
+`agent start` ensures one detached process and waits for captured enabled Projects to be ready.
+Use `qexp agent run` for foreground debugging. Neither machine initialization nor Project
+registration starts a long-lived process.
 
 ### 15.4 Local Process Ownership
 
@@ -1437,11 +1491,12 @@ directly operate remote PIDs.
 Global-agent operations are local to the qexp Machine:
 
 ```bash
-qexp agent add-project
-qexp agent list-projects
-qexp agent enable-project <project-id-or-root>
-qexp agent disable-project <project-id-or-root>
-qexp agent remove-project <project-id-or-root>
+qexp project register /path/to/project
+qexp project register --from-pool
+qexp project list
+qexp project enable <project-id-or-root>
+qexp project disable <project-id-or-root>
+qexp project remove <project-id-or-root>
 qexp agent start
 qexp agent status
 qexp agent gpus show
@@ -1450,15 +1505,11 @@ qexp agent gpus set --none
 qexp agent gpus reset
 ```
 
-`qexp init` initializes and registers every new Project before it returns successfully. Ordinary
-`qexp agent start` never initializes or registers the current directory. `qexp agent add-project`
-is an idempotent operations command for restoring a removed or lost current-generation binding and
-may run while the global agent is active. It preserves an existing binding's enabled/disabled state
-and reports the actual project ID and shared path. It can replace a superseded local binding with an
-available logical name. Runtime identity is bound to both its local random identity and the current
-Linux host, so copying only the runtime directory cannot renew authority on another host. Reusing a
-retained logical name from an uncertain runtime requires explicit `--adopt-existing` after old write eligibility is invalid;
-`qexp agent enable-project <project-id-or-root>` revalidates registration authority before enabling
+`qexp project register` is idempotent for a valid current binding, preserves its enablement and
+effective name, and reports the actual Project ID and shared path. It never replaces an uncertain
+owner through recovery adoption. Runtime identity is bound to both its local random identity and
+the current Linux host, so copying only the runtime directory cannot renew authority on another
+host. `qexp project enable <project-id-or-root>` revalidates registration authority before enabling
 new admission. An existing Project without the global-agent machine-record marker must use the one-time
 `qexp agent migrate-project` command. It stops only a verified old agent process, imports local
 execution evidence, registers the Project, and then starts or wakes the global agent without
@@ -1501,7 +1552,11 @@ are exposed through Task/Group JSON, events, and `doctor` only.
 
 ### 16.1 Submission and Project Commands
 
-- `qexp init`
+- `qexp init --machine NAME`
+- `qexp project init [PATH]`
+- `qexp project register PATH... | --from-pool`
+- `qexp project list`
+- `qexp project enable | disable | remove <project-id-or-root>`
 - `qexp submit`
 - `qexp batch-submit`
 - `qexp top`
@@ -1577,11 +1632,10 @@ or `invalid`; each reason is an object containing the prerequisite `task_id` and
 - `qexp agent restart`
 - `qexp agent stop`
 - `qexp agent status`
+- `qexp agent name [--set-to NAME]`
 - `qexp agent gpus show`
 - `qexp agent gpus set --visible <ids> | --none [--expected-revision <revision>]`
 - `qexp agent gpus reset [--expected-revision <revision>]`
-- `qexp agent add-project | list-projects`
-- `qexp agent disable-project | remove-project <project-id-or-root>`
 - `qexp agent migrate-project`
 - `qexp doctor`
 - `qexp clean`

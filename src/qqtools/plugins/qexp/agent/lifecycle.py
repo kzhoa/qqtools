@@ -80,6 +80,7 @@ from ..scheduler import (
 )
 from . import dispatch_loop as _dispatch
 from . import helpers as _helpers
+from .config import load_agent_config
 from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
 from .control_plane import _MachineControlPlane
 from .dispatch_loop import dispatch_machine_cycle
@@ -92,6 +93,7 @@ from .helpers import (
     _publish_project_snapshots,
     _read_pid,
 )
+from .inventory import load_inventory
 from .project_admin import _stop_verified_legacy_agent, migrate_project
 from .recovery_capture import inspect_recovery_capture
 from .recovery_enrollment import RecoveryEnrollment
@@ -102,18 +104,21 @@ def get_machine_agent_status(
 ) -> dict[str, Any]:
     """Return machine-agent process and project-registry status."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
+    machine_runtime.require_initialized()
+    agent_config = load_agent_config(machine_runtime)
     identity = _active_machine_identity(machine_runtime)
     pid = identity[0] if identity is not None else _read_pid(machine_runtime)
     running = bool(identity or (pid and not probe_local_pid))
     revision, bindings = machine_runtime.load_registry()
+    inventory_revision, inventory_entries = load_inventory(machine_runtime)
+    try:
+        process_status = read_json(machine_runtime.paths["agent"] / "status.json").get("machine_agent", {})
+    except (OSError, TypeError, ValueError):
+        process_status = {}
+    if not isinstance(process_status, dict):
+        process_status = {}
     upgrade = inspect_registered_upgrades(machine_runtime)
-    waiting_for_first_registration = False
-    if running:
-        try:
-            status = read_json(machine_runtime.paths["agent"] / "status.json").get("machine_agent", {})
-            waiting_for_first_registration = bool(status.get("waiting_for_first_registration"))
-        except (OSError, TypeError, ValueError):
-            waiting_for_first_registration = False
+    waiting_for_first_registration = bool(process_status.get("waiting_for_first_registration")) if running else False
     projects = []
     for binding in bindings:
         try:
@@ -146,12 +151,30 @@ def get_machine_agent_status(
             project["recovery_command"] = (
                 f"qexp --shared-root {shlex.quote(str(binding.shared_root))} "
                 f"--machine {shlex.quote(replacement_name)} "
-                f"--machine-runtime-root {shlex.quote(str(machine_runtime.root))} agent add-project"
+                f"--machine-runtime-root {shlex.quote(str(machine_runtime.root))} project register {shlex.quote(str(binding.shared_root))}"
             )
             project["recovery_note"] = (
                 f"The example logical name {replacement_name!r} is illustrative; verify its availability before use."
             )
         projects.append(project)
+    bound_ids = {binding.project_id for binding in bindings}
+    for inventory_entry in inventory_entries:
+        if inventory_entry.project_id in bound_ids:
+            continue
+        projects.append(
+            {
+                **inventory_entry.to_dict(),
+                "state": "inventory_only" if inventory_entry.shared_root.is_dir() else "inventory_only",
+                "status": "inventory_only",
+                "mount_available": inventory_entry.shared_root.is_dir(),
+                "machine_name": inventory_entry.name_override,
+                "registration_generation": None,
+                "runtime_instance_id": None,
+                "eligibility": {"state": "unregistered", "write_eligible": False},
+                "write_eligible": False,
+                "reason": "missing_mount" if not inventory_entry.shared_root.is_dir() else "not_registered",
+            }
+        )
     try:
         gpu_policy = show_gpu_policy(machine_runtime)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
@@ -173,6 +196,17 @@ def get_machine_agent_status(
         }
     return {
         "machine_runtime_root": str(machine_runtime.root),
+        "runtime_id": machine_runtime.instance_id,
+        "configured_agent_mode": agent_config.agent_mode,
+        "observed_agent_mode": process_status.get("observed_agent_mode"),
+        "requested_policy_revision": process_status.get("policy_revision_requested", agent_config.revision),
+        "acknowledged_policy_revision": process_status.get("policy_revision_acknowledged"),
+        "policy_revision_requested": process_status.get("policy_revision_requested", agent_config.revision),
+        "policy_revision_acknowledged": process_status.get("policy_revision_acknowledged"),
+        "readiness": bool(process_status.get("ready")) and running,
+        "ready": bool(process_status.get("ready")) and running,
+        "inventory_revision": inventory_revision,
+        "reconciled_project_ids": process_status.get("reconciled_project_ids", []),
         "agent_state": "active" if running else "stopped",
         "pid": pid,
         "is_running": running,
@@ -198,7 +232,15 @@ def run_machine_agent_loop(
     if threading.current_thread() is not threading.main_thread():
         raise RuntimeError("machine agent loop must run in the process main thread.")
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
-    machine_runtime.ensure_layout()
+    machine_runtime.require_initialized()
+    if machine_runtime.paths["replacement_transaction"].exists():
+        raise RuntimeError("machine agent activation is blocked by a pending machine replacement.")
+    machine_runtime.ensure_layout(create_identity=False)
+    agent_config = load_agent_config(machine_runtime)
+    try:
+        initial_inventory_revision, _initial_inventory = load_inventory(machine_runtime)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        initial_inventory_revision = None
     pid_path = machine_runtime.paths["pid"]
     current_identity = _active_machine_identity(machine_runtime)
     if current_identity is not None and current_identity[0] != os.getpid():
@@ -210,6 +252,12 @@ def run_machine_agent_loop(
     stop = False
     stop_reason: str | None = None
     has_consumed_binding = False
+    policy_revision_requested = agent_config.revision
+    policy_revision_acknowledged: int | None = None
+    observed_agent_mode = agent_config.agent_mode
+    observed_inventory_revision = initial_inventory_revision
+    reconciled_project_ids: list[str] = []
+    cycle_completed = False
     idle_since: float | None = None
     upgrade_worker: MachineUpgradeWorker | None = None
     discovery_worker: MachineGroupDiscoveryWorker | None = None
@@ -245,6 +293,14 @@ def run_machine_agent_loop(
                 pid=os.getpid(),
                 start_ticks=start_ticks,
                 waiting_for_first_registration=True,
+                runtime_id=machine_runtime.instance_id,
+                configured_agent_mode=agent_config.agent_mode,
+                observed_agent_mode=observed_agent_mode,
+                policy_revision_requested=policy_revision_requested,
+                policy_revision_acknowledged=policy_revision_acknowledged,
+                inventory_revision=observed_inventory_revision,
+                reconciled_project_ids=reconciled_project_ids,
+                ready=False,
             )
             is_status_published = True
             control_plane = _MachineControlPlane(
@@ -266,6 +322,15 @@ def run_machine_agent_loop(
                 scheduler_wakeup.clear()
                 if stop:
                     break
+                try:
+                    agent_config = load_agent_config(machine_runtime)
+                    policy_revision_requested = agent_config.revision
+                    observed_agent_mode = agent_config.agent_mode
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    # Keep the last valid policy observation while the durable
+                    # config is being repaired or published by another actor.
+                    pass
+                cycle_completed = False
                 try:
                     recovery_enrollment.poll()
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
@@ -296,6 +361,7 @@ def run_machine_agent_loop(
                                 supervise=False,
                                 publish_snapshots=False,
                             )
+                            cycle_completed = True
                             if machine_runtime.last_cycle_consumed_binding or _consume_first_registered_binding(
                                 machine_runtime
                             ):
@@ -323,15 +389,49 @@ def run_machine_agent_loop(
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     pass
                 try:
-                    if has_consumed_binding:
-                        _publish_process_status(
-                            machine_runtime,
-                            instance_id=instance_id,
-                            pid=os.getpid(),
-                            start_ticks=start_ticks,
-                            waiting_for_first_registration=False,
-                        )
-                except OSError:
+                    observed_inventory_revision, observed_entries = load_inventory(machine_runtime)
+                    enabled_ids = {entry.project_id for entry in observed_entries if entry.enabled}
+                    if cycle_completed:
+                        _registry_revision, observed_bindings = machine_runtime.load_registry()
+                        reconciled_project_ids = [
+                            entry.project_id
+                            for entry in observed_entries
+                            if entry.enabled
+                            and any(
+                                binding.project_id == entry.project_id
+                                and machine_runtime.registration_status(binding).get("write_eligible", False)
+                                for binding in observed_bindings
+                            )
+                        ]
+                        # A completed scheduler cycle acknowledges the exact
+                        # config revision observed at its start.  A current,
+                        # authority-valid binding is the durable proof that its
+                        # initial reconciliation was admitted.
+                        policy_revision_acknowledged = policy_revision_requested
+                    else:
+                        enabled_ids = {entry.project_id for entry in observed_entries if entry.enabled}
+                    ready = bool(
+                        cycle_completed
+                        and enabled_ids
+                        and policy_revision_acknowledged == policy_revision_requested
+                        and enabled_ids.issubset(set(reconciled_project_ids))
+                    )
+                    _publish_process_status(
+                        machine_runtime,
+                        instance_id=instance_id,
+                        pid=os.getpid(),
+                        start_ticks=start_ticks,
+                        waiting_for_first_registration=not has_consumed_binding,
+                        runtime_id=machine_runtime.instance_id,
+                        configured_agent_mode=agent_config.agent_mode,
+                        observed_agent_mode=observed_agent_mode,
+                        policy_revision_requested=policy_revision_requested,
+                        policy_revision_acknowledged=policy_revision_acknowledged,
+                        inventory_revision=observed_inventory_revision,
+                        reconciled_project_ids=reconciled_project_ids,
+                        ready=ready,
+                    )
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     pass
                 try:
                     # Dispatch can take a full multi-project cycle. Consume the
@@ -420,6 +520,14 @@ def run_machine_agent_loop(
                                 "pid_start_time_ticks": start_ticks,
                                 "state": "stopped",
                                 "waiting_for_first_registration": False,
+                                "runtime_id": machine_runtime.instance_id,
+                                "configured_agent_mode": agent_config.agent_mode,
+                                "observed_agent_mode": observed_agent_mode,
+                                "policy_revision_requested": policy_revision_requested,
+                                "policy_revision_acknowledged": policy_revision_acknowledged,
+                                "inventory_revision": observed_inventory_revision,
+                                "reconciled_project_ids": reconciled_project_ids,
+                                "ready": False,
                             }
                         },
                     )
@@ -467,6 +575,9 @@ def start_machine_agent(
 ):
     """Spawn the unique persistent machine agent."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
+    machine_runtime.require_initialized()
+    if machine_runtime.paths["replacement_transaction"].exists():
+        raise RuntimeError("machine agent start is blocked by a pending machine replacement.")
     with machine_runtime.agent_lifecycle_guard():
         return _start_machine_agent_locked(
             machine_runtime,
@@ -489,6 +600,9 @@ def ensure_machine_agent_started(
 ):
     """Return the running agent status, starting it atomically when absent."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
+    machine_runtime.require_initialized()
+    if machine_runtime.paths["replacement_transaction"].exists():
+        raise RuntimeError("machine agent start is blocked by a pending machine replacement.")
     with machine_runtime.agent_lifecycle_guard():
         status = get_machine_agent_status(machine_runtime)
         if status["is_running"]:
@@ -531,6 +645,7 @@ def _stop_machine_agent_locked(machine_runtime: MachineRuntime, *, timeout: floa
 def stop_machine_agent(runtime: MachineRuntime | str | Path | None = None, *, timeout: float = 10.0) -> bool:
     """Request a graceful machine-agent stop and wait for the process to exit."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
+    machine_runtime.require_initialized()
     with machine_runtime.agent_lifecycle_guard():
         return _stop_machine_agent_locked(machine_runtime, timeout=timeout)
 
@@ -546,6 +661,7 @@ def restart_machine_agent(
 ):
     """Replace a running machine agent without treating it as a cold start."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
+    machine_runtime.require_initialized()
     with machine_runtime.agent_lifecycle_guard():
         identity = _active_machine_identity(machine_runtime)
         previous_pid = identity[0] if identity is not None else None

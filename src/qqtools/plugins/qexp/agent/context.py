@@ -107,6 +107,8 @@ class MachineRuntime:
         self.root = resolve_machine_runtime_root(root)
         self._scheduler_authority_gate = RLock()
         self._scheduler_authority_pid: int | None = None
+        self._inventory_lock_depth = 0
+        self._config_lock_depth = 0
         self.paths = machine_runtime_paths(self.root)
         self.last_diagnostic_publish_ns: int | None = None
         self.ready_batch_sizers: dict[str, AdaptiveBatchSizer] = {}
@@ -147,14 +149,45 @@ class MachineRuntime:
         try:
             value = read_json(self.paths["identity"]).get("machine_runtime", {})
             instance_id = value.get("instance_id")
+            effective_id = value.get("runtime_id")
         except (OSError, TypeError, ValueError):
             instance_id = None
+            effective_id = None
         if not isinstance(instance_id, str) or not instance_id:
             instance_id = uuid.uuid4().hex
             atomic_replace(self.paths["identity"], {"machine_runtime": {"instance_id": instance_id}})
+            effective_id = None
+        # A compatibility import can only preserve an already-effective ID;
+        # it has no way to reverse the host-bound digest into the old random
+        # seed.  New identities retain the random seed and derive the public
+        # 64-hex value on the current host.
+        if (
+            isinstance(effective_id, str)
+            and len(effective_id) == 64
+            and all(char in "0123456789abcdef" for char in effective_id)
+        ):
+            return effective_id
         return sha256(f"{instance_id}\0{_host_instance_id()}".encode()).hexdigest()
 
-    def ensure_layout(self) -> None:
+    @property
+    def has_identity(self) -> bool:
+        """Return whether a durable identity exists without creating runtime state."""
+        try:
+            value = read_json(self.paths["identity"]).get("machine_runtime", {})
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return False
+        instance_id = value.get("instance_id") if isinstance(value, dict) else None
+        return isinstance(instance_id, str) and bool(instance_id)
+
+    def require_initialized(self) -> None:
+        """Reject operational use of an uninitialized machine runtime."""
+        if not self.has_identity:
+            raise RuntimeError("qexp machine runtime is uninitialized; run 'qexp init --machine NAME'.")
+        from .config import load_agent_config
+
+        load_agent_config(self, require_initialized=True)
+
+    def ensure_layout(self, *, create_identity: bool = True) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         if not os.access(self.root, os.W_OK | os.X_OK):
             raise RuntimeError(f"machine runtime root is not writable: {self.root}")
@@ -170,14 +203,45 @@ class MachineRuntime:
             "projects",
             "upgrades",
             "diagnostics",
+            "archives",
+            "generations",
         ):
             self.paths[name].mkdir(parents=True, exist_ok=True)
         self.paths["cpu_policy"].parent.mkdir(parents=True, exist_ok=True)
         self.paths["cursor"].parent.mkdir(parents=True, exist_ok=True)
         self.paths["gpu_policy_observation"].parent.mkdir(parents=True, exist_ok=True)
         self.paths["gpu_policy_warnings"].parent.mkdir(parents=True, exist_ok=True)
-        if not self.paths["identity"].exists():
+        if create_identity and not self.paths["identity"].exists():
             atomic_replace(self.paths["identity"], {"machine_runtime": {"instance_id": uuid.uuid4().hex}})
+
+    def ensure_compatibility_identity(self) -> str:
+        """Synthesize an identity only for an existing pre-feature registry."""
+        if self.has_identity:
+            return self.instance_id
+        if not self.paths["registry"].exists():
+            raise RuntimeError("qexp machine runtime is uninitialized; run 'qexp init --machine NAME'.")
+        try:
+            value = read_json(self.paths["registry"])
+            bindings = value.get("registry", {}).get("bindings", [])
+        except (OSError, TypeError, ValueError):
+            bindings = []
+        preserved = next(
+            (
+                item.get("runtime_instance_id")
+                for item in bindings
+                if isinstance(item, dict)
+                and isinstance(item.get("runtime_instance_id"), str)
+                and item["runtime_instance_id"]
+            ),
+            None,
+        )
+        self.ensure_layout()
+        if isinstance(preserved, str) and len(preserved) == 64:
+            atomic_replace(
+                self.paths["identity"],
+                {"machine_runtime": {"instance_id": preserved, "runtime_id": preserved, "compatibility": True}},
+            )
+        return self.instance_id
 
     def project_paths(self, project_id: str) -> dict[str, Path]:
         return machine_project_paths(self.root, project_id)
@@ -228,9 +292,35 @@ class MachineRuntime:
     @contextmanager
     def agent_lifecycle_guard(self, *, blocking: bool = True) -> Iterator[bool]:
         """Serialize machine-agent start, stop, restart, and readiness checks."""
-        self.ensure_layout()
+        # Read-only lifecycle ownership must not implicitly create a machine
+        # identity.  ``qexp init`` relies on this distinction to tell an empty
+        # runtime from a replacement, while initialized callers still have
+        # their durable layout in place.
+        self.ensure_layout(create_identity=False)
         with exclusive(self.paths["locks"] / "activation.lock", blocking=blocking) as acquired:
             yield acquired
+
+    @contextmanager
+    def inventory_guard(self, *, blocking: bool = True) -> Iterator[bool]:
+        """Serialize inventory publication independently from the registry."""
+        self.ensure_layout(create_identity=False)
+        self._inventory_lock_depth += 1
+        try:
+            with exclusive(self.paths["inventory_lock"], blocking=blocking) as acquired:
+                yield acquired
+        finally:
+            self._inventory_lock_depth -= 1
+
+    @contextmanager
+    def config_guard(self, *, blocking: bool = True) -> Iterator[bool]:
+        """Serialize global configuration revisions."""
+        self.ensure_layout(create_identity=False)
+        self._config_lock_depth += 1
+        try:
+            with exclusive(self.paths["config_lock"], blocking=blocking) as acquired:
+                yield acquired
+        finally:
+            self._config_lock_depth -= 1
 
     @contextmanager
     def registry_guard(self, *, blocking: bool = True) -> Iterator[bool]:
@@ -781,7 +871,7 @@ class MachineRuntime:
                     raise ValueError(f"qexp machine record is malformed: {record_path}") from None
                 if not isinstance(machine, dict) or machine.get("agent_runtime") != "machine":
                     raise ValueError("legacy project metadata detected; run 'qexp agent migrate-project'.")
-            raise ValueError(f"no local project binding exists for {root}; run 'qexp agent add-project'.")
+            raise ValueError(f"no local project binding exists for {root}; run 'qexp project register {root}'.")
         if len(matches) > 1:
             machines = ", ".join(sorted(binding.machine_name for binding in matches))
             raise RuntimeError(f"local project binding is ambiguous for {root}: {machines}.")

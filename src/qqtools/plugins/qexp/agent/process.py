@@ -35,7 +35,8 @@ def spawn_machine_agent_process(
     if loop_interval is not None and loop_interval <= 0:
         raise ValueError("loop_interval must be positive.")
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
-    machine_runtime.ensure_layout()
+    machine_runtime.require_initialized()
+    machine_runtime.ensure_layout(create_identity=False)
     startup_log = tempfile.TemporaryFile(mode="w+", encoding="utf-8") if stderr is None else None
     command = [
         sys.executable,

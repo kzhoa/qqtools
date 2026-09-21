@@ -7,7 +7,16 @@ import time
 from pathlib import Path
 
 import pytest
-from qexp_e2e import ensure_site_packages_import, is_machine_agent_running, jrun, make_env, run, stop_agent, wait_for
+from qexp_e2e import (
+    ensure_site_packages_import,
+    initialize_machine_project,
+    is_machine_agent_running,
+    jrun,
+    make_env,
+    run,
+    stop_agent,
+    wait_for,
+)
 
 from qqtools.plugins.qexp.tmux import is_libtmux_available
 
@@ -37,7 +46,7 @@ def test_installed_cli_stop_offline_completion_start(tmp_path: Path) -> None:
         str(machine_runtime_root),
     ]
     try:
-        run([*common, "init", "--agent-mode", "daemon"], env=env)
+        initialize_machine_project(common, env=env, agent_mode="daemon")
         run([*common, "agent", "start"], env=env)
         wait_for(lambda: is_machine_agent_running(common, env=env), timeout=10, label="agent startup")
         command = [

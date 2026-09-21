@@ -133,6 +133,14 @@ def machine_runtime_paths(root: Path) -> dict[str, Path]:
     return {
         "root": root,
         "locks": root / "locks",
+        # Machine lifecycle/configuration records are deliberately separate from
+        # the effective binding registry.  The aliases keep callers that use
+        # the descriptive names (global_config/current_generation) and the
+        # short names (config/generation) on the same durable paths.
+        "lifecycle_lock": root / "locks" / "activation.lock",
+        "config_lock": root / "locks" / "config.lock",
+        "inventory_lock": root / "locks" / "inventory.lock",
+        "replacement_lock": root / "locks" / "replacement.lock",
         "scheduler_lock": root / "locks" / "scheduler.lock",
         "registry_lock": root / "locks" / "registry.lock",
         "reservation_lock": root / "locks" / "gpu-reservations.lock",
@@ -140,6 +148,16 @@ def machine_runtime_paths(root: Path) -> dict[str, Path]:
         "registry": root / "registry.json",
         "registration_transaction": root / "registration-transaction.json",
         "identity": root / "identity.json",
+        "global_config": root / "config.json",
+        "config": root / "config.json",
+        "inventory": root / "inventory.json",
+        "replacement_transaction": root / "replacement-transaction.json",
+        "archives": root / "archives",
+        "archive": root / "archives",
+        "current_generation": root / "current-generation.json",
+        "generation_evidence": root / "generations",
+        "generations": root / "generations",
+        "scheduler": root / "scheduler",
         "cursor": root / "scheduler" / "cursor.json",
         "upgrade_cursor": root / "scheduler" / "upgrade-cursor.json",
         "agent": root / "agent",

@@ -63,6 +63,7 @@ def register_project(
     shared_root: str | Path,
     machine_name: str,
     *,
+    enabled: bool = True,
     adopt_existing: bool = False,
 ) -> ProjectRegistration:
     """Register a current-generation project with the machine agent.
@@ -91,7 +92,12 @@ def register_project(
     if load_machine_record(cfg) is not None and is_legacy_agent_project(cfg):
         raise ValueError("legacy project metadata requires 'qexp agent migrate-project'.")
     previous = machine_runtime.matching_binding(cfg)
-    binding, is_added = machine_runtime.ensure_binding(shared_root, machine_name, adopt_existing=adopt_existing)
+    binding, is_added = machine_runtime.ensure_binding(
+        shared_root,
+        machine_name,
+        enabled=enabled,
+        adopt_existing=adopt_existing,
+    )
     is_generation_replaced = bool(
         previous is not None and previous.registration_generation != binding.registration_generation
     )
@@ -346,7 +352,7 @@ def migrate_project(runtime: MachineRuntime | str | Path | None, cfg: RootConfig
     existing = machine_runtime.matching_binding(cfg)
     if existing is None:
         if not is_legacy_agent_project(cfg):
-            raise ValueError("project already uses the machine-agent runtime; use 'qexp agent add-project'.")
+            raise ValueError("project already uses the machine-agent runtime; use 'qexp project register <PATH>'.")
         try:
             binding = machine_runtime.add_binding(
                 cfg.shared_root,
@@ -462,8 +468,8 @@ def _enable_command(machine_runtime: MachineRuntime, binding: ProjectBinding) ->
     """Build a copyable command using the actual runtime selected by the caller."""
     project = shlex.quote(binding.project_id)
     if machine_runtime.root == default_machine_runtime_root():
-        return f"qexp agent enable-project {project}"
-    return f"qexp --machine-runtime-root {shlex.quote(str(machine_runtime.root))} agent enable-project {project}"
+        return f"qexp project enable {project}"
+    return f"qexp --machine-runtime-root {shlex.quote(str(machine_runtime.root))} project enable {project}"
 
 
 def enable_project(runtime: MachineRuntime | str | Path | None, identifier: str | Path) -> ProjectBinding:

@@ -10,6 +10,7 @@ obvious from the test directory. Every linked test must exist; `Pending` is an e
 | qexp production default host authority | [installed CLI E2E](e2e/qexp/test_host_authority.py) | serial clean CI runner | covered |
 | qexp durable-write crash boundaries | [Integration](integration/qexp/test_store_crash_boundaries.py) | local preflight | covered |
 | qexp machine registration generations, eligibility, and logical-name reuse | [Integration](integration/qexp/test_machine_runtime.py), [CLI contract](integration/qexp/test_cli_contract.py) | qexp-integration / installed E2E | covered |
+| qexp machine fresh-start, Project inventory/enrollment, image detachment, and global readiness | [Integration](integration/qexp/test_machine_enrollment.py) | [installed protected workflows](e2e/qexp/test_compatibility_contract.py) / artifact E2E | covered |
 | qexp multi-participant claim, CAS, fencing, and cancel races | [machine lab](integration/qexp/test_machine_lab.py) | local preflight | covered |
 | qexp deterministic recovery decisions | [Unit](unit/qexp/test_architecture_primitives.py) | local preflight | covered |
 | qexp expanded seed and crash-point matrix | [Unit](unit/qexp/test_architecture_stress.py) | local preflight | covered |

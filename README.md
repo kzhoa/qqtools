@@ -118,25 +118,29 @@ It is built around a shared project root, can work on multi-machines with multi-
 Quick start:
 
 ```bash
-qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
+qexp init --machine gpu-a
+qexp project init /mnt/share/myproject
+qexp project register /mnt/share/myproject
+qexp use --shared-root /mnt/share/myproject/.qexp
 qexp submit --name demo1 -- python train.py -c config1.yaml
 qexp submit --name demo2 -- python train.py -c config2.yaml
 qexp submit --name demo3 -- python train.py -c config3.yaml
 # 3 tasks will be queued and run sequentially
 ```
 
-After `init`, `qexp` saves the canonical `shared_root` as this user's default project. Use
-`qexp use --shared-root <project/.qexp>` to switch that default; it neither joins a machine nor
-registers the project. Joining a machine remains `qexp init --shared-root <project/.qexp>
---machine <local-machine>`.
+`qexp init` creates the local machine identity and global agent configuration only. `project init`
+creates shared Project truth, `project register` enrolls it in this machine, and `qexp use
+--shared-root <project/.qexp>` selects the default Project for ordinary commands. Selection neither
+creates nor enrolls a Project.
 
-Each qexp Machine has one global `qexp agent` process. `qexp init` registers a normal new project
-with it; a project created by an older qexp release uses the one-time `qexp agent migrate-project`.
-`qexp agent start` only starts the global agent for an already registered project. `qexp agent run`
-is the foreground debugging command.
+Each qexp Machine has one global `qexp agent` process and one resource pool shared by all enrolled
+Projects. A Project created by an older release with legacy agent metadata uses the one-time `qexp
+agent migrate-project`. `qexp agent start` starts or reuses the global agent and waits for every
+enabled Project to become ready. `qexp agent run` is the foreground debugging command.
 
 ```bash
-qexp init --shared-root /mnt/share/myproject/.qexp --machine gpu-a
+qexp init --machine gpu-a --agent-mode daemon
+qexp project register /mnt/share/myproject
 qexp agent start
 qexp agent status
 qexp agent stop
@@ -162,9 +166,14 @@ external CUDA processes or physical GPU utilization.
 Upgrade qexp and restart each machine's global agent before relying on this policy. Downgrading to
 an older policy-unaware agent can expose GPUs again because the older agent ignores the policy file.
 
-`qexp init` automatically registers a new project with the machine agent. `qexp agent add-project`
-is an operations command for restoring a removed or lost current-generation registration; it is not
-part of normal setup. Older per-project-agent metadata must use `qexp agent migrate-project`.
+Use `qexp project list|enable|disable|remove` to manage local enrollment. The saved Project pool can
+be reconciled after a deliberate fresh identity with `qexp project register --from-pool`. Older
+per-project-agent metadata still uses the distinct `qexp agent migrate-project` recovery workflow.
+
+`qexp init` always creates a fresh runtime identity when one already exists, even when the name is
+unchanged. It therefore requires confirmation or `--yes`; use `qexp agent name --set-to NAME` for a
+name-only change. Copied images with unfinished evidence require the explicit
+`--detach-old-runtime` decision; do not use it when the copy is the only recovery environment.
 
 `--machine` is a project-local logical worker name and, for operational commands, a compatibility
 assertion against the local MachineRuntime binding. It is not the Task target. Use

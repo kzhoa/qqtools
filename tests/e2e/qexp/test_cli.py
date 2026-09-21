@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from qexp_e2e import ensure_site_packages_import, jrun, make_env, make_layout, run, stop_agent
+from qexp_e2e import (
+    ensure_site_packages_import,
+    initialize_machine_project,
+    jrun,
+    make_env,
+    make_layout,
+    run,
+    stop_agent,
+)
 
 
 def test_installed_wheel_cli_flow(tmp_path):
@@ -17,7 +25,7 @@ def test_installed_wheel_cli_flow(tmp_path):
         str(runtime_root),
     ]
     try:
-        run([*common, "init", "--agent-mode", "daemon"], env=env)
+        initialize_machine_project(common, env=env, agent_mode="daemon")
         tmux_policy = jrun([*common, "config", "tmux", "show"], env=env)
         group = jrun([*common, "group", "create", "release-e2e", "--workers", "gpu-1"], env=env)
         submit = run(

@@ -452,33 +452,38 @@ def test_batch_prepared_notice_precedes_task_staging(tmp_path: Path):
     assert observed == [(result.operation_id, result.idempotency_key)]
 
 
-def test_agent_project_list_human_and_json_share_the_registry_result(tmp_path: Path, capsys):
+def test_project_list_human_and_json_share_the_registry_result(tmp_path: Path, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     runtime_root = tmp_path / "machine-runtime"
-    runtime = MachineRuntime(runtime_root)
-    binding, _created = runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
-    base = ["--machine-runtime-root", str(runtime_root), "agent", "list-projects"]
+    prefix = ["--machine-runtime-root", str(runtime_root)]
+    assert main([*prefix, "init", "--machine", "gpu-1", "--format=json"]) == 0
+    capsys.readouterr()
+    assert main([*prefix, "project", "register", str(cfg.shared_root), "--format=json"]) == 0
+    binding = json.loads(capsys.readouterr().out)["projects"][0]
+    base = [*prefix, "project", "list"]
 
     assert main(base) == 0
     human = capsys.readouterr().out
     assert human.splitlines()[0].startswith("Project ID")
-    assert binding.project_id in human
+    assert binding["project_id"] in human
     assert str(cfg.shared_root) in human
     assert cfg.machine_name in human
 
     assert main([*base, "--format=json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["action"] == "project_list"
-    assert payload["projects"][0]["project_id"] == binding.project_id
+    assert payload["projects"][0]["project_id"] == binding["project_id"]
     assert "kind" not in payload
     assert "payload" not in payload
     assert "presentation" not in payload
 
 
-def test_empty_agent_project_list_human_output_uses_fixed_message(tmp_path: Path, capsys):
+def test_empty_project_list_human_output_uses_fixed_message(tmp_path: Path, capsys):
     runtime_root = tmp_path / "machine-runtime"
+    prefix = ["--machine-runtime-root", str(runtime_root)]
+    assert main([*prefix, "init", "--machine", "gpu-1", "--format=json"]) == 0
+    capsys.readouterr()
 
-    assert main(["--machine-runtime-root", str(runtime_root), "agent", "list-projects"]) == 0
+    assert main([*prefix, "project", "list"]) == 0
     assert capsys.readouterr().out == "No results.\n"
 
 

@@ -36,6 +36,12 @@ class OutputKind(str, Enum):
     AGENT_OPERATION = "agent-operation"
     AGENT_STATUS = "agent-status"
     AGENT_PROJECT_LIST = "agent-project-list"
+    AGENT_CONFIG = "agent-config"
+    AGENT_READINESS = "agent-readiness"
+    MACHINE_INIT = "machine-init"
+    PROJECT_OPERATION = "project-operation"
+    PROJECT_REGISTER = "project-register"
+    PROJECT_LIST = "project-list"
     CPU_LANE = "cpu-lane"
     GPU_POLICY = "gpu-policy"
     UPGRADE_REGISTRY_STATUS = "upgrade-registry-status"
@@ -510,6 +516,12 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
         result["agent_state"],
         (
             ("PID", result["pid"]),
+            ("Runtime ID", result.get("runtime_id")),
+            ("Configured mode", result.get("configured_agent_mode")),
+            ("Observed mode", result.get("observed_agent_mode")),
+            ("Requested policy revision", result.get("requested_policy_revision")),
+            ("Acknowledged policy revision", result.get("acknowledged_policy_revision")),
+            ("Ready", result.get("ready")),
             ("Registry revision", result["registry_revision"]),
             ("Registered projects", len(projects)),
             ("GPU policy", result.get("gpu_policy")),
@@ -535,6 +547,103 @@ def _render_agent_project_list(result: Mapping[str, Any], _presentation: Mapping
             )
             for project in result["projects"]
         ],
+    )
+
+
+def _render_machine_init(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _operation(
+        result.get("action"),
+        "completed",
+        (
+            ("Agent name", result.get("agent_name")),
+            ("Agent mode", result.get("agent_mode")),
+            ("Old runtime ID", result.get("old_runtime_id")),
+            ("New runtime ID", result.get("new_runtime_id")),
+            ("Detached", result.get("detached")),
+            ("Archive", result.get("archive_path")),
+            ("Obligations", result.get("obligations")),
+        ),
+    )
+
+
+def _render_project_operation(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _operation(
+        result.get("action"),
+        result.get("status", result.get("state", "completed")),
+        (
+            ("Project ID", result.get("project_id")),
+            ("Shared root", result.get("shared_root")),
+            ("Machine", result.get("machine_name")),
+            ("Enabled", result.get("enabled")),
+            ("Source", result.get("name_source")),
+            ("Local only", result.get("local_only")),
+            ("Reason", result.get("reason")),
+        ),
+    )
+
+
+def _render_project_register(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    projects = result.get("projects", ())
+    return _table(
+        ("Project ID", "Shared root", "Machine", "Source", "Enabled", "Status", "Reason"),
+        [
+            (
+                project.get("project_id"),
+                project.get("shared_root"),
+                project.get("machine_name"),
+                project.get("name_source"),
+                project.get("enabled"),
+                project.get("status"),
+                project.get("reason"),
+            )
+            for project in projects
+        ],
+    )
+
+
+def _render_project_list(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _table(
+        ("Project ID", "Shared root", "Machine", "Source", "Enabled", "Status", "Mount"),
+        [
+            (
+                project.get("project_id"),
+                project.get("shared_root"),
+                project.get("machine_name"),
+                project.get("name_source"),
+                project.get("enabled"),
+                project.get("status"),
+                project.get("mount_available"),
+            )
+            for project in result.get("projects", ())
+        ],
+    )
+
+
+def _render_agent_config(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _details(
+        (
+            ("Agent name", result.get("agent_name")),
+            ("Agent mode", result.get("agent_mode")),
+            ("Revision", result.get("revision")),
+            ("Provenance", result.get("provenance")),
+            ("Runtime ID", result.get("runtime_id")),
+        )
+    )
+
+
+def _render_agent_readiness(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _operation(
+        "agent start",
+        "ready" if result.get("ready") else "not ready",
+        (
+            ("Runtime ID", result.get("runtime_id")),
+            ("Agent state", result.get("agent_state")),
+            ("Requested policy revision", result.get("requested_policy_revision")),
+            ("Observed policy revision", result.get("observed_policy_revision")),
+            ("Inventory revision", result.get("inventory_revision")),
+            ("Reasons", result.get("reasons", result.get("reason"))),
+            ("Projects", result.get("projects")),
+        ),
     )
 
 
@@ -973,6 +1082,69 @@ def _validate_agent_project_list(result: Any) -> None:
         _validate_project(project, f"agent-project-list payload.projects[{index}]")
 
 
+def _validate_machine_init(result: Any) -> None:
+    value = _mapping(result, "machine-init payload")
+    if _required(value, "action", "machine-init payload") not in {"initialized", "reinitialized"}:
+        raise ValueError("machine-init payload.action is invalid")
+    for key in (
+        "agent_name",
+        "agent_mode",
+        "old_runtime_id",
+        "new_runtime_id",
+        "detached",
+        "archive_path",
+        "obligations",
+    ):
+        _required(value, key, "machine-init payload")
+    _required_bool(value, "detached", "machine-init payload")
+    if not isinstance(value["new_runtime_id"], str) or len(value["new_runtime_id"]) != 64:
+        raise ValueError("machine-init payload.new_runtime_id must be a 64-hex runtime ID")
+    _required_sequence(value, "obligations", "machine-init payload")
+
+
+def _validate_project_operation(result: Any) -> None:
+    value = _mapping(result, "project-operation payload")
+    _required(value, "action", "project-operation payload")
+    if "project_id" in value:
+        _required(value, "shared_root", "project-operation payload")
+
+
+def _validate_project_register(result: Any) -> None:
+    value = _mapping(result, "project-register payload")
+    _required_int(value, "revision", "project-register payload")
+    projects = _required_sequence(value, "projects", "project-register payload")
+    for index, item in enumerate(projects):
+        project = _mapping(item, f"project-register payload.projects[{index}]")
+        for key in ("project_id", "shared_root", "enabled", "name_source", "status"):
+            _required(project, key, f"project-register payload.projects[{index}]")
+
+
+def _validate_project_list(result: Any) -> None:
+    value = _mapping(result, "project-list payload")
+    _required_int(value, "revision", "project-list payload")
+    projects = _required_sequence(value, "projects", "project-list payload")
+    for index, item in enumerate(projects):
+        project = _mapping(item, f"project-list payload.projects[{index}]")
+        for key in ("project_id", "shared_root", "enabled", "name_source", "status", "mount_available"):
+            _required(project, key, f"project-list payload.projects[{index}]")
+        _required_bool(project, "enabled", f"project-list payload.projects[{index}]")
+        _required_bool(project, "mount_available", f"project-list payload.projects[{index}]")
+
+
+def _validate_agent_config(result: Any) -> None:
+    value = _mapping(result, "agent-config payload")
+    for key in ("agent_name", "agent_mode", "revision", "provenance", "runtime_id"):
+        _required(value, key, "agent-config payload")
+    _required_int(value, "revision", "agent-config payload")
+
+
+def _validate_agent_readiness(result: Any) -> None:
+    value = _mapping(result, "agent-readiness payload")
+    _required_bool(value, "ready", "agent-readiness payload")
+    _required(value, "projects", "agent-readiness payload")
+    _sequence(value["projects"], "agent-readiness payload.projects")
+
+
 def _validate_agent_status(result: Any) -> None:
     value = _mapping(result, "agent-status payload")
     if _required(value, "action", "agent-status payload") != "status":
@@ -1181,6 +1353,12 @@ _REGISTRY: dict[OutputKind, _OutputContract] = {
     OutputKind.AGENT_OPERATION: _OutputContract(_validate_agent_operation, _render_agent_operation),
     OutputKind.AGENT_STATUS: _OutputContract(_validate_agent_status, _render_agent_status),
     OutputKind.AGENT_PROJECT_LIST: _OutputContract(_validate_agent_project_list, _render_agent_project_list),
+    OutputKind.AGENT_CONFIG: _OutputContract(_validate_agent_config, _render_agent_config),
+    OutputKind.AGENT_READINESS: _OutputContract(_validate_agent_readiness, _render_agent_readiness),
+    OutputKind.MACHINE_INIT: _OutputContract(_validate_machine_init, _render_machine_init),
+    OutputKind.PROJECT_OPERATION: _OutputContract(_validate_project_operation, _render_project_operation),
+    OutputKind.PROJECT_REGISTER: _OutputContract(_validate_project_register, _render_project_register),
+    OutputKind.PROJECT_LIST: _OutputContract(_validate_project_list, _render_project_list),
     OutputKind.CPU_LANE: _OutputContract(_validate_cpu_lane, _render_cpu_lane),
     OutputKind.GPU_POLICY: _OutputContract(_validate_gpu_policy, _render_gpu_policy),
     OutputKind.UPGRADE_REGISTRY_STATUS: _OutputContract(_validate_upgrade_registry, _render_upgrade_registry),

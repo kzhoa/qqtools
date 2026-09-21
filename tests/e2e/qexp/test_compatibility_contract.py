@@ -6,6 +6,7 @@ from pathlib import Path
 from qexp_e2e import (
     TASK_TERMINAL_TIMEOUT_SECONDS,
     ensure_site_packages_import,
+    initialize_machine_project,
     is_machine_agent_running,
     jrun,
     make_env,
@@ -43,7 +44,7 @@ def _wait_for_terminal_task(common: list[str], task_id: str, env: dict[str, str]
 
 
 def _assert_current_project_is_registered(common: list[str], shared_root: Path, env: dict[str, str]) -> None:
-    projects = jrun([*common, "agent", "list-projects"], env=env)["projects"]
+    projects = jrun([*common, "project", "list"], env=env)["projects"]
     assert any(project["shared_root"] == str(shared_root) for project in projects)
 
 
@@ -77,7 +78,7 @@ def test_new_project_activation_uses_registered_binding_without_add_project(tmp_
     common = _common(shared_root, runtime_root, machine_runtime_root)
 
     try:
-        run([*common, "init"], env=env)
+        initialize_machine_project(common, env=env)
         _assert_current_project_is_registered(common, shared_root, env)
         started = run([*common, "agent", "start", "--format=json"], env=env)
         status = json.loads(started.stdout)
@@ -103,7 +104,7 @@ def test_new_project_submit_activates_agent_without_manual_registration(tmp_path
     common = _common(shared_root, runtime_root, machine_runtime_root)
 
     try:
-        run([*common, "init"], env=env)
+        initialize_machine_project(common, env=env)
         _assert_current_project_is_registered(common, shared_root, env)
         assert not is_machine_agent_running(common, env=env)
 
@@ -135,7 +136,7 @@ def test_legacy_metadata_requires_migration_without_touching_unrelated_resources
     unrelated_reservation_path = machine_runtime_root / "reservations" / "active" / "unrelated.json"
 
     try:
-        run([*bootstrap_common, "init"], env=env)
+        initialize_machine_project(bootstrap_common, env=env)
         record = json.loads(record_path.read_text(encoding="utf-8"))
         record["machine"].pop("agent_runtime")
         record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
@@ -159,21 +160,8 @@ def test_legacy_metadata_requires_migration_without_touching_unrelated_resources
 
         other_root = base / "other-project" / ".qexp"
         other_runtime_root = base / "other-runtime"
-        run(
-            [
-                "qexp",
-                "--shared-root",
-                str(other_root),
-                "--machine",
-                "gpu-other",
-                "--runtime-root",
-                str(other_runtime_root),
-                "--machine-runtime-root",
-                str(machine_runtime_root),
-                "init",
-            ],
-            env=env,
-        )
+        other_common = _common(other_root, other_runtime_root, machine_runtime_root)
+        initialize_machine_project(other_common, env=env)
         unrelated_reservation_path.parent.mkdir(parents=True, exist_ok=True)
         unrelated_reservation_path.write_text(
             json.dumps(
@@ -194,15 +182,11 @@ def test_legacy_metadata_requires_migration_without_touching_unrelated_resources
         rejected = run(
             [
                 "qexp",
-                "--shared-root",
-                str(shared_root),
-                "--machine",
-                "gpu-2",
-                "--runtime-root",
-                str(runtime_root),
                 "--machine-runtime-root",
                 str(machine_runtime_root),
-                "init",
+                "project",
+                "register",
+                str(shared_root.parent),
             ],
             env=env,
             check=False,

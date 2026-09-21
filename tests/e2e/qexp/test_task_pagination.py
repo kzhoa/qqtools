@@ -2,7 +2,15 @@
 
 import json
 
-from qexp_e2e import ensure_site_packages_import, jrun, make_env, make_layout, run, stop_agent
+from qexp_e2e import (
+    ensure_site_packages_import,
+    initialize_machine_project,
+    jrun,
+    make_env,
+    make_layout,
+    run,
+    stop_agent,
+)
 
 
 def test_installed_task_pagination(tmp_path):
@@ -11,7 +19,7 @@ def test_installed_task_pagination(tmp_path):
     ensure_site_packages_import()
     common = ["qexp", "--shared-root", str(shared_root), "--machine", "gpu-1", "--runtime-root", str(runtime_root)]
     try:
-        run([*common, "init"], env=env)
+        initialize_machine_project(common, env=env)
         for key in ["page-a", "page-b", "page-c"]:
             run([*common, "submit", "--no-activate", "--task-id", key, "--", "true"], env=env)
         legacy = jrun([*common, "task", "list"], env=env)
