@@ -25,7 +25,14 @@ from pathlib import Path
 from typing import Any
 
 from ...agent.context import MachineRuntime, ProjectBinding
-from ..group_namespace import group_authority_identity, group_directory, is_group_authority_isolated
+from ..group_namespace import (
+    GroupNotPublished,
+    GroupPublicationUnavailable,
+    group_authority_identity,
+    group_directory,
+    is_group_authority_isolated,
+    read_group,
+)
 from ..paths import group_path, shared_paths, submission_path
 from ..records import validate_group_name, validate_identifier
 from ..store import atomic_replace, read_json_limited, require_json_size
@@ -996,6 +1003,10 @@ class MachineGroupDiscoveryWorker:
             return None
         if step.candidates:
             group = step.candidates[0].stem
+            try:
+                read_group(binding.shared_root, group)
+            except (GroupNotPublished, GroupPublicationUnavailable):
+                return None
             return index, binding, group
         if step.state == "complete":
             sweeps.pop(key, None)
@@ -1055,6 +1066,7 @@ class MachineGroupDiscoveryWorker:
             self._restart_due[key] = old
             return
         try:
+            read_group(binding.shared_root, old.group)
             if not group_path(binding.shared_root, old.group).exists():
                 return
             entry = self._new_entry(binding, old.group)
@@ -1076,6 +1088,7 @@ class MachineGroupDiscoveryWorker:
             if not self._eligible_binding(entry.binding):
                 continue
             try:
+                read_group(entry.binding.shared_root, entry.group)
                 if not group_path(entry.binding.shared_root, entry.group).exists():
                     self._queue_entry_close(entry)
                     continue

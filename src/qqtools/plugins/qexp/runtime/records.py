@@ -467,21 +467,31 @@ def normalize_worker_member(worker: dict[str, Any], *, machine: str = "worker") 
 
 
 def normalize_group_record(data: dict[str, Any]) -> dict[str, Any]:
-    """Validate canonical Worker fields in a Group record without writing it."""
+    """Validate canonical Group fields without writing historical defaults."""
     group = data.get("group")
     if not isinstance(group, dict) or not isinstance(group.get("worker_set"), dict):
         raise ValueError("Group Worker Set is malformed.")
+    # Historical Group records predate submission-owned publication.  A read
+    # projection may normalize the absent additive field, but callers must
+    # explicitly persist it before relying on provenance.
+    group.setdefault("creation_operation_id", None)
+    creation_operation_id = group["creation_operation_id"]
+    if creation_operation_id is not None:
+        validate_identifier(creation_operation_id, "creation_operation_id")
     for machine, worker in group["worker_set"].items():
         normalize_worker_member(worker, machine=str(machine))
     return data
 
 
-def new_group(name: str, machine: str) -> dict[str, Any]:
+def new_group(name: str, machine: str, *, creation_operation_id: str | None = None) -> dict[str, Any]:
     validate_group_name(name)
+    if creation_operation_id is not None:
+        validate_identifier(creation_operation_id, "creation_operation_id")
     return {
         "meta": _meta(machine),
         "group": {
             "name": name,
+            "creation_operation_id": creation_operation_id,
             "admission_state": "open",
             "dispatch_state": "active",
             "dispatch_epoch": 0,

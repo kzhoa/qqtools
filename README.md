@@ -236,7 +236,7 @@ For normal task and cleanup workflows:
 
 ```bash
 qexp submit --group sweep -- python train.py --config a.yaml
-qexp batch-submit --group sweep --file runs.yaml
+qexp submit --file runs.yaml --group sweep
 qexp group pause sweep
 qexp task retry TASK_ID
 qexp task retry TASK_ID --acknowledge-duplicate-risk
@@ -280,11 +280,12 @@ Feishu notifications are sent as interactive cards with status colour, Markdown 
 terminal Task metadata. The card's `Notification Machine Time` field is the event's `finished_at` value from the
 machine clock; qexp does not query an external time source or convert it to the recipient's timezone.
 
-`batch-submit` manifests may set Group workers and nested placement defaults, with per-Task
+`submit --file` manifests may name a Group, set Group workers and nested placement defaults, with per-Task
 overrides:
 
 ```yaml
 group:
+  name: sweep
   workers: [g1, g2]
 defaults:
   tmux: false
@@ -303,9 +304,9 @@ tasks:
 ```
 
 Group membership is explicit: `group create` defaults to the current machine only when
-`--workers` is omitted, while an explicit list is exact. Submission never implicitly adds its
-origin machine. A single `submit --group NAME` requires an existing Group; a new Group can be
-created atomically by `batch-submit` only when the manifest declares a non-empty `group.workers`.
+`--workers` is omitted, while an explicit list is exact. Either submission mode can create a
+missing named Group atomically. A new Group without a worker declaration starts with the verified
+submitting machine; an explicit manifest declaration is exact. `--group` overrides `group.name`.
 
 During a shared-filesystem outage, the owning agent retains the training process and GPU
 reservation in `suspect` and then `isolated` state; it does not create a replacement Attempt
@@ -319,10 +320,11 @@ are the Task home machine, historical Attempt machines, and the machine that pre
 Pending operations report `waiting_ack` and the remaining machine names. Cleanup blocks retry,
 claim, cancel, and offer, and its tombstone permanently reserves the Task ID.
 
-`batch-submit` is only a bulk-input command and does not create a public Batch identity.
-Task-level `tmux` booleans override `batch-submit --tmux|--no-tmux`, which overrides
-`defaults.tmux`; null or omission inherits the next level. The normalized override is retained
-across retries without becoming a Group-wide default.
+File mode is only a bulk-input mode and does not create a public Batch identity. Explicit
+`submit --tmux|--no-tmux` overrides every Task, followed by Task and `defaults.tmux` values; null
+or omission inherits the next level. The normalized override is retained across retries without
+becoming a Group-wide default. Use `submit --dry-run` for a read-only normalized preview and
+`submit --quiet` for committed Task IDs only.
 
 Python API:
 

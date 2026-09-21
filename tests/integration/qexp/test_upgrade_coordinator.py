@@ -539,9 +539,11 @@ def test_released_manifest_before_ready_bootstrap_is_recognized_exactly(tmp_path
     released_schema = {
         "schema": {key: value for key, value in schema["schema"].items() if key != "writer_capabilities"}
     }
-    # Released bootstrap predates the observation capability added by current init.
+    # Released bootstrap predates the later independently fenced capabilities.
     released_schema["schema"]["required_capabilities"] = [
-        item for item in released_schema["schema"]["required_capabilities"] if item != "task-observation-v1"
+        item
+        for item in released_schema["schema"]["required_capabilities"]
+        if item not in {"task-observation-v1", "submission-group-publication-v1"}
     ]
     path = cfg.shared_root / "operations/upgrades/protocol-manifest.json"
     manifest = read_json(path)
@@ -586,7 +588,9 @@ def test_released_false_positive_journal_reconciles_only_proven_terminal_state(t
     manifest = read_json(manifest_path)
     # Keep this source fingerprint faithful to the actual released bootstrap.
     original["schema"]["required_capabilities"] = [
-        item for item in original["schema"]["required_capabilities"] if item != "task-observation-v1"
+        item
+        for item in original["schema"]["required_capabilities"]
+        if item not in {"task-observation-v1", "submission-group-publication-v1"}
     ]
     manifest["upgrade_protocol_manifest"]["schema_digest"] = production._digest(original)
     atomic_replace(manifest_path, manifest)

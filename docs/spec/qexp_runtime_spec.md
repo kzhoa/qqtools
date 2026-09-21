@@ -495,6 +495,7 @@ Required logical shape:
 ```yaml
 group:
   name: str
+  creation_operation_id: str | null
   admission_state: open | sealed
   dispatch_state: active | paused
   dispatch_epoch: int
@@ -521,6 +522,13 @@ group:
 
 Group rules:
 
+- `creation_operation_id` is null for administratively created and historical Groups; a non-null
+  value permanently identifies the Submission Operation that created the Group
+- a marked Group is effective only when that exact Submission Operation is proven committed;
+  missing, corrupt, unreadable, or noncommitted operation truth fails closed
+- ordinary list/show, status, Worker, scheduling, placement, admission, discovery, ready-member,
+  and aggregate readers share this visibility proof; diagnostic and repair paths may request raw
+  provisional truth while reporting its owner and recovery state
 - Group membership is derived from Task truth
 - each grouped Task receives one immutable `group_membership_sequence`
 - membership sequences are allocated only during commit under the Group lock
@@ -767,7 +775,7 @@ Submission rules:
 - missing historical `task_observation` means inherit. Present malformed metadata is not
   reinterpreted as inheritance and disables attachment with a bounded diagnostic
 - YAML formatting, key order, and manifest path are not semantic input
-- `--group` is the sole source of Group identity
+- explicit `--group` overrides manifest `group.name`; omission of both selects no Group
 - `--machine` and `QEXP_MACHINE` are identity assertions only; they must match the verified local
   binding and cannot select Task placement
 - `submit --home-machine` resolves `current` to the verified submitting machine; a non-current
@@ -775,14 +783,13 @@ Submission rules:
   remote activation or write target-machine local state
 - an ungrouped Task may use a non-current home only with private placement, making that home the
   complete eligibility set
-- manifest `group.name` is invalid
 - manifest Worker Set changes come only from `group.workers`; root `workers` and
   `defaults.placement.workers` are invalid
 - the first operation resolves `home_machine: current`, generated Task IDs, placement
   defaults, original submitting machine, planned Worker Set, Group revision/worker-set epoch, and
   explicit Worker Set additions exactly once
-- a single submit cannot create a missing Group; a bulk submit may create one only with a non-empty
-  manifest `group.workers` declaration, whose initial Worker Set is exact
+- either input mode may create a missing Group; without a Worker declaration the exact initial
+  Worker Set is the verified submitting machine, while an explicit declaration is exact
 - retries load the existing operation before resolving machine-relative values
 - the same key and raw request reuse the stored resolved context across machines
 - the same key with different raw input fails with an idempotency conflict
@@ -1146,15 +1153,14 @@ discovers, stops, or registers sibling projects.
 
 ### 10.1 Common Submission Pipeline
 
-`qexp submit` and each member of `qexp batch-submit` normalize into the same `TaskSpec` plus the
-separate durable Task-observation choice owned by their Submission Operation.
-Both commands use Submission Operation commit; a single submit is an operation containing
-one Task. This prevents a separate single-Task crash protocol from drifting away from
-bulk correctness.
+Command and file inputs to `qexp submit` normalize into the same `TaskSpec` plus the separate
+durable Task-observation choice owned by their Submission Operation. Both modes use Submission
+Operation commit; command input is an operation containing one Task. This prevents a separate
+single-Task crash protocol from drifting away from file-input correctness.
 
-Single submission keeps its lightweight CLI behavior. Its generated operation identity is
-internal and is exposed only through JSON diagnostics or `doctor` after interruption.
-Bulk submission additionally exposes the explicit idempotency-key retry contract.
+Both modes expose an explicit idempotency-key retry contract. An omitted key is generated and
+disclosed with its operation identity before staging. Presentation, quiet, and activation choices
+do not change submission-content identity.
 
 An ungrouped Task has no membership sequence and must use private placement because no
 Group Worker Set exists to authorize remote execution.
@@ -1163,14 +1169,15 @@ Group Worker Set exists to authorize remote execution.
 
 Submission executes:
 
-1. parse and normalize the complete raw request, including nullable Task tmux overrides
+1. parse and normalize the complete raw request, including nullable Task tmux overrides, resolved
+   working directories, Project path/source, effective Group source, and explicit overrides
 2. derive the raw-request digest
 3. exclusively create or load the idempotency mapping
 4. if existing, validate the raw digest and reuse its stored resolved context
 5. if new, acquire the Group lock when grouped
 6. resolve Task IDs, homes, placement, and explicit Worker Set additions against the planned
-   claimable Worker Set; a single submission rejects a missing Group, while bulk creation requires
-   a non-empty manifest `group.workers` declaration
+   claimable Worker Set; either mode may plan a missing Group, defaulting a declaration-absent new
+   Group to the verified submitting machine
 7. persist the Submission Operation and its matching `task_observation` metadata in `preparing`
 8. release the Group lock
 
@@ -1201,7 +1208,10 @@ This guard describes current code. Released writers lacking the locked checks
 remain subject to separate activation qualification; installing a new capability
 is not evidence that all old processes are fenced.
 
-The operation exists before Task staging, so `doctor` can recover a terminal interruption.
+The operation exists before Task or provisional Group publication, so `doctor` can recover a
+terminal interruption. Dry-run uses the same typed normalization and read-only checks but does not
+create an operation or idempotency mapping, allocate final Task IDs, persist clock evidence,
+activate an agent, or write any other state.
 Doctor reads, validates, and clears a terminal operation's pending Group commit only while holding
 the same schema and Group writer fences; it must not overwrite a Group snapshot read before those
 fences were acquired.
@@ -1215,8 +1225,8 @@ The runtime then:
 3. verifies that all staged Tasks exactly match the resolved context
 4. reacquires the Group lock when grouped
 5. resolves any earlier `pending_submission_commit`
-6. creates the Group when the stored plan requires it, or validates the existing Group,
-   admission state, and Worker Set preconditions
+6. creates an operation-owned provisional Group with `creation_operation_id` when the stored plan
+   requires it, or validates the existing Group, admission state, and Worker Set preconditions
 7. reserves membership sequences and Worker Set changes in Group
    `pending_submission_commit`
 8. persists the same assignments in the operation `commit_plan` and changes it to
@@ -1236,6 +1246,12 @@ Readers treat operation-tagged Worker Set additions as effective only when their
 Submission Operation is committed. This provides atomic scheduler visibility without
 requiring a cross-file filesystem transaction.
 
+Readers likewise treat a marked Group as effective only when its creation operation is committed.
+An existing Group remains visible while a later submission is pending; only that operation's
+Worker additions are filtered. An invisible provisional Group still occupies its Group name.
+Competing create/control/submission writers reconcile its owning operation under the schema and
+Group fences before reuse or mutation; they never overwrite it as though it were absent.
+
 Every operation that later acquires the Group lock first reconciles
 `pending_submission_commit`:
 
@@ -1248,14 +1264,18 @@ Crash behavior:
 
 - before operation creation: no durable submission exists
 - after operation creation but before complete staging: no staged Task is claimable
+- after provisional Group publication but before operation commit: ordinary readers and schedulers
+  expose no effective Group or pending Worker additions; diagnostics identify the owning operation
 - after complete staging but before commit: retry or `doctor` may commit idempotently
 - after the Submission Operation commit point but before Group finalization: Tasks and the
   committed Operation remain durable; retry or `doctor` reruns the Group finalizer
 - during `committing`: the Group pending pointer forces completion or abort before another
   Group mutation can overtake it
 - incompatible later Group changes: operation becomes `blocked` with an explicit reason
-- an abort removes only uncommitted staged truth and inactive Worker Set additions
+- an abort removes only uncommitted staged truth and inactive Worker Set additions; it may remove a
+  provisional Group only when creation provenance matches and no committed foreign truth is lost
 - a committed operation is never rolled back into `preparing`
+- operation retention must preserve commit proof for as long as a Group refers to it
 
 ## 11. Group Control Protocol
 
@@ -2735,7 +2755,7 @@ The runtime implementation is not releasable until tests demonstrate:
 - stale fencing tokens cannot mutate Task or Attempt truth
 - every GPU acquisition failure window converges without reservation leakage
 - cross-machine idempotent retry reuses the first resolved submission context
-- manifest `group.name` is rejected and `--group` remains the only Group identity source
+- explicit `--group` overrides manifest `group.name`, while omission of both remains ungrouped
 - uncommitted bulk Tasks are never claimable
 - Worker Set drain and removal cannot strand private or home-only queued Tasks
 - manual and `after_seconds` offering are idempotent under repeated scanners

@@ -116,6 +116,22 @@ it rejects reads and writes that exceed the declared slice byte budget before th
 The existing `upgrade schema6` flow below is a historical drained transition and is not converted
 to an online coordinator migration by this guide.
 
+### Submission-owned Group publication in 1.3.22
+
+`submission-group-publication-v1` protects Groups created inside Submission Operations. Upgrade the
+package and restart the global agent on each registered machine, one machine at a time. Running
+training continues. The agent advances the existing machine enrollment and Group-authority fence;
+only after the project requires the new capability may a submission publish a provisional Group
+carrying `creation_operation_id`. A 1.3.21 process then fails before project mutation instead of
+reading that Group as an ordinary active Group.
+
+Inspect rollout state with `qexp agent upgrade status --format json`. If normal enrollment cannot
+finish, use `qexp agent upgrade coordinate --format json` from the machine scope and resolve every
+reported inaccessible Project or participant. Do not remove `creation_operation_id`, edit the
+required-capability set, or delete a provisional Group file manually. Same-key `qexp submit` retry
+and `qexp doctor repair` own recovery. Submission-operation commit evidence must be retained for as
+long as any Group refers to it.
+
 ## Do not treat every qqtools upgrade as an agent restart
 
 Use the target protocol's documented activation procedure. An unchanged root

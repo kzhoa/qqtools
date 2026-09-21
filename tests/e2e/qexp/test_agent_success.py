@@ -50,6 +50,7 @@ def test_installed_wheel_agent_completes_task(tmp_path):
                 "submit",
                 "--name",
                 "success-job",
+                "--quiet",
                 "--",
                 "python",
                 "-c",

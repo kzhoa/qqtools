@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from ..config_types import RootConfig
 from ..layout import ensure_machine_layout, ensure_shared_layout, is_task_dependencies_root, validate_root_contract
-from ..manifest import parse_batch_manifest
+from ..manifest import UNSET, parse_submission_manifest
 from ..runtime.availability import (
     AvailabilityTransitionRequest,
     AvailabilityTransitionResult,
@@ -27,8 +27,10 @@ from ..runtime.ready import (
 )
 from ..runtime.records import AttemptRecord, TaskRecord, utc_now, validate_group_name
 from ..runtime.store import read_json
-from ..runtime.submission import SubmissionResult, submit_specs
+from ..runtime.submission import SubmissionResult as RuntimeSubmissionResult
+from ..runtime.submission import submit_specs
 from ..runtime.tasks import load_task, save_task
+from ..submission_contracts import SubmissionRequest
 from ..task_observation import validate_tmux_override
 
 
@@ -66,23 +68,58 @@ def submit(
     validate_root_contract(cfg)
     ensure_shared_layout(cfg)
     ensure_machine_layout(cfg)
-    items = [
-        {
-            "task_id": task_id,
-            "name": name,
-            "command": list(command),
-            "requested_gpus": requested_gpus,
-            "requested_cpus": requested_cpus,
-            "working_directory": str(Path(working_dir or Path.cwd()).resolve()),
-            "home_machine": "current" if home_machine is None else home_machine,
-            "sharing_mode": sharing_mode,
-            "fallback_machines": fallback_machines,
-            "offer_after_seconds": offer_after_seconds,
-            "depends_on_task_ids": depends_on_task_ids or [],
-            "tmux_override": tmux_override,
-        }
-    ]
-    return submit_specs(cfg, items, group_name=validate_group_name(group), idempotency_key=idempotency_key)[0]
+    item = {
+        "task_id": task_id,
+        "name": name,
+        "command": list(command),
+        "requested_gpus": requested_gpus,
+        "requested_cpus": requested_cpus,
+        "working_directory": str(Path(working_dir or Path.cwd()).resolve()),
+        "home_machine": "current" if home_machine is None else home_machine,
+        "sharing_mode": sharing_mode,
+        "fallback_machines": fallback_machines,
+        "offer_after_seconds": offer_after_seconds,
+        "depends_on_task_ids": depends_on_task_ids or [],
+        "tmux_override": tmux_override,
+    }
+    return submit_specs(cfg, [item], group_name=validate_group_name(group), idempotency_key=idempotency_key)[0]
+
+
+def submit_request(
+    cfg: RootConfig,
+    request: SubmissionRequest,
+    *,
+    on_prepared: Callable[[str, str], None] | None = None,
+) -> RuntimeSubmissionResult | Any:
+    """Enter the single submission workflow for command and file requests."""
+    if not isinstance(request, SubmissionRequest):
+        raise TypeError("request must be a qexp SubmissionRequest.")
+    validate_root_contract(cfg)
+    if request.dry_run:
+        # Preview is an explicitly separate runtime entry point.  Do not fall
+        # back to submit_specs: a preview must not reserve an idempotency key or
+        # create durable Task/operation truth.
+        from ..runtime.submission import preview_specs
+
+        return preview_specs(
+            cfg,
+            request.normalized_specs,
+            group_name=request.group_name,
+            idempotency_key=request.idempotency_key,
+            kind="single" if request.mode == "command" else "bulk",
+            worker_set=request.worker_set if request.workers_declared else None,
+        )
+    ensure_shared_layout(cfg)
+    ensure_machine_layout(cfg)
+    return submit_specs(
+        cfg,
+        request.normalized_specs,
+        group_name=request.group_name,
+        idempotency_key=request.idempotency_key,
+        kind="single" if request.mode == "command" else "bulk",
+        worker_set=request.worker_set if request.workers_declared else None,
+        on_prepared=on_prepared,
+    )
 
 
 def batch_submit(
@@ -93,18 +130,22 @@ def batch_submit(
     idempotency_key: str | None = None,
     tmux_override: bool | None = None,
     on_prepared: Callable[[str, str], None] | None = None,
-) -> SubmissionResult:
+) -> RuntimeSubmissionResult:
     validate_tmux_override(tmux_override)
     validate_root_contract(cfg)
     group_name = validate_group_name(group)
-    normalized, workers = parse_batch_manifest(Path(manifest_path), group_name=group_name, tmux_override=tmux_override)
+    manifest = parse_submission_manifest(
+        Path(manifest_path),
+        group_name=group_name if group_name is not None else UNSET,
+        tmux_override=tmux_override if tmux_override is not None else UNSET,
+    )
     return submit_specs(
         cfg,
-        normalized,
-        group_name=group_name,
+        list(manifest.specs),
+        group_name=manifest.group_name,
         idempotency_key=idempotency_key,
         kind="bulk",
-        worker_set=workers,
+        worker_set=manifest.workers if manifest.workers_declared else None,
         on_prepared=on_prepared,
     )
 

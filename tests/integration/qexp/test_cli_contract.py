@@ -299,7 +299,7 @@ def test_submit_without_activation_persists_task_and_skips_local_agent(tmp_path:
         lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
-    assert main([*_base_args(cfg), "submit", "--no-activate", "--", "echo", "ok"]) == 0
+    assert main([*_base_args(cfg), "submit", "--no-activate", "--quiet", "--", "echo", "ok"]) == 0
     task_id = capsys.readouterr().out.strip()
 
     assert reasons == []
@@ -326,8 +326,8 @@ def test_batch_submit_requests_local_agent_activation(tmp_path: Path, monkeypatc
         lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
-    assert main([*_base_args(cfg), "batch-submit", "--file", str(manifest), "--group", "demo"]) == 0
-    assert reasons == ["batch-submit"]
+    assert main([*_base_args(cfg), "submit", "--file", str(manifest), "--group", "demo"]) == 0
+    assert reasons == ["submit"]
 
 
 def test_retry_requests_local_agent_activation(tmp_path: Path, monkeypatch):

@@ -48,6 +48,7 @@ def _submit_remote_task(shared_root: Path, runtime: MachineRuntime, capsys: pyte
                 "--no-activate",
                 "--home-machine",
                 "g4",
+                "--quiet",
                 "--",
                 "echo",
                 "ok",
@@ -252,6 +253,7 @@ def test_machine_assertion_conflict_fails_before_mutation_even_without_activatio
                 "g4",
                 "submit",
                 "--no-activate",
+                "--quiet",
                 "--",
                 "echo",
                 "bad",
@@ -316,6 +318,7 @@ def test_saved_machine_and_legacy_runtime_do_not_override_verified_context(
                 str(tmp_path / "another-wrong-runtime"),
                 "submit",
                 "--no-activate",
+                "--quiet",
                 "--",
                 "echo",
                 "ok",
@@ -335,7 +338,7 @@ def test_saved_machine_and_legacy_runtime_do_not_override_verified_context(
     }
 
 
-def test_single_submit_does_not_create_missing_group_or_add_origin_worker(
+def test_single_submit_rejects_remote_home_not_declared_in_new_group(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     shared_root, runtime = _setup_project(tmp_path)
@@ -358,7 +361,7 @@ def test_single_submit_does_not_create_missing_group_or_add_origin_worker(
         )
         == 2
     )
-    assert "does not exist" in capsys.readouterr().err
+    assert "not an active worker" in capsys.readouterr().err
     assert not (shared_root / "groups" / "missing.json").exists()
     assert not list((shared_root / "tasks").glob("*.json"))
 
@@ -412,12 +415,9 @@ def test_batch_manifest_can_atomically_create_exact_worker_set(
     )
     monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", lambda *args, **kwargs: True)
 
-    assert (
-        main(_args(shared_root, runtime, "batch-submit", "--file", str(manifest), "--group", "exp", "--format=json"))
-        == 0
-    )
+    assert main(_args(shared_root, runtime, "submit", "--file", str(manifest), "--group", "exp", "--format=json")) == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["state"] == "committed"
+    assert result["outcome"] == "committed"
     assert set(read_json(group_path(shared_root, "exp"))["group"]["worker_set"]) == {"g4"}
 
 

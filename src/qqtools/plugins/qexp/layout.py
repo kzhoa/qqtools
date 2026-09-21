@@ -19,6 +19,7 @@ from .runtime.protocol_compatibility import (
     GROUP_READY_MEMBERS_CAPABILITY,
     OBSERVATION_CAPABILITY,
     READY_WRITER_CAPABILITY,
+    SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
     SUPPORTED_REQUIRED_CAPABILITIES,
     TASK_DEPENDENCIES_CAPABILITY,
 )
@@ -62,6 +63,9 @@ def read_schema_version(cfg: RootConfig) -> int | None:
 
 
 _CPU_LANE_REQUIRED_ERROR = "qexp root requires cpu-lane-v1; complete conversion with qqtools 1.3.15."
+_SUBMISSION_GROUP_REQUIRED_ERROR = (
+    "qexp root requires submission-group-publication-v1; restart the machine agent after upgrading qqtools."
+)
 
 
 def _read_cpu_lane_capability(cfg: RootConfig, *, is_required: bool) -> bool:
@@ -112,6 +116,28 @@ def is_group_ready_members_root(cfg: RootConfig) -> bool:
     if unknown:
         raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
     return GROUP_READY_MEMBERS_CAPABILITY in capabilities
+
+
+def is_submission_group_publication_root(cfg: RootConfig, *, is_required: bool = False) -> bool:
+    """Return whether Submission-owned provisional Group publication is fenced."""
+    path = _schema_path(cfg)
+    if not path.exists():
+        if is_required:
+            raise RuntimeError(_SUBMISSION_GROUP_REQUIRED_ERROR)
+        return False
+    capabilities = read_json(path).get("schema", {}).get("required_capabilities")
+    if capabilities is None:
+        if is_required:
+            raise RuntimeError(_SUBMISSION_GROUP_REQUIRED_ERROR)
+        return False
+    if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
+        raise RuntimeError("qexp schema/version.json has malformed required capabilities.")
+    unknown = sorted(set(capabilities) - SUPPORTED_REQUIRED_CAPABILITIES)
+    if unknown:
+        raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
+    if is_required and SUBMISSION_GROUP_PUBLICATION_CAPABILITY not in capabilities:
+        raise RuntimeError(_SUBMISSION_GROUP_REQUIRED_ERROR)
+    return SUBMISSION_GROUP_PUBLICATION_CAPABILITY in capabilities
 
 
 def _validate_root_contract(cfg: RootConfig, *, should_require_cpu_lane: bool) -> None:
@@ -220,6 +246,7 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                         TASK_DEPENDENCIES_CAPABILITY,
                         GROUP_READY_MEMBERS_CAPABILITY,
                         OBSERVATION_CAPABILITY,
+                        SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
                     ],
                     "writer_capabilities": [READY_WRITER_CAPABILITY],
                 }

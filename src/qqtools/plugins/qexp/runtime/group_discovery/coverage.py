@@ -17,9 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..group_namespace import group_authority_identity
+from ..group_namespace import group_authority_identity, read_group
 from ..locks import exclusive
-from ..paths import group_path
 from ..records import validate_group_name, validate_identifier
 from ..store import atomic_replace, read_json_limited
 from .member_reader import (
@@ -523,7 +522,7 @@ class GroupCoverage:
             raise _MalformedRecord("invalid coverage record") from exc
 
     def _group_state(self) -> tuple[int, bool]:
-        value = read_json_limited(group_path(self._root, self._group), max_bytes=_MAX_RECORD_BYTES)
+        value = read_group(self._root, self._group)
         group = value.get("group")
         if type(group) is not dict:
             raise ValueError("Group envelope is malformed")

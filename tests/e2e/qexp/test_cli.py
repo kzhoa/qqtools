@@ -37,6 +37,7 @@ def test_installed_wheel_cli_flow(tmp_path):
                 "--name",
                 "cli-release-e2e",
                 "--no-tmux",
+                "--quiet",
                 "--",
                 "python",
                 "-c",

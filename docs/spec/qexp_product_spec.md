@@ -280,10 +280,10 @@ Once the user already has 10 SSH sessions open, submitting one machine-specific 
 in each session is natural and efficient:
 
 ```text
-g1: qexp batch-submit --group stage-c1 --file runs-g1.yaml
-g2: qexp batch-submit --group stage-c1 --file runs-g2.yaml
+g1: qexp submit --file runs-g1.yaml --group stage-c1
+g2: qexp submit --file runs-g2.yaml --group stage-c1
 ...
-g10: qexp batch-submit --group stage-c1 --file runs-g10.yaml
+g10: qexp submit --file runs-g10.yaml --group stage-c1
 ```
 
 This is not a product failure or an obsolete workflow. It expresses deliberate ownership:
@@ -468,7 +468,7 @@ helper.
 ### 6.5 Submission Operation
 
 A Submission Operation is an internal transaction for safely creating one or more Tasks.
-Both `submit` and `batch-submit` may use it so single and bulk creation share one atomic
+Both command and file modes of `submit` use it so single and bulk creation share one atomic
 runtime path.
 
 It is not a public management object. Users do not pause, cancel, retry, or monitor work by
@@ -558,7 +558,7 @@ observes the same policy.
 
 ## 7. No Public Batch Entity
 
-`batch-submit` is retained as a familiar command name and manifest convenience. It means:
+`submit --file` is the manifest input mode. It means:
 
 > Reliably validate and submit multiple independent Tasks.
 
@@ -570,7 +570,7 @@ Rules:
 - Tasks submitted by one invocation do not form a permanent user-visible subgroup
 - one invocation must still be atomic from the scheduler's visibility perspective
 - interrupted bulk submission must be recoverable and idempotent
-- `batch-submit` must not make single-Task submission more complex
+- file input must not make command input more complex
 
 Old Batch records are not inspectable through the new product. The new implementation
 must reject unsupported old schema instead of preserving a legacy Batch surface.
@@ -676,10 +676,9 @@ tasks:
 
 Defaults:
 
-- `--group` is the sole source of Group identity for both `submit` and `batch-submit`
-- `group.name` in a manifest is invalid rather than a second source with precedence rules
-- a manifest `group` configuration block requires `--group` and configures fields such as
-  the initial or additional Worker Set
+- `--group` overrides `group.name`; omission of both means an ungrouped private submission
+- a manifest `group` configuration block may identify the Group and configure its initial or
+  additional Worker Set
 - `group.workers` is the only manifest Worker Set input; root `workers` and
   `defaults.placement.workers` are invalid
 - omitted `home_machine` resolves to the verified submitting machine
@@ -884,11 +883,11 @@ Worker Set invariants:
 
 - every grouped Task's home machine must be a claimable, non-draining Group worker when the
   Task is committed
-- submission never adds the submitting machine to the Worker Set implicitly
+- submission never adds the submitting machine to an existing Group's Worker Set implicitly
 - `group create` defaults to `{current}` when `--workers` is omitted; an explicit `--workers`
   list is the exact initial Worker Set
-- a single submit may target only an existing Group; a new Group may be atomically created by
-  `batch-submit` only when its manifest declares a non-empty `group.workers` list
+- either input mode may atomically create a missing named Group; without a worker declaration its
+  initial Worker Set is the verified submitting machine, while an explicit declaration is exact
 - an explicitly configured non-current home machine must already be a claimable worker
 - a manifest may add workers explicitly but must not silently remove or replace the existing
   Worker Set
@@ -986,10 +985,10 @@ The user SSHs to each machine because its on-demand agent may be asleep.
 
 ```bash
 # g1
-qexp batch-submit --group stage-c1 --file runs-g1.yaml
+qexp submit --file runs-g1.yaml --group stage-c1
 
 # g2
-qexp batch-submit --group stage-c1 --file runs-g2.yaml
+qexp submit --file runs-g2.yaml --group stage-c1
 ```
 
 The same pattern continues through g10.
@@ -1041,7 +1040,7 @@ Expected behavior:
 The initial 200 Tasks settle. The Group remains open. The user adds three control Tasks:
 
 ```bash
-qexp batch-submit --group stage-c1 --file additional-controls.yaml
+qexp submit --file additional-controls.yaml --group stage-c1
 ```
 
 Expected behavior:
@@ -1163,40 +1162,61 @@ old process, which is why ambiguous automatic retry remains forbidden.
 ```bash
 qexp submit --task-id qm9-seed-1 --group qm9-study -- python train.py --seed 1
 qexp submit --home-machine gpu-b -- python train.py --seed 1
+qexp submit --file runs.yaml
+qexp submit --file runs.yaml --group qm9-study
 ```
 
 Rules:
 
-- single-Task submission must not require YAML
+- exactly one input mode is required: a nonempty command after `--` or one `--file` manifest
+- single-Task command submission must not require YAML
+- mode-specific options are rejected before activation or publication
 - Group is optional for ad hoc Tasks
 - `--machine` is the verified local identity assertion; `--home-machine` selects Task placement
   and defaults to the verified current machine
 - a private Task is executable only by its home machine; a non-current private home requires a
   valid current-generation Project machine record and does not require a Group
 - selecting a remote home never starts or controls that machine's agent
-- a single `--group` submission requires an existing Group; it does not create or modify the
-  Group Worker Set implicitly
+- either mode may create a missing named Group inside its Submission Operation
 - duplicate `task_id` fails by default
 - submission never creates a public Batch
 - `--no-activate` persists the Task without requesting local agent activation from that command
   invocation; an already-running eligible agent may still claim the Task
+- `--dry-run` performs resolution and read-only validation without registration, activation,
+  Task, Group, operation, idempotency, or clock-evidence writes
 
-### 12.2 `batch-submit`
+The submission-owned option matrix is:
 
-```bash
-qexp batch-submit --group qm9-study --file runs.yaml \
-  --idempotency-key qm9-study-submit-01
-```
+| Option/input | Command mode | File mode |
+| --- | --- | --- |
+| `-- COMMAND...` | Required, nonempty literal argv | Rejected |
+| `-f, --file MANIFEST` | Rejected | Required exactly once |
+| `--project PATH`, `--group NAME`, `--idempotency-key KEY` | Supported | Supported |
+| `--task-id ID`, `--name NAME`, `--depends-on TASK_ID` | Supported | Rejected; use Task fields |
+| `--gpus N`, `--cpus N`, `--home-machine NAME`, `--cwd PATH` | Task values | Override every Task |
+| `--sharing`, `--offer-after-seconds` | Supported | Rejected; use manifest placement |
+| `--tmux`, `--no-tmux`, `--no-activate`, `--dry-run` | Supported | Supported |
+| `--format human|json`, `--quiet` | Supported | Supported |
 
-`submit` and `batch-submit` produce the same normalized `TaskSpec`. `batch-submit` adds
-only list input, manifest-default inheritance, whole-input validation, and atomic
-multi-Task commit. It does not create a different Task type or lifecycle.
+`--quiet --format json` and `--quiet --dry-run` are invalid. Unknown options, unknown manifest
+fields, duplicate YAML keys, empty Task lists, and file-mode rewrites of commands, Task IDs, names,
+or dependencies are rejected. An omitted idempotency key creates a fresh random key; dry-run may
+compare a supplied key but never reserves it.
+
+### 12.2 File input, overrides, and idempotency
+
+`submit --file` adds list input, manifest-default inheritance, whole-input validation, and atomic
+multi-Task commit. It does not create a different Task type or lifecycle. `group.name` supplies a
+manifest Group selector and explicit `--group` takes precedence. Supported file-wide overrides are
+`--gpus`, `--cpus`, `--home-machine`, `--cwd`, and `--tmux|--no-tmux`; each applies to every Task.
+The field precedence is explicit CLI, Task, manifest defaults, applicable Project policy, then the
+built-in default. An omitted CLI value never overwrites a manifest value.
 
 Rules:
 
-- manifest is used only when several Tasks are submitted together
-- manifest `tasks[].tmux` and `defaults.tmux` accept only booleans or null; a Task boolean wins
-  the invocation's `--tmux`/`--no-tmux` default, which wins a manifest default, while null or
+- a one-Task manifest has the same transactional guarantees as command input
+- manifest `tasks[].tmux` and `defaults.tmux` accept only booleans or null; an explicit invocation
+  `--tmux`/`--no-tmux` wins every Task, then a Task boolean, then the manifest default; null or
   omission continues to the next level
 - the normalized choice is stored as a durable per-Task override; it does not update Group
   defaults, existing Tasks, or later independent submissions to the same Group
@@ -1225,12 +1245,46 @@ Rules:
 - success output reports Group, created Task count, home machines, and spillover summary
 - success output does not report a Batch ID
 
+Working-directory resolution is stable: command input without `--cwd` uses invocation cwd; file
+input without a Task/default value uses the selected Project directory; a relative Task/default
+value uses the manifest directory; and a relative CLI `--cwd` uses invocation cwd. Absolute values
+are preserved after normalization. These paths and the Project resolution source are frozen in the
+first operation context and reused on same-key retry.
+
+Human output is the default. `--format json` returns the submission schema version 1 with required
+`mode`, `outcome`, `project`, `group`, `operation`, `idempotency_key`, `task_ids`, `preview`, and
+`error` fields. Outcomes are `committed`, `rejected`, `pending`, `unknown`, and `preview`.
+`--quiet` prints committed Task IDs only and is incompatible with JSON and dry-run. Failed,
+pending, unknown, and preview results never present provisional IDs as committed output.
+
+`project` is null before resolution or contains canonical Project `path` and its resolution
+`source`. `group` always contains nullable `name`, `source`, and committed-only `disposition`.
+`operation` is null before durable identification or contains `id` and nullable verified `state`.
+`task_ids` contains committed IDs in input order only for `committed`; `preview` is non-null only
+for successful preview; and `error` is null on success or contains stable `code` and `message`.
+Preview contains normalized `tasks` with input indexes and per-field sources, `group_action`,
+`worker_additions`, and `evidence_gaps`.
+
+Input errors exit 2. Conflicts, operational rejection, `pending`, and `unknown` exit 1. Committed
+and preview results exit 0. Stable error codes include `invalid_input`, `context_error`,
+`idempotency_conflict`, `submission_aborted`, `submission_pending`, `submission_blocked`,
+`commit_unknown`, and `interrupted`. Caught interruption exits 130. A post-commit activation or
+finalization error retains `committed`, the verified IDs, and exits 1 with an operational error.
+
+Manifest omission is distinct from explicit null. Null optional mappings (`group`, `defaults`,
+`placement`, `placement.sharing`, and `placement.sharing.offer`) behave as omitted mappings.
+`group.name`, `group.workers`, `task_id`, and `name` use their documented unspecified behavior;
+`tmux` inherits; `requested_cpus` clears an inherited CPU request; and
+`placement.sharing.offer.after_seconds` clears an inherited delay. Null command, GPU count,
+working directory, home, sharing mode, fallback list, dependency list, or `tasks` is invalid.
+An explicitly empty worker declaration is not omission and must still satisfy placement.
+
 ## 13. Task Lifecycle and Cleanup
 
 Required meanings:
 
 - `qexp submit`: create one new logical Task
-- `qexp batch-submit`: create several logical Tasks through the same `TaskSpec` contract
+- `qexp submit --file`: create several logical Tasks through the same `TaskSpec` contract
 - `qexp task retry`: queue the next Attempt under one existing Task
 - `qexp task cancel`: cancel one Task's current queued or active work
 - `qexp group retry-failed`: retry Tasks whose current Attempt is failed
@@ -1444,6 +1498,14 @@ explicit custom legacy runtime.
 resolve to the verified local machine. A remote home needs valid current-generation shared Project
 machine metadata, but qexp does not remotely activate its agent or transfer project files.
 
+Submission accepts `--project` as either an initialized Project directory or its `.qexp` control
+directory, never as an opaque ID. Command input resolves explicit `--project`,
+`QEXP_SHARED_ROOT`, nearest initialized invocation-cwd ancestor, then saved context. File input
+first resolves the manifest relative to invocation cwd and then resolves explicit Project,
+environment, manifest ancestry, cwd ancestry, and saved context. A selected or discovered malformed
+root fails without falling through. The result reports the canonical Project directory and source.
+Discovery is read-only and never initializes or registers a Project.
+
 ### 15.3 Global Agent Residency
 
 Default behavior:
@@ -1558,7 +1620,6 @@ are exposed through Task/Group JSON, events, and `doctor` only.
 - `qexp project list`
 - `qexp project enable | disable | remove <project-id-or-root>`
 - `qexp submit`
-- `qexp batch-submit`
 - `qexp top`
 - `qexp machines`
 - `qexp config progress show`
@@ -1575,8 +1636,8 @@ filesystem writes at the cost of freshness; it is not a visibility deadline or a
 arbitrary application I/O.
 
 The project tmux policy defaults to disabled and applies only to future observer decisions.
-Single `submit --tmux|--no-tmux` supplies a Task override. For `batch-submit`, an explicit
-per-Task manifest value wins the invocation switch, then `defaults.tmux`, then project policy,
+`submit --tmux|--no-tmux` supplies a Task override. For file mode, the invocation switch wins
+every Task, then a per-Task manifest value, then `defaults.tmux`, then project policy,
 then the built-in disabled value. Explicit overrides survive retries; inherited Tasks sample the
 then-current project policy for each new observer decision. Policy changes never remove existing
 windows or create one for already-running work. Participating agents must be upgraded before the
@@ -1684,13 +1745,12 @@ The target CLI also does not promise aliases for the old flat `list`, `inspect`,
 - [ ] Home machine receives first refusal without receiving a premature claim.
 - [ ] First release offers Tasks only through `qexp task offer` or persisted
   `after_seconds`.
-- [ ] `--group` is the sole submission source for Group identity and manifest
-      `group.name` is rejected.
+- [ ] `--group` overrides manifest `group.name`; omission of both permits ungrouped private work.
 - [ ] Submission never implicitly adds its origin machine to a Group Worker Set.
 - [ ] `group create --workers` uses an exact explicit Worker Set and defaults to `{current}` only
       when the option is omitted.
-- [ ] Single Group submission requires an existing Group; batch creation requires explicit
-      non-empty manifest `group.workers`.
+- [ ] Both submission input modes may transactionally create a missing named Group without exposing
+      uncommitted Group or Worker truth.
 - [ ] Existing Task and Group operations use resource-first command namespaces; `show` is the
   structured single-resource observation verb, `logs` is the specialized application-log byte
   stream, and there is no parallel `inspect` spelling.

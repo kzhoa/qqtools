@@ -7,6 +7,7 @@ from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.cli import main
 from qqtools.plugins.qexp.commands.group import create_group
+from qqtools.plugins.qexp.runtime.tasks import load_task
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -262,18 +263,12 @@ def test_submit_preserves_training_format_argument(tmp_path: Path, monkeypatch, 
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     received: list[str] = []
 
-    class Result:
-        task_id = "task_x"
-
-    def fake_submit(cfg, command, **kwargs):
-        received.extend(command)
-        return Result()
-
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.task_commands.submit", fake_submit)
     monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", lambda *args, **kwargs: True)
-    assert main([*_base_args(cfg), "submit", "--", "python", "train.py", "--format=json"]) == 0
+    assert main([*_base_args(cfg), "submit", "--quiet", "--", "python", "train.py", "--format=json"]) == 0
+    task_id = capsys.readouterr().out.strip()
+    task = load_task(cfg, task_id)
+    received.extend(task.spec.command)
     assert received == ["python", "train.py", "--format=json"]
-    assert capsys.readouterr().out == "task_x\n"
 
 
 def test_group_human_outputs_project_summary_and_operation_context(tmp_path: Path, capsys):
@@ -409,11 +404,12 @@ def test_batch_json_is_one_document_and_idempotent_retry_is_silent_on_stderr(tmp
     manifest.write_text("tasks:\n  - command: [echo, ok]\n", encoding="utf-8")
     monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", lambda *args, **kwargs: True)
 
-    assert main([*_base_args(cfg), "batch-submit", "--file", str(manifest), "--format=json"]) == 0
+    assert main([*_base_args(cfg), "submit", "--file", str(manifest), "--format=json"]) == 0
     first_capture = capsys.readouterr()
     first = json.loads(first_capture.out)
-    assert first["state"] == "committed"
-    assert first["operation_id"]
+    assert first["outcome"] == "committed"
+    assert first["operation"]["state"] == "committed"
+    assert first["operation"]["id"]
     assert first["idempotency_key"]
     assert first_capture.err.startswith("qexp: prepared operation_id=")
 
@@ -421,7 +417,7 @@ def test_batch_json_is_one_document_and_idempotent_retry_is_silent_on_stderr(tmp
         main(
             [
                 *_base_args(cfg),
-                "batch-submit",
+                "submit",
                 "--file",
                 str(manifest),
                 "--idempotency-key",

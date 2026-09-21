@@ -341,8 +341,7 @@ tasks:
     ("body", "message"),
     [
         ("workers: [g2]\ntasks:\n  - command: [echo, ok]\n", r"root\.workers is not allowed"),
-        ("group:\n  name: exp\ntasks:\n  - command: [echo, ok]\n", r"group\.name is not allowed"),
-        ("group:\n  workers: [g2]\ntasks:\n  - command: [echo, ok]\n", r"manifest group requires --group"),
+        ("group:\n  workers: [g2]\ntasks:\n  - command: [echo, ok]\n", r"workers.*Group"),
         ("tasks: {}\n", r"tasks must be a non-empty list"),
         ("tasks:\n  - placement: []\n    command: [echo, ok]\n", r"tasks\[0\]\.placement must be a mapping"),
     ],
@@ -351,6 +350,20 @@ def test_manifest_allow_list_and_type_errors(tmp_path: Path, body: str, message:
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     with pytest.raises(ValueError, match=message):
         batch_submit(cfg, _manifest(tmp_path, body), group=None)
+
+
+def test_manifest_group_name_is_used_and_cli_group_overrides_it(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    manifest = _manifest(
+        tmp_path,
+        "group:\n  name: from-file\ntasks:\n  - command: [echo, ok]\n",
+    )
+
+    from_file = batch_submit(cfg, manifest, idempotency_key="from-file")
+    from_cli = batch_submit(cfg, manifest, group="from-cli", idempotency_key="from-cli")
+
+    assert from_file[0].group_name == "from-file"
+    assert from_cli[0].group_name == "from-cli"
 
 
 def test_flat_task_fields_work_with_deprecation_warning(tmp_path: Path):

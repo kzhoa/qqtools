@@ -64,7 +64,7 @@ def test_installed_cli_stop_offline_completion_start(tmp_path: Path) -> None:
                 f"Path({str(finished)!r}).touch()\n"
             ),
         ]
-        submit = run([*common, "submit", "--name", "installed-lifecycle", "--", *command], env=env)
+        submit = run([*common, "submit", "--name", "installed-lifecycle", "--quiet", "--", *command], env=env)
         task_id = submit.stdout.strip()
         wait_for(
             lambda: jrun([*common, "task", "show", task_id], env=env)["task"]["state"]["projection"] == "running",

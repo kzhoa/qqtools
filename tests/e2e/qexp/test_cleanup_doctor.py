@@ -50,6 +50,7 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
                 "submit",
                 "--name",
                 "failing-job",
+                "--quiet",
                 "--",
                 "python",
                 "-c",

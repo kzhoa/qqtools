@@ -12,6 +12,7 @@ import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from . import observer
 from .activation import (
@@ -67,6 +68,7 @@ from .launch_policy import (
 from .layout import clear_context, load_context, load_root_config, migrate_schema5_to_schema6, save_context
 from .lease import LeasePolicy, load_lease_policy, save_lease_policy
 from .legacy_agent import get_agent_status
+from .manifest import UNSET, normalize_command_submission, parse_submission_manifest
 from .notification_config import (
     DEFAULT_WEBHOOK_ENV,
     load_notifications,
@@ -74,10 +76,12 @@ from .notification_config import (
     write_shared_feishu_webhook,
 )
 from .progress_policy import set_progress_policy, show_progress_policy, validate_interval_seconds
+from .project_resolution import resolve_submission_project
 from .runtime.observation.api import ObservationError
-from .runtime.paths import shared_paths
+from .runtime.paths import idempotency_path, shared_paths, submission_path
 from .runtime.resources.cpu_lane import get_cpu_lane_policy, initialize_cpu_lane_capacity, set_cpu_lane_capacity
 from .runtime.store import iter_json, read_json
+from .runtime.submission_plan import semantic_digest
 from .runtime.upgrade.framework import UpgradeCoordinator
 from .runtime.upgrade.machine import advance_registered_upgrades, inspect_registered_upgrades
 from .schema6_upgrade import (
@@ -87,6 +91,7 @@ from .schema6_upgrade import (
     schema6_upgrade_status,
     start_schema6_upgrade,
 )
+from .submission_contracts import SubmissionRequest, submission_result_payload
 from .tmux_policy import set_tmux_policy, show_tmux_policy
 
 
@@ -94,7 +99,12 @@ class _PaginationParseError(RuntimeError):
     """An argparse error that belongs to paginated JSON output."""
 
 
+class _SubmissionParseError(RuntimeError):
+    """An argparse error that belongs to structured submission JSON output."""
+
+
 _PAGINATION_JSON_PARSE_MODE = False
+_SUBMISSION_JSON_PARSE_MODE = False
 
 
 class _QexpArgumentParser(argparse.ArgumentParser):
@@ -103,6 +113,8 @@ class _QexpArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         if _PAGINATION_JSON_PARSE_MODE:
             raise _PaginationParseError(message)
+        if _SUBMISSION_JSON_PARSE_MODE:
+            raise _SubmissionParseError(message)
         super().error(message)
 
 
@@ -123,6 +135,14 @@ def _is_paginated_json_argv(argv: list[str]) -> bool:
     return any(
         item == "--format=json" or (item == "--format" and index + 1 < len(argv) and argv[index + 1] == "json")
         for index, item in enumerate(argv)
+    )
+
+
+def _is_submission_json_argv(argv: list[str]) -> bool:
+    prefix = _submission_raw_prefix(argv)
+    return bool(prefix) and any(
+        item == "--format=json" or (item == "--format" and index + 1 < len(prefix) and prefix[index + 1] == "json")
+        for index, item in enumerate(prefix)
     )
 
 
@@ -176,6 +196,200 @@ def _emit(output: CliOutput[object], output_format: str, *, flush: bool = False)
     print(render(output, output_format), flush=flush)
 
 
+def _submission_group_file(request: SubmissionRequest) -> Path | None:
+    if request.group_name is None:
+        return None
+    # Submission's public group tree is schema-stable for this layer.  Keep
+    # this read-only probe separate from runtime publication decisions.
+    return request.project.control_root / "groups" / f"{request.group_name}.json"
+
+
+def _submission_preview(request: SubmissionRequest, value: object) -> dict[str, object]:
+    raw = value.to_dict() if callable(getattr(value, "to_dict", None)) else value
+    preview = dict(raw) if isinstance(raw, dict) else {}
+    tasks = preview.get("tasks")
+    if not isinstance(tasks, list):
+        tasks = []
+    normalized_tasks = []
+    for index, spec in enumerate(request.normalized_specs):
+        runtime_task = dict(tasks[index]) if index < len(tasks) and isinstance(tasks[index], dict) else {}
+        runtime_task.update(spec)
+        runtime_task["input_index"] = index
+        runtime_task["task_id"] = spec.get("task_id")
+        runtime_task["sources"] = dict(request.field_sources[index])
+        normalized_tasks.append(runtime_task)
+    group_file = _submission_group_file(request)
+    group_action = preview.get("group_action")
+    if group_action not in {"create", "reuse", "none", "unknown"}:
+        group_action = (
+            "none" if request.group_name is None else "reuse" if group_file and group_file.exists() else "create"
+        )
+    return {
+        "tasks": normalized_tasks,
+        "group_action": group_action,
+        "worker_additions": preview.get("worker_additions", request.worker_set),
+        "evidence_gaps": preview.get("evidence_gaps", []),
+    }
+
+
+def _submission_result_payload(request: SubmissionRequest, value: object) -> dict[str, object]:
+    if request.dry_run:
+        return submission_result_payload(
+            mode=request.mode,
+            outcome="preview",
+            project={"path": str(request.project.path), "source": request.project.source},
+            group={"name": request.group_name, "source": request.group_source, "disposition": None},
+            operation=None,
+            idempotency_key=request.idempotency_key,
+            task_ids=[],
+            preview=_submission_preview(request, value),
+            error=None,
+        )
+    raw = value.to_dict() if callable(getattr(value, "to_dict", None)) else value
+    raw = raw if isinstance(raw, dict) else {}
+    state = getattr(value, "state", raw.get("state"))
+    operation_id = getattr(value, "operation_id", raw.get("operation_id"))
+    idempotency_key = getattr(value, "idempotency_key", raw.get("idempotency_key"))
+    target_group = getattr(value, "target_group", raw.get("target_group", request.group_name))
+    committed = state == "committed"
+    outcome = "committed" if committed else "pending" if state in {"preparing", "committing", "blocked"} else "unknown"
+    disposition = (
+        "none"
+        if target_group is None
+        else "reused"
+        if request.group_existed is True
+        else "created"
+        if request.group_existed is False
+        else "reused"
+    )
+    if target_group is not None and operation_id:
+        try:
+            persisted = read_json(submission_path(request.project.control_root, operation_id))
+            resolved_context = persisted.get("submission", {}).get("resolved_context", {})
+            if isinstance(resolved_context, dict) and isinstance(resolved_context.get("create_group"), bool):
+                disposition = "created" if resolved_context["create_group"] else "reused"
+        except (OSError, KeyError, TypeError, ValueError):
+            pass
+    return submission_result_payload(
+        mode=request.mode,
+        outcome=outcome,
+        project={"path": str(request.project.path), "source": request.project.source},
+        group={"name": target_group, "source": request.group_source, "disposition": disposition},
+        operation={"id": operation_id, "state": state} if operation_id else None,
+        idempotency_key=idempotency_key,
+        task_ids=[task.task_id for task in value] if committed and hasattr(value, "__iter__") else [],
+        preview=None,
+        error=None,
+    )
+
+
+def _known_submission_state(args: argparse.Namespace, exc: BaseException) -> dict[str, Any]:
+    """Recover bounded operation facts disclosed before a failed return."""
+    request = getattr(args, "_submission_request", None)
+    if request is None:
+        return {}
+    key = (
+        getattr(exc, "idempotency_key", None)
+        or getattr(args, "_submission_prepared_key", None)
+        or request.idempotency_key
+    )
+    operation_id = getattr(exc, "operation_id", None) or getattr(args, "_submission_prepared_operation_id", None)
+    if operation_id is None and key:
+        try:
+            mapping = read_json(
+                idempotency_path(
+                    request.project.control_root,
+                    semantic_digest({"project": str(request.project.control_root), "key": key}),
+                )
+            )
+            operation_id = mapping.get("operation_id") if isinstance(mapping, dict) else None
+        except (OSError, KeyError, TypeError, ValueError):
+            pass
+    if not isinstance(operation_id, str):
+        return {"idempotency_key": key}
+    result: dict[str, Any] = {"operation_id": operation_id, "state": None, "idempotency_key": key}
+    try:
+        operation = read_json(submission_path(request.project.control_root, operation_id))["submission"]
+        result.update(
+            state=operation.get("state"),
+            idempotency_key=operation.get("idempotency_key", key),
+            target_group=operation.get("target_group", request.group_name),
+        )
+        context = operation.get("resolved_context")
+        if isinstance(context, dict):
+            result["create_group"] = context.get("create_group")
+            task_ids = context.get("task_ids")
+            if isinstance(task_ids, list) and all(isinstance(item, str) for item in task_ids):
+                result["task_ids"] = task_ids
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
+    return result
+
+
+def _submission_error_payload(args: argparse.Namespace, exc: BaseException) -> tuple[dict[str, object], int]:
+    request = getattr(args, "_submission_request", None)
+    mode = getattr(args, "_submission_mode", None) or _submission_error_mode(args)
+    project = None
+    group_name = getattr(args, "group", None)
+    group_source = "cli" if group_name is not None else "none"
+    known = _known_submission_state(args, exc)
+    operation_id = known.get("operation_id")
+    state = known.get("state")
+    operation = {"id": operation_id, "state": state} if operation_id else None
+    key = getattr(args, "idempotency_key", None)
+    if request is not None:
+        project = {"path": str(request.project.path), "source": request.project.source}
+        group_name = request.group_name
+        group_source = request.group_source
+        key = known.get("idempotency_key", request.idempotency_key)
+        group_name = known.get("target_group", group_name)
+    name = type(exc).__name__
+    if name == "IdempotencyConflict" or "idempotency key" in str(exc).lower():
+        code, outcome, exit_code = "idempotency_conflict", "rejected", 1
+    elif state == "committed":
+        code, outcome, exit_code = "finalization_pending", "committed", 1
+    elif state in {"preparing", "committing", "blocked"}:
+        code = "submission_blocked" if state == "blocked" else "submission_pending"
+        outcome, exit_code = "pending", 1
+    elif state == "aborted":
+        code, outcome, exit_code = "submission_aborted", "rejected", 1
+    elif request is None and isinstance(exc, (ValueError, OSError)):
+        code, exit_code = (
+            ("invalid_input", 2)
+            if not getattr(args, "_submission_resolution_started", False)
+            or getattr(args, "_submission_project_resolved", False)
+            else ("context_error", 1)
+        )
+        outcome = "rejected"
+    elif request is not None and not getattr(args, "_submission_cfg_resolved", False):
+        code, outcome, exit_code = "context_error", "rejected", 2
+    elif isinstance(exc, ValueError):
+        code, outcome, exit_code = "invalid_input", "rejected", 2
+    elif "blocked" in str(exc).lower():
+        code, outcome, exit_code = "submission_blocked", "pending", 1
+    elif "pending" in str(exc).lower():
+        code, outcome, exit_code = "submission_pending", "pending", 1
+    elif operation_id is not None:
+        code, outcome, exit_code = "commit_unknown", "unknown", 1
+    else:
+        code, outcome, exit_code = "submission_aborted", "rejected", 1
+    disposition = None
+    if outcome == "committed":
+        disposition = "none" if group_name is None else "created" if known.get("create_group") is True else "reused"
+    payload = submission_result_payload(
+        mode=mode,
+        outcome=outcome,
+        project=project,
+        group={"name": group_name, "source": group_source, "disposition": disposition},
+        operation=operation,
+        idempotency_key=key,
+        task_ids=known.get("task_ids", []) if outcome == "committed" else [],
+        preview=None,
+        error={"code": code, "message": str(exc)},
+    )
+    return payload, exit_code
+
+
 def _machine_assertion(args: argparse.Namespace) -> str | None:
     """Return the caller's identity assertion after checking duplicate inputs."""
     flag_value = getattr(args, "machine", None)
@@ -187,6 +401,9 @@ def _machine_assertion(args: argparse.Namespace) -> str | None:
 
 def _shared_root_input(args: argparse.Namespace) -> tuple[str | None, dict | None]:
     """Resolve only the shared-root locator; saved identity fields are intentionally ignored."""
+    submission_project = getattr(args, "_submission_project", None)
+    if args.command == "submit" and submission_project is not None:
+        return str(submission_project), None
     flag_value = getattr(args, "shared_root", None)
     environment_value = os.environ.get("QEXP_SHARED_ROOT")
     context = load_context() if flag_value is None and environment_value is None else None
@@ -196,7 +413,7 @@ def _shared_root_input(args: argparse.Namespace) -> tuple[str | None, dict | Non
 
 def _requires_verified_binding(args: argparse.Namespace) -> bool:
     """Classify commands that can create or change project-owned state."""
-    if args.command in {"submit", "batch-submit", "clean"}:
+    if args.command in {"submit", "clean"}:
         return True
     if args.command == "config":
         return (
@@ -465,49 +682,32 @@ def build_parser() -> argparse.ArgumentParser:
     submit = commands.add_parser(
         "submit",
         description=(
-            "Submit one Task using the verified local identity. --home-machine selects placement; "
-            "private Tasks are executable only by that home machine. qexp does not remotely start "
-            "the target agent."
+            "Submit one command or a manifest using the verified local identity. "
+            "qexp does not remotely start the target agent."
         ),
     )
-    for action in (submit,):
-        action.add_argument("--task-id")
-        action.add_argument("--name")
-        action.add_argument("--group")
-        action.add_argument("--gpus", type=int, default=1)
-        action.add_argument("--cpus", type=int)
-        action.add_argument("--cwd")
-        action.add_argument(
-            "--home-machine",
-            default="current",
-            help="Task home placement (default: verified current machine); does not activate a remote agent.",
-        )
-        action.add_argument("--sharing", choices=["private", "spillover"], default="private")
-        action.add_argument("--offer-after-seconds", type=int)
-        action.add_argument("--idempotency-key")
-        action.add_argument("--depends-on", action="append", default=[])
-        action.add_argument("--no-activate", action="store_true", help="Submit without activating the local agent.")
-        tmux_values = action.add_mutually_exclusive_group()
-        tmux_values.add_argument("--tmux", dest="tmux_override", action="store_true")
-        tmux_values.add_argument("--no-tmux", dest="tmux_override", action="store_false")
-        action.set_defaults(tmux_override=None)
-        action.add_argument("argv", nargs=argparse.REMAINDER)
-    bulk = commands.add_parser(
-        "batch-submit",
-        help="Submit manifest Tasks; per-Task tmux wins CLI, then defaults, and omission inherits project policy.",
-        description=(
-            "Submit manifest Tasks. Per-Task manifest tmux wins --tmux/--no-tmux, then the manifest defaults; "
-            "omitting all overrides inherits the project tmux policy."
-        ),
-    )
-    _add_output_format(bulk)
-    bulk.add_argument("--file", required=True, dest="manifest_file")
-    bulk.add_argument("--group")
-    bulk.add_argument("--idempotency-key")
-    bulk_tmux_values = bulk.add_mutually_exclusive_group()
-    bulk_tmux_values.add_argument("--tmux", dest="tmux_override", action="store_true")
-    bulk_tmux_values.add_argument("--no-tmux", dest="tmux_override", action="store_false")
-    bulk.set_defaults(tmux_override=None)
+    _add_output_format(submit)
+    submit.add_argument("--project", dest="project")
+    submit.add_argument("-f", "--file", dest="manifest_file")
+    submit.add_argument("--task-id")
+    submit.add_argument("--name")
+    submit.add_argument("--group")
+    submit.add_argument("--gpus", type=int, default=None)
+    submit.add_argument("--cpus", type=int, default=None)
+    submit.add_argument("--cwd")
+    submit.add_argument("--home-machine", default=None)
+    submit.add_argument("--sharing", choices=["private", "spillover"], default=None)
+    submit.add_argument("--offer-after-seconds", type=int, default=None)
+    submit.add_argument("--idempotency-key")
+    submit.add_argument("--depends-on", action="append", default=None)
+    submit.add_argument("--no-activate", action="store_true", help="Submit without activating the local agent.")
+    submit.add_argument("--dry-run", action="store_true")
+    submit.add_argument("--quiet", action="store_true")
+    tmux_values = submit.add_mutually_exclusive_group()
+    tmux_values.add_argument("--tmux", dest="tmux_override", action="store_true")
+    tmux_values.add_argument("--no-tmux", dest="tmux_override", action="store_false")
+    submit.set_defaults(tmux_override=None)
+    submit.add_argument("argv", nargs=argparse.REMAINDER)
     task = commands.add_parser("task")
     task_sub = task.add_subparsers(dest="task_action", required=True)
     cancel = task_sub.add_parser("cancel")
@@ -750,6 +950,209 @@ def _command(argv: list[str]) -> list[str]:
     return argv
 
 
+def _submission_raw_prefix(raw_argv: list[str]) -> list[str]:
+    """Return submit options before the literal command separator."""
+    try:
+        submit_index = raw_argv.index("submit")
+    except ValueError:
+        return []
+    prefix = raw_argv[submit_index + 1 :]
+    try:
+        return prefix[: prefix.index("--")]
+    except ValueError:
+        return prefix
+
+
+def _submission_option_supplied(raw_argv: list[str], *names: str) -> bool:
+    prefix = _submission_raw_prefix(raw_argv)
+    return any(item in names or any(item.startswith(f"{name}=") for name in names) for item in prefix)
+
+
+def _submission_raw_option(raw_argv: list[str], name: str) -> str | None:
+    prefix = _submission_raw_prefix(raw_argv)
+    for index, item in enumerate(prefix):
+        if item.startswith(f"{name}="):
+            return item.split("=", 1)[1]
+        if item == name and index + 1 < len(prefix):
+            return prefix[index + 1]
+    return None
+
+
+def _submission_parse_failure_payload(raw_argv: list[str], message: str) -> dict[str, Any]:
+    """Build the complete result schema when argparse cannot create a Namespace."""
+    has_file = _submission_option_supplied(raw_argv, "--file", "-f")
+    try:
+        tail = raw_argv[raw_argv.index("submit") + 1 :]
+    except ValueError:
+        tail = []
+    has_command_separator = "--" in tail
+    mode = (
+        "file"
+        if has_file and not has_command_separator
+        else "command"
+        if has_command_separator and not has_file
+        else None
+    )
+    group_name = _submission_raw_option(raw_argv, "--group")
+    return submission_result_payload(
+        mode=mode,
+        outcome="rejected",
+        project=None,
+        group={"name": group_name, "source": "cli" if group_name is not None else None, "disposition": None},
+        operation=None,
+        idempotency_key=_submission_raw_option(raw_argv, "--idempotency-key"),
+        task_ids=[],
+        preview=None,
+        error={"code": "invalid_input", "message": message},
+    )
+
+
+def _submission_mode_from_args(args: argparse.Namespace) -> tuple[str, list[str]]:
+    argv = _command(list(getattr(args, "argv", ()))) if getattr(args, "argv", None) else []
+    has_file = getattr(args, "manifest_file", None) is not None
+    has_command = bool(argv)
+    if has_file and has_command:
+        raise ValueError("submit requires exactly one input mode: --file MANIFEST or -- COMMAND....")
+    if not has_file and not has_command:
+        raise ValueError("submit requires exactly one input mode: --file MANIFEST or -- COMMAND....")
+    return ("file", []) if has_file else ("command", argv)
+
+
+def _submission_error_mode(args: argparse.Namespace) -> str | None:
+    """Infer a presentation mode without resolving a Project or reading state."""
+    try:
+        mode, _ = _submission_mode_from_args(args)
+    except ValueError:
+        mode = None
+    return mode
+
+
+def _prepare_submission_request(
+    args: argparse.Namespace, raw_argv: list[str], *, invocation_cwd: Path | None = None
+) -> SubmissionRequest:
+    """Validate modes/options and normalize a submission before cfg resolution."""
+    if args.command != "submit":
+        raise ValueError("submission request preparation requires submit command.")
+    invocation_cwd = Path(invocation_cwd or Path.cwd()).expanduser().resolve()
+    try:
+        submission_tail = raw_argv[raw_argv.index("submit") + 1 :]
+    except ValueError:
+        submission_tail = []
+    if getattr(args, "argv", None) and "--" not in submission_tail:
+        raise ValueError("command mode requires the literal '--' separator before COMMAND.")
+    mode, command = _submission_mode_from_args(args)
+    args._submission_mode = mode
+    command_only = {
+        "--task-id": "--task-id is only valid in command mode.",
+        "--name": "--name is only valid in command mode.",
+        "--depends-on": "--depends-on is only valid in command mode.",
+        "--sharing": "--sharing is only valid in command mode.",
+        "--offer-after-seconds": "--offer-after-seconds is only valid in command mode.",
+    }
+    if mode == "file":
+        for option, message in command_only.items():
+            if _submission_option_supplied(raw_argv, option):
+                raise ValueError(message)
+    elif _submission_option_supplied(raw_argv, "--file", "-f"):
+        raise ValueError("--file is only valid in file mode.")
+    if args.quiet and args.format == "json":
+        raise ValueError("--quiet cannot be combined with --format json.")
+    if args.quiet and args.dry_run:
+        raise ValueError("--quiet cannot be combined with --dry-run.")
+
+    manifest_path = None
+    if mode == "file":
+        manifest_path = Path(args.manifest_file).expanduser()
+        if not manifest_path.is_absolute():
+            manifest_path = invocation_cwd / manifest_path
+        manifest_path = manifest_path.resolve()
+    explicit_project = args.project if args.project is not None else getattr(args, "shared_root", None)
+    environment_value = os.environ.get("QEXP_SHARED_ROOT")
+    args._submission_resolution_started = True
+    saved_context = load_context() if explicit_project is None and environment_value is None else None
+    selection = resolve_submission_project(
+        explicit_project=explicit_project,
+        manifest_path=manifest_path,
+        invocation_cwd=invocation_cwd,
+        environment_value=environment_value,
+        saved_context=saved_context,
+    )
+    args._submission_project_resolved = True
+    if mode == "command":
+        item, field_sources = normalize_command_submission(
+            command,
+            requested_gpus=1 if args.gpus is None else args.gpus,
+            requested_cpus=args.cpus,
+            task_id=args.task_id,
+            name=args.name,
+            group=args.group,
+            working_directory=args.cwd,
+            home_machine="current" if args.home_machine is None else args.home_machine,
+            sharing_mode="private" if args.sharing is None else args.sharing,
+            offer_after_seconds=args.offer_after_seconds,
+            depends_on_task_ids=[] if args.depends_on is None else args.depends_on,
+            tmux_override=args.tmux_override,
+            invocation_cwd=invocation_cwd,
+            project_directory=selection.path,
+        )
+        group_name = args.group
+        group_source = "cli" if group_name is not None else "none"
+        workers: dict[str, dict[str, Any]] = {}
+        workers_declared = False
+        specs = (item,)
+        command_sources = dict(field_sources)
+        if args.gpus is None:
+            command_sources["requested_gpus"] = "builtin"
+        if args.home_machine is None:
+            command_sources["home_machine"] = "builtin"
+        if args.sharing is None:
+            command_sources["sharing_mode"] = "builtin"
+        field_sources = (command_sources,)
+    else:
+        result = parse_submission_manifest(
+            manifest_path,
+            group_name=args.group if args.group is not None else UNSET,
+            tmux_override=args.tmux_override if _submission_option_supplied(raw_argv, "--tmux", "--no-tmux") else UNSET,
+            requested_gpus=args.gpus if _submission_option_supplied(raw_argv, "--gpus") else UNSET,
+            requested_cpus=args.cpus if _submission_option_supplied(raw_argv, "--cpus") else UNSET,
+            home_machine=args.home_machine if _submission_option_supplied(raw_argv, "--home-machine") else UNSET,
+            working_directory=args.cwd if _submission_option_supplied(raw_argv, "--cwd") else UNSET,
+            project_directory=selection.path,
+            invocation_cwd=invocation_cwd,
+        )
+        group_name = result.group_name
+        group_source = result.group_source
+        workers = result.workers
+        workers_declared = result.workers_declared
+        specs = result.specs
+        field_sources = result.field_sources
+        args.manifest_file = str(result.manifest_path)
+    request = SubmissionRequest(
+        mode=mode,
+        specs=tuple(specs),
+        group_name=group_name,
+        group_source=group_source,
+        workers=workers,
+        workers_declared=workers_declared,
+        project=selection,
+        invocation_cwd=invocation_cwd,
+        manifest_path=manifest_path,
+        idempotency_key=args.idempotency_key,
+        no_activate=args.no_activate,
+        dry_run=args.dry_run,
+        output_format=args.format,
+        quiet=args.quiet,
+        field_sources=tuple(field_sources),
+        group_existed=(
+            (selection.control_root / "groups" / f"{group_name}.json").exists() if group_name is not None else None
+        ),
+    )
+    args._submission_project = selection.control_root
+    args._submission_mode = mode
+    args._submission_request = request
+    return request
+
+
 def _duration_seconds(value: str) -> int:
     matched = re.fullmatch(r"([0-9]+)([smh])", value)
     if not matched:
@@ -917,15 +1320,22 @@ def _upgrade_project_config(runtime: MachineRuntime, identifier: str):
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    global _PAGINATION_JSON_PARSE_MODE
+    global _PAGINATION_JSON_PARSE_MODE, _SUBMISSION_JSON_PARSE_MODE
     _PAGINATION_JSON_PARSE_MODE = _is_paginated_json_argv(raw_argv)
+    _SUBMISSION_JSON_PARSE_MODE = _is_submission_json_argv(raw_argv)
     try:
         args = build_parser().parse_args(raw_argv)
     except _PaginationParseError as exc:
         print(json.dumps({"error": {"code": "invalid_argument", "message": str(exc)}}))
         return 2
+    except _SubmissionParseError as exc:
+        payload = _submission_parse_failure_payload(raw_argv, str(exc))
+        print(json.dumps(payload))
+        print(f"qexp: {exc}", file=sys.stderr)
+        return 2
     finally:
         _PAGINATION_JSON_PARSE_MODE = False
+        _SUBMISSION_JSON_PARSE_MODE = False
     try:
         _validate_continuous_options(args)
         if args.command == "init":
@@ -1341,7 +1751,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
             _emit(CliOutput(OutputKind.GPU_POLICY, result), args.format)
             return 0
+        if args.command == "submit":
+            _prepare_submission_request(args, raw_argv, invocation_cwd=Path.cwd())
         cfg, execution_context = _resolve_cfg(args, require_binding=_requires_verified_binding(args))
+        if args.command == "submit":
+            args._submission_cfg_resolved = True
 
         def get_execution_context() -> ExecutionContext:
             return execution_context
@@ -1493,45 +1907,56 @@ def main(argv: list[str] | None = None) -> int:
             _emit(CliOutput(OutputKind.LEASE_POLICY, {"lease_policy": values}), args.format)
             return 0
         if args.command == "submit":
-            if not args.no_activate:
-                ensure_local_agent_active(cfg, reason="submit", **get_lifecycle_kwargs())
-            task_value = task_commands.submit(
-                cfg,
-                _command(args.argv),
-                requested_gpus=args.gpus,
-                requested_cpus=args.cpus,
-                task_id=args.task_id,
-                name=args.name,
-                group=args.group,
-                working_dir=args.cwd,
-                home_machine=args.home_machine,
-                sharing_mode=args.sharing,
-                offer_after_seconds=args.offer_after_seconds,
-                depends_on_task_ids=args.depends_on,
-                idempotency_key=args.idempotency_key,
-                tmux_override=args.tmux_override,
-            )
-            print(task_value.task_id)
-            return 0
-        if args.command == "batch-submit":
-            ensure_local_agent_active(cfg, reason="batch-submit", **get_lifecycle_kwargs())
 
             def print_prepared(operation_id: str, idempotency_key: str) -> None:
+                args._submission_prepared_operation_id = operation_id
+                args._submission_prepared_key = idempotency_key
                 print(
                     f"qexp: prepared operation_id={operation_id} idempotency_key={idempotency_key}",
                     file=sys.stderr,
                     flush=True,
                 )
 
-            values = task_commands.batch_submit(
-                cfg,
-                Path(args.manifest_file),
-                group=args.group,
-                idempotency_key=args.idempotency_key,
-                tmux_override=args.tmux_override,
-                on_prepared=print_prepared,
-            )
-            _emit(CliOutput(OutputKind.BATCH_SUBMIT, values.to_dict()), args.format)
+            request = args._submission_request
+            values = task_commands.submit_request(cfg, request, on_prepared=print_prepared)
+            # Activation is a post-commit follow-up.  It must never relabel a
+            # verified commit or erase the IDs from a quiet/JSON response.
+            payload = _submission_result_payload(request, values)
+            if not request.dry_run and payload["outcome"] == "committed" and not request.no_activate:
+                try:
+                    ensure_local_agent_active(cfg, reason="submit", **get_lifecycle_kwargs())
+                except Exception as activation_error:
+                    payload["error"] = {"code": "activation_failed", "message": str(activation_error)}
+                    if request.quiet:
+                        for task_id in payload["task_ids"]:
+                            print(task_id)
+                    else:
+                        _emit(
+                            CliOutput(
+                                OutputKind.SUBMISSION,
+                                payload,
+                                {
+                                    "task": {
+                                        "task_id": request.normalized_specs[0].get("task_id"),
+                                        "name": request.normalized_specs[0].get("name"),
+                                    }
+                                },
+                            ),
+                            args.format,
+                        )
+                    return 1
+            if request.quiet:
+                if payload["outcome"] == "committed":
+                    for task_id in payload["task_ids"]:
+                        print(task_id)
+            else:
+                presentation = {
+                    "task": {
+                        "task_id": request.normalized_specs[0].get("task_id"),
+                        "name": request.normalized_specs[0].get("name"),
+                    }
+                }
+                _emit(CliOutput(OutputKind.SUBMISSION, payload, presentation), args.format)
             return 0
         if args.command == "task":
             if args.task_action == "dependencies":
@@ -1905,7 +2330,32 @@ def main(argv: list[str] | None = None) -> int:
             return 0
     except ObservationError as exc:
         return _emit_observation_error(exc, getattr(args, "format", "human"))
+    except KeyboardInterrupt as exc:
+        if args.command == "submit":
+            payload, _exit_code = _submission_error_payload(args, exc)
+            payload["error"] = {"code": "interrupted", "message": "submission interrupted; retry with the same key."}
+            if getattr(args, "quiet", False):
+                for task_id in payload["task_ids"]:
+                    print(task_id)
+                print("qexp: submission interrupted; retry with the same key.", file=sys.stderr)
+            elif getattr(args, "format", "human") == "json":
+                print(json.dumps(payload))
+                print(f"qexp: {payload['error']['message']}", file=sys.stderr)
+            else:
+                print(f"qexp: {payload['error']['message']}", file=sys.stderr)
+            return 130
+        raise
     except (ValueError, RuntimeError, OSError) as exc:
+        if args.command == "submit":
+            payload, exit_code = _submission_error_payload(args, exc)
+            if getattr(args, "quiet", False):
+                print(f"qexp: {exc}", file=sys.stderr)
+            elif getattr(args, "format", "human") == "json":
+                print(json.dumps(payload))
+                print(f"qexp: {exc}", file=sys.stderr)
+            else:
+                print(f"qexp: {exc}", file=sys.stderr)
+            return exit_code
         if (
             args.command == "task"
             and args.task_action == "list"

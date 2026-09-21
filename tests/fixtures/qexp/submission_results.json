@@ -1,0 +1,83 @@
+{
+  "committed": {
+    "schema_version": 1,
+    "mode": "command",
+    "outcome": "committed",
+    "project": {"path": "/projects/a", "source": "cli"},
+    "group": {"name": null, "source": "none", "disposition": "none"},
+    "operation": {"id": "submission-1", "state": "committed"},
+    "idempotency_key": "key-1",
+    "task_ids": ["task-1"],
+    "preview": null,
+    "error": null
+  },
+  "rejected": {
+    "schema_version": 1,
+    "mode": "file",
+    "outcome": "rejected",
+    "project": {"path": "/projects/a", "source": "manifest_ancestor"},
+    "group": {"name": "exp", "source": "manifest", "disposition": null},
+    "operation": null,
+    "idempotency_key": "key-2",
+    "task_ids": [],
+    "preview": null,
+    "error": {"code": "invalid_input", "message": "manifest is invalid"}
+  },
+  "pending": {
+    "schema_version": 1,
+    "mode": "file",
+    "outcome": "pending",
+    "project": {"path": "/projects/a", "source": "saved"},
+    "group": {"name": "exp", "source": "cli", "disposition": null},
+    "operation": {"id": "submission-2", "state": "committing"},
+    "idempotency_key": "key-2",
+    "task_ids": [],
+    "preview": null,
+    "error": {"code": "submission_pending", "message": "retry the same request"}
+  },
+  "unknown": {
+    "schema_version": 1,
+    "mode": "command",
+    "outcome": "unknown",
+    "project": {"path": "/projects/a", "source": "environment"},
+    "group": {"name": null, "source": "none", "disposition": null},
+    "operation": {"id": "submission-3", "state": null},
+    "idempotency_key": "key-3",
+    "task_ids": [],
+    "preview": null,
+    "error": {"code": "commit_unknown", "message": "retry with key-3"}
+  },
+  "preview": {
+    "schema_version": 1,
+    "mode": "file",
+    "outcome": "preview",
+    "project": {"path": "/projects/a", "source": "cwd_ancestor"},
+    "group": {"name": "exp", "source": "manifest", "disposition": null},
+    "operation": null,
+    "idempotency_key": "key-4",
+    "task_ids": [],
+    "preview": {
+      "tasks": [
+        {
+          "input_index": 0,
+          "task_id": null,
+          "command": ["echo", "ok"],
+          "working_directory": "/projects/a",
+          "requested_gpus": 1,
+          "requested_cpus": null,
+          "home_machine": "gpu-1",
+          "sharing_mode": "private",
+          "fallback_machines": "group",
+          "offer_after_seconds": null,
+          "depends_on_task_ids": [],
+          "tmux_override": null,
+          "sources": {"requested_gpus": "builtin"}
+        }
+      ],
+      "group_action": "create",
+      "worker_additions": [{"machine_name": "gpu-1", "scheduling_role": "primary", "gpu_limit_gpus": null}],
+      "evidence_gaps": []
+    },
+    "error": null
+  }
+}

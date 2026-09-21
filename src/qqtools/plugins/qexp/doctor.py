@@ -14,10 +14,10 @@ from .layout import validate_root_contract
 from .lease import clock_capability
 from .runtime.availability import rebuild_deadline_indexes, reconcile_availability_operations
 from .runtime.group_namespace import group_directory
-from .runtime.locks import group_writer_lock, schema_lock, schema_reader_lock
+from .runtime.locks import schema_lock, schema_reader_lock
 from .runtime.observation.maintenance import ObservationMaintenance, request_rebuild
 from .runtime.observation.projection import inspect_observation, observation_path
-from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
+from .runtime.paths import attempt_path, local_paths, shared_paths, task_path
 from .runtime.process_evidence import ProcessEvidence, inspect_group_identity
 from .runtime.ready import (
     READY_BUILD_PAGE_SIZE,
@@ -37,8 +37,13 @@ from .runtime.ready.group_members import (
 from .runtime.ready.group_members_rebuild import audit_group_ready_members, repair_group_ready_members
 from .runtime.records import AttemptRecord, TaskRecord, normalize_group_record, utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
-from .runtime.submission import finalize_submission_group
-from .runtime.submission_control import control_paths, inspect_submission_control, request_control_rebuild
+from .runtime.submission import reconcile_submission
+from .runtime.submission_control import (
+    control_paths,
+    inspect_submission_control,
+    read_submission_state,
+    request_control_rebuild,
+)
 from .runtime.termination import list_decisions
 
 _TASK_OBSERVATION_INSTRUCTIONS = (
@@ -153,6 +158,31 @@ def verify_integrity(
                 str(exc),
             )
     groups = {name: {"group": group} for name, group in group_records.items()}
+    provisional_groups: list[dict[str, Any]] = []
+    for name, group in group_records.items():
+        operation_id = group.get("creation_operation_id")
+        if operation_id is None:
+            continue
+        try:
+            state = read_submission_state(cfg.shared_root, operation_id)
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+            state = "unavailable"
+            _issue(
+                issues,
+                "submission_group_publication_unavailable",
+                groups_root / f"{name}.json",
+                "high",
+                str(exc),
+            )
+        if state != "committed":
+            provisional_groups.append({"name": name, "operation_id": operation_id, "state": state})
+            _issue(
+                issues,
+                "submission_group_provisional",
+                groups_root / f"{name}.json",
+                "high",
+                f"operation_id={operation_id};state={state}",
+            )
     if member_state == "active":
         try:
             with schema_lock(cfg.shared_root):
@@ -531,31 +561,15 @@ def repair_metadata(
         group_name = operation.get("target_group")
         if not group_name:
             continue
-        if operation["state"] == "committed":
-            try:
-                finalize_submission_group(cfg, operation)
-            except (OSError, RuntimeError, TypeError, ValueError):
-                blocked.append(operation["operation_id"])
-                continue
-            repaired.append(operation["operation_id"])
-            continue
-        if operation["state"] in {"committed", "aborted", "blocked"}:
-            with group_writer_lock(cfg, group_name):
-                group_file = group_path(cfg.shared_root, group_name)
-                if not group_file.exists():
-                    continue
-                group_data = read_json(group_file)
-                normalize_group_record(group_data)
-                pending = group_data["group"].get("pending_submission_commit") or {}
-                if pending.get("operation_id") != operation["operation_id"]:
-                    continue
-                group_data["group"]["pending_submission_commit"] = None
-                group_data["meta"]["revision"] += 1
-                group_data["meta"]["updated_at"] = operation.get("committed_at") or group_data["meta"]["updated_at"]
-                atomic_replace(group_file, group_data)
-                repaired.append(operation["operation_id"])
-        else:
+        try:
+            state = reconcile_submission(cfg, operation["operation_id"], abort_incomplete=True)
+        except (OSError, RuntimeError, TypeError, ValueError):
             blocked.append(operation["operation_id"])
+        else:
+            if state in {"committed", "aborted"}:
+                repaired.append(operation["operation_id"])
+            else:
+                blocked.append(operation["operation_id"])
     for result in reconcile_cleanup_operations(cfg, reservation_runtime_root=reservation_runtime_root):
         if result["state"] == "completed":
             repaired.append(result["operation_id"])

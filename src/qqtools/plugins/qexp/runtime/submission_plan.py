@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -14,6 +15,7 @@ from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_task_depe
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
 from ..task_observation import build_task_observation, decode_task_observation, validate_tmux_override
 from .dependencies import normalize_dependency_ids
+from .group_namespace import read_group, read_group_raw
 from .locks import group_lock
 from .paths import group_path, machine_path
 from .ready.group_members import assert_group_ready_members_writable
@@ -109,12 +111,14 @@ class SubmissionRequest:
     group_name: str | None
     kind: str
     worker_set_additions: Mapping[str, Mapping[str, Any]]
+    worker_set_declared: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "specs", tuple(_freeze(item) for item in self.specs))
         object.__setattr__(self, "group_name", self.group_name)
         object.__setattr__(self, "kind", self.kind)
         object.__setattr__(self, "worker_set_additions", _freeze(self.worker_set_additions))
+        object.__setattr__(self, "worker_set_declared", bool(self.worker_set_declared))
 
     @property
     def target_group(self) -> str | None:
@@ -134,13 +138,18 @@ class SubmissionRequest:
 
     @property
     def raw_request(self) -> dict[str, Any]:
-        return {
+        value = {
             "group": self.group_name,
             "tasks": [_thaw(item) for item in self.specs],
             "worker_set": {
                 machine: _thaw(self.worker_set_additions[machine]) for machine in sorted(self.worker_set_additions)
             },
         }
+        # Keep omitted declarations byte-compatible with historical requests;
+        # explicit empty declarations remain semantically distinct.
+        if self.worker_set_declared and not self.worker_set_additions:
+            value["worker_set_declared"] = True
+        return value
 
     @property
     def raw_request_digest(self) -> str:
@@ -167,6 +176,7 @@ def normalize_submission_request(
         group_name=group_name,
         kind=kind,
         worker_set_additions=additions,
+        worker_set_declared=worker_set is not None,
     )
 
 
@@ -187,7 +197,11 @@ def _resolved_home(value: str | None, submitting_machine: str) -> str:
 
 
 def _resolved_specs(
-    specs: tuple[Mapping[str, Any], ...], submitting_machine: str, working_directory: str | None = None
+    specs: tuple[Mapping[str, Any], ...],
+    submitting_machine: str,
+    working_directory: str | None = None,
+    *,
+    allocate_task_ids: bool = True,
 ) -> list[dict[str, Any]]:
     if working_directory is None:
         working_directory = str(Path.cwd())
@@ -198,11 +212,15 @@ def _resolved_specs(
         command = raw.get("command")
         if not isinstance(command, list) or not command or any(not isinstance(item, str) for item in command):
             raise ValueError("command must be a non-empty list of strings.")
-        task_id = raw.get("task_id") or new_id()
-        validate_identifier(task_id, "task_id")
-        if task_id in seen:
+        task_id = raw.get("task_id")
+        if task_id is None and allocate_task_ids:
+            task_id = new_id()
+        if task_id is not None:
+            validate_identifier(task_id, "task_id")
+        if task_id is not None and task_id in seen:
             raise ValueError(f"duplicate task_id {task_id!r} in submission.")
-        seen.add(task_id)
+        if task_id is not None:
+            seen.add(task_id)
         home_machine = _resolved_home(raw.get("home_machine"), submitting_machine)
         result.append(
             {
@@ -271,6 +289,14 @@ def _planned_worker_set(
         worker = all_workers.get(machine)
         if worker is not None and worker.get("state") != "active":
             raise ValueError(f"machine {machine!r} is not a claimable Group worker.")
+        if worker is not None:
+            if worker.get("scheduling_role") != declaration.get("scheduling_role") or worker.get(
+                "gpu_limit_gpus"
+            ) != declaration.get("gpu_limit_gpus"):
+                raise ValueError(
+                    f"Worker {machine!r} already exists with a conflicting role or GPU limit; "
+                    "use group worker controls to change it."
+                )
         planned.setdefault(
             machine,
             {
@@ -348,7 +374,7 @@ def _validate_planned_dependencies(specs: list[Mapping[str, Any]], group_name: s
     """Reject deterministic dependency contradictions before any journal mutation."""
     if group_name is None and any(item["depends_on_task_ids"] for item in specs):
         raise ValueError("ungrouped tasks cannot declare dependencies.")
-    planned = {item["task_id"]: item for item in specs}
+    planned = {item["task_id"]: item for item in specs if item.get("task_id") is not None}
     visiting: set[str] = set()
     visited: set[str] = set()
 
@@ -386,6 +412,7 @@ class SubmissionPlan:
     group_precondition: Mapping[str, Any]
     planned_worker_set: tuple[str, ...]
     worker_set_additions: Mapping[str, Mapping[str, Any]]
+    worker_set_declared: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_ids", tuple(self.task_ids))
@@ -397,6 +424,7 @@ class SubmissionPlan:
         object.__setattr__(self, "group_precondition", _freeze(self.group_precondition))
         object.__setattr__(self, "planned_worker_set", tuple(self.planned_worker_set))
         object.__setattr__(self, "worker_set_additions", _freeze(self.worker_set_additions))
+        object.__setattr__(self, "worker_set_declared", bool(self.worker_set_declared))
 
     @property
     def idempotency_key(self) -> str:
@@ -420,7 +448,7 @@ def _resolved_context(plan: SubmissionPlan) -> dict[str, Any]:
     for frozen in plan.task_specs:
         item = _thaw(frozen)
         task_specs.append(item)
-    return {
+    context = {
         "task_ids": list(plan.task_ids),
         "task_specs": task_specs,
         "create_group": plan.create_group,
@@ -428,10 +456,26 @@ def _resolved_context(plan: SubmissionPlan) -> dict[str, Any]:
         "group_precondition": _thaw(plan.group_precondition),
         "planned_worker_set": list(plan.planned_worker_set),
     }
+    if plan.worker_set_declared and not plan.worker_set_additions:
+        context["worker_set_declared"] = True
+    elif not plan.worker_set_declared and plan.worker_set_additions:
+        # Nonempty declarations predate this field and remain byte-compatible.
+        # False is needed only when planning synthesized the default local Worker.
+        context["worker_set_declared"] = False
+    return context
 
 
-def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency_key: str) -> SubmissionPlan:
-    """Resolve one new submission while the submission fence is held."""
+def _resolve_submission_plan(
+    cfg: Any,
+    request: SubmissionRequest,
+    *,
+    idempotency_key: str,
+    operation_id: str,
+    allocate_task_ids: bool,
+    persist_clock_evidence: bool,
+    acquire_group_lock: bool = True,
+) -> SubmissionPlan:
+    """Resolve a plan using only caller-selected read/write side effects."""
     if not isinstance(request, SubmissionRequest):
         raise TypeError("request must be a SubmissionRequest.")
     if not isinstance(idempotency_key, str) or not idempotency_key:
@@ -440,7 +484,12 @@ def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency
     working_directory = str(Path.cwd())
     is_canonical = is_cpu_lane_root(cfg)
     dependencies_are_canonical = is_task_dependencies_root(cfg)
-    resolved = _resolved_specs(request.specs, submitting_machine, working_directory)
+    resolved = _resolved_specs(
+        request.specs,
+        submitting_machine,
+        working_directory,
+        allocate_task_ids=allocate_task_ids,
+    )
     if not dependencies_are_canonical and any(item["depends_on_task_ids"] for item in resolved):
         raise ValueError("Task dependencies require an activated task-dependencies-v1 root.")
     for item in resolved:
@@ -454,35 +503,38 @@ def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency
     group_precondition = _group_precondition(None)
     planned_workers: dict[str, dict[str, Any]] = {}
     if request.group_name:
-        with group_lock(cfg.shared_root, request.group_name):
+        lock_context = group_lock(cfg.shared_root, request.group_name) if acquire_group_lock else nullcontext()
+        with lock_context:
             if is_group_ready_members_root(cfg):
                 assert_group_ready_members_writable(cfg)
             group_file = group_path(cfg.shared_root, request.group_name)
-            group = read_json(group_file) if group_file.exists() else None
+            if group_file.exists():
+                group_reader = read_group_raw if acquire_group_lock else read_group
+                group = group_reader(cfg.shared_root, request.group_name)
+            else:
+                group = None
             if group is not None:
                 normalize_group_record(group)
             if group is not None and group["group"]["admission_state"] != "open":
                 raise ValueError(f"Group {request.group_name!r} is sealed.")
             group_precondition = _group_precondition(group)
-        if group is None and request.kind == "single":
-            raise ValueError(f"Group {request.group_name!r} does not exist; create it with 'qexp group create'.")
-        if group is None and not request.worker_set:
-            raise ValueError(
-                f"Group {request.group_name!r} does not exist; batch-submit requires a non-empty "
-                "manifest group.workers declaration."
-            )
-        planned_workers = _planned_worker_set(group, request.worker_set)
+        worker_additions = dict(request.worker_set_additions)
+        if group is None and not request.worker_set_declared:
+            worker_additions = {submitting_machine: {"scheduling_role": "primary", "gpu_limit_gpus": None}}
+        planned_workers = _planned_worker_set(group, worker_additions)
         _validate_placement_against_workers(resolved, group_name=request.group_name, planned_workers=planned_workers)
     else:
         if request.worker_set_additions:
             raise ValueError("ungrouped submissions cannot declare a Group Worker Set.")
+        worker_additions = {}
         _validate_placement_against_workers(resolved, group_name=None, planned_workers={submitting_machine: {}})
 
     if any(item["offer_after_seconds"] is not None for item in resolved):
         capability = clock_capability(cfg)
         if not capability.is_healthy or capability.observation is None:
             raise ValueError("timed offer requires a healthy clock capability; use an immediate share instead.")
-        persist_clock_observation(cfg, capability.observation)
+        if persist_clock_evidence:
+            persist_clock_observation(cfg, capability.observation)
         for item in resolved:
             if item["offer_after_seconds"] is not None:
                 deadline, proof = new_timed_offer_proof(capability.observation, item["offer_after_seconds"])
@@ -490,7 +542,7 @@ def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency
                 item["offer_clock_evidence"] = proof
 
     plan = SubmissionPlan(
-        operation_id=new_id(),
+        operation_id=operation_id,
         key=idempotency_key,
         kind=request.kind,
         raw_request_digest=request.raw_request_digest,
@@ -503,7 +555,8 @@ def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency
         create_group=bool(request.group_name and not group_precondition["exists"]),
         group_precondition=group_precondition,
         planned_worker_set=tuple(sorted(planned_workers)),
-        worker_set_additions=request.worker_set_additions,
+        worker_set_additions=worker_additions,
+        worker_set_declared=request.worker_set_declared,
     )
     context = _resolved_context(plan)
     return SubmissionPlan(
@@ -521,6 +574,19 @@ def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency
         group_precondition=plan.group_precondition,
         planned_worker_set=plan.planned_worker_set,
         worker_set_additions=plan.worker_set_additions,
+        worker_set_declared=plan.worker_set_declared,
+    )
+
+
+def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency_key: str) -> SubmissionPlan:
+    """Resolve one new submission while the submission fence is held."""
+    return _resolve_submission_plan(
+        cfg,
+        request,
+        idempotency_key=idempotency_key,
+        operation_id=new_id(),
+        allocate_task_ids=True,
+        persist_clock_evidence=True,
     )
 
 
@@ -730,8 +796,12 @@ def decode_submission_plan(operation: Mapping[str, Any]) -> SubmissionPlan:
         "group_precondition",
         "planned_worker_set",
     }
-    if set(context) != required_context:
+    allowed_context = required_context | {"worker_set_declared"}
+    if set(context) - allowed_context or not required_context.issubset(context):
         raise RuntimeError("submission resolved_context has invalid fields.")
+    persisted_worker_set_declared = context.get("worker_set_declared")
+    if persisted_worker_set_declared is not None and type(persisted_worker_set_declared) is not bool:
+        raise ValueError("submission worker_set_declared must be a boolean.")
     try:
         persisted_digest = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
     except (TypeError, ValueError) as exc:
@@ -798,6 +868,7 @@ def decode_submission_plan(operation: Mapping[str, Any]) -> SubmissionPlan:
     if planned_workers != sorted(set(planned_workers)):
         raise ValueError("submission planned_worker_set must be sorted and unique.")
     additions = _validate_worker_additions(context["worker_set_additions"])
+    worker_set_declared = bool(additions) if persisted_worker_set_declared is None else persisted_worker_set_declared
     if target_group is None and (precondition["exists"] or planned_workers or additions):
         raise ValueError("ungrouped submission has contradictory Group planning fields.")
     if not set(additions).issubset(planned_workers):
@@ -843,4 +914,5 @@ def decode_submission_plan(operation: Mapping[str, Any]) -> SubmissionPlan:
         group_precondition=dict(precondition),
         planned_worker_set=tuple(planned_workers),
         worker_set_additions=additions,
+        worker_set_declared=worker_set_declared,
     )

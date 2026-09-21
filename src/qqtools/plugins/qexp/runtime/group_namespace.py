@@ -5,16 +5,38 @@ from __future__ import annotations
 import os
 import stat
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from .protocol_compatibility import GROUP_AUTHORITY_CAPABILITY
-from .records import utc_now
+from .protocol_compatibility import GROUP_AUTHORITY_CAPABILITY, SUBMISSION_GROUP_PUBLICATION_CAPABILITY
+from .records import normalize_group_record, utc_now, validate_identifier
 from .responsibility_store import DurableIO
 from .store import atomic_replace, read_json, read_json_limited
 
 _GROUP_DIRECTORY = "groups-v2"
 _IDENTITY_FILE = ".authority-identity"
+_internal_provisional_read = ContextVar("qexp_internal_provisional_group_read", default=False)
+
+
+class GroupNotPublished(RuntimeError):
+    """A provisional Group is present but its Submission is not committed."""
+
+
+class GroupPublicationUnavailable(RuntimeError):
+    """The Submission proof required to publish a Group cannot be established."""
+
+
+@contextmanager
+def provisional_group_reader():
+    """Temporarily permit a fenced transaction to inspect its own Group stage."""
+    token = _internal_provisional_read.set(True)
+    try:
+        yield
+    finally:
+        _internal_provisional_read.reset(token)
 
 
 def journal_path(root: Path) -> Path:
@@ -106,8 +128,8 @@ def group_directory(root: Path) -> Path:
     raise RuntimeError("Group authority directory is missing or changed")
 
 
-def read_group(root: Path, name: str) -> dict[str, Any]:
-    """Read one Group, retrying a concurrent canonical namespace cutover."""
+def read_group_raw(root: Path, name: str) -> dict[str, Any]:
+    """Read one Group without applying Submission publication filtering."""
     directory = group_directory(root)
     try:
         value = read_json(directory / f"{name}.json")
@@ -118,6 +140,87 @@ def read_group(root: Path, name: str) -> dict[str, Any]:
         return read_json(current / f"{name}.json")
     current = group_directory(root)
     return value if current == directory else read_json(current / f"{name}.json")
+
+
+def _submission_state(root: Path, operation_id: str) -> str:
+    """Read one bounded Submission proof without requiring a RootConfig object."""
+    from .submission_control import read_submission_state
+
+    try:
+        return read_submission_state(root, operation_id)
+    except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+        raise GroupPublicationUnavailable(
+            f"Group publication proof for operation {operation_id!r} is unavailable."
+        ) from exc
+
+
+def group_visibility(root: Path, name: str, value: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return the one published Group projection shared by all ordinary readers.
+
+    A Group created by a Submission is published only after its exact operation
+    reaches ``committed``.  Existing Groups remain visible while filtering
+    Worker additions owned by an uncommitted Submission.
+    """
+    value = deepcopy(value if value is not None else read_group_raw(root, name))
+    try:
+        normalize_group_record(value)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise GroupPublicationUnavailable(f"Group {name!r} is malformed.") from exc
+    group = value["group"]
+    creation_operation_id = group.get("creation_operation_id")
+    if creation_operation_id is not None:
+        try:
+            validate_identifier(creation_operation_id, "creation_operation_id")
+        except (TypeError, ValueError) as exc:
+            raise GroupPublicationUnavailable(f"Group {name!r} has invalid creation provenance.") from exc
+        state = _submission_state(root, creation_operation_id)
+        if state != "committed":
+            raise GroupNotPublished(
+                f"Group {name!r} is not published; Submission operation {creation_operation_id!r} is {state}."
+            )
+
+    states: dict[str, str] = {}
+    workers = group.get("worker_set", {})
+    for machine, worker in list(workers.items()):
+        operation_id = worker.get("added_by_operation")
+        if operation_id is None:
+            continue
+        try:
+            validate_identifier(operation_id, "added_by_operation")
+        except (TypeError, ValueError) as exc:
+            raise GroupPublicationUnavailable(
+                f"Group {name!r} has invalid Worker publication provenance for {machine!r}."
+            ) from exc
+        state = states.setdefault(operation_id, _submission_state(root, operation_id))
+        if state != "committed":
+            del workers[machine]
+    return value
+
+
+def read_group(root: Path, name: str) -> dict[str, Any]:
+    """Read one published Group, retrying a concurrent namespace cutover."""
+    if _internal_provisional_read.get():
+        return read_group_raw(root, name)
+    directory = group_directory(root)
+    try:
+        value = read_group_raw(root, name)
+    except FileNotFoundError:
+        raise
+    current = group_directory(root)
+    if current != directory:
+        value = read_group_raw(root, name)
+    return group_visibility(root, name, value)
+
+
+def iter_published_groups(root: Path) -> list[dict[str, Any]]:
+    """Enumerate ordinary Group projections, excluding unpublished records."""
+    result: list[dict[str, Any]] = []
+    for path in sorted(group_directory(root).glob("*.json")):
+        try:
+            result.append(read_group(root, path.stem))
+        except GroupNotPublished:
+            continue
+    return result
 
 
 def has_group_authority_cutover(root: Path) -> bool:
@@ -184,6 +287,11 @@ def activate_group_authority_locked(cfg: object) -> bool:
     if journal is not None and journal["phase"] == "completed":
         if GROUP_AUTHORITY_CAPABILITY not in required or not is_group_authority_isolated(root):
             raise RuntimeError("Group authority completed without its capability")
+        if SUBMISSION_GROUP_PUBLICATION_CAPABILITY not in required:
+            # QQTOOLS-COMPAT-0015: qualified Group-authority activation fences
+            # every reader before a marked Group can be emitted.
+            required.append(SUBMISSION_GROUP_PUBLICATION_CAPABILITY)
+            atomic_replace(schema_path, schema)
         state.assert_ready_writer_compatible(cfg)
         if state.read_state_record(cfg)[1]["writer_capability"] != state.CURRENT_READY_WRITER_CAPABILITY:
             raise RuntimeError("Group authority lost its Task writer floor")
@@ -255,8 +363,15 @@ def activate_group_authority_locked(cfg: object) -> bool:
     atomic_replace(journal_path(root), {"group_authority": journal})
     # Cached released writers may recreate groups/. It is never selected again.
     # Keep it as a shadow; no recursive cleanup belongs in activation.
+    capabilities_changed = False
     if GROUP_AUTHORITY_CAPABILITY not in required:
         required.append(GROUP_AUTHORITY_CAPABILITY)
+        capabilities_changed = True
+    if SUBMISSION_GROUP_PUBLICATION_CAPABILITY not in required:
+        # QQTOOLS-COMPAT-0015: activation is one schema-manifest transition.
+        required.append(SUBMISSION_GROUP_PUBLICATION_CAPABILITY)
+        capabilities_changed = True
+    if capabilities_changed:
         atomic_replace(schema_path, schema)
     io.sync_directory(root / "schema", "group_authority_capability")
     journal["phase"] = "completed"

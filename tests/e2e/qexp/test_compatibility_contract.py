@@ -85,7 +85,9 @@ def test_new_project_activation_uses_registered_binding_without_add_project(tmp_
         assert status["action"] == "started"
         assert is_machine_agent_running(common, env=env)
 
-        task_id = run([*common, "submit", "--", "python", "-c", "print('protected start')"], env=env).stdout.strip()
+        task_id = run(
+            [*common, "submit", "--quiet", "--", "python", "-c", "print('protected start')"], env=env
+        ).stdout.strip()
         task = _wait_for_terminal_task(common, task_id, env)
 
         assert "site-packages" in ensure_site_packages_import()
@@ -108,7 +110,9 @@ def test_new_project_submit_activates_agent_without_manual_registration(tmp_path
         _assert_current_project_is_registered(common, shared_root, env)
         assert not is_machine_agent_running(common, env=env)
 
-        task_id = run([*common, "submit", "--", "python", "-c", "print('protected submit')"], env=env).stdout.strip()
+        task_id = run(
+            [*common, "submit", "--quiet", "--", "python", "-c", "print('protected submit')"], env=env
+        ).stdout.strip()
         task = _wait_for_terminal_task(common, task_id, env)
 
         assert "site-packages" in ensure_site_packages_import()

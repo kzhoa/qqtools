@@ -46,7 +46,7 @@ from ..runtime.records import (
     validate_identifier,
 )
 from ..runtime.store import atomic_replace, iter_json, read_json
-from ..runtime.submission import finalize_submission_group
+from ..runtime.submission import finalize_submission_group, reconcile_submission
 from ..runtime.tasks import load_task, save_task
 from .group_cancel import advance_indexed_cancel, initialize_cancel_discovery
 from .task import has_cleanup_operation, is_cleanup_blocked, retry
@@ -59,7 +59,8 @@ from .worker_removal import (
 
 
 def _finalize_pending_submission_before_group_mutation(cfg: RootConfig, name: str, path: Path) -> None:
-    """Finalize a committed submission before taking the Group mutation lock."""
+    """Reconcile an occupying Submission before taking a Group mutation lock."""
+    owner: str | None = None
     with group_writer_lock(cfg, name):
         path = group_path(cfg.shared_root, name)
         if not path.exists():
@@ -67,15 +68,12 @@ def _finalize_pending_submission_before_group_mutation(cfg: RootConfig, name: st
         data = read_json(path)
         normalize_group_record(data)
         pending = data["group"].get("pending_submission_commit") or {}
-        if not pending:
-            return
-        operation_file = submission_path(cfg.shared_root, pending["operation_id"])
-        if not operation_file.exists():
-            raise RuntimeError(f"Group {name!r} has pending submission commit {pending['operation_id']!r}.")
-        operation = read_json(operation_file)["submission"]
-        if operation.get("state") != "committed":
-            raise RuntimeError(f"Group {name!r} has pending submission commit {pending['operation_id']!r}.")
-    finalize_submission_group(cfg, operation)
+        owner = data["group"].get("creation_operation_id") or pending.get("operation_id")
+    if owner is None:
+        return
+    state = reconcile_submission(cfg, owner, abort_incomplete=True)
+    if state == "blocked":
+        raise RuntimeError(f"Group {name!r} is blocked by Submission operation {owner!r}.")
 
 
 def group_control(
@@ -601,6 +599,7 @@ def _reconcile_worker_remove_operation(
 
 def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -> dict[str, Any]:
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
+    _finalize_pending_submission_before_group_mutation(cfg, name, path)
     with group_writer_lock(cfg, name):
         path = group_path(cfg.shared_root, name)
         if path.exists():

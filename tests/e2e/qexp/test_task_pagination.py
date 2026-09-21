@@ -21,7 +21,7 @@ def test_installed_task_pagination(tmp_path):
     try:
         initialize_machine_project(common, env=env)
         for key in ["page-a", "page-b", "page-c"]:
-            run([*common, "submit", "--no-activate", "--task-id", key, "--", "true"], env=env)
+            run([*common, "submit", "--no-activate", "--task-id", key, "--quiet", "--", "true"], env=env)
         legacy = jrun([*common, "task", "list"], env=env)
         first = jrun([*common, "task", "list", "--page-size", "1"], env=env)
         assert first["items"] == legacy[:1]

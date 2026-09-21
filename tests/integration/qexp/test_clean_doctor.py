@@ -1,6 +1,5 @@
 import multiprocessing
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -223,18 +222,13 @@ def test_doctor_does_not_clear_pending_group_commit_from_a_stale_snapshot(
     group["group"]["pending_submission_commit"] = {"operation_id": operation_id}
     atomic_replace(path, group)
 
-    from qqtools.plugins.qexp.doctor import group_writer_lock as real_group_writer_lock
+    def replace_pending_before_reconcile(*_args, **_kwargs):
+        current = read_json(path)
+        current["group"]["pending_submission_commit"] = {"operation_id": "new-owner"}
+        atomic_replace(path, current)
+        return "blocked"
 
-    @contextmanager
-    def replace_pending_before_doctor_read(*args, **kwargs):
-        with real_group_writer_lock(*args, **kwargs) as acquired:
-            assert acquired
-            current = read_json(path)
-            current["group"]["pending_submission_commit"] = {"operation_id": "new-owner"}
-            atomic_replace(path, current)
-            yield acquired
-
-    monkeypatch.setattr("qqtools.plugins.qexp.doctor.group_writer_lock", replace_pending_before_doctor_read)
+    monkeypatch.setattr("qqtools.plugins.qexp.doctor.reconcile_submission", replace_pending_before_reconcile)
     repaired = repair_metadata(cfg)
 
     assert operation_id not in repaired["repaired"]

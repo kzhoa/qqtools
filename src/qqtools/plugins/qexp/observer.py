@@ -8,7 +8,7 @@ from typing import Any
 
 from .config_types import RootConfig
 from .runtime.dependencies import dependency_gate
-from .runtime.group_namespace import group_directory, read_group
+from .runtime.group_namespace import iter_published_groups, read_group
 from .runtime.locks import schema_reader_lock
 from .runtime.paths import (
     attempt_path,
@@ -306,13 +306,8 @@ def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
 
 
 def list_groups(cfg: RootConfig) -> list[dict[str, Any]]:
-    groups = []
     with schema_reader_lock(cfg.shared_root):
-        for path in iter_json(group_directory(cfg.shared_root)):
-            group = read_json(path)
-            normalize_group_record(group)
-            groups.append(group)
-    return groups
+        return iter_published_groups(cfg.shared_root)
 
 
 def list_group_machines(cfg: RootConfig, name: str, *, reservation_runtime_root: Path | None = None) -> dict[str, Any]:

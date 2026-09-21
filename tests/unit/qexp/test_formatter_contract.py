@@ -1,8 +1,20 @@
 import json
+from pathlib import Path
 
 import pytest
 
 from qqtools.plugins.qexp.formatter import CliOutput, OutputKind, render
+
+
+def test_submission_result_fixtures_satisfy_json_and_human_contracts() -> None:
+    fixtures = json.loads(
+        (Path(__file__).parents[2] / "fixtures" / "qexp" / "submission_results.json").read_text(encoding="utf-8")
+    )
+
+    for payload in fixtures.values():
+        output = CliOutput(OutputKind.SUBMISSION, payload)
+        assert json.loads(render(output, "json")) == payload
+        assert render(output, "human")
 
 
 def test_json_serializes_only_the_canonical_payload() -> None:

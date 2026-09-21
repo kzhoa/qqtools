@@ -19,6 +19,9 @@ GROUP_AUTHORITY_CAPABILITY = "group-authority-v2"
 READY_WRITER_CAPABILITY = "ready-v1"
 CURRENT_READY_WRITER_CAPABILITY = "ready-v2"
 OBSERVATION_CAPABILITY = "task-observation-v1"
+# QQTOOLS-COMPAT-0015: old readers must be fenced before Submission-owned
+# provisional Groups can carry creation provenance.
+SUBMISSION_GROUP_PUBLICATION_CAPABILITY = "submission-group-publication-v1"
 SUPPORTED_READY_WRITERS = frozenset({READY_WRITER_CAPABILITY, CURRENT_READY_WRITER_CAPABILITY})
 SUPPORTED_REQUIRED_CAPABILITIES = frozenset(
     {
@@ -28,6 +31,7 @@ SUPPORTED_REQUIRED_CAPABILITIES = frozenset(
         LOCAL_RECOVERY_CAPABILITY,
         GROUP_AUTHORITY_CAPABILITY,
         OBSERVATION_CAPABILITY,
+        SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
     }
 )
 
@@ -63,7 +67,13 @@ def manifest_schema_digest(schema: dict[str, Any]) -> str:
         record["required_capabilities"] = [
             item
             for item in capabilities
-            if item not in {LOCAL_RECOVERY_CAPABILITY, GROUP_AUTHORITY_CAPABILITY, OBSERVATION_CAPABILITY}
+            if item
+            not in {
+                LOCAL_RECOVERY_CAPABILITY,
+                GROUP_AUTHORITY_CAPABILITY,
+                OBSERVATION_CAPABILITY,
+                SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
+            }
         ]
     writers = record.get("writer_capabilities")
     if isinstance(writers, list):

@@ -30,8 +30,10 @@ class SubmissionControlUnavailable(ValueError):
     """Derived Submission visibility cannot be established safely."""
 
 
-def _root(cfg: RootConfig) -> Path:
-    return Path(cfg.shared_root).expanduser().resolve()
+def _root(cfg: RootConfig | Path | str) -> Path:
+    """Resolve either a RootConfig or a shared-root path for read proofs."""
+    value = cfg if isinstance(cfg, (str, Path)) else cfg.shared_root
+    return Path(value).expanduser().resolve()
 
 
 def _control_root(cfg: RootConfig) -> Path:

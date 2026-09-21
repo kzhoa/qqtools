@@ -19,13 +19,13 @@ def test_submit_tmux_flags_are_nullable_and_application_arguments_stay_after_sep
 
 def test_batch_tmux_flags_are_nullable_and_mutually_exclusive():
     parser = build_parser()
-    inherited = parser.parse_args(["batch-submit", "--file", "runs.yaml"])
-    enabled = parser.parse_args(["batch-submit", "--file", "runs.yaml", "--tmux"])
+    inherited = parser.parse_args(["submit", "--file", "runs.yaml"])
+    enabled = parser.parse_args(["submit", "--file", "runs.yaml", "--tmux"])
 
     assert inherited.tmux_override is None
     assert enabled.tmux_override is True
     with pytest.raises(SystemExit):
-        parser.parse_args(["batch-submit", "--file", "runs.yaml", "--tmux", "--no-tmux"])
+        parser.parse_args(["submit", "--file", "runs.yaml", "--tmux", "--no-tmux"])
 
 
 def test_config_tmux_set_requires_exactly_one_value():
