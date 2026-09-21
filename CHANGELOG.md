@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## v1.3.20
+## v1.3.21
 
 - feat: launch qexp runners directly with the agent environment and project working directory,
   using tmux only as an optional post-handoff log observer; add a configurable, bounded launch
