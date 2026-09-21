@@ -150,10 +150,11 @@ It is local-first:
   Attempt stdout/stderr logs are shared for cross-machine inspection
 
 qexp launches each runner directly from the local agent with an explicit working directory and
-the agent's current environment. When `tmux` is available, qexp creates a non-authoritative
-Attempt-log observer window after the runner accepts the durable handoff. Execution does not
-depend on tmux or interactive-shell readiness; without tmux, the runner and shared log retain the
-same lifecycle semantics while interactive observation is unavailable.
+the agent's current environment. A project may optionally create a non-authoritative `tmux`
+Attempt-log observer after the runner accepts the durable handoff; this observation policy is
+disabled by default. Execution does not depend on `tmux` or interactive-shell readiness. The
+runner, shared log, `task show --watch`, and `task logs --follow` retain the same lifecycle
+semantics when windows are disabled or unavailable.
 
 It may optionally cooperate across machines:
 
@@ -1143,6 +1144,11 @@ multi-Task commit. It does not create a different Task type or lifecycle.
 Rules:
 
 - manifest is used only when several Tasks are submitted together
+- manifest `tasks[].tmux` and `defaults.tmux` accept only booleans or null; a Task boolean wins
+  the invocation's `--tmux`/`--no-tmux` default, which wins a manifest default, while null or
+  omission continues to the next level
+- the normalized choice is stored as a durable per-Task override; it does not update Group
+  defaults, existing Tasks, or later independent submissions to the same Group
 - the command validates the complete input before commit
 - Tasks are not claimable until the internal Submission Operation commits
 - `--idempotency-key` is the explicit retry contract for scripts and uncertain outcomes
@@ -1280,6 +1286,9 @@ Human output distinguishes pending execution, no accepted report, an available s
 and an evidenced unavailable observation. Available timestamps show both absolute UTC time
 and relative age. JSON preserves the legacy `available|unavailable` status while adding the
 richer observation state and bounded reason. Retry never displays an older Attempt's report.
+The same response reports the stored tmux observer override as `enabled`, `disabled`, or
+`inherit`. This is a prospective choice for later observer decisions, not evidence that a window
+exists; Attempt references remain the source of live window evidence.
 
 Finite structured commands collect one canonical result before selecting JSON or human
 presentation. JSON serializes that result without presentation wrappers. Human rendering may
@@ -1415,11 +1424,10 @@ Only the owning machine agent may:
 - manage its local GPU reservations
 - confirm local process termination
 
-`tmux` is the primary supported operating mode for interactive execution and observation.
-When `tmux` is absent, qexp may fall back to a reduced detached-process path so the machine
-can still execute work, but that fallback is a compatibility path rather than the primary
-feature target. qexp does not guarantee parity of operational ergonomics or performance for
-non-`tmux` deployments.
+Detached runner execution is the execution path. Project-controlled `tmux` windows are optional,
+read-only log observers and are disabled by default. Disabling or closing one does not change the
+runner, process group, reservation, or Task lifecycle. The continuous Task and log commands are
+the ordinary observation path when no window is requested.
 
 Cross-machine commands write shared intent and wait for acknowledgements. They do not
 directly operate remote PIDs.
@@ -1500,6 +1508,8 @@ are exposed through Task/Group JSON, events, and `doctor` only.
 - `qexp machines`
 - `qexp config progress show`
 - `qexp config progress set --interval-seconds <seconds>`
+- `qexp config tmux show`
+- `qexp config tmux set --enabled | --disabled`
 - `qexp config launch-handoff show`
 - `qexp config launch-handoff set --timeout-seconds <seconds>`
 
@@ -1508,6 +1518,16 @@ to 1. It applies to subsequent launches and retries, while an already-running At
 the policy frozen at launch. A larger interval reduces progress-related local and shared
 filesystem writes at the cost of freshness; it is not a visibility deadline or a quota on
 arbitrary application I/O.
+
+The project tmux policy defaults to disabled and applies only to future observer decisions.
+Single `submit --tmux|--no-tmux` supplies a Task override. For `batch-submit`, an explicit
+per-Task manifest value wins the invocation switch, then `defaults.tmux`, then project policy,
+then the built-in disabled value. Explicit overrides survive retries; inherited Tasks sample the
+then-current project policy for each new observer decision. Policy changes never remove existing
+windows or create one for already-running work. Participating agents must be upgraded before the
+policy is enforced across every owning machine; a config write alone is not fleet rollout proof.
+An enabled decision still treats missing `tmux`/`libtmux` or window-creation failure as an
+observation diagnostic and never as a training failure.
 
 The launch-handoff policy defaults to 10 seconds and accepts finite values from 1 through
 300 seconds. It applies to subsequent launch and retry Attempts and is frozen when the local
@@ -1589,8 +1609,9 @@ The target CLI also does not promise aliases for the old flat `list`, `inspect`,
 - [ ] Explicit project migration verifies old PID identity, keeps training processes alive, and
       leaves one global agent process responsible for the migrated Project.
 - [ ] Machine runtime loss cannot assert process termination or cause automatic retry.
-- [ ] Agent stop/crash leaves an authorized runner, guardian, process group, and tmux execution
-  container alive; restart reconciles the same Attempt and never launches a successor.
+- [ ] Agent stop/crash leaves an authorized runner and guardian process group alive, and leaves
+  any existing optional tmux observer untouched; restart reconciles the same Attempt and never
+  launches a successor or replays an observer attachment decision.
 - [ ] Offline runner exit evidence records Task and Attempt identity and converges on restart
   within the declared 15-second healthy-host budget; mismatched evidence is retained and diagnosed.
 - [ ] Terminal evidence is retained until claim archival and reservation accounting are durable,

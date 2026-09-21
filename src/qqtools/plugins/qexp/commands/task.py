@@ -29,6 +29,7 @@ from ..runtime.records import AttemptRecord, TaskRecord, utc_now, validate_group
 from ..runtime.store import read_json
 from ..runtime.submission import SubmissionResult, submit_specs
 from ..runtime.tasks import load_task, save_task
+from ..task_observation import validate_tmux_override
 
 
 def is_cleanup_blocked(task: TaskRecord) -> bool:
@@ -59,7 +60,9 @@ def submit(
     offer_after_seconds: int | None = None,
     depends_on_task_ids: list[str] | None = None,
     idempotency_key: str | None = None,
+    tmux_override: bool | None = None,
 ) -> TaskRecord:
+    validate_tmux_override(tmux_override)
     validate_root_contract(cfg)
     ensure_shared_layout(cfg)
     ensure_machine_layout(cfg)
@@ -76,6 +79,7 @@ def submit(
             "fallback_machines": fallback_machines,
             "offer_after_seconds": offer_after_seconds,
             "depends_on_task_ids": depends_on_task_ids or [],
+            "tmux_override": tmux_override,
         }
     ]
     return submit_specs(cfg, items, group_name=validate_group_name(group), idempotency_key=idempotency_key)[0]
@@ -87,11 +91,13 @@ def batch_submit(
     *,
     group: str | None = None,
     idempotency_key: str | None = None,
+    tmux_override: bool | None = None,
     on_prepared: Callable[[str, str], None] | None = None,
 ) -> SubmissionResult:
+    validate_tmux_override(tmux_override)
     validate_root_contract(cfg)
     group_name = validate_group_name(group)
-    normalized, workers = parse_batch_manifest(Path(manifest_path), group_name=group_name)
+    normalized, workers = parse_batch_manifest(Path(manifest_path), group_name=group_name, tmux_override=tmux_override)
     return submit_specs(
         cfg,
         normalized,

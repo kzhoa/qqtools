@@ -18,6 +18,7 @@ def test_installed_wheel_cli_flow(tmp_path):
     ]
     try:
         run([*common, "init", "--agent-mode", "daemon"], env=env)
+        tmux_policy = jrun([*common, "config", "tmux", "show"], env=env)
         group = jrun([*common, "group", "create", "release-e2e", "--workers", "gpu-1"], env=env)
         submit = run(
             [
@@ -27,6 +28,7 @@ def test_installed_wheel_cli_flow(tmp_path):
                 "release-e2e",
                 "--name",
                 "cli-release-e2e",
+                "--no-tmux",
                 "--",
                 "python",
                 "-c",
@@ -42,9 +44,15 @@ def test_installed_wheel_cli_flow(tmp_path):
         followed = run([*common, "task", "logs", task_id, "--follow", "--interval-seconds", "1"], env=env)
 
         assert "site-packages" in imported_from
+        assert tmux_policy == {
+            "enabled": False,
+            "source": "default",
+            "applies_to": "new_observer_decisions",
+        }
         assert group["group"]["name"] == "release-e2e"
         assert task["task"]["task_id"] == task_id
         assert task["task"]["group_name"] == "release-e2e"
+        assert task["observation"]["tmux_override"] == "disabled"
         assert any(item["task_id"] == task_id for item in tasks)
         assert any(item["group"]["name"] == "release-e2e" for item in groups)
         assert any(item["machine"]["machine_name"] == "gpu-1" for item in machines)

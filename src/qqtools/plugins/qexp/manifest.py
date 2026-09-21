@@ -12,10 +12,11 @@ from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
 
 from .runtime.records import validate_gpu_limit, validate_identifier
+from .task_observation import validate_tmux_override
 
 _ROOT_KEYS = {"group", "defaults", "tasks"}
 _GROUP_KEYS = {"workers"}
-_DEFAULTS_KEYS = {"requested_gpus", "requested_cpus", "working_directory", "placement"}
+_DEFAULTS_KEYS = {"requested_gpus", "requested_cpus", "working_directory", "placement", "tmux"}
 _TASK_KEYS = {
     "task_id",
     "name",
@@ -28,6 +29,7 @@ _TASK_KEYS = {
     "fallback_machines",
     "offer_after_seconds",
     "depends_on_task_ids",
+    "tmux",
 }
 _PLACEMENT_KEYS = {"home_machine", "sharing"}
 _SHARING_KEYS = {"mode", "fallback_machines", "offer"}
@@ -147,6 +149,11 @@ def _offer_after(value: Any, path: str) -> int | None:
     return value
 
 
+def _tmux(value: Any, path: str) -> bool | None:
+    """Validate a manifest tmux value without accepting YAML number/string coercion."""
+    return validate_tmux_override(value, path)
+
+
 def _worker_names(value: Any, path: str) -> list[str]:
     if not isinstance(value, list):
         raise ValueError(f"{path} must be a list of machine names.")
@@ -258,9 +265,10 @@ def _apply_flat_fields(entry: dict[str, Any], placement: dict[str, Any], task_pa
 
 
 def parse_batch_manifest(
-    path: Path, *, group_name: str | None
+    path: Path, *, group_name: str | None, tmux_override: bool | None = None
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Parse a batch-submit manifest into canonical Task specs and Worker Set additions."""
+    tmux_override = validate_tmux_override(tmux_override, "tmux_override")
     raw = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeySafeLoader) or {}
     root = _mapping(raw, "root")
     _reject_unknown(root, _ROOT_KEYS, "root")
@@ -272,6 +280,7 @@ def parse_batch_manifest(
     defaults = _optional_mapping(root.get("defaults"), "defaults")
     _reject_unknown(defaults, _DEFAULTS_KEYS, "defaults")
     default_placement = _placement(defaults.get("placement"), "defaults.placement")
+    default_tmux = _tmux(defaults.get("tmux"), "defaults.tmux") if "tmux" in defaults else None
     if default_placement.get("sharing_mode") == "private" and (
         "fallback_machines" in default_placement or "offer_after_seconds" in default_placement
     ):
@@ -294,6 +303,9 @@ def parse_batch_manifest(
         ):
             raise ValueError(f"{task_path} declares private sharing with fallback or offer.")
         placement = _merge_placement(default_placement, task_placement)
+        task_tmux = _tmux(entry.get("tmux"), f"{task_path}.tmux") if "tmux" in entry else None
+        if task_tmux is None:
+            task_tmux = tmux_override if tmux_override is not None else default_tmux
         item = {
             "task_id": entry.get("task_id"),
             "name": entry.get("name"),
@@ -311,6 +323,7 @@ def parse_batch_manifest(
                 f"{task_path}.working_directory",
             ),
             "depends_on_task_ids": entry.get("depends_on_task_ids", []),
+            "tmux_override": task_tmux,
             **placement,
         }
         if item["task_id"] is not None:

@@ -12,6 +12,7 @@ from typing import Any, Mapping
 
 from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_task_dependencies_root
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
+from ..task_observation import build_task_observation, decode_task_observation, validate_tmux_override
 from .dependencies import normalize_dependency_ids
 from .locks import group_lock
 from .paths import group_path, machine_path
@@ -95,6 +96,7 @@ def _canonical_specs(specs: list[Mapping[str, Any]]) -> tuple[Mapping[str, Any],
             raise ValueError("each submission task specification must be a mapping.")
         item = dict(raw)
         item["home_machine"] = item.get("home_machine", "current")
+        item["tmux_override"] = validate_tmux_override(item.get("tmux_override"))
         canonical.append(_freeze(item))
     return tuple(canonical)
 
@@ -168,6 +170,14 @@ def normalize_submission_request(
     )
 
 
+def legacy_submission_request_digest(request: SubmissionRequest) -> str:
+    """Return the pre-tmux-policy digest for historical operation replay."""
+    raw_request = request.raw_request
+    for task in raw_request["tasks"]:
+        task.pop("tmux_override", None)
+    return semantic_digest(raw_request)
+
+
 def _resolved_home(value: str | None, submitting_machine: str) -> str:
     home = "current" if value is None else value
     if home == "current":
@@ -207,6 +217,7 @@ def _resolved_specs(
                 "fallback_machines": raw.get("fallback_machines", "group"),
                 "offer_after_seconds": raw.get("offer_after_seconds"),
                 "depends_on_task_ids": normalize_dependency_ids(raw.get("depends_on_task_ids")),
+                "tmux_override": validate_tmux_override(raw.get("tmux_override")),
             }
         )
     return result
@@ -370,6 +381,7 @@ class SubmissionPlan:
     target_group: str | None
     task_ids: tuple[str, ...]
     task_specs: tuple[Mapping[str, Any], ...]
+    tmux_overrides: tuple[bool | None, ...]
     create_group: bool
     group_precondition: Mapping[str, Any]
     planned_worker_set: tuple[str, ...]
@@ -378,6 +390,10 @@ class SubmissionPlan:
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_ids", tuple(self.task_ids))
         object.__setattr__(self, "task_specs", tuple(_freeze(item) for item in self.task_specs))
+        overrides = tuple(validate_tmux_override(item) for item in self.tmux_overrides)
+        if len(overrides) != len(self.task_ids):
+            raise ValueError("submission tmux overrides must match task IDs.")
+        object.__setattr__(self, "tmux_overrides", overrides)
         object.__setattr__(self, "group_precondition", _freeze(self.group_precondition))
         object.__setattr__(self, "planned_worker_set", tuple(self.planned_worker_set))
         object.__setattr__(self, "worker_set_additions", _freeze(self.worker_set_additions))
@@ -429,6 +445,7 @@ def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency
         raise ValueError("Task dependencies require an activated task-dependencies-v1 root.")
     for item in resolved:
         _task_spec(item, is_canonical=is_canonical)
+    tmux_overrides = tuple(validate_tmux_override(item.pop("tmux_override", None)) for item in resolved)
     _validate_planned_dependencies(resolved, request.group_name)
     for machine in sorted({item["home_machine"] for item in resolved if item["home_machine"] != submitting_machine}):
         _validate_target_machine_record(cfg, machine)
@@ -482,6 +499,7 @@ def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency
         target_group=request.group_name,
         task_ids=tuple(item["task_id"] for item in resolved),
         task_specs=tuple(resolved),
+        tmux_overrides=tmux_overrides,
         create_group=bool(request.group_name and not group_precondition["exists"]),
         group_precondition=group_precondition,
         planned_worker_set=tuple(sorted(planned_workers)),
@@ -498,6 +516,7 @@ def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency
         target_group=plan.target_group,
         task_ids=plan.task_ids,
         task_specs=plan.task_specs,
+        tmux_overrides=plan.tmux_overrides,
         create_group=plan.create_group,
         group_precondition=plan.group_precondition,
         planned_worker_set=plan.planned_worker_set,
@@ -526,6 +545,7 @@ def encode_submission_plan(plan: SubmissionPlan) -> dict[str, Any]:
     )
     if operation["submission"]["resolved_context_digest"] != plan.resolved_context_digest:
         raise RuntimeError("encoded submission plan resolved context digest is inconsistent.")
+    operation["task_observation"] = build_task_observation(plan.task_ids, plan.tmux_overrides)
     return _thaw(operation)
 
 
@@ -740,6 +760,15 @@ def decode_submission_plan(operation: Mapping[str, Any]) -> SubmissionPlan:
             raise RuntimeError("submission task_specs and task_ids disagree.")
         canonical_specs.append(item)
     _validate_planned_dependencies(canonical_specs, target_group)
+    if "task_observation" not in operation:
+        tmux_overrides = tuple(None for _ in task_ids)
+    else:
+        metadata = operation["task_observation"]
+        try:
+            decoded_metadata = decode_task_observation(metadata, task_ids)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("submission task_observation metadata is invalid.") from exc
+        tmux_overrides = tuple(item["tmux_override"] for item in decoded_metadata["tasks"])
 
     create_group = context["create_group"]
     if type(create_group) is not bool:
@@ -809,6 +838,7 @@ def decode_submission_plan(operation: Mapping[str, Any]) -> SubmissionPlan:
         target_group=target_group,
         task_ids=tuple(task_ids),
         task_specs=tuple(canonical_specs),
+        tmux_overrides=tmux_overrides,
         create_group=create_group,
         group_precondition=dict(precondition),
         planned_worker_set=tuple(planned_workers),

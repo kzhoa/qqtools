@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- feat: make qexp-created tmux log observers a project option disabled by default, with durable
+  per-Task and batch submission overrides while preserving detached execution and live viewers.
+
 ## v1.3.21
 
 - feat: launch qexp runners directly with the agent environment and project working directory,

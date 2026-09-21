@@ -20,6 +20,7 @@ from .layout import shared_attempt_log_path
 from .runtime.paths import local_paths
 from .runtime.records import AttemptRecord
 from .runtime.work_budget import diagnostic_span
+from .task_observation import resolve_task_tmux_observation
 from .tmux import create_window_for_task, is_tmux_launch_available, kill_window, send_command_to_window, window_exists
 
 _LAUNCH_FAILURE_CODES = frozenset(
@@ -201,6 +202,7 @@ class Executor:
     destroy_window: Callable[[str | None], None] = kill_window
     check_window: Callable[[str | None], bool] = window_exists
     tmux_available: Callable[[], bool] = is_tmux_launch_available
+    observer_decision: Callable[[RootConfig, str], dict[str, Any]] = resolve_task_tmux_observation
     spawn_runner: Callable[..., Any] = subprocess.Popen
 
     def build_runner_command(
@@ -324,7 +326,29 @@ class Executor:
     ) -> None:
         """Best-effort tmux observation after the runner has accepted its handoff."""
         try:
+            decision = self.observer_decision(cfg, task_id)
+            if not isinstance(decision, dict) or type(decision.get("enabled")) is not bool:
+                raise ValueError("observer decision is malformed")
+        except Exception as exc:
+            decision = {
+                "enabled": False,
+                "diagnostic_reason": f"{type(exc).__name__}: {exc}",
+            }
+        diagnostic_reason = decision.get("diagnostic_reason")
+        if diagnostic_reason is not None:
+            append_launch_diagnostic(
+                cfg,
+                task_id,
+                attempt_id,
+                f"tmux observer policy unavailable: {diagnostic_reason}",
+            )
+        if not decision["enabled"]:
+            return
+        try:
             if not self.tmux_available():
+                append_launch_diagnostic(
+                    cfg, task_id, attempt_id, "tmux launch observer unavailable: tmux/libtmux unavailable"
+                )
                 return
             process = handle.runner_process if handle.runner_process is not None else handle.reference
             command = self.build_observer_command(cfg, task_id, attempt_id, process.pid)

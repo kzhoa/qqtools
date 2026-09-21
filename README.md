@@ -278,6 +278,7 @@ overrides:
 group:
   workers: [g1, g2]
 defaults:
+  tmux: false
   placement:
     home_machine: current
     sharing:
@@ -285,6 +286,7 @@ defaults:
       fallback_machines: group
 tasks:
   - command: [python, train.py]
+    tmux: true
   - placement:
       sharing:
         mode: private
@@ -309,6 +311,9 @@ Pending operations report `waiting_ack` and the remaining machine names. Cleanup
 claim, cancel, and offer, and its tombstone permanently reserves the Task ID.
 
 `batch-submit` is only a bulk-input command and does not create a public Batch identity.
+Task-level `tmux` booleans override `batch-submit --tmux|--no-tmux`, which overrides
+`defaults.tmux`; null or omission inherits the next level. The normalized override is retained
+across retries without becoming a Group-wide default.
 
 Python API:
 
@@ -400,6 +405,8 @@ Tasks can trade freshness for lower local and shared filesystem write pressure:
 ```bash
 qexp config progress show
 qexp config progress set --interval-seconds 60
+qexp config tmux show
+qexp config tmux set --enabled
 ```
 
 The setting applies to subsequent launches and retries; already-running Attempts keep the
@@ -408,6 +415,13 @@ deadline: producer, agent, scan, and filesystem delays can make an update visibl
 Python applications can use `qqtools.qexp.progress.update()` directly, while custom producers may
 atomically replace the injected `QEXP_PROGRESS_PATH` progress-v1 mailbox and honor
 `QEXP_PROGRESS_INTERVAL_SECONDS`. Progress remains advisory and never controls Task execution.
+
+qexp-created tmux windows are optional, read-only Attempt-log observers and are disabled by
+default. Enable the project fallback for future decisions with `qexp config tmux set --enabled`,
+or select one submission with `qexp submit --tmux -- python entry.py`. `--no-tmux` is an explicit
+Task override. Policy changes do not create or remove windows retroactively, and every owning
+machine must run a supporting agent before project-wide enforcement is complete. Missing tmux or
+libtmux remains an observation-only diagnostic; training continues through the detached runner.
 
 `show --watch` refreshes a compact terminal view every two seconds. `logs --follow`
 streams application stdout/stderr and also works when redirected. Both viewers stop after

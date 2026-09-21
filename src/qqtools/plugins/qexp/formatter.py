@@ -47,6 +47,7 @@ class OutputKind(str, Enum):
     CONTEXT = "context"
     PROGRESS_POLICY = "progress-policy"
     LAUNCH_HANDOFF_POLICY = "launch-handoff-policy"
+    TMUX_POLICY = "tmux-policy"
     NOTIFICATIONS = "notifications"
     LEASE_POLICY = "lease-policy"
     DOCTOR_VERIFY = "doctor-verify"
@@ -279,6 +280,7 @@ def _render_task_show(result: Mapping[str, Any], _presentation: Mapping[str, obj
             ("GPUs", spec.get("requested_gpus")),
             ("Group", task.get("group_name")),
             ("Dependencies", task.get("depends_on_task_ids")),
+            ("TMUX observer override", result.get("observation", {}).get("tmux_override")),
         ),
         (
             ("State", state.get("projection")),
@@ -672,6 +674,17 @@ def _render_launch_handoff_policy(result: Mapping[str, Any], _presentation: Mapp
     )
 
 
+def _render_tmux_policy(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _details(
+        (
+            ("Project tmux observers enabled", result.get("enabled")),
+            ("Source", result.get("source")),
+            ("Applies to", "future observer decisions"),
+        ),
+        (("Scope", "This project only; existing windows and explicit Task choices are unchanged."),),
+    )
+
+
 def _render_named_operation(result: Mapping[str, Any], default_action: str) -> str:
     action = result.get("action", default_action)
     status = result.get("status", result.get("state", "completed"))
@@ -798,6 +811,10 @@ def _validate_task_show(result: Any) -> None:
     _required(control, "cancellation_operation_id", "task-show payload.task.control")
     _required_mapping(value, "dependency_gate", "task-show payload")
     _required_mapping(value, "progress", "task-show payload")
+    observation = _required_mapping(value, "observation", "task-show payload")
+    override = _required(observation, "tmux_override", "task-show payload.observation")
+    if override not in {"enabled", "disabled", "inherit"}:
+        raise ValueError("task-show payload.observation.tmux_override is invalid")
     attempts = _required_sequence(value, "attempts", "task-show payload")
     for index, item in enumerate(attempts):
         attempt = _mapping(item, f"task-show payload.attempts[{index}]")
@@ -1094,6 +1111,17 @@ def _validate_launch_handoff_policy(result: Any) -> None:
         _required(value, key, "launch-handoff-policy payload")
 
 
+def _validate_tmux_policy(result: Any) -> None:
+    value = _mapping(result, "tmux-policy payload")
+    _required_bool(value, "enabled", "tmux-policy payload")
+    source = _required(value, "source", "tmux-policy payload")
+    if source not in {"default", "configured"}:
+        raise ValueError("tmux-policy payload.source is invalid")
+    applies_to = _required(value, "applies_to", "tmux-policy payload")
+    if applies_to != "new_observer_decisions":
+        raise ValueError("tmux-policy payload.applies_to is invalid")
+
+
 def _validate_notifications(result: Any) -> None:
     value = _mapping(result, "notifications payload")
     _required_bool(value, "enabled", "notifications payload")
@@ -1167,6 +1195,7 @@ _REGISTRY: dict[OutputKind, _OutputContract] = {
         _validate_launch_handoff_policy,
         _render_launch_handoff_policy,
     ),
+    OutputKind.TMUX_POLICY: _OutputContract(_validate_tmux_policy, _render_tmux_policy),
     OutputKind.NOTIFICATIONS: _OutputContract(_validate_notifications, _render_notifications),
     OutputKind.LEASE_POLICY: _OutputContract(_validate_lease_policy, _render_lease_policy),
     OutputKind.DOCTOR_VERIFY: _OutputContract(_validate_doctor_verify, _render_doctor),

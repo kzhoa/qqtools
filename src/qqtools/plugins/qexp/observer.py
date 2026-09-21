@@ -25,6 +25,7 @@ from .runtime.records import AttemptRecord, TaskRecord, normalize_group_record
 from .runtime.resources.reservations import reservation_snapshot
 from .runtime.store import iter_json, read_json
 from .runtime.tasks import load_task
+from .task_observation import task_tmux_observation_label
 
 _TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
 
@@ -285,6 +286,7 @@ def list_tasks_page(
 def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
     task = load_task(cfg, task_id)
     result = task.to_dict()
+    result["observation"] = {"tmux_override": task_tmux_observation_label(cfg, task_id)}
     progress: ProgressObservation = inspect_progress(cfg, task)
     result["progress"] = progress
     gate = dependency_gate(cfg, task)

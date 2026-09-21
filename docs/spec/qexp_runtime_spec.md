@@ -149,10 +149,11 @@ The primary deployment assumes:
 - machine identities are registered explicitly and are administratively trusted
 - processes, PIDs, local launch backend state, GPU reservations, and wrapper state remain local
 
-The agent launches runners directly with its current environment. When `tmux` is available, it
-provides non-authoritative interactive log observation after durable runner handoff. Execution,
-fencing, and recovery do not depend on tmux availability or shell initialization; installations
-without tmux retain the same execution contract with reduced interactive observability.
+The agent launches runners directly with its current environment. After durable runner handoff,
+the Task override and project policy may request a non-authoritative `tmux` log observer; the
+built-in policy is disabled. Execution, fencing, and recovery do not depend on `tmux` availability,
+policy, or shell initialization. Continuous Task and log commands observe the same shared truth
+without a window.
 
 qexp does not snapshot source code. A Task executes the files visible on its execution
 machine at launch time.
@@ -704,6 +705,11 @@ It is an internal diagnostic object, not a daily CLI resource.
 Required logical shape:
 
 ```yaml
+task_observation: # absent only on historical operations
+  version: 1
+  tasks:
+    - task_id: str
+      tmux_override: bool | null
 submission:
   operation_id: str
   kind: single | bulk
@@ -743,6 +749,14 @@ Submission rules:
 
 - the canonical raw request covers normalized semantic manifest content and
   submission-affecting CLI arguments
+- every new request normalizes a Task tmux override to `true`, `false`, or null before hashing;
+  omitted and explicit null are equivalent, while changing an explicit value conflicts under the
+  same idempotency key
+- `task_observation` is published with the preparing operation before Task visibility, uses the
+  exact resolved Task order and identities, and remains outside `TaskSpec` so older whole-Task
+  writers cannot discard it; older operation readers ignore and retain the additive top-level key
+- missing historical `task_observation` means inherit. Present malformed metadata is not
+  reinterpreted as inheritance and disables attachment with a bounded diagnostic
 - YAML formatting, key order, and manifest path are not semantic input
 - `--group` is the sole source of Group identity
 - `--machine` and `QEXP_MACHINE` are identity assertions only; they must match the verified local
@@ -1034,9 +1048,12 @@ this guarantee and require cgroup-level containment to govern.
 
 The agent directly creates the runner with its current environment and the configured project
 working directory, without routing runner startup through a shell or the tmux server environment.
-Runner bootstrap output is appended to the Attempt log. After durable handoff, an available tmux
-session receives a non-authoritative log-observer window; observer failure cannot revoke an accepted
-runner. The project launch-handoff policy supplies a
+Runner bootstrap output is appended to the Attempt log. After durable handoff, the owner resolves
+the Task's explicit tmux override without reading project policy when that boolean is present.
+Otherwise it samples `tmux-policy.json`, whose missing-file default is disabled. A disabled decision
+returns before any tmux/libtmux probe or command construction. An enabled decision may create one
+non-authoritative log-observer window; policy, capability, ownership, or creation failure cannot
+revoke an accepted runner and produces no false window reference. The project launch-handoff policy supplies a
 finite 1-to-300-second observation budget, defaulting to 10 seconds, which is frozen for each
 initiated runner. The machine agent retains each unconfirmed handoff in process-local state and
 polls it across bounded dispatch cycles; it never sleeps for this budget while holding scheduler
@@ -1056,6 +1073,10 @@ Task-scoped `task show --watch` and `task logs --follow` commands independently 
 current Attempt through Task truth, so a retry can move those viewers to a new Attempt without
 repurposing an existing Attempt-bound tmux window. All viewer paths remain outside execution
 authority and perform no Task, Attempt, claim, lease, process, or reservation writes.
+Observer policy is resolved once for each new post-handoff decision and is not polled by heartbeat,
+lease renewal, or recurring supervision. Retry retains the Task's explicit override; inheritance
+uses the then-current project policy. Agent restart does not replay a completed attachment boundary,
+and policy changes do not alter existing windows.
 
 Reconciliation distinguishes three outcomes:
 
@@ -1115,7 +1136,8 @@ discovers, stops, or registers sibling projects.
 
 ### 10.1 Common Submission Pipeline
 
-`qexp submit` and each member of `qexp batch-submit` normalize into the same `TaskSpec`.
+`qexp submit` and each member of `qexp batch-submit` normalize into the same `TaskSpec` plus the
+separate durable Task-observation choice owned by their Submission Operation.
 Both commands use Submission Operation commit; a single submit is an operation containing
 one Task. This prevents a separate single-Task crash protocol from drifting away from
 bulk correctness.
@@ -1131,7 +1153,7 @@ Group Worker Set exists to authorize remote execution.
 
 Submission executes:
 
-1. parse and normalize the complete raw request
+1. parse and normalize the complete raw request, including nullable Task tmux overrides
 2. derive the raw-request digest
 3. exclusively create or load the idempotency mapping
 4. if existing, validate the raw digest and reuse its stored resolved context
@@ -1139,7 +1161,7 @@ Submission executes:
 6. resolve Task IDs, homes, placement, and explicit Worker Set additions against the planned
    claimable Worker Set; a single submission rejects a missing Group, while bulk creation requires
    a non-empty manifest `group.workers` declaration
-7. persist the Submission Operation in `preparing`
+7. persist the Submission Operation and its matching `task_observation` metadata in `preparing`
 8. release the Group lock
 
 Before the group-ready-members projection is active, all of this work remains under the legacy
@@ -1197,8 +1219,8 @@ The runtime then:
 13. releases the Group lock
 
 An existing Task ID is reusable only when it already belongs to the same Submission
-Operation and exactly matches the stored resolved `TaskSpec`. Any other collision fails;
-submission never overwrites Task truth.
+Operation and exactly matches the stored resolved `TaskSpec` and Task-observation metadata. Any
+other collision fails; submission never overwrites Task truth.
 
 Readers treat operation-tagged Worker Set additions as effective only when their
 Submission Operation is committed. This provides atomic scheduler visibility without
@@ -2383,7 +2405,7 @@ select blocked or orphaned work.
 ### 17.0 Lifecycle independence invariant
 
 Stopping or losing only the machine agent does not signal, detach, or relaunch an already
-authorized runner, guardian, process group, or tmux window. The runner writes an immutable exit
+authorized runner, guardian, process group, or existing optional tmux observer window. The runner writes an immutable exit
 observation containing the Attempt and Task identity. On the next agent start, startup
 reconciliation validates that identity, then either performs the recovery CAS for a verified live
 process or publishes the recorded exit through the original Attempt. A mismatched or incomplete

@@ -81,7 +81,14 @@ def test_request_digest_is_compatible_and_nested_input_is_snapshotted() -> None:
     )
     expected_input = {
         "group": "experiment",
-        "tasks": [{"command": ["echo", "before"], "fallback_machines": ["g2"], "home_machine": "current"}],
+        "tasks": [
+            {
+                "command": ["echo", "before"],
+                "fallback_machines": ["g2"],
+                "home_machine": "current",
+                "tmux_override": None,
+            }
+        ],
         "worker_set": {"g2": {"gpu_limit_gpus": 2, "scheduling_role": "borrow"}},
     }
     expected = hashlib.sha256(json.dumps(expected_input, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

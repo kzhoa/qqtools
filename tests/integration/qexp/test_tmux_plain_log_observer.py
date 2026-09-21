@@ -85,7 +85,7 @@ def test_enabled_tmux_observer_streams_plain_log_without_owning_training(
             "    time.sleep(.02)\n"
         ),
     ]
-    task = submit(cfg, command, working_dir=project_root)
+    task = submit(cfg, command, working_dir=project_root, tmux_override=True)
     agent = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
     try:
         _wait_for(ready.exists, "training start")

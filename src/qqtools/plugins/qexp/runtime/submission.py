@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from ..layout import is_cpu_lane_root, is_group_ready_members_root
+from ..task_observation import validate_tmux_override
 from .availability import remove_deadline_index, sync_deadline_index
 from .dependencies import validate_group_dependencies
 from .locks import group_lock, group_writer_lock, idempotency_lock, schema_writer_lock, task_lock, task_locks
@@ -43,6 +44,7 @@ from .submission_plan import (
     _validate_placement_against_workers,
     decode_submission_plan,
     encode_submission_plan,
+    legacy_submission_request_digest,
     normalize_submission_request,
     prepare_submission_plan,
     semantic_digest,
@@ -509,9 +511,18 @@ def submit_specs(
                 raise RuntimeError("persisted idempotency_key does not match requested key.")
             if "raw_request_digest" not in submission:
                 raise RuntimeError("persisted submission raw_request_digest is missing.")
-            if submission["raw_request_digest"] != raw_digest:
+            requested_overrides = tuple(validate_tmux_override(item.get("tmux_override")) for item in request.specs)
+            digest_matches = submission["raw_request_digest"] == raw_digest
+            legacy_inherit_replay = (
+                "task_observation" not in operation
+                and all(item is None for item in requested_overrides)
+                and submission["raw_request_digest"] == legacy_submission_request_digest(request)
+            )
+            if not digest_matches and not legacy_inherit_replay:
                 raise IdempotencyConflict("idempotency key was already used with different semantic input.")
             plan = decode_submission_plan(operation)
+            if requested_overrides != plan.tmux_overrides:
+                raise IdempotencyConflict("submission task observation metadata does not match the requested override.")
         else:
             plan = prepare_submission_plan(cfg, request, idempotency_key=key)
             operation = encode_submission_plan(plan)

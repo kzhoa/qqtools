@@ -83,6 +83,40 @@ def test_progress_policy_cli_reports_default_and_configured_value(tmp_path: Path
     assert "filesystem" in human.lower()
 
 
+def test_tmux_policy_cli_reports_project_default_and_configured_value_without_activation(
+    tmp_path: Path, monkeypatch, capsys
+):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    base = _base_args(cfg)
+    activations = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        lambda *_args, **_kwargs: activations.append(True),
+    )
+
+    assert main([*base, "config", "tmux", "show", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "enabled": False,
+        "source": "default",
+        "applies_to": "new_observer_decisions",
+    }
+    assert not (cfg.shared_root / "tmux-policy.json").exists()
+
+    assert main([*base, "config", "tmux", "set", "--enabled", "--format=json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "enabled": True,
+        "source": "configured",
+        "applies_to": "new_observer_decisions",
+    }
+    assert main([*base, "config", "tmux", "show"]) == 0
+    human = capsys.readouterr().out.lower()
+    assert "enabled" in human
+    assert "configured" in human
+    assert "project" in human
+    assert "future" in human or "new observer decisions" in human
+    assert activations == []
+
+
 def test_progress_policy_cli_accepts_large_finite_interval(tmp_path: Path, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     assert (

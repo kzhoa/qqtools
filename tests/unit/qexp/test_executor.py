@@ -115,6 +115,7 @@ def test_executor_uses_tmux_when_available(tmp_path: Path, monkeypatch):
         check_window=lambda window_id: True,
         tmux_available=lambda: True,
         spawn_runner=spawn_runner,
+        observer_decision=lambda _cfg, _task_id: {"enabled": True, "source": "task_override"},
     )
 
     result = executor.launch_attempt(_cfg(tmp_path), "task-1", _attempt())
@@ -128,6 +129,11 @@ def test_executor_uses_tmux_when_available(tmp_path: Path, monkeypatch):
 def test_executor_falls_back_to_detached_runner_without_tmux(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("QEXP_CURRENT_AGENT_ENV", "detached-current")
     spawned: list[dict[str, object]] = []
+    diagnostics = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.executor.append_launch_diagnostic",
+        lambda *_args: diagnostics.append(_args[-1]) or True,
+    )
 
     def fake_spawn(argv, **kwargs):
         spawned.append({"argv": argv, **kwargs})
@@ -143,6 +149,7 @@ def test_executor_falls_back_to_detached_runner_without_tmux(tmp_path: Path, mon
         check_window=lambda window_id: False,
         tmux_available=lambda: False,
         spawn_runner=fake_spawn,
+        observer_decision=lambda _cfg, _task_id: {"enabled": True, "source": "task_override"},
     )
     cfg = _cfg(tmp_path)
 
@@ -154,6 +161,59 @@ def test_executor_falls_back_to_detached_runner_without_tmux(tmp_path: Path, mon
     assert spawned[0]["cwd"] == str(cfg.project_root)
     assert spawned[0]["env"]["QEXP_CURRENT_AGENT_ENV"] == "detached-current"
     assert spawned[0]["start_new_session"] is True
+    assert diagnostics == ["tmux launch observer unavailable: tmux/libtmux unavailable"]
+
+
+def test_disabled_observer_returns_before_any_tmux_probe_or_command(tmp_path: Path, monkeypatch):
+    diagnostics = []
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.executor.append_launch_diagnostic",
+        lambda *_args: diagnostics.append(_args[-1]) or True,
+    )
+    executor = Executor(
+        create_window=lambda *_args: pytest.fail("disabled observer must not create a window"),
+        tmux_available=lambda: pytest.fail("disabled observer must not probe tmux"),
+        observer_decision=lambda _cfg, _task_id: {
+            "enabled": False,
+            "source": "default",
+            "diagnostic_reason": "malformed stored override",
+        },
+    )
+    handle = LaunchHandle("detached", _FakeProcess(4321), runner_process=_FakeProcess(4321))
+
+    executor.attach_observer(_cfg(tmp_path), "task-1", "attempt-1", handle)
+
+    assert handle.backend == "detached"
+    assert handle.observer_window_id is None
+    assert diagnostics == ["tmux observer policy unavailable: malformed stored override"]
+
+
+def test_observer_decision_is_resolved_per_task_without_executor_cache(tmp_path: Path):
+    decisions = {"visible": True, "quiet": False}
+    probes = []
+    windows = []
+
+    executor = Executor(
+        create_window=lambda task_id, *_args: windows.append(task_id) or f"@{len(windows)}",
+        tmux_available=lambda: probes.append(None) or True,
+        observer_decision=lambda _cfg, task_id: {"enabled": decisions[task_id], "source": "task_override"},
+    )
+
+    executor.attach_observer(
+        _cfg(tmp_path),
+        "visible",
+        "visible-attempt",
+        LaunchHandle("detached", _FakeProcess(1001), runner_process=_FakeProcess(1001)),
+    )
+    executor.attach_observer(
+        _cfg(tmp_path),
+        "quiet",
+        "quiet-attempt",
+        LaunchHandle("detached", _FakeProcess(1002), runner_process=_FakeProcess(1002)),
+    )
+
+    assert windows == ["visible"]
+    assert len(probes) == 1
 
 
 def test_executor_accepts_handoff_delayed_beyond_previous_two_second_limit(tmp_path: Path):

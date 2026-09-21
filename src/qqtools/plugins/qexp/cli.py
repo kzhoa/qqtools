@@ -75,6 +75,7 @@ from .schema6_upgrade import (
     schema6_upgrade_status,
     start_schema6_upgrade,
 )
+from .tmux_policy import set_tmux_policy, show_tmux_policy
 
 
 class _PaginationParseError(RuntimeError):
@@ -191,6 +192,7 @@ def _requires_verified_binding(args: argparse.Namespace) -> bool:
             or getattr(args, "provider_action", None) == "set"
             or getattr(args, "progress_action", None) == "set"
             or getattr(args, "launch_handoff_action", None) == "set"
+            or getattr(args, "tmux_action", None) == "set"
         )
     if args.command == "lease-policy":
         return args.lease_policy_action == "set"
@@ -382,6 +384,15 @@ def build_parser() -> argparse.ArgumentParser:
     launch_handoff_set = launch_handoff_sub.add_parser("set")
     _add_output_format(launch_handoff_set)
     launch_handoff_set.add_argument("--timeout-seconds", required=True)
+    tmux_config = config_sub.add_parser("tmux", help="Configure project tmux log observer windows.")
+    tmux_config_sub = tmux_config.add_subparsers(dest="tmux_action", required=True)
+    tmux_show = tmux_config_sub.add_parser("show")
+    _add_output_format(tmux_show)
+    tmux_set = tmux_config_sub.add_parser("set")
+    _add_output_format(tmux_set)
+    tmux_values = tmux_set.add_mutually_exclusive_group(required=True)
+    tmux_values.add_argument("--enabled", action="store_true")
+    tmux_values.add_argument("--disabled", action="store_true")
     provider = notifications_sub.add_parser("provider")
     provider_sub = provider.add_subparsers(dest="provider_action", required=True)
     provider_set = provider_sub.add_parser("set")
@@ -421,12 +432,27 @@ def build_parser() -> argparse.ArgumentParser:
         action.add_argument("--idempotency-key")
         action.add_argument("--depends-on", action="append", default=[])
         action.add_argument("--no-activate", action="store_true", help="Submit without activating the local agent.")
+        tmux_values = action.add_mutually_exclusive_group()
+        tmux_values.add_argument("--tmux", dest="tmux_override", action="store_true")
+        tmux_values.add_argument("--no-tmux", dest="tmux_override", action="store_false")
+        action.set_defaults(tmux_override=None)
         action.add_argument("argv", nargs=argparse.REMAINDER)
-    bulk = commands.add_parser("batch-submit")
+    bulk = commands.add_parser(
+        "batch-submit",
+        help="Submit manifest Tasks; per-Task tmux wins CLI, then defaults, and omission inherits project policy.",
+        description=(
+            "Submit manifest Tasks. Per-Task manifest tmux wins --tmux/--no-tmux, then the manifest defaults; "
+            "omitting all overrides inherits the project tmux policy."
+        ),
+    )
     _add_output_format(bulk)
     bulk.add_argument("--file", required=True, dest="manifest_file")
     bulk.add_argument("--group")
     bulk.add_argument("--idempotency-key")
+    bulk_tmux_values = bulk.add_mutually_exclusive_group()
+    bulk_tmux_values.add_argument("--tmux", dest="tmux_override", action="store_true")
+    bulk_tmux_values.add_argument("--no-tmux", dest="tmux_override", action="store_false")
+    bulk.set_defaults(tmux_override=None)
     task = commands.add_parser("task")
     task_sub = task.add_subparsers(dest="task_action", required=True)
     cancel = task_sub.add_parser("cancel")
@@ -1139,6 +1165,18 @@ def main(argv: list[str] | None = None) -> int:
             return {"machine_runtime": execution_context.machine_runtime}
 
         if args.command == "config":
+            if args.config_action == "tmux":
+                if args.tmux_action == "show":
+                    _emit(CliOutput(OutputKind.TMUX_POLICY, show_tmux_policy(cfg)), args.format)
+                    return 0
+                _emit(
+                    CliOutput(
+                        OutputKind.TMUX_POLICY,
+                        set_tmux_policy(cfg, args.enabled),
+                    ),
+                    args.format,
+                )
+                return 0
             if args.config_action == "progress":
                 if args.progress_action == "show":
                     _emit(CliOutput(OutputKind.PROGRESS_POLICY, show_progress_policy(cfg)), args.format)
@@ -1286,6 +1324,7 @@ def main(argv: list[str] | None = None) -> int:
                 offer_after_seconds=args.offer_after_seconds,
                 depends_on_task_ids=args.depends_on,
                 idempotency_key=args.idempotency_key,
+                tmux_override=args.tmux_override,
             )
             print(task_value.task_id)
             return 0
@@ -1304,6 +1343,7 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.manifest_file),
                 group=args.group,
                 idempotency_key=args.idempotency_key,
+                tmux_override=args.tmux_override,
                 on_prepared=print_prepared,
             )
             _emit(CliOutput(OutputKind.BATCH_SUBMIT, values.to_dict()), args.format)
