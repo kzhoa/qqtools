@@ -23,6 +23,7 @@ class OutputKind(str, Enum):
     TASK_LIST = "task-list"
     TASK_PAGE = "task-page"
     TASK_SHOW = "task-show"
+    TASK_WATCH = "task-watch"
     TASK_OPERATION = "task-operation"
     DEPENDENCIES = "dependencies"
     AVAILABILITY = "availability"
@@ -290,6 +291,36 @@ def _render_task_show(result: Mapping[str, Any], _presentation: Mapping[str, obj
             ("Reason", state.get("reason")),
             ("Dependency gate", result.get("dependency_gate")),
         ),
+        format_progress_details(result.get("progress")),
+    )
+
+
+def _render_task_watch(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    """Render one compact current Task frame without performing reads."""
+    attempt = result.get("selected_attempt")
+    attempt_values = (
+        (
+            ("Attempt ID", attempt.get("attempt_id")),
+            ("Attempt number", attempt.get("attempt_number")),
+            ("Attempt phase", attempt.get("phase")),
+            ("Machine", attempt.get("machine_name")),
+        )
+        if isinstance(attempt, Mapping)
+        else (("Attempt", "none"),)
+    )
+    observation = result.get("observation_state")
+    observation_reason = result.get("observation_reason")
+    if observation_reason is not None:
+        observation = f"{observation} ({observation_reason})"
+    return _details(
+        (
+            ("Task ID", result.get("task_id")),
+            ("Name", result.get("name")),
+            ("Phase", result.get("phase")),
+            ("Reason", result.get("reason")),
+        ),
+        attempt_values,
+        (("Observation", observation),),
         format_progress_details(result.get("progress")),
     )
 
@@ -775,6 +806,21 @@ def _validate_task_show(result: Any) -> None:
             _required(attempt_value, key, f"task-show payload.attempts[{index}].attempt")
 
 
+def _validate_task_watch(result: Any) -> None:
+    """Validate the compact payload consumed by the refreshing Task view."""
+    value = _mapping(result, "task-watch payload")
+    for key in ("task_id", "name", "phase", "reason", "terminal", "observation_state", "observation_reason"):
+        _required(value, key, "task-watch payload")
+    _required(value, "revision", "task-watch payload")
+    _required_bool(value, "terminal", "task-watch payload")
+    _required_mapping(value, "progress", "task-watch payload")
+    attempt = _required(value, "selected_attempt", "task-watch payload")
+    if attempt is not None:
+        attempt_value = _mapping(attempt, "task-watch payload.selected_attempt")
+        for key in ("attempt_id", "attempt_number", "phase", "machine_name", "log_path"):
+            _required(attempt_value, key, "task-watch payload.selected_attempt")
+
+
 def _validate_task_operation(result: Any) -> None:
     value = _mapping(result, "task-operation payload")
     _required(value, "task_id", "task-operation payload")
@@ -1094,6 +1140,7 @@ _REGISTRY: dict[OutputKind, _OutputContract] = {
     OutputKind.TASK_LIST: _OutputContract(_validate_task_list, _render_task_list),
     OutputKind.TASK_PAGE: _OutputContract(_validate_task_page, _render_task_page),
     OutputKind.TASK_SHOW: _OutputContract(_validate_task_show, _render_task_show),
+    OutputKind.TASK_WATCH: _OutputContract(_validate_task_watch, _render_task_watch),
     OutputKind.TASK_OPERATION: _OutputContract(_validate_task_operation, _render_task_operation),
     OutputKind.DEPENDENCIES: _OutputContract(_validate_dependencies, _render_dependencies),
     OutputKind.AVAILABILITY: _OutputContract(_validate_availability, _render_availability),

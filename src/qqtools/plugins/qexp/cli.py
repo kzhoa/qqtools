@@ -41,6 +41,7 @@ from .commands import cleanup
 from .commands import group as group_commands
 from .commands import logs as log_commands
 from .commands import task as task_commands
+from .commands import watch as watch_commands
 from .config_types import RootConfig
 from .doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
 from .formatter import CliOutput, OutputKind, render
@@ -464,8 +465,43 @@ def build_parser() -> argparse.ArgumentParser:
     show = task_sub.add_parser("show")
     _add_output_format(show)
     show.add_argument("task_id")
+    show.add_argument(
+        "--watch",
+        action="store_true",
+        help="Refresh a compact human Task view; interval controls reads and screen refreshes.",
+    )
+    show.add_argument(
+        "--interval-seconds",
+        default=None,
+        help="Watch refresh/read cadence in seconds (default: 2); it does not change progress reporting.",
+    )
+    show.add_argument(
+        "--follow-retries",
+        action="store_true",
+        help="Keep watching after a terminal result until a later retry appears.",
+    )
     logs = task_sub.add_parser("logs")
     logs.add_argument("task_id")
+    logs.add_argument(
+        "--follow",
+        action="store_true",
+        help="Follow application bytes; --tail applies on each Attempt and file generation.",
+    )
+    logs.add_argument(
+        "--tail",
+        default=None,
+        help="Initial lines per Attempt or replacement generation (default: 100; zero means new bytes only).",
+    )
+    logs.add_argument(
+        "--interval-seconds",
+        default=None,
+        help="Follow polling/read cadence in seconds (default: 2).",
+    )
+    logs.add_argument(
+        "--follow-retries",
+        action="store_true",
+        help="Keep following at terminal EOF until a later retry appears.",
+    )
     dependencies = task_sub.add_parser("dependencies")
     dependencies_sub = dependencies.add_subparsers(dest="dependencies_action", required=True)
     for name in ("show", "replace", "add", "remove"):
@@ -652,6 +688,86 @@ def _parse_progress_interval_argument(value: str) -> int | float:
     return validate_interval_seconds(parsed)
 
 
+def _parse_continuous_interval_argument(value: str) -> int | float:
+    """Parse a continuous viewer interval before any observation I/O starts."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("--interval-seconds must be a finite number of at least 1 second.")
+    text = value.strip()
+    try:
+        parsed: int | float = int(text, 10)
+    except ValueError:
+        try:
+            parsed = float(text)
+        except ValueError as exc:
+            raise ValueError("--interval-seconds must be a finite number of at least 1 second.") from exc
+    try:
+        return validate_interval_seconds(parsed)
+    except ValueError as exc:
+        raise ValueError("--interval-seconds must be a finite number of at least 1 second.") from exc
+
+
+def _parse_follow_tail_argument(value: str) -> int:
+    """Parse the nonnegative base-10 line count for log following."""
+    if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value.strip()) is None:
+        raise ValueError("--tail must be a non-negative base-10 integer.")
+    return int(value.strip(), 10)
+
+
+def _is_continuous_task(args: argparse.Namespace) -> bool:
+    return args.command == "task" and (
+        (args.task_action == "show" and bool(getattr(args, "watch", False)))
+        or (args.task_action == "logs" and bool(getattr(args, "follow", False)))
+    )
+
+
+def _validate_continuous_options(args: argparse.Namespace) -> None:
+    """Validate continuous-only flags before resolving a project or reading Task truth."""
+    if args.command != "task":
+        return
+    if args.task_action == "show":
+        watch = bool(getattr(args, "watch", False))
+        interval = getattr(args, "interval_seconds", None)
+        follow_retries = bool(getattr(args, "follow_retries", False))
+        if not watch:
+            if interval is not None:
+                raise ValueError("--interval-seconds requires --watch.")
+            if follow_retries:
+                raise ValueError("--follow-retries requires --watch.")
+            return
+        if getattr(args, "format", "human") == "json":
+            raise ValueError("--watch cannot be combined with --format json.")
+        args.interval_seconds = 2 if interval is None else _parse_continuous_interval_argument(interval)
+        isatty = getattr(sys.stdout, "isatty", None)
+        if not callable(isatty) or not isatty():
+            raise ValueError("--watch requires terminal stdout.")
+        return
+    if args.task_action != "logs":
+        return
+    follow = bool(getattr(args, "follow", False))
+    tail = getattr(args, "tail", None)
+    interval = getattr(args, "interval_seconds", None)
+    follow_retries = bool(getattr(args, "follow_retries", False))
+    if not follow:
+        if tail is not None:
+            raise ValueError("--tail requires --follow.")
+        if interval is not None:
+            raise ValueError("--interval-seconds requires --follow.")
+        if follow_retries:
+            raise ValueError("--follow-retries requires --follow.")
+        return
+    args.tail = 100 if tail is None else _parse_follow_tail_argument(tail)
+    args.interval_seconds = 2 if interval is None else _parse_continuous_interval_argument(interval)
+
+
+def _restore_watch_terminal() -> None:
+    """Leave one readable line after an interrupted in-place watch."""
+    try:
+        sys.stdout.write(chr(27) + "[0m\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        pass
+
+
 def _parse_launch_handoff_timeout_argument(value: str) -> int | float:
     """Parse a launch timeout so malformed values become a specific ValueError."""
     text = value.strip()
@@ -726,6 +842,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         _PAGINATION_JSON_PARSE_MODE = False
     try:
+        _validate_continuous_options(args)
         if args.command == "init":
             args.shared_root = args.init_shared_root or args.shared_root
             args.machine = args.init_machine or args.machine
@@ -1291,8 +1408,34 @@ def main(argv: list[str] | None = None) -> int:
                         args.format,
                     )
             elif args.task_action == "show":
+                if args.watch:
+                    try:
+                        return watch_commands.watch_task(
+                            cfg,
+                            args.task_id,
+                            interval_seconds=args.interval_seconds,
+                            follow_retries=args.follow_retries,
+                        )
+                    except KeyboardInterrupt:
+                        _restore_watch_terminal()
+                        return 130
+                    except BrokenPipeError:
+                        return 0
                 _emit(CliOutput(OutputKind.TASK_SHOW, observer.inspect_task(cfg, args.task_id)), args.format)
             elif args.task_action == "logs":
+                if args.follow:
+                    try:
+                        return log_commands.follow_logs(
+                            cfg,
+                            args.task_id,
+                            tail_lines=args.tail,
+                            interval_seconds=args.interval_seconds,
+                            follow_retries=args.follow_retries,
+                        )
+                    except KeyboardInterrupt:
+                        return 130
+                    except BrokenPipeError:
+                        return 0
                 print(log_commands.read_logs(cfg, args.task_id), end="")
             return 0
         if args.command == "group":
@@ -1545,7 +1688,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             code = "invalid_argument" if isinstance(exc, ValueError) else "index_unavailable"
             return _emit_observation_error(ObservationError(code, str(exc)), args.format)
-        if isinstance(exc, OSError) and not isinstance(exc, FileNotFoundError):
+        if isinstance(exc, OSError) and not isinstance(exc, FileNotFoundError) and not _is_continuous_task(args):
             raise
         print(f"qexp: {exc}", file=sys.stderr)
         return 2

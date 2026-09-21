@@ -382,6 +382,8 @@ configuration change. Inspect the existing Task while it runs:
 
 ```bash
 qexp task show TASK_ID
+qexp task show TASK_ID --watch
+qexp task logs TASK_ID --follow
 ```
 
 ```text
@@ -406,6 +408,14 @@ deadline: producer, agent, scan, and filesystem delays can make an update visibl
 Python applications can use `qqtools.qexp.progress.update()` directly, while custom producers may
 atomically replace the injected `QEXP_PROGRESS_PATH` progress-v1 mailbox and honor
 `QEXP_PROGRESS_INTERVAL_SECONDS`. Progress remains advisory and never controls Task execution.
+
+`show --watch` refreshes a compact terminal view every two seconds. `logs --follow`
+streams application stdout/stderr and also works when redirected. Both viewers stop after
+the Task's validated terminal result by default; add `--follow-retries` only when the viewer
+should remain open for a later retry. The refresh interval changes viewer reads, not the
+application's progress reporting policy. Closing either viewer, or a qexp-created tmux log
+window, never stops training. Buffered application output can still appear late, and finite
+`qexp task logs TASK_ID` remains available for a later complete read.
 
 For one-off runtime config edits, `qpipeline` also supports dotted CLI overrides after normal
 parser handling:

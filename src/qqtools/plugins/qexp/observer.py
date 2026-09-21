@@ -10,13 +10,222 @@ from .config_types import RootConfig
 from .runtime.dependencies import dependency_gate
 from .runtime.group_namespace import group_directory, read_group
 from .runtime.locks import schema_reader_lock
-from .runtime.paths import group_path, machine_path, shared_paths, submission_path, task_path
+from .runtime.paths import (
+    attempt_path,
+    group_path,
+    machine_path,
+    shared_log_path,
+    shared_paths,
+    submission_path,
+    task_path,
+)
 from .runtime.progress import inspect_progress
 from .runtime.progress_types import ProgressObservation
-from .runtime.records import TaskRecord, normalize_group_record
+from .runtime.records import AttemptRecord, TaskRecord, normalize_group_record
 from .runtime.resources.reservations import reservation_snapshot
 from .runtime.store import iter_json, read_json
 from .runtime.tasks import load_task
+
+_TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
+
+
+class CurrentObservationError(RuntimeError):
+    """Raised when a selected current Attempt is malformed or unreadable."""
+
+
+def _load_observation_task(cfg: RootConfig, task_id: str) -> TaskRecord:
+    """Load Task truth while translating malformed records to observation errors."""
+    try:
+        return load_task(cfg, task_id)
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise CurrentObservationError(f"Task {task_id!r} is malformed or unreadable.") from exc
+
+
+def _task_selection_signature(task: TaskRecord) -> tuple[Any, ...]:
+    """Return the Task fields that fence one current observation selection."""
+    claim = task.claim_control.get("active_claim") or {}
+    return (
+        task.meta.get("revision"),
+        task.state.get("projection"),
+        task.attempt_control.get("current_attempt_id"),
+        task.attempt_control.get("current_attempt_number"),
+        claim.get("attempt_id"),
+        claim.get("attempt_number"),
+        claim.get("fencing_token"),
+        claim.get("machine_name"),
+    )
+
+
+def _unavailable_current_view(task: TaskRecord, reason: str) -> dict[str, Any]:
+    """Build an explicit frame when a Task transition prevents selection."""
+    revision = task.meta.get("revision")
+    progress: ProgressObservation = {
+        "status": "unavailable",
+        "observation_state": "unavailable",
+        "reason": "identity_mismatch",
+    }
+    return {
+        "task_id": task.task_id,
+        "name": task.name,
+        "phase": task.state["projection"],
+        "reason": task.state.get("reason"),
+        "revision": revision,
+        "terminal": task.state["projection"] in _TERMINAL_PHASES,
+        "observation_state": "unavailable",
+        "observation_reason": reason,
+        "selected_attempt": None,
+        "progress": progress,
+    }
+
+
+def _read_current_attempt(cfg: RootConfig, task: TaskRecord) -> tuple[AttemptRecord | None, str | None]:
+    """Read the one Attempt permitted by Task truth, without history enumeration."""
+    projection = task.state.get("projection")
+    current_id = task.attempt_control.get("current_attempt_id")
+    current_number = task.attempt_control.get("current_attempt_number")
+    reason = task.state.get("reason")
+
+    if projection == "queued" and current_id is None:
+        return None, None
+    if (
+        current_id is None
+        and projection not in _TERMINAL_PHASES
+        and not (projection == "blocked" and reason == "orphaned_attempt_requires_recovery")
+    ):
+        return None, "identity_mismatch"
+    if type(current_number) is not int or current_number < 1:
+        return None, "identity_mismatch"
+
+    path = attempt_path(cfg.shared_root, task.task_id, current_number)
+    try:
+        attempt = AttemptRecord.from_dict(read_json(path))
+    except FileNotFoundError as exc:
+        raise CurrentObservationError(
+            f"selected Attempt {task.task_id!r} number {current_number} was not found."
+        ) from exc
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise CurrentObservationError(
+            f"selected Attempt {task.task_id!r} number {current_number} is malformed or unreadable."
+        ) from exc
+
+    if attempt.task_id != task.task_id or attempt.attempt_number != current_number:
+        raise CurrentObservationError(
+            f"selected Attempt {task.task_id!r} number {current_number} has mismatched identity."
+        )
+    if current_id is not None and attempt.attempt_id != current_id:
+        raise CurrentObservationError(f"selected Attempt {task.task_id!r} does not match current_attempt_id.")
+
+    if projection == "running":
+        claim = task.claim_control.get("active_claim") or {}
+        if (
+            current_id is None
+            or attempt.attempt_id != current_id
+            or attempt.phase not in {"starting", "running"}
+            or claim.get("attempt_id") != attempt.attempt_id
+            or claim.get("attempt_number") != attempt.attempt_number
+            or claim.get("fencing_token") != attempt.current_fencing_token
+            or claim.get("machine_name") != attempt.machine_name
+        ):
+            raise CurrentObservationError(
+                f"running Task {task.task_id!r} has inconsistent active claim or Attempt identity."
+            )
+    elif projection in _TERMINAL_PHASES:
+        if attempt.phase != projection:
+            raise CurrentObservationError(f"terminal Task {task.task_id!r} does not match its preserved Attempt.")
+    elif projection == "blocked":
+        if current_id is None and attempt.phase != "orphaned":
+            return None, "identity_mismatch"
+        if attempt.phase not in {"claimed", "starting", "running", "orphaned"}:
+            return None, "identity_mismatch"
+    elif projection == "queued":
+        if attempt.phase not in {"claimed", "starting", "running"}:
+            return None, "identity_mismatch"
+    else:
+        return None, "identity_mismatch"
+    return attempt, None
+
+
+def _selected_attempt_view(cfg: RootConfig, task: TaskRecord, attempt: AttemptRecord) -> dict[str, Any]:
+    """Return the compact Attempt descriptor used by both continuous viewers."""
+    process = attempt.process
+    if not isinstance(process, dict):
+        raise CurrentObservationError(f"Attempt {attempt.attempt_id!r} process data is malformed.")
+    references = process.get("log_references")
+    if references is None:
+        references = []
+    if not isinstance(references, list):
+        raise CurrentObservationError(f"Attempt {attempt.attempt_id!r} log references are malformed.")
+    if references:
+        reference = references[0]
+        if not isinstance(reference, str) or not reference or "\x00" in reference:
+            raise CurrentObservationError(f"Attempt {attempt.attempt_id!r} has an invalid log reference.")
+        log_path = Path(reference)
+    else:
+        log_path = shared_log_path(cfg.shared_root, task.task_id, attempt.attempt_id)
+    return {
+        "attempt_id": attempt.attempt_id,
+        "attempt_number": attempt.attempt_number,
+        "phase": attempt.phase,
+        "machine_name": attempt.machine_name,
+        "log_path": str(log_path),
+    }
+
+
+def inspect_current_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
+    """Collect one bounded, identity-checked current Task observation."""
+    task = _load_observation_task(cfg, task_id)
+    first_signature = _task_selection_signature(task)
+    try:
+        attempt, selection_reason = _read_current_attempt(cfg, task)
+    except CurrentObservationError:
+        latest_task = _load_observation_task(cfg, task_id)
+        if _task_selection_signature(latest_task) != first_signature:
+            return _unavailable_current_view(latest_task, "concurrent_transition")
+        raise
+    try:
+        latest_task = _load_observation_task(cfg, task_id)
+    except FileNotFoundError:
+        raise
+    if _task_selection_signature(latest_task) != first_signature:
+        return _unavailable_current_view(latest_task, "concurrent_transition")
+    if attempt is None:
+        if selection_reason == "identity_mismatch":
+            progress: ProgressObservation = {
+                "status": "unavailable",
+                "observation_state": "unavailable",
+                "reason": "identity_mismatch",
+            }
+        else:
+            progress = inspect_progress(cfg, latest_task)
+        return {
+            "task_id": latest_task.task_id,
+            "name": latest_task.name,
+            "phase": latest_task.state["projection"],
+            "reason": latest_task.state.get("reason"),
+            "revision": latest_task.meta.get("revision"),
+            "terminal": latest_task.state["projection"] in _TERMINAL_PHASES,
+            "observation_state": progress["observation_state"],
+            "observation_reason": progress.get("reason"),
+            "selected_attempt": None,
+            "progress": progress,
+        }
+
+    selected = _selected_attempt_view(cfg, latest_task, attempt)
+    progress = inspect_progress(cfg, latest_task)
+    return {
+        "task_id": latest_task.task_id,
+        "name": latest_task.name,
+        "phase": latest_task.state["projection"],
+        "reason": latest_task.state.get("reason"),
+        "revision": latest_task.meta.get("revision"),
+        "terminal": latest_task.state["projection"] in _TERMINAL_PHASES,
+        "observation_state": progress["observation_state"],
+        "observation_reason": progress.get("reason"),
+        "selected_attempt": selected,
+        "progress": progress,
+    }
 
 
 def _task_view(task: TaskRecord) -> dict[str, Any]:

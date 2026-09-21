@@ -21,11 +21,10 @@ def _common(base, name: str) -> list[str]:
 
 
 def test_installed_wheel_allows_one_default_host_authority(tmp_path) -> None:
-    env = make_env(tmp_path / "host-authority")
-    for name in ("TMPDIR", "TMP", "TEMP"):
-        env.pop(name, None)
-    first = _common(tmp_path, "first")
-    second = _common(tmp_path, "second")
+    base = tmp_path / "host-authority"
+    env = make_env(base)
+    first = _common(base, "first")
+    second = _common(base, "second")
     try:
         run([*first, "init", "--agent-mode", "daemon"], env=env)
         run([*second, "init", "--agent-mode", "daemon"], env=env)

@@ -39,6 +39,7 @@ def test_installed_wheel_cli_flow(tmp_path):
         tasks = jrun([*common, "task", "list"], env=env)
         groups = jrun([*common, "group", "list"], env=env)
         machines = jrun([*common, "machines"], env=env)
+        followed = run([*common, "task", "logs", task_id, "--follow", "--interval-seconds", "1"], env=env)
 
         assert "site-packages" in imported_from
         assert group["group"]["name"] == "release-e2e"
@@ -47,5 +48,6 @@ def test_installed_wheel_cli_flow(tmp_path):
         assert any(item["task_id"] == task_id for item in tasks)
         assert any(item["group"]["name"] == "release-e2e" for item in groups)
         assert any(item["machine"]["machine_name"] == "gpu-1" for item in machines)
+        assert "cli ok" in followed.stdout
     finally:
         stop_agent(common, env=env)

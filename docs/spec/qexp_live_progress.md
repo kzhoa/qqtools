@@ -341,6 +341,8 @@ integration-fixture, and documentation defects; all were repaired, and follow-up
 review reported no findings. The complete candidate preflight remains the
 promotion gate rather than being claimed by this focused evidence.
 
-Deferred: FD transport, `task watch`, metrics, history, ETA, list progress
-columns, multiple streams, stale policy, stdout parsers, and third-party framework
-adapters.
+Delivered observation: `qexp task show TASK_ID --watch` repeatedly presents the existing
+Attempt-scoped snapshot with refreshed relative ages. It does not change reporting cadence,
+infer completion, or provide a structured event stream. Continuous JSON/events, FD transport,
+metrics, history, ETA, list progress columns, multiple streams, stale policy, stdout parsers,
+and third-party framework adapters remain deferred.

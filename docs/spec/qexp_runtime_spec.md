@@ -1049,6 +1049,14 @@ It may commit an unstarted failure, release capacity, and clean the exact launch
 when no launch intent, process registration, process manifest, or exit observation exists. If
 evidence exists or cannot be verified, recovery retains authority and capacity for that Attempt.
 
+The tmux observer is bound to that one launched Attempt and follows its shared log from the
+beginning. It never hosts the runner or training process. Closing the pane therefore terminates
+only the log reader, and application buffering still controls when output becomes visible. The
+Task-scoped `task show --watch` and `task logs --follow` commands independently reselect the
+current Attempt through Task truth, so a retry can move those viewers to a new Attempt without
+repurposing an existing Attempt-bound tmux window. All viewer paths remain outside execution
+authority and perform no Task, Attempt, claim, lease, process, or reservation writes.
+
 Reconciliation distinguishes three outcomes:
 
 - matching identity with a live process permits Recovery CAS

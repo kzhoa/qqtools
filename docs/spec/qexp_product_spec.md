@@ -1260,6 +1260,9 @@ qexp task list
 qexp task list --group stage-c1
 qexp task show task_xxx
 qexp task show task_xxx --format=json
+qexp task show task_xxx --watch
+qexp task logs task_xxx
+qexp task logs task_xxx --follow
 qexp group list
 qexp group show stage-c1
 qexp group show stage-c1 --format=json
@@ -1267,8 +1270,9 @@ qexp top
 qexp machines
 ```
 
-`show` is the only ordinary single-resource observation verb. The target CLI does not
-define a parallel `inspect` spelling.
+`show` remains the structured single-resource snapshot verb. The target CLI does not
+define a parallel `inspect` spelling. `task logs` is the specialized application-log
+byte-stream command; it is not another structured resource view.
 
 `task show` includes optional Attempt-scoped application progress. Progress is advisory:
 it cannot renew a lease, change a claim, determine Task health, or publish completion.
@@ -1282,6 +1286,29 @@ presentation. JSON serializes that result without presentation wrappers. Human r
 derive labels and summaries only from the same result; it does not perform additional Task-history
 queries. Group and machine output retains its summary labels but displays `-` when the canonical,
 bounded observation result does not contain that summary.
+
+`task show --watch` refreshes a compact human Task view on terminal stdout. It follows the
+stable Task ID, shows authoritative Task phase and reason, and includes only a consistently
+selected current or terminal Attempt and its advisory progress. `task logs --follow` emits
+application log text to stdout as it becomes readable and sends qexp boundaries and diagnostics
+to stderr; redirected stdout is supported. Both commands poll shared storage and therefore cannot
+force application buffers to flush or promise a visibility deadline.
+
+Continuous observation is read-only. Closing or interrupting a viewer does not signal a runner,
+cancel work, start an agent, or change shared authority. By default a viewer observes the current
+Task lifecycle, renders or drains its validated terminal result, and exits. `--follow-retries`
+is the explicit long-lived mode that waits across a terminal result and follows a later retry.
+Attempt changes and replaced or truncated log files are announced as stream boundaries; bytes
+lost before a viewer can read them are not recoverable. `task logs --follow --tail N` applies the
+tail limit to every new Attempt or file generation, while finite `task logs` remains the complete
+read available after publication has settled.
+
+A selected nonterminal Attempt may wait for its log to appear. Permission failures, malformed
+references, and non-file targets stop the viewer with an observation error. Other temporary
+filesystem errors are coalesced while the Task is nonterminal and produce one recovery notice
+after reading resumes. Once Task truth is terminal, a missing or temporarily unreadable log gets
+one scheduled retry and then fails nonzero instead of waiting indefinitely. These diagnostics and
+Attempt/file boundaries use stderr; stdout remains only application log text.
 
 Group output should show:
 
@@ -1495,6 +1522,9 @@ compensation.
 
 - `qexp task list`
 - `qexp task show`
+- `qexp task show --watch [--interval-seconds <seconds>] [--follow-retries]`
+- `qexp task logs`
+- `qexp task logs --follow [--tail <lines>] [--interval-seconds <seconds>] [--follow-retries]`
 - `qexp task retry`
 - `qexp task cancel`
 - `qexp task offer`
@@ -1586,8 +1616,11 @@ The target CLI also does not promise aliases for the old flat `list`, `inspect`,
       when the option is omitted.
 - [ ] Single Group submission requires an existing Group; batch creation requires explicit
       non-empty manifest `group.workers`.
-- [ ] Existing Task and Group operations use resource-first command namespaces and `show`
-  is the only ordinary single-resource observation verb.
+- [ ] Existing Task and Group operations use resource-first command namespaces; `show` is the
+  structured single-resource observation verb, `logs` is the specialized application-log byte
+  stream, and there is no parallel `inspect` spelling.
+- [ ] Continuous Task and log viewers remain read-only, exit after validated terminal observation
+  by default, and cross retries only when `--follow-retries` is explicit.
 - [ ] Attempt and Submission Operation remain diagnostic internals without daily CLI
   resource trees.
 - [ ] Idle agents pull shared Tasks through a globally exclusive claim.
