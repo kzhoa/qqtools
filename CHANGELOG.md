@@ -9,6 +9,8 @@
   handoff timeout with fenced recovery and capacity retention for uncertain starts.
 - fix: derive finite qexp JSON and human output from one canonical bounded result, preventing
   presentation-only history reads and keeping summaries consistent when observations are absent.
+- fix: preserve runnable primary demand across dependency rechecks, keep recovery enrollment
+  progressing through unrelated process entries, and retry transient binding-removal races.
 - fix: validate balanced sampler costs once per window-based plan instead of once per window,
   preserving window index checks and rejecting invalid shared costs on epoch rebuilds.
 

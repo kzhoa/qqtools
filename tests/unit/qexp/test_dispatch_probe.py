@@ -100,6 +100,27 @@ def test_recheck_progress_preserves_completed_baseline_across_slices() -> None:
     assert not after_recheck.recheck.is_active
 
 
+def test_real_candidate_promotes_active_recheck_back_to_baseline() -> None:
+    session = PrimaryProbeSession()
+    key = ("project-a", "home", "gpu")
+    session.begin_round("gpu", (key,))
+    session.begin_route(key, 2)
+    session.record_dependency_wait(key, "candidate-start")
+    session.record_progress(key, "baseline-end")
+    session.finish_route(key, 2)
+    session.begin_round("gpu", (key,))
+    assert session.next_recheck("gpu") == key
+
+    session.hold_candidate(key, "candidate-start")
+
+    route = session.route(key)
+    assert route.cursor == "candidate-start"
+    assert route.revision == 2
+    assert not route.is_complete
+    assert route.recheck is None
+    assert session.completed_revisions("gpu", (key,)) is None
+
+
 def test_budget_exhaustion_resumes_the_active_recheck_before_rotating() -> None:
     session = PrimaryProbeSession()
     first = ("project-a", "shared", "gpu")

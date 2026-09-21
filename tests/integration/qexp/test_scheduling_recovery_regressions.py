@@ -634,6 +634,10 @@ def test_authority_restart_finishes_interrupted_recovery(tmp_path: Path, monkeyp
         "qqtools.plugins.qexp.authority.inspect_group_identity",
         lambda *_args: ProcessEvidence(state="alive"),
     )
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.authority.inspect_local_group_identity",
+        lambda *_args: ProcessEvidence(state="alive"),
+    )
 
     class RecoveryCrash(BaseException):
         pass

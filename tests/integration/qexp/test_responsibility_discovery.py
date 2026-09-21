@@ -49,7 +49,7 @@ def test_executor_publishes_durable_membership_before_runner_creation(tmp_path):
         assert entry["stage"] == "active"
         assert entry["payload"] == {"task_id": task.task_id, "attempt_number": 1}
         spawned.append(argv)
-        return SimpleNamespace(pid=4321)
+        return SimpleNamespace(pid=4321, wait=lambda: 0)
 
     executor = Executor(tmux_available=lambda: False, spawn_runner=spawn)
     reference, handoff = executor.initiate_attempt(cfg, task.task_id, attempt)
@@ -131,7 +131,8 @@ def test_runner_rechecks_publication_without_writes_or_shared_lock_and_can_finis
 
     cfg, task, attempt = prepared(tmp_path)
     Executor(
-        tmux_available=lambda: False, spawn_runner=lambda *_args, **_kwargs: SimpleNamespace(pid=4321)
+        tmux_available=lambda: False,
+        spawn_runner=lambda *_args, **_kwargs: SimpleNamespace(pid=4321, wait=lambda: 0),
     ).initiate_attempt(cfg, task.task_id, attempt)
     original = Ledger.publish
     checks = []
@@ -187,7 +188,7 @@ def test_publication_failure_reconciles_attempt_without_launch_and_preserves_exp
         spawned.append(args)
         identity = load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
         atomic_replace(local_paths(cfg.runtime_root)["launch_intents"] / f"{identity}.json", {})
-        return SimpleNamespace(pid=4321)
+        return SimpleNamespace(pid=4321, wait=lambda: 0)
 
     executor = Executor(tmux_available=lambda: False, spawn_runner=spawn)
     original = Ledger.publish

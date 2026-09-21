@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import tempfile
@@ -587,7 +588,16 @@ class MachineRuntime:
                     if blockers:
                         raise RuntimeError("cannot remove project with active local evidence: " + ", ".join(blockers))
                     if is_path_present(project_root):
-                        shutil.rmtree(project_root)
+                        try:
+                            shutil.rmtree(project_root)
+                        except OSError as exc:
+                            if exc.errno != errno.ENOTEMPTY:
+                                raise
+                            # A worker that passed its binding check before the
+                            # disable may finish one bounded staging write while
+                            # removal walks the tree. Release lifecycle locks and
+                            # retry after that writer observes the registry.
+                            raise CaptureBusy("project runtime removal is busy") from exc
                 self.registration.save_registry_locked(revision + 1, [item for item in bindings if item != binding])
         return binding
 

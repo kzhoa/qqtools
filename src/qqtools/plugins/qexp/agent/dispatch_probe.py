@@ -162,7 +162,9 @@ class PrimaryProbeSession:
 
     def hold_candidate(self, key: RouteKey, cursor: ReadyCursor | None) -> None:
         """Retain a real primary-demand candidate at its resume position."""
-        self.record_progress(key, cursor)
+        current = self.route(key)
+        self._routes[key] = PrimaryProbeRoute(cursor, current.revision, False)
+        self._lane_for_key(key).pending.add(key)
 
     def record_dependency_wait(self, key: RouteKey, cursor: ReadyCursor | None) -> None:
         """Retain or advance dependency-only recheck progress."""

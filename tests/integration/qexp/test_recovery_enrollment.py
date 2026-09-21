@@ -208,6 +208,7 @@ def test_slow_worker_does_not_block_poll_or_start_duplicate_worker(tmp_path, mon
 def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_path):
     from qqtools.plugins.qexp.agent.recovery_capture import inspect_recovery_capture
     from qqtools.plugins.qexp.runtime.group_namespace import is_group_authority_isolated
+    from qqtools.plugins.qexp.runtime.responsibility_capture import CAPTURE_FILE
     from qqtools.plugins.qexp.runtime.responsibility_completion import is_source_released, read_capture_completion
 
     runtime = MachineRuntime(tmp_path / "machine")
@@ -218,9 +219,14 @@ def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_p
         [
             sys.executable,
             "-c",
-            "import sys; from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop; "
+            "import os, sys; os.fsync = lambda _descriptor: None; "
+            "from pathlib import Path; "
+            "from qqtools.plugins.qexp.runtime import responsibility_process_capture as process_capture; "
+            "process_capture.PROC_ROOT = Path(sys.argv[2]); "
+            "from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop; "
             "run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])",
             str(runtime.root),
+            str(tmp_path / "proc"),
         ],
         env=environment,
         start_new_session=True,
@@ -261,6 +267,11 @@ def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_p
             on_timeout=lambda: {
                 binding.project_id: {
                     "capture": inspect_recovery_capture(runtime, binding),
+                    "writer_capture": (
+                        read_json(runtime.project_paths(binding.project_id)["root"] / CAPTURE_FILE)
+                        if (runtime.project_paths(binding.project_id)["root"] / CAPTURE_FILE).exists()
+                        else None
+                    ),
                     "blockers": runtime.binding_blockers(binding),
                 }
                 for binding, _path in entries

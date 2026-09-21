@@ -236,10 +236,20 @@ class RunnerProcessCapture:
                 return None
             if not stat.S_ISDIR(metadata.st_mode):
                 raise Unavailable("process capture encountered a non-directory PID")
+            with (process / "cmdline").open("rb") as stream:
+                raw = stream.read(COMMAND_BYTES + 1)
+            # Most same-user processes are unrelated.  Filter them before strict
+            # identity parsing so a malformed transient /proc stat cannot stall
+            # recovery enrollment for every project on the machine.
+            if len(raw) > COMMAND_BYTES:
+                if os.fsdecode(raw).split("\0")[1:3] == ["-m", RUNNER_MODULE]:
+                    raise Unavailable("runner command exceeds its capture byte bound")
+                return None
+            if self._runner_locator(raw) is None:
+                return None
             before = _process_stat(process / "stat", pid)
             if before[0] == "Z":
                 return None
-            # Ignore large unrelated commands without admitting a truncated runner.
             with (process / "cmdline").open("rb") as stream:
                 raw = stream.read(COMMAND_BYTES + 1)
             after = _process_stat(process / "stat", pid)
@@ -248,9 +258,7 @@ class RunnerProcessCapture:
         if before[1] != after[1] or after[0] == "Z":
             return None
         if len(raw) > COMMAND_BYTES:
-            if os.fsdecode(raw).split("\0")[1:3] == ["-m", RUNNER_MODULE]:
-                raise Unavailable("runner command exceeds its capture byte bound")
-            return None
+            raise Unavailable("runner command exceeds its capture byte bound")
         locator = self._runner_locator(raw)
         if locator is None:
             return None

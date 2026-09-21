@@ -142,6 +142,18 @@ def test_empty_completion_restarts_without_process_or_history_enumeration(projec
     assert (root / completion.COMPLETION_FILE).read_bytes() == proof
 
 
+def test_unrelated_process_does_not_require_runner_identity_stat(project):
+    _runtime, _binding, cfg, root, proc = project
+    fake = proc / "123456"
+    fake.mkdir()
+    (fake / "cmdline").write_bytes(b"python\0-c\0pass\0")
+    (fake / "stat").write_text("not a process stat")
+    ledger = Ledger.open_or_create(responsibility_root(root))
+    scanner = processes.RunnerProcessCapture(replace(cfg, runtime_root=root), ledger)
+
+    assert scanner.take().is_sweep_complete
+
+
 def test_admission_restarts_completed_earlier_census_and_evidence(project):
     from qqtools.plugins.qexp.runtime.responsibility_backfill import ResponsibilityBackfill
 

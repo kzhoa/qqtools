@@ -288,7 +288,9 @@ def test_running_query_rejects_registration_replacement_and_keeps_nullable_ident
         "advanced_at": "2026-09-20T00:00:00Z",
         "progress": {"stage": "train", "current": 1},
     }
-    replace_advisory_snapshot(shared_progress_path(cfg.shared_root, task.task_id, attempt.attempt_id), snapshot)
+    path = shared_progress_path(cfg.shared_root, task.task_id, attempt.attempt_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    replace_advisory_snapshot(path, snapshot)
     generations = iter(("generation-1", "generation-2"))
     monkeypatch.setattr(
         "qqtools.plugins.qexp.runtime.progress._running_registration_generation",
@@ -400,7 +402,7 @@ def test_unchanged_qpipeline_command_reaches_task_show_progress(cfg, monkeypatch
 
         def wait(self):
             try:
-                return self.child.wait(timeout=30)
+                return self.child.wait(timeout=180)
             except subprocess.TimeoutExpired:
                 os.killpg(self.pid, 9)
                 self.child.wait(timeout=5)

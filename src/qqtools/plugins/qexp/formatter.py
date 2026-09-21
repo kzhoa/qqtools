@@ -273,7 +273,7 @@ def _render_task_show(result: Mapping[str, Any], _presentation: Mapping[str, obj
         (
             ("Task ID", task.get("task_id")),
             ("Name", task.get("name")),
-            ("Command", spec.get("argv")),
+            ("Command", spec.get("command")),
             ("GPUs", spec.get("requested_gpus")),
             ("Group", task.get("group_name")),
             ("Dependencies", task.get("depends_on_task_ids")),
@@ -710,7 +710,7 @@ def _validate_task_show(result: Any) -> None:
     for key in ("task_id", "name", "group_name", "depends_on_task_ids"):
         _required(task, key, "task-show payload.task")
     spec = _required_mapping(task, "spec", "task-show payload.task")
-    for key in ("argv", "requested_gpus"):
+    for key in ("command", "requested_gpus"):
         _required(spec, key, "task-show payload.task.spec")
     placement = _required_mapping(task, "placement_policy", "task-show payload.task")
     _required(placement, "home_machine", "task-show payload.task.placement_policy")
