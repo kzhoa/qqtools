@@ -4,7 +4,7 @@ import subprocess
 import sys
 
 
-def test_installed_wheel_exposes_cli_only_from_owner_modules() -> None:
+def test_installed_wheel_exposes_owned_public_entrypoints_and_runtime_packages() -> None:
     script = """
 from pathlib import Path
 import importlib.metadata
@@ -29,8 +29,6 @@ assert callable(submission.dispatch_submission)
 """
     subprocess.run([sys.executable, "-E", "-c", script], check=True)
 
-
-def test_installed_wheel_supports_direct_cli_package_execution() -> None:
     result = subprocess.run(
         [sys.executable, "-E", "-m", "qqtools.plugins.qexp.cli", "--help"],
         text=True,
@@ -42,8 +40,6 @@ def test_installed_wheel_supports_direct_cli_package_execution() -> None:
     assert result.stdout.startswith("usage: qexp")
     assert result.stderr == ""
 
-
-def test_installed_wheel_exposes_runtime_packages_from_owner_modules() -> None:
     script = """
 from pathlib import Path
 import qqtools

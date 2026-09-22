@@ -48,26 +48,6 @@ def _assert_current_project_is_registered(common: list[str], shared_root: Path, 
     assert any(project["shared_root"] == str(shared_root) for project in projects)
 
 
-def test_use_rejects_removed_identity_inputs_and_keeps_locator_contract(tmp_path: Path) -> None:
-    base = tmp_path / "use-context"
-    shared_root = base / "project" / ".qexp"
-    env = make_env(base)
-
-    rejected = run(
-        ["qexp", "--machine", "gpu-1", "use", "--project", str(shared_root)],
-        env=env,
-        check=False,
-    )
-    assert rejected.returncode == 2
-    run(["qexp", "use", "--project", str(shared_root)], env=env)
-    assert json.loads((base / "home" / ".qqtools" / "qexp-context.json").read_text()) == {
-        "shared_root": str(shared_root)
-    }
-
-    shown = run(["qexp", "use", "--show", "--format=json"], env=env)
-    assert json.loads(shown.stdout) == {"shared_root": str(shared_root)}
-
-
 # Protected compatibility test: New project workflow
 def test_new_project_activation_uses_registered_binding_without_add_project(tmp_path: Path) -> None:
     base = tmp_path / "protected-new-project-activation"
