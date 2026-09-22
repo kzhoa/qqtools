@@ -121,7 +121,7 @@ Quick start:
 qexp init --machine gpu-a
 qexp project init /mnt/share/myproject
 qexp project register /mnt/share/myproject
-qexp use --shared-root /mnt/share/myproject/.qexp
+qexp use --project /mnt/share/myproject/.qexp
 qexp submit --name demo1 -- python train.py -c config1.yaml
 qexp submit --name demo2 -- python train.py -c config2.yaml
 qexp submit --name demo3 -- python train.py -c config3.yaml
@@ -130,12 +130,12 @@ qexp submit --name demo3 -- python train.py -c config3.yaml
 
 `qexp init` creates the local machine identity and global agent configuration only. `project init`
 creates shared Project truth, `project register` enrolls it in this machine, and `qexp use
---shared-root <project/.qexp>` selects the default Project for ordinary commands. Selection neither
+--project <project/.qexp>` selects the default Project for ordinary commands. Selection neither
 creates nor enrolls a Project.
 
 Each qexp Machine has one global `qexp agent` process and one resource pool shared by all enrolled
-Projects. A Project created by an older release with legacy agent metadata uses the one-time `qexp
-agent migrate-project`. `qexp agent start` starts or reuses the global agent and waits for every
+Projects. A Project created by an older release with legacy agent metadata uses the one-time
+`qexp admin migrate agent --project PATH --machine NAME`. `qexp agent start` starts or reuses the global agent and waits for every
 enabled Project to become ready. `qexp agent run` is the foreground debugging command.
 
 ```bash
@@ -150,10 +150,10 @@ The MachineRuntime also owns one persistent GPU allowlist shared by every regist
 Change it while the agent is running; no restart is required:
 
 ```bash
-qexp agent gpus show
-qexp agent gpus set --visible 0,2,3
-qexp agent gpus set --none
-qexp agent gpus reset
+qexp agent config gpus show
+qexp agent config gpus set --visible 0,2,3
+qexp agent config gpus set --none
+qexp agent config gpus reset
 ```
 
 `set --none` intentionally disables new GPU work, while CPU-lane work remains independent.
@@ -168,7 +168,7 @@ an older policy-unaware agent can expose GPUs again because the older agent igno
 
 Use `qexp project list|enable|disable|remove` to manage local enrollment. The saved Project pool can
 be reconciled after a deliberate fresh identity with `qexp project register --from-pool`. Older
-per-project-agent metadata still uses the distinct `qexp agent migrate-project` recovery workflow.
+per-project-agent metadata still uses the distinct `qexp admin migrate agent --project PATH --machine NAME` recovery workflow.
 
 `qexp init` always creates a fresh runtime identity when one already exists, even when the name is
 unchanged. It therefore requires confirmation or `--yes`; use `qexp agent name --set-to NAME` for a
@@ -196,7 +196,7 @@ compatible. A drained schema-5 root can be upgraded only when it has no active c
 running Attempt:
 
 ```bash
-qexp migrate --shared-root /path/to/project/.qexp --machine gpu1 --to-schema 6
+qexp admin migrate schema --project /path/to/project/.qexp --machine gpu1 --to-schema 6
 ```
 
 The agent owns lease renewal, Recovery, termination, terminal publication, and GPU
@@ -205,15 +205,15 @@ registration and exit-observation records. Inspect or change the shared lease po
 while no active claim exists:
 
 ```bash
-qexp lease-policy show
-qexp lease-policy set --ttl-seconds 180 --renew-interval-seconds 10
-qexp doctor verify
+qexp config show lease
+qexp config set lease --ttl-seconds 180 --renew-interval-seconds 10
+qexp admin check --project /path/to/project
 ```
 
 Schema 6 detects clock capability instead of requiring `chronyc` on every host. A qualified
 provider permits full bounded-lease coordination; otherwise eligible work runs in holder-bound
-local-safe mode and is never expired, remotely recovered, or automatically replaced. `qexp
-doctor verify` and `qexp agent status` expose the provider, authority mode, and blocker.
+local-safe mode and is never expired, remotely recovered, or automatically replaced.
+`qexp admin check --project PATH` and `qexp agent status` expose the provider, authority mode, and blocker.
 
 For existing-project upgrades, including recovery from `ready_index=degraded` / `marker corrupt`
 and the explicit 1.3.15 schema-6 capability activation, see
@@ -222,12 +222,12 @@ and the explicit 1.3.15 schema-6 capability activation, see
 ```bash
 qexp task share TASK_ID
 qexp task share TASK_ID --after 10m --with gpu-b,gpu-c
-qexp task keep-local TASK_ID
+qexp task unshare TASK_ID
 qexp task offer TASK_ID --format=json
 ```
 
 `share` is the user-facing control for letting eligible Group workers help while the home
-machine remains eligible. `share --after` records a bounded deadline; `keep-local` clears the
+machine remains eligible. `share --after` records a bounded deadline; `unshare` clears the
 shared policy and returns the Task to the home queue. `task offer` is retained for Tasks that
 were already submitted with spillover policy and only moves that existing policy into the shared
 queue. Scripts and other machine consumers must request structured command output explicitly with `--format=json`.
@@ -239,21 +239,24 @@ qexp submit --group sweep -- python train.py --config a.yaml
 qexp submit --file runs.yaml --group sweep
 qexp group pause sweep
 qexp task retry TASK_ID
-qexp task retry TASK_ID --acknowledge-duplicate-risk
-qexp clean --task-id TASK_ID --dry-run
-qexp clean --older-than-days 30 --limit 100
+qexp task wait TASK_ID --timeout 30m
+qexp task list --name demo1 --page-size 50
+qexp task logs TASK_ID -n 100
+qexp status
+qexp admin clean --project /path/to/project --task-id TASK_ID --dry-run
+qexp admin clean --project /path/to/project --older-than-days 30 --limit 100
 ```
 
 Terminal notifications are disabled by default. Configure the machine-local Feishu Incoming
 Webhook from the agent environment (the default, recommended mode):
 
 ```bash
-qexp config notifications set --enabled
-qexp config notifications provider set feishu --enabled \
+qexp config set notifications --enabled
+qexp config set notifications --provider feishu --enabled \
   --webhook-env QEXP_FEISHU_WEBHOOK --secret-env QEXP_FEISHU_SECRET
 export QEXP_FEISHU_WEBHOOK='https://open.feishu.cn/open-apis/bot/v2/hook/...'
 export QEXP_FEISHU_SECRET='...'
-qexp config notifications show
+qexp config show notifications
 ```
 
 For installations that deliberately accept the shared-root credential risk, a webhook can instead
@@ -262,12 +265,12 @@ from standard input so it does not enter shell history; the explicit acknowledge
 
 ```bash
 printf '%s\n' 'https://open.feishu.cn/open-apis/bot/v2/hook/...' |
-  qexp config notifications provider set feishu \
+  qexp config set notifications --provider feishu \
     --enabled --credential-source shared_file --webhook-stdin --acknowledge-shared-secret-risk
 ```
 
 This file is requested as owner-private (`0600`) but remains on the shared control root. Anyone
-with access to that storage or its backups may be able to read it. `qexp config notifications show`
+with access to that storage or its backups may be able to read it. `qexp config show notifications`
 never prints the URL. A signing secret, when configured, remains environment-only.
 
 The webhook and secret are read by the process that commits the terminal transition. Non-sensitive
@@ -414,10 +417,10 @@ Progress reporting defaults to one update every 30 seconds. A project with many 
 Tasks can trade freshness for lower local and shared filesystem write pressure:
 
 ```bash
-qexp config progress show
-qexp config progress set --interval-seconds 60
-qexp config tmux show
-qexp config tmux set --enabled
+qexp config show progress
+qexp config set progress --interval-seconds 60
+qexp config show tmux
+qexp config set tmux --enabled
 ```
 
 The setting applies to subsequent launches and retries; already-running Attempts keep the
@@ -428,7 +431,7 @@ atomically replace the injected `QEXP_PROGRESS_PATH` progress-v1 mailbox and hon
 `QEXP_PROGRESS_INTERVAL_SECONDS`. Progress remains advisory and never controls Task execution.
 
 qexp-created tmux windows are optional, read-only Attempt-log observers and are disabled by
-default. Enable the project fallback for future decisions with `qexp config tmux set --enabled`,
+default. Enable the project fallback for future decisions with `qexp config set tmux --enabled`,
 or select one submission with `qexp submit --tmux -- python entry.py`. `--no-tmux` is an explicit
 Task override. Policy changes do not create or remove windows retroactively, and every owning
 machine must run a supporting agent before project-wide enforcement is complete. Missing tmux or

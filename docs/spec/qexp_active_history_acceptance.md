@@ -109,7 +109,7 @@ Group authority automatically moves to the canonical `groups-v2` namespace under
 the recorded upgrade protocol; old cached writers cannot mutate canonical truth.
 Unfinished old worker-removal operations without worker incarnation evidence are
 blocked. Tasks, processes and resources remain intact; operators may reissue
-`qexp group machines remove <group> <machine>` when removal is still needed.
+`qexp group worker remove <group> <machine>` when removal is still needed.
 This compatibility change was explicitly approved on 2026-09-19 and is documented
 in the public product/runtime upgrade contracts.
 

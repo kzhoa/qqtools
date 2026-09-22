@@ -15,7 +15,7 @@ def _base_args(cfg) -> list[str]:
     machine_runtime_root = cfg.runtime_root.parent / "machine-runtime"
     MachineRuntime(machine_runtime_root).ensure_binding(cfg.shared_root, cfg.machine_name)
     return [
-        "--shared-root",
+        "--project",
         str(cfg.shared_root),
         "--machine",
         cfg.machine_name,
@@ -32,7 +32,6 @@ def _base_args(cfg) -> list[str]:
         (["task", "show", "task-1", "--interval-seconds", "2"], "requires --watch"),
         (["task", "show", "task-1", "--follow-retries"], "requires --watch"),
         (["task", "show", "task-1", "--watch", "--format=json"], "cannot be combined"),
-        (["task", "logs", "task-1", "--tail", "2"], "requires --follow"),
         (["task", "logs", "task-1", "--interval-seconds", "2"], "requires --follow"),
         (["task", "logs", "task-1", "--follow-retries"], "requires --follow"),
         (["task", "logs", "task-1", "--follow", "--tail", "-1"], "non-negative"),

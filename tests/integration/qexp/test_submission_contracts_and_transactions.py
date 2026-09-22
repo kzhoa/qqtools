@@ -441,7 +441,7 @@ def test_human_follow_up_commands_use_parseable_project_locator(
     for label in ("Show: ", "Logs: "):
         command = next(line.removeprefix(label) for line in lines if line.startswith(label))
         parsed = build_parser().parse_args(shlex.split(command)[1:])
-        assert parsed.shared_root == str(project / ".qexp")
+        assert parsed.project == str(project)
 
 
 def test_process_death_after_provisional_group_publication_hides_group_and_allows_same_key_recovery(

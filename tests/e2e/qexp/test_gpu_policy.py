@@ -9,7 +9,7 @@ def test_installed_cli_persists_machine_gpu_policy_without_project_context(tmp_p
     base = tmp_path / "gpu-policy"
     runtime_root = base / "machine-runtime"
     env = make_env(base)
-    command = ["qexp", "--machine-runtime-root", str(runtime_root), "agent", "gpus"]
+    command = ["qexp", "--machine-runtime-root", str(runtime_root), "agent", "config", "gpus"]
 
     changed = run(
         [*command, "set", "--visible", "2,0", "--expected-revision", "0", "--format=json"],

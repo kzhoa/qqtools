@@ -109,6 +109,16 @@ def set_progress_policy(shared_root: Any, interval_seconds: Any) -> dict[str, An
     return _result(interval, "configured")
 
 
+def reset_progress_policy(shared_root: Any) -> dict[str, Any]:
+    """Remove the explicit policy after strictly validating any existing file."""
+    root = _shared_root(shared_root)
+    path = progress_policy_path(root)
+    with exclusive(progress_policy_lock_path(root)):
+        _read_configured(root)
+        path.unlink(missing_ok=True)
+    return _result(DEFAULT_PROGRESS_INTERVAL_SECONDS, "default")
+
+
 def resolve_progress_policy(shared_root: Any) -> dict[str, Any]:
     """Resolve launch policy, falling back safely with a bounded local reason."""
     try:
@@ -133,6 +143,7 @@ __all__ = [
     "load_progress_policy",
     "progress_policy_lock_path",
     "progress_policy_path",
+    "reset_progress_policy",
     "resolve_progress_policy",
     "set_progress_policy",
     "show_progress_policy",

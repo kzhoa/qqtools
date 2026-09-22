@@ -13,14 +13,17 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .config_types import RootConfig
+from .runtime.locks import exclusive
 from .runtime.paths import local_paths, shared_paths
 from .runtime.records import utc_now
 from .runtime.store import atomic_replace, read_json
 
 AUTHORITY_MODES = ("bounded_lease", "holder_bound")
+LEASE_POLICY_LOCK_FILENAME = "lease-policy.lock"
 
 
 class LeaseRenewalOutcome(str, Enum):
@@ -164,8 +167,23 @@ def default_lease_policy_document() -> dict[str, Any]:
     return {"lease_policy": asdict(LeasePolicy())}
 
 
-def load_lease_policy(cfg: RootConfig) -> LeasePolicy:
-    value = read_json(shared_paths(cfg.shared_root)["lease_policy"]).get("lease_policy")
+def lease_policy_path(cfg: RootConfig) -> Path:
+    """Return the authoritative project lease-policy path."""
+    return shared_paths(cfg.shared_root)["lease_policy"]
+
+
+def lease_policy_lock_path(cfg: RootConfig) -> Path:
+    """Return the lock used only for lease-policy reads and writes."""
+    return shared_paths(cfg.shared_root)["locks"] / LEASE_POLICY_LOCK_FILENAME
+
+
+def _read_lease_policy(cfg: RootConfig) -> LeasePolicy:
+    path = lease_policy_path(cfg)
+    try:
+        document = read_json(path)
+    except FileNotFoundError:
+        return LeasePolicy()
+    value = document.get("lease_policy")
     if not isinstance(value, dict):
         raise RuntimeError("qexp lease policy is malformed.")
     value = dict(value)
@@ -178,10 +196,28 @@ def load_lease_policy(cfg: RootConfig) -> LeasePolicy:
     return LeasePolicy(**value)
 
 
+def load_lease_policy(cfg: RootConfig) -> LeasePolicy:
+    """Load the policy, using the built-in policy only when its file is absent."""
+    return _read_lease_policy(cfg)
+
+
 def save_lease_policy(cfg: RootConfig, policy: LeasePolicy) -> None:
+    """Validate the current record and atomically save a lease policy under lock."""
     value = asdict(policy)
     value["clock_provider_priority"] = list(policy.clock_provider_priority)
-    atomic_replace(shared_paths(cfg.shared_root)["lease_policy"], {"lease_policy": value})
+    path = lease_policy_path(cfg)
+    with exclusive(lease_policy_lock_path(cfg)):
+        _read_lease_policy(cfg)
+        atomic_replace(path, {"lease_policy": value})
+
+
+def reset_lease_policy(cfg: RootConfig) -> LeasePolicy:
+    """Remove the explicit policy after strictly validating any existing record."""
+    path = lease_policy_path(cfg)
+    with exclusive(lease_policy_lock_path(cfg)):
+        _read_lease_policy(cfg)
+        path.unlink(missing_ok=True)
+    return LeasePolicy()
 
 
 def lease_expiry(policy: LeasePolicy) -> str:

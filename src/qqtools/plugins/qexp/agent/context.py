@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import os
+import shlex
 import shutil
 import tempfile
 import time
@@ -870,7 +871,19 @@ class MachineRuntime:
                 except (OSError, TypeError, ValueError):
                     raise ValueError(f"qexp machine record is malformed: {record_path}") from None
                 if not isinstance(machine, dict) or machine.get("agent_runtime") != "machine":
-                    raise ValueError("legacy project metadata detected; run 'qexp agent migrate-project'.")
+                    command = shlex.join(
+                        [
+                            "qexp",
+                            "admin",
+                            "migrate",
+                            "agent",
+                            "--project",
+                            str(root),
+                            "--machine",
+                            record_path.parent.name,
+                        ]
+                    )
+                    raise ValueError(f"legacy project metadata detected; run '{command}'.")
             raise ValueError(f"no local project binding exists for {root}; run 'qexp project register {root}'.")
         if len(matches) > 1:
             machines = ", ".join(sorted(binding.machine_name for binding in matches))
@@ -889,7 +902,19 @@ class MachineRuntime:
         ):
             raise ValueError(f"local binding for machine {binding.machine_name!r} does not match Project truth.")
         if machine.get("agent_runtime") != "machine":
-            raise ValueError("legacy project metadata detected; run 'qexp agent migrate-project'.")
+            command = shlex.join(
+                [
+                    "qexp",
+                    "admin",
+                    "migrate",
+                    "agent",
+                    "--project",
+                    str(root),
+                    "--machine",
+                    binding.machine_name,
+                ]
+            )
+            raise ValueError(f"legacy project metadata detected; run '{command}'.")
         return binding
 
     def verified_execution_context(self, shared_root: str | Path) -> ExecutionContext:

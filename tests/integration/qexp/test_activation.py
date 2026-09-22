@@ -1,3 +1,4 @@
+import shlex
 import time
 from pathlib import Path
 from threading import Barrier, Thread
@@ -27,8 +28,19 @@ def test_legacy_project_requires_explicit_migration(tmp_path: Path) -> None:
     record["machine"].pop("agent_runtime")
     atomic_replace(record_path, record)
 
-    with pytest.raises(RuntimeError, match="qexp agent migrate-project"):
+    with pytest.raises(RuntimeError) as error:
         ensure_local_agent_active(cfg, reason="submit", machine_runtime=MachineRuntime(tmp_path / "machine-runtime"))
+    command = str(error.value).partition("run '")[2].removesuffix("'.")
+    assert shlex.split(command) == [
+        "qexp",
+        "admin",
+        "migrate",
+        "agent",
+        "--project",
+        str(cfg.shared_root),
+        "--machine",
+        cfg.machine_name,
+    ]
 
 
 def test_registered_project_does_not_start_a_second_machine_agent(

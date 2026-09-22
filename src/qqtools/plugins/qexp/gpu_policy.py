@@ -340,10 +340,10 @@ def _repair_commands(
     commands = []
     suggested = (visible or discovered)[:_MAX_WARNING_IDS]
     if suggested:
-        commands.append("qexp agent gpus set --visible " + ",".join(str(item) for item in suggested))
-    commands.append("qexp agent gpus set --none")
-    commands.append("qexp agent gpus reset")
-    commands.append("qexp agent gpus show")
+        commands.append("qexp agent config gpus set --visible " + ",".join(str(item) for item in suggested))
+    commands.append("qexp agent config gpus set --none")
+    commands.append("qexp agent config gpus reset")
+    commands.append("qexp agent config gpus show")
     return commands
 
 
@@ -377,7 +377,7 @@ def _build_warnings(
                 discovered_gpu_ids=None,
                 effective_visible_gpu_ids=None,
                 undiscovered_configured_gpu_ids=None,
-                repair_commands=["qexp agent gpus show"],
+                repair_commands=["qexp agent config gpus show"],
             ),
         )
     missing = tuple(item for item in configured if item not in discovered)
@@ -389,7 +389,7 @@ def _build_warnings(
         f"Configured: {','.join(str(item) for item in configured)}. "
         f"Discovered: {','.join(str(item) for item in discovered) or 'none'}. "
         f"Effective visible GPUs: {','.join(str(item) for item in effective) or 'none'}. "
-        "If these GPUs should exist, repair NVIDIA/container device exposure and run qexp agent gpus show."
+        "If these GPUs should exist, repair NVIDIA/container device exposure and run qexp agent config gpus show."
     )
     return (
         _warning(

@@ -40,8 +40,10 @@ For operational commands, including `submit`, qexp derives the current machine i
 unique local `MachineRuntime` project binding selected by the canonical shared root and stable
 project ID. A caller-provided machine name is not an authority source.
 
-Operational context separates project location from identity. `--shared-root`, `QEXP_SHARED_ROOT`,
-and the saved context shared root may locate the Project. `--machine` and `QEXP_MACHINE` are
+Operational context separates project location from identity. `--project` is the canonical Project
+locator; `QEXP_SHARED_ROOT` and the saved context shared root remain fallback locators. The retired
+root-position `--shared-root` spelling is historical compatibility input only and does not select
+ordinary Project context. `--machine` and `QEXP_MACHINE` are
 compatibility assertions only: each must equal the binding-derived machine or the command fails
 before mutation. The saved context machine/runtime root, `--runtime-root`, and `QEXP_RUNTIME_ROOT`
 are non-authoritative legacy inputs; they do not select identity, activation target, or reservation
@@ -86,9 +88,10 @@ the submission command originated there.
 
 ### Group resource pools remain explicitly dynamic
 
-The Group Worker Set remains the dynamically changeable resource pool. `qexp group machines add`,
+The Group Worker Set remains the dynamically changeable resource pool. `qexp group worker add`,
 `drain`, and `remove` retain their existing safety semantics, including protection against stranding
-queued work; active membership still controls subsequent claim eligibility.
+queued work; `set` edits existing policy and `resume` explicitly reactivates a draining worker.
+Active membership still controls subsequent claim eligibility.
 
 Submission is not a Worker Set transition. A submit, regardless of local or remote home, never
 adds its origin machine to a Group. Batch manifest `group.workers` remains an explicit, audited

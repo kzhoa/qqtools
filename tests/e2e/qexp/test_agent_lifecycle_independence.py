@@ -36,7 +36,7 @@ def test_installed_cli_stop_offline_completion_start(tmp_path: Path) -> None:
     env = make_env(base)
     common = [
         "qexp",
-        "--shared-root",
+        "--project",
         str(shared_root),
         "--machine",
         "gpu-1",

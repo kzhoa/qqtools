@@ -9,7 +9,7 @@ pytestmark = [pytest.mark.e2e, pytest.mark.host_exclusive]
 def _common(base, name: str) -> list[str]:
     return [
         "qexp",
-        "--shared-root",
+        "--project",
         str(base / name / ".qexp"),
         "--machine",
         name,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 import shutil
 import time
 import uuid
@@ -437,6 +438,7 @@ def initialize_machine(
                 )
             return {
                 "action": "initialized",
+                "machine_runtime_root": str(machine_runtime.root),
                 "agent_name": target_name,
                 "agent_mode": selected_mode,
                 "old_runtime_id": None,
@@ -561,6 +563,7 @@ def initialize_machine(
         machine_runtime.paths["replacement_transaction"].unlink(missing_ok=True)
         return {
             "action": "reinitialized",
+            "machine_runtime_root": str(machine_runtime.root),
             "agent_name": target_name,
             "agent_mode": selected_mode,
             "old_runtime_id": reported_old_id,
@@ -811,7 +814,20 @@ def register_projects(
                 try:
                     stable_id, cfg = _load_project_identity(entry.shared_root)
                     if _legacy_project(cfg):
-                        raise ValueError("legacy project metadata requires 'qexp agent migrate-project'.")
+                        migration_machine = binding.machine_name if binding is not None else config.name
+                        command = shlex.join(
+                            [
+                                "qexp",
+                                "admin",
+                                "migrate",
+                                "agent",
+                                "--project",
+                                str(entry.shared_root),
+                                "--machine",
+                                migration_machine,
+                            ]
+                        )
+                        raise ValueError(f"legacy project metadata requires '{command}'.")
                     effective, source, override = _name_intent(
                         machine_runtime,
                         config,

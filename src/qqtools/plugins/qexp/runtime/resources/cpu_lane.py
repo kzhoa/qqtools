@@ -118,7 +118,7 @@ def initialize_cpu_lane_capacity(runtime_root: Path | Any, *, capacity: int) -> 
             if current.capacity != capacity:
                 raise ValueError(
                     "CPU lane capacity is already configured as "
-                    f"{current.capacity}; use 'qexp agent cpu-lane set' to change it."
+                    f"{current.capacity}; use 'qexp agent config cpu set' to change it."
                 )
             return current
         policy = CpuLanePolicy(capacity, 1)

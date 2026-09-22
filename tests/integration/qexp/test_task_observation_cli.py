@@ -14,7 +14,7 @@ pytestmark = pytest.mark.integration
 
 def args(cfg):
     return [
-        "--shared-root",
+        "--project",
         str(cfg.shared_root),
         "--machine",
         cfg.machine_name,
@@ -42,6 +42,19 @@ def test_cli_legacy_json_and_live_page_continuation(tmp_path, capsys):
     assert main([*args(cfg), "--page-size", "1"]) == 0
     human = capsys.readouterr().out
     assert "page_full" in human and "--cursor" in human and "task list" in human
+
+
+def test_exact_name_without_page_options_uses_indexed_page_contract(tmp_path, capsys):
+    cfg = isolated_group(tmp_path, tail=0)
+    submit(cfg, ["true"], task_id="first", group="experiment", name="same-name")
+    submit(cfg, ["true"], task_id="second", group="experiment", name="same-name")
+    submit(cfg, ["true"], task_id="other", group="experiment", name="other-name")
+
+    assert main([*args(cfg), "--name", "same-name", "--format=json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert [item["task_id"] for item in output["items"]] == ["first", "second"]
+    assert output["consistency"] == "live"
 
 
 @pytest.mark.parametrize(

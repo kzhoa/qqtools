@@ -17,7 +17,7 @@ def test_installed_wheel_cli_flow(tmp_path):
     imported_from = ensure_site_packages_import()
     common = [
         "qexp",
-        "--shared-root",
+        "--project",
         str(shared_root),
         "--machine",
         "gpu-1",
@@ -26,7 +26,7 @@ def test_installed_wheel_cli_flow(tmp_path):
     ]
     try:
         initialize_machine_project(common, env=env, agent_mode="daemon")
-        tmux_policy = jrun([*common, "config", "tmux", "show"], env=env)
+        tmux_policy = jrun([*common, "config", "show", "tmux"], env=env)
         group = jrun([*common, "group", "create", "release-e2e", "--workers", "gpu-1"], env=env)
         submit = run(
             [
@@ -49,7 +49,7 @@ def test_installed_wheel_cli_flow(tmp_path):
         task = jrun([*common, "task", "show", task_id], env=env)
         tasks = jrun([*common, "task", "list"], env=env)
         groups = jrun([*common, "group", "list"], env=env)
-        machines = jrun([*common, "machines"], env=env)
+        machines = jrun([*common, "machine", "list"], env=env)
         followed = run([*common, "task", "logs", task_id, "--follow", "--interval-seconds", "1"], env=env)
 
         assert "site-packages" in imported_from

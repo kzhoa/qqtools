@@ -108,6 +108,16 @@ def set_launch_handoff_policy(shared_root: Any, timeout_seconds: Any) -> dict[st
     return _result(timeout, "configured")
 
 
+def reset_launch_handoff_policy(shared_root: Any) -> dict[str, Any]:
+    """Remove the explicit policy after strictly validating any existing file."""
+    root = _shared_root(shared_root)
+    path = launch_handoff_policy_path(root)
+    with exclusive(launch_handoff_policy_lock_path(root)):
+        _read_configured(root)
+        path.unlink(missing_ok=True)
+    return _result(DEFAULT_LAUNCH_HANDOFF_TIMEOUT_SECONDS, "default")
+
+
 def resolve_launch_handoff_policy(shared_root: Any) -> dict[str, Any]:
     """Resolve the launch policy, falling back safely with a bounded reason."""
     try:
@@ -138,6 +148,7 @@ __all__ = [
     "launch_handoff_policy_path",
     "load_launch_handoff_policy",
     "resolve_launch_handoff_policy",
+    "reset_launch_handoff_policy",
     "set_launch_handoff_policy",
     "show_launch_handoff_policy",
     "validate_launch_handoff_timeout_seconds",

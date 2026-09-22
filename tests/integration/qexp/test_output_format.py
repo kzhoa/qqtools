@@ -16,7 +16,7 @@ def _base_args(cfg) -> list[str]:
     machine_runtime_root = cfg.runtime_root.parent / "machine-runtime"
     MachineRuntime(machine_runtime_root).ensure_binding(cfg.shared_root, cfg.machine_name)
     return [
-        "--shared-root",
+        "--project",
         str(cfg.shared_root),
         "--machine",
         cfg.machine_name,
@@ -62,26 +62,28 @@ def test_progress_policy_cli_reports_default_and_configured_value(tmp_path: Path
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     base = _base_args(cfg)
 
-    assert main([*base, "config", "progress", "show", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out) == {
-        "interval_seconds": 30,
-        "source": "default",
-        "applies_to": "new_launches",
+    assert main([*base, "config", "show", "progress", "--format=json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown == {
+        "action": "show",
+        "section": "progress",
+        "scope": "project",
+        "values": {"interval_seconds": 30, "source": "default", "applies_to": "new_launches"},
     }
 
-    assert main([*base, "config", "progress", "set", "--interval-seconds", "60", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out) == {
+    assert main([*base, "config", "set", "progress", "--interval-seconds", "60", "--format=json"]) == 0
+    configured = json.loads(capsys.readouterr().out)
+    assert configured["values"] == {
         "interval_seconds": 60,
         "source": "configured",
         "applies_to": "new_launches",
     }
 
-    assert main([*base, "config", "progress", "show"]) == 0
+    assert main([*base, "config", "show", "progress"]) == 0
     human = capsys.readouterr().out
-    assert "Interval seconds: 60" in human
-    assert "Source: configured" in human
-    assert "Applies to: new_launches" in human
-    assert "filesystem" in human.lower()
+    assert "interval_seconds=60" in human
+    assert "source=configured" in human
+    assert "applies_to=new_launches" in human
 
 
 def test_tmux_policy_cli_reports_project_default_and_configured_value_without_activation(
@@ -95,26 +97,28 @@ def test_tmux_policy_cli_reports_project_default_and_configured_value_without_ac
         lambda *_args, **_kwargs: activations.append(True),
     )
 
-    assert main([*base, "config", "tmux", "show", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out) == {
+    assert main([*base, "config", "show", "tmux", "--format=json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["values"] == {
         "enabled": False,
         "source": "default",
         "applies_to": "new_observer_decisions",
     }
     assert not (cfg.shared_root / "tmux-policy.json").exists()
 
-    assert main([*base, "config", "tmux", "set", "--enabled", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out) == {
+    assert main([*base, "config", "set", "tmux", "--enabled", "--format=json"]) == 0
+    configured = json.loads(capsys.readouterr().out)
+    assert configured["values"] == {
         "enabled": True,
         "source": "configured",
         "applies_to": "new_observer_decisions",
     }
-    assert main([*base, "config", "tmux", "show"]) == 0
+    assert main([*base, "config", "show", "tmux"]) == 0
     human = capsys.readouterr().out.lower()
     assert "enabled" in human
     assert "configured" in human
     assert "project" in human
-    assert "future" in human or "new observer decisions" in human
+    assert "new_observer_decisions" in human
     assert activations == []
 
 
@@ -125,23 +129,24 @@ def test_progress_policy_cli_accepts_large_finite_interval(tmp_path: Path, capsy
             [
                 *_base_args(cfg),
                 "config",
-                "progress",
                 "set",
+                "progress",
                 "--interval-seconds=1e308",
                 "--format=json",
             ]
         )
         == 0
     )
-    assert json.loads(capsys.readouterr().out)["interval_seconds"] == 1e308
+    assert json.loads(capsys.readouterr().out)["values"]["interval_seconds"] == 1e308
 
 
 def test_launch_handoff_policy_cli_reports_default_and_configured_value(tmp_path: Path, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     base = _base_args(cfg)
 
-    assert main([*base, "config", "launch-handoff", "show", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out) == {
+    assert main([*base, "config", "show", "launch-handoff", "--format=json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["values"] == {
         "timeout_seconds": 10,
         "source": "default",
         "applies_to": "new_launches",
@@ -152,8 +157,8 @@ def test_launch_handoff_policy_cli_reports_default_and_configured_value(tmp_path
             [
                 *base,
                 "config",
-                "launch-handoff",
                 "set",
+                "launch-handoff",
                 "--timeout-seconds",
                 "12.5",
                 "--format=json",
@@ -161,17 +166,18 @@ def test_launch_handoff_policy_cli_reports_default_and_configured_value(tmp_path
         )
         == 0
     )
-    assert json.loads(capsys.readouterr().out) == {
+    configured = json.loads(capsys.readouterr().out)
+    assert configured["values"] == {
         "timeout_seconds": 12.5,
         "source": "configured",
         "applies_to": "new_launches",
     }
 
-    assert main([*base, "config", "launch-handoff", "show"]) == 0
+    assert main([*base, "config", "show", "launch-handoff"]) == 0
     human = capsys.readouterr().out
-    assert "Timeout seconds: 12.5" in human
-    assert "Source: configured" in human
-    assert "Applies to: new_launches" in human
+    assert "timeout_seconds=12.5" in human
+    assert "source=configured" in human
+    assert "applies_to=new_launches" in human
 
 
 @pytest.mark.parametrize("value", ["0", "0.5", "301", "nan", "inf", "-inf"])
@@ -183,15 +189,19 @@ def test_launch_handoff_policy_cli_rejects_invalid_timeout(tmp_path: Path, capsy
             [
                 *_base_args(cfg),
                 "config",
-                "launch-handoff",
                 "set",
+                "launch-handoff",
                 f"--timeout-seconds={value}",
                 "--format=json",
             ]
         )
         == 2
     )
-    assert "timeout" in capsys.readouterr().err.lower()
+    output = capsys.readouterr()
+    error = json.loads(output.out)["error"]
+    assert not output.err
+    assert error["code"] == "invalid_argument"
+    assert "timeout" in error["message"].lower()
 
 
 @pytest.mark.parametrize("value", ["0", "0.5", "nan", "inf", "-inf"])
@@ -203,8 +213,8 @@ def test_progress_policy_cli_rejects_invalid_interval(tmp_path: Path, capsys, va
             [
                 *_base_args(cfg),
                 "config",
-                "progress",
                 "set",
+                "progress",
                 f"--interval-seconds={value}",
             ]
         )
@@ -306,7 +316,7 @@ def test_group_json_remains_raw_workflow_result(tmp_path: Path, capsys):
     assert "action" not in created
 
 
-def test_group_machines_cli_exposes_normalized_role_and_limit(tmp_path: Path, capsys):
+def test_group_workers_cli_exposes_normalized_role_and_limit(tmp_path: Path, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     assert main([*_base_args(cfg), "group", "create", "demo", "--format=json"]) == 0
     capsys.readouterr()
@@ -316,7 +326,7 @@ def test_group_machines_cli_exposes_normalized_role_and_limit(tmp_path: Path, ca
             [
                 *_base_args(cfg),
                 "group",
-                "machines",
+                "worker",
                 "add",
                 "demo",
                 "gpu-2",
@@ -330,7 +340,7 @@ def test_group_machines_cli_exposes_normalized_role_and_limit(tmp_path: Path, ca
         == 0
     )
     capsys.readouterr()
-    assert main([*_base_args(cfg), "group", "machines", "list", "demo", "--format=json"]) == 0
+    assert main([*_base_args(cfg), "group", "worker", "list", "demo", "--format=json"]) == 0
     machines = json.loads(capsys.readouterr().out)["machines"]
     assert machines[-1]["scheduling_role"] == "borrow"
     assert machines[-1]["gpu_limit_gpus"] == 2
@@ -340,7 +350,7 @@ def test_group_machines_cli_exposes_normalized_role_and_limit(tmp_path: Path, ca
             [
                 *_base_args(cfg),
                 "group",
-                "machines",
+                "worker",
                 "set",
                 "demo",
                 "gpu-2",
@@ -359,7 +369,7 @@ def test_group_machines_cli_exposes_normalized_role_and_limit(tmp_path: Path, ca
             [
                 *_base_args(cfg),
                 "group",
-                "machines",
+                "worker",
                 "add",
                 "demo",
                 "gpu-3",
@@ -376,7 +386,7 @@ def test_group_machines_cli_exposes_normalized_role_and_limit(tmp_path: Path, ca
     assert primary["group"]["worker_set"]["gpu-3"]["gpu_limit_gpus"] == 1
 
 
-def test_group_machines_cli_rejects_removed_max_gpus_alias(tmp_path: Path, capsys):
+def test_group_workers_cli_rejects_removed_max_gpus_alias(tmp_path: Path, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     assert main([*_base_args(cfg), "group", "create", "demo", "--format=json"]) == 0
     capsys.readouterr()
@@ -386,7 +396,7 @@ def test_group_machines_cli_rejects_removed_max_gpus_alias(tmp_path: Path, capsy
             [
                 *_base_args(cfg),
                 "group",
-                "machines",
+                "worker",
                 "set",
                 "demo",
                 "gpu-2",
@@ -411,6 +421,8 @@ def test_batch_json_is_one_document_and_idempotent_retry_is_silent_on_stderr(tmp
     assert first["operation"]["state"] == "committed"
     assert first["operation"]["id"]
     assert first["idempotency_key"]
+    assert first["preview"] is None
+    assert first["error"] is None
     assert first_capture.err.startswith("qexp: prepared operation_id=")
 
     assert (
@@ -485,21 +497,22 @@ def test_empty_project_list_human_output_uses_fixed_message(tmp_path: Path, caps
 
 def test_cpu_lane_human_and_json_share_the_policy_result(tmp_path: Path, capsys):
     runtime_root = tmp_path / "machine-runtime"
-    base = ["--machine-runtime-root", str(runtime_root), "agent", "cpu-lane"]
+    base = ["--machine-runtime-root", str(runtime_root), "agent", "config", "cpu"]
 
     assert main([*base, "set", "--capacity", "4"]) == 0
     human = capsys.readouterr().out
     assert "Capacity: 4" in human
     assert "Revision: 1" in human
+    assert f"MachineRuntime root: {runtime_root}" in human
 
     assert main([*base, "show", "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"cpu_lane": {"capacity": 4, "revision": 1}}
+    assert json.loads(capsys.readouterr().out) == {
+        "machine_runtime_root": str(runtime_root),
+        "cpu_lane": {"capacity": 4, "revision": 1},
+    }
 
 
-@pytest.mark.parametrize("action", ["coordinate", "retry"])
-def test_machine_upgrade_advance_human_reads_flat_projects_and_json_is_unchanged(
-    tmp_path: Path, monkeypatch, capsys, action: str
-):
+def test_machine_upgrade_advance_human_reads_flat_projects_and_json_is_unchanged(tmp_path: Path, monkeypatch, capsys):
     result = {
         "projects": [
             {
@@ -524,7 +537,7 @@ def test_machine_upgrade_advance_human_reads_flat_projects_and_json_is_unchanged
         return result
 
     monkeypatch.setattr("qqtools.plugins.qexp.cli.advance_registered_upgrades", fake_advance)
-    base = ["--machine-runtime-root", str(tmp_path / "machine-runtime"), "agent", "upgrade", action]
+    base = ["--machine-runtime-root", str(tmp_path / "machine-runtime"), "admin", "upgrade", "advance"]
 
     assert main(base) == 0
     human = capsys.readouterr().out
@@ -560,7 +573,7 @@ def test_machine_upgrade_status_human_reads_nested_projects_and_json_is_unchange
         "discovery_boundary": "locally_registered_bindings",
     }
     monkeypatch.setattr("qqtools.plugins.qexp.cli.inspect_registered_upgrades", lambda _runtime: result)
-    base = ["--machine-runtime-root", str(tmp_path / "machine-runtime"), "agent", "upgrade", "status"]
+    base = ["--machine-runtime-root", str(tmp_path / "machine-runtime"), "admin", "upgrade", "status"]
 
     assert main(base) == 0
     human = capsys.readouterr().out
@@ -589,6 +602,6 @@ def test_group_and_machine_human_output_do_not_query_task_history_for_presentati
     group_show = capsys.readouterr().out
     assert "Task summary: -" in group_show
     assert "Queue summary: -" in group_show
-    assert main([*base, "machines"]) == 0
+    assert main([*base, "machine", "list"]) == 0
     machines = capsys.readouterr().out
     assert machines == "No results.\n" or "Task summary" in machines.splitlines()[0]

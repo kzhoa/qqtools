@@ -22,7 +22,7 @@ def test_installed_wheel_agent_completes_task(tmp_path):
     imported_from = ensure_site_packages_import()
     common = [
         "qexp",
-        "--shared-root",
+        "--project",
         str(shared_root),
         "--machine",
         "gpu-1",

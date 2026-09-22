@@ -59,6 +59,7 @@ def evaluate_readiness(runtime: MachineRuntime | str | Path | None, snapshot: di
         config = load_agent_config(machine_runtime)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         return {
+            "machine_runtime_root": str(machine_runtime.root),
             "ready": False,
             "reason": "agent_config_unavailable",
             "error": str(exc),
@@ -125,6 +126,7 @@ def evaluate_readiness(runtime: MachineRuntime | str | Path | None, snapshot: di
     # Preserve first-seen order while avoiding repeated generic diagnostics.
     unique_reasons = list(dict.fromkeys(reasons))
     return {
+        "machine_runtime_root": str(machine_runtime.root),
         "ready": not unique_reasons,
         "reason": None if not unique_reasons else unique_reasons[0],
         "reasons": unique_reasons,

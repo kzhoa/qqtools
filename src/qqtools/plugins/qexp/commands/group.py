@@ -636,6 +636,7 @@ def change_worker(
     gpu_limit_gpus: int | None = None,
     has_gpu_limit: bool = False,
 ) -> dict[str, Any]:
+    validate_identifier(machine, "worker_machine")
     path = group_path(cfg.shared_root, validate_group_name(group_name) or group_name)
     _finalize_pending_submission_before_group_mutation(cfg, group_name, path)
     with group_writer_lock(cfg, group_name):
@@ -657,7 +658,6 @@ def change_worker(
         if has_gpu_limit:
             gpu_limit_gpus = validate_gpu_limit(gpu_limit_gpus, "gpu_limit_gpus")
         if action == "add":
-            validate_identifier(machine, "worker_machine")
             if role not in {None, "primary", "borrow"}:
                 raise ValueError("role must be 'primary' or 'borrow'.")
             selected_role = role or "primary"
@@ -668,17 +668,18 @@ def change_worker(
                     gpu_limit_gpus=gpu_limit_gpus,
                 )
             else:
-                current_role = selected_role if role is not None else current["scheduling_role"]
-                current_limit = gpu_limit_gpus if has_gpu_limit else current["gpu_limit_gpus"]
-                current.update(
-                    {
-                        "scheduling_role": current_role,
-                        "gpu_limit_gpus": current_limit,
-                        "state": "active",
-                    }
-                )
-                current.pop("removal_operation_id", None)
-                current["state_epoch"] += 1
+                if current["state"] == "draining":
+                    raise ValueError(f"worker {machine!r} is draining; use 'resume' before adding it again.")
+                if current["state"] == "removing" or current.get("removal_operation_id") is not None:
+                    raise ValueError(
+                        f"worker {machine!r} is being removed; wait for removal to finish instead of cancelling it."
+                    )
+                requested_role = role if role is not None else current["scheduling_role"]
+                requested_limit = gpu_limit_gpus if has_gpu_limit else current["gpu_limit_gpus"]
+                if current["scheduling_role"] != requested_role or current["gpu_limit_gpus"] != requested_limit:
+                    raise ValueError(f"worker {machine!r} already exists with a different policy; use 'set'.")
+                worker_changed = False
+
         elif machine not in workers:
             raise ValueError(f"machine {machine!r} is not a Worker Set member.")
         elif action == "set":
@@ -705,6 +706,17 @@ def change_worker(
             )
             if changed:
                 worker["state_epoch"] += 1
+        elif action == "resume":
+            worker = workers[machine]
+            if worker["state"] == "removing" or worker.get("removal_operation_id") is not None:
+                raise ValueError(f"worker {machine!r} is being removed; wait for removal to finish before resuming it.")
+            if worker["state"] == "active":
+                worker_changed = False
+            elif worker["state"] == "draining":
+                worker["state"] = "active"
+                worker_changed = True
+            else:
+                raise ValueError(f"worker {machine!r} has an invalid lifecycle state.")
         elif action == "drain":
             if workers[machine]["state"] == "removing":
                 workers[machine].pop("removal_operation_id", None)
@@ -799,9 +811,11 @@ def change_worker(
             return data
         else:
             raise ValueError(f"unknown Worker Set action {action!r}.")
+        if not worker_changed:
+            return data
         if worker_changed:
             data["group"]["worker_set_epoch"] += 1
-            if action in {"add", "set"} and machine in workers:
+            if action in {"add", "set", "resume"} and machine in workers:
                 workers[machine]["state_epoch"] = data["group"]["worker_set_epoch"]
         data["meta"]["revision"] += 1
         data["meta"]["updated_at"] = utc_now()
@@ -818,10 +832,128 @@ def change_worker(
         return data
 
 
-def group_retry_failed(cfg: RootConfig, name: str) -> list[TaskRecord]:
-    result = []
-    for task_file in iter_json(shared_paths(cfg.shared_root)["tasks"]):
-        task = TaskRecord.from_dict(read_json(task_file))
-        if task.group_name == name and task.state["projection"] == "failed":
-            result.append(retry(cfg, task.task_id))
-    return result
+def group_retry_failed(cfg: RootConfig, name: str) -> dict[str, Any]:
+    """Retry the current failed Tasks in a Group and classify skipped work.
+
+    Group membership is selected while the Group writer fence is held.  The
+    selected Task and Attempt revisions are then rechecked after releasing the
+    Group fence, because ``retry`` owns the complete schema/Group/Task lock
+    sequence and must not be called while a Group lock is held.
+    """
+    name = validate_group_name(name) or name
+    _finalize_pending_submission_before_group_mutation(cfg, name, group_path(cfg.shared_root, name))
+
+    # Each entry is the authoritative snapshot at one Group revision.  The
+    # snapshot keeps retry from expanding to Tasks added after selection and
+    # lets a concurrent Task transition be reported as ``other``.
+    selected: list[dict[str, Any]] = []
+    retried_task_ids: list[str] = []
+    skipped: dict[str, list[str]] = {"blocked": [], "orphaned": [], "other": []}
+    with group_writer_lock(cfg, name):
+        group_data = read_group(cfg.shared_root, name)
+        normalize_group_record(group_data)
+        group = group_data["group"]
+        if group.get("name") != name:
+            raise ValueError(f"Group record name does not match requested Group {name!r}.")
+        selection_revision = group_data["meta"].get("revision")
+        if type(selection_revision) is not int or selection_revision < 1:
+            raise ValueError("Group revision is invalid.")
+        next_membership_sequence = group.get("next_membership_sequence")
+        if type(next_membership_sequence) is not int or next_membership_sequence < 1:
+            raise ValueError("Group membership sequence is invalid.")
+        membership_high_watermark = next_membership_sequence - 1
+
+        for task_file in iter_json(shared_paths(cfg.shared_root)["tasks"]):
+            task = TaskRecord.from_dict(read_json(task_file))
+            membership_sequence = task.group_membership_sequence
+            if (
+                task.group_name != name
+                or type(membership_sequence) is not int
+                or membership_sequence < 1
+                or membership_sequence > membership_high_watermark
+            ):
+                continue
+            current_attempt = None
+            current_attempt_number = task.attempt_control.get("current_attempt_number")
+            current_attempt_id = task.attempt_control.get("current_attempt_id")
+            if current_attempt_number is not None:
+                try:
+                    current_attempt = AttemptRecord.from_dict(
+                        read_json(attempt_path(cfg.shared_root, task.task_id, current_attempt_number))
+                    )
+                except (FileNotFoundError, OSError, KeyError, TypeError, ValueError):
+                    current_attempt = None
+
+            if task.state["projection"] == "blocked":
+                if (
+                    current_attempt is not None
+                    and (current_attempt_id is None or current_attempt_id == current_attempt.attempt_id)
+                    and current_attempt.phase == "orphaned"
+                ):
+                    skipped["orphaned"].append(task.task_id)
+                else:
+                    skipped["blocked"].append(task.task_id)
+                continue
+            if (
+                task.state["projection"] != "failed"
+                or current_attempt is None
+                or (current_attempt_id is not None and current_attempt_id != current_attempt.attempt_id)
+                or current_attempt.phase != "failed"
+            ):
+                skipped["other"].append(task.task_id)
+                continue
+            selected.append(
+                {
+                    "task_id": task.task_id,
+                    "task_revision": task.meta["revision"],
+                    "group_membership_sequence": membership_sequence,
+                    "attempt_number": current_attempt_number,
+                    "attempt_id": current_attempt.attempt_id,
+                    "group_revision": selection_revision,
+                }
+            )
+
+    for selection in sorted(selected, key=lambda item: item["task_id"]):
+        task_id = selection["task_id"]
+        try:
+            current_task = load_task(cfg, task_id)
+            current_attempt_number = current_task.attempt_control.get("current_attempt_number")
+            current_attempt_id = current_task.attempt_control.get("current_attempt_id")
+            if (
+                current_task.group_name != name
+                or current_task.group_membership_sequence != selection["group_membership_sequence"]
+                or current_task.meta["revision"] != selection["task_revision"]
+                or current_task.state["projection"] != "failed"
+                or current_attempt_number != selection["attempt_number"]
+                or (current_attempt_id is not None and current_attempt_id != selection["attempt_id"])
+            ):
+                skipped["other"].append(task_id)
+                continue
+            current_attempt = AttemptRecord.from_dict(
+                read_json(attempt_path(cfg.shared_root, task_id, current_attempt_number))
+            )
+            if current_attempt.attempt_id != selection["attempt_id"] or current_attempt.phase != "failed":
+                skipped["other"].append(task_id)
+                continue
+            retry(cfg, task_id)
+        except (FileNotFoundError, OSError, KeyError, TypeError, ValueError, RuntimeError):
+            # A concurrent transition is deliberately not reclassified as a
+            # newly eligible blocked/orphaned Task.
+            skipped["other"].append(task_id)
+        else:
+            # ``retry`` only returns after its own authoritative transition.
+            # Keep the result deterministic even if the Task list was not.
+            selected_task_id = task_id
+            if selected_task_id not in retried_task_ids:
+                retried_task_ids.append(selected_task_id)
+
+    retried_task_ids.sort()
+    for task_ids in skipped.values():
+        task_ids.sort()
+
+    return {
+        "group": name,
+        "retried_task_ids": retried_task_ids,
+        "retried_count": len(retried_task_ids),
+        "skipped": skipped,
+    }

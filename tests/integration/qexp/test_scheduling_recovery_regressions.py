@@ -1267,7 +1267,17 @@ def test_worker_remove_does_not_follow_reactivated_worker(tmp_path, should_drain
     _existing_group(cfg)
     original = submit(cfg, ["echo", "old"], group="exp")
     change_worker(cfg, "exp", "g1", "remove", terminate_running=terminate_running)
-    change_worker(cfg, "exp", "g1", "add")
+    # Simulate a stale pre-cutover writer reactivating the member. The canonical
+    # add/resume APIs both reject this while removal is in progress.
+    path = group_path(cfg.shared_root, "exp")
+    group = read_json(path)
+    worker = group["group"]["worker_set"]["g1"]
+    worker["state"] = "active"
+    worker.pop("removal_operation_id", None)
+    worker["state_epoch"] += 1
+    group["group"]["worker_set_epoch"] += 1
+    group["meta"]["revision"] += 1
+    atomic_replace(path, group)
     cancel_task(cfg, original.task_id)
     if terminate_running:
         later = submit(cfg, ["echo", "new"], group="exp")

@@ -201,7 +201,7 @@ def test_human_cancel_activates_pending_work_without_listing_task_history(tmp_pa
         assert (
             cli.main(
                 [
-                    "--shared-root",
+                    "--project",
                     str(cfg.shared_root),
                     "--machine",
                     cfg.machine_name,

@@ -259,8 +259,8 @@ use only the framework-neutral five-field application payload.
 The project-level commands are:
 
 ```bash
-qexp config progress show
-qexp config progress set --interval-seconds 30
+qexp config show progress
+qexp config set progress --interval-seconds 30
 ```
 
 The dedicated `<shared-root>/progress-policy.json` record has version 1 and one

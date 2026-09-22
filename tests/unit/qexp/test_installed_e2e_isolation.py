@@ -60,7 +60,7 @@ def test_cleanup_accepts_realistic_common_command(tmp_path: Path) -> None:
     env = helpers.make_env(base)
     common = [
         "qexp",
-        "--shared-root",
+        "--project",
         str(base / ".qexp"),
         "--machine",
         "gpu-1",

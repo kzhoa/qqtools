@@ -55,7 +55,7 @@ def _viewer_command(cfg, runtime: MachineRuntime, *args: str) -> list[str]:
         sys.executable,
         "-m",
         "qqtools.plugins.qexp.cli",
-        "--shared-root",
+        "--project",
         str(cfg.shared_root),
         "--machine",
         cfg.machine_name,

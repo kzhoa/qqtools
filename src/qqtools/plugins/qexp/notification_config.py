@@ -17,6 +17,8 @@ from .runtime.store import atomic_replace, read_json
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_WEBHOOK_ENV = "QEXP_FEISHU_WEBHOOK"
 _CREDENTIAL_SOURCES = frozenset({"env", "shared_file"})
+_NOTIFICATION_FIELDS = frozenset({"enabled", "providers"})
+_FEISHU_FIELDS = frozenset({"enabled", "webhook_env", "credential_source", "secret_env", "timeout_seconds"})
 
 
 def default_notifications() -> dict[str, Any]:
@@ -101,6 +103,63 @@ def load_notifications(cfg: RootConfig) -> dict[str, Any]:
         return validate_notifications(record.get("notifications"))
     except ValueError:
         return {"enabled": False, "providers": {}}
+
+
+def load_notifications_strict(cfg: RootConfig) -> dict[str, Any] | None:
+    """Load the configured section without converting malformed state to defaults."""
+    record = load_machine_record(cfg) or {}
+    if "notifications" not in record:
+        return None
+    value = record["notifications"]
+    if value is None:
+        return default_notifications()
+    if not isinstance(value, dict):
+        raise ValueError("notifications must be an object")
+    unknown = frozenset(value) - _NOTIFICATION_FIELDS
+    if unknown:
+        raise ValueError(f"unknown notification fields: {sorted(unknown)!r}")
+    providers = value.get("providers", {})
+    if not isinstance(providers, dict):
+        raise ValueError("notifications.providers must be an object")
+    for name, raw in providers.items():
+        if name != "feishu":
+            raise ValueError(f"unknown notification provider {name!r}")
+        if not isinstance(raw, dict):
+            raise ValueError("feishu configuration must be an object")
+        unknown_provider = frozenset(raw) - _FEISHU_FIELDS
+        if unknown_provider:
+            raise ValueError(f"unknown feishu fields: {sorted(unknown_provider)!r}")
+    return validate_notifications(value)
+
+
+def reset_notifications(cfg: RootConfig, provider: str | None = None) -> dict[str, Any]:
+    """Remove a notification override while preserving credentials and other machine state."""
+    if provider is not None and provider != "feishu":
+        raise ValueError(f"unknown notification provider {provider!r}")
+    with machine_lock(cfg.shared_root, cfg.machine_name):
+        record = load_machine_record(cfg) or {}
+        if "notifications" not in record:
+            return default_notifications()
+        current = load_notifications_strict(cfg)
+        if current is None:
+            return default_notifications()
+        if provider is None:
+            del record["notifications"]
+            save_machine_record(cfg, record)
+            return default_notifications()
+        configured = record["notifications"]
+        if not isinstance(configured, dict):
+            raise ValueError("notifications must be an object")
+        providers = configured.get("providers", {})
+        if provider not in providers:
+            return current
+        providers = dict(providers)
+        del providers[provider]
+        configured = dict(configured)
+        configured["providers"] = providers
+        record["notifications"] = configured
+        save_machine_record(cfg, record)
+        return validate_notifications(configured)
 
 
 def update_notifications(cfg: RootConfig, updater) -> dict[str, Any]:

@@ -254,6 +254,7 @@ def agent_config_payload(runtime: Any) -> dict[str, Any]:
     machine_runtime = _as_runtime(runtime)
     config = load_agent_config(machine_runtime)
     return {
+        "machine_runtime_root": str(machine_runtime.root),
         "agent_name": config.name,
         "agent_mode": config.agent_mode,
         "revision": config.revision,

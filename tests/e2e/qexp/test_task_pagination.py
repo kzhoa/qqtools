@@ -17,7 +17,7 @@ def test_installed_task_pagination(tmp_path):
     base, shared_root, runtime_root = make_layout(tmp_path / "pages")
     env = make_env(base)
     ensure_site_packages_import()
-    common = ["qexp", "--shared-root", str(shared_root), "--machine", "gpu-1", "--runtime-root", str(runtime_root)]
+    common = ["qexp", "--project", str(shared_root), "--machine", "gpu-1", "--runtime-root", str(runtime_root)]
     try:
         initialize_machine_project(common, env=env)
         for key in ["page-a", "page-b", "page-c"]:

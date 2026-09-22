@@ -90,7 +90,19 @@ def register_project(
             "Install a supported qqtools version before registering this project."
         ) from exc
     if load_machine_record(cfg) is not None and is_legacy_agent_project(cfg):
-        raise ValueError("legacy project metadata requires 'qexp agent migrate-project'.")
+        command = shlex.join(
+            [
+                "qexp",
+                "admin",
+                "migrate",
+                "agent",
+                "--project",
+                str(cfg.shared_root),
+                "--machine",
+                machine_name,
+            ]
+        )
+        raise ValueError(f"legacy project metadata requires '{command}'.")
     previous = machine_runtime.matching_binding(cfg)
     binding, is_added = machine_runtime.ensure_binding(
         shared_root,

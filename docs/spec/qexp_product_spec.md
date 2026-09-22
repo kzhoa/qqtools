@@ -17,7 +17,7 @@ cross-machine takeover is deliberately disabled.
 
 `queued_home` remains home-only. In `queued_shared`, home and eligible remote workers compete
 and the winning machine's clock capability decides authority mode. Users can use `qexp task
-share`, `share --after 10m`, repeated `--with`, and `qexp task keep-local`; `task offer` remains
+share`, `share --after 10m`, repeated `--with`, and `qexp task unshare`; `task offer` remains
 the immediate operation for an existing spillover policy. Doctor and agent status show provider,
 full/local-safe capability, authority mode, and exact blocked reasons.
 
@@ -89,7 +89,7 @@ pitch or delivery change description, with explicit approval.
 
 - New project activation: `qexp init --machine NAME -> qexp project init -> qexp project register -> qexp agent start`
 - New project submission: `qexp init --machine NAME -> qexp project init -> qexp project register -> qexp submit -- <command>`
-- Legacy project migration: `qexp agent migrate-project`
+- Legacy project migration: `qexp admin migrate agent --project PATH --machine NAME`
 
 `init --machine NAME` initializes or deliberately replaces only the local MachineRuntime identity
 and global agent configuration. `project init [PATH]` creates shared Project truth, and `project
@@ -101,7 +101,7 @@ Unless `--no-activate` is supplied, `submit` activates the local agent for an ex
 and submitted work eventually converges through its normal scheduling lifecycle. `--no-activate`
 is an explicit non-activation exception, not an additional prerequisite for the main workflow.
 
-`migrate-project` handles only a project carrying legacy metadata. It verifies and stops the old
+`admin migrate agent` handles only a project carrying legacy metadata. It verifies and stops the old
 agent, imports that project's local evidence, and enables its binding. If a prior registration from
 another machine runtime remains, migration may replace it only after that registration's shared
 write eligibility expires; local PID or runtime-path observations cannot shorten this interval. A
@@ -181,7 +181,7 @@ Rules:
 - unsupported schemas fail before any agent or mutating command starts
 - the implementation should fail fast on an unsupported schema instead of partially
   interpreting old truth
-- a drained schema-5 root may be upgraded by `qexp migrate --to-schema 6`; it must have
+- a drained schema-5 root may be upgraded by `qexp admin migrate schema --project PATH --to-schema 6`; it must have
   no active claim or running Attempt, and no mixed-schema runtime is supported
 
 Loss of Batch-era qexp scheduling metadata is a known and accepted product risk. The schema-5
@@ -327,11 +327,11 @@ Users express this through story-level controls rather than editing placement fi
 qexp task share <task-id>
 qexp task share <task-id> --after 10m
 qexp task share <task-id> --with g2 --with g3
-qexp task keep-local <task-id>
+qexp task unshare <task-id>
 ```
 
 `share` expands the candidate set; it does not transfer ownership away from the home machine.
-`keep-local` clears sharing policy and deadlines while preserving the Task home machine.
+`unshare` clears sharing policy and deadlines while preserving the Task home machine.
 
 ### 4.5 Why Failure Recovery Is Conservative
 
@@ -526,10 +526,10 @@ One MachineRuntime owns one persistent GPU admission policy shared by every regi
 Operators inspect and change it without project context:
 
 ```bash
-qexp agent gpus show
-qexp agent gpus set --visible 0,2,3
-qexp agent gpus set --none
-qexp agent gpus reset
+qexp agent config gpus show
+qexp agent config gpus set --visible 0,2,3
+qexp agent config gpus set --none
+qexp agent config gpus reset
 ```
 
 `set --visible` accepts a strict comma-separated list of unique, nonnegative integer device IDs.
@@ -611,8 +611,8 @@ qexp group reopen <group>
 qexp group pause <group>
 qexp group resume <group>
 qexp group cancel <group>
-qexp group cancel <group> --terminate-running
-qexp group retry-failed <group>
+qexp group cancel <group> --all
+qexp group retry <group>
 ```
 
 Default Group cancellation cancels current queued Tasks and allows running Attempts to
@@ -781,7 +781,7 @@ Supported controls:
   only after current clock evidence proves the deadline has elapsed.
 - `qexp task share <task-id> --with g2 --with g3` restricts helper eligibility to active Group
   workers. The home machine must not be listed because it remains eligible by definition.
-- `qexp task keep-local <task-id>` resets policy to private, queue scope to home, and clears
+- `qexp task unshare <task-id>` resets policy to private, queue scope to home, and clears
   delayed-offer state.
 - `qexp task offer <task-id>` is retained for already-spillover Tasks. It cannot convert a
   private Task into spillover.
@@ -897,19 +897,19 @@ Worker Set invariants:
 Required operations:
 
 ```bash
-qexp group machines add <group> g11 --role borrow --gpu-limit-gpus 2
-qexp group machines set <group> g11 --role primary --gpu-limit-gpus 2
-qexp group machines drain <group> g5
-qexp group machines remove <group> g5 --terminate-running
-qexp group machines list <group>
+qexp group worker add <group> g11 --role borrow --gpu-limit-gpus 2
+qexp group worker set <group> g11 --role primary --gpu-limit-gpus 2
+qexp group worker drain <group> g5
+qexp group worker remove <group> g5 --all
+qexp group worker list <group>
 ```
 
 After a rolling upgrade activates Group isolation, an unfinished removal created
 by an older release can report `blocked` with `legacy_worker_incarnation_unknown`.
 It cannot safely identify a worker that may have been reactivated since the
 request. Its Tasks, processes and resources remain untouched. If removal is still
-wanted, run `qexp group machines remove <group> <machine>` again, including
-`--terminate-running` only when termination is intended. New removal operations
+wanted, run `qexp group worker remove <group> <machine>` again, including
+`--all` only when termination is intended. New removal operations
 recover automatically after interruption and cannot follow a reactivated worker.
 The upgrade itself is automatic and preserves running training; it requires no
 per-project activation command.
@@ -956,7 +956,7 @@ unclaimable. In particular:
 Removal can remain `converging` while background membership confirmation catches
 up. The CLI starts local background advancement after saving the request. It then
 reports blocking Task IDs or completes when current membership and changes have
-been checked; `--terminate-running` does not bypass this confirmation.
+been checked; `--all` does not bypass this confirmation.
 
 Forced removal:
 
@@ -1056,7 +1056,7 @@ Expected behavior:
 The user adds g11 after the Group has started:
 
 ```bash
-qexp group machines add stage-c1 g11
+qexp group worker add stage-c1 g11
 ```
 
 After g11's agent starts, it may claim compatible shared Tasks.
@@ -1064,7 +1064,7 @@ After g11's agent starts, it may claim compatible shared Tasks.
 The user drains g5:
 
 ```bash
-qexp group machines drain stage-c1 g5
+qexp group worker drain stage-c1 g5
 ```
 
 g5 stops taking new work and finishes current Attempts.
@@ -1099,7 +1099,7 @@ For a running Attempt, heartbeat staleness and lease expiry have different meani
 Schema-6 treats an individual renewal I/O failure as a visible `suspect` condition, not as
 an immediate task failure. The running process and its GPUs remain reserved while qexp
 retries within the authoritative lease. Users can inspect lease diagnostics and any pending
-termination reconciliation through `qexp doctor verify`.
+termination reconciliation through `qexp admin check --project PATH`.
 
 The shared default lease policy is 120 seconds with a 10 second renewal interval. Long
 training may use a larger authoritative TTL after a maintenance-window policy change. A holder
@@ -1287,7 +1287,7 @@ Required meanings:
 - `qexp submit --file`: create several logical Tasks through the same `TaskSpec` contract
 - `qexp task retry`: queue the next Attempt under one existing Task
 - `qexp task cancel`: cancel one Task's current queued or active work
-- `qexp group retry-failed`: retry Tasks whose current Attempt is failed
+- `qexp group retry`: retry Tasks whose current Attempt is failed
 - `qexp group cancel`: cancel current Group work under explicit running-process semantics
 
 Retry rules:
@@ -1314,7 +1314,7 @@ new Attempt with a higher fencing token.
 
 Retry supersedes the old Attempt's qexp execution authority. It does not inspect the old machine,
 claim that the old process stopped, or undo external side effects. No additional duplicate-risk
-acknowledgement flag is required. `qexp group retry-failed` remains limited to failed Tasks and
+acknowledgement flag is required. `qexp group retry` remains limited to failed Tasks and
 never selects blocked or orphaned work.
 
 Task cancellation semantics:
@@ -1337,8 +1337,8 @@ contract and must not silently become an alias for retry.
 Schema-5 commands are:
 
 ```bash
-qexp clean --task-id <task-id> [--dry-run]
-qexp clean --older-than-days <days> --limit <count> [--dry-run]
+qexp admin clean --project PATH --task-id <task-id> [--dry-run]
+qexp admin clean --project PATH --older-than-days <days> --limit <count> [--dry-run]
 ```
 
 Bulk cleanup defaults to a 30-day retention window and a hard limit of 100 Tasks.
@@ -1377,9 +1377,26 @@ qexp task logs task_xxx --follow
 qexp group list
 qexp group show stage-c1
 qexp group show stage-c1 --format=json
-qexp top
-qexp machines
+qexp status
+qexp machine list
 ```
+
+`status` is a bounded Project overview. It reports the resolved Project path, stable identity and
+selection source; exact local participation; machine-wide local-agent evidence; Task observation
+index state; and explicit next actions. It does not enumerate Task, Attempt, Group, machine, or
+operation history. After Project resolution it attempts at most 32 record reads, rejects records
+larger than 256 KiB, and reads at most 2 MiB in total. Missing optional evidence produces a useful
+partial result with null totals and reasons, never invented zero totals or an inferred stopped
+agent. Invalid required Project identity remains an error.
+
+Initiating Group cancellation, worker removal, and Task cleanup results include an opaque versioned
+`operation_reference` plus the internal operation ID. The reference binds Project identity,
+operation kind, exact storage key, and operation ID without granting authority. `admin operation
+show` requires an explicitly selected matching Project, accepts at most 4 KiB, validates identifiers
+before I/O, and reads only the known active/archive paths with one archival-race retry. Invalid
+references exit 2; missing, mismatched, or unreadable records exit 1; a valid blocked operation is
+a successful read. Missing history is `not_found`, never inferred expiry. Single-Task cancellation
+continues to use `task show` and does not fabricate an operation record.
 
 `show` remains the structured single-resource snapshot verb. The target CLI does not
 define a parallel `inspect` spelling. `task logs` is the specialized application-log
@@ -1487,11 +1504,18 @@ compatibility assertions only; a mismatch fails before project mutation and sugg
 `--home-machine` for placement intent. Saved-context machine/runtime fields and standalone
 `--runtime-root` inputs do not select operational identity or local resource ownership.
 
-`qexp use --shared-root <project/.qexp>` is a local default-project selector. It writes only a
+Ordinary Project commands resolve `--project PATH`, `QEXP_SHARED_ROOT`, the nearest initialized
+Project in the current-directory ancestry, then saved context. A directory and its `.qexp` control
+directory normalize to the same Project. An explicit, environmental, or discovered malformed
+target fails instead of falling through; read-only discovery creates nothing. Common options may
+occur before or after the command path, before a submission payload separator. Equal duplicates
+normalize to one value and conflicting duplicates fail. Tokens after `submit --` remain literal.
+
+`qexp use --project <project/.qexp>` is a local default-project selector. It writes only a
 canonical `shared_root`; it does not validate or register the Project, create a machine record, or
 select machine identity. `qexp project register` is the normal enrollment path. `qexp use` rejects
 machine/runtime inputs. `project register --machine NAME` accepts one explicit Project; the legacy
-`agent migrate-project` workflow still requires explicit machine identity and may receive an
+`admin migrate agent` workflow still requires explicit machine identity and may receive an
 explicit custom legacy runtime.
 
 `qexp submit --home-machine <name>` selects Task placement independently. `current` and omission
@@ -1561,10 +1585,10 @@ qexp project disable <project-id-or-root>
 qexp project remove <project-id-or-root>
 qexp agent start
 qexp agent status
-qexp agent gpus show
-qexp agent gpus set --visible 0,2,3
-qexp agent gpus set --none
-qexp agent gpus reset
+qexp agent config gpus show
+qexp agent config gpus set --visible 0,2,3
+qexp agent config gpus set --none
+qexp agent config gpus reset
 ```
 
 `qexp project register` is idempotent for a valid current binding, preserves its enablement and
@@ -1573,7 +1597,7 @@ owner through recovery adoption. Runtime identity is bound to both its local ran
 the current Linux host, so copying only the runtime directory cannot renew authority on another
 host. `qexp project enable <project-id-or-root>` revalidates registration authority before enabling
 new admission. An existing Project without the global-agent machine-record marker must use the one-time
-`qexp agent migrate-project` command. It stops only a verified old agent process, imports local
+`qexp admin migrate agent --project PATH --machine NAME` command. It stops only a verified old agent process, imports local
 execution evidence, registers the Project, and then starts or wakes the global agent without
 terminating already running training processes. Late immutable runner evidence is drained from
 the legacy runtime instead of permanently mirrored. Repeating a completed migration preserves
@@ -1610,7 +1634,9 @@ The command rule is:
 
 Attempt and Submission Operation are internal diagnostic objects. The daily CLI does not
 provide `qexp attempt ...` or `qexp submission-operation ...` resource trees. Their facts
-are exposed through Task/Group JSON, events, and `doctor` only.
+are exposed through Task/Group JSON, events, and `admin check` only. Control operations for
+Group cancellation, worker removal, and cleanup have a bounded read-only diagnostic view through
+`admin operation show`; this does not make them general execution objects.
 
 ### 16.1 Submission and Project Commands
 
@@ -1619,15 +1645,13 @@ are exposed through Task/Group JSON, events, and `doctor` only.
 - `qexp project register PATH... | --from-pool`
 - `qexp project list`
 - `qexp project enable | disable | remove <project-id-or-root>`
-- `qexp submit`
-- `qexp top`
-- `qexp machines`
-- `qexp config progress show`
-- `qexp config progress set --interval-seconds <seconds>`
-- `qexp config tmux show`
-- `qexp config tmux set --enabled | --disabled`
-- `qexp config launch-handoff show`
-- `qexp config launch-handoff set --timeout-seconds <seconds>`
+- `qexp use --project PATH | --show | --clear`
+- `qexp submit [--file MANIFEST | -- COMMAND...]`
+- `qexp status`
+- `qexp machine list | show NAME`
+- `qexp config show [SECTION]`
+- `qexp config set SECTION [--provider NAME] ...`
+- `qexp config reset SECTION [--provider NAME]`
 
 The progress policy defaults to 30 seconds and accepts finite values greater than or equal
 to 1. It applies to subsequent launches and retries, while an already-running Attempt keeps
@@ -1654,15 +1678,32 @@ retains the reservation for recovery. Machine-agent scheduling remains available
 while handoffs are pending; pending Attempts keep their reservations until confirmation or fenced
 compensation.
 
+Project configuration uses fixed typed sections: `lease`, `notifications`, `progress`, `tmux`,
+and `launch-handoff`. Unqualified `config show` reports every Project section independently;
+one malformed section makes the aggregate incomplete without substituting a plausible default.
+The explicit global `agent` section never resolves a Project. Notification providers are selected
+only with `--provider` on that section, and provider changes do not enable notifications globally.
+
+`config reset SECTION` removes the explicit override and restores inheritance or the built-in
+default after validating the existing state. It is not a write of today's default value. Resetting
+notifications does not delete separately stored credentials, and provider reset preserves other
+providers. `config reset agent` is invalid because agent name and identity have no implicit reset.
+Configuration writes retain verified binding, locking, active-claim, and policy-specific guards;
+they never rewrite policies frozen into existing Attempts.
+
 ### 16.2 Task Commands
 
 - `qexp task list`
 - `qexp task show`
 - `qexp task show --watch [--interval-seconds <seconds>] [--follow-retries]`
 - `qexp task logs`
-- `qexp task logs --follow [--tail <lines>] [--interval-seconds <seconds>] [--follow-retries]`
+- `qexp task logs [-n|--tail <lines>]`
+- `qexp task logs -f|--follow [-n|--tail <lines>] [--interval-seconds <seconds>] [--follow-retries]`
+- `qexp task wait <task-id> [--timeout <duration>]`
 - `qexp task retry`
 - `qexp task cancel`
+- `qexp task share`
+- `qexp task unshare`
 - `qexp task offer`
 
 `qexp task list --format=json` returns stable Task summary records. In addition to identity,
@@ -1670,6 +1711,17 @@ placement, phase, claim, and GPU fields, each record includes `depends_on_task_i
 `dependency_state`, and `dependency_reasons`. The IDs are sorted; a Task with no prerequisites
 has `[]`, `ready`, and `[]` respectively. `dependency_state` is `ready`, `waiting`, `blocked`,
 or `invalid`; each reason is an object containing the prerequisite `task_id` and its reason.
+
+`task list --name NAME` uses case-sensitive exact matching inside one bounded indexed candidate
+page. Names do not become mutation identifiers. An empty result with a continuation cursor means
+that the inspected candidate page contained no matches; only `stop_reason: exhausted` proves the
+traversal has ended. Name-aware cursors bind the exact name and cannot be reused with another
+filter.
+
+`task wait` pins the current or next Attempt lifecycle when it starts and never follows a later
+retry. It performs direct bounded Task, selected-Attempt, and dependency reads. Its exit codes are
+0 succeeded, 1 failed/cancelled, 2 invalid input, 3 blocked, 4 timeout, 5 superseded,
+6 observation failure, and 130 caught interruption. Timeout and interruption do not mutate work.
 
 ### 16.3 Group Commands
 
@@ -1681,10 +1733,8 @@ or `invalid`; each reason is an object containing the prerequisite `task_id` and
 - `qexp group pause`
 - `qexp group resume`
 - `qexp group cancel`
-- `qexp group retry-failed`
-- `qexp group machines add`
-- `qexp group machines drain`
-- `qexp group machines remove`
+- `qexp group retry`
+- `qexp group worker list | add | set | drain | resume | remove`
 
 ### 16.4 Agent Commands
 
@@ -1694,16 +1744,26 @@ or `invalid`; each reason is an object containing the prerequisite `task_id` and
 - `qexp agent stop`
 - `qexp agent status`
 - `qexp agent name [--set-to NAME]`
-- `qexp agent gpus show`
-- `qexp agent gpus set --visible <ids> | --none [--expected-revision <revision>]`
-- `qexp agent gpus reset [--expected-revision <revision>]`
-- `qexp agent migrate-project`
-- `qexp doctor`
-- `qexp clean`
+- `qexp agent config cpu show | set`
+- `qexp agent config gpus show`
+- `qexp agent config gpus set --visible <ids> | --none [--expected-revision <revision>]`
+- `qexp agent config gpus reset [--expected-revision <revision>]`
+- `qexp admin migrate agent --project PATH --machine NAME`
+- `qexp admin {check|repair} --project PATH`
+- `qexp admin clean --project PATH`
+- `qexp admin operation show REFERENCE --project PATH`
+- `qexp admin upgrade status | advance [--project PATH]`
+- `qexp admin upgrade pause | plan | apply | validate | resume --project PATH`
+- `qexp admin migrate schema --project PATH --to-schema 6`
+- `qexp admin migrate schema6 {check|start|status|attest|resume} --project PATH`
 
-Legacy Batch inspection and retry commands are removed when the new model becomes active.
-The target CLI also does not promise aliases for the old flat `list`, `inspect`, `retry`,
-`cancel`, or hyphenated Group command spellings.
+The 1.3.22 CLI consolidation is an approved direct cutover. Retired `top`, `machines`, `doctor`,
+`clean`, `lease-policy`, `task keep-local`, `group retry-failed`, `group machines`, flat agent
+resource configuration, and previous upgrade/migration spellings do not forward to the new
+operations. No temporary compatibility implementation is retained for these spellings, so they
+have no compatibility-registry lifecycle. Legacy Batch inspection and retry commands remain
+owned by the submission cutover. The target CLI also does not promise aliases for the old flat
+`list`, `inspect`, `retry`, `cancel`, or hyphenated Group command spellings.
 
 ## 17. Acceptance Checklist
 

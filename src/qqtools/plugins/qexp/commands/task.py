@@ -63,6 +63,7 @@ def submit(
     depends_on_task_ids: list[str] | None = None,
     idempotency_key: str | None = None,
     tmux_override: bool | None = None,
+    on_prepared: Callable[[str, str], None] | None = None,
 ) -> TaskRecord:
     validate_tmux_override(tmux_override)
     validate_root_contract(cfg)

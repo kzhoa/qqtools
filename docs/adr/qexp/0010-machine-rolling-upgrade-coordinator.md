@@ -40,7 +40,7 @@ projections, capabilities, and protocols.
    the worker; no history scan or migration timer is retained for an idle project.
 4. Machine status reports the local discovery boundary, inaccessible roots, per-project phase and
    blockers, package/agent state, and migration state separately. `qexp agent restart` is the
-   normal L1 trigger. `qexp agent upgrade coordinate` is an exceptional all-registered-root
+   normal L1 trigger. `qexp admin upgrade advance` is an exceptional all-registered-root
    recovery surface; it does not claim roots absent from the local registry.
 5. A migration may block admission only when its journal explicitly records that the current write
    path is unsafe or indeterminate. A failed migration with a provably safe old path keeps

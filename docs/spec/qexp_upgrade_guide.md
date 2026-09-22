@@ -1,14 +1,14 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-20
+updated_at: 2026-09-21
 archived_at:
 ---
 
 # qexp Upgrade and Ready-Index Recovery Guide
 
 This guide is for an existing qexp project rooted at `PROJECT_ROOT` (for example,
-`/mnt/share/myproject/.qexp`). Run commands with its explicit shared-root path.
+`/mnt/share/myproject/.qexp`). Run commands with its explicit Project path.
 
 ## Upgrade to machine setup and Project enrollment
 
@@ -65,14 +65,14 @@ that project activation or legacy cleanup has completed. Inspect the bounded mac
 view with:
 
 ```bash
-qexp agent upgrade status --format json
+qexp admin upgrade status --format json
 ```
 
 An exceptional recovery pass can advance every project visible in that machine registry while
 training processes continue:
 
 ```bash
-qexp agent upgrade coordinate --format json
+qexp admin upgrade advance --format json
 ```
 
 The output records the discovery boundary and lists inaccessible or omitted roots. It must not be
@@ -83,12 +83,12 @@ When a project reports `paused`, `repair_required`, or `pause_pending`, do not e
 files directly. Use the explicit project-scoped flow:
 
 ```bash
-qexp agent upgrade pause --project PROJECT_ID --reason "describe the incident"
-qexp agent upgrade inspect --project PROJECT_ID --format json
-qexp agent upgrade plan --project PROJECT_ID --target MIGRATION_OR_PHASE --format json
-qexp agent upgrade apply --project PROJECT_ID --repair-id REPAIR_ID --format json
-qexp agent upgrade validate --project PROJECT_ID --repair-id REPAIR_ID --format json
-qexp agent upgrade resume --project PROJECT_ID --format json
+qexp admin upgrade pause --project PROJECT_ID --reason "describe the incident"
+qexp admin upgrade status --project PROJECT_ID --format json
+qexp admin upgrade plan --project PROJECT_ID --target MIGRATION_OR_PHASE --format json
+qexp admin upgrade apply --project PROJECT_ID --repair-id REPAIR_ID --format json
+qexp admin upgrade validate --project PROJECT_ID --repair-id REPAIR_ID --format json
+qexp admin upgrade resume --project PROJECT_ID --format json
 ```
 
 Repair plans must preserve revisions, evidence and a durable snapshot proof. Unsupported
@@ -113,7 +113,7 @@ schema fields are not excluded from manifest drift detection.
 Migration implementations must use the supplied upgrade storage facade for callback-owned JSON I/O;
 it rejects reads and writes that exceed the declared slice byte budget before the operation proceeds.
 
-The existing `upgrade schema6` flow below is a historical drained transition and is not converted
+The existing `admin migrate schema6` flow below is a historical drained transition and is not converted
 to an online coordinator migration by this guide.
 
 ### Submission-owned Group publication in 1.3.22
@@ -125,11 +125,11 @@ only after the project requires the new capability may a submission publish a pr
 carrying `creation_operation_id`. A 1.3.21 process then fails before project mutation instead of
 reading that Group as an ordinary active Group.
 
-Inspect rollout state with `qexp agent upgrade status --format json`. If normal enrollment cannot
-finish, use `qexp agent upgrade coordinate --format json` from the machine scope and resolve every
+Inspect rollout state with `qexp admin upgrade status --format json`. If normal enrollment cannot
+finish, use `qexp admin upgrade advance --format json` from the machine scope and resolve every
 reported inaccessible Project or participant. Do not remove `creation_operation_id`, edit the
 required-capability set, or delete a provisional Group file manually. Same-key `qexp submit` retry
-and `qexp doctor repair` own recovery. Submission-operation commit evidence must be retained for as
+and `qexp admin repair --project PATH` own recovery. Submission-operation commit evidence must be retained for as
 long as any Group refers to it.
 
 ## Do not treat every qqtools upgrade as an agent restart
@@ -159,14 +159,14 @@ stops new claims intentionally rather than scheduling potentially wrong work.
 2. Inspect the failure:
 
    ```bash
-   qexp --shared-root PROJECT_ROOT doctor verify --format json
+   qexp --project PROJECT_ROOT admin check --format json
    ```
 
 3. If no running Task, active claim, or unfinished control operation requires intervention, rebuild
    the derived projection from durable Task truth:
 
    ```bash
-   qexp --shared-root PROJECT_ROOT doctor repair --format json
+   qexp --project PROJECT_ROOT admin repair --format json
    ```
 
    A member audit can return `verification.state: building` while its projection remains active.
@@ -180,7 +180,7 @@ stops new claims intentionally rather than scheduling potentially wrong work.
    qexp agent restart
    ```
 
-`doctor repair` regenerates the ready markers, catalog, and reservations. It does not discard
+`admin repair` regenerates the ready markers, catalog, and reservations. It does not discard
 Task or Attempt truth. If repair reports `blocked`, resolve the listed operation or execution
 evidence first; do not force-delete it.
 
@@ -198,22 +198,22 @@ machine runtime is not at qexp's default location.
 3. From a coordinator machine, run the read-only preflight:
 
    ```bash
-   qexp --shared-root PROJECT_ROOT upgrade schema6 check --format json
+   qexp --project PROJECT_ROOT admin migrate schema6 check --format json
    ```
 
    Proceed only when `blockers` is empty.
 4. Create the activation and save the returned `activation_id`:
 
    ```bash
-   qexp --shared-root PROJECT_ROOT upgrade schema6 start --format json
+   qexp --project PROJECT_ROOT admin migrate schema6 start --format json
    ```
 
 5. On every machine listed in the returned `participants`, verify that normal clients remain
    stopped and attest with that machine's logical qexp name:
 
    ```bash
-   qexp --shared-root PROJECT_ROOT --machine MACHINE_NAME \
-     upgrade schema6 attest \
+   qexp --project PROJECT_ROOT --machine MACHINE_NAME \
+     admin migrate schema6 attest \
      --activation-id ACTIVATION_ID \
      --confirm-clients-stopped \
      --format json
@@ -222,19 +222,19 @@ machine runtime is not at qexp's default location.
 6. On the coordinator, complete the conversion:
 
    ```bash
-   qexp --shared-root PROJECT_ROOT \
-     upgrade schema6 resume \
+   qexp --project PROJECT_ROOT \
+     admin migrate schema6 resume \
      --activation-id ACTIVATION_ID \
      --format json
    ```
 
-   Success requires `phase: completed`. If interrupted, use `upgrade schema6 status`, correct the
+   Success requires `phase: completed`. If interrupted, use `admin migrate schema6 status`, correct the
    reported blocker, collect fresh attestations, and rerun `resume` with the same activation ID.
 7. Before returning the project to service, verify and repair its derived ready projection:
 
    ```bash
-   qexp --shared-root PROJECT_ROOT doctor verify --format json
-   qexp --shared-root PROJECT_ROOT doctor repair --format json
+   qexp --project PROJECT_ROOT admin check --format json
+   qexp --project PROJECT_ROOT admin repair --format json
    ```
 
    Repeat verify or repair while `group_ready_members.verification.state` is `building`. Continue
@@ -243,12 +243,29 @@ machine runtime is not at qexp's default location.
 
 8. Restart agents and clients after the activation is complete and the ready index is active.
 
+## Historical migration support matrix
+
+The CLI consolidation changes where these operations are found; it does not retire any historical
+migration protocol. The supported-version review retains all three entries because released source
+and recovery obligations still require distinct prerequisites:
+
+| Source state | Retained command | Reason and operator path |
+| --- | --- | --- |
+| Drained schema-5 Project | `qexp admin migrate schema --project PATH --to-schema 6` | This is the only supported one-way conversion to schema 6. Active claims or running Attempts block it. |
+| Schema-6 root missing the 1.3.15 capabilities | `qexp admin migrate schema6 {check|start|status|attest|resume} --project PATH` | This remains the drained, participant-attested activation path; it is not an online coordinator migration. |
+| Project with legacy per-Project agent metadata | `qexp admin migrate agent --project PATH --machine NAME` | This remains the protected ownership-preserving import path and keeps runner/terminal recovery ordering. |
+
+No evidence currently proves that the supported source range or recovery obligations have ended.
+Removing one of these commands therefore requires a later supported-version decision that updates
+implementation, tests, and this guide together. The consolidated `admin upgrade` family remains the
+separate machine-rolling path for protocols that explicitly qualify for it.
+
 ## Older schema-5 projects
 
 Schema-5 roots use a different, one-way migration. They must be drained before conversion:
 
 ```bash
-qexp migrate --shared-root PROJECT_ROOT --machine MACHINE_NAME --to-schema 6
+qexp admin migrate schema --project PROJECT_ROOT --machine MACHINE_NAME --to-schema 6
 ```
 
 After the schema-5 migration, follow the schema-6 capability-upgrade procedure when targeting
@@ -259,9 +276,9 @@ qqtools 1.3.15.
 | Situation | Correct action |
 | --- | --- |
 | Same qexp protocol, healthy ready index | Upgrade every participating machine, then restart agents one at a time. |
-| `ready_index=degraded` or `marker corrupt` | Stop normal clients, run `doctor verify`, then `doctor repair`; restart only after the index is active. |
-| Existing schema-6 root moving to 1.3.15 | Drain all participants and run `upgrade schema6 check/start/attest/resume`. |
-| Existing schema-5 root | Drain it and run `qexp migrate --to-schema 6` before the schema-6 capability upgrade. |
+| `ready_index=degraded` or `marker corrupt` | Stop normal clients, run `admin check`, then `admin repair`; restart only after the index is active. |
+| Existing schema-6 root moving to 1.3.15 | Drain all participants and run `admin migrate schema6 check/start/attest/resume`. |
+| Existing schema-5 root | Drain it and run `qexp admin migrate schema --project PATH --to-schema 6` before the schema-6 capability upgrade. |
 
 ## Task history pagination
 
@@ -275,8 +292,8 @@ Use `qexp task list --page-size 50 --format json` for indexed pages. Preserve
 `--phase` and `--group` when following `next_cursor`. `index_not_ready` means the
 background build has not completed; legacy Task listing remains available with
 its original scan cost. `index_unavailable` means the query projection cannot
-currently establish completeness. Inspect `qexp doctor verify --format json` and
+currently establish completeness. Inspect `qexp admin check --project PATH --format json` and
 its `task_observation` status. Interrupted publication is recovered automatically;
-after correcting damaged source data, `qexp doctor repair` requests another build.
+after correcting damaged source data, `qexp admin repair --project PATH` requests another build.
 Do not remove required capabilities or downgrade writers to bypass the gate.
 A rebuild invalidates old cursors; restart explicitly without `--cursor`.

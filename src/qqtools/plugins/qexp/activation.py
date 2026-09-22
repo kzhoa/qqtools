@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 from collections.abc import Callable
 
@@ -42,7 +43,19 @@ def managed_project_agent_status(
 
 def _registration_error(cfg: RootConfig) -> RuntimeError:
     if is_legacy_agent_project(cfg):
-        return RuntimeError("legacy project metadata detected; run 'qexp agent migrate-project'.")
+        command = shlex.join(
+            [
+                "qexp",
+                "admin",
+                "migrate",
+                "agent",
+                "--project",
+                str(cfg.shared_root),
+                "--machine",
+                cfg.machine_name,
+            ]
+        )
+        return RuntimeError(f"legacy project metadata detected; run '{command}'.")
     return RuntimeError("project is not registered; run 'qexp project register <PATH>'.")
 
 

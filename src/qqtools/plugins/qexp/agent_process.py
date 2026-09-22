@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -16,8 +17,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    build_parser().parse_args(argv)
-    raise RuntimeError("standalone agent runtime was removed; run 'qexp agent migrate-project'.")
+    args = build_parser().parse_args(argv)
+    command = shlex.join(
+        [
+            "qexp",
+            "admin",
+            "migrate",
+            "agent",
+            "--project",
+            args.shared_root,
+            "--machine",
+            args.machine,
+        ]
+    )
+    raise RuntimeError(f"standalone agent runtime was removed; run '{command}'.")
 
 
 if __name__ == "__main__":

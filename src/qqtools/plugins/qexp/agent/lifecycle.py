@@ -149,8 +149,7 @@ def get_machine_agent_status(
                 "explicit takeover is required before this binding can dispatch or publish authoritative state."
             )
             project["recovery_command"] = (
-                f"qexp --shared-root {shlex.quote(str(binding.shared_root))} "
-                f"--machine {shlex.quote(replacement_name)} "
+                f"qexp --machine {shlex.quote(replacement_name)} "
                 f"--machine-runtime-root {shlex.quote(str(machine_runtime.root))} project register {shlex.quote(str(binding.shared_root))}"
             )
             project["recovery_note"] = (

@@ -84,10 +84,10 @@ def jrun(args: list[str], *, env: dict[str, str]) -> object:
 
 def initialize_machine_project(common: list[str], *, env: dict[str, str], agent_mode: str | None = None) -> None:
     """Initialize one machine and enroll the Project selected by an E2E command prefix."""
-    shared_root = _single_argument_value(common, "--shared-root")
+    shared_root = _single_argument_value(common, "--project")
     machine = _single_argument_value(common, "--machine")
     if shared_root is None or machine is None:
-        raise ValueError("E2E setup requires --shared-root and --machine")
+        raise ValueError("E2E setup requires --project and --machine")
     machine_runtime_root = _single_argument_value(common, "--machine-runtime-root")
     prefix = ["qexp"]
     if machine_runtime_root is not None:

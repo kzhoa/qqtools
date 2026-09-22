@@ -8,7 +8,7 @@ def test_gpu_policy_cli_is_machine_scoped_and_revisioned(tmp_path, capsys) -> No
     from qqtools.plugins.qexp.cli import main
 
     runtime_root = tmp_path / "machine"
-    common = ["--machine-runtime-root", str(runtime_root), "agent", "gpus"]
+    common = ["--machine-runtime-root", str(runtime_root), "agent", "config", "gpus"]
 
     assert main([*common, "set", "--visible", "2,0", "--expected-revision", "0", "--format", "json"]) == 0
     current = json.loads(capsys.readouterr().out)
@@ -40,7 +40,7 @@ def test_gpu_policy_cli_rejects_invalid_lists_without_replacing_policy(tmp_path,
     from qqtools.plugins.qexp.cli import main
 
     runtime_root = tmp_path / "machine"
-    common = ["--machine-runtime-root", str(runtime_root), "agent", "gpus"]
+    common = ["--machine-runtime-root", str(runtime_root), "agent", "config", "gpus"]
     assert main([*common, "set", "--visible", "0,1"]) == 0
     capsys.readouterr()
 
@@ -59,11 +59,11 @@ def test_explicit_none_does_not_change_cpu_lane(tmp_path, capsys) -> None:
 
     runtime_root = tmp_path / "machine"
     root = ["--machine-runtime-root", str(runtime_root), "agent"]
-    assert main([*root, "cpu-lane", "set", "--capacity", "2", "--format", "json"]) == 0
+    assert main([*root, "config", "cpu", "set", "--capacity", "2", "--format", "json"]) == 0
     capsys.readouterr()
-    assert main([*root, "gpus", "set", "--none", "--format", "json"]) == 0
+    assert main([*root, "config", "gpus", "set", "--none", "--format", "json"]) == 0
     capsys.readouterr()
-    assert main([*root, "cpu-lane", "show", "--format", "json"]) == 0
+    assert main([*root, "config", "cpu", "show", "--format", "json"]) == 0
     lane = json.loads(capsys.readouterr().out)
     assert lane["cpu_lane"] == {"capacity": 2, "revision": 1}
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 from .config_types import MachinePolicy, RootConfig
@@ -58,7 +59,19 @@ def init_shared_root(
     runtime_root = runtime_root or (Path.home() / ".qqtools" / "qexp-runtime" / project_id(shared_root) / machine_name)
     cfg = RootConfig(shared_root, shared_root.parent, machine_name, runtime_root)
     if has_legacy_agent_metadata(cfg):
-        raise ValueError("legacy project metadata requires 'qexp agent migrate-project'.")
+        command = shlex.join(
+            [
+                "qexp",
+                "admin",
+                "migrate",
+                "agent",
+                "--project",
+                str(cfg.shared_root),
+                "--machine",
+                cfg.machine_name,
+            ]
+        )
+        raise ValueError(f"legacy project metadata requires '{command}'.")
     initialize_shared_root(cfg)
     save_machine_config(cfg, agent_mode=agent_mode)
     return cfg

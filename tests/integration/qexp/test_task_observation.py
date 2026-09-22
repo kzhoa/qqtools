@@ -137,7 +137,7 @@ def test_cursor_binds_identity_filters_order_and_generation(tmp_path):
         observer.list_tasks_page(cfg, cursor=token, phase="queued")
     assert error.value.code == "invalid_cursor"
     with pytest.raises(ObservationError) as error:
-        observer.list_tasks_page(cfg, cursor=rewrite_cursor(token, v=2))
+        observer.list_tasks_page(cfg, cursor=rewrite_cursor(token, v=3))
     assert error.value.code == "cursor_expired"
     request_rebuild(cfg)
     finish_build(cfg)
@@ -167,6 +167,31 @@ def test_empty_budget_page_advances_past_stale_candidates(tmp_path):
     assert first["next_cursor"] is not None
     second = observer.list_tasks_page(cfg, page_size=1, cursor=first["next_cursor"])
     assert [item["task_id"] for item in second["items"]] == ["z-live"]
+
+
+def test_exact_name_filter_uses_sparse_bounded_pages_and_binds_cursor(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    seed(cfg, [*[f"a-{index:04d}" for index in range(260)], "z-match"])
+    with task_writer_lock(cfg, "z-match", "experiment"):
+        task = load_task(cfg, "z-match")
+        task.name = "target"
+        task.meta["revision"] += 1
+        save_task(cfg, task)
+
+    first = observer.list_tasks_page(cfg, name="target", page_size=1)
+    assert first["items"] == []
+    assert first["stop_reason"] == "budget_exhausted"
+    assert first["next_cursor"] is not None
+    with pytest.raises(ObservationError) as error:
+        observer.list_tasks_page(cfg, name="different", page_size=1, cursor=first["next_cursor"])
+    assert error.value.code == "invalid_cursor"
+    second = observer.list_tasks_page(cfg, name="target", page_size=1, cursor=first["next_cursor"])
+    assert [item["task_id"] for item in second["items"]] == ["z-match"]
+    assert second["next_cursor"] is not None
+    final = observer.list_tasks_page(cfg, name="target", page_size=1, cursor=second["next_cursor"])
+    assert final["items"] == []
+    assert final["stop_reason"] == "exhausted"
+    assert final["next_cursor"] is None
 
 
 def test_publication_failure_preserves_truth_and_rebuilds_missing_entry(tmp_path, monkeypatch):

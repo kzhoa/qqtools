@@ -90,6 +90,16 @@ def set_tmux_policy(shared_root: Any, enabled: Any) -> dict[str, Any]:
     return _result(enabled, "configured")
 
 
+def reset_tmux_policy(shared_root: Any) -> dict[str, Any]:
+    """Remove the explicit policy after strictly validating any existing file."""
+    root = _shared_root(shared_root)
+    path = tmux_policy_path(root)
+    with exclusive(tmux_policy_lock_path(root)):
+        _read_configured(root)
+        path.unlink(missing_ok=True)
+    return _result(False, "default")
+
+
 def resolve_tmux_policy(shared_root: Any) -> dict[str, Any]:
     """Resolve the policy safely for an observer decision."""
     try:
@@ -111,6 +121,7 @@ __all__ = [
     "TMUX_POLICY_VERSION",
     "load_tmux_policy",
     "resolve_tmux_policy",
+    "reset_tmux_policy",
     "set_tmux_policy",
     "show_tmux_policy",
     "tmux_policy_lock_path",

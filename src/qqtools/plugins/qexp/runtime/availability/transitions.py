@@ -518,7 +518,9 @@ def apply_availability_transition(
                         "Submit the work to a Group to let other machines help."
                     )
                 if task.placement_runtime["queue_scope"] != "home":
-                    raise ValueError("share --after requires a home-queued Task; use keep-local first.")
+                    raise ValueError(
+                        "share --after requires a home-queued Task; use 'qexp task unshare TASK_ID' first."
+                    )
                 fallback = _normalize_helpers(task, group, request.helper_machines)
                 idempotent = _same_delayed_share(task, fallback, request.after_seconds)
                 if not idempotent:

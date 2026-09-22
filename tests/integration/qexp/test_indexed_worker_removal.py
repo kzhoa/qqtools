@@ -206,7 +206,7 @@ def test_worker_policy_change_rechecks_only_sensitive_members(tmp_path, monkeypa
         patch.setattr(GroupCoverage, "read_member", no_terminal_revisit)
         advance_until(cfg, operation_id, lambda value: shared.task_id in value["blockers"])
         assert control(cfg, operation_id)["state"] != "completed"
-        change_worker(cfg, "experiment", "g2", "add")
+        change_worker(cfg, "experiment", "g2", "resume")
         finish(cfg, operation_id)
 
 
@@ -289,7 +289,7 @@ def test_cli_activates_background_only_after_durable_remove(tmp_path, monkeypatc
         assert (
             cli.main(
                 [
-                    "--shared-root",
+                    "--project",
                     str(cfg.shared_root),
                     "--machine",
                     cfg.machine_name,
@@ -298,7 +298,7 @@ def test_cli_activates_background_only_after_durable_remove(tmp_path, monkeypatc
                     "--machine-runtime-root",
                     str(machine_root),
                     "group",
-                    "machines",
+                    "worker",
                     "remove",
                     "experiment",
                     "g1",

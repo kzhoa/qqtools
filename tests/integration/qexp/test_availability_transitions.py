@@ -32,7 +32,7 @@ def _base_args(cfg) -> list[str]:
     machine_runtime_root = cfg.runtime_root.parent / "machine-runtime"
     MachineRuntime(machine_runtime_root).ensure_binding(cfg.shared_root, cfg.machine_name)
     return [
-        "--shared-root",
+        "--project",
         str(cfg.shared_root),
         "--machine",
         cfg.machine_name,
@@ -453,7 +453,7 @@ def test_cli_availability_json_and_human_outputs(tmp_path: Path, monkeypatch, ca
     assert payload["task_id"] == task.task_id
     assert payload["resulting_state"] == "shared"
 
-    assert main([*_base_args(cfg), "task", "keep-local", task.task_id]) == 0
+    assert main([*_base_args(cfg), "task", "unshare", task.task_id]) == 0
     assert "restricted to its home machine" in capsys.readouterr().out
 
 

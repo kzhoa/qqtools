@@ -48,7 +48,7 @@ from .runtime.termination import list_decisions
 
 _TASK_OBSERVATION_INSTRUCTIONS = (
     "Paginated list unavailable until the global agent completes the background build; "
-    "doctor repair requests a rebuild on a damaged index."
+    "qexp admin repair --project PATH requests a rebuild on a damaged index."
 )
 
 
@@ -507,7 +507,7 @@ def verify_integrity(
             "submission_control_unavailable",
             control_paths(cfg)["state"],
             "low",
-            "Run doctor repair to restart background Submission visibility certification.",
+            "Run 'qexp admin repair --project PATH' to restart background Submission visibility certification.",
         )
     is_complete = member_verification["state"] != "building"
     is_healthy = not issues and member_verification["state"] == "completed"
@@ -630,7 +630,8 @@ def repair_metadata(
     audit = member_record.get("audit") if isinstance(member_record.get("audit"), dict) else {}
     if member_record.get("state") == "building" or audit.get("state") == "building":
         message = (
-            "Member projection repair slice completed; rerun doctor repair while group_ready_members.state is building."
+            "Member projection repair slice completed; rerun 'qexp admin repair --project PATH' "
+            "while group_ready_members.state is building."
         )
     task_observation: dict[str, Any] = {
         "state": "degraded",

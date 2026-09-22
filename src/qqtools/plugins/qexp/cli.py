@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import json
 import math
 import os
@@ -10,6 +11,7 @@ import re
 import shlex
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -52,10 +54,16 @@ from .agent.setup import (
     set_project_enablement,
 )
 from .commands import cleanup
+from .commands import configuration as configuration_commands
+from .commands import context as context_commands
 from .commands import group as group_commands
 from .commands import logs as log_commands
+from .commands import operation as operation_commands
+from .commands import status as status_commands
 from .commands import task as task_commands
+from .commands import wait as wait_commands
 from .commands import watch as watch_commands
+from .commands.registry import CommandSpec, bind_command
 from .config_types import RootConfig
 from .doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
 from .formatter import CliOutput, OutputKind, render
@@ -103,8 +111,31 @@ class _SubmissionParseError(RuntimeError):
     """An argparse error that belongs to structured submission JSON output."""
 
 
+class _JsonParseError(RuntimeError):
+    """An argparse error that belongs to another finite JSON invocation."""
+
+
 _PAGINATION_JSON_PARSE_MODE = False
 _SUBMISSION_JSON_PARSE_MODE = False
+_JSON_PARSE_MODE = False
+_ACTIVE_COMMAND_SPEC: contextvars.ContextVar[CommandSpec | None] = contextvars.ContextVar(
+    "qexp_active_command_spec", default=None
+)
+
+_DYNAMIC_OUTPUT_KINDS: dict[str, frozenset[OutputKind]] = {
+    "agent-operation": frozenset({OutputKind.AGENT_OPERATION, OutputKind.AGENT_READINESS}),
+    "doctor-check": frozenset({OutputKind.DOCTOR_VERIFY}),
+    "group-operation": frozenset({OutputKind.GROUP_OPERATION, OutputKind.GROUP_MACHINES}),
+    "task-list": frozenset({OutputKind.TASK_LIST, OutputKind.TASK_PAGE}),
+    "task-show": frozenset({OutputKind.TASK_SHOW, OutputKind.TASK_WATCH}),
+    "upgrade": frozenset(
+        {
+            OutputKind.UPGRADE_REGISTRY_STATUS,
+            OutputKind.UPGRADE_ADVANCE,
+            OutputKind.UPGRADE_PROJECT,
+        }
+    ),
+}
 
 
 class _QexpArgumentParser(argparse.ArgumentParser):
@@ -115,7 +146,65 @@ class _QexpArgumentParser(argparse.ArgumentParser):
             raise _PaginationParseError(message)
         if _SUBMISSION_JSON_PARSE_MODE:
             raise _SubmissionParseError(message)
+        if _JSON_PARSE_MODE:
+            raise _JsonParseError(message)
         super().error(message)
+
+    def parse_args(self, args: list[str] | None = None, namespace: argparse.Namespace | None = None):
+        raw = list(sys.argv[1:] if args is None else args)
+        conflict = _common_option_conflict(raw)
+        if conflict is not None:
+            self.error(conflict)
+        return super().parse_args(raw, namespace)
+
+
+_COMMON_OPTIONS = frozenset({"--project", "--machine", "--runtime-root", "--machine-runtime-root", "--format"})
+
+
+def _normalized_common_value(name: str, value: str) -> str:
+    if name == "--project":
+        return str(context_commands.normalize_project_path(value))
+    if name in {"--runtime-root", "--machine-runtime-root"}:
+        return str(Path(value).expanduser().resolve())
+    return value
+
+
+def _common_option_conflict(argv: list[str]) -> str | None:
+    """Reject conflicting duplicate common options before argparse dispatches."""
+    values: dict[str, str] = {}
+    stop = len(argv)
+    try:
+        submit_index = argv.index("submit")
+    except ValueError:
+        submit_index = -1
+    if submit_index >= 0:
+        try:
+            separator = argv.index("--", submit_index + 1)
+        except ValueError:
+            separator = len(argv)
+        stop = separator
+    index = 0
+    while index < stop:
+        token = argv[index]
+        name = token.split("=", 1)[0]
+        if name not in _COMMON_OPTIONS:
+            index += 1
+            continue
+        if "=" in token:
+            value = token.split("=", 1)[1]
+        elif index + 1 < stop:
+            value = argv[index + 1]
+            index += 1
+        else:
+            index += 1
+            continue
+        normalized = _normalized_common_value(name, value)
+        previous = values.get(name)
+        if previous is not None and previous != normalized:
+            return f"conflicting values for {name}: {previous!r} and {value!r}."
+        values[name] = normalized
+        index += 1
+    return None
 
 
 def _is_paginated_json_argv(argv: list[str]) -> bool:
@@ -146,6 +235,20 @@ def _is_submission_json_argv(argv: list[str]) -> bool:
     )
 
 
+def _is_json_argv(argv: list[str]) -> bool:
+    """Return whether a pre-payload option requests JSON diagnostics."""
+    stop = len(argv)
+    try:
+        submit_index = argv.index("submit")
+        stop = argv.index("--", submit_index + 1)
+    except (ValueError, IndexError):
+        pass
+    return any(
+        item == "--format=json" or (item == "--format" and index + 1 < stop and argv[index + 1] == "json")
+        for index, item in enumerate(argv[:stop])
+    )
+
+
 def _parse_page_size(value: str | None) -> int:
     """Parse a CLI page size so malformed values become ObservationErrors."""
     if value is None:
@@ -165,6 +268,64 @@ def _emit_observation_error(error: ObservationError, output_format: str) -> int:
     return error.exit_code
 
 
+def _is_wait_json_argv(argv: list[str]) -> bool:
+    """Return whether raw argv selects JSON ``task wait`` diagnostics."""
+    return any(argv[index : index + 2] == ["task", "wait"] for index in range(len(argv) - 1)) and _is_json_argv(argv)
+
+
+def _raw_wait_task_id(argv: list[str]) -> str | None:
+    """Recover the wait Task ID for parser errors without running argparse again."""
+    option_values = {
+        "--project",
+        "--machine",
+        "--runtime-root",
+        "--machine-runtime-root",
+        "--format",
+        "--timeout",
+    }
+    for index in range(len(argv) - 1):
+        if argv[index : index + 2] != ["task", "wait"]:
+            continue
+        cursor = index + 2
+        while cursor < len(argv):
+            token = argv[cursor]
+            if token == "--":
+                return None
+            if token in option_values:
+                cursor += 2
+                continue
+            if any(token.startswith(f"{option}=") for option in option_values):
+                cursor += 1
+                continue
+            if token.startswith("-"):
+                cursor += 1
+                continue
+            return token
+    return None
+
+
+def _emit_wait_error(
+    *,
+    task_id: str | None,
+    project: object | None,
+    outcome: str,
+    reason: str,
+    code: str,
+    message: str,
+    exit_code: int,
+) -> int:
+    """Emit the fixed task-wait schema for pre-resolution CLI failures."""
+    result = wait_commands.make_wait_result(
+        project=project,
+        task_id=task_id,
+        outcome=outcome,
+        reason=reason,
+        error={"code": code, "message": message},
+    )
+    _emit(CliOutput(OutputKind.TASK_WAIT, result), "json")
+    return exit_code
+
+
 def _emit_task_page(cfg: RootConfig, args: argparse.Namespace, page: dict[str, object], page_size: int) -> None:
     """Render paginated task results and a shell-safe continuation command."""
     presentation: dict[str, object] = {}
@@ -172,10 +333,8 @@ def _emit_task_page(cfg: RootConfig, args: argparse.Namespace, page: dict[str, o
     if args.format == "human" and next_cursor is not None:
         command = [
             "qexp",
-            "--shared-root",
+            "--project",
             str(cfg.shared_root),
-            "--machine",
-            cfg.machine_name,
             "task",
             "list",
         ]
@@ -183,16 +342,55 @@ def _emit_task_page(cfg: RootConfig, args: argparse.Namespace, page: dict[str, o
             command.extend(("--phase", args.phase))
         if args.group:
             command.extend(("--group", args.group))
+        if getattr(args, "name", None) is not None:
+            command.extend(("--name", args.name))
         command.extend(("--page-size", str(page_size), "--cursor", str(next_cursor)))
         presentation["continuation_command"] = shlex.join(command)
     _emit(CliOutput(OutputKind.TASK_PAGE, page, presentation), args.format)
 
 
 def _add_output_format(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--format", choices=("human", "json"), default="human")
+    """Add a leaf format option without overwriting a root-level value."""
+    if "--format" not in parser._option_string_actions:
+        parser.add_argument("--format", choices=("human", "json"), default=argparse.SUPPRESS)
+
+
+def _add_common_options(parser: argparse.ArgumentParser, *, include_format: bool = True) -> None:
+    """Allow common context options at every ordinary command level."""
+    options = (
+        ("--project", {"help": "Project directory or its .qexp control directory."}),
+        ("--machine", {"help": "Assert the local logical machine identity."}),
+        ("--runtime-root", {"help": "Override the project-local runtime root."}),
+        ("--machine-runtime-root", {"help": "Override the machine-global runtime root."}),
+    )
+    for option, kwargs in options:
+        if option not in parser._option_string_actions:
+            parser.add_argument(option, default=argparse.SUPPRESS, **kwargs)
+    if include_format and "--format" not in parser._option_string_actions:
+        parser.add_argument("--format", choices=("human", "json"), default=argparse.SUPPRESS)
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for child in action.choices.values():
+                _add_common_options(child, include_format=include_format)
 
 
 def _emit(output: CliOutput[object], output_format: str, *, flush: bool = False) -> None:
+    command_spec = _ACTIVE_COMMAND_SPEC.get()
+    if command_spec is not None:
+        allowed = _DYNAMIC_OUTPUT_KINDS.get(command_spec.output)
+        if allowed is None:
+            try:
+                allowed = frozenset({OutputKind(command_spec.output)})
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"command handler {command_spec.handler!r} has no structured output contract "
+                    f"for {command_spec.output!r}."
+                ) from exc
+        if output.kind not in allowed:
+            raise RuntimeError(
+                f"command handler {command_spec.handler!r} emitted {output.kind.value!r}; "
+                f"registered output is {command_spec.output!r}."
+            )
     print(render(output, output_format), flush=flush)
 
 
@@ -399,54 +597,28 @@ def _machine_assertion(args: argparse.Namespace) -> str | None:
     return flag_value if flag_value is not None else environment_value
 
 
-def _shared_root_input(args: argparse.Namespace) -> tuple[str | None, dict | None]:
-    """Resolve only the shared-root locator; saved identity fields are intentionally ignored."""
-    submission_project = getattr(args, "_submission_project", None)
-    if args.command == "submit" and submission_project is not None:
-        return str(submission_project), None
-    flag_value = getattr(args, "shared_root", None)
-    environment_value = os.environ.get("QEXP_SHARED_ROOT")
-    context = load_context() if flag_value is None and environment_value is None else None
-    shared = flag_value or environment_value or (context or {}).get("shared_root")
-    return shared, context
-
-
 def _requires_verified_binding(args: argparse.Namespace) -> bool:
-    """Classify commands that can create or change project-owned state."""
-    if args.command in {"submit", "clean"}:
-        return True
-    if args.command == "config":
-        return (
-            getattr(args, "notifications_action", None) == "set"
-            or getattr(args, "provider_action", None) == "set"
-            or getattr(args, "progress_action", None) == "set"
-            or getattr(args, "launch_handoff_action", None) == "set"
-            or getattr(args, "tmux_action", None) == "set"
-        )
-    if args.command == "lease-policy":
-        return args.lease_policy_action == "set"
-    if args.command == "task":
-        return not (
-            args.task_action in {"list", "show", "logs"}
-            or (args.task_action == "dependencies" and args.dependencies_action == "show")
-        )
-    if args.command == "group":
-        return args.group_action not in {"list", "show"}
-    if args.command == "agent":
-        return args.agent_action in {"start", "run"}
-    return args.command == "doctor" and args.action == "repair"
+    """Use the leaf's registered context policy as the sole write classification."""
+    if args.command_spec.handler in {"config_set", "config_reset"}:
+        return getattr(args, "section", None) != "agent"
+    return args.command_spec.context == "project-write"
 
 
-def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[object, ExecutionContext]:
-    shared, _saved_context = _shared_root_input(args)
-    if not shared:
-        raise ValueError("--shared-root is required or must be saved with qexp use.")
+def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[object, ExecutionContext, str]:
+    submission_request = getattr(args, "_submission_request", None)
+    if args.command_spec.handler == "submit" and submission_request is not None:
+        selection = context_commands.ProjectSelection(
+            submission_request.project.control_root,
+            submission_request.project.source,
+        )
+    else:
+        selection = context_commands.resolve_project(getattr(args, "project", None))
     assertion = _machine_assertion(args)
     machine_runtime = MachineRuntime(getattr(args, "machine_runtime_root", None))
 
     if require_binding:
         try:
-            execution_context = machine_runtime.verified_execution_context(shared)
+            execution_context = machine_runtime.verified_execution_context(selection.shared_root)
         except ValueError as exc:
             if str(exc).startswith("no local project binding exists"):
                 raise ValueError(
@@ -461,233 +633,124 @@ def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[ob
                 f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}.\n"
                 f"Use '--home-machine {assertion}' to select Task placement."
             )
-        return execution_context.cfg, execution_context
+        return execution_context.cfg, execution_context, selection.source
 
     # Read-only project commands should use the binding-owned local runtime when one is
     # available, while remaining usable for observation before local registration.
-    if not (args.command == "agent" and args.agent_action in {"add-project", "migrate-project"}):
-        try:
-            execution_context = machine_runtime.verified_execution_context(shared)
-        except (ValueError, RuntimeError):
-            execution_context = None
-        if execution_context is not None:
-            verified_machine = execution_context.cfg.machine_name
-            if assertion is not None and assertion != verified_machine:
-                raise ValueError(
-                    f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}."
-                )
-            return execution_context.cfg, execution_context
+    try:
+        execution_context = machine_runtime.verified_execution_context(selection.shared_root)
+    except (ValueError, RuntimeError):
+        execution_context = None
+    if execution_context is not None:
+        verified_machine = execution_context.cfg.machine_name
+        if assertion is not None and assertion != verified_machine:
+            raise ValueError(f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}.")
+        return execution_context.cfg, execution_context, selection.source
 
     # Read-only project observation must remain possible without a local binding. The sentinel is
     # never used as an authority source because this branch is not used for mutations.
-    if args.command == "agent" and args.agent_action in {"add-project", "migrate-project"}:
-        if assertion is None:
-            raise ValueError(
-                "agent add-project and migrate-project require --machine or QEXP_MACHINE "
-                "when no local project binding exists."
-            )
     machine = assertion or "unbound"
-    runtime = None
-    if args.command == "agent" and args.agent_action in {"add-project", "migrate-project"}:
-        runtime = getattr(args, "runtime_root", None) or os.environ.get("QEXP_RUNTIME_ROOT")
-    cfg = load_root_config(shared, machine, runtime, require_initialized=True)
-    return cfg, ExecutionContext(cfg, machine_runtime)
+    runtime = getattr(args, "runtime_root", None) or os.environ.get("QEXP_RUNTIME_ROOT")
+    cfg = context_commands.config_for_selection(
+        selection,
+        machine_name=machine,
+        runtime_root=runtime,
+        require_initialized=True,
+    )
+    return cfg, ExecutionContext(cfg, machine_runtime), selection.source
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the canonical qexp resource/action command tree."""
     parser = _QexpArgumentParser(
+        prog="qexp",
         description=(
-            "qexp schema-6 experiment queue; --machine is local identity, --home-machine is Task "
-            "placement, and Attempt machine is selected later by claim. qexp does not remotely "
-            "start a target agent."
+            "qexp schema-6 experiment queue. Project commands use --project; --machine asserts local identity, "
+            "while --home-machine selects Task placement. Selecting placement does not remotely start an agent."
         ),
         epilog=(
-            "Machine setup is: qexp init --machine NAME. Shared Project creation is: "
-            "qexp project init PATH; local enrollment is: qexp project register PATH. "
-            "qexp use only saves local CLI context."
+            "Machine setup: qexp init --machine NAME. Create shared truth with qexp project init PATH, "
+            "then enroll it with qexp project register PATH. qexp use only saves local CLI fallback context."
         ),
     )
-    parser.add_argument("--shared-root", help="Locate the shared project control root.")
-    parser.add_argument(
-        "--machine",
-        help="Assert the local logical machine identity; this is not the Task target machine.",
-    )
-    parser.add_argument("--runtime-root")
-    parser.add_argument("--machine-runtime-root")
+    parser.add_argument("--project", help="Project directory or its .qexp control directory.")
+    # Parse the former root-position spelling only far enough to provide the
+    # bounded QQTOOLS-COMPAT-0014 diagnostic.  It is intentionally hidden from
+    # help and never participates in ordinary Project selection.
+    parser.add_argument("--shared-root", dest="compat_shared_root", help=argparse.SUPPRESS)
+    parser.add_argument("--machine", help="Assert the local logical machine identity.")
+    parser.add_argument("--runtime-root", help="Override the project-local runtime root.")
+    parser.add_argument("--machine-runtime-root", help="Override the machine-global runtime root.")
+    parser.add_argument("--format", choices=("human", "json"), default="human")
     commands = parser.add_subparsers(dest="command", required=True)
+
     init = commands.add_parser(
         "init",
-        help="Initialize or replace this machine runtime.",
+        help="Initialize or replace the machine runtime.",
         description=(
-            "Initialize or replace the local machine identity and global agent policy. "
-            "Project creation and enrollment are separate: use 'qexp project init' and "
-            "'qexp project register'."
+            "Initialize the local machine identity and global agent policy. Project creation and enrollment are "
+            "separate; use qexp project register PATH after creating shared truth."
         ),
     )
     init.add_argument("--shared-root", dest="init_shared_root")
     init.add_argument("--machine", dest="init_machine")
-    init.add_argument("--agent-mode", choices=["on_demand", "daemon"])
+    init.add_argument("--agent-mode", choices=("on_demand", "daemon"))
     init.add_argument("--detach-old-runtime", action="store_true")
     init.add_argument("--yes", action="store_true")
-    _add_output_format(init)
     init.add_argument("--cpu-lane-capacity", type=int)
+    _add_output_format(init)
+    bind_command(init, handler="init", context="machine", output="machine-init")
 
     project = commands.add_parser(
         "project",
-        help="Create shared Projects and manage local machine enrollment.",
-        description="Project init creates shared truth; project register/list/enable/disable/remove manage local enrollment.",
+        help="Create shared Projects and manage local enrollment.",
+        description="Project setup owns shared truth and machine enrollment.",
     )
     project_sub = project.add_subparsers(dest="project_action", required=True)
     project_init = project_sub.add_parser("init", help="Create shared Project truth without enrollment.")
-    _add_output_format(project_init)
     project_init.add_argument("path", nargs="?")
+    _add_output_format(project_init)
+    bind_command(project_init, handler="project_init", context="setup", output="project-operation")
     project_register = project_sub.add_parser("register", help="Enroll explicit Projects or saved inventory entries.")
-    _add_output_format(project_register)
     project_register.add_argument("paths", nargs="*")
     project_register.add_argument("--from-pool", action="store_true")
     project_register.add_argument("--machine", dest="project_machine")
     project_register.add_argument("--name-source", choices=("default", "explicit"))
-    for project_action in ("list",):
-        project_list_parser = project_sub.add_parser(project_action)
-        _add_output_format(project_list_parser)
+    _add_output_format(project_register)
+    bind_command(project_register, handler="project_register", context="machine", output="project-register")
+    project_list = project_sub.add_parser("list", help="List local Project registrations.")
+    _add_output_format(project_list)
+    bind_command(project_list, handler="project_list", context="machine", output="project-list")
     for project_action in ("enable", "disable", "remove"):
-        project_selector = project_sub.add_parser(project_action)
-        _add_output_format(project_selector)
-        project_selector.add_argument("selector")
-    migrate = commands.add_parser("migrate")
-    migrate.add_argument("--to-schema", type=int, required=True)
-    upgrade = commands.add_parser("upgrade")
-    upgrade_sub = upgrade.add_subparsers(dest="upgrade_feature", required=True)
-    coordinator_upgrade = upgrade_sub.add_parser(
-        "coordinator",
-        help="Run the exceptional machine-level coordinator over registered projects.",
+        selector = project_sub.add_parser(project_action, help=f"{project_action.capitalize()} a Project registration.")
+        selector.add_argument("selector")
+        _add_output_format(selector)
+        bind_command(selector, handler=f"project_{project_action}", context="machine", output="project-operation")
+
+    use = commands.add_parser(
+        "use",
+        help="Save or inspect fallback Project context without initialization.",
+        description=(
+            "Use --project to save a fallback locator, or --show/--clear to inspect or clear it. "
+            "This does not initialize a shared root or register the project with the local machine agent."
+        ),
     )
-    _add_output_format(coordinator_upgrade)
-    coordinator_upgrade.add_argument("--project", dest="upgrade_project")
-    schema6_upgrade = upgrade_sub.add_parser("schema6")
-    schema6_upgrade_sub = schema6_upgrade.add_subparsers(dest="schema6_upgrade_action", required=True)
-    for name in ("check", "start", "status"):
-        action = schema6_upgrade_sub.add_parser(name)
-        _add_output_format(action)
-        if name != "status":
-            action.add_argument(
-                "--capability",
-                action="append",
-                dest="capabilities",
-                choices=("cpu-lane-v1", "task-dependencies-v1"),
-            )
-    schema6_attest = schema6_upgrade_sub.add_parser("attest")
-    _add_output_format(schema6_attest)
-    schema6_attest.add_argument("--activation-id", required=True)
-    schema6_attest.add_argument("--confirm-clients-stopped", action="store_true")
-    schema6_resume = schema6_upgrade_sub.add_parser("resume")
-    _add_output_format(schema6_resume)
-    schema6_resume.add_argument("--activation-id", required=True)
-    lease_policy = commands.add_parser("lease-policy", help=argparse.SUPPRESS)
-    lease_policy_sub = lease_policy.add_subparsers(dest="lease_policy_action", required=True)
-    lease_show = lease_policy_sub.add_parser("show")
-    _add_output_format(lease_show)
-    policy_set = lease_policy_sub.add_parser("set")
-    _add_output_format(policy_set)
-    policy_set.add_argument("--ttl-seconds", type=int)
-    policy_set.add_argument("--renew-interval-seconds", type=float)
-    policy_set.add_argument("--max-clock-skew-seconds", type=float)
-    policy_set.add_argument("--clock-observation-max-age-seconds", type=float)
-    policy_set.add_argument("--clock-provider-margin-seconds", type=float)
-    policy_set.add_argument("--clock-provider-priority")
-    policy_set.add_argument("--renewal-commit-margin-seconds", type=float)
-    config = commands.add_parser("config")
-    config_sub = config.add_subparsers(dest="config_action", required=True)
-    config_lease = config_sub.add_parser("lease", help="Configure lease policy.")
-    config_lease_sub = config_lease.add_subparsers(dest="lease_policy_action", required=True)
-    for _name in ("show", "set"):
-        _lp = config_lease_sub.add_parser(_name)
-        _add_output_format(_lp)
-        if _name == "set":
-            for _arg, _typ in (
-                ("ttl-seconds", int),
-                ("renew-interval-seconds", float),
-                ("max-clock-skew-seconds", float),
-                ("clock-observation-max-age-seconds", float),
-                ("clock-provider-margin-seconds", float),
-                ("renewal-commit-margin-seconds", float),
-            ):
-                _lp.add_argument("--" + _arg, type=_typ)
-            _lp.add_argument("--clock-provider-priority")
-    config_agent = config_sub.add_parser("agent", help="Configure the machine-global agent.")
-    config_agent_sub = config_agent.add_subparsers(dest="agent_config_action", required=True)
-    config_agent_show = config_agent_sub.add_parser("show")
-    _add_output_format(config_agent_show)
-    config_agent_set = config_agent_sub.add_parser("set")
-    _add_output_format(config_agent_set)
-    config_agent_set.add_argument("--name")
-    config_agent_set.add_argument("--agent-mode", choices=("daemon", "on_demand"))
-    # Machine-global configuration also has the public verb-first spelling.
-    config_show = config_sub.add_parser("show")
-    _add_output_format(config_show)
-    config_show.add_argument("config_target", choices=("agent",))
-    config_set = config_sub.add_parser("set")
-    _add_output_format(config_set)
-    config_set.add_argument("config_target", choices=("agent",))
-    config_set.add_argument("--name")
-    config_set.add_argument("--agent-mode", choices=("daemon", "on_demand"))
-    notifications = config_sub.add_parser("notifications")
-    notifications_sub = notifications.add_subparsers(dest="notifications_action", required=True)
-    notifications_show = notifications_sub.add_parser("show")
-    _add_output_format(notifications_show)
-    notifications_set = notifications_sub.add_parser("set")
-    _add_output_format(notifications_set)
-    notifications_set.add_argument("--enabled", action="store_true")
-    notifications_set.add_argument("--disabled", action="store_true")
-    progress_config = config_sub.add_parser("progress", help="Configure advisory progress reporting frequency.")
-    progress_config_sub = progress_config.add_subparsers(dest="progress_action", required=True)
-    progress_show = progress_config_sub.add_parser("show")
-    _add_output_format(progress_show)
-    progress_set = progress_config_sub.add_parser("set")
-    _add_output_format(progress_set)
-    progress_set.add_argument("--interval-seconds", required=True)
-    launch_handoff_config = config_sub.add_parser(
-        "launch-handoff",
-        help="Configure the runner launch-handoff timeout.",
-    )
-    launch_handoff_sub = launch_handoff_config.add_subparsers(dest="launch_handoff_action", required=True)
-    launch_handoff_show = launch_handoff_sub.add_parser("show")
-    _add_output_format(launch_handoff_show)
-    launch_handoff_set = launch_handoff_sub.add_parser("set")
-    _add_output_format(launch_handoff_set)
-    launch_handoff_set.add_argument("--timeout-seconds", required=True)
-    tmux_config = config_sub.add_parser("tmux", help="Configure project tmux log observer windows.")
-    tmux_config_sub = tmux_config.add_subparsers(dest="tmux_action", required=True)
-    tmux_show = tmux_config_sub.add_parser("show")
-    _add_output_format(tmux_show)
-    tmux_set = tmux_config_sub.add_parser("set")
-    _add_output_format(tmux_set)
-    tmux_values = tmux_set.add_mutually_exclusive_group(required=True)
-    tmux_values.add_argument("--enabled", action="store_true")
-    tmux_values.add_argument("--disabled", action="store_true")
-    provider = notifications_sub.add_parser("provider")
-    provider_sub = provider.add_subparsers(dest="provider_action", required=True)
-    provider_set = provider_sub.add_parser("set")
-    _add_output_format(provider_set)
-    provider_set.add_argument("provider")
-    provider_set.add_argument("--enabled", action="store_true")
-    provider_set.add_argument("--disabled", action="store_true")
-    provider_set.add_argument("--webhook-env")
-    provider_set.add_argument("--credential-source", choices=["env", "shared_file"])
-    provider_set.add_argument("--webhook-stdin", action="store_true")
-    provider_set.add_argument("--acknowledge-shared-secret-risk", action="store_true")
-    provider_set.add_argument("--secret-env")
-    provider_set.add_argument("--unset-secret-env", action="store_true")
-    provider_set.add_argument("--timeout-seconds", type=float)
+    use.add_argument("--project", dest="use_project", help="Project directory or .qexp control directory to save.")
+    use.add_argument("--show", action="store_true", help="Show the saved fallback Project.")
+    use.add_argument("--clear", action="store_true", help="Clear the saved fallback Project.")
+    _add_output_format(use)
+    bind_command(use, handler="use", context="none", output="context")
+
     submit = commands.add_parser(
         "submit",
+        help="Submit one Task using the verified local identity.",
         description=(
             "Submit one command or a manifest using the verified local identity. "
             "qexp does not remotely start the target agent."
         ),
     )
     _add_output_format(submit)
-    submit.add_argument("--project", dest="project")
+    submit.add_argument("--project", dest="project", default=argparse.SUPPRESS)
     submit.add_argument("-f", "--file", dest="manifest_file")
     submit.add_argument("--task-id")
     submit.add_argument("--name")
@@ -708,128 +771,159 @@ def build_parser() -> argparse.ArgumentParser:
     tmux_values.add_argument("--no-tmux", dest="tmux_override", action="store_false")
     submit.set_defaults(tmux_override=None)
     submit.add_argument("argv", nargs=argparse.REMAINDER)
-    task = commands.add_parser("task")
+    bind_command(submit, handler="submit", context="project-write", output="submission")
+
+    status = commands.add_parser("status", help="Show a bounded Project overview and next actions.")
+    _add_output_format(status)
+    bind_command(status, handler="status", context="project-read", output="status")
+
+    task = commands.add_parser("task", help="Inspect and operate on Tasks in the selected Project.")
     task_sub = task.add_subparsers(dest="task_action", required=True)
-    cancel = task_sub.add_parser("cancel")
-    _add_output_format(cancel)
+    cancel = task_sub.add_parser("cancel", help="Cancel one Task and preserve its lifecycle identity.")
     cancel.add_argument("task_id")
-    retry = task_sub.add_parser("retry")
+    _add_output_format(cancel)
+    bind_command(cancel, handler="task_cancel", context="project-write", output="task-operation")
+    retry = task_sub.add_parser("retry", help="Queue the next Attempt for one failed Task.")
     retry.add_argument("task_id")
-    retry.add_argument(
-        "--acknowledge-duplicate-risk",
-        action="store_true",
-        help="Deprecated compatibility option; retained as a no-op.",
-    )
-    offer = task_sub.add_parser("offer")
-    _add_output_format(offer)
-    offer.add_argument("task_id")
-    share = task_sub.add_parser("share")
-    _add_output_format(share)
+    retry.add_argument("--quiet", action="store_true", help="Print only the retained Task ID.")
+    _add_output_format(retry)
+    bind_command(retry, handler="task_retry", context="project-write", output="task-operation")
+    share = task_sub.add_parser("share", help="Enable immediate or delayed Task sharing.")
     share.add_argument("task_id")
     share.add_argument("--after")
-    share.add_argument(
-        "--with",
-        dest="helper_machines",
-        action="append",
-        help="Helper machine; repeat the option or use comma-separated machine names.",
-    )
-    keep_local = task_sub.add_parser("keep-local")
-    _add_output_format(keep_local)
-    keep_local.add_argument("task_id")
-    listing = task_sub.add_parser("list")
-    _add_output_format(listing)
+    share.add_argument("--with", dest="helper_machines", action="append")
+    _add_output_format(share)
+    bind_command(share, handler="task_share", context="project-write", output="availability")
+    unshare = task_sub.add_parser("unshare", help="Return a queued Task to private home placement.")
+    unshare.add_argument("task_id")
+    _add_output_format(unshare)
+    bind_command(unshare, handler="task_unshare", context="project-write", output="availability")
+    offer = task_sub.add_parser("offer", help="Offer eligible spillover work immediately.")
+    offer.add_argument("task_id")
+    _add_output_format(offer)
+    bind_command(offer, handler="task_offer", context="project-write", output="availability")
+    listing = task_sub.add_parser("list", help="List Tasks with bounded filters and pagination.")
     listing.add_argument("--phase")
     listing.add_argument("--group")
+    listing.add_argument("--name", help="Exact, case-sensitive Task name filter.")
     listing.add_argument("--limit", type=int, default=None)
     listing.add_argument("--page-size", default=None)
     listing.add_argument("--cursor", default=None)
-    show = task_sub.add_parser("show")
-    _add_output_format(show)
+    _add_output_format(listing)
+    bind_command(listing, handler="task_list", context="project-read", output="task-list")
+    show = task_sub.add_parser(
+        "show",
+        help="Show one Task and its bounded Attempt history.",
+        description=(
+            "Show one Task. --watch performs screen refreshes; it does not change progress reporting. "
+            "--follow-retries continues onto a later retry."
+        ),
+    )
     show.add_argument("task_id")
-    show.add_argument(
-        "--watch",
-        action="store_true",
-        help="Refresh a compact human Task view; interval controls reads and screen refreshes.",
+    show.add_argument("--watch", action="store_true")
+    show.add_argument("--interval-seconds", default=None)
+    show.add_argument("--follow-retries", action="store_true")
+    _add_output_format(show)
+    bind_command(show, handler="task_show", context="project-read", output="task-show")
+    logs = task_sub.add_parser(
+        "logs",
+        help="Read Task logs or explicitly follow a live byte stream.",
+        description=(
+            "Read finite logs or follow each Attempt and file generation. --follow-retries continues onto a later "
+            "retry."
+        ),
     )
-    show.add_argument(
-        "--interval-seconds",
-        default=None,
-        help="Watch refresh/read cadence in seconds (default: 2); it does not change progress reporting.",
-    )
-    show.add_argument(
-        "--follow-retries",
-        action="store_true",
-        help="Keep watching after a terminal result until a later retry appears.",
-    )
-    logs = task_sub.add_parser("logs")
     logs.add_argument("task_id")
-    logs.add_argument(
-        "--follow",
-        action="store_true",
-        help="Follow application bytes; --tail applies on each Attempt and file generation.",
-    )
-    logs.add_argument(
-        "--tail",
-        default=None,
-        help="Initial lines per Attempt or replacement generation (default: 100; zero means new bytes only).",
-    )
-    logs.add_argument(
-        "--interval-seconds",
-        default=None,
-        help="Follow polling/read cadence in seconds (default: 2).",
-    )
-    logs.add_argument(
-        "--follow-retries",
-        action="store_true",
-        help="Keep following at terminal EOF until a later retry appears.",
-    )
-    dependencies = task_sub.add_parser("dependencies")
+    logs.add_argument("-f", "--follow", action="store_true")
+    logs.add_argument("-n", "--tail", default=None)
+    logs.add_argument("--interval-seconds", default=None)
+    logs.add_argument("--follow-retries", action="store_true")
+    _add_output_format(logs)
+    bind_command(logs, handler="task_logs", context="project-read", output="raw-logs")
+    wait = task_sub.add_parser("wait", help="Wait for one selected Task lifecycle without mutating it.")
+    wait.add_argument("task_id")
+    wait.add_argument("--timeout", default=None)
+    _add_output_format(wait)
+    bind_command(wait, handler="task_wait", context="project-read", output="task-wait")
+    dependencies = task_sub.add_parser("dependencies", help="Inspect or atomically edit Task dependencies.")
     dependencies_sub = dependencies.add_subparsers(dest="dependencies_action", required=True)
     for name in ("show", "replace", "add", "remove"):
-        action = dependencies_sub.add_parser(name)
-        _add_output_format(action)
+        action = dependencies_sub.add_parser(name, help=f"{name.capitalize()} Task dependencies.")
         action.add_argument("task_id")
         if name != "show":
             action.add_argument("--depends-on", action="append", default=[])
-    group = commands.add_parser("group")
+        _add_output_format(action)
+        bind_command(
+            action,
+            handler=f"task_dependencies_{name}",
+            context="project-write" if name != "show" else "project-read",
+            output="dependencies",
+        )
+
+    group = commands.add_parser("group", help="Inspect Groups and control admission, dispatch, and workers.")
     group_sub = group.add_subparsers(dest="group_action", required=True)
-    create = group_sub.add_parser("create")
-    _add_output_format(create)
+    create = group_sub.add_parser("create", help="Create a Group and its initial Worker Set.")
     create.add_argument("name")
     create.add_argument("--workers", nargs="*", default=None)
-    group_list = group_sub.add_parser("list")
+    _add_output_format(create)
+    bind_command(create, handler="group_create", context="project-write", output="group-operation")
+    group_list = group_sub.add_parser("list", help="List Groups in the selected Project.")
     _add_output_format(group_list)
-    show_group = group_sub.add_parser("show")
-    _add_output_format(show_group)
+    bind_command(group_list, handler="group_list", context="project-read", output="group-list")
+    show_group = group_sub.add_parser("show", help="Show one Group and its Worker Set.")
     show_group.add_argument("name")
-    for name in ("seal", "reopen", "pause", "resume", "cancel", "retry-failed"):
-        action = group_sub.add_parser(name)
-        _add_output_format(action)
+    _add_output_format(show_group)
+    bind_command(show_group, handler="group_show", context="project-read", output="group-show")
+    for name in ("seal", "reopen", "pause", "resume", "cancel", "retry"):
+        action = group_sub.add_parser(name, help=f"{name.capitalize()} Group control state.")
         action.add_argument("name")
         if name == "cancel":
-            action.add_argument("--terminate-running", action="store_true")
-    machines = group_sub.add_parser("machines")
-    machines_sub = machines.add_subparsers(dest="machine_action", required=True)
-    for name in ("add", "set", "drain", "remove", "list"):
-        action = machines_sub.add_parser(name)
+            action.add_argument("--all", action="store_true", help="Include launch-authorized and running Tasks.")
         _add_output_format(action)
+        bind_command(action, handler=f"group_{name}", context="project-write", output="group-operation")
+    worker = group_sub.add_parser("worker", help="Manage Group Worker Set membership and lifecycle.")
+    worker_sub = worker.add_subparsers(dest="worker_action", required=True)
+    for name in ("list", "add", "set", "drain", "resume", "remove"):
+        action = worker_sub.add_parser(name, help=f"{name.capitalize()} a Group worker.")
         action.add_argument("group_name")
         if name != "list":
             action.add_argument("worker_machine")
         if name in {"add", "set"}:
             action.add_argument("--role", choices=("primary", "borrow"))
-            gpu_limit = action.add_mutually_exclusive_group()
-            gpu_limit.add_argument("--gpu-limit-gpus", type=_gpu_limit_gpus)
+            action.add_argument("--gpu-limit-gpus", type=_gpu_limit_gpus)
         if name == "remove":
-            action.add_argument("--terminate-running", action="store_true")
-    agent = commands.add_parser("agent")
+            action.add_argument("--all", action="store_true", help="Terminate running work while removing.")
+        _add_output_format(action)
+        bind_command(
+            action,
+            handler=f"group_worker_{name}",
+            context="project-write" if name != "list" else "project-read",
+            output="group-operation",
+        )
+
+    machine = commands.add_parser("machine", help="Inspect declared Project machines.")
+    machine_sub = machine.add_subparsers(dest="machine_action", required=True)
+    machine_list = machine_sub.add_parser("list", help="List bounded machine observations.")
+    _add_output_format(machine_list)
+    bind_command(machine_list, handler="machine_list", context="project-read", output="machines")
+    machine_show = machine_sub.add_parser("show", help="Show one machine declaration and observations.")
+    machine_show.add_argument("name")
+    _add_output_format(machine_show)
+    bind_command(machine_show, handler="machine_show", context="project-read", output="machine-show")
+
+    agent = commands.add_parser("agent", help="Manage the local machine agent and its global resources.")
     agent_sub = agent.add_subparsers(dest="agent_action", required=True)
-    for name in (
-        "start",
-        "run",
-        "restart",
-        "status",
-        "stop",
+    for name in ("start", "run", "restart", "status", "stop"):
+        action = agent_sub.add_parser(name, help=f"{name.capitalize()} the machine-wide local agent.")
+        _add_output_format(action)
+        output = "agent-status" if name == "status" else "agent-operation"
+        bind_command(action, handler=f"agent_{name}", context="machine", output=output)
+    agent_sub.choices["start"].add_argument("--timeout", type=float, default=30.0)
+    agent_name = agent_sub.add_parser("name", help="Show or change the machine-global agent name.")
+    agent_name.add_argument("--set-to", dest="set_to")
+    _add_output_format(agent_name)
+    bind_command(agent_name, handler="agent_name", context="machine", output="agent-config")
+    for legacy_name in (
         "add-project",
         "list-projects",
         "enable-project",
@@ -837,108 +931,175 @@ def build_parser() -> argparse.ArgumentParser:
         "remove-project",
         "migrate-project",
     ):
-        action = agent_sub.add_parser(name)
-        _add_output_format(action)
-    agent_sub.choices["start"].add_argument("--timeout", type=float, default=30.0)
-    agent_sub.choices["name"] = agent_sub.add_parser("name", help="Show or change the machine-global agent name.")
-    _add_output_format(agent_sub.choices["name"])
-    agent_sub.choices["name"].add_argument("--set-to", dest="set_to")
-    cpu_lane = agent_sub.add_parser("cpu-lane")
-    cpu_lane_sub = cpu_lane.add_subparsers(dest="cpu_lane_action", required=True)
-    cpu_lane_show = cpu_lane_sub.add_parser("show")
-    _add_output_format(cpu_lane_show)
-    cpu_lane_set = cpu_lane_sub.add_parser("set")
-    _add_output_format(cpu_lane_set)
-    cpu_lane_set.add_argument("--capacity", type=int, required=True)
-    gpus = agent_sub.add_parser("gpus", help="Inspect or change the machine GPU admission policy.")
+        legacy = agent_sub.add_parser(
+            legacy_name,
+            help="Retired non-executing compatibility diagnostic for Project enrollment commands.",
+        )
+        legacy.add_argument("legacy_selector", nargs="?")
+        if legacy_name == "add-project":
+            legacy.add_argument("--adopt-existing", action="store_true")
+        bind_command(legacy, handler=f"retired_{legacy_name}", context="none", output="diagnostic")
+    agent_config = agent_sub.add_parser("config", help="Inspect or set machine-wide agent resources.")
+    agent_config_sub = agent_config.add_subparsers(dest="agent_config_resource", required=True)
+    gpus = agent_config_sub.add_parser("gpus", help="Inspect or change GPU admission policy.")
     gpus_sub = gpus.add_subparsers(dest="gpu_action", required=True)
-    gpu_show = gpus_sub.add_parser("show")
+    gpu_show = gpus_sub.add_parser("show", help="Show GPU admission policy.")
     _add_output_format(gpu_show)
-    gpu_set = gpus_sub.add_parser("set")
-    _add_output_format(gpu_set)
+    bind_command(gpu_show, handler="agent_config_gpus_show", context="machine", output="gpu-policy")
+    gpu_set = gpus_sub.add_parser("set", help="Set visible GPU IDs or disable GPU admission.")
     gpu_set_values = gpu_set.add_mutually_exclusive_group(required=True)
     gpu_set_values.add_argument("--visible")
     gpu_set_values.add_argument("--none", action="store_true")
     gpu_set.add_argument("--expected-revision", type=int)
-    gpu_reset = gpus_sub.add_parser("reset")
-    _add_output_format(gpu_reset)
+    _add_output_format(gpu_set)
+    bind_command(gpu_set, handler="agent_config_gpus_set", context="machine", output="gpu-policy")
+    gpu_reset = gpus_sub.add_parser("reset", help="Reset GPU admission policy.")
     gpu_reset.add_argument("--expected-revision", type=int)
-    agent_sub.choices["add-project"].add_argument(
-        "--adopt-existing",
-        action="store_true",
-        help="Explicitly reuse a logically owned name after its old write eligibility has expired.",
-    )
-    for name in ("disable-project", "enable-project", "remove-project"):
-        agent_sub.choices[name].add_argument("project")
-    agent_upgrade = agent_sub.add_parser(
-        "upgrade",
-        help="Inspect and advance registered-project rolling upgrades.",
-    )
-    agent_upgrade_sub = agent_upgrade.add_subparsers(dest="agent_upgrade_action", required=True)
-    for name in ("status", "retry", "coordinate"):
-        action = agent_upgrade_sub.add_parser(name)
+    _add_output_format(gpu_reset)
+    bind_command(gpu_reset, handler="agent_config_gpus_reset", context="machine", output="gpu-policy")
+    cpu = agent_config_sub.add_parser("cpu", help="Inspect or set machine-wide CPU lane capacity.")
+    cpu_sub = cpu.add_subparsers(dest="cpu_action", required=True)
+    cpu_show = cpu_sub.add_parser("show", help="Show CPU lane capacity.")
+    _add_output_format(cpu_show)
+    bind_command(cpu_show, handler="agent_config_cpu_show", context="machine", output="cpu-lane")
+    cpu_set = cpu_sub.add_parser("set", help="Set CPU lane capacity.")
+    cpu_set.add_argument("--capacity", type=int, required=True)
+    _add_output_format(cpu_set)
+    bind_command(cpu_set, handler="agent_config_cpu_set", context="machine", output="cpu-lane")
+
+    config = commands.add_parser("config", help="Inspect or set typed Project and global agent configuration.")
+    config_sub = config.add_subparsers(dest="config_action", required=True)
+    config_show = config_sub.add_parser("show", help="Show all Project sections or one typed section.")
+    config_show.add_argument("section", nargs="?", choices=configuration_commands.CONFIG_SECTIONS)
+    _add_output_format(config_show)
+    bind_command(config_show, handler="config_show", context="section", output="config")
+    config_set = config_sub.add_parser("set", help="Set typed options in one configuration section.")
+    config_set.add_argument("section", choices=configuration_commands.CONFIG_SECTIONS)
+    config_set.add_argument("--provider")
+    config_set.add_argument("--name")
+    config_set.add_argument("--agent-mode", choices=("daemon", "on_demand"))
+    config_boolean = config_set.add_mutually_exclusive_group()
+    config_boolean.add_argument("--enabled", action="store_true", default=None)
+    config_boolean.add_argument("--disabled", action="store_true", default=None)
+    config_set.add_argument("--interval-seconds", type=float)
+    config_set.add_argument("--timeout-seconds", type=float)
+    config_set.add_argument("--ttl-seconds", type=int)
+    config_set.add_argument("--renew-interval-seconds", type=float)
+    config_set.add_argument("--max-clock-skew-seconds", type=float)
+    config_set.add_argument("--clock-observation-max-age-seconds", type=float)
+    config_set.add_argument("--clock-provider-margin-seconds", type=float)
+    config_set.add_argument("--clock-provider-priority")
+    config_set.add_argument("--renewal-commit-margin-seconds", type=float)
+    config_set.add_argument("--webhook-env")
+    config_set.add_argument("--credential-source", choices=("env", "shared_file"))
+    config_set.add_argument("--webhook-stdin", action="store_true")
+    config_set.add_argument("--acknowledge-shared-secret-risk", action="store_true")
+    config_set.add_argument("--secret-env")
+    config_set.add_argument("--unset-secret-env", action="store_true")
+    config_set.add_argument("--shared-webhook")
+    _add_output_format(config_set)
+    bind_command(config_set, handler="config_set", context="section", output="config")
+    config_reset = config_sub.add_parser("reset", help="Reset one typed configuration override.")
+    config_reset.add_argument("section", choices=configuration_commands.CONFIG_SECTIONS)
+    config_reset.add_argument("--provider")
+    _add_output_format(config_reset)
+    bind_command(config_reset, handler="config_reset", context="section", output="config")
+
+    admin = commands.add_parser("admin", help="Run bounded Project maintenance and machine upgrade operations.")
+    admin_sub = admin.add_subparsers(dest="admin_action", required=True)
+    for name in ("check", "repair"):
+        action = admin_sub.add_parser(name, help=f"Run bounded metadata {name} checks.")
+        action.add_argument("--strict", action="store_true")
+        action.add_argument("--max-work-items", type=int, default=64)
         _add_output_format(action)
-        action.add_argument("--project", dest="upgrade_project")
-    pause = agent_upgrade_sub.add_parser("pause")
-    _add_output_format(pause)
-    pause.add_argument("--project", dest="upgrade_project", required=True)
-    pause.add_argument("--reason", required=True)
-    inspect = agent_upgrade_sub.add_parser("inspect")
-    _add_output_format(inspect)
-    inspect.add_argument("--project", dest="upgrade_project", required=True)
-    plan = agent_upgrade_sub.add_parser("plan")
-    _add_output_format(plan)
-    plan.add_argument("--project", dest="upgrade_project", required=True)
-    plan.add_argument("--target", required=True)
-    for name in ("apply", "validate"):
-        action = agent_upgrade_sub.add_parser(name)
-        _add_output_format(action)
-        action.add_argument("--project", dest="upgrade_project", required=True)
-        action.add_argument("--repair-id", required=True)
-    resume = agent_upgrade_sub.add_parser("resume")
-    _add_output_format(resume)
-    resume.add_argument("--project", dest="upgrade_project", required=True)
-    top = commands.add_parser("top")
-    _add_output_format(top)
-    machine_list = commands.add_parser("machines")
-    _add_output_format(machine_list)
-    doctor = commands.add_parser("doctor")
-    _add_output_format(doctor)
-    doctor.add_argument("action", choices=["verify", "repair"], default="verify", nargs="?")
-    doctor.add_argument("--strict", action="store_true")
-    doctor.add_argument("--max-work-items", type=int, default=64)
-    clean = commands.add_parser(
+        bind_command(
+            action,
+            handler=f"admin_{name}",
+            context="project-write" if name == "repair" else "project-read",
+            output=f"doctor-{name}",
+        )
+    clean = admin_sub.add_parser(
         "clean",
-        help="Remove terminal qexp metadata while preserving experiment work directories.",
-        description="Remove terminal qexp metadata while preserving experiment work directories.",
+        help="Clean terminal Task metadata under bounded retention rules.",
+        description="Clean retained qexp metadata while preserving experiment work directories.",
     )
-    _add_output_format(clean)
     clean_scope = clean.add_mutually_exclusive_group()
-    clean_scope.add_argument("--task-id", help="Clean one terminal task, regardless of its age.")
-    clean_scope.add_argument("--group", help="Clean terminal tasks in one group subject to retention and limit.")
-    clean.add_argument(
-        "--older-than-days", type=int, default=30, help="Minimum task age for bulk cleanup (default: 30)."
+    clean_scope.add_argument("--task-id")
+    clean_scope.add_argument("--group")
+    clean.add_argument("--older-than-days", type=int, default=30)
+    clean.add_argument("--limit", type=int, default=100)
+    clean.add_argument("--max-work-items", type=int, default=64)
+    clean.add_argument("--dry-run", action="store_true")
+    _add_output_format(clean)
+    bind_command(clean, handler="admin_clean", context="project-write", output="clean")
+    operation = admin_sub.add_parser("operation", help="Inspect one durable asynchronous operation reference.")
+    operation_sub = operation.add_subparsers(dest="operation_action", required=True)
+    operation_show = operation_sub.add_parser("show", help="Inspect a Group, worker, or cleanup operation reference.")
+    operation_show.add_argument("reference")
+    _add_output_format(operation_show)
+    bind_command(operation_show, handler="admin_operation_show", context="project-read", output="operation")
+    admin_upgrade = admin_sub.add_parser("upgrade", help="Inspect or advance machine-global Project upgrades.")
+    admin_upgrade_sub = admin_upgrade.add_subparsers(dest="admin_upgrade_action", required=True)
+    for name in ("status", "advance"):
+        action = admin_upgrade_sub.add_parser(name, help=f"{name.capitalize()} registered Project upgrades.")
+        _add_output_format(action)
+        bind_command(action, handler=f"admin_upgrade_{name}", context="machine", output="upgrade")
+    pause = admin_upgrade_sub.add_parser("pause", help="Pause a registered Project upgrade.")
+    pause.add_argument("--reason", required=True)
+    _add_output_format(pause)
+    bind_command(pause, handler="admin_upgrade_pause", context="registered-project", output="upgrade")
+    plan = admin_upgrade_sub.add_parser("plan", help="Plan a registered Project upgrade repair.")
+    plan.add_argument("--target", required=True)
+    _add_output_format(plan)
+    bind_command(plan, handler="admin_upgrade_plan", context="registered-project", output="upgrade-repair")
+    for name in ("apply", "validate"):
+        action = admin_upgrade_sub.add_parser(name, help=f"{name.capitalize()} a registered Project upgrade repair.")
+        action.add_argument("--repair-id", required=True)
+        _add_output_format(action)
+        bind_command(action, handler=f"admin_upgrade_{name}", context="registered-project", output="upgrade-repair")
+    resume = admin_upgrade_sub.add_parser("resume", help="Resume a registered Project upgrade.")
+    _add_output_format(resume)
+    bind_command(resume, handler="admin_upgrade_resume", context="registered-project", output="upgrade")
+    migrate = admin_sub.add_parser("migrate", help="Run explicit schema and legacy-agent migrations.")
+    migrate_sub = migrate.add_subparsers(dest="migrate_action", required=True)
+    schema = migrate_sub.add_parser("schema", help="Convert an explicit Project to schema 6.")
+    schema.add_argument("--to-schema", type=int, required=True)
+    _add_output_format(schema)
+    bind_command(schema, handler="admin_migrate_schema", context="explicit-project", output="schema6-upgrade")
+    schema6 = migrate_sub.add_parser("schema6", help="Run drained schema-6 capability activation.")
+    schema6_sub = schema6.add_subparsers(dest="schema6_upgrade_action", required=True)
+    for name in ("check", "start", "status"):
+        action = schema6_sub.add_parser(name, help=f"Schema-6 upgrade {name}.")
+        if name != "status":
+            action.add_argument(
+                "--capability", action="append", dest="capabilities", choices=("cpu-lane-v1", "task-dependencies-v1")
+            )
+        _add_output_format(action)
+        bind_command(
+            action, handler=f"admin_migrate_schema6_{name}", context="explicit-project", output="schema6-upgrade"
+        )
+    attest = schema6_sub.add_parser("attest", help="Attest stopped clients for schema-6 activation.")
+    attest.add_argument("--activation-id", required=True)
+    attest.add_argument("--confirm-clients-stopped", action="store_true")
+    _add_output_format(attest)
+    bind_command(attest, handler="admin_migrate_schema6_attest", context="explicit-project", output="schema6-upgrade")
+    resume_schema6 = schema6_sub.add_parser("resume", help="Resume schema-6 activation.")
+    resume_schema6.add_argument("--activation-id", required=True)
+    _add_output_format(resume_schema6)
+    bind_command(
+        resume_schema6, handler="admin_migrate_schema6_resume", context="explicit-project", output="schema6-upgrade"
     )
-    clean.add_argument(
-        "--limit", type=int, default=100, help="Maximum number of bulk-cleanup candidates (default: 100)."
-    )
-    clean.add_argument(
-        "--max-work-items", type=int, default=64, help="Maximum group-member archive entries per cleanup slice."
-    )
-    clean.add_argument("--dry-run", action="store_true", help="Show candidates without cleaning them.")
-    use = commands.add_parser(
-        "use",
-        help="Save local CLI context without initializing or registering a project.",
-        description=(
-            "Save the local default shared root without validating it. "
-            "This command does not initialize a shared root, create a Project machine record, "
-            "or register the project with the local machine agent."
-        ),
-    )
-    use.add_argument("--shared-root", dest="use_shared_root", help="Shared project control root to save.")
-    use.add_argument("--show", action="store_true")
-    use.add_argument("--clear", action="store_true")
-    use.add_argument("--format", choices=("human", "json"))
+    legacy = migrate_sub.add_parser("agent", help="Migrate legacy Project agent metadata.")
+    _add_output_format(legacy)
+    bind_command(legacy, handler="admin_migrate_agent", context="explicit-project", output="agent-operation")
+
+    # Add common options to every ordinary parser level so options can appear
+    # before or after a command path.  Setup parsers retain their feature-owned
+    # explicit options; ``use`` has its own --project selector.
+    ordinary = {"status", "task", "group", "machine", "agent", "config", "admin", "submit"}
+    for name in ordinary:
+        _add_common_options(commands.choices[name], include_format=True)
+    _add_common_options(parser, include_format=False)
     return parser
 
 
@@ -1031,7 +1192,7 @@ def _prepare_submission_request(
     args: argparse.Namespace, raw_argv: list[str], *, invocation_cwd: Path | None = None
 ) -> SubmissionRequest:
     """Validate modes/options and normalize a submission before cfg resolution."""
-    if args.command != "submit":
+    if args.command_spec.handler != "submit":
         raise ValueError("submission request preparation requires submit command.")
     invocation_cwd = Path(invocation_cwd or Path.cwd()).expanduser().resolve()
     try:
@@ -1202,17 +1363,15 @@ def _parse_follow_tail_argument(value: str) -> int:
 
 
 def _is_continuous_task(args: argparse.Namespace) -> bool:
-    return args.command == "task" and (
-        (args.task_action == "show" and bool(getattr(args, "watch", False)))
-        or (args.task_action == "logs" and bool(getattr(args, "follow", False)))
+    return (args.command_spec.handler == "task_show" and bool(getattr(args, "watch", False))) or (
+        args.command_spec.handler == "task_logs" and bool(getattr(args, "follow", False))
     )
 
 
 def _validate_continuous_options(args: argparse.Namespace) -> None:
     """Validate continuous-only flags before resolving a project or reading Task truth."""
-    if args.command != "task":
-        return
-    if args.task_action == "show":
+    handler = args.command_spec.handler
+    if handler == "task_show":
         watch = bool(getattr(args, "watch", False))
         interval = getattr(args, "interval_seconds", None)
         follow_retries = bool(getattr(args, "follow_retries", False))
@@ -1229,19 +1388,19 @@ def _validate_continuous_options(args: argparse.Namespace) -> None:
         if not callable(isatty) or not isatty():
             raise ValueError("--watch requires terminal stdout.")
         return
-    if args.task_action != "logs":
+    if handler != "task_logs":
         return
     follow = bool(getattr(args, "follow", False))
     tail = getattr(args, "tail", None)
     interval = getattr(args, "interval_seconds", None)
     follow_retries = bool(getattr(args, "follow_retries", False))
     if not follow:
-        if tail is not None:
-            raise ValueError("--tail requires --follow.")
         if interval is not None:
             raise ValueError("--interval-seconds requires --follow.")
         if follow_retries:
             raise ValueError("--follow-retries requires --follow.")
+        if tail is not None:
+            args.tail = _parse_follow_tail_argument(tail)
         return
     args.tail = 100 if tail is None else _parse_follow_tail_argument(tail)
     args.interval_seconds = 2 if interval is None else _parse_continuous_interval_argument(interval)
@@ -1320,9 +1479,10 @@ def _upgrade_project_config(runtime: MachineRuntime, identifier: str):
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    global _PAGINATION_JSON_PARSE_MODE, _SUBMISSION_JSON_PARSE_MODE
+    global _JSON_PARSE_MODE, _PAGINATION_JSON_PARSE_MODE, _SUBMISSION_JSON_PARSE_MODE
     _PAGINATION_JSON_PARSE_MODE = _is_paginated_json_argv(raw_argv)
     _SUBMISSION_JSON_PARSE_MODE = _is_submission_json_argv(raw_argv)
+    _JSON_PARSE_MODE = _is_json_argv(raw_argv)
     try:
         args = build_parser().parse_args(raw_argv)
     except _PaginationParseError as exc:
@@ -1333,15 +1493,48 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload))
         print(f"qexp: {exc}", file=sys.stderr)
         return 2
+    except _JsonParseError as exc:
+        if _is_wait_json_argv(raw_argv):
+            return _emit_wait_error(
+                task_id=_raw_wait_task_id(raw_argv),
+                project=None,
+                outcome="invalid_input",
+                reason="invalid_input",
+                code="invalid_input",
+                message=str(exc),
+                exit_code=2,
+            )
+        print(json.dumps({"error": {"code": "invalid_argument", "message": str(exc)}}))
+        return 2
     finally:
         _PAGINATION_JSON_PARSE_MODE = False
         _SUBMISSION_JSON_PARSE_MODE = False
+        _JSON_PARSE_MODE = False
+    resolved_cfg = None
+    selection_source = None
+    handler = args.command_spec.handler
+    command_spec_token = _ACTIVE_COMMAND_SPEC.set(args.command_spec)
     try:
         _validate_continuous_options(args)
-        if args.command == "init":
+        if handler == "task_wait":
+            # Invocation validity is independent of Project discovery.  Check
+            # it first so a bad duration cannot be mislabeled as an
+            # observation failure merely because context is also unavailable.
+            wait_commands.parse_wait_timeout(args.timeout)
+        if getattr(args, "compat_shared_root", None) is not None:
+            # Parse the former root-position locator only far enough to give a
+            # bounded migration diagnostic.  It never participates in normal
+            # Project selection.
+            print(
+                "qexp: QQTOOLS-COMPAT-0014: --shared-root is retired; use "
+                f"'--project {shlex.quote(str(args.compat_shared_root))}'.",
+                file=sys.stderr,
+            )
+            return 2
+        if handler == "init":
             # QQTOOLS-COMPAT-0014: the former project-bound init spelling is
             # retained only as a bounded diagnostic during the transition.
-            if args.init_shared_root or args.shared_root or args.runtime_root or args.cpu_lane_capacity is not None:
+            if args.init_shared_root or args.runtime_root or args.cpu_lane_capacity is not None:
                 print(
                     "qexp: QQTOOLS-COMPAT-0014: qexp init is machine-only. "
                     "Use 'qexp project init PATH' to create shared Project truth, then "
@@ -1397,13 +1590,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             _emit(CliOutput(OutputKind.MACHINE_INIT, result), args.format)
             return 0
-        if args.command == "project":
+        if handler.startswith("project_"):
             runtime = MachineRuntime(args.machine_runtime_root)
-            if args.project_action == "init":
+            if handler == "project_init":
                 result = initialize_project(args.path)
                 _emit(CliOutput(OutputKind.PROJECT_OPERATION, result), args.format)
                 return 0
-            if args.project_action == "register":
+            if handler == "project_register":
                 project_machine = args.project_machine
                 if project_machine is not None and args.machine is not None and project_machine != args.machine:
                     raise ValueError("project register --machine conflicts with the global --machine assertion.")
@@ -1419,43 +1612,42 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(CliOutput(OutputKind.PROJECT_REGISTER, result), args.format)
                 statuses = [item.get("status") for item in result.get("projects", ())]
                 return 0 if not statuses or all(item in {"registered", "disabled"} for item in statuses) else 2
-            if args.project_action == "list":
+            if handler == "project_list":
                 _emit(CliOutput(OutputKind.PROJECT_LIST, list_projects(runtime)), args.format)
                 return 0
-            if args.project_action == "remove":
+            if handler == "project_remove":
                 result = remove_project(runtime, args.selector)
             else:
-                result = set_project_enablement(runtime, args.selector, args.project_action == "enable")
+                result = set_project_enablement(runtime, args.selector, handler == "project_enable")
             _emit(CliOutput(OutputKind.PROJECT_OPERATION, result), args.format)
             return 0
-        if args.command == "config" and (
-            args.config_action == "agent" or (args.config_action in {"show", "set"} and args.config_target == "agent")
-        ):
+        if handler in {"config_show", "config_set", "config_reset"} and getattr(args, "section", None) == "agent":
             runtime = MachineRuntime(args.machine_runtime_root)
-            config_action = args.agent_config_action if args.config_action == "agent" else args.config_action
-            if config_action == "show":
-                result = get_agent_config(runtime)
+            if handler == "config_show":
+                result = configuration_commands.show_config("agent", cfg=None, runtime=runtime)
+            elif handler == "config_set":
+                values = {
+                    key: value
+                    for key, value in {"name": args.name, "agent_mode": args.agent_mode}.items()
+                    if value is not None
+                }
+                result = configuration_commands.set_config(
+                    "agent", cfg=None, runtime=runtime, provider=args.provider, values=values
+                )
             else:
-                if args.name is None and args.agent_mode is None:
-                    raise ValueError("config set agent requires --name or --agent-mode.")
-                set_agent_config(runtime, name=args.name, agent_mode=args.agent_mode)
-                result = get_agent_config(runtime)
-            _emit(CliOutput(OutputKind.AGENT_CONFIG, result), args.format)
+                # Agent configuration is machine-global and has no reset
+                # default.  Reject it without resolving a Project context.
+                result = configuration_commands.reset_config("agent", cfg=None, runtime=runtime)
+            _emit(CliOutput(OutputKind.CONFIG, result), args.format)
             return 0
-        if args.command == "agent" and args.agent_action == "name":
+        if handler == "agent_name":
             runtime = MachineRuntime(args.machine_runtime_root)
             if args.set_to is not None:
                 set_agent_config(runtime, name=args.set_to)
             result = agent_config_payload(runtime)
             _emit(CliOutput(OutputKind.AGENT_CONFIG, result), args.format)
             return 0
-        if args.command == "agent" and args.agent_action in {
-            "add-project",
-            "list-projects",
-            "enable-project",
-            "disable-project",
-            "remove-project",
-        }:
+        if handler.startswith("retired_"):
             # QQTOOLS-COMPAT-0014: retired executing routes fail before any
             # runtime/configuration resolution or state creation.
             replacement = {
@@ -1464,15 +1656,16 @@ def main(argv: list[str] | None = None) -> int:
                 "enable-project": "qexp project enable SELECTOR",
                 "disable-project": "qexp project disable SELECTOR",
                 "remove-project": "qexp project remove SELECTOR",
-            }[args.agent_action]
+                "migrate-project": "qexp admin migrate agent --project PATH --machine NAME",
+            }[handler.removeprefix("retired_")]
             print(
                 f"qexp: QQTOOLS-COMPAT-0014: retired command; use '{replacement}'.",
                 file=sys.stderr,
             )
             return 2
-        if args.command == "agent" and args.agent_action in {"start", "run"}:
+        if handler in {"agent_start", "agent_run"}:
             runtime = MachineRuntime(args.machine_runtime_root)
-            if args.agent_action == "start" and (
+            if handler == "agent_start" and (
                 isinstance(args.timeout, bool) or not math.isfinite(args.timeout) or args.timeout <= 0
             ):
                 raise ValueError("agent start timeout must be a positive finite number of seconds.")
@@ -1483,7 +1676,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = evaluate_readiness(runtime, snapshot)
                 _emit(CliOutput(OutputKind.AGENT_READINESS, result), args.format)
                 return 2
-            if args.agent_action == "run":
+            if handler == "agent_run":
                 from .agent.lifecycle import run_machine_agent_loop
 
                 run_machine_agent_loop(runtime)
@@ -1494,101 +1687,13 @@ def main(argv: list[str] | None = None) -> int:
                 ready = wait_for_readiness(runtime, snapshot, timeout_seconds=args.timeout)
             _emit(CliOutput(OutputKind.AGENT_READINESS, ready), args.format)
             return 0 if ready["ready"] else 2
-        if args.command == "migrate":
-            if not args.shared_root or not args.machine:
-                raise ValueError("migrate requires --shared-root and --machine.")
-            if args.to_schema != 6:
-                raise ValueError("only --to-schema 6 is supported.")
-            root = Path(args.shared_root).expanduser().resolve()
-            runtime = Path(args.runtime_root) if args.runtime_root else root.parent / ".qexp-runtime" / args.machine
-            migrate_schema5_to_schema6(RootConfig(root, root.parent, args.machine, runtime))
-            print(root)
-            return 0
-        if args.command == "upgrade":
-            if args.upgrade_feature == "coordinator":
-                runtime = MachineRuntime(args.machine_runtime_root)
-                project = getattr(args, "upgrade_project", None)
-                if project is None:
-                    result = advance_registered_upgrades(runtime, force_discovery=True)
-                else:
-                    result = UpgradeCoordinator(_upgrade_project_config(runtime, project)).advance(force_retry=True)
-                _emit(
-                    CliOutput(
-                        OutputKind.UPGRADE_PROJECT if project is not None else OutputKind.UPGRADE_ADVANCE,
-                        result,
-                    ),
-                    args.format,
-                )
-                return 0
-            if not args.shared_root:
-                raise ValueError("schema-6 upgrade requires an explicit --shared-root.")
-            machine = args.machine or "upgrade-coordinator"
-            runtime = Path(args.runtime_root) if args.runtime_root else None
-            cfg = load_root_config(args.shared_root, machine, runtime, require_initialized=False)
-            if args.upgrade_feature == "schema6":
-                if args.schema6_upgrade_action == "check":
-                    _emit(
-                        CliOutput(
-                            OutputKind.SCHEMA6_UPGRADE,
-                            check_schema6_upgrade(
-                                cfg,
-                                capabilities=args.capabilities,
-                                machine_runtime_root=args.machine_runtime_root,
-                            ),
-                        ),
-                        args.format,
-                    )
-                    return 0
-                if args.schema6_upgrade_action == "status":
-                    _emit(CliOutput(OutputKind.SCHEMA6_UPGRADE, schema6_upgrade_status(cfg)), args.format)
-                    return 0
-                if args.schema6_upgrade_action == "start":
-                    _emit(
-                        CliOutput(
-                            OutputKind.SCHEMA6_UPGRADE,
-                            start_schema6_upgrade(
-                                cfg,
-                                capabilities=args.capabilities,
-                                machine_runtime_root=args.machine_runtime_root,
-                            ),
-                        ),
-                        args.format,
-                    )
-                    return 0
-                if args.schema6_upgrade_action == "resume":
-                    _emit(
-                        CliOutput(
-                            OutputKind.SCHEMA6_UPGRADE,
-                            resume_schema6_upgrade(
-                                cfg,
-                                activation_id=args.activation_id,
-                                machine_runtime_root=args.machine_runtime_root,
-                            ),
-                        ),
-                        args.format,
-                    )
-                    return 0
-                if not args.confirm_clients_stopped or not args.machine:
-                    raise ValueError("attest requires --machine and --confirm-clients-stopped.")
-                _emit(
-                    CliOutput(
-                        OutputKind.SCHEMA6_UPGRADE,
-                        attest_schema6_upgrade(
-                            cfg,
-                            activation_id=args.activation_id,
-                            machine_name=args.machine,
-                            machine_runtime_root=args.machine_runtime_root,
-                        ),
-                    ),
-                    args.format,
-                )
-                return 0
-        if args.command == "use":
-            is_selecting = args.use_shared_root is not None
+        if handler == "use":
+            use_project = args.use_project if args.use_project is not None else getattr(args, "project", None)
+            is_selecting = use_project is not None
             if sum((is_selecting, args.show, args.clear)) != 1:
-                raise ValueError("use requires exactly one of --shared-root, --show, or --clear.")
-            if args.machine is not None or args.runtime_root is not None:
-                raise ValueError("qexp use accepts only --shared-root, --show, or --clear.")
+                raise ValueError("use requires exactly one of --project, --show, or --clear.")
+            if args.machine is not None or args.runtime_root is not None or args.machine_runtime_root is not None:
+                raise ValueError("qexp use accepts only --project, --show, or --clear.")
             if args.clear:
                 clear_context()
                 return 0
@@ -1602,61 +1707,18 @@ def main(argv: list[str] | None = None) -> int:
                     args.format or "human",
                 )
                 return 0
-            if args.format:
-                raise ValueError("--format requires --show.")
-            if not args.use_shared_root:
-                raise ValueError("use requires a non-empty --shared-root.")
-            save_context(args.use_shared_root)
+            if not use_project:
+                raise ValueError("use requires a non-empty --project.")
+            save_context(context_commands.normalize_project_path(use_project))
             return 0
-        if args.command == "agent" and args.agent_action in {
-            "status",
-            "list-projects",
-            "disable-project",
-            "enable-project",
-            "remove-project",
-            "stop",
-            "restart",
-        }:
+        if handler in {"agent_status", "agent_stop", "agent_restart"}:
             runtime = MachineRuntime(args.machine_runtime_root)
-            if args.agent_action == "status":
+            if handler == "agent_status":
                 _emit(
                     CliOutput(OutputKind.AGENT_STATUS, {"action": "status", **get_machine_agent_status(runtime)}),
                     args.format,
                 )
-            elif args.agent_action == "list-projects":
-                _emit(
-                    CliOutput(
-                        OutputKind.AGENT_PROJECT_LIST,
-                        {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]},
-                    ),
-                    args.format,
-                )
-            elif args.agent_action == "disable-project":
-                binding = set_project_enabled(runtime, args.project, False)
-                _emit(
-                    CliOutput(OutputKind.AGENT_OPERATION, {"action": "project_disabled", **binding.to_dict()}),
-                    args.format,
-                )
-            elif args.agent_action == "enable-project":
-                binding = enable_project(runtime, args.project)
-                _emit(
-                    CliOutput(
-                        OutputKind.AGENT_OPERATION,
-                        {
-                            "action": "project_enabled",
-                            **binding.to_dict(),
-                            "message": "Project registration checks passed; new task admission is enabled.",
-                        },
-                    ),
-                    args.format,
-                )
-            elif args.agent_action == "remove-project":
-                binding = unregister_project(runtime, args.project)
-                _emit(
-                    CliOutput(OutputKind.AGENT_OPERATION, {"action": "project_removed", **binding.to_dict()}),
-                    args.format,
-                )
-            elif args.agent_action == "stop":
+            elif handler == "agent_stop":
                 stopped = stop_machine_agent(runtime)
                 _emit(
                     CliOutput(
@@ -1680,39 +1742,60 @@ def main(argv: list[str] | None = None) -> int:
                     args.format,
                 )
             return 0
-        if args.command == "agent" and args.agent_action == "upgrade":
+        if handler.startswith("agent_config_"):
             runtime = MachineRuntime(args.machine_runtime_root)
-            action = args.agent_upgrade_action
-            project = getattr(args, "upgrade_project", None)
-            if action == "status":
-                if project is None:
-                    result = inspect_registered_upgrades(runtime)
+            if handler.startswith("agent_config_gpus_"):
+                runtime.ensure_layout()
+                if handler == "agent_config_gpus_show":
+                    result = show_gpu_policy(runtime)
+                elif handler == "agent_config_gpus_reset":
+                    result = reset_gpu_policy(runtime, expected_revision=args.expected_revision)
                 else:
-                    result = UpgradeCoordinator(_upgrade_project_config(runtime, project)).status()
-                _emit(
-                    CliOutput(
-                        OutputKind.UPGRADE_REGISTRY_STATUS if project is None else OutputKind.UPGRADE_PROJECT,
-                        result,
-                    ),
-                    args.format,
-                )
+                    configured = () if args.none else parse_gpu_id_list(args.visible)
+                    result = set_gpu_policy(runtime, configured, expected_revision=args.expected_revision)
+                result["machine_runtime_root"] = str(runtime.root)
+                _emit(CliOutput(OutputKind.GPU_POLICY, result), args.format)
                 return 0
-            if action in {"retry", "coordinate"}:
+            runtime.ensure_layout()
+            policy = (
+                set_cpu_lane_capacity(runtime.root, capacity=args.capacity)
+                if handler == "agent_config_cpu_set"
+                else get_cpu_lane_policy(runtime.root)
+            )
+            _emit(
+                CliOutput(
+                    OutputKind.CPU_LANE,
+                    {"machine_runtime_root": str(runtime.root), "cpu_lane": policy.to_dict},
+                ),
+                args.format,
+            )
+            return 0
+
+        if handler.startswith("admin_upgrade_"):
+            runtime = MachineRuntime(args.machine_runtime_root)
+            action = handler.removeprefix("admin_upgrade_")
+            project = getattr(args, "project", None)
+            if action in {"status", "advance"}:
                 if project is None:
-                    result = advance_registered_upgrades(runtime, force_discovery=True)
+                    result = (
+                        inspect_registered_upgrades(runtime)
+                        if action == "status"
+                        else advance_registered_upgrades(runtime, force_discovery=True)
+                    )
+                    kind = OutputKind.UPGRADE_REGISTRY_STATUS if action == "status" else OutputKind.UPGRADE_ADVANCE
                 else:
-                    result = UpgradeCoordinator(_upgrade_project_config(runtime, project)).advance(force_retry=True)
-                _emit(
-                    CliOutput(OutputKind.UPGRADE_ADVANCE if project is None else OutputKind.UPGRADE_PROJECT, result),
-                    args.format,
-                )
+                    selected = _upgrade_project_config(runtime, project)
+                    coordinator = UpgradeCoordinator(selected)
+                    result = coordinator.status() if action == "status" else coordinator.advance(force_retry=True)
+                    kind = OutputKind.UPGRADE_PROJECT
+                _emit(CliOutput(kind, result), args.format)
                 return 0
-            cfg = _upgrade_project_config(runtime, project)
-            coordinator = UpgradeCoordinator(cfg)
+            if project is None:
+                raise ValueError(f"admin upgrade {action} requires explicit --project PATH.")
+            selected = _upgrade_project_config(runtime, project)
+            coordinator = UpgradeCoordinator(selected)
             if action == "pause":
                 result = coordinator.request_pause(args.reason)
-            elif action == "inspect":
-                result = coordinator.status()
             elif action == "plan":
                 result = coordinator.inspect_repair(args.target)
             elif action == "apply":
@@ -1721,40 +1804,88 @@ def main(argv: list[str] | None = None) -> int:
                 result = coordinator.validate_repair(args.repair_id)
             else:
                 result = coordinator.resume()
-            output_kind = (
-                OutputKind.UPGRADE_REPAIR if action in {"plan", "apply", "validate"} else OutputKind.UPGRADE_PROJECT
+            kind = OutputKind.UPGRADE_REPAIR if action in {"plan", "apply", "validate"} else OutputKind.UPGRADE_PROJECT
+            _emit(CliOutput(kind, result, {"action": action}), args.format)
+            return 0
+
+        if handler.startswith("admin_migrate_"):
+            if args.project is None:
+                raise ValueError("admin migrate requires explicit --project PATH.")
+            selection_path = context_commands.normalize_project_path(args.project)
+            machine = args.machine or "upgrade-coordinator"
+            cfg = load_root_config(
+                selection_path,
+                machine,
+                getattr(args, "runtime_root", None),
+                require_initialized=False,
             )
-            _emit(CliOutput(output_kind, result, {"action": action}), args.format)
-            return 0
-        if args.command == "agent" and args.agent_action == "cpu-lane":
-            runtime = MachineRuntime(args.machine_runtime_root)
-            runtime.ensure_layout()
-            if args.cpu_lane_action == "set":
-                policy = set_cpu_lane_capacity(runtime.root, capacity=args.capacity)
-            else:
-                policy = get_cpu_lane_policy(runtime.root)
-            _emit(CliOutput(OutputKind.CPU_LANE, {"cpu_lane": policy.to_dict}), args.format)
-            return 0
-        if args.command == "agent" and args.agent_action == "gpus":
-            runtime = MachineRuntime(args.machine_runtime_root)
-            runtime.ensure_layout()
-            if args.gpu_action == "show":
-                result = show_gpu_policy(runtime)
-            elif args.gpu_action == "reset":
-                result = reset_gpu_policy(runtime, expected_revision=args.expected_revision)
-            else:
-                configured = () if args.none else parse_gpu_id_list(args.visible)
-                result = set_gpu_policy(
-                    runtime,
-                    configured,
-                    expected_revision=args.expected_revision,
+            if handler == "admin_migrate_schema":
+                if args.to_schema != 6:
+                    raise ValueError("only --to-schema 6 is supported.")
+                migrate_schema5_to_schema6(cfg)
+                _emit(
+                    CliOutput(OutputKind.SCHEMA6_UPGRADE, {"phase": "completed", "project": str(cfg.project_root)}),
+                    args.format,
                 )
-            _emit(CliOutput(OutputKind.GPU_POLICY, result), args.format)
+                return 0
+            if handler == "admin_migrate_agent":
+                if args.machine is None:
+                    raise ValueError("admin migrate agent requires --machine NAME.")
+                runtime = MachineRuntime(args.machine_runtime_root)
+                binding = migrate_project(runtime, cfg)
+                _process, agent_status = ensure_machine_agent_started(runtime)
+                _emit(
+                    CliOutput(
+                        OutputKind.AGENT_OPERATION,
+                        {
+                            "action": "project_migrated",
+                            **binding.to_dict(),
+                            **agent_status,
+                            "migration_candidates": [],
+                        },
+                    ),
+                    args.format,
+                )
+                return 0
+            action = handler.removeprefix("admin_migrate_schema6_")
+            if action == "check":
+                result = check_schema6_upgrade(
+                    cfg,
+                    capabilities=args.capabilities,
+                    machine_runtime_root=args.machine_runtime_root,
+                )
+            elif action == "status":
+                result = schema6_upgrade_status(cfg)
+            elif action == "start":
+                result = start_schema6_upgrade(
+                    cfg,
+                    capabilities=args.capabilities,
+                    machine_runtime_root=args.machine_runtime_root,
+                )
+            elif action == "resume":
+                result = resume_schema6_upgrade(
+                    cfg,
+                    activation_id=args.activation_id,
+                    machine_runtime_root=args.machine_runtime_root,
+                )
+            else:
+                if not args.confirm_clients_stopped or args.machine is None:
+                    raise ValueError("attest requires --machine and --confirm-clients-stopped.")
+                result = attest_schema6_upgrade(
+                    cfg,
+                    activation_id=args.activation_id,
+                    machine_name=args.machine,
+                    machine_runtime_root=args.machine_runtime_root,
+                )
+            _emit(CliOutput(OutputKind.SCHEMA6_UPGRADE, result), args.format)
             return 0
-        if args.command == "submit":
+        if handler in {"admin_check", "admin_repair", "admin_clean"} and getattr(args, "project", None) is None:
+            raise ValueError(f"admin {handler.removeprefix('admin_')} requires explicit --project PATH.")
+        if handler == "submit":
             _prepare_submission_request(args, raw_argv, invocation_cwd=Path.cwd())
-        cfg, execution_context = _resolve_cfg(args, require_binding=_requires_verified_binding(args))
-        if args.command == "submit":
+        cfg, execution_context, selection_source = _resolve_cfg(args, require_binding=_requires_verified_binding(args))
+        resolved_cfg = cfg
+        if handler == "submit":
             args._submission_cfg_resolved = True
 
         def get_execution_context() -> ExecutionContext:
@@ -1763,150 +1894,61 @@ def main(argv: list[str] | None = None) -> int:
         def get_lifecycle_kwargs() -> dict[str, MachineRuntime]:
             return {"machine_runtime": execution_context.machine_runtime}
 
-        if args.command == "config":
-            if args.config_action == "tmux":
-                if args.tmux_action == "show":
-                    _emit(CliOutput(OutputKind.TMUX_POLICY, show_tmux_policy(cfg)), args.format)
-                    return 0
-                _emit(
-                    CliOutput(
-                        OutputKind.TMUX_POLICY,
-                        set_tmux_policy(cfg, args.enabled),
-                    ),
-                    args.format,
-                )
-                return 0
-            if args.config_action == "progress":
-                if args.progress_action == "show":
-                    _emit(CliOutput(OutputKind.PROGRESS_POLICY, show_progress_policy(cfg)), args.format)
-                    return 0
-                _emit(
-                    CliOutput(
-                        OutputKind.PROGRESS_POLICY,
-                        set_progress_policy(cfg, _parse_progress_interval_argument(args.interval_seconds)),
-                    ),
-                    args.format,
-                )
-                return 0
-            if args.config_action == "launch-handoff":
-                if args.launch_handoff_action == "show":
-                    _emit(CliOutput(OutputKind.LAUNCH_HANDOFF_POLICY, show_launch_handoff_policy(cfg)), args.format)
-                    return 0
-                _emit(
-                    CliOutput(
-                        OutputKind.LAUNCH_HANDOFF_POLICY,
-                        set_launch_handoff_policy(
-                            cfg,
-                            _parse_launch_handoff_timeout_argument(args.timeout_seconds),
-                        ),
-                    ),
-                    args.format,
-                )
-                return 0
-            if args.config_action != "notifications":
-                raise ValueError("unknown config action")
-            if args.notifications_action == "show":
-                _emit(CliOutput(OutputKind.NOTIFICATIONS, load_notifications(cfg)), args.format)
-                return 0
-            if args.notifications_action == "set":
+        if handler.startswith("config_"):
+            section = getattr(args, "section", None)
+            if handler == "config_show":
+                result = configuration_commands.show_config(section, cfg=cfg, runtime=execution_context.machine_runtime)
+            elif handler == "config_set":
                 if args.enabled and args.disabled:
                     raise ValueError("--enabled and --disabled are mutually exclusive")
-                if not args.enabled and not args.disabled:
-                    raise ValueError("one of --enabled or --disabled is required")
-                value = update_notifications(
-                    cfg,
-                    lambda current: {
-                        **current,
-                        "enabled": args.enabled,
-                    },
-                )
-                _emit(CliOutput(OutputKind.NOTIFICATIONS, value), args.format)
-                return 0
-            if args.provider_action == "set":
-                if args.provider != "feishu":
-                    raise ValueError(f"unknown notification provider {args.provider!r}")
-                if args.enabled and args.disabled:
-                    raise ValueError("--enabled and --disabled are mutually exclusive")
-                if args.secret_env and args.unset_secret_env:
-                    raise ValueError("--secret-env and --unset-secret-env are mutually exclusive")
-                if args.webhook_stdin and args.credential_source != "shared_file":
-                    raise ValueError("--webhook-stdin requires --credential-source shared_file")
-                if args.credential_source == "shared_file" and not args.acknowledge_shared_secret_risk:
-                    raise ValueError("--credential-source shared_file requires --acknowledge-shared-secret-risk")
-                shared_webhook = None
+                values = {
+                    key: value
+                    for key, value in {
+                        "name": args.name,
+                        "agent_mode": args.agent_mode,
+                        "enabled": True if args.enabled else False if args.disabled else None,
+                        "interval_seconds": args.interval_seconds,
+                        "timeout_seconds": args.timeout_seconds,
+                        "ttl_seconds": args.ttl_seconds,
+                        "renew_interval_seconds": args.renew_interval_seconds,
+                        "max_clock_skew_seconds": args.max_clock_skew_seconds,
+                        "clock_observation_max_age_seconds": args.clock_observation_max_age_seconds,
+                        "clock_provider_margin_seconds": args.clock_provider_margin_seconds,
+                        "clock_provider_priority": args.clock_provider_priority,
+                        "renewal_commit_margin_seconds": args.renewal_commit_margin_seconds,
+                        "webhook_env": args.webhook_env,
+                        "credential_source": args.credential_source,
+                        "secret_env": None if args.unset_secret_env else args.secret_env,
+                        "acknowledge_shared_secret_risk": args.acknowledge_shared_secret_risk or None,
+                        "shared_webhook": args.shared_webhook,
+                    }.items()
+                    if value is not None
+                }
                 if args.webhook_stdin:
-                    shared_webhook = sys.stdin.readline().rstrip("\r\n")
-                    if not shared_webhook:
+                    if args.credential_source != "shared_file":
+                        raise ValueError("--webhook-stdin requires --credential-source shared_file")
+                    values["shared_webhook"] = sys.stdin.readline().rstrip("\r\n")
+                    if not values["shared_webhook"]:
                         raise ValueError("--webhook-stdin requires a non-empty first input line")
-
-                def update_provider(current):
-                    providers = dict(current["providers"])
-                    provider_value = dict(
-                        providers.get(
-                            "feishu",
-                            {
-                                "enabled": False,
-                                "webhook_env": DEFAULT_WEBHOOK_ENV,
-                                "secret_env": None,
-                                "timeout_seconds": 5,
-                                "credential_source": "env",
-                            },
-                        )
-                    )
-                    if args.enabled:
-                        provider_value["enabled"] = True
-                    if args.disabled:
-                        provider_value["enabled"] = False
-                    if args.credential_source is not None:
-                        provider_value["credential_source"] = args.credential_source
-                    if args.webhook_env is not None:
-                        provider_value["webhook_env"] = args.webhook_env
-                    if args.secret_env is not None:
-                        provider_value["secret_env"] = args.secret_env
-                    if args.unset_secret_env:
-                        provider_value["secret_env"] = None
-                    if args.timeout_seconds is not None:
-                        provider_value["timeout_seconds"] = args.timeout_seconds
-                    providers["feishu"] = provider_value
-                    return {**current, "providers": providers}
-
-                value = update_notifications(cfg, update_provider)
-                if shared_webhook is not None:
-                    write_shared_feishu_webhook(cfg, shared_webhook)
-                _emit(CliOutput(OutputKind.NOTIFICATIONS, value), args.format)
-                return 0
-        if args.command == "lease-policy" or (args.command == "config" and args.config_action == "lease"):
-            current = load_lease_policy(cfg)
-            if args.lease_policy_action == "show":
-                _emit(CliOutput(OutputKind.LEASE_POLICY, {"lease_policy": asdict(current)}), args.format)
-                return 0
-            has_active_claim = any(
-                bool(data.get("task", {}).get("claim_control", {}).get("active_claim"))
-                for path in iter_json(shared_paths(cfg.shared_root)["tasks"])
-                for data in [read_json(path)]
-            )
-            if has_active_claim:
-                raise RuntimeError("lease policy cannot change while an active claim exists.")
-            values = asdict(current)
-            for field, value in {
-                "ttl_seconds": args.ttl_seconds,
-                "renew_interval_seconds": args.renew_interval_seconds,
-                "max_clock_skew_seconds": args.max_clock_skew_seconds,
-                "clock_observation_max_age_seconds": args.clock_observation_max_age_seconds,
-                "clock_provider_margin_seconds": args.clock_provider_margin_seconds,
-                "renewal_commit_margin_seconds": args.renewal_commit_margin_seconds,
-            }.items():
-                if value is not None:
-                    values[field] = value
-            if args.clock_provider_priority is not None:
-                values["clock_provider_priority"] = tuple(
-                    item.strip() for item in args.clock_provider_priority.split(",") if item.strip()
+                result = configuration_commands.set_config(
+                    section,
+                    cfg=cfg,
+                    runtime=execution_context.machine_runtime,
+                    provider=args.provider,
+                    values=values,
                 )
-            updated = LeasePolicy(**values)
-            save_lease_policy(cfg, updated)
-            _emit(CliOutput(OutputKind.LEASE_POLICY, {"lease_policy": values}), args.format)
+            else:
+                result = configuration_commands.reset_config(
+                    section,
+                    cfg=cfg,
+                    runtime=execution_context.machine_runtime,
+                    provider=args.provider,
+                )
+            _emit(CliOutput(OutputKind.CONFIG, result), args.format)
+            if handler == "config_show" and section is None and result.get("complete") is False:
+                return 1
             return 0
-        if args.command == "submit":
+        if handler == "submit":
 
             def print_prepared(operation_id: str, idempotency_key: str) -> None:
                 args._submission_prepared_operation_id = operation_id
@@ -1958,9 +2000,10 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 _emit(CliOutput(OutputKind.SUBMISSION, payload, presentation), args.format)
             return 0
-        if args.command == "task":
-            if args.task_action == "dependencies":
-                if args.dependencies_action == "show":
+        if handler.startswith("task_"):
+            if handler.startswith("task_dependencies_"):
+                dependency_action = handler.removeprefix("task_dependencies_")
+                if handler == "task_dependencies_show":
                     task_value = task_commands.load_task(cfg, args.task_id)
                     _emit(
                         CliOutput(
@@ -1971,7 +2014,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 else:
                     task_value = task_commands.edit_dependencies(
-                        cfg, args.task_id, args.depends_on, action=args.dependencies_action
+                        cfg, args.task_id, args.depends_on, action=dependency_action
                     )
                     _emit(
                         CliOutput(
@@ -1981,7 +2024,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.format,
                     )
                 return 0
-            if args.task_action == "cancel":
+            if handler == "task_cancel":
                 context = get_execution_context()
                 task_value = task_commands.cancel(cfg, args.task_id, reservation_runtime_root=context.reservation_root)
                 claim = task_value.claim_control.get("active_claim") or {}
@@ -2000,23 +2043,36 @@ def main(argv: list[str] | None = None) -> int:
                             "operation_state": "waiting_ack" if is_pending else "completed",
                             "pending_acknowledgement": is_pending,
                             "termination_acknowledged_at": task_value.control.get("termination_acknowledged_at"),
+                            "follow_up_command": f"qexp task show {shlex.quote(task_value.task_id)} --project {shlex.quote(str(cfg.project_root))}",
                         },
                     ),
                     args.format,
                 )
-            elif args.task_action == "retry":
+            elif handler == "task_retry":
+                if args.quiet and args.format == "json":
+                    raise ValueError("--quiet cannot be combined with --format json.")
                 ensure_local_agent_active(cfg, reason="task-retry", **get_lifecycle_kwargs())
-                task_value = task_commands.retry(
-                    cfg,
-                    args.task_id,
-                    acknowledge_duplicate_risk=args.acknowledge_duplicate_risk,
-                )
-                print(task_value.task_id)
-            elif args.task_action == "offer":
+                task_value = task_commands.retry(cfg, args.task_id)
+                if args.quiet or args.format == "human":
+                    print(task_value.task_id)
+                else:
+                    _emit(
+                        CliOutput(
+                            OutputKind.TASK_OPERATION,
+                            {
+                                "action": "retry",
+                                "task_id": task_value.task_id,
+                                "task_state": task_value.state["projection"],
+                                "operation_state": "accepted",
+                            },
+                        ),
+                        args.format,
+                    )
+            elif handler == "task_offer":
                 ensure_local_agent_active(cfg, reason="task-offer", **get_lifecycle_kwargs())
                 result = task_commands.offer(cfg, args.task_id)
                 _emit(CliOutput(OutputKind.AVAILABILITY, result.to_dict()), args.format)
-            elif args.task_action == "share":
+            elif handler == "task_share":
                 after_seconds = _duration_seconds(args.after) if args.after is not None else None
                 ensure_local_agent_active(cfg, reason="task-share", **get_lifecycle_kwargs())
                 result = task_commands.share(
@@ -2026,12 +2082,15 @@ def main(argv: list[str] | None = None) -> int:
                     helper_machines=_split_machine_list(args.helper_machines),
                 )
                 _emit(CliOutput(OutputKind.AVAILABILITY, result.to_dict()), args.format)
-            elif args.task_action == "keep-local":
-                ensure_local_agent_active(cfg, reason="task-keep-local", **get_lifecycle_kwargs())
+            elif handler == "task_unshare":
+                ensure_local_agent_active(cfg, reason="task-unshare", **get_lifecycle_kwargs())
                 result = task_commands.keep_local(cfg, args.task_id)
                 _emit(CliOutput(OutputKind.AVAILABILITY, result.to_dict()), args.format)
-            elif args.task_action == "list":
-                is_paginated = args.page_size is not None or args.cursor is not None
+            elif handler == "task_list":
+                # Exact-name lookup is index-backed even when callers do not opt into
+                # explicit pagination.  This keeps the daily lookup path bounded and
+                # gives it the same cursor/filter integrity guarantees as a page query.
+                is_paginated = args.page_size is not None or args.cursor is not None or args.name is not None
                 if is_paginated:
                     if args.limit is not None:
                         raise ObservationError(
@@ -2044,6 +2103,7 @@ def main(argv: list[str] | None = None) -> int:
                         cfg,
                         phase=args.phase,
                         group=args.group,
+                        name=args.name,
                         page_size=page_size,
                         cursor=args.cursor,
                     )
@@ -2053,11 +2113,15 @@ def main(argv: list[str] | None = None) -> int:
                     _emit(
                         CliOutput(
                             OutputKind.TASK_LIST,
-                            observer.list_tasks(cfg, phase=args.phase, group=args.group, limit=limit),
+                            [
+                                item
+                                for item in observer.list_tasks(cfg, phase=args.phase, group=args.group, limit=limit)
+                                if args.name is None or item.get("name") == args.name
+                            ],
                         ),
                         args.format,
                     )
-            elif args.task_action == "show":
+            elif handler == "task_show":
                 if args.watch:
                     try:
                         return watch_commands.watch_task(
@@ -2072,7 +2136,7 @@ def main(argv: list[str] | None = None) -> int:
                     except BrokenPipeError:
                         return 0
                 _emit(CliOutput(OutputKind.TASK_SHOW, observer.inspect_task(cfg, args.task_id)), args.format)
-            elif args.task_action == "logs":
+            elif handler == "task_logs":
                 if args.follow:
                     try:
                         return log_commands.follow_logs(
@@ -2086,29 +2150,33 @@ def main(argv: list[str] | None = None) -> int:
                         return 130
                     except BrokenPipeError:
                         return 0
-                print(log_commands.read_logs(cfg, args.task_id), end="")
+                print(log_commands.read_logs(cfg, args.task_id, tail_lines=args.tail), end="")
+            elif handler == "task_wait":
+                timeout = wait_commands.parse_wait_timeout(args.timeout)
+                result, wait_exit = wait_commands.wait_for_task(cfg, args.task_id, timeout_seconds=timeout)
+                _emit(CliOutput(OutputKind.TASK_WAIT, result), args.format)
+                return wait_exit
             return 0
-        if args.command == "group":
+        if handler.startswith("group_"):
             presentation = None
-            if args.group_action == "create":
+            if handler == "group_create":
                 result = group_commands.create_group(cfg, args.name, args.workers)
                 kind = OutputKind.GROUP_OPERATION
                 presentation = {"action": "create"}
-            elif args.group_action == "list":
+            elif handler == "group_list":
                 result = observer.list_groups(cfg)
                 kind = OutputKind.GROUP_LIST
-            elif args.group_action == "show":
+            elif handler == "group_show":
                 result = group_commands.show_group(cfg, args.name)
                 kind = OutputKind.GROUP_SHOW
-            elif args.group_action == "retry-failed":
-                ensure_local_agent_active(cfg, reason="group-retry-failed", **get_lifecycle_kwargs())
-                result = {
-                    "task_ids": [task_value.task_id for task_value in group_commands.group_retry_failed(cfg, args.name)]
-                }
+            elif handler == "group_retry":
+                ensure_local_agent_active(cfg, reason="group-retry", **get_lifecycle_kwargs())
+                result = group_commands.group_retry_failed(cfg, args.name)
                 kind = OutputKind.GROUP_OPERATION
-                presentation = {"action": "retry-failed", "name": args.name, "status": "completed"}
-            elif args.group_action == "machines":
-                if args.machine_action == "list":
+                presentation = {"action": "retry", "name": args.name, "status": "completed"}
+            elif handler.startswith("group_worker_"):
+                worker_action = handler.removeprefix("group_worker_")
+                if handler == "group_worker_list":
                     result = observer.list_group_machines(
                         cfg,
                         args.group_name,
@@ -2121,20 +2189,20 @@ def main(argv: list[str] | None = None) -> int:
                     cfg,
                     args.group_name,
                     args.worker_machine,
-                    args.machine_action,
-                    terminate_running=getattr(args, "terminate_running", False),
+                    worker_action,
+                    terminate_running=getattr(args, "all", False),
                     role=getattr(args, "role", None),
                     gpu_limit_gpus=None if gpu_limit_gpus in {None, "unlimited"} else gpu_limit_gpus,
                     has_gpu_limit=gpu_limit_gpus is not None,
                 )
                 kind = OutputKind.GROUP_OPERATION
                 presentation = {
-                    "action": args.machine_action,
+                    "action": worker_action,
                     "worker_machine": args.worker_machine,
                 }
                 worker_control = result.get("worker_control") if isinstance(result, dict) else None
                 if (
-                    args.machine_action == "remove"
+                    handler == "group_worker_remove"
                     and isinstance(worker_control, dict)
                     and isinstance(worker_control.get("discovery"), dict)
                     and worker_control.get("state") in {"preparing", "converging", "waiting_ack", "blocked"}
@@ -2146,18 +2214,29 @@ def main(argv: list[str] | None = None) -> int:
                             "reason": worker_control.get("blocked_reason"),
                         }
                     )
+                worker_control = result.get("worker_control") if isinstance(result, dict) else None
+                worker_operation_id = worker_control.get("operation_id") if isinstance(worker_control, dict) else None
+                if handler == "group_worker_remove" and worker_operation_id:
+                    reference = operation_commands.create_operation_reference(
+                        cfg, "worker_remove", worker_operation_id, worker_operation_id
+                    )
+                    result["operation_reference"] = reference
+                    result["follow_up_command"] = (
+                        f"qexp admin operation show {reference} --project {shlex.quote(str(cfg.project_root))}"
+                    )
             else:
+                group_action = handler.removeprefix("group_")
                 context = get_execution_context()
-                if args.group_action == "resume":
+                if handler == "group_resume":
                     ensure_local_agent_active(cfg, reason="group-resume", **get_lifecycle_kwargs())
                 result = group_commands.group_control(
                     cfg,
                     args.name,
-                    args.group_action,
-                    terminate_running=getattr(args, "terminate_running", False),
+                    group_action,
+                    terminate_running=getattr(args, "all", False),
                     reservation_runtime_root=context.reservation_root,
                 )
-                if args.group_action == "cancel":
+                if handler == "group_cancel":
                     control = result.get("cancellation_operation", {})
                     if (
                         isinstance(control, dict)
@@ -2166,8 +2245,8 @@ def main(argv: list[str] | None = None) -> int:
                     ):
                         ensure_local_agent_active(cfg, reason="group-cancel", **get_lifecycle_kwargs())
                 kind = OutputKind.GROUP_OPERATION
-                presentation = {"action": args.group_action}
-                if args.group_action == "cancel":
+                presentation = {"action": group_action}
+                if handler == "group_cancel":
                     control = result.get("cancellation_operation", {})
                     pending_machines = control.get("pending_machine_acknowledgements", {})
                     presentation.update(
@@ -2179,123 +2258,37 @@ def main(argv: list[str] | None = None) -> int:
                             "reason": control.get("blocked_reason"),
                         }
                     )
+                    operation_id = control.get("operation_id") if isinstance(control, dict) else None
+                    if operation_id:
+                        reference = operation_commands.create_operation_reference(
+                            cfg, "group_cancel", operation_id, operation_id
+                        )
+                        result["operation_reference"] = reference
+                        result["follow_up_command"] = (
+                            f"qexp admin operation show {reference} --project {shlex.quote(str(cfg.project_root))}"
+                        )
             _emit(
                 CliOutput(kind, result, presentation or {}),
                 args.format,
             )
             return 0
-        if args.command == "agent":
-            runtime = get_execution_context().machine_runtime
-            if args.agent_action == "add-project":
-                warned_generation = None
-                if args.adopt_existing:
-                    warned_generation = adoption_warning_generation(runtime, cfg)
-                    if warned_generation is not None:
-                        print(
-                            f"Warning: registration generation {warned_generation!r} will be replaced; "
-                            "the previous environment will lose automatic access to this name on its next start.",
-                            file=sys.stderr,
-                        )
-                registration = register_project(
-                    runtime,
-                    cfg.shared_root,
-                    cfg.machine_name,
-                    adopt_existing=args.adopt_existing,
-                )
-                action = "project_added" if registration.is_added else "project_already_registered"
-                if registration.is_adopted and warned_generation is None:
-                    print(
-                        f"Warning: registration generation {registration.binding.registration_generation!r} "
-                        "replaced the previous logical-machine ownership; the previous environment will lose "
-                        "automatic access to this name on its next start.",
-                        file=sys.stderr,
-                    )
-                result = {
-                    "action": action,
-                    **registration.binding.to_dict(),
-                    "message": registration.message,
-                }
-                if not registration.binding.enabled:
-                    result["enable_command"] = _enable_command(runtime, registration.binding)
-                _emit(CliOutput(OutputKind.AGENT_OPERATION, result), args.format)
-                return 0
-            if args.agent_action == "migrate-project":
-                binding = migrate_project(runtime, cfg)
-                _process, status = ensure_machine_agent_started(runtime)
-                siblings = [
-                    str(path)
-                    for path in sorted(cfg.shared_root.parent.parent.glob("*/.qexp"))
-                    if path.resolve() != cfg.shared_root
-                ]
-                _emit(
-                    CliOutput(
-                        OutputKind.AGENT_OPERATION,
-                        {"action": "project_migrated", **binding.to_dict(), **status, "migration_candidates": siblings},
-                    ),
-                    args.format,
-                )
-                return 0
-            if args.agent_action == "list-projects":
-                _emit(
-                    CliOutput(
-                        OutputKind.AGENT_PROJECT_LIST,
-                        {"action": "project_list", "projects": get_machine_agent_status(runtime)["projects"]},
-                    ),
-                    args.format,
-                )
-                return 0
-            if args.agent_action == "disable-project":
-                binding = set_project_enabled(runtime, args.project, False)
-                _emit(
-                    CliOutput(OutputKind.AGENT_OPERATION, {"action": "project_disabled", **binding.to_dict()}),
-                    args.format,
-                )
-                return 0
-            if args.agent_action == "remove-project":
-                binding = unregister_project(runtime, args.project)
-                _emit(
-                    CliOutput(OutputKind.AGENT_OPERATION, {"action": "project_removed", **binding.to_dict()}),
-                    args.format,
-                )
-                return 0
-            if args.agent_action == "status":
-                _emit(
-                    CliOutput(OutputKind.AGENT_STATUS, {"action": "status", **get_machine_agent_status(runtime)}),
-                    args.format,
-                )
-                return 0
-            if args.agent_action == "start":
-                action, status = start_local_agent(
-                    cfg, reason="manual_start", require_eligible_work=False, machine_runtime=runtime
-                )
-                _emit(CliOutput(OutputKind.AGENT_OPERATION, {"action": action, **status}), args.format)
-            elif args.agent_action == "run":
-                run_local_agent_foreground(
-                    cfg,
-                    reason="manual_run",
-                    on_started=lambda status: _emit(
-                        CliOutput(OutputKind.AGENT_OPERATION, {"action": "running", **status}),
-                        args.format,
-                        flush=True,
-                    ),
-                    machine_runtime=runtime,
-                )
-            elif args.agent_action == "restart":
-                action, status = restart_local_agent(cfg, machine_runtime=runtime)
-                _emit(CliOutput(OutputKind.AGENT_OPERATION, {"action": action, **status}), args.format)
-            elif args.agent_action == "stop":
-                action, status = stop_local_agent(cfg, machine_runtime=runtime)
-                _emit(CliOutput(OutputKind.AGENT_OPERATION, {"action": action, **status}), args.format)
+        if handler == "status":
+            result = status_commands.project_status(
+                cfg,
+                selection_source=selection_source,
+                machine_runtime=execution_context.machine_runtime,
+            )
+            _emit(CliOutput(OutputKind.STATUS, result), args.format)
             return 0
-        if args.command == "top":
-            result = observer.top_view(cfg, all_machines=True)
-            _emit(CliOutput(OutputKind.TOP, result), args.format)
+        if handler in {"machine_list", "machine_show"}:
+            if handler == "machine_list":
+                result = observer.list_machines(cfg)
+                _emit(CliOutput(OutputKind.MACHINES, result), args.format)
+            else:
+                result = status_commands.machine_detail(cfg, args.name)
+                _emit(CliOutput(OutputKind.MACHINE_SHOW, result), args.format)
             return 0
-        if args.command == "machines":
-            result = observer.list_machines(cfg)
-            _emit(CliOutput(OutputKind.MACHINES, result), args.format)
-            return 0
-        if args.command == "doctor":
+        if handler in {"admin_check", "admin_repair"}:
             context = get_execution_context()
             result = (
                 verify_integrity(
@@ -2304,17 +2297,23 @@ def main(argv: list[str] | None = None) -> int:
                     project_id=context.project_id,
                     max_work_items=args.max_work_items,
                 )
-                if args.action == "verify"
+                if handler == "admin_check"
                 else repair_metadata(
                     context.local_cfg,
                     reservation_runtime_root=context.reservation_root,
                     max_work_items=args.max_work_items,
                 )
             )
-            output_kind = OutputKind.DOCTOR_VERIFY if args.action == "verify" else OutputKind.DOCTOR_REPAIR
+            output_kind = OutputKind.DOCTOR_VERIFY if handler == "admin_check" else OutputKind.DOCTOR_REPAIR
             _emit(CliOutput(output_kind, result), args.format)
             return resolve_verify_exit_code(result, strict=args.strict)
-        if args.command == "clean":
+        if handler == "admin_operation_show":
+            if args.project is None:
+                raise ValueError("admin operation show requires explicit --project PATH.")
+            result, operation_exit = operation_commands.inspect_operation(cfg, args.reference)
+            _emit(CliOutput(OutputKind.OPERATION, result), args.format)
+            return operation_exit
+        if handler == "admin_clean":
             context = get_execution_context()
             result = cleanup.clean(
                 context.local_cfg,
@@ -2326,12 +2325,36 @@ def main(argv: list[str] | None = None) -> int:
                 max_work_items=args.max_work_items,
                 reservation_runtime_root=context.reservation_root,
             )
+            operations = result.get("operations")
+            if isinstance(operations, dict):
+                for task_id, operation in operations.items():
+                    if not isinstance(operation, dict):
+                        continue
+                    operation_id = operation.get("operation_id")
+                    if isinstance(operation_id, str):
+                        reference = operation_commands.create_operation_reference(
+                            cfg, "cleanup", str(task_id), operation_id
+                        )
+                        operation["operation_reference"] = reference
+                        operation["follow_up_command"] = (
+                            f"qexp admin operation show {reference} --project {shlex.quote(str(cfg.project_root))}"
+                        )
             _emit(CliOutput(OutputKind.CLEAN, result), args.format)
             return 0
     except ObservationError as exc:
+        if handler == "task_wait" and getattr(args, "format", "human") == "json":
+            return _emit_wait_error(
+                task_id=getattr(args, "task_id", None),
+                project=resolved_cfg.shared_root if resolved_cfg is not None else None,
+                outcome="observation_failed",
+                reason="observation_failed",
+                code=exc.code,
+                message=exc.message,
+                exit_code=6,
+            )
         return _emit_observation_error(exc, getattr(args, "format", "human"))
     except KeyboardInterrupt as exc:
-        if args.command == "submit":
+        if handler == "submit":
             payload, _exit_code = _submission_error_payload(args, exc)
             payload["error"] = {"code": "interrupted", "message": "submission interrupted; retry with the same key."}
             if getattr(args, "quiet", False):
@@ -2346,7 +2369,7 @@ def main(argv: list[str] | None = None) -> int:
             return 130
         raise
     except (ValueError, RuntimeError, OSError) as exc:
-        if args.command == "submit":
+        if handler == "submit":
             payload, exit_code = _submission_error_payload(args, exc)
             if getattr(args, "quiet", False):
                 print(f"qexp: {exc}", file=sys.stderr)
@@ -2356,17 +2379,37 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"qexp: {exc}", file=sys.stderr)
             return exit_code
-        if (
-            args.command == "task"
-            and args.task_action == "list"
-            and (args.page_size is not None or args.cursor is not None)
-        ):
+        if handler == "task_wait" and getattr(args, "format", "human") == "json":
+            invalid_timeout = isinstance(exc, ValueError) and "timeout" in str(exc).lower()
+            return _emit_wait_error(
+                task_id=getattr(args, "task_id", None),
+                project=resolved_cfg.shared_root if resolved_cfg is not None else None,
+                outcome="invalid_input" if invalid_timeout else "observation_failed",
+                reason="invalid_input" if invalid_timeout else "project_context",
+                code="invalid_input" if invalid_timeout else "project_context",
+                message=str(exc),
+                exit_code=2 if invalid_timeout else 6,
+            )
+        if handler == "task_list" and (args.page_size is not None or args.cursor is not None):
             code = "invalid_argument" if isinstance(exc, ValueError) else "index_unavailable"
             return _emit_observation_error(ObservationError(code, str(exc)), args.format)
         if isinstance(exc, OSError) and not isinstance(exc, FileNotFoundError) and not _is_continuous_task(args):
-            raise
+            if getattr(args, "format", "human") != "json":
+                raise
+        if getattr(args, "format", "human") == "json" and not _is_continuous_task(args):
+            operational = isinstance(exc, (RuntimeError, OSError))
+            return _emit_observation_error(
+                ObservationError(
+                    "operational_failure" if operational else "invalid_argument",
+                    str(exc),
+                    1 if operational else 2,
+                ),
+                "json",
+            )
         print(f"qexp: {exc}", file=sys.stderr)
         return 2
+    finally:
+        _ACTIVE_COMMAND_SPEC.reset(command_spec_token)
     return 0
 
 

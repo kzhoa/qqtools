@@ -43,7 +43,14 @@ def get_log_path(cfg: RootConfig, task_id: str) -> Path:
     return shared_attempt_log_path(cfg, task_id, attempt.attempt_id)
 
 
-def read_logs(cfg: RootConfig, task_id: str) -> str:
+def _validate_read_tail(tail_lines: int | None) -> None:
+    if tail_lines is not None and (type(tail_lines) is not int or tail_lines < 0):
+        raise ValueError("tail_lines must be a non-negative integer or None.")
+
+
+def read_logs(cfg: RootConfig, task_id: str, *, tail_lines: int | None = None) -> str:
+    """Read the selected finite log, optionally limiting it to its last lines."""
+    _validate_read_tail(tail_lines)
     path = get_log_path(cfg, task_id)
     if not path.exists():
         task = load_task(cfg, task_id)
@@ -52,7 +59,16 @@ def read_logs(cfg: RootConfig, task_id: str) -> str:
             f"log for Task {task_id!r} Attempt {attempt.attempt_id!r} on machine "
             f"{attempt.machine_name!r} was not found at {path}"
         )
-    return path.read_text(encoding="utf-8", errors="replace")
+    if tail_lines is None:
+        return path.read_text(encoding="utf-8", errors="replace")
+    if tail_lines == 0:
+        return ""
+    with path.open("rb") as handle:
+        file_stat = os.fstat(handle.fileno())
+        _ensure_regular(path, file_stat.st_mode)
+        offset = _tail_offset(handle, file_stat.st_size, tail_lines, 64 * 1024)
+        handle.seek(offset)
+        return handle.read().decode("utf-8", errors="replace")
 
 
 def tail_log(cfg: RootConfig, task_id: str) -> None:

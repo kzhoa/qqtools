@@ -30,7 +30,7 @@ def _setup_project(tmp_path: Path, machines: tuple[str, ...] = ("g3", "g4")) -> 
 
 def _args(shared_root: Path, runtime: MachineRuntime, *values: str) -> list[str]:
     return [
-        "--shared-root",
+        "--project",
         str(shared_root),
         "--machine-runtime-root",
         str(runtime.root),

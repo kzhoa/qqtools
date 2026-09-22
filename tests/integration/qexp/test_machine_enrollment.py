@@ -35,8 +35,10 @@ def test_machine_init_is_project_independent_and_same_name_reset_is_fresh(
     assert len(first["new_runtime_id"]) == 64
     assert MachineRuntime(runtime_root).load_registry()[1] == []
 
-    assert main(_invoke(runtime_root, "init", "--machine", "g1", "--format=json")) == 2
-    assert "--yes" in capsys.readouterr().err
+    assert main(_invoke(runtime_root, "init", "--machine", "g1", "--format=json")) == 1
+    duplicate = _json(capsys)["error"]
+    assert duplicate["code"] == "operational_failure"
+    assert "--yes" in duplicate["message"]
 
     assert main(_invoke(runtime_root, "init", "--machine", "g1", "--yes", "--format=json")) == 0
     second = _json(capsys)
@@ -201,7 +203,9 @@ def test_explicit_alias_is_frozen_and_pool_inputs_are_exclusive(
         )
         == 2
     )
-    assert "mutually exclusive" in capsys.readouterr().err
+    conflict = _json(capsys)["error"]
+    assert conflict["code"] == "invalid_argument"
+    assert "mutually exclusive" in conflict["message"]
 
 
 def test_legacy_registry_migrates_to_unresolved_inventory_without_changing_binding(
@@ -286,8 +290,10 @@ def test_detachment_archives_unsettled_evidence_without_shared_mutation(
     evidence.parent.mkdir(parents=True, exist_ok=True)
     evidence.write_text('{"event": {"pending": true}}', encoding="utf-8")
 
-    assert main(_invoke(runtime_root, "init", "--machine", "clone", "--yes", "--format=json")) == 2
-    assert "recovery" in capsys.readouterr().err.lower()
+    assert main(_invoke(runtime_root, "init", "--machine", "clone", "--yes", "--format=json")) == 1
+    unsettled = _json(capsys)["error"]
+    assert unsettled["code"] == "operational_failure"
+    assert "recovery" in unsettled["message"].lower()
     assert evidence.exists()
 
     assert (
@@ -355,9 +361,11 @@ def test_detachment_rejects_live_runner_evidence(tmp_path: Path, capsys: pytest.
                     "--format=json",
                 )
             )
-            == 2
+            == 1
         )
-        assert "live or ambiguous" in capsys.readouterr().err
+        live = _json(capsys)["error"]
+        assert live["code"] == "operational_failure"
+        assert "live or ambiguous" in live["message"]
     finally:
         process.terminate()
         process.wait(timeout=5)
@@ -389,9 +397,11 @@ def test_detachment_rejects_malformed_runner_evidence(tmp_path: Path, capsys: py
                 "--format=json",
             )
         )
-        == 2
+        == 1
     )
-    assert "live or ambiguous" in capsys.readouterr().err
+    malformed = _json(capsys)["error"]
+    assert malformed["code"] == "operational_failure"
+    assert "live or ambiguous" in malformed["message"]
 
 
 @pytest.mark.parametrize(
@@ -402,6 +412,7 @@ def test_detachment_rejects_malformed_runner_evidence(tmp_path: Path, capsys: py
         (("agent", "enable-project", "id"), "qexp project enable"),
         (("agent", "disable-project", "id"), "qexp project disable"),
         (("agent", "remove-project", "id"), "qexp project remove"),
+        (("agent", "migrate-project", "id"), "qexp admin migrate agent"),
     ],
 )
 def test_retired_project_commands_are_nonexecuting_diagnostics(

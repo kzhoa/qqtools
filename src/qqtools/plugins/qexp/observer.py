@@ -274,13 +274,14 @@ def list_tasks_page(
     *,
     phase: str | None = None,
     group: str | None = None,
+    name: str | None = None,
     page_size: int = 50,
     cursor: str | None = None,
 ) -> dict[str, Any]:
     """Return one live, indexed page of Task views."""
     from .runtime.observation.api import list_tasks_page as _list_tasks_page
 
-    return _list_tasks_page(cfg, phase=phase, group=group, page_size=page_size, cursor=cursor)
+    return _list_tasks_page(cfg, phase=phase, group=group, name=name, page_size=page_size, cursor=cursor)
 
 
 def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:

@@ -77,8 +77,8 @@ source_versions = ["1.3.21"]
 target_version = "1.3.22"
 mixed_version_range = ["1.3.21-1.3.22.x"]
 normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
-machine_status_command = "qexp agent upgrade status"
-recovery_command = "qexp agent upgrade coordinate"
+machine_status_command = "qexp admin upgrade status"
+recovery_command = "qexp admin upgrade advance"
 workload_continuity = true
 interruption_budget_seconds = 1.0
 
@@ -102,8 +102,8 @@ source_versions = ["1.3.16"]
 target_version = "1.4.0"
 mixed_version_range = ["1.3.16-1.4.x"]
 normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
-machine_status_command = "qexp agent upgrade status"
-recovery_command = "qexp agent upgrade coordinate"
+machine_status_command = "qexp admin upgrade status"
+recovery_command = "qexp admin upgrade advance"
 workload_continuity = true
 interruption_budget_seconds = 1.0
 

@@ -151,7 +151,7 @@ def _validate_root_contract(cfg: RootConfig, *, should_require_cpu_lane: bool) -
     if shared_upgrade_journal.exists():
         upgrade = read_json(shared_upgrade_journal).get("schema6_upgrade", {})
         if upgrade.get("phase") != "completed":
-            raise RuntimeError("schema-6 upgrade is preparing; run 'qexp upgrade schema6 status'.")
+            raise RuntimeError("schema-6 upgrade is preparing; run 'qexp admin migrate schema6 status'.")
     forbidden = {"global", "batches", "resubmit", "resubmit_operations"}
     present = forbidden.intersection(path.name for path in cfg.shared_root.iterdir())
     if present:

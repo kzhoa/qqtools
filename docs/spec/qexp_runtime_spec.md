@@ -71,7 +71,7 @@ destructive:
 - no mixed-schema runtime is supported
 - no legacy reader or compatibility repair path is provided
 - an unsupported `.qexp` schema fails before any agent or mutating command starts
-- a drained schema-5 root may be upgraded with `qexp migrate --to-schema 6`; migration
+- a drained schema-5 root may be upgraded with `qexp admin migrate schema --project PATH --to-schema 6`; migration
   rejects any root with an active claim or running Attempt
 
 Loss of Batch-era scheduling metadata is a known and accepted product risk. The schema-5 to
@@ -85,7 +85,7 @@ API.
 
 1. **Legacy classification**: if any project machine record carries legacy metadata, `init`,
    registration, and agent startup must not implicitly reclassify or overwrite it; only
-   `qexp agent migrate-project` performs that conversion.
+   `qexp admin migrate agent --project PATH --machine NAME` performs that conversion.
 2. **Agent ownership**: one shared `MachineRuntime` root has one global agent and one unified GPU
    reservation set. Projects join it only through controlled bindings. A logical `--machine` name
    is not physical-host identity; projects share this arbitration boundary only when they use the
@@ -197,9 +197,9 @@ those values. Read-only project commands may observe shared truth without a loca
 
 The local CLI context is only a canonical `shared_root` locator. Unknown legacy machine/runtime
 fields do not participate in resolution. `project register --machine NAME` accepts one explicit
-Project. The legacy `agent migrate-project` workflow requires explicit machine input and may
-receive an explicit custom legacy runtime. Neither path selects ordinary execution or reservation
-authority before a verified binding exists.
+Project. The legacy `qexp admin migrate agent --project PATH --machine NAME` workflow requires
+explicit machine input and may receive an explicit custom legacy runtime. Neither path selects
+ordinary execution or reservation authority before a verified binding exists.
 
 `MachineRuntime` owns a versioned Project inventory distinct from its effective binding registry,
 one random current runtime generation, revisioned global agent configuration, scheduler/registry/
@@ -1137,10 +1137,11 @@ and no automatic replacement.
 ### 9.5 Explicit Legacy Project Migration
 
 An existing Project without the global-agent machine-record marker is migrated only by explicit
-`qexp agent migrate-project`. The operation verifies the old PID through Linux process identity
-and its configured project arguments before signalling it. Process exit is checked against the
-same PID start identity so PID reuse cannot delay the handoff. Reservation transfer holds both the
-legacy and unified reservation locks while it re-reads, validates, writes, and removes records.
+`qexp admin migrate agent --project PATH --machine NAME`. The operation verifies the old PID
+through Linux process identity and its configured project arguments before signalling it. Process
+exit is checked against the same PID start identity so PID reuse cannot delay the handoff.
+Reservation transfer holds both the legacy and unified reservation locks while it re-reads,
+validates, writes, and removes records.
 After the old agent stops, its local evidence is moved once into the machine runtime. The machine
 agent subsequently drains only immutable registration, observation, and launch-intent records
 that a previously launched runner may still write, deleting each legacy source after the target
@@ -1316,7 +1317,7 @@ For each Task at or below the captured membership sequence:
   claim and reservation
 - an Attempt whose `starting` gate already committed follows running semantics
 - default cancellation lets starting/running work finish
-- `--terminate-running` publishes machine-local termination intent
+- `--all` publishes machine-local termination intent
 
 Tasks appended after the high watermark are not affected.
 
@@ -1344,7 +1345,7 @@ and running termination intent before declaring convergence. It reloads operatio
 truth after acquiring the Group lock, and replay of an older default cancellation
 must not clear a later termination request. Local reservation release and lifecycle
 hooks follow committed pre-launch transitions after authority locks are released.
-`doctor repair` uses this same replay for active and legacy operation records and
+`qexp admin repair --project PATH` uses this same replay for active and legacy operation records and
 reports rejected or unfinished cancellation as blocked rather than repaired.
 
 An active applicable barrier also fences claim and fresh launch authorization,
@@ -1658,8 +1659,8 @@ candidate; routine admission never falls back to full parsing. The worker rotate
 projects, obeys binding write eligibility and backs off when no pending work exists.
 It does not run on the renewal or supervision loop.
 
-`doctor verify` reports `submission_control.state`; damaged activation metadata is
-reported as unavailable. `doctor repair` requests a background recertification
+`qexp admin check --project PATH` reports `submission_control.state`; damaged activation metadata is
+reported as unavailable. `qexp admin repair --project PATH` requests a background recertification
 under the maintenance lock without changing Submission, Task or Attempt truth.
 This receipt protocol removes the known bulk-source payload-read dependency;
 whole-machine latency and I/O qualification remain separate acceptance evidence.
@@ -1757,7 +1758,7 @@ active claim. It acquires Group then Task lock and validates:
 
 All queued availability changes use the same durable operation path:
 
-1. acquire Group then Task lock, or only Task lock for standalone idempotent `keep-local`
+1. acquire Group then Task lock, or only Task lock for standalone idempotent `task unshare`
 2. resolve an existing active or archived operation, or write
    `operations/availability/<operation-id>.json` in `prepared` state only when neither exists
 3. re-read Task truth and validate submission, projection, claim, cleanup, cancellation, Group,
@@ -1774,7 +1775,7 @@ type and never enumerates completed operation history. Existing flat unfinished 
 are split once under the project schema lock.
 
 If Task truth is committed but audit or index writing is interrupted, the operation remains
-replayable. Agent startup and `qexp doctor repair` reconcile incomplete availability operations
+replayable. Agent startup and `qexp admin repair --project PATH` reconcile incomplete availability operations
 and rebuild advisory deadline indexes from Task truth.
 
 Supported actions:
@@ -1799,7 +1800,7 @@ The first release supports exactly:
 - `qexp task share <task-id>`
 - `qexp task share <task-id> --after <duration>`
 - `qexp task share <task-id> --with <machine>`
-- `qexp task keep-local <task-id>`
+- `qexp task unshare <task-id>`
 - `qexp task offer <task-id>`
 - persisted `after_seconds` eligibility
 
@@ -1835,7 +1836,7 @@ acquires the Task lock and validates authoritative Task truth:
 
 The winning transition sets queue scope to shared and records reason, actor, and time.
 Repeated offers succeed idempotently without increasing Task revision. A concurrent claim,
-cancel, cleanup, worker drain, share, keep-local, manual offer, or elapsed offer linearizes
+cancel, cleanup, worker drain, share, unshare, manual offer, or elapsed offer linearizes
 through the same Task lock and only one state change can win.
 
 Heartbeat staleness does not bypass `after_seconds` in the first release. Automatic
@@ -1956,14 +1957,14 @@ most 32 distinct reasons. Dynamic values are allowlisted, length bounded, and ma
 `truncated_fields` marker; arbitrary exception messages, paths, commands, environment values, and
 payloads are never persisted.
 
-Status and doctor display canonical v1 reasons and a bounded allowlist of the pre-v1 reason forms.
+Status and admin diagnostics display canonical v1 reasons and a bounded allowlist of the pre-v1 reason forms.
 Unknown v1 or historical values are represented only by a SHA-256 digest placeholder. A malformed
 or unreadable state record is fail-closed as `degraded` and is reported with a synthetic
 `ready_state_invalid` diagnostic using only the allowlisted exception type, errno, or JSON line and
 column. Strict mutation and repair reads reject a non-list or non-string `degraded_reasons` field
 and do not overwrite that state.
 
-`doctor repair` captures `prior_degraded_reasons` after its active projection audit has persisted
+`qexp admin repair --project PATH` captures `prior_degraded_reasons` after its active projection audit has persisted
 new findings and before starting ready-index rebuild. The active state may clear its durable
 reasons after a successful repair, while the returned evidence snapshot remains available to the
 caller. During the 1.3.16 to 1.3.18 compatibility transition, older free-text values remain
@@ -1997,7 +1998,7 @@ finish, the schema gate to remain installed, and every recently active machine a
 `ready-v1`; otherwise the project enters `degraded`. The single `state: active` replacement is the
 cutover point. Ordinary active scheduling never reads build pages or falls back to Task history.
 
-`doctor repair` first audits an active projection. On damage it commits `degraded`, moves the
+`qexp admin repair --project PATH` first audits an active projection. On damage it commits `degraded`, moves the
 advisory home/shared marker trees, catalogs, reservations, allocators, and cursors beneath the new
 build's `replaced-projection/` directory, and rebuilds from Task truth. The move preserves forensic
 evidence and never moves or rewrites Task, Attempt, Submission, claim, or GPU-reservation authority.
@@ -2268,7 +2269,9 @@ lease expiry to move from `suspect` to `isolated`; without a cached deadline it 
 `suspect`. Shared I/O failures are non-fatal to the agent loop and never authorize a signal,
 reservation release, Recovery, or replacement Attempt.
 
-The shared lease policy is stored at `project/lease-policy.json`. The default is a 120
+An explicit shared lease policy is stored at `project/lease-policy.json`; absence means the
+built-in policy after `config reset lease`. A malformed record never falls back to that default.
+The default is a 120
 second TTL, 10 second normal renewal interval, bounded jittered retry, 1 second maximum
 clock skew and 5 second renewal commit margin. Holders stop ordinary work at
 `lease_expires_at - max_clock_skew_seconds`; reclaimers wait until
@@ -2402,7 +2405,7 @@ For a failed Task, under the Task lock it:
 The next Attempt number is materialized when a later claim wins. Task ID and Group Task
 count do not change.
 
-`qexp group retry-failed <group>` acquires the Group lock to establish a stable selection
+`qexp group retry <group>` acquires the Group lock to establish a stable selection
 revision, then applies the same Task retry transition only to Tasks whose current
 projection and current Attempt are failed. A historical failure behind a newer Attempt is
 never selected.
@@ -2425,9 +2428,9 @@ remains `orphaned`, and every late write carrying its obsolete authority is reje
 
 Retry supersedes the old Attempt's qexp execution authority. It does not inspect the old
 machine, assert physical process termination, or undo external side effects. The manual retry
-command requires no additional duplicate-risk acknowledgement flag. During one compatibility
-cycle, an existing `--acknowledge-duplicate-risk` argument may be accepted only as a deprecated
-no-op and must not change the transition. Automatic retry and `qexp group retry-failed` never
+command requires no additional duplicate-risk acknowledgement flag. The retired
+`--acknowledge-duplicate-risk` argument is rejected and cannot change the transition. Automatic
+retry and `qexp group retry` never
 select blocked or orphaned work.
 
 ## 17. Agent Lifecycle
@@ -2517,7 +2520,7 @@ not prevent startup: only the discovered intersection is visible, and a durable
 `configured_gpu_ids_not_discovered` warning reports the revision, sets, and repair commands. A
 discovery failure reports validation unavailable without classifying every configured ID as
 missing. Warning emission is deduplicated by policy revision and discovery fingerprint, while
-status and `agent gpus show` retain the current warning until the mismatch clears.
+status and `agent config gpus show` retain the current warning until the mismatch clears.
 
 The policy record is a permanent additive MachineRuntime format. The supported upgrade path is a
 machine-by-machine package upgrade and global-agent restart; running Attempts retain their existing
@@ -2563,7 +2566,7 @@ Derived indexes and summaries:
 
 ## 19. Doctor Contract
 
-`qexp doctor` diagnoses shared truth and coordinates machine-local repair where evidence is
+`qexp admin check --project PATH` diagnoses shared truth and coordinates machine-local repair where evidence is
 available.
 
 It must distinguish:
@@ -2662,7 +2665,7 @@ marker names, and submission-operation IDs are at most 256 UTF-8 bytes; Group na
 characters and lanes are the `gpu` or `cpu` Task enum. An unsupported encoding fails closed before
 its authoritative grouped write commits.
 
-`doctor verify` and active `doctor repair` share a durable audit record keyed by projection
+`qexp admin check --project PATH` and active `qexp admin repair --project PATH` share a durable audit record keyed by projection
 identity. A completed audit is historical display data only: the next verify or active repair
 creates a new audit ID. Each invocation consumes at most `--max-work-items` (1--64) across capture
 entries, Task checks, Group/directory/member-page reads, locator checks, and membership-revision
@@ -2710,7 +2713,7 @@ failed audit and rebuild slice.
 Repair parks `groups/` atomically beneath `replaced-groups/<build-id>/` after a durable prepared
 record, creates an empty replacement, fsyncs the fixed parent directories, and then publishes
 `building` with the already selected next projection identity. It does not enumerate or recursively
-delete the old tree. `qexp clean --max-work-items N` is the sole archive remover: it processes at
+delete the old tree. `qexp admin clean --project PATH --max-work-items N` is the sole archive remover: it processes at
 most N archive entries outside the schema lock and records its current archive for retry. Archive
 retention does not change the active projection gate.
 
@@ -2835,6 +2838,12 @@ Missing Task truth removes that candidate; malformed or unreadable truth is an
 explicit error. Cursors bind project identity, normalized filters, ordering
 version, rebuild generation, and last inspected ID. They are validated values,
 never filesystem paths.
+
+Unfiltered traversal retains cursor version 1 unchanged. An exact Task-name filter uses cursor
+version 2 and adds the case-sensitive name to the bound filters. A version-1 cursor cannot acquire
+a name filter, and a version-2 cursor cannot change or remove it. Name filtering happens after one
+bounded candidate-page read and before dependency evaluation; nonmatching candidates still advance
+the cursor, and the query never reads more pages merely to fill the requested result size.
 
 New roots initialize an empty active generation. Existing roots wait for the
 already qualified canonical Group isolation and recovery-admission boundary before

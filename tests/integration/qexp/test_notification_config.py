@@ -15,7 +15,7 @@ def test_shared_file_webhook_cli_requires_acknowledgement(tmp_path, monkeypatch,
     machine_runtime_root = cfg.runtime_root.parent / "machine-runtime"
     MachineRuntime(machine_runtime_root).ensure_binding(cfg.shared_root, cfg.machine_name)
     arguments = [
-        "--shared-root",
+        "--project",
         str(cfg.shared_root),
         "--runtime-root",
         str(cfg.runtime_root),
@@ -24,9 +24,9 @@ def test_shared_file_webhook_cli_requires_acknowledgement(tmp_path, monkeypatch,
         "--machine-runtime-root",
         str(machine_runtime_root),
         "config",
-        "notifications",
-        "provider",
         "set",
+        "notifications",
+        "--provider",
         "feishu",
         "--credential-source",
         "shared_file",
@@ -54,5 +54,5 @@ def test_shared_file_webhook_cli_requires_acknowledgement(tmp_path, monkeypatch,
     assert cli.main(arguments + ["--webhook-stdin", "--acknowledge-shared-secret-risk"]) == 0
 
     assert shared_feishu_webhook_path(cfg).exists()
-    assert cli.main(arguments[:8] + ["config", "notifications", "show"]) == 0
+    assert cli.main(arguments[:8] + ["config", "show", "notifications"]) == 0
     assert "https://example.invalid/persisted-webhook" not in capsys.readouterr().out

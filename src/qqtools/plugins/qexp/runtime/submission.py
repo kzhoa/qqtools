@@ -386,7 +386,7 @@ def _load_plan_tasks(cfg: Any, plan: SubmissionPlan) -> list[TaskRecord]:
     try:
         return [TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id))) for task_id in plan.task_ids]
     except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("committed submission has missing Task truth; run qexp doctor repair.") from exc
+        raise RuntimeError("committed submission has missing Task truth; run qexp admin repair.") from exc
 
 
 def _execute_submission_locked(

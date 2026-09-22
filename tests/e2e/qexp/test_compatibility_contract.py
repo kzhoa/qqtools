@@ -19,7 +19,7 @@ from qexp_e2e import (
 def _common(shared_root: Path, runtime_root: Path, machine_runtime_root: Path) -> list[str]:
     return [
         "qexp",
-        "--shared-root",
+        "--project",
         str(shared_root),
         "--machine",
         "gpu-1",
@@ -54,12 +54,12 @@ def test_use_rejects_removed_identity_inputs_and_keeps_locator_contract(tmp_path
     env = make_env(base)
 
     rejected = run(
-        ["qexp", "--machine", "gpu-1", "use", "--shared-root", str(shared_root)],
+        ["qexp", "--machine", "gpu-1", "use", "--project", str(shared_root)],
         env=env,
         check=False,
     )
     assert rejected.returncode == 2
-    run(["qexp", "use", "--shared-root", str(shared_root)], env=env)
+    run(["qexp", "use", "--project", str(shared_root)], env=env)
     assert json.loads((base / "home" / ".qqtools" / "qexp-context.json").read_text()) == {
         "shared_root": str(shared_root)
     }
@@ -196,11 +196,28 @@ def test_legacy_metadata_requires_migration_without_touching_unrelated_resources
             check=False,
         )
         assert rejected.returncode == 2
-        assert "qexp agent migrate-project" in rejected.stderr
+        assert "qexp admin migrate agent --project" in rejected.stderr
+        assert "--machine gpu-1" in rejected.stderr
         assert record_path.read_bytes() == original_legacy_record
         assert not (shared_root / "machines" / "gpu-2" / "machine.json").exists()
 
-        migrated = jrun([*common, "agent", "migrate-project"], env=env)
+        migrated = jrun(
+            [
+                "qexp",
+                "admin",
+                "migrate",
+                "agent",
+                "--project",
+                str(shared_root),
+                "--machine",
+                "gpu-1",
+                "--runtime-root",
+                str(runtime_root),
+                "--machine-runtime-root",
+                str(machine_runtime_root),
+            ],
+            env=env,
+        )
         assert migrated["action"] == "project_migrated"
         assert migrated["enabled"] is True
         assert record_path.read_bytes() != original_legacy_record

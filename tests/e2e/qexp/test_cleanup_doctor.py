@@ -22,7 +22,7 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
     imported_from = ensure_site_packages_import()
     common = [
         "qexp",
-        "--shared-root",
+        "--project",
         str(shared_root),
         "--machine",
         "gpu-1",
@@ -72,7 +72,7 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
         def clean_after_local_process_exit() -> bool:
             nonlocal clean
             try:
-                clean = jrun([*common, "clean", "--task-id", task_id], env=env)
+                clean = jrun([*common, "admin", "clean", "--task-id", task_id], env=env)
             except RuntimeError as exc:
                 marker = "cannot be cleaned: "
                 message = str(exc)
@@ -93,7 +93,7 @@ def test_installed_wheel_cleanup_and_doctor_flow(tmp_path):
 
         def is_verification_complete() -> bool:
             nonlocal verify
-            verify = jrun([*common, "doctor", "verify"], env=env)
+            verify = jrun([*common, "admin", "check"], env=env)
             return verify["complete"]
 
         wait_for(

@@ -34,10 +34,8 @@ class OutputKind(str, Enum):
     GROUP_OPERATION = "group-operation"
     GROUP_MACHINES = "group-machines"
     MACHINES = "machines"
-    TOP = "top"
     AGENT_OPERATION = "agent-operation"
     AGENT_STATUS = "agent-status"
-    AGENT_PROJECT_LIST = "agent-project-list"
     AGENT_CONFIG = "agent-config"
     AGENT_READINESS = "agent-readiness"
     MACHINE_INIT = "machine-init"
@@ -53,14 +51,14 @@ class OutputKind(str, Enum):
     SCHEMA6_UPGRADE = "schema6-upgrade"
     SUBMISSION = "submission"
     CONTEXT = "context"
-    PROGRESS_POLICY = "progress-policy"
-    LAUNCH_HANDOFF_POLICY = "launch-handoff-policy"
-    TMUX_POLICY = "tmux-policy"
-    NOTIFICATIONS = "notifications"
-    LEASE_POLICY = "lease-policy"
     DOCTOR_VERIFY = "doctor-verify"
     DOCTOR_REPAIR = "doctor-repair"
     CLEAN = "clean"
+    CONFIG = "config"
+    TASK_WAIT = "task-wait"
+    STATUS = "status"
+    MACHINE_SHOW = "machine-show"
+    OPERATION = "operation"
 
 
 T = TypeVar("T")
@@ -81,6 +79,7 @@ class CpuLaneValue(TypedDict):
 
 
 class CpuLanePayload(TypedDict):
+    machine_runtime_root: str
     cpu_lane: CpuLaneValue
 
 
@@ -259,7 +258,10 @@ def _render_task_list(result: Any, _presentation: Mapping[str, object]) -> str:
 
 
 def _render_task_page(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
-    rendered = _render_task_table(result["items"])
+    if not result["items"] and result.get("next_cursor") is not None:
+        rendered = "No matches in this page; more candidates remain."
+    else:
+        rendered = _render_task_table(result["items"])
     lines = [rendered, f"Stop reason: {result['stop_reason']}"]
     command = presentation.get("continuation_command")
     if command is not None:
@@ -388,7 +390,8 @@ def _render_group_show(result: Mapping[str, Any], presentation: Mapping[str, obj
 
 
 def _render_group_operation(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
-    group = result.get("group", {})
+    group_value = result.get("group", {})
+    group = group_value if isinstance(group_value, Mapping) else {}
     action = presentation.get("action", result.get("action", "group"))
     status = presentation.get("status", result.get("status", group.get("dispatch_state")))
     return _operation(
@@ -469,31 +472,12 @@ def _render_machines(result: Any, _presentation: Mapping[str, object]) -> str:
     )
 
 
-def _render_top(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    return _table(
-        (
-            "Machine",
-            "Availability",
-            "GPU visible",
-            "GPU reserved",
-            "GPU unreserved",
-            "GPU source",
-            "GPU mode",
-            "GPU draining",
-            "GPU warnings",
-            "Agent state",
-            "Task summary",
-            "Reason",
-        ),
-        [_machine_values(item, result["tasks"]) for item in result["machines"]],
-    )
-
-
 def _render_agent_operation(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
     return _operation(
         result.get("action"),
         result.get("agent_state", result.get("status", result.get("state"))),
         (
+            ("MachineRuntime root", result.get("machine_runtime_root")),
             ("Agent mode", result.get("agent_mode")),
             ("Project ID", result.get("project_id")),
             ("Machine", result.get("machine_name")),
@@ -517,6 +501,7 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
         result["action"],
         result["agent_state"],
         (
+            ("MachineRuntime root", result.get("machine_runtime_root")),
             ("PID", result["pid"]),
             ("Runtime ID", result.get("runtime_id")),
             ("Configured mode", result.get("configured_agent_mode")),
@@ -534,29 +519,12 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
     )
 
 
-def _render_agent_project_list(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    return _table(
-        ("Project ID", "Shared root", "Machine", "Enabled", "State", "Eligibility", "Write eligible"),
-        [
-            (
-                project.get("project_id"),
-                project.get("shared_root"),
-                project.get("machine_name"),
-                project.get("enabled"),
-                project.get("state"),
-                project.get("eligibility", {}).get("state"),
-                project.get("write_eligible"),
-            )
-            for project in result["projects"]
-        ],
-    )
-
-
 def _render_machine_init(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
     return _operation(
         result.get("action"),
         "completed",
         (
+            ("MachineRuntime root", result.get("machine_runtime_root")),
             ("Agent name", result.get("agent_name")),
             ("Agent mode", result.get("agent_mode")),
             ("Old runtime ID", result.get("old_runtime_id")),
@@ -638,6 +606,7 @@ def _render_agent_readiness(result: Mapping[str, Any], _presentation: Mapping[st
         "agent start",
         "ready" if result.get("ready") else "not ready",
         (
+            ("MachineRuntime root", result.get("machine_runtime_root")),
             ("Runtime ID", result.get("runtime_id")),
             ("Agent state", result.get("agent_state")),
             ("Requested policy revision", result.get("requested_policy_revision")),
@@ -651,12 +620,19 @@ def _render_agent_readiness(result: Mapping[str, Any], _presentation: Mapping[st
 
 def _render_cpu_lane(result: CpuLanePayload, _presentation: Mapping[str, object]) -> str:
     lane = result["cpu_lane"]
-    return _details((("Capacity", lane["capacity"]), ("Revision", lane["revision"])))
+    return _details(
+        (
+            ("MachineRuntime root", result.get("machine_runtime_root")),
+            ("Capacity", lane["capacity"]),
+            ("Revision", lane["revision"]),
+        )
+    )
 
 
 def _render_gpu_policy(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
     return _details(
         (
+            ("MachineRuntime root", result.get("machine_runtime_root")),
             ("Mode", result.get("mode")),
             ("Source", result.get("source")),
             ("Revision", result.get("revision")),
@@ -782,9 +758,8 @@ def _render_submission(result: Mapping[str, Any], presentation: Mapping[str, obj
                 lines.append(f"Project: {project_path}")
             lines.append(f"Group: {_value(group_name)}")
             if project_path and task_id:
-                shared_root = str(Path(str(project_path)) / ".qexp")
-                locator = shlex.join(["qexp", "--shared-root", shared_root, "task", "show", str(task_id)])
-                logs = shlex.join(["qexp", "--shared-root", shared_root, "task", "logs", str(task_id)])
+                locator = shlex.join(["qexp", "--project", str(project_path), "task", "show", str(task_id)])
+                logs = shlex.join(["qexp", "--project", str(project_path), "task", "logs", str(task_id)])
                 lines.extend([f"Show: {locator}", f"Logs: {logs}"])
             return "\n".join(lines)
         lines = [f"Submitted {len(task_ids)} task{'s' if len(task_ids) != 1 else ''}."]
@@ -793,9 +768,8 @@ def _render_submission(result: Mapping[str, Any], presentation: Mapping[str, obj
         if group_name:
             lines.append(f"Group: {group_name}")
             if project_path:
-                shared_root = str(Path(str(project_path)) / ".qexp")
                 lines.append(
-                    f"Inspect: {shlex.join(['qexp', '--shared-root', shared_root, 'group', 'show', str(group_name)])}"
+                    f"Inspect: {shlex.join(['qexp', '--project', str(project_path), 'group', 'show', str(group_name)])}"
                 )
         else:
             lines.append(f"Task IDs: {_value(task_ids)}")
@@ -807,45 +781,6 @@ def _render_submission(result: Mapping[str, Any], presentation: Mapping[str, obj
 
 def _render_context(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
     return f"shared_root: {result.get('shared_root') or '<not set>'}"
-
-
-def _render_progress_policy(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    return _details(
-        (
-            ("Interval seconds", result.get("interval_seconds")),
-            ("Source", result.get("source")),
-            ("Applies to", result.get("applies_to")),
-        ),
-        (
-            (
-                "Timing",
-                "Shorter intervals show fresh reports sooner but increase filesystem I/O; "
-                "longer intervals reduce I/O and may delay visibility.",
-            ),
-        ),
-    )
-
-
-def _render_launch_handoff_policy(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    return _details(
-        (
-            ("Timeout seconds", result.get("timeout_seconds")),
-            ("Source", result.get("source")),
-            ("Applies to", result.get("applies_to")),
-        ),
-        (("Timing", "The timeout is frozen for each new runner launch."),),
-    )
-
-
-def _render_tmux_policy(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    return _details(
-        (
-            ("Project tmux observers enabled", result.get("enabled")),
-            ("Source", result.get("source")),
-            ("Applies to", "future observer decisions"),
-        ),
-        (("Scope", "This project only; existing windows and explicit Task choices are unchanged."),),
-    )
 
 
 def _render_named_operation(result: Mapping[str, Any], default_action: str) -> str:
@@ -862,20 +797,102 @@ def _render_named_operation(result: Mapping[str, Any], default_action: str) -> s
     )
 
 
-def _render_notifications(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    return _render_named_operation(result, "notifications")
-
-
-def _render_lease_policy(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    return _render_named_operation(result, "lease-policy")
-
-
 def _render_doctor(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
     return _render_named_operation(result, "doctor")
 
 
 def _render_clean(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
     return _render_named_operation(result, "clean")
+
+
+def _render_config(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    """Render typed configuration while retaining section/source information."""
+    sections = result.get("sections")
+    if isinstance(sections, Mapping):
+        rows = []
+        for name, value in sections.items():
+            if isinstance(value, Mapping) and value.get("status") == "error":
+                rows.append((name, "error", value.get("error")))
+            elif isinstance(value, Mapping):
+                rows.append((name, "ok", value.get("values")))
+            else:
+                rows.append((name, "error", value))
+        return _table(("Section", "Status", "Values"), rows)
+    return _render_named_operation(result, "config")
+
+
+def _render_task_wait(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _details(
+        (
+            ("Task ID", result.get("task_id")),
+            ("Outcome", result.get("outcome")),
+            ("Reason", result.get("reason")),
+            ("Selected Attempt number", result.get("selected_attempt_number")),
+            ("Selected Attempt ID", result.get("selected_attempt_id")),
+            ("Task exit code", result.get("task_exit_code")),
+            ("Project", result.get("project")),
+            ("Error", result.get("error")),
+        )
+    )
+
+
+def _render_status(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    project = result.get("project", {})
+    participation = result.get("local_participation", {})
+    agent = result.get("local_agent", {})
+    observation = result.get("task_observation", {})
+    return _details(
+        (
+            ("Project", project.get("path") if isinstance(project, Mapping) else project),
+            ("Project ID", project.get("project_id") if isinstance(project, Mapping) else None),
+            ("Selection source", project.get("selection_source") if isinstance(project, Mapping) else None),
+            ("Status", result.get("status")),
+        ),
+        (
+            (
+                "Local participation",
+                participation.get("state") if isinstance(participation, Mapping) else participation,
+            ),
+            ("Local agent", agent.get("state") if isinstance(agent, Mapping) else agent),
+            ("Task observation", observation.get("state") if isinstance(observation, Mapping) else observation),
+            ("Totals", result.get("totals")),
+        ),
+        (("Next actions", result.get("next_actions")), ("Warnings", result.get("warnings"))),
+    )
+
+
+def _render_machine_show(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _details(
+        (
+            ("Machine", result.get("machine_name")),
+            ("Project", result.get("project")),
+            ("Complete", result.get("complete")),
+            ("Declaration", result.get("declaration")),
+        ),
+        (
+            ("Agent", result.get("agent")),
+            ("GPU", result.get("gpu")),
+            ("Summary", result.get("summary")),
+            ("Warnings", result.get("warnings")),
+        ),
+    )
+
+
+def _render_operation(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _details(
+        (
+            ("Reference", result.get("reference")),
+            ("Kind", result.get("kind")),
+            ("Operation ID", result.get("operation_id")),
+            ("Target", result.get("target")),
+            ("State", result.get("state")),
+            ("Outcome", result.get("outcome")),
+            ("Progress", result.get("progress")),
+            ("Blockers", result.get("blockers")),
+            ("Pending machines", result.get("pending_machines")),
+            ("Error", result.get("error")),
+        )
+    )
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -1051,7 +1068,10 @@ def _validate_group_operation(result: Any) -> None:
     if "group" not in value and "task_ids" not in value:
         raise ValueError("group-operation payload requires 'group' or 'task_ids'")
     if "group" in value:
-        _validate_group_record(value, "group-operation payload")
+        if isinstance(value["group"], Mapping):
+            _validate_group_record(value, "group-operation payload")
+        elif not isinstance(value["group"], str):
+            raise TypeError("group-operation payload.group must be a Group record or name")
     if "task_ids" in value:
         _sequence(value["task_ids"], "group-operation payload.task_ids")
 
@@ -1078,15 +1098,6 @@ def _validate_machines(result: Any) -> None:
         _validate_machine(item, f"machines payload[{index}]")
 
 
-def _validate_top(result: Any) -> None:
-    value = _mapping(result, "top payload")
-    machines = _required_sequence(value, "machines", "top payload")
-    tasks = _required_sequence(value, "tasks", "top payload")
-    _validate_task_items(tasks, "top payload.tasks")
-    for index, item in enumerate(machines):
-        _validate_machine(item, f"top payload.machines[{index}]")
-
-
 def _validate_agent_operation(result: Any) -> None:
     value = _mapping(result, "agent-operation payload")
     action = _required(value, "action", "agent-operation payload")
@@ -1111,7 +1122,7 @@ def _validate_agent_operation(result: Any) -> None:
             _required(value, key, "agent-operation payload")
         return
     if action in lifecycle_actions:
-        for key in ("agent_state", "pid", "is_running"):
+        for key in ("machine_runtime_root", "agent_state", "pid", "is_running"):
             _required(value, key, "agent-operation payload")
         return
     raise ValueError(f"agent-operation payload has unknown action {action!r}")
@@ -1127,20 +1138,12 @@ def _validate_project(value: Any, label: str) -> None:
     _required_bool(project, "write_eligible", label)
 
 
-def _validate_agent_project_list(result: Any) -> None:
-    value = _mapping(result, "agent-project-list payload")
-    if _required(value, "action", "agent-project-list payload") != "project_list":
-        raise ValueError("agent-project-list payload.action must be 'project_list'")
-    projects = _required_sequence(value, "projects", "agent-project-list payload")
-    for index, project in enumerate(projects):
-        _validate_project(project, f"agent-project-list payload.projects[{index}]")
-
-
 def _validate_machine_init(result: Any) -> None:
     value = _mapping(result, "machine-init payload")
     if _required(value, "action", "machine-init payload") not in {"initialized", "reinitialized"}:
         raise ValueError("machine-init payload.action is invalid")
     for key in (
+        "machine_runtime_root",
         "agent_name",
         "agent_mode",
         "old_runtime_id",
@@ -1187,13 +1190,14 @@ def _validate_project_list(result: Any) -> None:
 
 def _validate_agent_config(result: Any) -> None:
     value = _mapping(result, "agent-config payload")
-    for key in ("agent_name", "agent_mode", "revision", "provenance", "runtime_id"):
+    for key in ("machine_runtime_root", "agent_name", "agent_mode", "revision", "provenance", "runtime_id"):
         _required(value, key, "agent-config payload")
     _required_int(value, "revision", "agent-config payload")
 
 
 def _validate_agent_readiness(result: Any) -> None:
     value = _mapping(result, "agent-readiness payload")
+    _required(value, "machine_runtime_root", "agent-readiness payload")
     _required_bool(value, "ready", "agent-readiness payload")
     _required(value, "projects", "agent-readiness payload")
     _sequence(value["projects"], "agent-readiness payload.projects")
@@ -1203,7 +1207,7 @@ def _validate_agent_status(result: Any) -> None:
     value = _mapping(result, "agent-status payload")
     if _required(value, "action", "agent-status payload") != "status":
         raise ValueError("agent-status payload.action must be 'status'")
-    for key in ("agent_state", "pid", "registry_revision"):
+    for key in ("machine_runtime_root", "agent_state", "pid", "registry_revision"):
         _required(value, key, "agent-status payload")
     projects = _required_sequence(value, "projects", "agent-status payload")
     for index, project in enumerate(projects):
@@ -1218,6 +1222,7 @@ def _validate_agent_status(result: Any) -> None:
 
 def _validate_cpu_lane(result: Any) -> None:
     value = _mapping(result, "cpu-lane payload")
+    _required(value, "machine_runtime_root", "cpu-lane payload")
     lane = _required_mapping(value, "cpu_lane", "cpu-lane payload")
     _required_int(lane, "capacity", "cpu-lane payload.cpu_lane")
     _required_int(lane, "revision", "cpu-lane payload.cpu_lane")
@@ -1225,6 +1230,7 @@ def _validate_cpu_lane(result: Any) -> None:
 
 def _validate_gpu_policy(result: Any) -> None:
     value = _mapping(result, "gpu-policy payload")
+    _required(value, "machine_runtime_root", "gpu-policy payload")
     for key in (
         "mode",
         "source",
@@ -1405,40 +1411,6 @@ def _validate_context(result: Any) -> None:
     _required(value, "shared_root", "context payload")
 
 
-def _validate_progress_policy(result: Any) -> None:
-    value = _mapping(result, "progress-policy payload")
-    for key in ("interval_seconds", "source", "applies_to"):
-        _required(value, key, "progress-policy payload")
-
-
-def _validate_launch_handoff_policy(result: Any) -> None:
-    value = _mapping(result, "launch-handoff-policy payload")
-    for key in ("timeout_seconds", "source", "applies_to"):
-        _required(value, key, "launch-handoff-policy payload")
-
-
-def _validate_tmux_policy(result: Any) -> None:
-    value = _mapping(result, "tmux-policy payload")
-    _required_bool(value, "enabled", "tmux-policy payload")
-    source = _required(value, "source", "tmux-policy payload")
-    if source not in {"default", "configured"}:
-        raise ValueError("tmux-policy payload.source is invalid")
-    applies_to = _required(value, "applies_to", "tmux-policy payload")
-    if applies_to != "new_observer_decisions":
-        raise ValueError("tmux-policy payload.applies_to is invalid")
-
-
-def _validate_notifications(result: Any) -> None:
-    value = _mapping(result, "notifications payload")
-    _required_bool(value, "enabled", "notifications payload")
-    _required_mapping(value, "providers", "notifications payload")
-
-
-def _validate_lease_policy(result: Any) -> None:
-    value = _mapping(result, "lease-policy payload")
-    _required_mapping(value, "lease_policy", "lease-policy payload")
-
-
 def _validate_doctor_verify(result: Any) -> None:
     value = _mapping(result, "doctor-verify payload")
     for key in ("schema_version", "tasks_checked", "issues", "complete", "healthy"):
@@ -1464,6 +1436,44 @@ def _validate_clean(result: Any) -> None:
     _mapping(value["skipped"], "clean payload.skipped")
 
 
+def _validate_config(result: Any) -> None:
+    _mapping(result, "config payload")
+
+
+def _validate_task_wait(result: Any) -> None:
+    value = _mapping(result, "task-wait payload")
+    for key in (
+        "schema_version",
+        "task_id",
+        "project",
+        "selected_attempt_number",
+        "selected_attempt_id",
+        "outcome",
+        "reason",
+        "task_exit_code",
+        "error",
+    ):
+        _required(value, key, "task-wait payload")
+
+
+def _validate_status(result: Any) -> None:
+    value = _mapping(result, "status payload")
+    for key in ("project", "local_participation", "local_agent", "task_observation", "next_actions"):
+        _required(value, key, "status payload")
+
+
+def _validate_machine_show(result: Any) -> None:
+    value = _mapping(result, "machine-show payload")
+    for key in ("machine_name", "project", "declaration", "warnings", "complete"):
+        _required(value, key, "machine-show payload")
+
+
+def _validate_operation(result: Any) -> None:
+    value = _mapping(result, "operation payload")
+    for key in ("reference", "kind", "operation_id", "outcome", "error"):
+        _required(value, key, "operation payload")
+
+
 @dataclass(frozen=True, slots=True)
 class _OutputContract:
     validator: Validator
@@ -1483,10 +1493,8 @@ _REGISTRY: dict[OutputKind, _OutputContract] = {
     OutputKind.GROUP_OPERATION: _OutputContract(_validate_group_operation, _render_group_operation),
     OutputKind.GROUP_MACHINES: _OutputContract(_validate_group_machines, _render_group_machines),
     OutputKind.MACHINES: _OutputContract(_validate_machines, _render_machines),
-    OutputKind.TOP: _OutputContract(_validate_top, _render_top),
     OutputKind.AGENT_OPERATION: _OutputContract(_validate_agent_operation, _render_agent_operation),
     OutputKind.AGENT_STATUS: _OutputContract(_validate_agent_status, _render_agent_status),
-    OutputKind.AGENT_PROJECT_LIST: _OutputContract(_validate_agent_project_list, _render_agent_project_list),
     OutputKind.AGENT_CONFIG: _OutputContract(_validate_agent_config, _render_agent_config),
     OutputKind.AGENT_READINESS: _OutputContract(_validate_agent_readiness, _render_agent_readiness),
     OutputKind.MACHINE_INIT: _OutputContract(_validate_machine_init, _render_machine_init),
@@ -1502,17 +1510,14 @@ _REGISTRY: dict[OutputKind, _OutputContract] = {
     OutputKind.SCHEMA6_UPGRADE: _OutputContract(_validate_schema6_upgrade, _render_schema6),
     OutputKind.SUBMISSION: _OutputContract(_validate_submission, _render_submission),
     OutputKind.CONTEXT: _OutputContract(_validate_context, _render_context),
-    OutputKind.PROGRESS_POLICY: _OutputContract(_validate_progress_policy, _render_progress_policy),
-    OutputKind.LAUNCH_HANDOFF_POLICY: _OutputContract(
-        _validate_launch_handoff_policy,
-        _render_launch_handoff_policy,
-    ),
-    OutputKind.TMUX_POLICY: _OutputContract(_validate_tmux_policy, _render_tmux_policy),
-    OutputKind.NOTIFICATIONS: _OutputContract(_validate_notifications, _render_notifications),
-    OutputKind.LEASE_POLICY: _OutputContract(_validate_lease_policy, _render_lease_policy),
     OutputKind.DOCTOR_VERIFY: _OutputContract(_validate_doctor_verify, _render_doctor),
     OutputKind.DOCTOR_REPAIR: _OutputContract(_validate_doctor_repair, _render_doctor),
     OutputKind.CLEAN: _OutputContract(_validate_clean, _render_clean),
+    OutputKind.CONFIG: _OutputContract(_validate_config, _render_config),
+    OutputKind.TASK_WAIT: _OutputContract(_validate_task_wait, _render_task_wait),
+    OutputKind.STATUS: _OutputContract(_validate_status, _render_status),
+    OutputKind.MACHINE_SHOW: _OutputContract(_validate_machine_show, _render_machine_show),
+    OutputKind.OPERATION: _OutputContract(_validate_operation, _render_operation),
 }
 
 

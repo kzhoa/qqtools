@@ -18,7 +18,7 @@ def test_submission_result_fixtures_satisfy_json_and_human_contracts() -> None:
 
 
 def test_json_serializes_only_the_canonical_payload() -> None:
-    payload = {"cpu_lane": {"capacity": 3, "revision": 7}}
+    payload = {"machine_runtime_root": "/machine-runtime", "cpu_lane": {"capacity": 3, "revision": 7}}
     output = CliOutput(OutputKind.CPU_LANE, payload, {"action": "ignored"})
 
     assert json.loads(render(output, "json")) == payload
@@ -26,44 +26,23 @@ def test_json_serializes_only_the_canonical_payload() -> None:
 
 def test_cpu_lane_human_output_requires_and_renders_policy_fields() -> None:
     rendered = render(
-        CliOutput(OutputKind.CPU_LANE, {"cpu_lane": {"capacity": 3, "revision": 7}}),
+        CliOutput(
+            OutputKind.CPU_LANE,
+            {"machine_runtime_root": "/machine-runtime", "cpu_lane": {"capacity": 3, "revision": 7}},
+        ),
         "human",
     )
 
-    assert rendered.splitlines() == ["Capacity: 3", "Revision: 7"]
+    assert rendered.splitlines() == ["MachineRuntime root: /machine-runtime", "Capacity: 3", "Revision: 7"]
 
     with pytest.raises((TypeError, ValueError), match="capacity"):
-        render(CliOutput(OutputKind.CPU_LANE, {"cpu_lane": {"revision": 7}}), "human")
-
-
-def test_project_list_human_output_has_a_distinct_table_and_empty_state() -> None:
-    project = {
-        "project_id": "project-1",
-        "shared_root": "/shared/project",
-        "machine_name": "gpu-1",
-        "enabled": True,
-        "state": "enabled",
-        "eligibility": {"state": "eligible", "write_eligible": True},
-        "write_eligible": True,
-    }
-
-    rendered = render(
-        CliOutput(OutputKind.AGENT_PROJECT_LIST, {"action": "project_list", "projects": [project]}),
-        "human",
-    )
-
-    assert rendered.splitlines()[0].startswith("Project ID")
-    assert "project-1" in rendered
-    assert "/shared/project" in rendered
-    assert "gpu-1" in rendered
-    assert "eligible" in rendered
-    assert (
         render(
-            CliOutput(OutputKind.AGENT_PROJECT_LIST, {"action": "project_list", "projects": []}),
+            CliOutput(
+                OutputKind.CPU_LANE,
+                {"machine_runtime_root": "/machine-runtime", "cpu_lane": {"revision": 7}},
+            ),
             "human",
         )
-        == "No results."
-    )
 
 
 def test_upgrade_registry_and_advance_render_their_distinct_project_shapes() -> None:

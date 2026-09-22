@@ -120,28 +120,28 @@ remain usable by their old binaries.
 
 ## Operator entry points (1.3.15)
 
-Provide a feature-specific `qexp upgrade cpu-lane` command group. It is independent of the
-existing `qexp migrate --to-schema` interface and the machine CPU-capacity configuration commands.
-All upgrade commands require explicit global `--shared-root`; saved CLI context must not silently
+Provide the feature-specific `qexp admin migrate schema6` command group. It is independent of the
+`qexp admin migrate schema --project PATH --to-schema` interface and the machine CPU-capacity configuration commands.
+All upgrade commands require explicit global `--project`; saved CLI context must not silently
 choose a mutation target. They support the existing `--format human|json` convention. These are
 planned interfaces, not commands currently available in the installed CLI.
 
 ```bash
 # Read-only inventory and preflight; no marker, lock-file or policy creation.
-qexp --shared-root /mnt/share/myproject/.qexp upgrade cpu-lane check
+qexp admin migrate schema6 check --project /mnt/share/myproject/.qexp
 
 # After draining and stopping normal clients, create the activation session.
-qexp --shared-root /mnt/share/myproject/.qexp upgrade cpu-lane start
+qexp admin migrate schema6 start --project /mnt/share/myproject/.qexp
 
 # On EACH registered machine, use the activation ID returned by start.
-qexp --shared-root /mnt/share/myproject/.qexp --machine gpu-a \
-  upgrade cpu-lane attest --activation-id <id> --confirm-clients-stopped
+qexp admin migrate schema6 attest --project /mnt/share/myproject/.qexp --machine gpu-a \
+  --activation-id <id> --confirm-clients-stopped
 
 # On the coordinator, verify all attestations and perform or resume conversion.
-qexp --shared-root /mnt/share/myproject/.qexp upgrade cpu-lane resume --activation-id <id>
+qexp admin migrate schema6 resume --project /mnt/share/myproject/.qexp --activation-id <id>
 
 # Read-only progress and recovery instructions, including during interruption.
-qexp --shared-root /mnt/share/myproject/.qexp upgrade cpu-lane status --format json
+qexp admin migrate schema6 status --project /mnt/share/myproject/.qexp --format json
 ```
 
 | Action | Contract |
@@ -180,7 +180,7 @@ project controls, let supervision drain tasks (or explicitly cancel them), stop 
 and suppress automatic restart, then run `check`, `start`, local `attest` on every participant,
 and `resume`. `status` with phase `completed` is the signal to restart agents/clients and restore
 any project binding that the operator disabled. Upgrade does not re-enable bindings, start agents
-or set positive CPU capacity; allocate CPU slots separately with `agent cpu-lane set`.
+or set positive CPU capacity; allocate CPU slots separately with `agent config cpu set`.
 
 1.3.16 removes this temporary command group with the upgrader. Permanent first-open diagnostics
 on legacy/preparing roots direct operators to use 1.3.15 and the same commands to finish conversion;

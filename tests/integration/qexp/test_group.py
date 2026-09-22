@@ -1,13 +1,16 @@
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from qqtools.plugins.qexp import batch_submit, init_shared_root, submit
-from qqtools.plugins.qexp.commands.group import change_worker, create_group, group_control
+from qqtools.plugins.qexp.commands import group as group_commands
+from qqtools.plugins.qexp.commands.group import change_worker, create_group, group_control, group_retry_failed
 from qqtools.plugins.qexp.observer import list_group_machines, list_groups
 from qqtools.plugins.qexp.runtime.paths import group_path
 from qqtools.plugins.qexp.runtime.resources.reservations import reserve_admitted
 from qqtools.plugins.qexp.runtime.store import read_json
+from qqtools.plugins.qexp.scheduler import claim_task, fail_attempt
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -72,6 +75,77 @@ def test_group_worker_set_accepts_primary_gpu_limit(tmp_path: Path):
 
     group = change_worker(cfg, "exp", "g2", "add", role="primary", gpu_limit_gpus=1, has_gpu_limit=True)
     assert group["group"]["worker_set"]["g2"]["gpu_limit_gpus"] == 1
+
+
+def test_group_retry_missing_group_is_an_error(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+
+    with pytest.raises(FileNotFoundError):
+        group_retry_failed(cfg, "missing")
+
+
+def test_group_retry_does_not_expand_to_members_added_after_selection(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
+    first = submit(cfg, ["echo", "first"], group="exp")
+    first_attempt = claim_task(cfg, first.task_id, [0])
+    assert first_attempt is not None
+    assert fail_attempt(cfg, first.task_id, first_attempt.attempt_id, first_attempt.current_fencing_token, "failed")
+
+    real_group_writer_lock = group_commands.group_writer_lock
+    lock_calls = 0
+
+    @contextmanager
+    def racing_group_writer_lock(*args, **kwargs):
+        nonlocal lock_calls
+        lock_calls += 1
+        with real_group_writer_lock(*args, **kwargs) as acquired:
+            yield acquired
+        if lock_calls == 2:
+            late = submit(cfg, ["echo", "late"], group="exp")
+            late_attempt = claim_task(cfg, late.task_id, [0])
+            assert late_attempt is not None
+            assert fail_attempt(
+                cfg, late.task_id, late_attempt.attempt_id, late_attempt.current_fencing_token, "late_failure"
+            )
+
+    monkeypatch.setattr(group_commands, "group_writer_lock", racing_group_writer_lock)
+
+    result = group_retry_failed(cfg, "exp")
+
+    assert result["retried_task_ids"] == [first.task_id]
+    assert result["retried_count"] == 1
+    assert result["skipped"] == {"blocked": [], "orphaned": [], "other": []}
+
+
+def test_group_retry_classifies_selected_failure_changed_before_application(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
+    task = submit(cfg, ["echo", "failure"], group="exp")
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "failed")
+
+    real_group_writer_lock = group_commands.group_writer_lock
+    real_task_retry = group_commands.retry
+    lock_calls = 0
+
+    @contextmanager
+    def racing_group_writer_lock(*args, **kwargs):
+        nonlocal lock_calls
+        lock_calls += 1
+        with real_group_writer_lock(*args, **kwargs) as acquired:
+            yield acquired
+        if lock_calls == 2:
+            real_task_retry(cfg, task.task_id)
+
+    monkeypatch.setattr(group_commands, "group_writer_lock", racing_group_writer_lock)
+
+    result = group_retry_failed(cfg, "exp")
+
+    assert result["retried_task_ids"] == []
+    assert result["retried_count"] == 0
+    assert result["skipped"] == {"blocked": [], "orphaned": [], "other": [task.task_id]}
 
 
 def test_group_machine_usage_includes_unexpired_provisional_reservation(tmp_path: Path):

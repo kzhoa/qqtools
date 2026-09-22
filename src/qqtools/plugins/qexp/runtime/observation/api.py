@@ -12,7 +12,8 @@ from ...config_types import RootConfig
 from ...layout import project_id
 from ..records import TASK_ID_PATTERN
 
-_CURSOR_FIELDS = frozenset({"v", "project", "phase", "group", "order", "generation", "last"})
+_CURSOR_V1_FIELDS = frozenset({"v", "project", "phase", "group", "order", "generation", "last"})
+_CURSOR_V2_FIELDS = _CURSOR_V1_FIELDS | {"name"}
 _CURSOR_ORDER = "task_id-asc-v1"
 _MAX_CURSOR_LENGTH = 4096
 _MAX_TASK_ID_LENGTH = 250
@@ -70,6 +71,18 @@ def _normalize_filter(value: str | None, label: str) -> str | None:
     return value
 
 
+def _normalize_name_filter(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _invalid_argument("name must be a string or null.")
+    if not value:
+        raise _invalid_argument("name must not be empty.")
+    if len(value) > _MAX_TASK_ID_LENGTH:
+        raise _invalid_argument("name must be at most 250 characters.")
+    return value
+
+
 def _validate_page_size(page_size: int) -> int:
     if type(page_size) is not int or not 1 <= page_size <= 1000:
         raise _invalid_argument("page_size must be an integer from 1 through 1000.")
@@ -84,7 +97,15 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _encode_cursor(*, project: str, phase: str | None, group: str | None, generation: str, last: str) -> str:
+def _encode_cursor(
+    *,
+    project: str,
+    phase: str | None,
+    group: str | None,
+    name: str | None = None,
+    generation: str,
+    last: str,
+) -> str:
     value = {
         "generation": generation,
         "group": group,
@@ -92,8 +113,13 @@ def _encode_cursor(*, project: str, phase: str | None, group: str | None, genera
         "order": _CURSOR_ORDER,
         "phase": phase,
         "project": project,
-        "v": 1,
     }
+    if name is None:
+        # Keep the legacy token's fields and values byte-for-byte unchanged.
+        value["v"] = 1
+    else:
+        value["name"] = name
+        value["v"] = 2
     token = base64.urlsafe_b64encode(_canonical_json(value)).decode("ascii")
     if len(token) > _MAX_CURSOR_LENGTH:
         raise _index_unavailable("the continuation cursor exceeds the maximum supported length.")
@@ -113,7 +139,14 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"cursor contains unsupported JSON constant {value!r}.")
 
 
-def _decode_cursor(cursor: str, *, project: str, phase: str | None, group: str | None) -> tuple[str, str]:
+def _decode_cursor(
+    cursor: str,
+    *,
+    project: str,
+    phase: str | None,
+    group: str | None,
+    name: str | None = None,
+) -> tuple[str, str]:
     if not isinstance(cursor, str) or not cursor or len(cursor) > _MAX_CURSOR_LENGTH:
         raise _invalid_cursor("cursor is missing, too long, or not a string.")
     if _CANONICAL_BASE64_PATTERN.fullmatch(cursor) is None:
@@ -135,13 +168,23 @@ def _decode_cursor(cursor: str, *, project: str, phase: str | None, group: str |
         json.JSONDecodeError,
     ) as exc:
         raise _invalid_cursor("cursor is not valid canonical JSON.") from exc
-    if not isinstance(value, dict) or set(value) != _CURSOR_FIELDS:
+    if not isinstance(value, dict) or "v" not in value:
         raise _invalid_cursor("cursor fields are invalid.")
     version = value["v"]
     if type(version) is not int:
         raise _invalid_cursor("cursor version is not an integer.")
-    if version != 1:
+    if version == 1:
+        expected_fields = _CURSOR_V1_FIELDS
+    elif version == 2:
+        expected_fields = _CURSOR_V2_FIELDS
+    else:
         raise ObservationError("cursor_expired", "cursor version is no longer supported.", 1)
+    if set(value) != expected_fields:
+        raise _invalid_cursor("cursor fields are invalid.")
+    if version == 1 and name is not None:
+        raise ObservationError("cursor_expired", "cursor does not support a name filter.", 1)
+    if version == 2 and name is None:
+        raise ObservationError("cursor_expired", "cursor requires its name filter.", 1)
     if not isinstance(value["project"], str) or not isinstance(value["order"], str):
         raise _invalid_cursor("cursor project or ordering fields are invalid.")
     if value["project"] != project:
@@ -157,6 +200,12 @@ def _decode_cursor(cursor: str, *, project: str, phase: str | None, group: str |
         raise _invalid_cursor("cursor group filter is invalid.")
     if value["phase"] != phase or value["group"] != group:
         raise _invalid_cursor("cursor filters do not match this request.")
+    if version == 2 and value["name"] != name:
+        raise _invalid_cursor("cursor name filters do not match this request.")
+    if version == 2 and (not isinstance(value["name"], str) or not value["name"]):
+        raise _invalid_cursor("cursor name filter is invalid.")
+    if version == 2 and len(value["name"]) > _MAX_TASK_ID_LENGTH:
+        raise _invalid_cursor("cursor name filter is too long.")
     generation = value["generation"]
     if not isinstance(generation, str) or _GENERATION_PATTERN.fullmatch(generation) is None:
         raise _invalid_cursor("cursor index generation is invalid.")
@@ -189,6 +238,7 @@ def list_tasks_page(
     *,
     phase: str | None = None,
     group: str | None = None,
+    name: str | None = None,
     page_size: int = 50,
     cursor: str | None = None,
 ) -> dict[str, Any]:
@@ -198,6 +248,7 @@ def list_tasks_page(
         cfg: Initialized qexp project configuration.
         phase: Optional exact Task phase filter.
         group: Optional exact Group filter.
+        name: Optional exact, case-sensitive Task name filter.
         page_size: Number of matching Task views to return, from 1 through 1000.
         cursor: Opaque continuation returned by a previous page.
 
@@ -209,12 +260,19 @@ def list_tasks_page(
     """
     phase = _normalize_filter(phase, "phase")
     group = _normalize_filter(group, "group")
+    name = _normalize_name_filter(name)
     page_size = _validate_page_size(page_size)
     current_project = project_id(cfg.shared_root)
     expected_generation: str | None = None
     after: str | None = None
     if cursor is not None:
-        expected_generation, after = _decode_cursor(cursor, project=current_project, phase=phase, group=group)
+        expected_generation, after = _decode_cursor(
+            cursor,
+            project=current_project,
+            phase=phase,
+            group=group,
+            name=name,
+        )
 
     from . import projection
 
@@ -264,6 +322,8 @@ def list_tasks_page(
                 continue
             if group is not None and view["group"] != group:
                 continue
+            if name is not None and view["name"] != name:
+                continue
             gate = dependency_gate(cfg, task)
             view["depends_on_task_ids"] = task.depends_on_task_ids
             view["dependency_state"] = gate.state
@@ -298,6 +358,7 @@ def list_tasks_page(
             project=current_project,
             phase=phase,
             group=group,
+            name=name,
             generation=generation,
             last=last_inspected,
         )

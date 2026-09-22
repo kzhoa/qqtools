@@ -28,12 +28,10 @@ def test_batch_tmux_flags_are_nullable_and_mutually_exclusive():
         parser.parse_args(["submit", "--file", "runs.yaml", "--tmux", "--no-tmux"])
 
 
-def test_config_tmux_set_requires_exactly_one_value():
+def test_config_tmux_set_rejects_conflicting_values():
     parser = build_parser()
 
-    assert parser.parse_args(["config", "tmux", "set", "--enabled"]).enabled is True
-    assert parser.parse_args(["config", "tmux", "set", "--disabled"]).disabled is True
+    assert parser.parse_args(["config", "set", "tmux", "--enabled"]).enabled is True
+    assert parser.parse_args(["config", "set", "tmux", "--disabled"]).disabled is True
     with pytest.raises(SystemExit):
-        parser.parse_args(["config", "tmux", "set"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["config", "tmux", "set", "--enabled", "--disabled"])
+        parser.parse_args(["config", "set", "tmux", "--enabled", "--disabled"])
