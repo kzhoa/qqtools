@@ -1005,7 +1005,7 @@ class MachineGroupDiscoveryWorker:
             group = step.candidates[0].stem
             try:
                 read_group(binding.shared_root, group)
-            except (GroupNotPublished, GroupPublicationUnavailable):
+            except (FileNotFoundError, GroupNotPublished, GroupPublicationUnavailable):
                 return None
             return index, binding, group
         if step.state == "complete":
@@ -1092,6 +1092,9 @@ class MachineGroupDiscoveryWorker:
                 if not group_path(entry.binding.shared_root, entry.group).exists():
                     self._queue_entry_close(entry)
                     continue
+            except FileNotFoundError:
+                self._queue_entry_close(entry)
+                continue
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 continue
             if entry.service_turn:

@@ -266,8 +266,8 @@ def test_generation_invalidation_rebuilds_census_before_completion(tmp_path):
 
 
 def test_cli_activates_background_only_after_durable_remove(tmp_path, monkeypatch, capsys):
-    from qqtools.plugins.qexp import cli
     from qqtools.plugins.qexp.agent.context import MachineRuntime
+    from qqtools.plugins.qexp.cli import entrypoint, project_handlers
 
     cfg = isolated_group(tmp_path, tail=0)
     submit(cfg, ["true"], group="experiment")
@@ -284,10 +284,10 @@ def test_cli_activates_background_only_after_durable_remove(tmp_path, monkeypatc
         pytest.fail("removal rendered unused Task history")
 
     with monkeypatch.context() as patch:
-        patch.setattr(cli, "ensure_local_agent_active", activate)
-        patch.setattr(cli.observer, "list_tasks", no_history)
+        patch.setattr(project_handlers, "ensure_local_agent_active", activate)
+        patch.setattr(project_handlers.observer, "list_tasks", no_history)
         assert (
-            cli.main(
+            entrypoint.main(
                 [
                     "--project",
                     str(cfg.shared_root),

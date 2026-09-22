@@ -82,7 +82,9 @@ def test_new_project_activation_uses_registered_binding_without_add_project(tmp_
         _assert_current_project_is_registered(common, shared_root, env)
         started = run([*common, "agent", "start", "--format=json"], env=env)
         status = json.loads(started.stdout)
-        assert status["action"] == "started"
+        assert status["ready"] is True
+        assert status["machine_runtime_root"] == str(machine_runtime_root)
+        assert status["projects"]
         assert is_machine_agent_running(common, env=env)
 
         task_id = run(
@@ -191,13 +193,16 @@ def test_legacy_metadata_requires_migration_without_touching_unrelated_resources
                 "project",
                 "register",
                 str(shared_root.parent),
+                "--format=json",
             ],
             env=env,
             check=False,
         )
         assert rejected.returncode == 2
-        assert "qexp admin migrate agent --project" in rejected.stderr
-        assert "--machine gpu-1" in rejected.stderr
+        rejected_payload = json.loads(rejected.stdout)
+        reason = rejected_payload["projects"][0]["reason"]
+        assert "qexp admin migrate agent --project" in reason
+        assert "--machine gpu-1" in reason
         assert record_path.read_bytes() == original_legacy_record
         assert not (shared_root / "machines" / "gpu-2" / "machine.json").exists()
 

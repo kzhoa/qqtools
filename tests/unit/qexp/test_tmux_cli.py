@@ -1,6 +1,6 @@
 import pytest
 
-from qqtools.plugins.qexp.cli import build_parser
+from qqtools.plugins.qexp.cli.parser import build_parser
 
 
 def test_submit_tmux_flags_are_nullable_and_application_arguments_stay_after_separator():

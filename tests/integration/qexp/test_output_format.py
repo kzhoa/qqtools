@@ -5,7 +5,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.runtime.tasks import load_task
 
@@ -93,7 +93,7 @@ def test_tmux_policy_cli_reports_project_default_and_configured_value_without_ac
     base = _base_args(cfg)
     activations = []
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active",
         lambda *_args, **_kwargs: activations.append(True),
     )
 
@@ -263,7 +263,7 @@ def test_invalid_format_is_rejected_before_task_action(tmp_path: Path, monkeypat
         called = True
         raise AssertionError("workflow must not run")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.task_commands.offer", fail_if_called)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.project_handlers.task_commands.offer", fail_if_called)
     with pytest.raises(SystemExit):
         main([*_base_args(cfg), "task", "offer", "task_x", f"--format={value}"])
     assert called is False
@@ -273,7 +273,7 @@ def test_submit_preserves_training_format_argument(tmp_path: Path, monkeypatch, 
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     received: list[str] = []
 
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", lambda *args, **kwargs: True)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.submission.ensure_local_agent_active", lambda *args, **kwargs: True)
     assert main([*_base_args(cfg), "submit", "--quiet", "--", "python", "train.py", "--format=json"]) == 0
     task_id = capsys.readouterr().out.strip()
     task = load_task(cfg, task_id)
@@ -412,7 +412,7 @@ def test_batch_json_is_one_document_and_idempotent_retry_is_silent_on_stderr(tmp
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     manifest = tmp_path / "runs.yaml"
     manifest.write_text("tasks:\n  - command: [echo, ok]\n", encoding="utf-8")
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", lambda *args, **kwargs: True)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.submission.ensure_local_agent_active", lambda *args, **kwargs: True)
 
     assert main([*_base_args(cfg), "submit", "--file", str(manifest), "--format=json"]) == 0
     first_capture = capsys.readouterr()
@@ -536,7 +536,7 @@ def test_machine_upgrade_advance_human_reads_flat_projects_and_json_is_unchanged
         calls += 1
         return result
 
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.advance_registered_upgrades", fake_advance)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.local_handlers.advance_registered_upgrades", fake_advance)
     base = ["--machine-runtime-root", str(tmp_path / "machine-runtime"), "admin", "upgrade", "advance"]
 
     assert main(base) == 0
@@ -572,7 +572,7 @@ def test_machine_upgrade_status_human_reads_nested_projects_and_json_is_unchange
         "discovery_source": "machine_registry",
         "discovery_boundary": "locally_registered_bindings",
     }
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.inspect_registered_upgrades", lambda _runtime: result)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.local_handlers.inspect_registered_upgrades", lambda _runtime: result)
     base = ["--machine-runtime-root", str(tmp_path / "machine-runtime"), "admin", "upgrade", "status"]
 
     assert main(base) == 0
@@ -592,7 +592,7 @@ def test_group_and_machine_human_output_do_not_query_task_history_for_presentati
     def fail_if_called(*_args, **_kwargs):
         raise AssertionError("human presentation must not perform a Task history query")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.observer.list_tasks", fail_if_called)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.project_handlers.observer.list_tasks", fail_if_called)
     base = _base_args(cfg)
 
     assert main([*base, "group", "list"]) == 0
@@ -605,3 +605,23 @@ def test_group_and_machine_human_output_do_not_query_task_history_for_presentati
     assert main([*base, "machine", "list"]) == 0
     machines = capsys.readouterr().out
     assert machines == "No results.\n" or "Task summary" in machines.splitlines()[0]
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_code", "stderr_expected"),
+    [
+        (["task", "list", "--page-size", "10", "--format=json", "--unknown"], "invalid_argument", False),
+        (["status", "--format=json", "--unknown"], "invalid_argument", False),
+        (["submit", "--format=json", "--unknown"], "invalid_input", True),
+    ],
+)
+def test_raw_argv_parse_failures_retain_their_structured_routing(
+    argv: list[str], expected_code: str, stderr_expected: bool, capsys
+) -> None:
+    assert main(argv) == 2
+
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    error = result["error"]
+    assert error["code"] == expected_code
+    assert bool(captured.err) is stderr_expected

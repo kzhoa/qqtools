@@ -5,7 +5,7 @@ import time
 
 
 def test_gpu_policy_cli_is_machine_scoped_and_revisioned(tmp_path, capsys) -> None:
-    from qqtools.plugins.qexp.cli import main
+    from qqtools.plugins.qexp.cli.entrypoint import main
 
     runtime_root = tmp_path / "machine"
     common = ["--machine-runtime-root", str(runtime_root), "agent", "config", "gpus"]
@@ -37,7 +37,7 @@ def test_gpu_policy_cli_is_machine_scoped_and_revisioned(tmp_path, capsys) -> No
 
 
 def test_gpu_policy_cli_rejects_invalid_lists_without_replacing_policy(tmp_path, capsys) -> None:
-    from qqtools.plugins.qexp.cli import main
+    from qqtools.plugins.qexp.cli.entrypoint import main
 
     runtime_root = tmp_path / "machine"
     common = ["--machine-runtime-root", str(runtime_root), "agent", "config", "gpus"]
@@ -55,7 +55,7 @@ def test_gpu_policy_cli_rejects_invalid_lists_without_replacing_policy(tmp_path,
 
 
 def test_explicit_none_does_not_change_cpu_lane(tmp_path, capsys) -> None:
-    from qqtools.plugins.qexp.cli import main
+    from qqtools.plugins.qexp.cli.entrypoint import main
 
     runtime_root = tmp_path / "machine"
     root = ["--machine-runtime-root", str(runtime_root), "agent"]

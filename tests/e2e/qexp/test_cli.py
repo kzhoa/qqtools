@@ -54,9 +54,14 @@ def test_installed_wheel_cli_flow(tmp_path):
 
         assert "site-packages" in imported_from
         assert tmux_policy == {
-            "enabled": False,
-            "source": "default",
-            "applies_to": "new_observer_decisions",
+            "action": "show",
+            "scope": "project",
+            "section": "tmux",
+            "values": {
+                "enabled": False,
+                "source": "default",
+                "applies_to": "new_observer_decisions",
+            },
         }
         assert group["group"]["name"] == "release-e2e"
         assert task["task"]["task_id"] == task_id

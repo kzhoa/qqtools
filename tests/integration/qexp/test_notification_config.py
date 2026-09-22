@@ -2,8 +2,8 @@ import io
 
 import pytest
 
-from qqtools.plugins.qexp import cli
 from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.machine_config import init_shared_root
 from qqtools.plugins.qexp.notification_config import shared_feishu_webhook_path
 
@@ -32,12 +32,12 @@ def test_shared_file_webhook_cli_requires_acknowledgement(tmp_path, monkeypatch,
         "shared_file",
     ]
 
-    assert cli.main(arguments) == 2
+    assert main(arguments) == 2
     assert not shared_feishu_webhook_path(cfg).exists()
 
     monkeypatch.setattr("sys.stdin", io.StringIO("https://example.invalid/persisted-webhook\n"))
     assert (
-        cli.main(
+        main(
             arguments
             + [
                 "--webhook-stdin",
@@ -51,8 +51,8 @@ def test_shared_file_webhook_cli_requires_acknowledgement(tmp_path, monkeypatch,
     assert not shared_feishu_webhook_path(cfg).exists()
 
     monkeypatch.setattr("sys.stdin", io.StringIO("https://example.invalid/persisted-webhook\n"))
-    assert cli.main(arguments + ["--webhook-stdin", "--acknowledge-shared-secret-risk"]) == 0
+    assert main(arguments + ["--webhook-stdin", "--acknowledge-shared-secret-risk"]) == 0
 
     assert shared_feishu_webhook_path(cfg).exists()
-    assert cli.main(arguments[:8] + ["config", "show", "notifications"]) == 0
+    assert main(arguments[:8] + ["config", "show", "notifications"]) == 0
     assert "https://example.invalid/persisted-webhook" not in capsys.readouterr().out

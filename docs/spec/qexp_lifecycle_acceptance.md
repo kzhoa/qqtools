@@ -173,11 +173,15 @@ remain diagnostic; the current gate results above are the acceptance evidence.
 
 ## Aggregate gate evidence contract (2026-09-15)
 
-The `qexp-integration` tox environment now delegates to `scripts/qexp_integration_gate.py`. The
-wrapper preserves the existing two four-worker phases, but applies one 600-second wall-clock budget
-to their combined collection, execution, and teardown path. Each phase receives a separate JUnit
+The `qexp-integration` tox environment delegates to `scripts/qexp_integration_gate.py`. The
+wrapper preserves the existing two four-worker phases and applies one 600-second soft wall-clock
+budget to their combined collection, execution, and teardown path. Both phases normally finish so
+their complete reports are retained; a successful over-budget run then fails as `budget_exceeded`.
+A separate shared 1200-second hard timeout terminates a stuck process tree and reports
+`hard_timeout`. Each phase receives a separate JUnit
 XML file, stdout/stderr logs, collection manifest, and raw per-report timing JSON; `summary.json`
-records phase exit codes, durations, status, Python version, and `GITHUB_SHA` when available. The
+records phase exit codes, durations, soft-budget overrun, hard timeout, status, Python version, and
+`GITHUB_SHA` when available. The
 wrapper removes only its own known report files at startup, so a rerun cannot inherit stale phase
 artifacts. A collection failure, worker
 failure, timeout, or cleanup failure is non-zero and is not converted to success by a later passing

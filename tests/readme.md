@@ -82,8 +82,10 @@ Bare `tox` runs only the complete source preflight. The explicit Python matrix
 checks installed-package imports and CLI startup; missing interpreters fail.
 
 The complete qexp Integration gate runs ordinary and lifecycle collections as
-two four-worker phases within a shared 600-second budget. Reports go to
-`qexp-gate-reports/`; `QEXP_GATE_REPORT_DIR` overrides that location.
+two four-worker phases. It lets both phases finish and rejects a successful run
+that exceeds the shared 600-second soft budget, preserving their complete timing
+reports. A shared 1200-second hard timeout still terminates a stuck process tree.
+Reports go to `qexp-gate-reports/`; `QEXP_GATE_REPORT_DIR` overrides that location.
 
 Default source pytest collection excludes E2E. `artifact-e2e` builds a wheel
 from the checkout; `release-e2e` validates the selected exact wheel. See

@@ -7,7 +7,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.commands.task import submit as submit_task
 from qqtools.plugins.qexp.layout import load_context
 from qqtools.plugins.qexp.observer import inspect_task
@@ -206,7 +206,7 @@ def test_remote_home_does_not_activate_the_target_agent(
         calls.append((cfg.machine_name, machine_runtime.root))
         return True
 
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", activate)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.submission.ensure_local_agent_active", activate)
     assert main(_args(shared_root, runtime, "submit", "--home-machine", "g4", "--", "echo", "ok")) == 0
     capsys.readouterr()
     assert calls == [("g3", runtime.root)]
@@ -413,7 +413,7 @@ def test_batch_manifest_can_atomically_create_exact_worker_set(
         "group:\n  workers: [g4]\ntasks:\n  - placement:\n      home_machine: g4\n    command: [echo, ok]\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", lambda *args, **kwargs: True)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.submission.ensure_local_agent_active", lambda *args, **kwargs: True)
 
     assert main(_args(shared_root, runtime, "submit", "--file", str(manifest), "--group", "exp", "--format=json")) == 0
     result = json.loads(capsys.readouterr().out)

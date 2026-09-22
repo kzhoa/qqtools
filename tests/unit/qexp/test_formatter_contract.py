@@ -6,6 +6,25 @@ import pytest
 from qqtools.plugins.qexp.formatter import CliOutput, OutputKind, render
 
 
+def _gpu_policy_view() -> dict[str, object]:
+    return {
+        "mode": "auto",
+        "source": "discovery",
+        "revision": 0,
+        "configured_gpu_ids": None,
+        "discovered_gpu_ids": [0],
+        "visible_gpu_ids": [0],
+        "undiscovered_configured_gpu_ids": [],
+        "reserved_gpu_ids": [],
+        "unreserved_gpu_ids": [0],
+        "draining_gpu_ids": [],
+        "discovery_status": "available",
+        "visible_status": "available",
+        "warnings": [],
+        "agent_running": False,
+    }
+
+
 def test_submission_result_fixtures_satisfy_json_and_human_contracts() -> None:
     fixtures = json.loads(
         (Path(__file__).parents[2] / "fixtures" / "qexp" / "submission_results.json").read_text(encoding="utf-8")
@@ -108,3 +127,26 @@ def test_agent_operation_rejects_an_action_without_its_required_payload(output_f
 
     with pytest.raises((TypeError, ValueError), match="project_id"):
         render(output, output_format)
+
+
+def test_agent_status_accepts_nested_gpu_policy_view_without_runtime_root() -> None:
+    payload = {
+        "action": "status",
+        "machine_runtime_root": "/machine-runtime",
+        "agent_state": "stopped",
+        "pid": None,
+        "registry_revision": 0,
+        "projects": [],
+        "upgrade": {"projects": []},
+        "gpu_policy": _gpu_policy_view(),
+    }
+
+    assert json.loads(render(CliOutput(OutputKind.AGENT_STATUS, payload), "json")) == payload
+
+
+def test_standalone_gpu_policy_still_requires_runtime_root() -> None:
+    with pytest.raises((TypeError, ValueError), match="machine_runtime_root"):
+        render(CliOutput(OutputKind.GPU_POLICY, _gpu_policy_view()), "json")
+
+    payload = {"machine_runtime_root": "/machine-runtime", **_gpu_policy_view()}
+    assert json.loads(render(CliOutput(OutputKind.GPU_POLICY, payload), "json")) == payload

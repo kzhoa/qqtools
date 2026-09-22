@@ -1215,7 +1215,7 @@ def _validate_agent_status(result: Any) -> None:
     upgrade = _required_mapping(value, "upgrade", "agent-status payload")
     _validate_upgrade_registry(upgrade)
     if "gpu_policy" in value:
-        _validate_gpu_policy(value["gpu_policy"])
+        _validate_gpu_policy_view(value["gpu_policy"], "agent-status payload.gpu_policy")
     if "warnings" in value:
         _sequence(value["warnings"], "agent-status payload.warnings")
 
@@ -1228,9 +1228,8 @@ def _validate_cpu_lane(result: Any) -> None:
     _required_int(lane, "revision", "cpu-lane payload.cpu_lane")
 
 
-def _validate_gpu_policy(result: Any) -> None:
-    value = _mapping(result, "gpu-policy payload")
-    _required(value, "machine_runtime_root", "gpu-policy payload")
+def _validate_gpu_policy_view(result: Any, label: str) -> None:
+    value = _mapping(result, label)
     for key in (
         "mode",
         "source",
@@ -1247,13 +1246,13 @@ def _validate_gpu_policy(result: Any) -> None:
         "warnings",
         "agent_running",
     ):
-        _required(value, key, "gpu-policy payload")
+        _required(value, key, label)
     if value["mode"] not in {"auto", "explicit"}:
-        raise ValueError("gpu-policy payload.mode is invalid")
+        raise ValueError(f"{label}.mode is invalid")
     if value["source"] not in {"discovery", "environment", "persisted", "pending", "unavailable"}:
-        raise ValueError("gpu-policy payload.source is invalid")
+        raise ValueError(f"{label}.source is invalid")
     if type(value["revision"]) is not int or value["revision"] < 0:
-        raise TypeError("gpu-policy payload.revision must be a nonnegative integer")
+        raise TypeError(f"{label}.revision must be a nonnegative integer")
     for key in (
         "configured_gpu_ids",
         "discovered_gpu_ids",
@@ -1265,11 +1264,17 @@ def _validate_gpu_policy(result: Any) -> None:
     ):
         ids = value[key]
         if ids is not None:
-            values = _sequence(ids, f"gpu-policy payload.{key}")
+            values = _sequence(ids, f"{label}.{key}")
             if any(type(item) is not int or item < 0 for item in values):
-                raise TypeError(f"gpu-policy payload.{key} must contain nonnegative integers")
-    _sequence(value["warnings"], "gpu-policy payload.warnings")
-    _required_bool(value, "agent_running", "gpu-policy payload")
+                raise TypeError(f"{label}.{key} must contain nonnegative integers")
+    _sequence(value["warnings"], f"{label}.warnings")
+    _required_bool(value, "agent_running", label)
+
+
+def _validate_gpu_policy_payload(result: Any) -> None:
+    value = _mapping(result, "gpu-policy payload")
+    _required(value, "machine_runtime_root", "gpu-policy payload")
+    _validate_gpu_policy_view(value, "gpu-policy payload")
 
 
 def _validate_upgrade_registry(result: Any) -> None:
@@ -1502,7 +1507,7 @@ _REGISTRY: dict[OutputKind, _OutputContract] = {
     OutputKind.PROJECT_REGISTER: _OutputContract(_validate_project_register, _render_project_register),
     OutputKind.PROJECT_LIST: _OutputContract(_validate_project_list, _render_project_list),
     OutputKind.CPU_LANE: _OutputContract(_validate_cpu_lane, _render_cpu_lane),
-    OutputKind.GPU_POLICY: _OutputContract(_validate_gpu_policy, _render_gpu_policy),
+    OutputKind.GPU_POLICY: _OutputContract(_validate_gpu_policy_payload, _render_gpu_policy),
     OutputKind.UPGRADE_REGISTRY_STATUS: _OutputContract(_validate_upgrade_registry, _render_upgrade_registry),
     OutputKind.UPGRADE_ADVANCE: _OutputContract(_validate_upgrade_advance, _render_upgrade_advance),
     OutputKind.UPGRADE_PROJECT: _OutputContract(_validate_upgrade_project, _render_upgrade_project),

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.layout import load_root_config
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -263,7 +263,7 @@ def test_agent_start_rejects_a_registered_project_that_becomes_legacy(
     record["machine"].pop("agent_runtime")
     record_path.write_text(json.dumps(record), encoding="utf-8")
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_machine_agent_started",
+        "qqtools.plugins.qexp.cli.local_handlers.ensure_machine_agent_started",
         lambda _runtime: (None, {}),
     )
 

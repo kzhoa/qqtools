@@ -19,9 +19,10 @@ from qqtools.plugins.qexp.agent.recovery_capture import RecoveryCapture
 from qqtools.plugins.qexp.runtime.paths import idempotency_path, submission_path, task_path
 from qqtools.plugins.qexp.runtime.recovery_admission import fence_recovery_admission
 from qqtools.plugins.qexp.runtime.store import read_json
-from qqtools.plugins.qexp.runtime.submission import semantic_digest
+from qqtools.plugins.qexp.runtime.submission import normalize_submission_request, semantic_digest
 from qqtools.plugins.qexp.runtime.submission_control import publish_submission
 from qqtools.plugins.qexp.scheduler import cancel_task
+from qqtools.plugins.qexp.task_observation import build_task_observation
 from tests.helpers.qexp import observation_scale
 from tests.helpers.qexp.observation_scale import build_observation
 
@@ -130,6 +131,15 @@ def seed_settled_history(cfg, count, mode):
     build_observation(cfg, {identifier: ("cancelled", None) for identifier in identifiers})
 
 
+def request_worker_set(context):
+    """Reconstruct whether the persisted request declared a Worker Set."""
+    additions = context["worker_set_additions"]
+    is_declared = context.get("worker_set_declared")
+    if is_declared is None:
+        is_declared = bool(additions)
+    return additions if is_declared else None
+
+
 def _write_operation(cfg, operation, operation_id, key, identifiers):
     submission = operation["submission"]
     context = submission["resolved_context"]
@@ -139,11 +149,16 @@ def _write_operation(cfg, operation, operation_id, key, identifiers):
     submission["operation_id"] = operation_id
     submission["idempotency_key"] = key
     submission["kind"] = "batch" if len(identifiers) > 1 else "single"
-    submission["raw_request_digest"] = semantic_digest(
-        {"group": None, "tasks": context["task_specs"], "worker_set": {}}
+    request = normalize_submission_request(
+        context["task_specs"],
+        group_name=submission["target_group"],
+        kind=submission["kind"],
+        worker_set=request_worker_set(context),
     )
+    submission["raw_request_digest"] = request.raw_request_digest
     submission["resolved_context_digest"] = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
     submission["staged_task_count"] = len(identifiers)
+    operation["task_observation"] = build_task_observation(identifiers, [None] * len(identifiers))
     if len(identifiers) > 1:
         publish_submission(cfg, operation)
     else:

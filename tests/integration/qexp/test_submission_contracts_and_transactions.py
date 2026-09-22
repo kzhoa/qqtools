@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.cli import build_parser, main
+from qqtools.plugins.qexp.cli.entrypoint import main
+from qqtools.plugins.qexp.cli.parser import build_parser
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.machine_config import init_shared_root
 from qqtools.plugins.qexp.runtime.paths import group_path, submission_path
@@ -41,7 +42,7 @@ def _submit_prefix(project: Path, cfg, machine_runtime: MachineRuntime) -> list[
 def _disable_activation(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     calls: list[str] = []
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.submission.ensure_local_agent_active",
         lambda *_args, **kwargs: calls.append(str(kwargs.get("reason"))),
     )
     return calls
@@ -312,7 +313,7 @@ def test_activation_failure_preserves_committed_ids_and_exits_one(
     def fail_activation(*_args, **_kwargs):
         raise RuntimeError("agent unavailable")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", fail_activation)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.submission.ensure_local_agent_active", fail_activation)
 
     assert main([*_submit_prefix(project, cfg, machine_runtime), "--format", "json", "--", "echo", "ok"]) == 1
 

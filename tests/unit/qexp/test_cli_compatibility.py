@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.cli.entrypoint import main
 
 
 @pytest.mark.parametrize(

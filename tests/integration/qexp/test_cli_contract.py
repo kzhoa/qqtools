@@ -5,7 +5,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.layout import load_context, runtime_pid_path
 from qqtools.plugins.qexp.legacy_agent import get_agent_status
@@ -62,7 +62,9 @@ def test_task_retry_accepts_blocked_orphan_without_acknowledgement(tmp_path: Pat
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active", lambda *_args, **_kwargs: False
+    )
 
     assert main([*_base_args(cfg), "task", "retry", task.task_id]) == 0
 
@@ -77,7 +79,9 @@ def test_task_retry_rejects_retired_duplicate_risk_flag_without_mutation(tmp_pat
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.ensure_local_agent_active", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active", lambda *_args, **_kwargs: False
+    )
 
     with pytest.raises(SystemExit) as exc_info:
         main([*_base_args(cfg), "task", "retry", task.task_id, "--acknowledge-duplicate-risk"])
@@ -142,7 +146,7 @@ def test_use_still_fails_when_context_save_fails(tmp_path: Path, monkeypatch):
     def fail_save_context(*args, **kwargs):
         raise OSError(30, "Read-only file system", "/readonly/.qqtools/qexp-context.json")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.save_context", fail_save_context)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.local_handlers.save_context", fail_save_context)
 
     with pytest.raises(OSError, match="Read-only file system"):
         main(["use", "--project", str(tmp_path / ".qexp")])
@@ -281,7 +285,7 @@ def test_submit_requests_local_agent_activation(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     reasons: list[str] = []
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.submission.ensure_local_agent_active",
         lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
@@ -293,7 +297,7 @@ def test_submit_without_activation_persists_task_and_skips_local_agent(tmp_path:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     reasons: list[str] = []
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.submission.ensure_local_agent_active",
         lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
@@ -320,7 +324,7 @@ def test_batch_submit_requests_local_agent_activation(tmp_path: Path, monkeypatc
     manifest.write_text("tasks:\n  - command: ['echo', 'ok']\n", encoding="utf-8")
     reasons: list[str] = []
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.submission.ensure_local_agent_active",
         lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
@@ -341,7 +345,7 @@ def test_retry_requests_local_agent_activation(tmp_path: Path, monkeypatch):
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     reasons: list[str] = []
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active",
         lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
@@ -355,7 +359,7 @@ def test_offer_requests_local_agent_activation(tmp_path: Path, monkeypatch):
     task = submit(cfg, ["echo", "ok"], group="demo", sharing_mode="spillover")
     reasons: list[str] = []
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active",
         lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
@@ -369,7 +373,7 @@ def test_group_resume_requests_local_agent_activation(tmp_path: Path, monkeypatc
     main([*_base_args(cfg), "group", "pause", "demo"])
     reasons: list[str] = []
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active",
         lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
@@ -395,7 +399,7 @@ def test_group_retry_failed_skips_blocked_orphans_and_requests_activation(tmp_pa
     assert expire_claim(cfg, blocked_task.task_id, orphaned_attempt.attempt_id, orphaned_attempt.current_fencing_token)
     reasons: list[str] = []
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active",
         lambda cfg, *, reason, **kwargs: reasons.append(reason) or True,
     )
 
@@ -408,11 +412,11 @@ def test_group_retry_failed_skips_blocked_orphans_and_requests_activation(tmp_pa
 def test_agent_stop_returns_structured_status(tmp_path: Path, monkeypatch, capsys):
     runtime_root = tmp_path / "machine-runtime"
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.stop_machine_agent",
+        "qqtools.plugins.qexp.cli.local_handlers.stop_machine_agent",
         lambda _runtime: False,
     )
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.get_machine_agent_status",
+        "qqtools.plugins.qexp.cli.local_handlers.get_machine_agent_status",
         lambda runtime: {
             "machine_runtime_root": str(runtime.root),
             "agent_state": "stopped",
@@ -434,11 +438,11 @@ def test_agent_restart_returns_structured_status(tmp_path: Path, monkeypatch, ca
         previous_pid = 432
 
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.restart_machine_agent",
+        "qqtools.plugins.qexp.cli.local_handlers.restart_machine_agent",
         lambda _runtime: FakeProcess(),
     )
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.get_machine_agent_status",
+        "qqtools.plugins.qexp.cli.local_handlers.get_machine_agent_status",
         lambda runtime: {
             "machine_runtime_root": str(runtime.root),
             "agent_state": "active",
@@ -490,7 +494,7 @@ def test_legacy_project_requires_explicit_migration(tmp_path: Path, monkeypatch,
     record_path.write_text(json.dumps(record), encoding="utf-8")
     base = [*_base_args(cfg), "--machine-runtime-root", str(runtime_root), "agent"]
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_machine_agent_started",
+        "qqtools.plugins.qexp.cli.local_handlers.ensure_machine_agent_started",
         lambda _runtime: (None, {}),
     )
 
@@ -509,8 +513,10 @@ def test_global_agent_status_and_stop_do_not_require_project_context(tmp_path: P
         "projects": [],
         "upgrade": {"projects": []},
     }
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.get_machine_agent_status", lambda _runtime: machine_status)
-    monkeypatch.setattr("qqtools.plugins.qexp.cli.stop_machine_agent", lambda _runtime: True)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.local_handlers.get_machine_agent_status", lambda _runtime: machine_status
+    )
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.local_handlers.stop_machine_agent", lambda _runtime: True)
 
     assert main(["--machine-runtime-root", str(runtime_root), "agent", "status", "--format=json"]) == 0
     assert json.loads(capsys.readouterr().out)["agent_state"] == "active"
@@ -528,7 +534,7 @@ def test_explicit_machine_runtime_root_submits_through_global_activation(
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.submission.ensure_local_agent_active",
         lambda _cfg, *, reason, machine_runtime: machine_runtime.root == runtime.root and reason == "submit",
     )
 

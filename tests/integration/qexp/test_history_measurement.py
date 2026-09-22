@@ -45,8 +45,8 @@ def test_retained_fixture_preserves_idempotency_and_complete_observation(tmp_pat
     from qqtools.plugins.qexp import init_shared_root, observer
     from qqtools.plugins.qexp.runtime.paths import idempotency_path
     from qqtools.plugins.qexp.runtime.store import read_json
-    from qqtools.plugins.qexp.runtime.submission import semantic_digest, submit_specs
-    from tests.helpers.qexp.history_qualification import seed_settled_history
+    from qqtools.plugins.qexp.runtime.submission import decode_submission_plan, semantic_digest, submit_specs
+    from tests.helpers.qexp.history_qualification import request_worker_set, seed_settled_history
 
     cfg = init_shared_root(tmp_path / "project/.qexp", "worker", runtime_root=tmp_path / "runtime")
     seed_settled_history(cfg, 3, shape)
@@ -58,8 +58,12 @@ def test_retained_fixture_preserves_idempotency_and_complete_observation(tmp_pat
     sources = list((cfg.shared_root / "operations/submissions").glob("*.json"))
     assert len(sources) == (1 if shape == "bulk" else 3)
     for source in sources:
-        operation = read_json(source)["submission"]
+        operation_record = read_json(source)
+        plan = decode_submission_plan(operation_record)
+        operation = operation_record["submission"]
         context = operation["resolved_context"]
+        assert list(plan.task_ids) == context["task_ids"]
+        assert list(plan.tmux_overrides) == [None] * len(context["task_ids"])
         assert (
             operation["resolved_context_digest"]
             == hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
@@ -69,7 +73,12 @@ def test_retained_fixture_preserves_idempotency_and_complete_observation(tmp_pat
         mapping = idempotency_path(cfg.shared_root, semantic_digest({"project": str(cfg.shared_root), "key": key}))
         assert read_json(mapping)["operation_id"] == operation["operation_id"]
         replay = submit_specs(
-            cfg, operation["resolved_context"]["task_specs"], idempotency_key=key, kind=operation["kind"]
+            cfg,
+            operation["resolved_context"]["task_specs"],
+            group_name=operation["target_group"],
+            idempotency_key=key,
+            kind=operation["kind"],
+            worker_set=request_worker_set(context),
         )
         for task in replay:
             assert task.state["projection"] == "cancelled"
@@ -77,6 +86,20 @@ def test_retained_fixture_preserves_idempotency_and_complete_observation(tmp_pat
             assert task.task_id not in observed
             observed.add(task.task_id)
     assert observed == expected
+
+
+@pytest.mark.parametrize(
+    ("context", "expected"),
+    [
+        ({"worker_set_additions": {}, "worker_set_declared": False}, None),
+        ({"worker_set_additions": {}, "worker_set_declared": True}, {}),
+        ({"worker_set_additions": {"worker": {}}}, {"worker": {}}),
+    ],
+)
+def test_retained_fixture_reconstructs_worker_set_declaration(context, expected):
+    from tests.helpers.qexp.history_qualification import request_worker_set
+
+    assert request_worker_set(context) == expected
 
 
 def test_retained_fixture_accepts_new_task_transitions_without_rebuild(tmp_path, monkeypatch):

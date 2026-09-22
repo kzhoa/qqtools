@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
-from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.cli.entrypoint import main
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 

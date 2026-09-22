@@ -5,7 +5,7 @@ import json
 import pytest
 
 from qqtools.plugins.qexp import submit
-from qqtools.plugins.qexp.cli import main
+from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.runtime.observation.maintenance import request_rebuild
 from tests.helpers.qexp_discovery import isolated_group
 

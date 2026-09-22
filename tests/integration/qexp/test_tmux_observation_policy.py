@@ -60,7 +60,7 @@ def test_omitted_and_null_override_have_the_same_identity(tmp_path: Path):
     assert inspect_task(cfg, first.task_id)["observation"] == {"tmux_override": "inherit"}
 
 
-def test_batch_precedence_preserves_false_and_does_not_change_group(tmp_path: Path):
+def test_batch_cli_override_wins_every_task_and_does_not_change_group(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     create_group(cfg, "study")
     manifest = tmp_path / "runs.yaml"
@@ -84,7 +84,7 @@ tasks:
 
     tasks = batch_submit(cfg, manifest, group="study", tmux_override=True)
     assert _metadata(cfg, tasks[0])["tasks"] == [
-        {"task_id": "task-explicit-false", "tmux_override": False},
+        {"task_id": "task-explicit-false", "tmux_override": True},
         {"task_id": "task-cli-default", "tmux_override": True},
         {"task_id": "task-explicit-true", "tmux_override": True},
     ]

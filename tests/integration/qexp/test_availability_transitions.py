@@ -10,7 +10,8 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.cli import _split_machine_list, main
+from qqtools.plugins.qexp.cli.entrypoint import main
+from qqtools.plugins.qexp.cli.project_handlers import _split_machine_list
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
@@ -443,7 +444,7 @@ def test_cli_availability_json_and_human_outputs(tmp_path: Path, monkeypatch, ca
     _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp")
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active",
         lambda cfg, *, reason, **kwargs: True,
     )
 
@@ -464,7 +465,7 @@ def test_cli_share_accepts_comma_separated_helper_machines(tmp_path: Path, monke
     change_worker(cfg, "exp", "g2", "add")
     change_worker(cfg, "exp", "g3", "add")
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.cli.ensure_local_agent_active",
+        "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active",
         lambda cfg, *, reason, **kwargs: True,
     )
 

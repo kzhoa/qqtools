@@ -177,8 +177,8 @@ def test_census_rejects_partial_terminal_transition_predating_journal(tmp_path, 
 
 
 def test_human_cancel_activates_pending_work_without_listing_task_history(tmp_path, monkeypatch, capsys):
-    from qqtools.plugins.qexp import cli
     from qqtools.plugins.qexp.agent.context import MachineRuntime
+    from qqtools.plugins.qexp.cli import entrypoint, project_handlers
 
     cfg = isolated_group(tmp_path, tail=0)
     submit(cfg, ["true"], group="experiment")
@@ -196,10 +196,10 @@ def test_human_cancel_activates_pending_work_without_listing_task_history(tmp_pa
         pytest.fail("human cancellation rendered unused full-history Task summaries")
 
     with monkeypatch.context() as patch:
-        patch.setattr(cli, "ensure_local_agent_active", activate)
-        patch.setattr(cli.observer, "list_tasks", no_history)
+        patch.setattr(project_handlers, "ensure_local_agent_active", activate)
+        patch.setattr(project_handlers.observer, "list_tasks", no_history)
         assert (
-            cli.main(
+            entrypoint.main(
                 [
                     "--project",
                     str(cfg.shared_root),

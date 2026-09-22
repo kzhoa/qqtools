@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
 import shlex
 
 import pytest
 
-from qqtools.plugins.qexp.cli import _DYNAMIC_OUTPUT_KINDS, build_parser, main
+from qqtools.plugins.qexp.cli.entrypoint import _DYNAMIC_OUTPUT_KINDS, main
+from qqtools.plugins.qexp.cli.parser import build_parser
 from qqtools.plugins.qexp.commands.registry import CommandSpec
 from qqtools.plugins.qexp.formatter import OutputKind
 
@@ -29,6 +31,22 @@ def _leaf_specs(parser: argparse.ArgumentParser) -> list[CommandSpec]:
         assert isinstance(spec, CommandSpec)
         return [spec]
     return [spec for subparser in subparsers for child in subparser.choices.values() for spec in _leaf_specs(child)]
+
+
+def _leaf_spec_map(
+    parser: argparse.ArgumentParser, prefix: tuple[str, ...] = ()
+) -> dict[tuple[str, ...], tuple[str, str, str]]:
+    subparsers = [action for action in parser._actions if isinstance(action, argparse._SubParsersAction)]
+    if not subparsers:
+        spec = parser.get_default("command_spec")
+        assert isinstance(spec, CommandSpec)
+        return {prefix: (spec.handler, spec.context, spec.output)}
+    return {
+        path: spec
+        for subparser in subparsers
+        for name, child in subparser.choices.items()
+        for path, spec in _leaf_spec_map(child, (*prefix, name)).items()
+    }
 
 
 def _leaf_parsers(parser: argparse.ArgumentParser) -> list[argparse.ArgumentParser]:
@@ -82,6 +100,122 @@ def test_consolidated_cli_owns_the_canonical_resource_action_paths() -> None:
     assert retired.isdisjoint(leaves)
 
 
+def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
+    expected = {
+        ("init",): ("init", "machine", "machine-init"),
+        ("project", "init"): ("project_init", "setup", "project-operation"),
+        ("project", "register"): ("project_register", "machine", "project-register"),
+        ("project", "list"): ("project_list", "machine", "project-list"),
+        ("project", "enable"): ("project_enable", "machine", "project-operation"),
+        ("project", "disable"): ("project_disable", "machine", "project-operation"),
+        ("project", "remove"): ("project_remove", "machine", "project-operation"),
+        ("use",): ("use", "none", "context"),
+        ("submit",): ("submit", "project-write", "submission"),
+        ("status",): ("status", "project-read", "status"),
+        ("task", "cancel"): ("task_cancel", "project-write", "task-operation"),
+        ("task", "retry"): ("task_retry", "project-write", "task-operation"),
+        ("task", "share"): ("task_share", "project-write", "availability"),
+        ("task", "unshare"): ("task_unshare", "project-write", "availability"),
+        ("task", "offer"): ("task_offer", "project-write", "availability"),
+        ("task", "list"): ("task_list", "project-read", "task-list"),
+        ("task", "show"): ("task_show", "project-read", "task-show"),
+        ("task", "logs"): ("task_logs", "project-read", "raw-logs"),
+        ("task", "wait"): ("task_wait", "project-read", "task-wait"),
+        ("task", "dependencies", "show"): ("task_dependencies_show", "project-read", "dependencies"),
+        ("task", "dependencies", "replace"): ("task_dependencies_replace", "project-write", "dependencies"),
+        ("task", "dependencies", "add"): ("task_dependencies_add", "project-write", "dependencies"),
+        ("task", "dependencies", "remove"): ("task_dependencies_remove", "project-write", "dependencies"),
+        ("group", "create"): ("group_create", "project-write", "group-operation"),
+        ("group", "list"): ("group_list", "project-read", "group-list"),
+        ("group", "show"): ("group_show", "project-read", "group-show"),
+        ("group", "seal"): ("group_seal", "project-write", "group-operation"),
+        ("group", "reopen"): ("group_reopen", "project-write", "group-operation"),
+        ("group", "pause"): ("group_pause", "project-write", "group-operation"),
+        ("group", "resume"): ("group_resume", "project-write", "group-operation"),
+        ("group", "cancel"): ("group_cancel", "project-write", "group-operation"),
+        ("group", "retry"): ("group_retry", "project-write", "group-operation"),
+        ("group", "worker", "list"): ("group_worker_list", "project-read", "group-operation"),
+        ("group", "worker", "add"): ("group_worker_add", "project-write", "group-operation"),
+        ("group", "worker", "set"): ("group_worker_set", "project-write", "group-operation"),
+        ("group", "worker", "drain"): ("group_worker_drain", "project-write", "group-operation"),
+        ("group", "worker", "resume"): ("group_worker_resume", "project-write", "group-operation"),
+        ("group", "worker", "remove"): ("group_worker_remove", "project-write", "group-operation"),
+        ("machine", "list"): ("machine_list", "project-read", "machines"),
+        ("machine", "show"): ("machine_show", "project-read", "machine-show"),
+        ("agent", "start"): ("agent_start", "machine", "agent-operation"),
+        ("agent", "run"): ("agent_run", "machine", "agent-operation"),
+        ("agent", "restart"): ("agent_restart", "machine", "agent-operation"),
+        ("agent", "status"): ("agent_status", "machine", "agent-status"),
+        ("agent", "stop"): ("agent_stop", "machine", "agent-operation"),
+        ("agent", "name"): ("agent_name", "machine", "agent-config"),
+        ("agent", "add-project"): ("retired_add-project", "none", "diagnostic"),
+        ("agent", "list-projects"): ("retired_list-projects", "none", "diagnostic"),
+        ("agent", "enable-project"): ("retired_enable-project", "none", "diagnostic"),
+        ("agent", "disable-project"): ("retired_disable-project", "none", "diagnostic"),
+        ("agent", "remove-project"): ("retired_remove-project", "none", "diagnostic"),
+        ("agent", "migrate-project"): ("retired_migrate-project", "none", "diagnostic"),
+        ("agent", "config", "gpus", "show"): ("agent_config_gpus_show", "machine", "gpu-policy"),
+        ("agent", "config", "gpus", "set"): ("agent_config_gpus_set", "machine", "gpu-policy"),
+        ("agent", "config", "gpus", "reset"): ("agent_config_gpus_reset", "machine", "gpu-policy"),
+        ("agent", "config", "cpu", "show"): ("agent_config_cpu_show", "machine", "cpu-lane"),
+        ("agent", "config", "cpu", "set"): ("agent_config_cpu_set", "machine", "cpu-lane"),
+        ("config", "show"): ("config_show", "section", "config"),
+        ("config", "set"): ("config_set", "section", "config"),
+        ("config", "reset"): ("config_reset", "section", "config"),
+        ("admin", "check"): ("admin_check", "project-read", "doctor-check"),
+        ("admin", "repair"): ("admin_repair", "project-write", "doctor-repair"),
+        ("admin", "clean"): ("admin_clean", "project-write", "clean"),
+        ("admin", "operation", "show"): ("admin_operation_show", "project-read", "operation"),
+        ("admin", "upgrade", "status"): ("admin_upgrade_status", "machine", "upgrade"),
+        ("admin", "upgrade", "advance"): ("admin_upgrade_advance", "machine", "upgrade"),
+        ("admin", "upgrade", "pause"): ("admin_upgrade_pause", "registered-project", "upgrade"),
+        ("admin", "upgrade", "plan"): ("admin_upgrade_plan", "registered-project", "upgrade-repair"),
+        ("admin", "upgrade", "apply"): ("admin_upgrade_apply", "registered-project", "upgrade-repair"),
+        ("admin", "upgrade", "validate"): ("admin_upgrade_validate", "registered-project", "upgrade-repair"),
+        ("admin", "upgrade", "resume"): ("admin_upgrade_resume", "registered-project", "upgrade"),
+        ("admin", "migrate", "schema"): ("admin_migrate_schema", "explicit-project", "schema6-upgrade"),
+        ("admin", "migrate", "schema6", "check"): (
+            "admin_migrate_schema6_check",
+            "explicit-project",
+            "schema6-upgrade",
+        ),
+        ("admin", "migrate", "schema6", "start"): (
+            "admin_migrate_schema6_start",
+            "explicit-project",
+            "schema6-upgrade",
+        ),
+        ("admin", "migrate", "schema6", "status"): (
+            "admin_migrate_schema6_status",
+            "explicit-project",
+            "schema6-upgrade",
+        ),
+        ("admin", "migrate", "schema6", "attest"): (
+            "admin_migrate_schema6_attest",
+            "explicit-project",
+            "schema6-upgrade",
+        ),
+        ("admin", "migrate", "schema6", "resume"): (
+            "admin_migrate_schema6_resume",
+            "explicit-project",
+            "schema6-upgrade",
+        ),
+        ("admin", "migrate", "agent"): ("admin_migrate_agent", "explicit-project", "agent-operation"),
+    }
+
+    assert _leaf_spec_map(build_parser()) == expected
+
+
+def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
+    text = "\n".join(
+        f"{' '.join(parser.prog.split()[1:])}\n{' '.join(parser.format_help().split())}"
+        for parser in _leaf_parsers(build_parser())
+    )
+
+    assert (
+        hashlib.sha256(text.encode()).hexdigest() == "c974eed4d0a84bfaf18e4010145decf22d17de63a642bffd68f0a8bc2fc9a736"
+    )
+
+
 def test_root_help_has_descriptions_without_suppressed_placeholders(capsys) -> None:
     parser = build_parser()
     with pytest.raises(SystemExit) as result:
@@ -103,6 +237,30 @@ def test_short_daily_options_have_command_local_meanings() -> None:
     assert not finite.follow
     assert following.follow
     assert following.tail == "0"
+
+
+def test_common_options_retain_before_after_and_equal_duplicate_placement() -> None:
+    parser = build_parser()
+    before = parser.parse_args(["--project", "/tmp/example", "task", "list", "--format=json"])
+    after = parser.parse_args(["task", "list", "--project", "/tmp/example", "--format=json"])
+    duplicate = parser.parse_args(
+        ["--project", "/tmp/example", "task", "list", "--project", "/tmp/example", "--format=json"]
+    )
+
+    assert (before.project, before.format, before.command_spec) == (after.project, after.format, after.command_spec)
+    assert (duplicate.project, duplicate.format, duplicate.command_spec) == (
+        before.project,
+        before.format,
+        before.command_spec,
+    )
+
+
+def test_conflicting_common_option_duplicates_remain_rejected(capsys) -> None:
+    with pytest.raises(SystemExit) as result:
+        build_parser().parse_args(["--project", "/tmp/first", "task", "list", "--project", "/tmp/second"])
+
+    assert result.value.code == 2
+    assert "conflicting values for --project" in capsys.readouterr().err
 
 
 def test_retired_retry_acknowledgement_is_not_accepted() -> None:

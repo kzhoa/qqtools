@@ -55,7 +55,7 @@ Repository = "https://github.com/kzhoa/qqtools.git"
 [project.scripts]
 qread = "qqtools.cli.qread:main"
 qcgen = "qqtools.cli.qcgen:main"
-qexp = "qqtools.plugins.qexp.cli:main"
+qexp = "qqtools.plugins.qexp.cli.entrypoint:main"
 
 # === build settings ===
 [build-system]

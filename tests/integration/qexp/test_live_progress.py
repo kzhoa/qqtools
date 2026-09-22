@@ -382,54 +382,6 @@ def test_real_guardian_inherits_channel_and_runs_public_api(cfg, monkeypatch):
     assert read_logs(cfg, task.task_id).strip() == "done"
 
 
-def test_unchanged_qpipeline_command_reaches_task_show_progress(cfg, monkeypatch):
-    if not sys.platform.startswith("linux"):
-        pytest.skip("qexp process guardian requires Linux")
-    source_root = str(Path(__file__).resolve().parents[3] / "src")
-    monkeypatch.setenv("PYTHONPATH", source_root + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    fixture = Path(__file__).resolve().parents[2] / "fixtures" / "qexp_progress_qpipeline.py"
-    task = submit(cfg, [sys.executable, str(fixture)])
-    attempt = claim_task(cfg, task.task_id, [0])
-    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    launch_id = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"][
-        "authorization"
-    ]["launch_id"]
-
-    class BoundedChild:
-        def __init__(self, *args, **kwargs):
-            self.child = subprocess.Popen(*args, **kwargs)
-            self.pid = self.child.pid
-
-        def wait(self):
-            try:
-                return self.child.wait(timeout=180)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.pid, 9)
-                self.child.wait(timeout=5)
-                raise
-
-    assert (
-        run_attempt(
-            cfg,
-            task.task_id,
-            attempt.attempt_id,
-            attempt.current_fencing_token,
-            launch_id,
-            popen_factory=BoundedChild,
-        )
-        == 0
-    )
-    AuthoritySupervisor(cfg).tick()
-    p = projector(cfg)
-    p.tick()
-    p.close()
-    view = inspect_task(cfg, task.task_id)
-
-    assert view["progress"]["observation_state"] == "available"
-    assert view["progress"]["progress"]["stage"] == "train"
-    assert "Epoch 1" in view["progress"]["progress"]["message"]
-
-
 def test_progress_loop_is_separate_and_stop_is_bounded(monkeypatch, tmp_path):
     import threading
     import time

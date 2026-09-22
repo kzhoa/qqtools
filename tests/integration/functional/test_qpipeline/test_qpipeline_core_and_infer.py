@@ -6,6 +6,7 @@ import torch
 
 import qqtools as qt
 import qqtools.plugins.qpipeline.qpipeline as qpipeline_module
+import qqtools.plugins.qpipeline.runner as runner_package
 import qqtools.plugins.qpipeline.runner.eval_runner as eval_runner_module
 import qqtools.plugins.qpipeline.runner.runner as runner_module
 import qqtools.plugins.qpipeline.runner.runner_utils.progress as progress_module
@@ -189,6 +190,12 @@ def test_qpipeline_mode_overrides_args_test(base_args, tiny_task, tiny_model):
 def test_qpipeline_imports_eval_runners_from_eval_runner_module():
     assert qpipeline_module.evaluate_runner is eval_runner_module.evaluate_runner
     assert qpipeline_module.infer_runner is eval_runner_module.infer_runner
+
+
+def test_runner_package_exports_functions_from_owner_modules():
+    assert runner_package.train_runner is runner_module.train_runner
+    assert runner_package.evaluate_runner is eval_runner_module.evaluate_runner
+    assert runner_package.infer_runner is eval_runner_module.infer_runner
 
 
 def test_evaluate_runner_uses_dedup_runtime_gather(monkeypatch, base_args, tiny_task, tiny_model):
