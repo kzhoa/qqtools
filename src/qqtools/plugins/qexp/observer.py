@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -366,22 +367,45 @@ def _machine_view(cfg: RootConfig, machine_path_value: Any) -> dict[str, Any]:
     if not isinstance(machine_name, str):
         return record
     state_dir = shared_paths(cfg.shared_root)["machines"] / machine_name / "state"
-    state = {
-        name: read_json(path) for name in ("agent", "gpu", "summary") if (path := state_dir / f"{name}.json").exists()
-    }
-    agent = state.get("agent", {})
+    state: dict[str, Any] = {}
+    agent_path = state_dir / "agent.json"
+    agent_unavailable = False
+    for name in ("agent", "gpu", "summary"):
+        path = state_dir / f"{name}.json"
+        if not path.exists():
+            continue
+        try:
+            state[name] = read_json(path)
+        except (OSError, KeyError, TypeError, ValueError):
+            if name == "agent":
+                agent_unavailable = True
+    wrapper = state.get("agent")
+    agent = wrapper.get("agent") if isinstance(wrapper, dict) else None
     heartbeat = agent.get("heartbeat_at") if isinstance(agent, dict) else None
     interval = agent.get("heartbeat_interval_seconds") if isinstance(agent, dict) else None
-    if isinstance(heartbeat, str) and isinstance(interval, (int, float)):
+    observed_state = agent.get("observed_state") if isinstance(agent, dict) else None
+    if agent_unavailable or (agent_path.exists() and not isinstance(agent, dict)):
+        state["freshness"] = "unavailable"
+    elif not agent_path.exists():
+        state["freshness"] = "missing"
+    elif observed_state == "stopped":
+        state["freshness"] = "stopped"
+    elif (
+        isinstance(heartbeat, str)
+        and isinstance(interval, (int, float))
+        and not isinstance(interval, bool)
+        and math.isfinite(interval)
+        and interval > 0
+    ):
         try:
             elapsed = (
                 datetime.now(timezone.utc) - datetime.fromisoformat(heartbeat.replace("Z", "+00:00"))
             ).total_seconds()
             state["freshness"] = "stale" if elapsed > interval * 3 else "fresh"
-        except ValueError:
-            state["freshness"] = "unknown"
+        except (TypeError, ValueError):
+            state["freshness"] = "unavailable"
     else:
-        state["freshness"] = "unknown"
+        state["freshness"] = "unavailable"
     record["state"] = state
     return record
 

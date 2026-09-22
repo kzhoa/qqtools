@@ -7,10 +7,10 @@ import shlex
 
 import pytest
 
-from qqtools.plugins.qexp.cli.entrypoint import _DYNAMIC_OUTPUT_KINDS, main
+from qqtools.plugins.qexp.cli.command_spec import CommandAudience, CommandSpec, ContextKind, OutputMode
+from qqtools.plugins.qexp.cli.entrypoint import main
+from qqtools.plugins.qexp.cli.output import OutputKind
 from qqtools.plugins.qexp.cli.parser import build_parser
-from qqtools.plugins.qexp.commands.registry import CommandSpec
-from qqtools.plugins.qexp.formatter import OutputKind
 
 
 def _leaf_paths(parser: argparse.ArgumentParser, prefix: tuple[str, ...] = ()) -> set[tuple[str, ...]]:
@@ -40,7 +40,36 @@ def _leaf_spec_map(
     if not subparsers:
         spec = parser.get_default("command_spec")
         assert isinstance(spec, CommandSpec)
-        return {prefix: (spec.handler, spec.context, spec.output)}
+        dynamic_outputs = {
+            frozenset({OutputKind.AGENT_OPERATION, OutputKind.AGENT_READINESS}): "agent-operation",
+            frozenset({OutputKind.DOCTOR_VERIFY}): "doctor-check",
+            frozenset({OutputKind.TASK_LIST, OutputKind.TASK_PAGE}): "task-list",
+            frozenset({OutputKind.TASK_SHOW, OutputKind.TASK_WATCH}): "task-show",
+            frozenset(
+                {
+                    OutputKind.UPGRADE_REGISTRY_STATUS,
+                    OutputKind.UPGRADE_ADVANCE,
+                    OutputKind.UPGRADE_PROJECT,
+                }
+            ): "upgrade",
+        }
+        if spec.handler == "agent_run":
+            output = "agent-operation"
+        elif spec.handler.startswith("group_") and spec.handler not in {"group_list", "group_show"}:
+            output = "group-operation"
+        elif spec.handler in {"task_cancel", "task_retry"}:
+            output = "task-operation"
+        elif spec.handler in {"admin_upgrade_pause", "admin_upgrade_resume"}:
+            output = "upgrade"
+        elif spec.output_kinds in dynamic_outputs:
+            output = dynamic_outputs[spec.output_kinds]
+        elif len(spec.output_kinds) == 1:
+            output = next(iter(spec.output_kinds)).value
+        elif spec.modes == frozenset({OutputMode.DIAGNOSTIC}):
+            output = "diagnostic"
+        else:
+            output = "raw-logs"
+        return {prefix: (spec.handler, spec.context.value, output)}
     return {
         path: spec
         for subparser in subparsers
@@ -212,7 +241,7 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     )
 
     assert (
-        hashlib.sha256(text.encode()).hexdigest() == "c974eed4d0a84bfaf18e4010145decf22d17de63a642bffd68f0a8bc2fc9a736"
+        hashlib.sha256(text.encode()).hexdigest() == "2b772ba9fb7e2dd17b6120c29128e41d40469550668b2c10c74e797d3df8eb42"
     )
 
 
@@ -272,14 +301,34 @@ def test_retired_retry_acknowledgement_is_not_accepted() -> None:
 def test_every_leaf_has_an_executable_handler_and_output_contract() -> None:
     specs = _leaf_specs(build_parser())
     handlers = [spec.handler for spec in specs]
-    structured_outputs = {kind.value for kind in OutputKind}
-    unstructured_outputs = {"diagnostic", "raw-logs"}
 
     assert len(handlers) == len(set(handlers))
-    assert all(
-        spec.output in structured_outputs or spec.output in _DYNAMIC_OUTPUT_KINDS or spec.output in unstructured_outputs
-        for spec in specs
-    )
+    assert all(isinstance(spec.context, ContextKind) for spec in specs)
+    assert all(spec.modes and all(isinstance(mode, OutputMode) for mode in spec.modes) for spec in specs)
+    assert all(all(isinstance(kind, OutputKind) for kind in spec.output_kinds) for spec in specs)
+    assert all(isinstance(spec.audience, CommandAudience) for spec in specs)
+
+
+def test_parser_leaf_modes_and_output_kinds_are_explicit() -> None:
+    parser = build_parser()
+    specs = {
+        path: leaf.get_default("command_spec")
+        for leaf in _leaf_parsers(parser)
+        for path in [tuple(leaf.prog.split()[1:])]
+    }
+
+    assert specs[("task", "show")].modes == frozenset({OutputMode.FINITE, OutputMode.CONTINUOUS})
+    assert specs[("task", "show")].output_kinds == frozenset({OutputKind.TASK_SHOW, OutputKind.TASK_WATCH})
+    assert specs[("task", "logs")].modes == frozenset({OutputMode.RAW, OutputMode.CONTINUOUS})
+    assert specs[("task", "logs")].output_kinds == frozenset()
+    assert specs[("agent", "run")].modes == frozenset({OutputMode.CONTINUOUS})
+    assert specs[("agent", "run")].output_kinds == frozenset()
+    assert specs[("agent", "run")].audience is CommandAudience.DEBUG
+    assert specs[("init",)].modes == frozenset({OutputMode.FINITE, OutputMode.DIAGNOSTIC})
+    assert specs[("agent", "add-project")].modes == frozenset({OutputMode.DIAGNOSTIC})
+    assert specs[("agent", "add-project")].output_kinds == frozenset()
+    assert specs[("task", "list")].modes == frozenset({OutputMode.FINITE})
+    assert specs[("task", "list")].output_kinds == frozenset({OutputKind.TASK_LIST, OutputKind.TASK_PAGE})
 
 
 def test_every_leaf_help_discloses_its_operational_contract() -> None:
@@ -314,6 +363,24 @@ def test_leaf_help_discloses_dynamic_scope_and_activation_contracts() -> None:
     assert "--visible VISIBLE" in parsers["qexp agent config gpus set"].epilog
     assert "--reason REASON --project PATH" in parsers["qexp admin upgrade pause"].epilog
     assert "--to-schema 6" in parsers["qexp admin migrate schema"].epilog
+
+    agent_run_help = parsers["qexp agent run"].format_help()
+    assert "foreground" in agent_run_help.lower()
+    assert "debug" in agent_run_help.lower()
+    assert "qexp agent start" in agent_run_help
+    assert "--format" not in parsers["qexp agent run"]._option_string_actions
+    assert "--format" not in parsers["qexp task logs"]._option_string_actions
+
+
+def test_agent_parent_help_directs_ordinary_users_to_start(capsys) -> None:
+    with pytest.raises(SystemExit) as result:
+        build_parser().parse_args(["agent", "--help"])
+
+    assert result.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "foreground" in help_text.lower()
+    assert "debugging" in help_text.lower()
+    assert "qexp agent start" in help_text
 
 
 def test_main_dispatches_leaf_execution_from_command_spec_handler() -> None:

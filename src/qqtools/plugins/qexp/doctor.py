@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import shlex
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -509,14 +511,34 @@ def verify_integrity(
             "low",
             "Run 'qexp admin repair --project PATH' to restart background Submission visibility certification.",
         )
-    is_complete = member_verification["state"] != "building"
-    is_healthy = not issues and member_verification["state"] == "completed"
+    incomplete_reasons: list[str] = []
+    if member_verification["state"] == "building":
+        incomplete_reasons.append("group_ready_members_building")
+    if task_observation.get("state") == "building":
+        incomplete_reasons.append("task_observation_building")
+    if submission_control.get("state") == "waiting":
+        incomplete_reasons.append("submission_control_waiting")
+    is_complete = not incomplete_reasons
+    is_healthy = is_complete and not issues
+    issue_counts = dict(sorted(Counter(item.get("severity", "unknown") for item in issues).items()))
+    if is_healthy:
+        outcome = "healthy"
+    elif any(item.get("severity") in {"critical", "high"} for item in issues):
+        outcome = "unhealthy"
+    else:
+        outcome = "partial"
+    repair_command = "qexp admin repair --project " + shlex.quote(str(cfg.project_root))
     return {
         "schema_version": 6,
         "tasks_checked": checked,
         "issues": issues,
+        "issue_counts": issue_counts,
+        "incomplete_reasons": incomplete_reasons,
         "complete": is_complete,
         "healthy": is_healthy,
+        "outcome": outcome,
+        "repair_command": None if is_healthy else repair_command,
+        "next_action": None if is_healthy else repair_command,
         "ready_index": read_ready_index_status(cfg),
         "group_ready_members": {
             "state": group_ready_members_state(cfg),
@@ -662,9 +684,31 @@ def repair_metadata(
         else:
             if submission_control["state"] == "waiting":
                 blocked.append("submission_control")
+    rerun_required = bool(
+        blocked
+        or ready_record.get("state") == "building"
+        or member_record.get("state") == "building"
+        or audit.get("state") == "building"
+        or submission_control.get("state") == "waiting"
+        or task_observation.get("state") == "building"
+    )
+    if blocked or rerun_required:
+        outcome = "blocked" if blocked else "partial"
+        next_action = "qexp admin repair --project " + shlex.quote(str(cfg.project_root))
+    elif repaired:
+        outcome = "repaired"
+        next_action = None
+    else:
+        outcome = "no_change"
+        next_action = None
     return {
         "repaired": repaired,
         "blocked": blocked,
+        "repaired_count": len(repaired),
+        "blocked_count": len(blocked),
+        "outcome": outcome,
+        "rerun_required": rerun_required,
+        "next_action": next_action,
         "ready_index": {
             "state": ready_record.get("state"),
             "build": ready_build,
@@ -793,6 +837,11 @@ def normalize_verify_severity(value: str) -> str:
 
 
 def resolve_verify_exit_code(result: dict[str, Any], *, strict: bool = False, fail_on: str | None = None) -> int:
+    # Repair is a mutating convergence command: a blocked item is a failed
+    # repair even when other items were repaired successfully.  Keep the
+    # historical verify/check policy for non-strict checks below.
+    if result.get("blocked"):
+        return 1
     if strict and (not result.get("complete", True) or not result.get("healthy", False)):
         return 1
     return 1 if result.get("issues") and (strict or fail_on) else 0

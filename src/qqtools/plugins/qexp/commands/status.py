@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..agent.bindings import ProjectBinding
+from ..agent.config import AgentConfig
 from ..agent.context import MachineRuntime
 from ..agent.inventory import ProjectInventoryEntry
 from ..config_types import RootConfig
@@ -212,6 +213,29 @@ def _agent_observation(
     return {"scope": "machine", "state": state, "observed_at": observed_at, "reason": reason}
 
 
+def _configured_agent_mode(reader: _ReadBudget, runtime: MachineRuntime, warnings: list[str]) -> str | None:
+    """Read the durable mode without invoking the compatibility/migration loader."""
+    path = runtime.paths["global_config"]
+    try:
+        value = reader.read_json(path)
+    except _BoundedReadFailure as exc:
+        warnings.append(_warning("agent configuration", exc))
+        return None
+    if value is None:
+        warnings.append("agent configuration unavailable (record_missing).")
+        return None
+    raw = value.get("agent_config", value.get("config"))
+    if not isinstance(raw, dict):
+        warnings.append("agent configuration unavailable (record_malformed).")
+        return None
+    try:
+        config = AgentConfig.from_dict(raw)
+    except (TypeError, ValueError):
+        warnings.append("agent configuration unavailable (record_malformed).")
+        return None
+    return config.agent_mode
+
+
 def _task_observation(
     value: dict[str, Any] | None, *, failed: bool, missing: bool, cfg: RootConfig
 ) -> dict[str, object]:
@@ -288,6 +312,8 @@ def project_status(
     else:
         observation_failed = False
 
+    configured_agent_mode = _configured_agent_mode(reader, machine_runtime, warnings)
+
     registry: list[ProjectBinding] | None = None
     inventory: list[ProjectInventoryEntry] | None = None
     if registry_raw is not None:
@@ -312,6 +338,11 @@ def project_status(
         inventory_failed=inventory_failed,
     )
     local_agent = _agent_observation(agent_raw, failed=agent_failed, missing=agent_missing)
+    observed_agent_mode = (
+        agent_raw.get("machine_agent", {}).get("observed_agent_mode") if isinstance(agent_raw, dict) else None
+    )
+    local_agent["configured_mode"] = configured_agent_mode
+    local_agent["observed_mode"] = observed_agent_mode if isinstance(observed_agent_mode, str) else None
     task_observation = _task_observation(
         observation_raw,
         failed=observation_failed,
@@ -333,6 +364,7 @@ def project_status(
         },
         "local_participation": {"state": participation_state, "reason": participation_reason},
         "local_agent": local_agent,
+        "configured_agent_mode": configured_agent_mode,
         "task_observation": task_observation,
         "totals": {"tasks": None, "machines": None, "reason": "not_available"},
         "next_actions": _follow_up_actions(cfg, participation_state),

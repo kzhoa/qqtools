@@ -120,6 +120,29 @@ def test_operation_reference_survives_archival_and_blocked_is_successful_read(tm
     assert archived["operation_id"] == operation_id
 
 
+def test_operation_inspection_preserves_timestamps_and_lifecycle_outcome(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    operation_id = "operation-timestamps"
+    reference = create_operation_reference(cfg, "group_cancel", operation_id, operation_id)
+    record = _group_cancel_record(operation_id)
+    record["meta"].update(
+        {
+            "created_at": "2026-09-22T10:00:00Z",
+            "updated_at": "2026-09-22T10:01:00Z",
+        }
+    )
+    atomic_replace(active_operation_path(cfg, "group_control", operation_id), record)
+
+    result, exit_code = inspect_operation(cfg, reference)
+
+    assert exit_code == 0
+    assert result["outcome"] == "ok"
+    assert result["lifecycle_outcome"] == "blocked"
+    assert result["created_at"] == "2026-09-22T10:00:00Z"
+    assert result["updated_at"] == "2026-09-22T10:01:00Z"
+    assert result["next_action"] == f"qexp admin operation show {reference} --project {cfg.project_root}"
+
+
 def test_operation_reference_rejects_wrong_project_before_record_lookup(tmp_path: Path, monkeypatch) -> None:
     cfg = _cfg(tmp_path)
     reference = create_operation_reference(cfg, "group_cancel", "operation-1", "operation-1")

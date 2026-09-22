@@ -181,6 +181,57 @@ def test_machine_budget_rotates_projects_without_losing_queued_work(tmp_path: Pa
     assert set(first["pending_project_ids"]) == {binding.project_id for binding in bindings}
 
 
+def test_advance_recomputes_aggregate_after_final_slice(tmp_path: Path, monkeypatch) -> None:
+    from qqtools.plugins.qexp.runtime.upgrade import machine as machine_upgrade
+
+    cfg = _config(tmp_path)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    runtime.upgrade_runnable_projects = {binding.project_id}
+    monkeypatch.setattr(
+        machine_upgrade,
+        "discover_registered_upgrades",
+        lambda *_args, **_kwargs: {
+            "projects": [{"project_id": binding.project_id, "state": "runnable", "pending": True}],
+            "pending_project_ids": [binding.project_id],
+            "runnable_project_ids": [binding.project_id],
+            "discovery_source": "machine_registry",
+        },
+    )
+    monkeypatch.setattr(
+        UpgradeCoordinator,
+        "status",
+        lambda _self: {
+            "migrations": [
+                {
+                    "state": "runnable",
+                    "max_records_per_slice": 1,
+                    "max_metadata_ops_per_slice": 1,
+                    "max_io_bytes_per_slice": 1,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        UpgradeCoordinator,
+        "advance",
+        lambda _self: {
+            "project_id": binding.project_id,
+            "state": "complete",
+            "pending": False,
+            "can_run": False,
+            "admission_blocked": False,
+            "blockers": [],
+        },
+    )
+
+    result = advance_registered_upgrades(runtime)
+
+    assert result["pending_project_ids"] == []
+    assert result["aggregate_state"] == "complete"
+    assert result["all_roots_complete"] is True
+
+
 def test_inaccessible_discovery_is_retained_and_reprobed(tmp_path: Path, monkeypatch) -> None:
     cfg = _config(tmp_path)
     (cfg.shared_root / "operations" / "upgrades" / "protocol-manifest.json").unlink()
@@ -194,6 +245,11 @@ def test_inaccessible_discovery_is_retained_and_reprobed(tmp_path: Path, monkeyp
     monkeypatch.setattr(UpgradeCoordinator, "discover", inaccessible)
     first = discover_registered_upgrades(runtime)
     assert first["pending_project_ids"]
+    advanced = advance_registered_upgrades(runtime, force_discovery=True)
+    assert advanced["projects"] == []
+    assert advanced["aggregate_state"] == "inaccessible"
+    assert advanced["inaccessible_projects"]
+    assert advanced["all_roots_complete"] is False
     monkeypatch.setattr(UpgradeCoordinator, "discover", original_discover)
     runtime.upgrade_probe_deadlines[next(iter(runtime.upgrade_pending_projects))] = 0.0
     recovered = discover_registered_upgrades(runtime)

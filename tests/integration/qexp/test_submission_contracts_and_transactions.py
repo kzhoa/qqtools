@@ -69,6 +69,7 @@ def test_command_mode_json_uses_complete_submission_result(
         "task_ids": [result["task_ids"][0]],
         "preview": None,
         "error": None,
+        "activation": None,
     }
     assert captured.err.startswith("qexp: prepared operation_id=")
     assert f"idempotency_key={result['idempotency_key']}" in captured.err
@@ -310,8 +311,10 @@ def test_activation_failure_preserves_committed_ids_and_exits_one(
 ) -> None:
     project, cfg, machine_runtime = _project(tmp_path)
 
+    from qqtools.plugins.qexp.activation import AgentActivationError
+
     def fail_activation(*_args, **_kwargs):
-        raise RuntimeError("agent unavailable")
+        raise AgentActivationError("agent unavailable")
 
     monkeypatch.setattr("qqtools.plugins.qexp.cli.submission.ensure_local_agent_active", fail_activation)
 
@@ -322,6 +325,57 @@ def test_activation_failure_preserves_committed_ids_and_exits_one(
     assert result["task_ids"]
     assert result["operation"]["state"] == "committed"
     assert result["error"]["code"] == "activation_failed"
+    assert result["activation"]["outcome"] == "failed"
+    follow_up = shlex.split(result["activation"]["follow_up_command"])
+    assert follow_up == ["qexp", "--machine-runtime-root", str(machine_runtime.root), "agent", "start"]
+
+
+def test_activation_failure_human_states_commit_failure_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from qqtools.plugins.qexp.activation import AgentActivationError
+
+    project, cfg, machine_runtime = _project(tmp_path)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.submission.ensure_local_agent_active",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AgentActivationError("agent unavailable")),
+    )
+
+    assert main([*_submit_prefix(project, cfg, machine_runtime), "--", "echo", "ok"]) == 1
+
+    output = capsys.readouterr().out
+    assert "Committed" in output
+    assert "activation failed" in output.lower()
+    assert "agent unavailable" in output
+    assert "agent start" in output
+    assert str(machine_runtime.root) in output
+
+
+def test_unexpected_activation_exception_is_not_downgraded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project, cfg, machine_runtime = _project(tmp_path)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.submission.ensure_local_agent_active",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("programming defect")),
+    )
+
+    with pytest.raises(RuntimeError, match="programming defect"):
+        main([*_submit_prefix(project, cfg, machine_runtime), "--", "echo", "ok"])
+
+
+@pytest.mark.parametrize(
+    "error", [ValueError("programming defect"), RuntimeError("programming defect"), OSError("programming defect")]
+)
+def test_unexpected_submission_workflow_exception_is_not_downgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    project, cfg, machine_runtime = _project(tmp_path)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.submission.task_commands.submit_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(type(error), match="programming defect"):
+        main([*_submit_prefix(project, cfg, machine_runtime), "--", "echo", "ok"])
 
 
 def test_finalization_failure_preserves_committed_result(
@@ -372,6 +426,7 @@ def test_recovery_identifiers_are_disclosed_before_provisional_group_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from qqtools.plugins.qexp.runtime import submission as submission_runtime
+    from qqtools.plugins.qexp.runtime.submission import SubmissionPending
 
     project, cfg, machine_runtime = _project(tmp_path)
     manifest = tmp_path / "runs.yaml"
@@ -382,7 +437,7 @@ def test_recovery_identifiers_are_disclosed_before_provisional_group_failure(
     monkeypatch.setattr(
         submission_runtime,
         "sync_primary_ready_group",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("projection failed")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SubmissionPending("projection failed")),
     )
 
     assert (

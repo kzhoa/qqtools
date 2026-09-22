@@ -136,15 +136,24 @@ creates nor enrolls a Project.
 Each qexp Machine has one global `qexp agent` process and one resource pool shared by all enrolled
 Projects. A Project created by an older release with legacy agent metadata uses the one-time
 `qexp admin migrate agent --project PATH --machine NAME`. `qexp agent start` starts or reuses the global agent and waits for every
-enabled Project to become ready. `qexp agent run` is the foreground debugging command.
+enabled Project to become ready. `qexp agent run` is a foreground debugging stream: it has no
+`--format` option or structured startup document. `Ctrl+C` stops that foreground agent, but does
+not signal detached runners that it already launched.
 
 ```bash
 qexp init --machine gpu-a --agent-mode daemon
 qexp project register /mnt/share/myproject
 qexp agent start
 qexp agent status
+qexp agent restart
+qexp agent status  # observe readiness after process replacement
 qexp agent stop
 ```
+
+`agent restart` waits for replacement of the agent process, not for every Project to converge.
+Its result can therefore say `Ready: pending`; use the following `agent status` to observe later
+readiness. Status keeps configured `daemon|on_demand` policy distinct from a differing observed
+mode.
 
 The MachineRuntime also owns one persistent GPU allowlist shared by every registered project.
 Change it while the agent is running; no restart is required:
@@ -230,7 +239,8 @@ qexp task offer TASK_ID --format=json
 machine remains eligible. `share --after` records a bounded deadline; `unshare` clears the
 shared policy and returns the Task to the home queue. `task offer` is retained for Tasks that
 were already submitted with spillover policy and only moves that existing policy into the shared
-queue. Scripts and other machine consumers must request structured command output explicitly with `--format=json`.
+queue. Scripts and other machine consumers must request structured output from finite commands
+explicitly with `--format=json`; raw and continuous commands do not accept a structured format.
 
 For normal task and cleanup workflows:
 
@@ -322,6 +332,10 @@ process manifests, and logs before deleting shared Task and Attempt records. Req
 are the Task home machine, historical Attempt machines, and the machine that prepared cleanup.
 Pending operations report `waiting_ack` and the remaining machine names. Cleanup blocks retry,
 claim, cancel, and offer, and its tombstone permanently reserves the Task ID.
+
+Operation summaries use `accepted` or `waiting_ack` while durable convergence remains, `blocked`
+when operator action is required, and `completed` only after the command's convergence boundary.
+Pending results include an operation reference and exact follow-up command when one exists.
 
 File mode is only a bulk-input mode and does not create a public Batch identity. Explicit
 `submit --tmux|--no-tmux` overrides every Task, followed by Task and `defaults.tmux` values; null
@@ -437,8 +451,9 @@ Task override. Policy changes do not create or remove windows retroactively, and
 machine must run a supporting agent before project-wide enforcement is complete. Missing tmux or
 libtmux remains an observation-only diagnostic; training continues through the detached runner.
 
-`show --watch` refreshes a compact terminal view every two seconds. `logs --follow`
-streams application stdout/stderr and also works when redirected. Both viewers stop after
+`show --watch` refreshes a compact terminal-only view every two seconds and rejects `--format`.
+Finite `task logs` and `logs --follow` preserve raw application bytes on stdout; qexp diagnostics
+and stream boundaries use stderr, and structured formats are rejected. Both viewers stop after
 the Task's validated terminal result by default; add `--follow-retries` only when the viewer
 should remain open for a later retry. The refresh interval changes viewer reads, not the
 application's progress reporting policy. Closing either viewer, or a qexp-created tmux log

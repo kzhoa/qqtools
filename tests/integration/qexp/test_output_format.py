@@ -58,6 +58,40 @@ def test_task_list_defaults_to_human_and_json_is_explicit(tmp_path: Path, capsys
     ]
 
 
+def test_human_and_json_each_execute_once_and_emit_once(tmp_path: Path, monkeypatch, capsys) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    submit(cfg, ["echo", "ok"])
+    from qqtools.plugins.qexp.cli import entrypoint, project_handlers
+
+    workflow_calls: list[str] = []
+    render_calls: list[str] = []
+    original_list_tasks = project_handlers.observer.list_tasks
+    original_render = entrypoint.render
+
+    def counted_list_tasks(*args, **kwargs):
+        workflow_calls.append("list")
+        return original_list_tasks(*args, **kwargs)
+
+    def counted_render(output, output_format):
+        render_calls.append(output_format)
+        return original_render(output, output_format)
+
+    monkeypatch.setattr(project_handlers.observer, "list_tasks", counted_list_tasks)
+    monkeypatch.setattr(entrypoint, "render", counted_render)
+
+    assert main([*_base_args(cfg), "task", "list"]) == 0
+    human = capsys.readouterr()
+    assert main([*_base_args(cfg), "task", "list", "--format=json"]) == 0
+    structured = capsys.readouterr()
+
+    assert workflow_calls == ["list", "list"]
+    assert render_calls == ["human", "json"]
+    assert human.out.count("Task ID") == 1
+    assert human.err == ""
+    assert len(json.loads(structured.out)) == 1
+    assert structured.err == ""
+
+
 def test_progress_policy_cli_reports_default_and_configured_value(tmp_path: Path, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     base = _base_args(cfg)
@@ -68,7 +102,10 @@ def test_progress_policy_cli_reports_default_and_configured_value(tmp_path: Path
         "action": "show",
         "section": "progress",
         "scope": "project",
+        "source": "default",
+        "applies_to": "new_launches",
         "values": {"interval_seconds": 30, "source": "default", "applies_to": "new_launches"},
+        "effective_values": {"interval_seconds": 30, "source": "default", "applies_to": "new_launches"},
     }
 
     assert main([*base, "config", "set", "progress", "--interval-seconds", "60", "--format=json"]) == 0
@@ -250,7 +287,7 @@ def test_empty_task_list_uses_fixed_message(tmp_path: Path, capsys):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
 
     assert main([*_base_args(cfg), "task", "list"]) == 0
-    assert capsys.readouterr().out == "No results.\n"
+    assert capsys.readouterr().out == "No Tasks.\n"
 
 
 @pytest.mark.parametrize("value", ["text", "xml"])
@@ -313,7 +350,8 @@ def test_group_json_remains_raw_workflow_result(tmp_path: Path, capsys):
     assert main([*_base_args(cfg), "group", "create", "demo", "--format=json"]) == 0
     created = json.loads(capsys.readouterr().out)
     assert created["group"]["name"] == "demo"
-    assert "action" not in created
+    assert created["action"] == "create"
+    assert created["outcome"] == "completed"
 
 
 def test_group_workers_cli_exposes_normalized_role_and_limit(tmp_path: Path, capsys):
@@ -363,6 +401,11 @@ def test_group_workers_cli_exposes_normalized_role_and_limit(tmp_path: Path, cap
     )
     updated = json.loads(capsys.readouterr().out)
     assert updated["group"]["worker_set"]["gpu-2"]["gpu_limit_gpus"] is None
+    assert updated["action"] == "set"
+    assert updated["outcome"] == "completed"
+    assert updated["worker_state"] == "active"
+    assert updated["scheduling_role"] == "borrow"
+    assert updated["gpu_limit_gpus"] is None
 
     assert (
         main(
@@ -492,7 +535,7 @@ def test_empty_project_list_human_output_uses_fixed_message(tmp_path: Path, caps
     capsys.readouterr()
 
     assert main([*prefix, "project", "list"]) == 0
-    assert capsys.readouterr().out == "No results.\n"
+    assert capsys.readouterr().out == "No enrolled Projects.\nNext: qexp project register PATH\n"
 
 
 def test_cpu_lane_human_and_json_share_the_policy_result(tmp_path: Path, capsys):
@@ -509,6 +552,7 @@ def test_cpu_lane_human_and_json_share_the_policy_result(tmp_path: Path, capsys)
     assert json.loads(capsys.readouterr().out) == {
         "machine_runtime_root": str(runtime_root),
         "cpu_lane": {"capacity": 4, "revision": 1},
+        "action": "shown",
     }
 
 
@@ -547,7 +591,13 @@ def test_machine_upgrade_advance_human_reads_flat_projects_and_json_is_unchanged
     assert "waiting" in human
 
     assert main([*base, "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out) == result
+    assert json.loads(capsys.readouterr().out) == {
+        **result,
+        "action": "advance",
+        "outcome": "waiting",
+        "reason": "upgrade work remains pending",
+        "next_action": "qexp admin upgrade status",
+    }
     assert calls == 2
 
 
@@ -582,7 +632,13 @@ def test_machine_upgrade_status_human_reads_nested_projects_and_json_is_unchange
     assert "pending" in human
 
     assert main([*base, "--format=json"]) == 0
-    assert json.loads(capsys.readouterr().out) == result
+    assert json.loads(capsys.readouterr().out) == {
+        **result,
+        "action": "status",
+        "outcome": "waiting",
+        "reason": "upgrade work remains pending",
+        "next_action": "qexp admin upgrade status",
+    }
 
 
 def test_group_and_machine_human_output_do_not_query_task_history_for_presentation(tmp_path: Path, monkeypatch, capsys):

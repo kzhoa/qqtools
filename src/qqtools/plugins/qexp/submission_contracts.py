@@ -156,7 +156,7 @@ class SubmissionRequest:
 
 @dataclass(frozen=True, slots=True)
 class SubmissionResult:
-    """Canonical submission result payload consumed by :mod:`formatter`."""
+    """Canonical submission result payload consumed by the CLI output boundary."""
 
     schema_version: int = 1
     mode: SubmissionMode | None = None
@@ -168,6 +168,7 @@ class SubmissionResult:
     task_ids: tuple[str, ...] = ()
     preview: Mapping[str, Any] | None = None
     error: Mapping[str, Any] | None = None
+    activation: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -182,6 +183,7 @@ class SubmissionResult:
         object.__setattr__(self, "operation", _freeze(self.operation) if self.operation is not None else None)
         object.__setattr__(self, "preview", _freeze(self.preview) if self.preview is not None else None)
         object.__setattr__(self, "error", _freeze(self.error) if self.error is not None else None)
+        object.__setattr__(self, "activation", _freeze(self.activation) if self.activation is not None else None)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -195,6 +197,7 @@ class SubmissionResult:
             "task_ids": list(self.task_ids),
             "preview": _thaw(self.preview),
             "error": _thaw(self.error),
+            "activation": _thaw(self.activation),
         }
 
 
@@ -209,6 +212,7 @@ def submission_result_payload(
     task_ids: list[str] | tuple[str, ...] = (),
     preview: Mapping[str, Any] | None = None,
     error: Mapping[str, Any] | None = None,
+    activation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a complete JSON-compatible result, including every nullable field."""
     if isinstance(project, ProjectSelection):
@@ -223,6 +227,7 @@ def submission_result_payload(
         task_ids=tuple(task_ids),
         preview=preview,
         error=error,
+        activation=activation,
     ).to_dict()
 
 

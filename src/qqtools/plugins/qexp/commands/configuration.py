@@ -7,10 +7,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, fields
 from typing import Any
 
-from ..agent.config import agent_config_payload, set_agent_config
+from ..agent.config import agent_config_payload, set_agent_config, validate_agent_mode, validate_agent_name
 from ..agent.context import MachineRuntime
 from ..config_types import RootConfig
-from ..launch_policy import reset_launch_handoff_policy, set_launch_handoff_policy, show_launch_handoff_policy
+from ..launch_policy import (
+    reset_launch_handoff_policy,
+    set_launch_handoff_policy,
+    show_launch_handoff_policy,
+    validate_launch_handoff_timeout_seconds,
+)
 from ..lease import LeasePolicy, lease_policy_path, load_lease_policy, reset_lease_policy, save_lease_policy
 from ..notification_config import (
     default_notifications,
@@ -20,10 +25,15 @@ from ..notification_config import (
     validate_notifications,
     write_shared_feishu_webhook,
 )
-from ..progress_policy import reset_progress_policy, set_progress_policy, show_progress_policy
+from ..progress_policy import (
+    reset_progress_policy,
+    set_progress_policy,
+    show_progress_policy,
+    validate_interval_seconds,
+)
 from ..runtime.paths import shared_paths
 from ..runtime.store import iter_json, read_json
-from ..tmux_policy import reset_tmux_policy, set_tmux_policy, show_tmux_policy
+from ..tmux_policy import reset_tmux_policy, set_tmux_policy, show_tmux_policy, validate_tmux_policy_enabled
 
 PROJECT_CONFIG_SECTIONS = ("lease", "notifications", "progress", "tmux", "launch-handoff")
 CONFIG_SECTIONS = PROJECT_CONFIG_SECTIONS + ("agent",)
@@ -95,7 +105,128 @@ def _validate_keys(values: Mapping[str, object], allowed: frozenset[str], label:
 
 
 def _result(action: str, section: str, scope: str, values: dict[str, Any]) -> dict[str, object]:
-    return {"action": action, "section": section, "scope": scope, "values": values}
+    """Build the stable envelope used by all typed configuration commands.
+
+    ``values`` remains the historical field.  ``effective_values`` is an
+    additive alias with a name that makes it clear that the payload contains
+    the value in force after a mutation (or the value being inspected for a
+    read).  Source and application timing are facts supplied by the policy
+    implementation, not inferred by the renderer.
+    """
+    return {
+        "action": action,
+        "section": section,
+        "scope": scope,
+        "source": values.get("source", "unavailable"),
+        "applies_to": values.get("applies_to"),
+        "values": values,
+        "effective_values": values,
+    }
+
+
+def _field_value(values: Mapping[str, Any], section: str, field: str, provider: str | None) -> Any:
+    """Return one user-facing field from a policy result.
+
+    Policy modules intentionally use small, section-specific result shapes.
+    Keeping this translation here avoids leaking those implementation shapes
+    into the CLI contract while still allowing truthful no-op detection.
+    """
+    if section == "lease":
+        nested = values.get("lease_policy")
+        return nested.get(field) if isinstance(nested, Mapping) else None
+    if section == "notifications" and provider is not None:
+        providers = values.get("providers")
+        nested = providers.get(provider) if isinstance(providers, Mapping) else None
+        return nested.get(field) if isinstance(nested, Mapping) else None
+    if section == "notifications" and field == "enabled":
+        return values.get("enabled")
+    return values.get(field)
+
+
+def _changed_fields(
+    section: str,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    requested: Mapping[str, object],
+    provider: str | None,
+) -> list[str]:
+    changed: list[str] = []
+    for field, requested_value in requested.items():
+        # The actual shared webhook is intentionally never loaded for output.
+        # Supplying one always represents a write, even when the redacted view
+        # cannot compare its bytes with the previous value.
+        if field == "shared_webhook":
+            changed.append(field)
+            continue
+        if _field_value(before, section, field, provider) != _field_value(after, section, field, provider):
+            changed.append(field)
+        elif requested_value is not None and _field_value(after, section, field, provider) is None:
+            # A value that was accepted but is not represented in a section's
+            # compact view still counts as a changed field.  This is mainly a
+            # guard for future typed policy fields.
+            changed.append(field)
+    return changed
+
+
+def _requested_changed_fields(
+    section: str,
+    current: Mapping[str, Any],
+    requested: Mapping[str, object],
+    provider: str | None,
+) -> list[str]:
+    """Compare requested values with the current effective policy values."""
+    changed: list[str] = []
+    for field, requested_value in requested.items():
+        if field == "shared_webhook":
+            changed.append(field)
+            continue
+        normalized = requested_value
+        if section == "lease" and field == "clock_provider_priority":
+            normalized = _normalize_clock_provider_priority(requested_value)
+        if normalized != _field_value(current, section, field, provider):
+            changed.append(field)
+    return changed
+
+
+def _mutation_result(
+    action: str,
+    section: str,
+    scope: str,
+    before: Mapping[str, Any],
+    after: dict[str, Any],
+    requested: Mapping[str, object],
+    provider: str | None,
+) -> dict[str, object]:
+    fields_changed = _changed_fields(section, before, after, requested, provider)
+    changed = bool(fields_changed)
+    return {
+        **_result(action, section, scope, after),
+        "changed": changed,
+        "outcome": "updated" if changed else "no_change",
+        "changed_fields": fields_changed,
+    }
+
+
+def _reset_changed_fields(
+    section: str,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    provider: str | None,
+) -> list[str]:
+    if section == "notifications" and provider is None and before.get("providers") != after.get("providers"):
+        return ["providers"]
+    candidates = {
+        "lease": _LEASE_FIELDS,
+        "notifications": _NOTIFICATION_FIELDS | _FEISHU_FIELDS,
+        "progress": {"interval_seconds"},
+        "tmux": {"enabled"},
+        "launch-handoff": {"timeout_seconds"},
+    }.get(section, set())
+    return [
+        field
+        for field in sorted(candidates)
+        if _field_value(before, section, field, provider) != _field_value(after, section, field, provider)
+    ]
 
 
 def _lease_values(policy: LeasePolicy, *, source: str) -> dict[str, Any]:
@@ -122,8 +253,19 @@ def _redact_notifications(value: Mapping[str, Any]) -> dict[str, Any]:
     for name, raw in providers.items():
         if isinstance(raw, dict):
             redacted = dict(raw)
-            for secret_field in ("shared_webhook", "webhook", "secret"):
-                redacted.pop(secret_field, None)
+            redacted_fields: list[str] = []
+            for secret_field in tuple(redacted):
+                normalized = str(secret_field).lower()
+                if normalized in {"webhook", "shared_webhook", "secret", "signing_secret", "token", "password"} or (
+                    "secret" in normalized and not normalized.endswith("_env")
+                ):
+                    redacted.pop(secret_field, None)
+                    redacted_fields.append(str(secret_field))
+            if redacted_fields:
+                # Tell operators why a credential is absent without exposing
+                # its value.  Environment variable names remain visible as
+                # non-secret source metadata (for example ``secret_env``).
+                redacted["redacted_fields"] = sorted(redacted_fields)
             result["providers"][name] = redacted
         else:
             result["providers"][name] = raw
@@ -171,15 +313,28 @@ def show_config(
                 complete = False
                 sections[name] = {
                     "status": "error",
+                    "scope": "project",
+                    "source": "unavailable",
+                    "applies_to": None,
                     "error": {"code": "invalid_config", "message": str(exc)},
                 }
             else:
-                sections[name] = {"status": "ok", "values": values}
+                sections[name] = {
+                    "status": "ok",
+                    "scope": "project",
+                    "source": values.get("source", "unavailable"),
+                    "applies_to": values.get("applies_to"),
+                    "values": values,
+                    "effective_values": values,
+                }
         return {"action": "show", "scope": "project", "complete": complete, "sections": sections}
 
     name = _require_section(section)
     if name == "agent":
-        return _result("show", name, "global", agent_config_payload(runtime))
+        values = agent_config_payload(runtime)
+        values["source"] = "default" if values.get("provenance") == "default" else "configured"
+        values["applies_to"] = "new_agent_processes"
+        return _result("show", name, "global", values)
     return _result("show", name, "project", _show_project(name, _require_project_cfg(cfg)))
 
 
@@ -337,6 +492,83 @@ def _set_agent(runtime: MachineRuntime, values: Mapping[str, object]) -> dict[st
     return agent_config_payload(runtime)
 
 
+def _validate_set_options(
+    section: str,
+    options: Mapping[str, object],
+    *,
+    provider: str | None,
+    cfg: RootConfig | None,
+) -> None:
+    """Validate a mutation before equality can classify it as a no-op."""
+    if section == "agent":
+        _validate_keys(options, _AGENT_FIELDS, "agent")
+        if "name" in options:
+            validate_agent_name(options["name"])  # type: ignore[arg-type]
+        if "agent_mode" in options:
+            validate_agent_mode(options["agent_mode"])  # type: ignore[arg-type]
+        return
+    if section == "lease":
+        _validate_keys(options, _LEASE_FIELDS, "lease")
+        _validate_lease_types(options)
+        normalized = dict(options)
+        if "clock_provider_priority" in normalized:
+            normalized["clock_provider_priority"] = _normalize_clock_provider_priority(
+                normalized["clock_provider_priority"]
+            )
+        current = load_lease_policy(_require_project_cfg(cfg))
+        LeasePolicy(**{**asdict(current), **normalized})
+        return
+    if section == "notifications":
+        if provider is None:
+            _validate_keys(options, _NOTIFICATION_FIELDS, "notifications")
+            _validate_bool(options.get("enabled"), "notifications.enabled")
+            return
+        _validate_keys(options, _FEISHU_FIELDS, "feishu")
+        if "enabled" in options:
+            _validate_bool(options["enabled"], "feishu.enabled")
+        if "acknowledge_shared_secret_risk" in options:
+            _validate_bool(options["acknowledge_shared_secret_risk"], "feishu.acknowledge_shared_secret_risk")
+        if "shared_webhook" in options:
+            webhook = options["shared_webhook"]
+            if not isinstance(webhook, str) or not webhook:
+                raise ValueError("shared Feishu webhook must be a non-empty string")
+            if options.get("credential_source") != "shared_file":
+                raise ValueError("feishu.shared_webhook requires credential_source=shared_file")
+            if options.get("acknowledge_shared_secret_risk") is not True:
+                raise ValueError("feishu.shared_webhook requires acknowledge_shared_secret_risk=true")
+        if options.get("credential_source") == "shared_file" and (
+            options.get("acknowledge_shared_secret_risk") is not True
+        ):
+            raise ValueError("feishu.credential_source shared_file requires acknowledge_shared_secret_risk=true")
+        current = load_notifications_strict(_require_project_cfg(cfg)) or default_notifications()
+        providers = current.get("providers", {})
+        current_provider = providers.get(provider, {}) if isinstance(providers, Mapping) else {}
+        candidate_provider = {
+            "enabled": False,
+            "webhook_env": "QEXP_FEISHU_WEBHOOK",
+            "secret_env": None,
+            "timeout_seconds": 5,
+            "credential_source": "env",
+            **(dict(current_provider) if isinstance(current_provider, Mapping) else {}),
+        }
+        for field in ("enabled", "webhook_env", "credential_source", "secret_env", "timeout_seconds"):
+            if field in options:
+                candidate_provider[field] = options[field]
+        validate_notifications({"enabled": current["enabled"], "providers": {provider: candidate_provider}})
+        return
+    if section == "progress":
+        _validate_keys(options, frozenset({"interval_seconds"}), "progress")
+        validate_interval_seconds(options.get("interval_seconds"))
+        return
+    if section == "tmux":
+        _validate_keys(options, frozenset({"enabled"}), "tmux")
+        validate_tmux_policy_enabled(options.get("enabled"))
+        return
+    if section == "launch-handoff":
+        _validate_keys(options, frozenset({"timeout_seconds"}), "launch-handoff")
+        validate_launch_handoff_timeout_seconds(options.get("timeout_seconds"))
+
+
 def set_config(
     section: str,
     *,
@@ -349,12 +581,30 @@ def set_config(
     name = _require_section(section)
     _validate_provider(name, provider)
     options = _values_mapping(values)
+    _validate_set_options(name, options, provider=provider, cfg=cfg)
     if name == "agent":
         if provider is not None:
             raise ValueError("provider is not supported for agent")
-        return _result("set", name, "global", _set_agent(runtime, options))
+        before = agent_config_payload(runtime)
+        before["source"] = "default" if before.get("provenance") == "default" else "configured"
+        before["applies_to"] = "new_agent_processes"
+        # Do not advance the global configuration revision for an explicit
+        # no-op.  The command still returns the complete effective payload.
+        changed_fields = _requested_changed_fields(name, before, options, None)
+        after = before if not changed_fields else _set_agent(runtime, options)
+        if changed_fields:
+            after["source"] = "default" if after.get("provenance") == "default" else "configured"
+            after["applies_to"] = "new_agent_processes"
+        return _mutation_result("set", name, "global", before, after, options, None)
 
     project_cfg = _require_project_cfg(cfg)
+    before = _show_project(name, project_cfg)
+    # Avoid rewriting a policy when every requested field is already effective.
+    # A supplied shared webhook is deliberately treated as a write because its
+    # value is never loaded into the redacted comparison view.
+    no_op = not _requested_changed_fields(name, before, options, provider)
+    if no_op:
+        return _mutation_result("set", name, "project", before, dict(before), options, provider)
     if name == "lease":
         if provider is not None:
             raise ValueError("provider is not supported for lease")
@@ -382,7 +632,7 @@ def set_config(
         result = set_launch_handoff_policy(project_cfg, options["timeout_seconds"])
     else:
         raise ValueError(f"unknown project config section {name!r}")
-    return _result("set", name, "project", result)
+    return _mutation_result("set", name, "project", before, result, options, provider)
 
 
 def reset_config(
@@ -399,6 +649,7 @@ def reset_config(
         raise ValueError("agent configuration cannot be reset")
 
     project_cfg = _require_project_cfg(cfg)
+    before = _show_project(name, project_cfg)
     if name == "lease":
         if provider is not None:
             raise ValueError("provider is not supported for lease")
@@ -420,7 +671,13 @@ def reset_config(
         result = reset_launch_handoff_policy(project_cfg)
     else:
         raise ValueError(f"unknown project config section {name!r}")
-    return _result("reset", name, "project", result)
+    changed_fields = _reset_changed_fields(name, before, result, provider)
+    return {
+        **_result("reset", name, "project", result),
+        "changed": bool(changed_fields),
+        "outcome": "updated" if changed_fields else "no_change",
+        "changed_fields": changed_fields,
+    }
 
 
 def _show_notifications_after_notification_reset(

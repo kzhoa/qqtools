@@ -464,6 +464,67 @@ def migrate_project(runtime: MachineRuntime | str | Path | None, cfg: RootConfig
     return binding
 
 
+def project_migration_state(runtime: MachineRuntime | str | Path | None, binding: ProjectBinding) -> dict[str, Any]:
+    """Read the durable legacy-agent migration state for a registered project.
+
+    The migration record is the recovery authority for the handoff.  Callers
+    use this bounded read after migration (including when a later agent start
+    fails) so the CLI can distinguish a durable active handoff from an
+    incomplete or unavailable migration instead of inferring state from the
+    process status.
+    """
+    machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
+    path = machine_runtime.migration_path(binding.project_id)
+    if not path.exists():
+        return {
+            "state": "missing",
+            "project_id": binding.project_id,
+            "shared_root": str(binding.shared_root),
+            "machine_name": binding.machine_name,
+            "updated_at": None,
+        }
+    try:
+        value = read_json(path)
+    except (OSError, TypeError, ValueError) as exc:
+        return {
+            "state": "unavailable",
+            "project_id": binding.project_id,
+            "shared_root": str(binding.shared_root),
+            "machine_name": binding.machine_name,
+            "updated_at": None,
+            "error": str(exc),
+        }
+    migration = value.get("migration") if isinstance(value, dict) else None
+    if not isinstance(migration, dict):
+        return {
+            "state": "malformed",
+            "project_id": binding.project_id,
+            "shared_root": str(binding.shared_root),
+            "machine_name": binding.machine_name,
+            "updated_at": None,
+            "error": "migration record is malformed",
+        }
+    result = {
+        key: migration.get(key)
+        for key in (
+            "state",
+            "project_id",
+            "shared_root",
+            "machine_name",
+            "prepared_at",
+            "updated_at",
+            "detail",
+        )
+        if key in migration
+    }
+    result.setdefault("project_id", binding.project_id)
+    result.setdefault("shared_root", str(binding.shared_root))
+    result.setdefault("machine_name", binding.machine_name)
+    result.setdefault("state", "malformed")
+    result.setdefault("updated_at", None)
+    return result
+
+
 def unregister_project(runtime: MachineRuntime | str | Path | None, identifier: str | Path) -> ProjectBinding:
     return (runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)).remove_binding(identifier)
 

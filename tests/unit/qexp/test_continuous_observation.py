@@ -638,3 +638,15 @@ def test_follow_replaces_invalid_utf8(tmp_path: Path, monkeypatch: pytest.Monkey
 
     assert follow_logs(_cfg(tmp_path), "task-1", stdout=stdout, stderr=StringIO(), chunk_size=2) == 0
     assert stdout.getvalue() == "before�after\n"
+
+
+def test_follow_preserves_invalid_utf8_for_binary_stdout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "attempt.log"
+    payload = b"before\xffafter\n"
+    path.write_bytes(payload)
+    observation = _follow_payload(path, terminal=True)
+    monkeypatch.setattr(observer, "inspect_current_task", lambda *_args: observation)
+    stdout = BytesIO()
+
+    assert follow_logs(_cfg(tmp_path), "task-1", stdout=stdout, stderr=StringIO(), chunk_size=2) == 0
+    assert stdout.getvalue() == payload

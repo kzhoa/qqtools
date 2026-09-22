@@ -11,14 +11,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..agent.context import ExecutionContext, MachineRuntime
+from ..agent.context import ExecutionContext, MachineRuntime, ProjectBindingRequiredError
 from ..commands import context as context_commands
 from ..commands import wait as wait_commands
-from ..commands.registry import CommandSpec
 from ..config_types import RootConfig
-from ..formatter import CliOutput, OutputKind, render
 from ..runtime.observation.api import ObservationError
+from .command_spec import CommandSpec, ContextKind, OutputMode
+from .errors import CliOperationalError, CliUsageError, classify_cli_error
 from .local_handlers import LOCAL_HANDLERS, dispatch_local
+from .outcome import CommandOutcome, validate_command_outcome
+from .output import CliOutput, OutputKind, render
 from .parser import (
     _is_json_argv,
     _JsonParseError,
@@ -27,8 +29,10 @@ from .parser import (
     _SubmissionParseError,
     build_parser,
 )
-from .project_handlers import _is_continuous_task, _validate_continuous_options, dispatch_project
+from .project_handlers import _validate_continuous_options, dispatch_project
 from .submission import (
+    SubmissionCommandError,
+    SubmissionInputError,
     _prepare_submission_request,
     _submission_error_payload,
     _submission_parse_failure_payload,
@@ -42,21 +46,6 @@ _ACTIVE_COMMAND_SPEC: contextvars.ContextVar[CommandSpec | None] = contextvars.C
     "qexp_active_command_spec", default=None
 )
 
-_DYNAMIC_OUTPUT_KINDS: dict[str, frozenset[OutputKind]] = {
-    "agent-operation": frozenset({OutputKind.AGENT_OPERATION, OutputKind.AGENT_READINESS}),
-    "doctor-check": frozenset({OutputKind.DOCTOR_VERIFY}),
-    "group-operation": frozenset({OutputKind.GROUP_OPERATION, OutputKind.GROUP_MACHINES}),
-    "task-list": frozenset({OutputKind.TASK_LIST, OutputKind.TASK_PAGE}),
-    "task-show": frozenset({OutputKind.TASK_SHOW, OutputKind.TASK_WATCH}),
-    "upgrade": frozenset(
-        {
-            OutputKind.UPGRADE_REGISTRY_STATUS,
-            OutputKind.UPGRADE_ADVANCE,
-            OutputKind.UPGRADE_PROJECT,
-        }
-    ),
-}
-
 
 def _emit_observation_error(error: ObservationError, output_format: str) -> int:
     """Render one stable observation error at the CLI boundary."""
@@ -65,6 +54,21 @@ def _emit_observation_error(error: ObservationError, output_format: str) -> int:
     else:
         print(f"qexp: {error.message}", file=sys.stderr)
     return error.exit_code
+
+
+def _emit_user_error(error: CliUsageError | CliOperationalError, output_format: str) -> int:
+    classified = classify_cli_error(error)
+    assert classified is not None
+    if output_format == "json":
+        payload: dict[str, Any] = {"code": classified.code, "message": classified.message}
+        if classified.next_action is not None:
+            payload["next_action"] = classified.next_action
+        print(json.dumps({"error": payload}))
+    else:
+        print(f"qexp: {classified.message}", file=sys.stderr)
+        if classified.next_action is not None:
+            print(f"Next: {classified.next_action}", file=sys.stderr)
+    return classified.exit_code
 
 
 def _is_wait_json_argv(argv: list[str]) -> bool:
@@ -126,23 +130,42 @@ def _emit_wait_error(
 
 
 def _emit(output: CliOutput[object], output_format: str, *, flush: bool = False) -> None:
-    command_spec = _ACTIVE_COMMAND_SPEC.get()
-    if command_spec is not None:
-        allowed = _DYNAMIC_OUTPUT_KINDS.get(command_spec.output)
-        if allowed is None:
-            try:
-                allowed = frozenset({OutputKind(command_spec.output)})
-            except ValueError as exc:
-                raise RuntimeError(
-                    f"command handler {command_spec.handler!r} has no structured output contract "
-                    f"for {command_spec.output!r}."
-                ) from exc
-        if output.kind not in allowed:
-            raise RuntimeError(
-                f"command handler {command_spec.handler!r} emitted {output.kind.value!r}; "
-                f"registered output is {command_spec.output!r}."
-            )
     print(render(output, output_format), flush=flush)
+
+
+def _active_mode(args: argparse.Namespace) -> OutputMode:
+    """Resolve the command's stream mode from typed metadata and switches."""
+    spec = args.command_spec
+    handler = spec.handler
+    if handler == "task_show":
+        return OutputMode.CONTINUOUS if bool(getattr(args, "watch", False)) else OutputMode.FINITE
+    if handler == "task_logs":
+        return OutputMode.CONTINUOUS if bool(getattr(args, "follow", False)) else OutputMode.RAW
+    if handler == "init" and (args.init_shared_root or args.runtime_root or args.cpu_lane_capacity is not None):
+        return OutputMode.DIAGNOSTIC
+    if spec.modes == frozenset({OutputMode.DIAGNOSTIC}):
+        return OutputMode.DIAGNOSTIC
+    if handler == "submit" and bool(getattr(args, "quiet", False)):
+        return OutputMode.RAW
+    if handler == "task_retry" and bool(getattr(args, "quiet", False)):
+        return OutputMode.RAW
+    if OutputMode.FINITE in spec.modes:
+        return OutputMode.FINITE
+    if handler == "agent_run":
+        return OutputMode.CONTINUOUS
+    if len(spec.modes) == 1:
+        return next(iter(spec.modes))
+    raise RuntimeError(f"command {handler!r} has ambiguous output modes")
+
+
+def _finalize_outcome(args: argparse.Namespace, outcome: CommandOutcome) -> int:
+    """Validate and emit a handler outcome exactly once at the CLI boundary."""
+    mode = _active_mode(args)
+    validate_command_outcome(args.command_spec, mode, outcome)
+    if mode is OutputMode.FINITE:
+        output_format = getattr(args, "format", "human")
+        print(render(outcome.output, output_format))
+    return outcome.exit_code
 
 
 def _machine_assertion(args: argparse.Namespace) -> str | None:
@@ -150,7 +173,7 @@ def _machine_assertion(args: argparse.Namespace) -> str | None:
     flag_value = getattr(args, "machine", None)
     environment_value = os.environ.get("QEXP_MACHINE")
     if flag_value is not None and environment_value is not None and flag_value != environment_value:
-        raise ValueError(f"--machine {flag_value!r} conflicts with QEXP_MACHINE {environment_value!r}.")
+        raise CliUsageError(f"--machine {flag_value!r} conflicts with QEXP_MACHINE {environment_value!r}.")
     return flag_value if flag_value is not None else environment_value
 
 
@@ -158,7 +181,7 @@ def _requires_verified_binding(args: argparse.Namespace) -> bool:
     """Use the leaf's registered context policy as the sole write classification."""
     if args.command_spec.handler in {"config_set", "config_reset"}:
         return getattr(args, "section", None) != "agent"
-    return args.command_spec.context == "project-write"
+    return args.command_spec.context is ContextKind.PROJECT_WRITE
 
 
 def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[object, ExecutionContext, str]:
@@ -169,24 +192,25 @@ def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[ob
             submission_request.project.source,
         )
     else:
-        selection = context_commands.resolve_project(getattr(args, "project", None))
+        try:
+            selection = context_commands.resolve_project(getattr(args, "project", None))
+        except context_commands.ProjectSelectionError as exc:
+            raise CliUsageError(str(exc)) from exc
     assertion = _machine_assertion(args)
     machine_runtime = MachineRuntime(getattr(args, "machine_runtime_root", None))
 
     if require_binding:
         try:
             execution_context = machine_runtime.verified_execution_context(selection.shared_root)
-        except ValueError as exc:
-            if str(exc).startswith("no local project binding exists"):
-                raise ValueError(
-                    f"{exc} To join this machine for the first time, run 'qexp project register <PATH>'; "
-                    "to restore a missing current-generation binding, run "
-                    "'qexp project register <PATH>'."
-                ) from exc
-            raise
+        except ProjectBindingRequiredError as exc:
+            raise CliUsageError(
+                f"{exc} To join this machine for the first time, run 'qexp project register <PATH>'; "
+                "to restore a missing current-generation binding, run "
+                "'qexp project register <PATH>'."
+            ) from exc
         verified_machine = execution_context.cfg.machine_name
         if assertion is not None and assertion != verified_machine:
-            raise ValueError(
+            raise CliUsageError(
                 f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}.\n"
                 f"Use '--home-machine {assertion}' to select Task placement."
             )
@@ -201,7 +225,7 @@ def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[ob
     if execution_context is not None:
         verified_machine = execution_context.cfg.machine_name
         if assertion is not None and assertion != verified_machine:
-            raise ValueError(f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}.")
+            raise CliUsageError(f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}.")
         return execution_context.cfg, execution_context, selection.source
 
     # Read-only project observation must remain possible without a local binding. The sentinel is
@@ -250,12 +274,25 @@ def main(argv: list[str] | None = None) -> int:
     handler = args.command_spec.handler
     command_spec_token = _ACTIVE_COMMAND_SPEC.set(args.command_spec)
     try:
-        _validate_continuous_options(args)
+        explicit_format = any(token == "--format" or token.startswith("--format=") for token in raw_argv)
+        if explicit_format and handler == "agent_run":
+            raise CliUsageError("agent run is foreground debugging and does not support --format.")
+        if explicit_format and handler == "task_logs":
+            raise CliUsageError("task logs writes raw application bytes and does not support --format.")
+        if explicit_format and handler == "task_show" and bool(getattr(args, "watch", False)):
+            raise CliUsageError("task show --watch cannot be combined with --format; it is terminal-only.")
+        try:
+            _validate_continuous_options(args)
+        except ValueError as exc:
+            raise CliUsageError(str(exc)) from exc
         if handler == "task_wait":
             # Invocation validity is independent of Project discovery.  Check
             # it first so a bad duration cannot be mislabeled as an
             # observation failure merely because context is also unavailable.
-            wait_commands.parse_wait_timeout(args.timeout)
+            try:
+                wait_commands.parse_wait_timeout(args.timeout)
+            except ValueError as exc:
+                raise CliUsageError(str(exc)) from exc
         if getattr(args, "compat_shared_root", None) is not None:
             # Parse the former root-position locator only far enough to give a
             # bounded migration diagnostic.  It never participates in normal
@@ -270,17 +307,27 @@ def main(argv: list[str] | None = None) -> int:
             not handler.startswith("config_") or getattr(args, "section", None) == "agent"
         )
         if is_local:
-            return dispatch_local(handler, args, emitter=_emit)
+            return _finalize_outcome(args, dispatch_local(handler, args))
         if handler in {"admin_check", "admin_repair", "admin_clean"} and getattr(args, "project", None) is None:
-            raise ValueError(f"admin {handler.removeprefix('admin_')} requires explicit --project PATH.")
+            raise CliUsageError(f"admin {handler.removeprefix('admin_')} requires explicit --project PATH.")
         if handler == "submit":
-            _prepare_submission_request(args, raw_argv, invocation_cwd=Path.cwd())
-        cfg, execution_context, selection_source = _resolve_cfg(args, require_binding=_requires_verified_binding(args))
+            try:
+                _prepare_submission_request(args, raw_argv, invocation_cwd=Path.cwd())
+            except SubmissionInputError as exc:
+                raise SubmissionCommandError(exc) from exc
+        try:
+            cfg, execution_context, selection_source = _resolve_cfg(
+                args, require_binding=_requires_verified_binding(args)
+            )
+        except CliUsageError as exc:
+            if handler == "submit":
+                raise SubmissionCommandError(SubmissionInputError(str(exc))) from exc
+            raise
         resolved_cfg = cfg
         if handler == "submit":
             args._submission_cfg_resolved = True
-            return dispatch_submission(args, cfg, execution_context, emitter=_emit)
-        return dispatch_project(args, cfg, execution_context, selection_source, emitter=_emit)
+            return _finalize_outcome(args, dispatch_submission(args, cfg, execution_context))
+        return _finalize_outcome(args, dispatch_project(args, cfg, execution_context, selection_source))
     except ObservationError as exc:
         if handler == "task_wait" and getattr(args, "format", "human") == "json":
             return _emit_wait_error(
@@ -293,6 +340,28 @@ def main(argv: list[str] | None = None) -> int:
                 exit_code=6,
             )
         return _emit_observation_error(exc, getattr(args, "format", "human"))
+    except (CliUsageError, CliOperationalError) as exc:
+        if handler == "task_wait" and getattr(args, "format", "human") == "json":
+            return _emit_wait_error(
+                task_id=getattr(args, "task_id", None),
+                project=resolved_cfg.shared_root if resolved_cfg is not None else None,
+                outcome="invalid_input",
+                reason="invalid_input",
+                code="invalid_input",
+                message=str(exc),
+                exit_code=2,
+            )
+        return _emit_user_error(exc, getattr(args, "format", "human"))
+    except SubmissionCommandError as exc:
+        payload, exit_code = _submission_error_payload(args, exc.error)
+        if getattr(args, "quiet", False):
+            print(f"qexp: {exc}", file=sys.stderr)
+        elif getattr(args, "format", "human") == "json":
+            print(json.dumps(payload))
+            print(f"qexp: {exc}", file=sys.stderr)
+        else:
+            print(f"qexp: {exc}", file=sys.stderr)
+        return exit_code
     except KeyboardInterrupt as exc:
         if handler == "submit":
             payload, _exit_code = _submission_error_payload(args, exc)
@@ -309,16 +378,6 @@ def main(argv: list[str] | None = None) -> int:
             return 130
         raise
     except (ValueError, RuntimeError, OSError) as exc:
-        if handler == "submit":
-            payload, exit_code = _submission_error_payload(args, exc)
-            if getattr(args, "quiet", False):
-                print(f"qexp: {exc}", file=sys.stderr)
-            elif getattr(args, "format", "human") == "json":
-                print(json.dumps(payload))
-                print(f"qexp: {exc}", file=sys.stderr)
-            else:
-                print(f"qexp: {exc}", file=sys.stderr)
-            return exit_code
         if handler == "task_wait" and getattr(args, "format", "human") == "json":
             invalid_timeout = isinstance(exc, ValueError) and "timeout" in str(exc).lower()
             return _emit_wait_error(
@@ -333,25 +392,7 @@ def main(argv: list[str] | None = None) -> int:
         if handler == "task_list" and (args.page_size is not None or args.cursor is not None):
             code = "invalid_argument" if isinstance(exc, ValueError) else "index_unavailable"
             return _emit_observation_error(ObservationError(code, str(exc)), args.format)
-        if (
-            isinstance(exc, OSError)
-            and not isinstance(exc, FileNotFoundError)
-            and not _is_continuous_task(args)
-            and getattr(args, "format", "human") != "json"
-        ):
-            raise
-        if getattr(args, "format", "human") == "json" and not _is_continuous_task(args):
-            operational = isinstance(exc, (RuntimeError, OSError))
-            return _emit_observation_error(
-                ObservationError(
-                    "operational_failure" if operational else "invalid_argument",
-                    str(exc),
-                    1 if operational else 2,
-                ),
-                "json",
-            )
-        print(f"qexp: {exc}", file=sys.stderr)
-        return 2
+        raise
     finally:
         _ACTIVE_COMMAND_SPEC.reset(command_spec_token)
     return 0

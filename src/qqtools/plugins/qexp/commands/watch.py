@@ -8,7 +8,7 @@ from collections.abc import Callable
 from typing import Any, TextIO
 
 from .. import observer
-from ..formatter import CliOutput, OutputKind, render
+from ..cli.output import CliOutput, OutputKind, render
 
 
 def watch_task(

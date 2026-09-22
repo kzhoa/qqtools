@@ -647,6 +647,7 @@ class UpgradeCoordinator:
                 repair["state"] = "validation_failed"
                 item["state"] = "repair_required"
                 item["error"] = result.blocker or "repair validation did not complete"
+                repair["error"] = item["error"]
             repair["validated_at"] = utc_now()
             repair["validation"] = result.detail
             _save_journal(self.cfg, journal)

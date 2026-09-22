@@ -40,7 +40,15 @@ from .inventory import (
 from .project_admin import enable_project, register_project, set_project_enabled, unregister_project
 
 
-class MachineResetConfirmationRequired(RuntimeError):
+class SetupUsageError(ValueError):
+    """A setup request contains an invalid user-controlled value."""
+
+
+class SetupOperationalError(RuntimeError):
+    """A recognized machine or Project state blocks setup progress."""
+
+
+class MachineResetConfirmationRequired(SetupOperationalError):
     """Raised before a replacement mutates state when confirmation is absent."""
 
     def __init__(self, facts: dict[str, Any]):
@@ -58,20 +66,20 @@ def _identity_record(runtime: MachineRuntime) -> dict[str, Any] | None:
         return None
     value = read_json(path)
     if not isinstance(value, dict):
-        raise RuntimeError("machine runtime identity is malformed.")
+        raise SetupOperationalError("machine runtime identity is malformed.")
     record = value.get("machine_runtime")
     if not isinstance(record, dict):
-        raise RuntimeError("machine runtime identity is malformed.")
+        raise SetupOperationalError("machine runtime identity is malformed.")
     seed = record.get("instance_id")
     effective = record.get("runtime_id")
     if not isinstance(seed, str) or not seed:
-        raise RuntimeError("machine runtime identity is malformed.")
+        raise SetupOperationalError("machine runtime identity is malformed.")
     if effective is not None and (
         not isinstance(effective, str)
         or len(effective) != 64
         or any(char not in "0123456789abcdef" for char in effective)
     ):
-        raise RuntimeError("machine runtime identity has an invalid public runtime ID.")
+        raise SetupOperationalError("machine runtime identity has an invalid public runtime ID.")
     return record
 
 
@@ -250,50 +258,56 @@ def _read_replacement(runtime: MachineRuntime) -> dict[str, Any] | None:
     value = read_json(path)
     transaction = value.get("replacement")
     if not isinstance(transaction, dict):
-        raise RuntimeError("machine replacement transaction is malformed.")
+        raise SetupOperationalError("machine replacement transaction is malformed.")
     for key in ("version", "target_name", "new_runtime_id", "policy", "phase", "detach_old_runtime"):
         if key not in transaction:
-            raise RuntimeError("machine replacement transaction is malformed.")
+            raise SetupOperationalError("machine replacement transaction is malformed.")
     if (
         type(transaction["version"]) is not int
         or transaction["version"] != 1
         or transaction["phase"] not in {"staged", "archived", "published"}
     ):
-        raise RuntimeError("machine replacement transaction is unsupported.")
+        raise SetupOperationalError("machine replacement transaction is unsupported.")
     try:
         validate_agent_name(transaction["target_name"])
         validate_agent_mode(transaction["policy"])
     except (TypeError, ValueError) as exc:
-        raise RuntimeError("machine replacement transaction is malformed.") from exc
+        raise SetupOperationalError("machine replacement transaction is malformed.") from exc
     new_runtime_id = transaction["new_runtime_id"]
     if (
         not isinstance(new_runtime_id, str)
         or len(new_runtime_id) != 64
         or any(char not in "0123456789abcdef" for char in new_runtime_id)
     ):
-        raise RuntimeError("machine replacement transaction has an invalid target runtime ID.")
+        raise SetupOperationalError("machine replacement transaction has an invalid target runtime ID.")
     if type(transaction["detach_old_runtime"]) is not bool:
-        raise RuntimeError("machine replacement transaction has an invalid reset policy.")
+        raise SetupOperationalError("machine replacement transaction has an invalid reset policy.")
     archive = Path(transaction.get("archive_path", ""))
     try:
         if archive.parent.resolve() != runtime.paths["archives"].resolve():
             raise ValueError
     except (OSError, RuntimeError, ValueError) as exc:
-        raise RuntimeError("machine replacement transaction has an invalid archive path.") from exc
+        raise SetupOperationalError("machine replacement transaction has an invalid archive path.") from exc
     return transaction
+
+
+def pending_machine_replacement(runtime: MachineRuntime) -> dict[str, Any] | None:
+    """Return validated facts needed to resume a pending identity replacement."""
+    transaction = _read_replacement(runtime)
+    return dict(transaction) if transaction is not None else None
 
 
 def _validate_pending_target(transaction: dict[str, Any], name: str, mode: str | None, detach: bool) -> str:
     if transaction["target_name"] != name:
-        raise RuntimeError(
+        raise SetupOperationalError(
             f"machine replacement is pending for target {transaction['target_name']!r}; "
             "retry that target before choosing another name."
         )
     requested = mode if mode is not None else transaction["policy"]
     if requested != transaction["policy"]:
-        raise RuntimeError("machine replacement is pending with a different agent mode.")
+        raise SetupOperationalError("machine replacement is pending with a different agent mode.")
     if transaction.get("detach_old_runtime") and not detach:
-        raise RuntimeError("the pending replacement requires --detach-old-runtime to resume.")
+        raise SetupOperationalError("the pending replacement requires --detach-old-runtime to resume.")
     return transaction["new_runtime_id"]
 
 
@@ -314,7 +328,7 @@ def _archive_tree(runtime: MachineRuntime, archive: Path, *, transaction: dict[s
             elif child.is_file():
                 shutil.copy2(child, target)
             else:
-                raise RuntimeError(f"cannot archive non-regular machine runtime entry: {child}")
+                raise SetupOperationalError(f"cannot archive non-regular machine runtime entry: {child}")
         manifest = {
             "archive": {
                 "version": 1,
@@ -359,7 +373,7 @@ def _clear_old_local_state(runtime: MachineRuntime) -> None:
 def _ensure_machine_dirs(runtime: MachineRuntime) -> None:
     runtime.root.mkdir(parents=True, exist_ok=True)
     if not os.access(runtime.root, os.W_OK | os.X_OK):
-        raise RuntimeError(f"machine runtime root is not writable: {runtime.root}")
+        raise SetupOperationalError(f"machine runtime root is not writable: {runtime.root}")
     for name in (
         "locks",
         "agent",
@@ -392,8 +406,11 @@ def initialize_machine(
 ) -> dict[str, Any]:
     """Initialize or replace one machine identity with a staged commit."""
     machine_runtime = _runtime(runtime)
-    target_name = validate_agent_name(name)
-    selected_mode = validate_agent_mode(agent_mode) if agent_mode is not None else None
+    try:
+        target_name = validate_agent_name(name)
+        selected_mode = validate_agent_mode(agent_mode) if agent_mode is not None else None
+    except ValueError as exc:
+        raise SetupUsageError(str(exc)) from exc
     if yes is not None:
         confirmed = confirmed or yes
 
@@ -406,7 +423,7 @@ def initialize_machine(
             new_id = None
         old_id = _current_runtime_id(machine_runtime)
         if expected_old_runtime_id is not None and old_id != expected_old_runtime_id:
-            raise RuntimeError(
+            raise SetupOperationalError(
                 "machine identity changed after confirmation was requested; inspect the current identity and retry."
             )
         if old_id is None and transaction is not None:
@@ -451,12 +468,12 @@ def initialize_machine(
         facts = machine_init_facts(machine_runtime)
         if transaction is None:
             if not facts["local_execution_excluded"]:
-                raise RuntimeError(
+                raise SetupOperationalError(
                     "cannot reinitialize machine while local agent/process ownership is live or ambiguous: "
                     + ", ".join(facts["obligations"])
                 )
             if facts["obligations"] and not detach_old_runtime:
-                raise RuntimeError(
+                raise SetupOperationalError(
                     "cannot reinitialize machine with unresolved recovery obligations: "
                     + ", ".join(facts["obligations"])
                 )
@@ -512,7 +529,9 @@ def initialize_machine(
             # Archive must contain the manifest before any current authority is
             # removed.  A failed archive therefore leaves the old identity intact.
             if not (archive / "manifest.json").is_file():
-                raise RuntimeError("machine replacement archive is incomplete; current identity remains active.")
+                raise SetupOperationalError(
+                    "machine replacement archive is incomplete; current identity remains active."
+                )
             _clear_old_local_state(machine_runtime)
             _ensure_machine_dirs(machine_runtime)
             old_revision = 0
@@ -584,7 +603,7 @@ def initialize_project(shared_root: str | Path | None = None) -> dict[str, Any]:
         identity = read_json(shared_paths(root)["project"] / "identity.json").get("project", {})
         stable_id = identity.get("project_id")
         if not isinstance(stable_id, str) or not stable_id:
-            raise RuntimeError("qexp Project identity is malformed.")
+            raise SetupOperationalError("qexp Project identity is malformed.")
         return {
             "action": "project_already_initialized",
             "project_id": stable_id,
@@ -648,16 +667,16 @@ def _result_for_binding(
 
 def _load_project_identity(root: Path) -> tuple[str, RootConfig]:
     if not root.is_dir():
-        raise ValueError(f"Project path is missing or not mounted: {root}")
+        raise SetupUsageError(f"Project path is missing or not mounted: {root}")
     identity_path = shared_paths(root)["project"] / "identity.json"
     if not identity_path.is_file():
-        raise ValueError(f"Project is not initialized: {root}; run 'qexp project init {root.parent}'.")
+        raise SetupUsageError(f"Project is not initialized: {root}; run 'qexp project init {root.parent}'.")
     identity = read_json(identity_path).get("project")
     if not isinstance(identity, dict) or identity.get("shared_root") != str(root):
-        raise ValueError(f"Project identity is malformed: {identity_path}")
+        raise SetupUsageError(f"Project identity is malformed: {identity_path}")
     stable_id = identity.get("project_id")
     if not isinstance(stable_id, str) or not stable_id:
-        raise ValueError(f"Project identity has no stable ID: {identity_path}")
+        raise SetupUsageError(f"Project identity has no stable ID: {identity_path}")
     # Root validation is independent of local machine records.
     cfg = load_root_config(root, "project-enrollment", require_initialized=True)
     return stable_id, cfg
@@ -679,19 +698,19 @@ def _name_intent(
     name_source: str | None,
 ) -> tuple[str, str, str | None]:
     if machine_name is not None and name_source == "default":
-        raise ValueError("--machine and --name-source default are mutually exclusive.")
+        raise SetupUsageError("--machine and --name-source default are mutually exclusive.")
     requested_source = "explicit" if machine_name is not None else name_source
     if requested_source is not None and requested_source not in {"default", "explicit"}:
-        raise ValueError("--name-source must be default or explicit for registration.")
+        raise SetupUsageError("--name-source must be default or explicit for registration.")
     if entry is not None and entry.name_source == "unresolved" and requested_source is None:
-        raise ValueError("name_source_unresolved")
+        raise SetupUsageError("name_source_unresolved")
     source = requested_source or (entry.name_source if entry is not None else "default")
     override = machine_name if machine_name is not None else (entry.name_override if entry is not None else None)
     if source == "default":
         override = None
     if binding is not None:
         if machine_name is not None and machine_name != binding.machine_name:
-            raise ValueError(
+            raise SetupUsageError(
                 f"Project {binding.project_id!r} is already registered as {binding.machine_name!r}; "
                 "ordinary registration cannot adopt or rename it."
             )
@@ -719,15 +738,15 @@ def register_projects(
     machine_runtime.require_initialized()
     selected_paths = list(paths)
     if from_pool and selected_paths:
-        raise ValueError("Project register paths and --from-pool are mutually exclusive.")
+        raise SetupUsageError("Project register paths and --from-pool are mutually exclusive.")
     if not from_pool and not selected_paths:
-        raise ValueError("project register requires at least one Project path or --from-pool.")
+        raise SetupUsageError("project register requires at least one Project path or --from-pool.")
     if machine_name is not None and (from_pool or len(selected_paths) != 1):
-        raise ValueError("--machine requires exactly one explicit Project path.")
+        raise SetupUsageError("--machine requires exactly one explicit Project path.")
     if machine_name is not None and name_source == "default":
-        raise ValueError("--machine and --name-source default are mutually exclusive.")
+        raise SetupUsageError("--machine and --name-source default are mutually exclusive.")
     if from_pool and (machine_name is not None or name_source is not None):
-        raise ValueError("--from-pool does not accept --machine or --name-source.")
+        raise SetupUsageError("--from-pool does not accept --machine or --name-source.")
     config = load_agent_config(machine_runtime)
     with machine_runtime.agent_lifecycle_guard():
         with machine_runtime.inventory_guard():
@@ -827,7 +846,7 @@ def register_projects(
                                 migration_machine,
                             ]
                         )
-                        raise ValueError(f"legacy project metadata requires '{command}'.")
+                        raise SetupUsageError(f"legacy project metadata requires '{command}'.")
                     effective, source, override = _name_intent(
                         machine_runtime,
                         config,
@@ -875,8 +894,8 @@ def _selected_entry(
     matches = find_inventory_entries(entries, selector)
     if len(matches) != 1:
         if not matches:
-            raise ValueError(f"machine Project inventory has no entry for {selector!r}.")
-        raise ValueError(f"machine Project inventory selector {selector!r} is ambiguous.")
+            raise SetupUsageError(f"machine Project inventory has no entry for {selector!r}.")
+        raise SetupUsageError(f"machine Project inventory selector {selector!r} is ambiguous.")
     return revision, entries, matches[0]
 
 
@@ -888,9 +907,9 @@ def remove_project(runtime: MachineRuntime | str | Path | None, selector: str | 
         with machine_runtime.inventory_guard():
             revision, entries, entry = _selected_entry(machine_runtime, selector)
             if machine_runtime.paths["replacement_transaction"].exists():
-                raise RuntimeError("Project removal is blocked by a pending machine replacement.")
+                raise SetupOperationalError("Project removal is blocked by a pending machine replacement.")
             if machine_runtime.paths["registration_transaction"].exists():
-                raise RuntimeError("Project removal is blocked by pending registration recovery.")
+                raise SetupOperationalError("Project removal is blocked by pending registration recovery.")
             binding = next(
                 (
                     item
@@ -931,7 +950,7 @@ def set_project_enablement(
                 None,
             )
             if binding is None:
-                raise ValueError(f"Project {entry.project_id!r} is not registered.")
+                raise SetupUsageError(f"Project {entry.project_id!r} is not registered.")
             updated_binding = (
                 enable_project(machine_runtime, binding.project_id)
                 if enabled
@@ -964,6 +983,8 @@ def get_agent_config(runtime: MachineRuntime | str | Path | None) -> dict[str, A
 
 __all__ = [
     "MachineResetConfirmationRequired",
+    "SetupOperationalError",
+    "SetupUsageError",
     "get_agent_config",
     "initialize_machine",
     "initialize_project",

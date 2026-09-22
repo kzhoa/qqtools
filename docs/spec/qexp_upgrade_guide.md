@@ -60,9 +60,10 @@ python -m pip install --upgrade qqtools
 qexp agent restart
 ```
 
-Restart success means that the global agent restarted and resumed supervision; it does not claim
-that project activation or legacy cleanup has completed. Inspect the bounded machine registry
-view with:
+Restart success means that the old global-agent process stopped and its replacement started; it
+does not wait for every Project to become ready or claim that activation or legacy cleanup has
+completed. The result may say `Ready: pending`. Observe later convergence first with
+`qexp agent status`, then inspect the bounded machine registry view with:
 
 ```bash
 qexp admin upgrade status --format json
@@ -180,6 +181,10 @@ stops new claims intentionally rather than scheduling potentially wrong work.
    qexp agent restart
    ```
 
+   Restart does not wait for Project readiness. If it reports `Ready: pending`, run
+   `qexp agent status` until the required Project evidence is ready or an actionable blocker is
+   reported.
+
 `admin repair` regenerates the ready markers, catalog, and reservations. It does not discard
 Task or Attempt truth. If repair reports `blocked`, resolve the listed operation or execution
 evidence first; do not force-delete it.
@@ -275,8 +280,8 @@ qqtools 1.3.15.
 
 | Situation | Correct action |
 | --- | --- |
-| Same qexp protocol, healthy ready index | Upgrade every participating machine, then restart agents one at a time. |
-| `ready_index=degraded` or `marker corrupt` | Stop normal clients, run `admin check`, then `admin repair`; restart only after the index is active. |
+| Same qexp protocol, healthy ready index | Upgrade every participating machine, restart agents one at a time, then confirm readiness with `agent status`. |
+| `ready_index=degraded` or `marker corrupt` | Stop normal clients, run `admin check`, then `admin repair`; restart only after the index is active, and observe post-restart readiness with `agent status`. |
 | Existing schema-6 root moving to 1.3.15 | Drain all participants and run `admin migrate schema6 check/start/attest/resume`. |
 | Existing schema-5 root | Drain it and run `qexp admin migrate schema --project PATH --to-schema 6` before the schema-6 capability upgrade. |
 

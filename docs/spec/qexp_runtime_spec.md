@@ -2495,7 +2495,9 @@ qexp agent run
 
 `agent start` ensures a detached agent, waits for current-generation readiness, and does not
 restart a healthy process. `agent run` keeps
-the agent in the current terminal for debugging. Both modes auto-start after local submission;
+the agent in the current terminal for debugging. It has no structured output format or finite
+startup record. Restart readiness is observed separately: process replacement may return while
+Project readiness remains pending, and `agent status` reports later convergence. Both modes auto-start after local submission;
 they differ only in whether true idleness ends the agent process.
 
 ### 17.3 Agent Startup Reconciliation

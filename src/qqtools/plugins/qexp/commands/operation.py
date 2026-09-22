@@ -6,6 +6,7 @@ import base64
 import binascii
 import json
 import re
+import shlex
 from typing import Any
 
 from ..config_types import RootConfig
@@ -242,7 +243,22 @@ def _result_base(payload: dict[str, object], reference: str) -> dict[str, object
         "pending_machines": [],
         "outcome": None,
         "error": None,
+        "lifecycle_outcome": None,
+        "created_at": None,
+        "updated_at": None,
+        "completed_at": None,
+        "next_action": None,
     }
+
+
+def _lifecycle_outcome(state: object) -> str:
+    if state == "completed":
+        return "completed"
+    if state == "blocked":
+        return "blocked"
+    if state in {"preparing", "converging", "waiting_ack"}:
+        return "waiting_ack"
+    return "pending"
 
 
 def inspect_operation(cfg: RootConfig, reference: str) -> tuple[dict[str, object], int]:
@@ -254,13 +270,18 @@ def inspect_operation(cfg: RootConfig, reference: str) -> tuple[dict[str, object
         record = _read_operation_record(cfg, storage_kind, payload["key"])
     except FileNotFoundError:
         result.update(
-            {"outcome": "not_found", "error": {"code": "not_found", "message": "operation record was not found."}}
+            {
+                "outcome": "not_found",
+                "lifecycle_outcome": "not_found",
+                "error": {"code": "not_found", "message": "operation record was not found."},
+            }
         )
         return result, 1
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         result.update(
             {
                 "outcome": "unreadable",
+                "lifecycle_outcome": "unreadable",
                 "error": {"code": "unreadable", "message": f"operation record is unreadable: {exc}"},
             }
         )
@@ -273,14 +294,33 @@ def inspect_operation(cfg: RootConfig, reference: str) -> tuple[dict[str, object
             operation_id=payload["operation_id"],
         )
     except LookupError as exc:
-        result.update({"outcome": "mismatched", "error": {"code": "mismatched", "message": str(exc)}})
+        result.update(
+            {
+                "outcome": "mismatched",
+                "lifecycle_outcome": "mismatched",
+                "error": {"code": "mismatched", "message": str(exc)},
+            }
+        )
         return result, 1
     except (TypeError, ValueError) as exc:
-        result.update({"outcome": "unreadable", "error": {"code": "unreadable", "message": str(exc)}})
+        result.update(
+            {
+                "outcome": "unreadable",
+                "lifecycle_outcome": "unreadable",
+                "error": {"code": "unreadable", "message": str(exc)},
+            }
+        )
         return result, 1
     blockers = inner.get("blockers")
     if not isinstance(blockers, list):
         blockers = []
+    lifecycle_outcome = _lifecycle_outcome(inner["state"])
+    meta = record["meta"]
+    next_action = None
+    if lifecycle_outcome in {"waiting_ack", "blocked", "pending"}:
+        next_action = (
+            "qexp admin operation show " + shlex.quote(reference) + " --project " + shlex.quote(str(cfg.project_root))
+        )
     result.update(
         {
             "target": target,
@@ -289,6 +329,11 @@ def inspect_operation(cfg: RootConfig, reference: str) -> tuple[dict[str, object
             "blockers": blockers,
             "pending_machines": _pending_machines(inner, payload["kind"]),
             "outcome": "ok",
+            "lifecycle_outcome": lifecycle_outcome,
+            "created_at": meta.get("created_at"),
+            "updated_at": meta.get("updated_at"),
+            "completed_at": inner.get("completed_at"),
+            "next_action": next_action,
         }
     )
     return result, 0

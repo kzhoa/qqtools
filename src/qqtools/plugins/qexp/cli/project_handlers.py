@@ -7,7 +7,6 @@ import re
 import shlex
 import sys
 from pathlib import Path
-from typing import Callable
 
 from .. import observer
 from ..activation import ensure_local_agent_active
@@ -23,9 +22,11 @@ from ..commands import wait as wait_commands
 from ..commands import watch as watch_commands
 from ..config_types import RootConfig
 from ..doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
-from ..formatter import CliOutput, OutputKind
 from ..progress_policy import validate_interval_seconds
 from ..runtime.observation.api import ObservationError
+from .errors import CliUsageError
+from .outcome import CommandOutcome
+from .output import CliOutput, OutputKind
 
 
 def _parse_page_size(value: str | None) -> int:
@@ -38,13 +39,12 @@ def _parse_page_size(value: str | None) -> int:
         raise ObservationError("invalid_argument", "page_size must be an integer from 1 through 1000.", 2) from exc
 
 
-def _emit_task_page(
+def _task_page_output(
     cfg: RootConfig,
     args: argparse.Namespace,
     page: dict[str, object],
     page_size: int,
-    emitter: Callable[..., None],
-) -> None:
+) -> CliOutput[object]:
     """Render paginated task results and a shell-safe continuation command."""
     presentation: dict[str, object] = {}
     next_cursor = page.get("next_cursor")
@@ -64,13 +64,13 @@ def _emit_task_page(
             command.extend(("--name", args.name))
         command.extend(("--page-size", str(page_size), "--cursor", str(next_cursor)))
         presentation["continuation_command"] = shlex.join(command)
-    emitter(CliOutput(OutputKind.TASK_PAGE, page, presentation), args.format)
+    return CliOutput(OutputKind.TASK_PAGE, page, presentation)
 
 
 def _duration_seconds(value: str) -> int:
     matched = re.fullmatch(r"([0-9]+)([smh])", value)
     if not matched:
-        raise ValueError("duration must use an explicit s, m, or h unit, for example 10m.")
+        raise CliUsageError("duration must use an explicit s, m, or h unit, for example 10m.")
     amount = int(matched.group(1))
     return amount * {"s": 1, "m": 60, "h": 3600}[matched.group(2)]
 
@@ -134,8 +134,6 @@ def _validate_continuous_options(args: argparse.Namespace) -> None:
             if follow_retries:
                 raise ValueError("--follow-retries requires --watch.")
             return
-        if getattr(args, "format", "human") == "json":
-            raise ValueError("--watch cannot be combined with --format json.")
         args.interval_seconds = 2 if interval is None else _parse_continuous_interval_argument(interval)
         isatty = getattr(sys.stdout, "isatty", None)
         if not callable(isatty) or not isatty():
@@ -173,7 +171,7 @@ def _split_machine_list(values: list[str] | None) -> list[str] | None:
         return None
     machines = [machine.strip() for value in values for machine in value.split(",")]
     if not all(machines):
-        raise ValueError("--with machine names must be comma-separated non-empty values.")
+        raise CliUsageError("--with machine names must be comma-separated non-empty values.")
     return machines
 
 
@@ -182,9 +180,7 @@ def dispatch_project(
     cfg: RootConfig,
     execution_context: ExecutionContext,
     selection_source: str,
-    *,
-    emitter: Callable[..., None],
-) -> int:
+) -> CommandOutcome:
     """Dispatch a handler after the entry point resolved Project authority."""
     handler = args.command_spec.handler
 
@@ -200,7 +196,7 @@ def dispatch_project(
             result = configuration_commands.show_config(section, cfg=cfg, runtime=execution_context.machine_runtime)
         elif handler == "config_set":
             if args.enabled and args.disabled:
-                raise ValueError("--enabled and --disabled are mutually exclusive")
+                raise CliUsageError("--enabled and --disabled are mutually exclusive")
             values = {
                 key: value
                 for key, value in {
@@ -226,53 +222,52 @@ def dispatch_project(
             }
             if args.webhook_stdin:
                 if args.credential_source != "shared_file":
-                    raise ValueError("--webhook-stdin requires --credential-source shared_file")
+                    raise CliUsageError("--webhook-stdin requires --credential-source shared_file")
                 values["shared_webhook"] = sys.stdin.readline().rstrip("\r\n")
                 if not values["shared_webhook"]:
-                    raise ValueError("--webhook-stdin requires a non-empty first input line")
-            result = configuration_commands.set_config(
-                section,
-                cfg=cfg,
-                runtime=execution_context.machine_runtime,
-                provider=args.provider,
-                values=values,
-            )
+                    raise CliUsageError("--webhook-stdin requires a non-empty first input line")
+            try:
+                result = configuration_commands.set_config(
+                    section,
+                    cfg=cfg,
+                    runtime=execution_context.machine_runtime,
+                    provider=args.provider,
+                    values=values,
+                )
+            except ValueError as exc:
+                raise CliUsageError(str(exc)) from exc
         else:
-            result = configuration_commands.reset_config(
-                section,
-                cfg=cfg,
-                runtime=execution_context.machine_runtime,
-                provider=args.provider,
-            )
-        emitter(CliOutput(OutputKind.CONFIG, result), args.format)
+            try:
+                result = configuration_commands.reset_config(
+                    section,
+                    cfg=cfg,
+                    runtime=execution_context.machine_runtime,
+                    provider=args.provider,
+                )
+            except ValueError as exc:
+                raise CliUsageError(str(exc)) from exc
         if handler == "config_show" and section is None and result.get("complete") is False:
-            return 1
-        return 0
+            return CommandOutcome(1, CliOutput(OutputKind.CONFIG, result))
+        return CommandOutcome(0, CliOutput(OutputKind.CONFIG, result))
 
     if handler.startswith("task_"):
         if handler.startswith("task_dependencies_"):
             dependency_action = handler.removeprefix("task_dependencies_")
             if handler == "task_dependencies_show":
                 task_value = task_commands.load_task(cfg, args.task_id)
-                emitter(
-                    CliOutput(
-                        OutputKind.DEPENDENCIES,
-                        {"task_id": task_value.task_id, "depends_on_task_ids": task_value.depends_on_task_ids},
-                    ),
-                    args.format,
+                output = CliOutput(
+                    OutputKind.DEPENDENCIES,
+                    {"task_id": task_value.task_id, "depends_on_task_ids": task_value.depends_on_task_ids},
                 )
             else:
                 task_value = task_commands.edit_dependencies(
                     cfg, args.task_id, args.depends_on, action=dependency_action
                 )
-                emitter(
-                    CliOutput(
-                        OutputKind.DEPENDENCIES,
-                        {"task_id": task_value.task_id, "depends_on_task_ids": task_value.depends_on_task_ids},
-                    ),
-                    args.format,
+                output = CliOutput(
+                    OutputKind.DEPENDENCIES,
+                    {"task_id": task_value.task_id, "depends_on_task_ids": task_value.depends_on_task_ids},
                 )
-            return 0
+            return CommandOutcome(0, output)
         if handler == "task_cancel":
             context = get_execution_context()
             task_value = task_commands.cancel(cfg, args.task_id, reservation_runtime_root=context.reservation_root)
@@ -282,45 +277,55 @@ def dispatch_project(
                 and task_value.control.get("terminate_running")
                 and not task_value.control.get("termination_acknowledged_at")
             )
-            emitter(
-                CliOutput(
-                    OutputKind.TASK_OPERATION,
-                    {
-                        "task_id": task_value.task_id,
-                        "task_state": task_value.state["projection"],
-                        "owning_machine": claim.get("machine_name") or task_value.placement_policy["home_machine"],
-                        "operation_state": "waiting_ack" if is_pending else "completed",
-                        "pending_acknowledgement": is_pending,
-                        "termination_acknowledged_at": task_value.control.get("termination_acknowledged_at"),
-                        "follow_up_command": f"qexp task show {shlex.quote(task_value.task_id)} --project {shlex.quote(str(cfg.project_root))}",
-                    },
-                ),
-                args.format,
+            is_blocked = task_value.state["projection"] == "blocked"
+            output = CliOutput(
+                OutputKind.TASK_CANCEL,
+                {
+                    "action": "cancel",
+                    "outcome": "waiting_ack" if is_pending else "blocked" if is_blocked else "completed",
+                    "task_id": task_value.task_id,
+                    "task_state": task_value.state["projection"],
+                    "owning_machine": claim.get("machine_name") or task_value.placement_policy["home_machine"],
+                    "operation_state": "waiting_ack" if is_pending else "blocked" if is_blocked else "completed",
+                    "pending_acknowledgement": is_pending,
+                    "termination_acknowledged_at": task_value.control.get("termination_acknowledged_at"),
+                    "reason": task_value.state.get("reason"),
+                    "follow_up_command": f"qexp task show {shlex.quote(task_value.task_id)} --project {shlex.quote(str(cfg.project_root))}",
+                },
             )
+            return CommandOutcome(1 if is_blocked else 0, output)
         elif handler == "task_retry":
             if args.quiet and args.format == "json":
-                raise ValueError("--quiet cannot be combined with --format json.")
+                raise CliUsageError("--quiet cannot be combined with --format json.")
             ensure_local_agent_active(cfg, reason="task-retry", **get_lifecycle_kwargs())
             task_value = task_commands.retry(cfg, args.task_id)
-            if args.quiet or args.format == "human":
+            if args.quiet:
                 print(task_value.task_id)
             else:
-                emitter(
+                return CommandOutcome(
+                    0,
                     CliOutput(
-                        OutputKind.TASK_OPERATION,
+                        OutputKind.TASK_RETRY,
                         {
                             "action": "retry",
+                            "outcome": "accepted",
                             "task_id": task_value.task_id,
                             "task_state": task_value.state["projection"],
                             "operation_state": "accepted",
+                            "follow_up_command": (
+                                f"qexp task show {shlex.quote(task_value.task_id)} "
+                                f"--project {shlex.quote(str(cfg.project_root))}"
+                            ),
                         },
                     ),
-                    args.format,
                 )
+            return CommandOutcome(0)
         elif handler == "task_offer":
             ensure_local_agent_active(cfg, reason="task-offer", **get_lifecycle_kwargs())
             result = task_commands.offer(cfg, args.task_id)
-            emitter(CliOutput(OutputKind.AVAILABILITY, result.to_dict()), args.format)
+            payload = result.to_dict()
+            payload["outcome"] = "no_change" if payload["idempotent"] else "completed"
+            return CommandOutcome(0, CliOutput(OutputKind.AVAILABILITY, payload))
         elif handler == "task_share":
             after_seconds = _duration_seconds(args.after) if args.after is not None else None
             ensure_local_agent_active(cfg, reason="task-share", **get_lifecycle_kwargs())
@@ -330,11 +335,15 @@ def dispatch_project(
                 after_seconds=after_seconds,
                 helper_machines=_split_machine_list(args.helper_machines),
             )
-            emitter(CliOutput(OutputKind.AVAILABILITY, result.to_dict()), args.format)
+            payload = result.to_dict()
+            payload["outcome"] = "no_change" if payload["idempotent"] else "completed"
+            return CommandOutcome(0, CliOutput(OutputKind.AVAILABILITY, payload))
         elif handler == "task_unshare":
             ensure_local_agent_active(cfg, reason="task-unshare", **get_lifecycle_kwargs())
             result = task_commands.keep_local(cfg, args.task_id)
-            emitter(CliOutput(OutputKind.AVAILABILITY, result.to_dict()), args.format)
+            payload = result.to_dict()
+            payload["outcome"] = "no_change" if payload["idempotent"] else "completed"
+            return CommandOutcome(0, CliOutput(OutputKind.AVAILABILITY, payload))
         elif handler == "task_list":
             # Exact-name lookup is index-backed even when callers do not opt into
             # explicit pagination.  This keeps the daily lookup path bounded and
@@ -356,10 +365,11 @@ def dispatch_project(
                     page_size=page_size,
                     cursor=args.cursor,
                 )
-                _emit_task_page(cfg, args, page, page_size, emitter)
+                return CommandOutcome(0, _task_page_output(cfg, args, page, page_size))
             else:
                 limit = 50 if args.limit is None else args.limit
-                emitter(
+                return CommandOutcome(
+                    0,
                     CliOutput(
                         OutputKind.TASK_LIST,
                         [
@@ -368,50 +378,52 @@ def dispatch_project(
                             if args.name is None or item.get("name") == args.name
                         ],
                     ),
-                    args.format,
                 )
         elif handler == "task_show":
             if args.watch:
                 try:
-                    return watch_commands.watch_task(
-                        cfg,
-                        args.task_id,
-                        interval_seconds=args.interval_seconds,
-                        follow_retries=args.follow_retries,
+                    return CommandOutcome(
+                        watch_commands.watch_task(
+                            cfg,
+                            args.task_id,
+                            interval_seconds=args.interval_seconds,
+                            follow_retries=args.follow_retries,
+                        )
                     )
                 except KeyboardInterrupt:
                     _restore_watch_terminal()
-                    return 130
+                    return CommandOutcome(130)
                 except BrokenPipeError:
-                    return 0
-            emitter(CliOutput(OutputKind.TASK_SHOW, observer.inspect_task(cfg, args.task_id)), args.format)
+                    return CommandOutcome(0)
+            return CommandOutcome(0, CliOutput(OutputKind.TASK_SHOW, observer.inspect_task(cfg, args.task_id)))
         elif handler == "task_logs":
             if args.follow:
                 try:
-                    return log_commands.follow_logs(
-                        cfg,
-                        args.task_id,
-                        tail_lines=args.tail,
-                        interval_seconds=args.interval_seconds,
-                        follow_retries=args.follow_retries,
+                    return CommandOutcome(
+                        log_commands.follow_logs(
+                            cfg,
+                            args.task_id,
+                            tail_lines=args.tail,
+                            interval_seconds=args.interval_seconds,
+                            follow_retries=args.follow_retries,
+                        )
                     )
                 except KeyboardInterrupt:
-                    return 130
+                    return CommandOutcome(130)
                 except BrokenPipeError:
-                    return 0
-            print(log_commands.read_logs(cfg, args.task_id, tail_lines=args.tail), end="")
+                    return CommandOutcome(0)
+            log_commands.write_logs(cfg, args.task_id, tail_lines=args.tail)
+            return CommandOutcome(0)
         elif handler == "task_wait":
             timeout = wait_commands.parse_wait_timeout(args.timeout)
             result, wait_exit = wait_commands.wait_for_task(cfg, args.task_id, timeout_seconds=timeout)
-            emitter(CliOutput(OutputKind.TASK_WAIT, result), args.format)
-            return wait_exit
-        return 0
+            return CommandOutcome(wait_exit, CliOutput(OutputKind.TASK_WAIT, result))
+        return CommandOutcome(0)
     if handler.startswith("group_"):
-        presentation = None
         if handler == "group_create":
             result = group_commands.create_group(cfg, args.name, args.workers)
-            kind = OutputKind.GROUP_OPERATION
-            presentation = {"action": "create"}
+            kind = OutputKind.GROUP_STATE_CHANGE
+            result = {"action": "create", "outcome": "completed", **result}
         elif handler == "group_list":
             result = observer.list_groups(cfg)
             kind = OutputKind.GROUP_LIST
@@ -421,8 +433,13 @@ def dispatch_project(
         elif handler == "group_retry":
             ensure_local_agent_active(cfg, reason="group-retry", **get_lifecycle_kwargs())
             result = group_commands.group_retry_failed(cfg, args.name)
-            kind = OutputKind.GROUP_OPERATION
-            presentation = {"action": "retry", "name": args.name, "status": "completed"}
+            kind = OutputKind.GROUP_RETRY
+            result = {
+                "action": "retry",
+                "outcome": "completed" if result["retried_count"] else "no_change",
+                **result,
+                "follow_up_command": f"qexp group show {shlex.quote(args.name)} --project {shlex.quote(str(cfg.project_root))}",
+            }
         elif handler.startswith("group_worker_"):
             worker_action = handler.removeprefix("group_worker_")
             if handler == "group_worker_list":
@@ -431,8 +448,7 @@ def dispatch_project(
                     args.group_name,
                     reservation_runtime_root=execution_context.reservation_root,
                 )
-                emitter(CliOutput(OutputKind.GROUP_MACHINES, result), args.format)
-                return 0
+                return CommandOutcome(0, CliOutput(OutputKind.GROUP_MACHINES, result))
             gpu_limit_gpus = getattr(args, "gpu_limit_gpus", None)
             result = group_commands.change_worker(
                 cfg,
@@ -444,12 +460,32 @@ def dispatch_project(
                 gpu_limit_gpus=None if gpu_limit_gpus in {None, "unlimited"} else gpu_limit_gpus,
                 has_gpu_limit=gpu_limit_gpus is not None,
             )
-            kind = OutputKind.GROUP_OPERATION
-            presentation = {
+            kind = OutputKind.GROUP_WORKER_CHANGE
+            result = {
                 "action": worker_action,
+                "outcome": "completed",
                 "worker_machine": args.worker_machine,
+                **result,
             }
             worker_control = result.get("worker_control") if isinstance(result, dict) else None
+            group_record = result.get("group") if isinstance(result.get("group"), dict) else {}
+            worker_set = group_record.get("worker_set") if isinstance(group_record.get("worker_set"), dict) else {}
+            worker = worker_set.get(args.worker_machine)
+            worker_is_present = isinstance(worker, dict)
+            if not isinstance(worker, dict) and isinstance(worker_control, dict):
+                worker = worker_control.get("worker_before")
+            if isinstance(worker, dict):
+                result.update(
+                    {
+                        "worker_state": (
+                            "removed"
+                            if not worker_is_present and worker_control.get("state") == "completed"
+                            else worker.get("state")
+                        ),
+                        "scheduling_role": worker.get("scheduling_role"),
+                        "gpu_limit_gpus": worker.get("gpu_limit_gpus"),
+                    }
+                )
             if (
                 handler == "group_worker_remove"
                 and isinstance(worker_control, dict)
@@ -457,13 +493,14 @@ def dispatch_project(
                 and worker_control.get("state") in {"preparing", "converging", "waiting_ack", "blocked"}
             ):
                 ensure_local_agent_active(cfg, reason="group-worker-remove", **get_lifecycle_kwargs())
-                presentation.update(
-                    {
-                        "status": worker_control.get("state"),
-                        "reason": worker_control.get("blocked_reason"),
-                    }
-                )
+                result["outcome"] = "blocked" if worker_control.get("state") == "blocked" else "waiting_ack"
+                result["status"] = worker_control.get("state")
+                result["reason"] = worker_control.get("blocked_reason")
             worker_control = result.get("worker_control") if isinstance(result, dict) else None
+            if isinstance(worker_control, dict):
+                result["blockers"] = list(worker_control.get("blockers") or [])
+                pending = worker_control.get("pending_machine_acknowledgements")
+                result["pending_machines"] = list(pending) if isinstance(pending, dict) else []
             worker_operation_id = worker_control.get("operation_id") if isinstance(worker_control, dict) else None
             if handler == "group_worker_remove" and worker_operation_id:
                 reference = operation_commands.create_operation_reference(
@@ -493,13 +530,18 @@ def dispatch_project(
                     and control.get("state") in {"preparing", "converging", "waiting_ack", "blocked"}
                 ):
                     ensure_local_agent_active(cfg, reason="group-cancel", **get_lifecycle_kwargs())
-            kind = OutputKind.GROUP_OPERATION
-            presentation = {"action": group_action}
+            kind = OutputKind.GROUP_CANCEL if handler == "group_cancel" else OutputKind.GROUP_STATE_CHANGE
+            result = {"action": group_action, "outcome": "completed", **result}
             if handler == "group_cancel":
                 control = result.get("cancellation_operation", {})
                 pending_machines = control.get("pending_machine_acknowledgements", {})
-                presentation.update(
+                result.update(
                     {
+                        "outcome": "blocked"
+                        if control.get("state") == "blocked"
+                        else "waiting_ack"
+                        if control.get("state") in {"preparing", "converging", "waiting_ack"}
+                        else "completed",
                         "status": control.get("state"),
                         "pending_machines": list(pending_machines.keys()) if isinstance(pending_machines, dict) else [],
                         "reason": control.get("blocked_reason"),
@@ -514,27 +556,21 @@ def dispatch_project(
                     result["follow_up_command"] = (
                         f"qexp admin operation show {reference} --project {shlex.quote(str(cfg.project_root))}"
                     )
-        emitter(
-            CliOutput(kind, result, presentation or {}),
-            args.format,
-        )
-        return 0
+        return CommandOutcome(0, CliOutput(kind, result))
     if handler == "status":
         result = status_commands.project_status(
             cfg,
             selection_source=selection_source,
             machine_runtime=execution_context.machine_runtime,
         )
-        emitter(CliOutput(OutputKind.STATUS, result), args.format)
-        return 0
+        return CommandOutcome(0, CliOutput(OutputKind.STATUS, result))
     if handler in {"machine_list", "machine_show"}:
         if handler == "machine_list":
             result = observer.list_machines(cfg)
-            emitter(CliOutput(OutputKind.MACHINES, result), args.format)
+            return CommandOutcome(0, CliOutput(OutputKind.MACHINES, result))
         else:
             result = status_commands.machine_detail(cfg, args.name)
-            emitter(CliOutput(OutputKind.MACHINE_SHOW, result), args.format)
-        return 0
+            return CommandOutcome(0, CliOutput(OutputKind.MACHINE_SHOW, result))
     if handler in {"admin_check", "admin_repair"}:
         context = get_execution_context()
         result = (
@@ -552,14 +588,12 @@ def dispatch_project(
             )
         )
         output_kind = OutputKind.DOCTOR_VERIFY if handler == "admin_check" else OutputKind.DOCTOR_REPAIR
-        emitter(CliOutput(output_kind, result), args.format)
-        return resolve_verify_exit_code(result, strict=args.strict)
+        return CommandOutcome(resolve_verify_exit_code(result, strict=args.strict), CliOutput(output_kind, result))
     if handler == "admin_operation_show":
         if args.project is None:
-            raise ValueError("admin operation show requires explicit --project PATH.")
+            raise CliUsageError("admin operation show requires explicit --project PATH.")
         result, operation_exit = operation_commands.inspect_operation(cfg, args.reference)
-        emitter(CliOutput(OutputKind.OPERATION, result), args.format)
-        return operation_exit
+        return CommandOutcome(operation_exit, CliOutput(OutputKind.OPERATION, result))
     if handler == "admin_clean":
         context = get_execution_context()
         result = cleanup.clean(
@@ -586,7 +620,6 @@ def dispatch_project(
                     operation["follow_up_command"] = (
                         f"qexp admin operation show {reference} --project {shlex.quote(str(cfg.project_root))}"
                     )
-        emitter(CliOutput(OutputKind.CLEAN, result), args.format)
-        return 0
+        return CommandOutcome(0, CliOutput(OutputKind.CLEAN, result))
 
-    return 0
+    return CommandOutcome(0)

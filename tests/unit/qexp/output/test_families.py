@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp.formatter import CliOutput, OutputKind, render
+from qqtools.plugins.qexp.cli.output import CliOutput, OutputKind, render
 
 
 def _gpu_policy_view() -> dict[str, object]:
@@ -27,7 +29,7 @@ def _gpu_policy_view() -> dict[str, object]:
 
 def test_submission_result_fixtures_satisfy_json_and_human_contracts() -> None:
     fixtures = json.loads(
-        (Path(__file__).parents[2] / "fixtures" / "qexp" / "submission_results.json").read_text(encoding="utf-8")
+        (Path(__file__).parents[3] / "fixtures" / "qexp" / "submission_results.json").read_text(encoding="utf-8")
     )
 
     for payload in fixtures.values():
@@ -36,29 +38,31 @@ def test_submission_result_fixtures_satisfy_json_and_human_contracts() -> None:
         assert render(output, "human")
 
 
-def test_json_serializes_only_the_canonical_payload() -> None:
-    payload = {"machine_runtime_root": "/machine-runtime", "cpu_lane": {"capacity": 3, "revision": 7}}
-    output = CliOutput(OutputKind.CPU_LANE, payload, {"action": "ignored"})
-
-    assert json.loads(render(output, "json")) == payload
-
-
 def test_cpu_lane_human_output_requires_and_renders_policy_fields() -> None:
     rendered = render(
         CliOutput(
             OutputKind.CPU_LANE,
-            {"machine_runtime_root": "/machine-runtime", "cpu_lane": {"capacity": 3, "revision": 7}},
+            {
+                "action": "shown",
+                "machine_runtime_root": "/machine-runtime",
+                "cpu_lane": {"capacity": 3, "revision": 7},
+            },
         ),
         "human",
     )
 
-    assert rendered.splitlines() == ["MachineRuntime root: /machine-runtime", "Capacity: 3", "Revision: 7"]
+    assert rendered.splitlines() == [
+        "Outcome: shown",
+        "MachineRuntime root: /machine-runtime",
+        "Capacity: 3",
+        "Revision: 7",
+    ]
 
     with pytest.raises((TypeError, ValueError), match="capacity"):
         render(
             CliOutput(
                 OutputKind.CPU_LANE,
-                {"machine_runtime_root": "/machine-runtime", "cpu_lane": {"revision": 7}},
+                {"action": "shown", "machine_runtime_root": "/machine-runtime", "cpu_lane": {"revision": 7}},
             ),
             "human",
         )
@@ -114,13 +118,6 @@ def test_upgrade_registry_and_advance_render_their_distinct_project_shapes() -> 
     assert "waiting" in flat
 
 
-def test_unknown_output_kind_has_no_generic_human_fallback() -> None:
-    output = CliOutput("not-registered", {"value": 1})  # type: ignore[arg-type]
-
-    with pytest.raises((TypeError, ValueError), match="not-registered"):
-        render(output, "human")
-
-
 @pytest.mark.parametrize("output_format", ["human", "json"])
 def test_agent_operation_rejects_an_action_without_its_required_payload(output_format: str) -> None:
     output = CliOutput(OutputKind.AGENT_OPERATION, {"action": "project_added"})
@@ -146,7 +143,7 @@ def test_agent_status_accepts_nested_gpu_policy_view_without_runtime_root() -> N
 
 def test_standalone_gpu_policy_still_requires_runtime_root() -> None:
     with pytest.raises((TypeError, ValueError), match="machine_runtime_root"):
-        render(CliOutput(OutputKind.GPU_POLICY, _gpu_policy_view()), "json")
+        render(CliOutput(OutputKind.GPU_POLICY, {"action": "shown", **_gpu_policy_view()}), "json")
 
-    payload = {"machine_runtime_root": "/machine-runtime", **_gpu_policy_view()}
+    payload = {"action": "shown", "machine_runtime_root": "/machine-runtime", **_gpu_policy_view()}
     assert json.loads(render(CliOutput(OutputKind.GPU_POLICY, payload), "json")) == payload

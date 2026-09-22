@@ -11,6 +11,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.cli.entrypoint import main
+from qqtools.plugins.qexp.cli.errors import CliUsageError
 from qqtools.plugins.qexp.cli.project_handlers import _split_machine_list
 from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
@@ -453,9 +454,13 @@ def test_cli_availability_json_and_human_outputs(tmp_path: Path, monkeypatch, ca
     assert payload["action"] == "share_now"
     assert payload["task_id"] == task.task_id
     assert payload["resulting_state"] == "shared"
+    assert payload["outcome"] == "completed"
 
     assert main([*_base_args(cfg), "task", "unshare", task.task_id]) == 0
-    assert "restricted to its home machine" in capsys.readouterr().out
+    human = capsys.readouterr().out
+    assert "restricted to its home machine" in human
+    assert human.count("Queue scope: home") == 1
+    assert "Status: home" not in human
 
 
 def test_cli_share_accepts_comma_separated_helper_machines(tmp_path: Path, monkeypatch):
@@ -487,7 +492,7 @@ def test_cli_share_accepts_comma_separated_helper_machines(tmp_path: Path, monke
 
 
 def test_cli_share_rejects_empty_comma_separated_helper_machine():
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(CliUsageError, match="non-empty"):
         _split_machine_list(["g2,,g3"])
 
 

@@ -46,6 +46,14 @@ LEGACY_AGENT_EVIDENCE = (
 LEGACY_RUNNER_INBOX = ("registrations", "observations", "launch_intents", "events")
 
 
+class MachineRuntimeUninitializedError(RuntimeError):
+    """A machine-scoped command requires an initialized runtime identity."""
+
+
+class ProjectBindingRequiredError(ValueError):
+    """The selected Project has no local machine binding."""
+
+
 def resolve_machine_runtime_root(value: str | Path | None = None) -> Path:
     """Resolve the machine-local authority root without creating it."""
     configured = value if value is not None else os.environ.get(MACHINE_RUNTIME_ENV)
@@ -183,7 +191,9 @@ class MachineRuntime:
     def require_initialized(self) -> None:
         """Reject operational use of an uninitialized machine runtime."""
         if not self.has_identity:
-            raise RuntimeError("qexp machine runtime is uninitialized; run 'qexp init --machine NAME'.")
+            raise MachineRuntimeUninitializedError(
+                "qexp machine runtime is uninitialized; run 'qexp init --machine NAME'."
+            )
         from .config import load_agent_config
 
         load_agent_config(self, require_initialized=True)
@@ -884,7 +894,9 @@ class MachineRuntime:
                         ]
                     )
                     raise ValueError(f"legacy project metadata detected; run '{command}'.")
-            raise ValueError(f"no local project binding exists for {root}; run 'qexp project register {root}'.")
+            raise ProjectBindingRequiredError(
+                f"no local project binding exists for {root}; run 'qexp project register {root}'."
+            )
         if len(matches) > 1:
             machines = ", ".join(sorted(binding.machine_name for binding in matches))
             raise RuntimeError(f"local project binding is ambiguous for {root}: {machines}.")

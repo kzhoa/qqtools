@@ -44,7 +44,8 @@ def _base_args(cfg) -> list[str]:
 )
 def test_continuous_option_errors_precede_project_resolution(argv: list[str], message: str, capsys) -> None:
     assert cli_entrypoint.main(argv) == 2
-    assert message in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert message in (captured.out if "--format=json" in argv else captured.err)
 
 
 def test_watch_rejects_redirected_stdout_before_project_resolution(capsys) -> None:

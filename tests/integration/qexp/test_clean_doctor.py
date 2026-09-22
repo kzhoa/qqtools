@@ -21,6 +21,7 @@ from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
 from qqtools.plugins.qexp.runtime.records import SCHEMA_VERSION, new_id, utc_now
 from qqtools.plugins.qexp.runtime.resources.reservations import attach, reserve, reserved_gpu_ids
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+from qqtools.plugins.qexp.runtime.submission import SubmissionFinalizationError
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import (
     authorize_launch,
@@ -109,9 +110,15 @@ def test_clean_exact_terminal_task_supports_dry_run_and_audit(tmp_path: Path):
     preview = clean(cfg, task_id=task.task_id, dry_run=True)
     assert preview["candidates"] == [task.task_id]
     assert preview["removed"] == []
+    assert preview["outcome"] == "preview"
+    assert preview["deletion_performed"] is False
     assert task_path(cfg.shared_root, task.task_id).exists()
     result = clean(cfg, task_id=task.task_id)
     assert result["removed"]
+    assert result["outcome"] == "completed"
+    assert result["removed_task_ids"] == [task.task_id]
+    assert result["pending_task_ids"] == []
+    assert result["removed_count"] == 1
     assert not task_path(cfg.shared_root, task.task_id).exists()
     assert not (cfg.shared_root / "attempts" / task.task_id).exists()
     cleanup_operation = read_json(cfg.shared_root / "operations" / "cleanup" / f"{task.task_id}.json")["cleanup"]
@@ -163,7 +170,7 @@ def test_submission_finalizer_failure_preserves_task_and_deadline_index(tmp_path
 
     monkeypatch.setattr(submission_runtime, "atomic_replace", fail_after_task_and_index_are_staged)
 
-    with pytest.raises(OSError, match="injected final group commit failure"):
+    with pytest.raises(SubmissionFinalizationError, match="injected final group commit failure"):
         submit(cfg, ["echo", "ok"], task_id=task_id, group="exp", sharing_mode="spillover", offer_after_seconds=3600)
 
     assert task_path(cfg.shared_root, task_id).exists()
@@ -185,7 +192,7 @@ def test_doctor_finalizes_committed_submission_group(tmp_path: Path, monkeypatch
         original_atomic_replace(path, value)
 
     monkeypatch.setattr(submission_runtime, "atomic_replace", fail_group_finalizer)
-    with pytest.raises(OSError, match="simulated Group finalizer failure"):
+    with pytest.raises(SubmissionFinalizationError, match="simulated Group finalizer failure"):
         batch_submit(cfg, manifest, group="exp", idempotency_key="repair-finalizer")
 
     monkeypatch.setattr(submission_runtime, "atomic_replace", original_atomic_replace)

@@ -15,6 +15,10 @@ from ..config_types import RootConfig
 from ..layout import load_context, load_root_config
 
 
+class ProjectSelectionError(ValueError):
+    """An explicit or discovered Project selector is missing or invalid."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectSelection:
     """The canonical project control root and the selector that chose it."""
@@ -33,13 +37,13 @@ def normalize_project_path(value: str | os.PathLike[str]) -> Path:
 
 def _validate_project_path(path: Path) -> Path:
     if not path.exists():
-        raise ValueError(f"selected Project does not exist: {path}")
+        raise ProjectSelectionError(f"selected Project does not exist: {path}")
     if not path.is_dir():
-        raise ValueError(f"selected Project is not a directory: {path}")
+        raise ProjectSelectionError(f"selected Project is not a directory: {path}")
     try:
         load_root_config(path, "unbound", require_initialized=True)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        raise ValueError(f"selected Project is invalid: {path}: {exc}") from exc
+        raise ProjectSelectionError(f"selected Project is invalid: {path}: {exc}") from exc
     return path
 
 
@@ -69,10 +73,10 @@ def resolve_project(explicit: str | os.PathLike[str] | None = None) -> ProjectSe
     if saved is not None:
         value = saved.get("shared_root")
         if not isinstance(value, str) or not value:
-            raise ValueError("saved qexp Project context is malformed")
+            raise ProjectSelectionError("saved qexp Project context is malformed")
         return ProjectSelection(_validate_project_path(normalize_project_path(value)), "saved")
 
-    raise ValueError("Project is required; pass --project PATH or run 'qexp use --project PATH'.")
+    raise ProjectSelectionError("Project is required; pass --project PATH or run 'qexp use --project PATH'.")
 
 
 def config_for_selection(
@@ -91,4 +95,10 @@ def config_for_selection(
     )
 
 
-__all__ = ["ProjectSelection", "config_for_selection", "normalize_project_path", "resolve_project"]
+__all__ = [
+    "ProjectSelection",
+    "ProjectSelectionError",
+    "config_for_selection",
+    "normalize_project_path",
+    "resolve_project",
+]

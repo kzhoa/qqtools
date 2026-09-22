@@ -147,7 +147,7 @@ def test_interactive_reset_rejects_identity_changed_during_prompt(
     monkeypatch.setattr(sys, "stdin", InteractiveInput())
     monkeypatch.setattr("builtins.input", replace_before_consent)
 
-    assert main(_invoke(runtime_root, "init", "--machine", "requested")) == 2
+    assert main(_invoke(runtime_root, "init", "--machine", "requested")) == 1
     captured = capsys.readouterr()
     assert first_id in captured.err
     assert "identity changed after confirmation" in captured.err

@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-21
+updated_at: 2026-09-22
 archived_at:
 ---
 
@@ -1383,7 +1383,9 @@ qexp machine list
 
 `status` is a bounded Project overview. It reports the resolved Project path, stable identity and
 selection source; exact local participation; machine-wide local-agent evidence; Task observation
-index state; and explicit next actions. It does not enumerate Task, Attempt, Group, machine, or
+index state; configured machine-global agent mode; separately observed mode when it differs; and
+explicit next actions. Missing or malformed machine configuration yields a null configured mode
+and a bounded warning, including while the agent is stopped. It does not enumerate Task, Attempt, Group, machine, or
 operation history. After Project resolution it attempts at most 32 record reads, rejects records
 larger than 256 KiB, and reads at most 2 MiB in total. Missing optional evidence produces a useful
 partial result with null totals and reasons, never invented zero totals or an inferred stopped
@@ -1415,15 +1417,17 @@ exists; Attempt references remain the source of live window evidence.
 Finite structured commands collect one canonical result before selecting JSON or human
 presentation. JSON serializes that result without presentation wrappers. Human rendering may
 derive labels and summaries only from the same result; it does not perform additional Task-history
-queries. Group and machine output retains its summary labels but displays `-` when the canonical,
-bounded observation result does not contain that summary.
+queries. Optional empty rows are omitted unless absence is itself decision-relevant. Output uses
+distinct operator vocabulary for `No results`, `No matches in this page`, `Unavailable`, `Partial`,
+`Accepted`/`Waiting`, `Blocked`, `No change`/`Already`, and `Completed`.
 
 `task show --watch` refreshes a compact human Task view on terminal stdout. It follows the
 stable Task ID, shows authoritative Task phase and reason, and includes only a consistently
-selected current or terminal Attempt and its advisory progress. `task logs --follow` emits
-application log text to stdout as it becomes readable and sends qexp boundaries and diagnostics
-to stderr; redirected stdout is supported. Both commands poll shared storage and therefore cannot
-force application buffers to flush or promise a visibility deadline.
+selected current or terminal Attempt and its advisory progress. It rejects `--format` because no
+structured event-stream contract exists. `task logs` and `task logs --follow` reject `--format`;
+they emit application log bytes to stdout as they become readable and send qexp boundaries and
+diagnostics to stderr; redirected stdout is supported. Both commands poll shared storage and
+therefore cannot force application buffers to flush or promise a visibility deadline.
 
 Continuous observation is read-only. Closing or interrupting a viewer does not signal a runner,
 cancel work, start an agent, or change shared authority. By default a viewer observes the current
@@ -1439,7 +1443,7 @@ references, and non-file targets stop the viewer with an observation error. Othe
 filesystem errors are coalesced while the Task is nonterminal and produce one recovery notice
 after reading resumes. Once Task truth is terminal, a missing or temporarily unreadable log gets
 one scheduled retry and then fails nonzero instead of waiting indefinitely. These diagnostics and
-Attempt/file boundaries use stderr; stdout remains only application log text.
+Attempt/file boundaries use stderr; stdout remains only application log bytes.
 
 Group output should show:
 
@@ -1552,7 +1556,8 @@ qexp agent start
 ```
 
 `agent start` ensures one detached process and waits for captured enabled Projects to be ready.
-Use `qexp agent run` for foreground debugging. Neither machine initialization nor Project
+Use `qexp agent run` for foreground debugging. It has no `--format` option or finite startup
+record, and interrupting it does not signal already launched runners. Neither machine initialization nor Project
 registration starts a long-lived process.
 
 ### 15.4 Local Process Ownership
@@ -1607,6 +1612,11 @@ the binding's current operator-controlled enabled or disabled state.
 machine authority and therefore affect every registered Project. Activation-triggering commands
 require their Project to be registered; `submit --no-activate` may still persist work without
 starting the agent.
+
+`restart` waits for the old process to stop and its replacement to start, but does not add a
+readiness wait. It reports available evidence and otherwise says `Ready: pending`; a later
+`agent status` observes convergence. Lifecycle status reports configured `daemon|on_demand`
+policy separately from a differing observed process mode.
 
 Machine runtime loss is not project loss. A replacement machine agent starts from explicitly
 registered bindings and does not infer, supervise, or declare the terminal state of processes
@@ -1706,6 +1716,10 @@ they never rewrite policies frozen into existing Attempts.
 - `qexp task unshare`
 - `qexp task offer`
 
+`task show --watch` is a terminal-only continuous view and rejects `--format`. `task logs` and
+`task logs --follow` are raw application-byte streams: stdout is reserved for application bytes,
+while qexp diagnostics and stream boundaries use stderr. They do not provide JSON wrapping.
+
 `qexp task list --format=json` returns stable Task summary records. In addition to identity,
 placement, phase, claim, and GPU fields, each record includes `depends_on_task_ids`,
 `dependency_state`, and `dependency_reasons`. The IDs are sorted; a Task with no prerequisites
@@ -1756,6 +1770,11 @@ retry. It performs direct bounded Task, selected-Attempt, and dependency reads. 
 - `qexp admin upgrade pause | plan | apply | validate | resume --project PATH`
 - `qexp admin migrate schema --project PATH --to-schema 6`
 - `qexp admin migrate schema6 {check|start|status|attest|resume} --project PATH`
+
+`agent run` is a foreground debugging stream with no `--format` or finite startup record.
+`agent restart` reports process replacement and current readiness evidence without waiting for
+Project convergence; use `agent status` for the subsequent configured-mode, observed-mode, and
+readiness view.
 
 The 1.3.22 CLI consolidation is an approved direct cutover. Retired `top`, `machines`, `doctor`,
 `clean`, `lease-policy`, `task keep-local`, `group retry-failed`, `group machines`, flat agent
@@ -1818,6 +1837,9 @@ owned by the submission cutover. The target CLI also does not promise aliases fo
   by default, and cross retries only when `--follow-retries` is explicit.
 - [ ] Attempt and Submission Operation remain diagnostic internals without daily CLI
   resource trees.
+- [ ] Every CLI leaf is classified as finite, raw, continuous, or compatibility diagnostic;
+      raw and continuous leaves reject structured format selection before domain work begins.
+- [ ] Finite JSON and human output use the same canonical result and preserve the same exit code.
 - [ ] Idle agents pull shared Tasks through a globally exclusive claim.
 - [ ] Home agents may later claim their own still-shared Tasks.
 - [ ] Agents do not pre-claim more work than they can promptly execute.

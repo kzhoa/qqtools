@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from .context import MachineRuntime
-from .lifecycle import run_machine_agent_loop
+from .lifecycle import MachineAgentStartError, run_machine_agent_loop
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,14 +55,19 @@ def spawn_machine_agent_process(
     environment["PYTHONPATH"] = (
         source_root if not existing_pythonpath else f"{source_root}{os.pathsep}{existing_pythonpath}"
     )
-    process = subprocess.Popen(
-        command,
-        env=environment,
-        stdin=subprocess.DEVNULL if stdin is None else stdin,
-        stdout=subprocess.DEVNULL if stdout is None else stdout,
-        stderr=startup_log if startup_log is not None else stderr,
-        start_new_session=True,
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            env=environment,
+            stdin=subprocess.DEVNULL if stdin is None else stdin,
+            stdout=subprocess.DEVNULL if stdout is None else stdout,
+            stderr=startup_log if startup_log is not None else stderr,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        if startup_log is not None:
+            startup_log.close()
+        raise MachineAgentStartError(f"machine agent process could not be started: {exc}") from exc
     try:
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
@@ -81,7 +86,9 @@ def spawn_machine_agent_process(
                     startup_log.seek(0)
                     lines = startup_log.read().strip().splitlines()
                     details = f": {lines[-1]}" if lines else ""
-                raise RuntimeError(f"machine agent exited during startup with exit code {exit_code}{details}.")
+                raise MachineAgentStartError(
+                    f"machine agent exited during startup with exit code {exit_code}{details}."
+                )
             time.sleep(0.02)
         process.terminate()
         try:
@@ -89,7 +96,7 @@ def spawn_machine_agent_process(
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
-        raise RuntimeError("machine agent did not acquire scheduler authority within 5 seconds.")
+        raise MachineAgentStartError("machine agent did not acquire scheduler authority within 5 seconds.")
     finally:
         if startup_log is not None:
             startup_log.close()

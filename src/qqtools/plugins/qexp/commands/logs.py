@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import io
 import math
 import os
 import stat
@@ -48,8 +49,8 @@ def _validate_read_tail(tail_lines: int | None) -> None:
         raise ValueError("tail_lines must be a non-negative integer or None.")
 
 
-def read_logs(cfg: RootConfig, task_id: str, *, tail_lines: int | None = None) -> str:
-    """Read the selected finite log, optionally limiting it to its last lines."""
+def read_log_bytes(cfg: RootConfig, task_id: str, *, tail_lines: int | None = None) -> bytes:
+    """Read the selected finite log without decoding application bytes."""
     _validate_read_tail(tail_lines)
     path = get_log_path(cfg, task_id)
     if not path.exists():
@@ -60,19 +61,55 @@ def read_logs(cfg: RootConfig, task_id: str, *, tail_lines: int | None = None) -
             f"{attempt.machine_name!r} was not found at {path}"
         )
     if tail_lines is None:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return path.read_bytes()
     if tail_lines == 0:
-        return ""
+        return b""
     with path.open("rb") as handle:
         file_stat = os.fstat(handle.fileno())
         _ensure_regular(path, file_stat.st_mode)
         offset = _tail_offset(handle, file_stat.st_size, tail_lines, 64 * 1024)
         handle.seek(offset)
-        return handle.read().decode("utf-8", errors="replace")
+        return handle.read()
+
+
+def read_logs(cfg: RootConfig, task_id: str, *, tail_lines: int | None = None) -> str:
+    """Read the selected finite log as replacement-decoded text for library callers."""
+    return read_log_bytes(cfg, task_id, tail_lines=tail_lines).decode("utf-8", errors="replace")
+
+
+def _binary_stream(stream: TextIO | BinaryIO) -> TextIO | BinaryIO:
+    """Return a text stream's underlying byte stream when it exposes one."""
+    return getattr(stream, "buffer", stream)
+
+
+def _is_binary_stream(stream: TextIO | BinaryIO) -> bool:
+    return isinstance(stream, (io.BufferedIOBase, io.RawIOBase, io.BytesIO))
+
+
+def _write_bytes(stream: TextIO | BinaryIO, data: bytes) -> None:
+    if not data:
+        return
+    if _is_binary_stream(stream):
+        stream.write(data)  # type: ignore[arg-type]
+    else:
+        stream.write(data.decode("utf-8", errors="replace"))  # type: ignore[arg-type]
+    stream.flush()
+
+
+def write_logs(
+    cfg: RootConfig,
+    task_id: str,
+    *,
+    tail_lines: int | None = None,
+    stdout: TextIO | BinaryIO | None = None,
+) -> None:
+    """Write finite application bytes to stdout, retaining text-stream compatibility in tests."""
+    stream = _binary_stream(sys.stdout) if stdout is None else stdout
+    _write_bytes(stream, read_log_bytes(cfg, task_id, tail_lines=tail_lines))
 
 
 def tail_log(cfg: RootConfig, task_id: str) -> None:
-    print(read_logs(cfg, task_id), end="")
+    write_logs(cfg, task_id)
 
 
 class _SelectionChanged(RuntimeError):
@@ -264,18 +301,29 @@ def _generation_status(attachment: _Attachment) -> str:
     return "eof"
 
 
-def _write_application(stdout: TextIO, text: str) -> None:
-    if not text:
+def _write_application(stdout: TextIO | BinaryIO, data: bytes, decoder: Any) -> None:
+    if not data:
         return
     try:
-        stdout.write(text)
+        if _is_binary_stream(stdout):
+            stdout.write(data)  # type: ignore[arg-type]
+        else:
+            stdout.write(decoder.decode(data, final=False))  # type: ignore[arg-type]
         stdout.flush()
     except BrokenPipeError as exc:
         raise _OutputClosed from exc
 
 
-def _finish_attachment(attachment: _Attachment, stdout: TextIO) -> None:
-    _write_application(stdout, attachment.decoder.decode(b"", final=True))
+def _finish_attachment(attachment: _Attachment, stdout: TextIO | BinaryIO) -> None:
+    if _is_binary_stream(stdout):
+        return
+    text = attachment.decoder.decode(b"", final=True)
+    if text:
+        try:
+            stdout.write(text)  # type: ignore[arg-type]
+            stdout.flush()
+        except BrokenPipeError as exc:
+            raise _OutputClosed from exc
 
 
 def _transition_notice(stderr: TextIO, previous: _LogDescriptor | None, current: _LogDescriptor | None) -> None:
@@ -318,13 +366,15 @@ def follow_logs(
     tail_lines: int = 100,
     interval_seconds: int | float = 2,
     follow_retries: bool = False,
-    stdout: TextIO = sys.stdout,
-    stderr: TextIO = sys.stderr,
+    stdout: TextIO | BinaryIO | None = None,
+    stderr: TextIO | None = None,
     sleep: Callable[[float], None] = time.sleep,
     chunk_size: int = 64 * 1024,
 ) -> int:
     """Follow the selected current Task Attempt log without retaining its contents."""
     _validate_follow_options(tail_lines, interval_seconds, chunk_size)
+    stdout = _binary_stream(sys.stdout) if stdout is None else stdout
+    stderr = sys.stderr if stderr is None else stderr
     attachment: _Attachment | None = None
     observed: object = _UNSET
     pending_payload: Mapping[str, Any] | None = None
@@ -549,7 +599,7 @@ def follow_logs(
 
             report_success()
             try:
-                _write_application(stdout, attachment.decoder.decode(data, final=False))
+                _write_application(stdout, data, attachment.decoder)
             except _OutputClosed:
                 return 0
             latest_terminal = bool(latest_payload.get("terminal"))

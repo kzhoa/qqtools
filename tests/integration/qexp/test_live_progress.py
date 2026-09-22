@@ -10,9 +10,9 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, read_logs, submit
 from qqtools.plugins.qexp.authority import AuthoritySupervisor
+from qqtools.plugins.qexp.cli.output import CliOutput, OutputKind, render
 from qqtools.plugins.qexp.commands.cleanup import clean
 from qqtools.plugins.qexp.commands.task import retry
-from qqtools.plugins.qexp.formatter import CliOutput, OutputKind, render
 from qqtools.plugins.qexp.observer import inspect_task
 from qqtools.plugins.qexp.progress_policy import set_progress_policy
 from qqtools.plugins.qexp.runner import run_attempt
@@ -261,7 +261,7 @@ def test_query_normalizes_optional_payload_fields_and_formatter_keeps_json_canon
     def fail_if_formatted(*_args, **_kwargs):
         raise AssertionError("JSON rendering invoked human progress formatting")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.formatter.format_progress_details", fail_if_formatted)
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.output.task.format_progress_details", fail_if_formatted)
     assert json.loads(render(CliOutput(OutputKind.TASK_SHOW, view), "json")) == view
 
 

@@ -147,6 +147,13 @@ def discover_registered_upgrades(runtime: MachineRuntime, *, force: bool = False
     ):
         pending_ids = set(getattr(runtime, "upgrade_pending_projects", set()))
         deadlines = getattr(runtime, "upgrade_probe_deadlines", {})
+        # Keep the last bounded status for every registered binding.  The fast
+        # path below probes only due pending roots, but callers still need the
+        # last known inaccessible and complete roots to distinguish a partial
+        # discovery from an empty/all-complete result.
+        cached_projects = getattr(runtime, "upgrade_discovery_projects", {})
+        if not isinstance(cached_projects, dict):
+            cached_projects = {}
         due_ids = [
             project_id
             for project_id in sorted(pending_ids)
@@ -163,6 +170,7 @@ def discover_registered_upgrades(runtime: MachineRuntime, *, force: bool = False
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 deadlines[binding.project_id] = _inaccessible_probe_deadline()
                 continue
+            cached_projects[binding.project_id] = status
             if not status.get("pending"):
                 pending_ids.discard(binding.project_id)
                 runtime.upgrade_runnable_projects.discard(binding.project_id)
@@ -179,9 +187,24 @@ def discover_registered_upgrades(runtime: MachineRuntime, *, force: bool = False
                 else:
                     runtime.upgrade_admission_blocked_projects.discard(binding.project_id)
         runtime.upgrade_pending_projects = pending_ids
+        runtime.upgrade_discovery_projects = {
+            binding.project_id: cached_projects[binding.project_id]
+            for binding in bindings
+            if binding.project_id in cached_projects
+        }
+        projects = [
+            runtime.upgrade_discovery_projects[binding.project_id]
+            for binding in bindings
+            if binding.project_id in runtime.upgrade_discovery_projects
+        ]
+        inaccessible_projects = [item for item in projects if item.get("state") == "inaccessible"]
         return {
+            "projects": projects,
+            "inaccessible_projects": inaccessible_projects,
             "pending_project_ids": sorted(pending_ids),
             "runnable_project_ids": sorted(getattr(runtime, "upgrade_runnable_projects", set())),
+            "aggregate_state": "inaccessible" if inaccessible_projects else "pending" if pending_ids else "complete",
+            "all_roots_complete": not inaccessible_projects and not pending_ids,
             "discovery_source": "machine_registry",
         }
     pending_ids: set[str] = set()
@@ -218,11 +241,18 @@ def discover_registered_upgrades(runtime: MachineRuntime, *, force: bool = False
         for status in projects
         if status.get("pending")
     }
+    runtime.upgrade_discovery_projects = {
+        status["project_id"]: status for status in projects if isinstance(status.get("project_id"), str)
+    }
     runtime.upgrade_discovery_complete = True
+    inaccessible_projects = [item for item in projects if item.get("state") == "inaccessible"]
     return {
         "projects": projects,
+        "inaccessible_projects": inaccessible_projects,
         "pending_project_ids": sorted(pending_ids),
         "runnable_project_ids": sorted(runnable_ids),
+        "aggregate_state": "inaccessible" if inaccessible_projects else "pending" if pending_ids else "complete",
+        "all_roots_complete": not inaccessible_projects and not pending_ids,
         "discovery_source": "machine_registry",
     }
 
@@ -238,6 +268,16 @@ def advance_registered_upgrades(
     discovery = discover_registered_upgrades(runtime, force=force_discovery)
     _revision, bindings = runtime.load_registry()
     pending_ids: set[str] = set(discovery.get("pending_project_ids", ()))
+    discovered_projects = list(discovery.get("projects", ()))
+    inaccessible_projects = list(discovery.get("inaccessible_projects", ()))
+    if not inaccessible_projects:
+        inaccessible_projects = [item for item in discovered_projects if item.get("state") == "inaccessible"]
+    discovery_facts = {
+        "inaccessible_projects": inaccessible_projects,
+        "aggregate_state": "inaccessible" if inaccessible_projects else "pending" if pending_ids else "complete",
+        "all_roots_complete": not inaccessible_projects and not pending_ids,
+        "discovery_boundary": "locally_registered_bindings",
+    }
     if not pending_ids:
         runtime.upgrade_pending_projects = set()
         return {
@@ -246,6 +286,7 @@ def advance_registered_upgrades(
             "pending_project_ids": [],
             "worker_state": "idle",
             "discovery_source": "machine_registry",
+            **discovery_facts,
         }
 
     runnable_ids = set(getattr(runtime, "upgrade_runnable_projects", pending_ids))
@@ -320,6 +361,11 @@ def advance_registered_upgrades(
     if cursor is not None:
         _save_upgrade_cursor(runtime, cursor)
     worker_state = "runnable" if any(item.get("state") in {"runnable"} for item in results) else "waiting"
+    current_discovery_facts = {
+        **discovery_facts,
+        "aggregate_state": "inaccessible" if inaccessible_projects else "pending" if pending_ids else "complete",
+        "all_roots_complete": not inaccessible_projects and not pending_ids,
+    }
     return {
         "projects": results,
         "slices": len(results),
@@ -333,6 +379,7 @@ def advance_registered_upgrades(
             "queued_work": max(0, len(ordered) - len(results)),
         },
         "discovery_source": "machine_registry",
+        **current_discovery_facts,
     }
 
 

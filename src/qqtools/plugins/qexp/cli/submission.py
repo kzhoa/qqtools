@@ -4,21 +4,43 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from ..activation import ensure_local_agent_active
+from ..activation import AgentActivationError, ensure_local_agent_active
 from ..agent.context import ExecutionContext
 from ..commands import task as task_commands
-from ..formatter import CliOutput, OutputKind
 from ..layout import load_context
 from ..manifest import UNSET, normalize_command_submission, parse_submission_manifest
 from ..project_resolution import resolve_submission_project
+from ..runtime.group_namespace import GroupNotPublished
 from ..runtime.paths import idempotency_path, submission_path
 from ..runtime.store import read_json
+from ..runtime.submission import (
+    IdempotencyConflict,
+    SubmissionFinalizationError,
+    SubmissionPending,
+    SubmissionRejected,
+    SubmissionUnknown,
+)
 from ..runtime.submission_plan import semantic_digest
 from ..submission_contracts import SubmissionRequest, submission_result_payload
+from .outcome import CommandOutcome
+from .output import CliOutput, OutputKind
+
+
+class SubmissionCommandError(Exception):
+    """A recognized submission workflow failure requiring its fixed result schema."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+class SubmissionInputError(ValueError):
+    """A recognized submission invocation or manifest error."""
 
 
 def _submission_group_file(request: SubmissionRequest) -> Path | None:
@@ -219,7 +241,7 @@ def _command(argv: list[str]) -> list[str]:
     if argv and argv[0] == "--":
         argv = argv[1:]
     if not argv:
-        raise ValueError("submit requires a command after '--'.")
+        raise SubmissionInputError("submit requires a command after '--'.")
     return argv
 
 
@@ -285,9 +307,9 @@ def _submission_mode_from_args(args: argparse.Namespace) -> tuple[str, list[str]
     has_file = getattr(args, "manifest_file", None) is not None
     has_command = bool(argv)
     if has_file and has_command:
-        raise ValueError("submit requires exactly one input mode: --file MANIFEST or -- COMMAND....")
+        raise SubmissionInputError("submit requires exactly one input mode: --file MANIFEST or -- COMMAND....")
     if not has_file and not has_command:
-        raise ValueError("submit requires exactly one input mode: --file MANIFEST or -- COMMAND....")
+        raise SubmissionInputError("submit requires exactly one input mode: --file MANIFEST or -- COMMAND....")
     return ("file", []) if has_file else ("command", argv)
 
 
@@ -305,14 +327,14 @@ def _prepare_submission_request(
 ) -> SubmissionRequest:
     """Validate modes/options and normalize a submission before cfg resolution."""
     if args.command_spec.handler != "submit":
-        raise ValueError("submission request preparation requires submit command.")
+        raise RuntimeError("submission request preparation requires submit command.")
     invocation_cwd = Path(invocation_cwd or Path.cwd()).expanduser().resolve()
     try:
         submission_tail = raw_argv[raw_argv.index("submit") + 1 :]
     except ValueError:
         submission_tail = []
     if getattr(args, "argv", None) and "--" not in submission_tail:
-        raise ValueError("command mode requires the literal '--' separator before COMMAND.")
+        raise SubmissionInputError("command mode requires the literal '--' separator before COMMAND.")
     mode, command = _submission_mode_from_args(args)
     args._submission_mode = mode
     command_only = {
@@ -325,13 +347,13 @@ def _prepare_submission_request(
     if mode == "file":
         for option, message in command_only.items():
             if _submission_option_supplied(raw_argv, option):
-                raise ValueError(message)
+                raise SubmissionInputError(message)
     elif _submission_option_supplied(raw_argv, "--file", "-f"):
-        raise ValueError("--file is only valid in file mode.")
+        raise SubmissionInputError("--file is only valid in file mode.")
     if args.quiet and args.format == "json":
-        raise ValueError("--quiet cannot be combined with --format json.")
+        raise SubmissionInputError("--quiet cannot be combined with --format json.")
     if args.quiet and args.dry_run:
-        raise ValueError("--quiet cannot be combined with --dry-run.")
+        raise SubmissionInputError("--quiet cannot be combined with --dry-run.")
 
     manifest_path = None
     if mode == "file":
@@ -343,31 +365,37 @@ def _prepare_submission_request(
     environment_value = os.environ.get("QEXP_SHARED_ROOT")
     args._submission_resolution_started = True
     saved_context = load_context() if explicit_project is None and environment_value is None else None
-    selection = resolve_submission_project(
-        explicit_project=explicit_project,
-        manifest_path=manifest_path,
-        invocation_cwd=invocation_cwd,
-        environment_value=environment_value,
-        saved_context=saved_context,
-    )
+    try:
+        selection = resolve_submission_project(
+            explicit_project=explicit_project,
+            manifest_path=manifest_path,
+            invocation_cwd=invocation_cwd,
+            environment_value=environment_value,
+            saved_context=saved_context,
+        )
+    except ValueError as exc:
+        raise SubmissionInputError(str(exc)) from exc
     args._submission_project_resolved = True
     if mode == "command":
-        item, field_sources = normalize_command_submission(
-            command,
-            requested_gpus=1 if args.gpus is None else args.gpus,
-            requested_cpus=args.cpus,
-            task_id=args.task_id,
-            name=args.name,
-            group=args.group,
-            working_directory=args.cwd,
-            home_machine="current" if args.home_machine is None else args.home_machine,
-            sharing_mode="private" if args.sharing is None else args.sharing,
-            offer_after_seconds=args.offer_after_seconds,
-            depends_on_task_ids=[] if args.depends_on is None else args.depends_on,
-            tmux_override=args.tmux_override,
-            invocation_cwd=invocation_cwd,
-            project_directory=selection.path,
-        )
+        try:
+            item, field_sources = normalize_command_submission(
+                command,
+                requested_gpus=1 if args.gpus is None else args.gpus,
+                requested_cpus=args.cpus,
+                task_id=args.task_id,
+                name=args.name,
+                group=args.group,
+                working_directory=args.cwd,
+                home_machine="current" if args.home_machine is None else args.home_machine,
+                sharing_mode="private" if args.sharing is None else args.sharing,
+                offer_after_seconds=args.offer_after_seconds,
+                depends_on_task_ids=[] if args.depends_on is None else args.depends_on,
+                tmux_override=args.tmux_override,
+                invocation_cwd=invocation_cwd,
+                project_directory=selection.path,
+            )
+        except ValueError as exc:
+            raise SubmissionInputError(str(exc)) from exc
         group_name = args.group
         group_source = "cli" if group_name is not None else "none"
         workers: dict[str, dict[str, Any]] = {}
@@ -382,17 +410,22 @@ def _prepare_submission_request(
             command_sources["sharing_mode"] = "builtin"
         field_sources = (command_sources,)
     else:
-        result = parse_submission_manifest(
-            manifest_path,
-            group_name=args.group if args.group is not None else UNSET,
-            tmux_override=args.tmux_override if _submission_option_supplied(raw_argv, "--tmux", "--no-tmux") else UNSET,
-            requested_gpus=args.gpus if _submission_option_supplied(raw_argv, "--gpus") else UNSET,
-            requested_cpus=args.cpus if _submission_option_supplied(raw_argv, "--cpus") else UNSET,
-            home_machine=args.home_machine if _submission_option_supplied(raw_argv, "--home-machine") else UNSET,
-            working_directory=args.cwd if _submission_option_supplied(raw_argv, "--cwd") else UNSET,
-            project_directory=selection.path,
-            invocation_cwd=invocation_cwd,
-        )
+        try:
+            result = parse_submission_manifest(
+                manifest_path,
+                group_name=args.group if args.group is not None else UNSET,
+                tmux_override=(
+                    args.tmux_override if _submission_option_supplied(raw_argv, "--tmux", "--no-tmux") else UNSET
+                ),
+                requested_gpus=args.gpus if _submission_option_supplied(raw_argv, "--gpus") else UNSET,
+                requested_cpus=args.cpus if _submission_option_supplied(raw_argv, "--cpus") else UNSET,
+                home_machine=args.home_machine if _submission_option_supplied(raw_argv, "--home-machine") else UNSET,
+                working_directory=args.cwd if _submission_option_supplied(raw_argv, "--cwd") else UNSET,
+                project_directory=selection.path,
+                invocation_cwd=invocation_cwd,
+            )
+        except (OSError, ValueError) as exc:
+            raise SubmissionInputError(str(exc)) from exc
         group_name = result.group_name
         group_source = result.group_source
         workers = result.workers
@@ -430,9 +463,7 @@ def dispatch_submission(
     args: argparse.Namespace,
     cfg: object,
     execution_context: ExecutionContext,
-    *,
-    emitter: Callable[..., None],
-) -> int:
+) -> CommandOutcome:
     """Execute a prepared submission and preserve its output/activation policy."""
 
     def print_prepared(operation_id: str, idempotency_key: str) -> None:
@@ -445,7 +476,17 @@ def dispatch_submission(
         )
 
     request = args._submission_request
-    values = task_commands.submit_request(cfg, request, on_prepared=print_prepared)
+    try:
+        values = task_commands.submit_request(cfg, request, on_prepared=print_prepared)
+    except (
+        GroupNotPublished,
+        IdempotencyConflict,
+        SubmissionFinalizationError,
+        SubmissionPending,
+        SubmissionRejected,
+        SubmissionUnknown,
+    ) as exc:
+        raise SubmissionCommandError(exc) from exc
     # Activation is a post-commit follow-up.  It must never relabel a
     # verified commit or erase the IDs from a quiet/JSON response.
     payload = _submission_result_payload(request, values)
@@ -456,13 +497,24 @@ def dispatch_submission(
                 reason="submit",
                 machine_runtime=execution_context.machine_runtime,
             )
-        except Exception as activation_error:
+        except AgentActivationError as activation_error:
             payload["error"] = {"code": "activation_failed", "message": str(activation_error)}
+            follow_up = activation_error.next_action or shlex.join(
+                [
+                    "qexp",
+                    "--machine-runtime-root",
+                    str(execution_context.machine_runtime.root),
+                    "agent",
+                    "start",
+                ]
+            )
+            payload["activation"] = {"outcome": "failed", "follow_up_command": follow_up}
             if request.quiet:
                 for task_id in payload["task_ids"]:
                     print(task_id)
             else:
-                emitter(
+                return CommandOutcome(
+                    1,
                     CliOutput(
                         OutputKind.SUBMISSION,
                         payload,
@@ -473,9 +525,8 @@ def dispatch_submission(
                             }
                         },
                     ),
-                    args.format,
                 )
-            return 1
+            return CommandOutcome(1)
     if request.quiet:
         if payload["outcome"] == "committed":
             for task_id in payload["task_ids"]:
@@ -487,5 +538,5 @@ def dispatch_submission(
                 "name": request.normalized_specs[0].get("name"),
             }
         }
-        emitter(CliOutput(OutputKind.SUBMISSION, payload, presentation), args.format)
-    return 0
+        return CommandOutcome(0, CliOutput(OutputKind.SUBMISSION, payload, presentation))
+    return CommandOutcome(0)

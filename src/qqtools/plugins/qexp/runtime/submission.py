@@ -104,6 +104,19 @@ class SubmissionUnknown(RuntimeError):
         self.idempotency_key = idempotency_key
 
 
+class SubmissionRejected(ValueError):
+    """Submission input or current domain state rejects the request."""
+
+
+class SubmissionFinalizationError(RuntimeError):
+    """Committed submission truth exists but its follow-up finalization failed."""
+
+    def __init__(self, message: str, *, operation_id: str | None = None, idempotency_key: str | None = None):
+        super().__init__(message)
+        self.operation_id = operation_id
+        self.idempotency_key = idempotency_key
+
+
 class SubmissionResult(list[TaskRecord]):
     def __init__(
         self,
@@ -180,7 +193,7 @@ class SubmissionPreview:
 def _reject_cleanup_tombstones(cfg: Any, resolved: list[dict[str, Any]]) -> None:
     for item in resolved:
         if operation_exists(cfg, "cleanup", item["task_id"]):
-            raise ValueError(f"Task {item['task_id']!r} was cleaned and its id cannot be reused.")
+            raise SubmissionRejected(f"Task {item['task_id']!r} was cleaned and its id cannot be reused.")
 
 
 def preview_specs(
@@ -204,7 +217,7 @@ def preview_specs(
     frozen_plan: SubmissionPlan | None = None
     if idempotency_key is not None:
         if not isinstance(idempotency_key, str) or not idempotency_key:
-            raise ValueError("idempotency_key must be a non-empty string or null.")
+            raise SubmissionRejected("idempotency_key must be a non-empty string or null.")
         mapping_path = idempotency_path(
             cfg.shared_root,
             semantic_digest({"project": str(cfg.shared_root), "key": idempotency_key}),
@@ -334,19 +347,31 @@ def _finalize_submission_group_locked(cfg: Any, submission: dict[str, Any]) -> N
         assert_group_ready_members_writable(cfg)
     group_file = group_path(cfg.shared_root, group_name)
     if not group_file.exists():
-        raise RuntimeError(f"committed submission {submission['operation_id']!r} has a missing Group {group_name!r}.")
+        raise SubmissionFinalizationError(
+            f"committed submission {submission['operation_id']!r} has a missing Group {group_name!r}.",
+            operation_id=submission["operation_id"],
+            idempotency_key=submission.get("idempotency_key"),
+        )
     group = read_json(group_file)
     normalize_group_record(group)
     pending = group["group"].get("pending_submission_commit") or {}
     if not pending:
         return
     if pending.get("operation_id") != submission["operation_id"]:
-        raise RuntimeError(f"Group {group_name!r} has pending submission commit {pending.get('operation_id')!r}.")
+        raise SubmissionFinalizationError(
+            f"Group {group_name!r} has pending submission commit {pending.get('operation_id')!r}.",
+            operation_id=submission["operation_id"],
+            idempotency_key=submission.get("idempotency_key"),
+        )
     sequences = pending.get("membership_sequences")
     if sequences is None:
         sequences = submission["commit_plan"].get("group_membership_sequences")
     if not isinstance(sequences, list):
-        raise RuntimeError(f"submission {submission['operation_id']!r} has no membership sequence plan.")
+        raise SubmissionFinalizationError(
+            f"submission {submission['operation_id']!r} has no membership sequence plan.",
+            operation_id=submission["operation_id"],
+            idempotency_key=submission.get("idempotency_key"),
+        )
     group["group"]["next_membership_sequence"] = max(
         group["group"]["next_membership_sequence"], max(sequences, default=0) + 1
     )
@@ -368,6 +393,20 @@ def finalize_submission_group(cfg: Any, submission: dict[str, Any]) -> None:
         _finalize_submission_group_locked(cfg, submission)
 
 
+def _finalize_committed_submission(cfg: Any, submission: dict[str, Any]) -> None:
+    """Translate only recognized post-commit I/O into a submission failure."""
+    try:
+        finalize_submission_group(cfg, submission)
+    except SubmissionFinalizationError:
+        raise
+    except OSError as exc:
+        raise SubmissionFinalizationError(
+            str(exc),
+            operation_id=submission.get("operation_id"),
+            idempotency_key=submission.get("idempotency_key"),
+        ) from exc
+
+
 def _plan_specs(plan: SubmissionPlan) -> list[dict[str, Any]]:
     """Return independent mutable task specifications from an immutable plan."""
     return [_thaw(item) for item in plan.task_specs]
@@ -386,7 +425,11 @@ def _load_plan_tasks(cfg: Any, plan: SubmissionPlan) -> list[TaskRecord]:
     try:
         return [TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id))) for task_id in plan.task_ids]
     except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("committed submission has missing Task truth; run qexp admin repair.") from exc
+        raise SubmissionFinalizationError(
+            "committed submission has missing Task truth; run qexp admin repair.",
+            operation_id=plan.operation_id,
+            idempotency_key=plan.idempotency_key,
+        ) from exc
 
 
 def _execute_submission_locked(
@@ -402,12 +445,16 @@ def _execute_submission_locked(
     state = submission["state"]
     if state == "committed":
         tasks = _load_plan_tasks(cfg, plan)
-        finalize_submission_group(cfg, submission)
+        _finalize_committed_submission(cfg, submission)
         return _submission_result(tasks, submission)
     if state == "aborted":
-        raise RuntimeError(f"submission operation was aborted: {submission['failure_reason']}")
+        raise SubmissionRejected(f"submission operation was aborted: {submission['failure_reason']}")
     if state == "blocked":
-        raise RuntimeError(f"submission operation is blocked: {submission['failure_reason']}")
+        raise SubmissionPending(
+            f"submission operation is blocked: {submission['failure_reason']}",
+            operation_id=plan.operation_id,
+            idempotency_key=submission.get("idempotency_key"),
+        )
 
     resolved = _plan_specs(plan)
     operation_id = plan.operation_id
@@ -454,7 +501,11 @@ def _execute_submission_locked(
             group_was_missing = not group_file.exists()
             if group_was_missing:
                 if not plan.create_group:
-                    raise RuntimeError(f"Group {group_name!r} disappeared during submission.")
+                    raise SubmissionPending(
+                        f"Group {group_name!r} disappeared during submission.",
+                        operation_id=operation_id,
+                        idempotency_key=submission.get("idempotency_key"),
+                    )
                 group = new_group(
                     group_name,
                     plan.original_submitting_machine,
@@ -468,7 +519,11 @@ def _execute_submission_locked(
             has_own_pending_commit = pending.get("operation_id") == operation_id
             has_own_creation = group["group"].get("creation_operation_id") == operation_id
             if pending and not has_own_pending_commit:
-                raise RuntimeError(f"Group {group_name!r} has pending submission commit {pending['operation_id']!r}.")
+                raise SubmissionPending(
+                    f"Group {group_name!r} has pending submission commit {pending['operation_id']!r}.",
+                    operation_id=operation_id,
+                    idempotency_key=submission.get("idempotency_key"),
+                )
             if precondition.get("exists") and not has_own_pending_commit:
                 _validate_group_precondition(group, precondition, group_name)
             elif (
@@ -480,12 +535,12 @@ def _execute_submission_locked(
                 operation["submission"]["state"] = "aborted"
                 operation["submission"]["failure_reason"] = f"Group {group_name!r} changed during submission."
                 publish_submission(cfg, operation)
-                raise RuntimeError(f"Group {group_name!r} changed during submission.")
+                raise SubmissionRejected(f"Group {group_name!r} changed during submission.")
             if group["group"]["admission_state"] != "open":
                 operation["submission"]["state"] = "aborted"
                 operation["submission"]["failure_reason"] = f"Group {group_name!r} is sealed."
                 publish_submission(cfg, operation)
-                raise ValueError(f"Group {group_name!r} is sealed.")
+                raise SubmissionRejected(f"Group {group_name!r} is sealed.")
             additions = _thaw(plan.worker_set_additions)
             planned_workers = _planned_worker_set(group, additions)
             _validate_placement_against_workers(resolved, group_name=group_name, planned_workers=planned_workers)
@@ -559,7 +614,7 @@ def _execute_submission_locked(
             if path.exists():
                 current = TaskRecord.from_dict(read_json(path))
                 if not _task_matches_resolved(current, item, operation_id, group_name):
-                    raise ValueError(f"Task {item['task_id']!r} already exists with different truth.")
+                    raise SubmissionRejected(f"Task {item['task_id']!r} already exists with different truth.")
                 if current.ready_generation == 0:
                     old_generation, _ = prepare_ready_transition(cfg, current, "submission_resume")
                     current.meta["revision"] += 1
@@ -617,7 +672,7 @@ def _execute_submission_locked(
         else:
             with task_locks(cfg.shared_root, list(plan.task_ids)):
                 stage_and_commit()
-        finalize_submission_group(cfg, operation["submission"])
+        _finalize_committed_submission(cfg, operation["submission"])
         return _submission_result(staged, operation["submission"])
     except Exception as exc:
         if commit_durable or operation["submission"].get("state") == "blocked":
@@ -747,7 +802,7 @@ def reconcile_submission(
         submission = operation["submission"]
         plan = decode_submission_plan(operation)
         if submission["state"] == "committed":
-            finalize_submission_group(cfg, submission)
+            _finalize_committed_submission(cfg, submission)
             return "committed"
         if submission["state"] == "aborted":
             if abort_incomplete:

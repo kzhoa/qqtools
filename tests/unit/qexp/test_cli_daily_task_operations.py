@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -207,6 +208,19 @@ def test_finite_log_tail_handles_zero_and_last_lines(monkeypatch, tmp_path: Path
     assert logs.read_logs(cfg, "task-1") == "first\nsecond\nthird\n"
     with pytest.raises(ValueError):
         logs.read_logs(cfg, "task-1", tail_lines=-1)
+
+
+def test_finite_log_writer_preserves_invalid_utf8_for_binary_stdout(monkeypatch, tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    path = tmp_path / "attempt.log"
+    payload = b"before\xffafter\n"
+    path.write_bytes(payload)
+    monkeypatch.setattr(logs, "get_log_path", lambda _cfg, _task_id: path)
+    stdout = BytesIO()
+
+    logs.write_logs(cfg, "task-1", stdout=stdout)
+
+    assert stdout.getvalue() == payload
 
 
 def test_name_cursor_v2_binds_exact_filter_and_v1_stays_unchanged() -> None:

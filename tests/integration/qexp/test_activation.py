@@ -6,8 +6,14 @@ from threading import Barrier, Thread
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
-from qqtools.plugins.qexp.activation import ensure_local_agent_active
+from qqtools.plugins.qexp.activation import AgentActivationError, ensure_local_agent_active
 from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.lifecycle import (
+    MachineAgentStartBlockedError,
+    MachineAgentStartError,
+    restart_machine_agent,
+)
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -55,6 +61,87 @@ def test_registered_project_does_not_start_a_second_machine_agent(
     )
 
     assert ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime) is False
+
+
+def test_pending_machine_replacement_is_a_named_activation_failure(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    archive = runtime.paths["archives"] / "replacement"
+    atomic_replace(
+        runtime.paths["replacement_transaction"],
+        {
+            "replacement": {
+                "version": 1,
+                "target_name": "gpu-2",
+                "new_runtime_id": "a" * 64,
+                "policy": "daemon",
+                "phase": "staged",
+                "detach_old_runtime": True,
+                "archive_path": str(archive),
+            }
+        },
+    )
+
+    with pytest.raises(AgentActivationError, match="pending machine replacement") as captured:
+        ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime)
+    assert captured.value.next_action is not None
+    assert str(runtime.root) in captured.value.next_action
+    assert "init --machine gpu-2 --agent-mode daemon --yes --detach-old-runtime" in captured.value.next_action
+
+
+def test_activation_named_start_error_retries_without_replacing_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.activation._ensure_machine_agent_started",
+        lambda _runtime: (_ for _ in ()).throw(MachineAgentStartError("spawn denied")),
+    )
+
+    with pytest.raises(AgentActivationError, match="spawn denied") as captured:
+        ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime)
+
+    assert shlex.split(captured.value.next_action or "") == [
+        "qexp",
+        "--machine-runtime-root",
+        str(runtime.root),
+        "agent",
+        "start",
+    ]
+
+
+@pytest.mark.parametrize("error", [ValueError("programming defect"), OSError("programming defect")])
+def test_activation_unexpected_errors_are_not_downgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.activation._ensure_machine_agent_started",
+        lambda _runtime: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(type(error), match="programming defect"):
+        ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime)
+
+
+def test_restart_is_blocked_before_stopping_during_machine_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
+    runtime.paths["replacement_transaction"].write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.agent.lifecycle._stop_machine_agent_locked",
+        lambda *_args, **_kwargs: pytest.fail("restart stopped the agent before checking replacement state"),
+    )
+
+    with pytest.raises(MachineAgentStartBlockedError, match="pending machine replacement"):
+        restart_machine_agent(runtime)
 
 
 def test_concurrent_activation_starts_only_one_machine_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

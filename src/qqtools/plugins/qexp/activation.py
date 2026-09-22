@@ -9,15 +9,26 @@ from collections.abc import Callable
 
 from .agent.context import MachineRuntime, ProjectBinding
 from .agent.lifecycle import (
+    MachineAgentStartBlockedError,
+    MachineAgentStartError,
     ensure_machine_agent_started,
     get_machine_agent_status,
     restart_machine_agent,
     run_machine_agent_loop,
     stop_machine_agent,
 )
+from .agent.setup import pending_machine_replacement
 from .config_types import RootConfig
 from .events import write_event
 from .machine_config import is_legacy_agent_project
+
+
+class AgentActivationError(RuntimeError):
+    """An expected registration or process failure blocked agent activation."""
+
+    def __init__(self, message: str, *, next_action: str | None = None) -> None:
+        super().__init__(message)
+        self.next_action = next_action
 
 
 def managed_project_agent_status(
@@ -41,7 +52,7 @@ def managed_project_agent_status(
     )
 
 
-def _registration_error(cfg: RootConfig) -> RuntimeError:
+def _registration_error(cfg: RootConfig) -> AgentActivationError:
     if is_legacy_agent_project(cfg):
         command = shlex.join(
             [
@@ -55,8 +66,11 @@ def _registration_error(cfg: RootConfig) -> RuntimeError:
                 cfg.machine_name,
             ]
         )
-        return RuntimeError(f"legacy project metadata detected; run '{command}'.")
-    return RuntimeError("project is not registered; run 'qexp project register <PATH>'.")
+        return AgentActivationError(f"legacy project metadata detected; run '{command}'.", next_action=command)
+    return AgentActivationError(
+        "project is not registered; run 'qexp project register <PATH>'.",
+        next_action="qexp project register <PATH>",
+    )
 
 
 def _ensure_machine_agent_started(
@@ -65,6 +79,30 @@ def _ensure_machine_agent_started(
     """Start the machine agent once through the shared lifecycle lock."""
     process, status = ensure_machine_agent_started(runtime)
     return process is not None, status
+
+
+def _agent_start_command(runtime: MachineRuntime) -> str:
+    return shlex.join(["qexp", "--machine-runtime-root", str(runtime.root), "agent", "start"])
+
+
+def _replacement_resume_command(runtime: MachineRuntime) -> str:
+    transaction = pending_machine_replacement(runtime)
+    if transaction is None:
+        return _agent_start_command(runtime)
+    command = [
+        "qexp",
+        "--machine-runtime-root",
+        str(runtime.root),
+        "init",
+        "--machine",
+        transaction["target_name"],
+        "--agent-mode",
+        transaction["policy"],
+        "--yes",
+    ]
+    if transaction["detach_old_runtime"]:
+        command.append("--detach-old-runtime")
+    return shlex.join(command)
 
 
 def ensure_managed_project_agent_active(
@@ -76,7 +114,16 @@ def ensure_managed_project_agent_active(
     runtime, _binding, status = managed
     if status["is_running"]:
         return "already_running", status
-    is_started, status = _ensure_machine_agent_started(runtime)
+    try:
+        is_started, status = _ensure_machine_agent_started(runtime)
+    except MachineAgentStartBlockedError as exc:
+        raise AgentActivationError(
+            f"machine agent could not be started: {exc}", next_action=_replacement_resume_command(runtime)
+        ) from exc
+    except MachineAgentStartError as exc:
+        raise AgentActivationError(
+            f"machine agent could not be started: {exc}", next_action=_agent_start_command(runtime)
+        ) from exc
     return ("started" if is_started else "already_running"), status
 
 
@@ -86,7 +133,16 @@ def ensure_local_agent_active(cfg: RootConfig, *, reason: str, machine_runtime: 
     runtime = machine_runtime or MachineRuntime()
     if runtime.matching_binding(cfg) is None:
         raise _registration_error(cfg)
-    is_started, status = _ensure_machine_agent_started(runtime)
+    try:
+        is_started, status = _ensure_machine_agent_started(runtime)
+    except MachineAgentStartBlockedError as exc:
+        raise AgentActivationError(
+            f"machine agent could not be started: {exc}", next_action=_replacement_resume_command(runtime)
+        ) from exc
+    except MachineAgentStartError as exc:
+        raise AgentActivationError(
+            f"machine agent could not be started: {exc}", next_action=_agent_start_command(runtime)
+        ) from exc
     if is_started:
         warnings = status.get("warnings", [])
         if warnings and isinstance(warnings[0], dict):

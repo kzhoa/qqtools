@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.lifecycle import MachineAgentStartError
 from qqtools.plugins.qexp.agent.process import spawn_machine_agent_process
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 
@@ -56,6 +57,18 @@ def test_machine_agent_startup_error_includes_child_failure(tmp_path: Path, monk
     monkeypatch.setattr("qqtools.plugins.qexp.agent.process.subprocess.Popen", start_process)
 
     with pytest.raises(RuntimeError, match="machine scheduler authority is already held"):
+        spawn_machine_agent_process(runtime)
+
+
+def test_machine_agent_spawn_oserror_is_named(tmp_path: Path, monkeypatch) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.agent.process.subprocess.Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("spawn denied")),
+    )
+
+    with pytest.raises(MachineAgentStartError, match="spawn denied"):
         spawn_machine_agent_process(runtime)
 
 

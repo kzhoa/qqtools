@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- breaking: remove the ineffective `qexp agent run --format human|json` surface and define
+  foreground agent execution as a debug stream without a finite startup document.
+- fix: derive finite qexp human and JSON output from the same typed command result and exit policy;
+  report configured agent mode and readiness, preserve raw/continuous stream boundaries, and use
+  actionable accepted, waiting, blocked, no-change, and completed outcomes.
 - feat: separate qexp machine initialization, shared Project creation, local enrollment, and agent
   activation; add reusable Project inventory, guarded runtime detachment, mutable global agent
   naming, daemon-default residency, and readiness-aware idempotent startup.

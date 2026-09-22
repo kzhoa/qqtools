@@ -580,9 +580,15 @@ def clean(
         candidates = candidates[:limit]
     result: dict[str, Any] = {
         "dry_run": dry_run,
+        "deletion": "none" if dry_run else "requested",
+        "deletion_performed": False,
         "candidates": [task.task_id for task in candidates],
         "removed": [],
         "skipped": {},
+        "removed_task_ids": [],
+        "pending_task_ids": [],
+        "skipped_task_ids": [],
+        "blocked_task_ids": [],
     }
     from ..runtime.ready.group_members_rebuild import cleanup_group_ready_member_archives
 
@@ -611,6 +617,8 @@ def clean(
                 ]
                 if unsafe_blockers:
                     result["skipped"][task.task_id] = unsafe_blockers
+                    result["skipped_task_ids"].append(task.task_id)
+                    result["blocked_task_ids"].append(task.task_id)
                     continue
                 if not dry_run:
                     operation = _start_cleanup_operation(cfg, task)
@@ -620,6 +628,40 @@ def clean(
             if reconciliation["task_id"] in result["candidates"]:
                 result["removed"].extend(reconciliation["removed"])
                 result.setdefault("operations", {})[reconciliation["task_id"]] = reconciliation
+    operations = result.get("operations", {})
+    if isinstance(operations, dict):
+        for candidate_id, operation in operations.items():
+            if not isinstance(operation, dict):
+                continue
+            state = operation.get("state")
+            if state == "completed":
+                result["removed_task_ids"].append(str(candidate_id))
+            elif state == "blocked":
+                result["blocked_task_ids"].append(str(candidate_id))
+            else:
+                result["pending_task_ids"].append(str(candidate_id))
+    result["removed_task_ids"] = sorted(set(result["removed_task_ids"]))
+    result["pending_task_ids"] = sorted(
+        set(result["pending_task_ids"]) - set(result["removed_task_ids"]) - set(result["blocked_task_ids"])
+    )
+    result["skipped_task_ids"] = sorted(set(result["skipped_task_ids"]))
+    result["blocked_task_ids"] = sorted(set(result["blocked_task_ids"]))
+    result["candidate_count"] = len(result["candidates"])
+    result["removed_count"] = len(result["removed_task_ids"])
+    result["pending_count"] = len(result["pending_task_ids"])
+    result["skipped_count"] = len(result["skipped_task_ids"])
+    result["blocked_count"] = len(result["blocked_task_ids"])
+    result["deletion_performed"] = bool(result["removed"] or result["removed_task_ids"])
+    if dry_run:
+        result["outcome"] = "preview"
+    elif result["blocked_task_ids"]:
+        result["outcome"] = "blocked"
+    elif result["pending_task_ids"]:
+        result["outcome"] = "waiting"
+    elif result["removed_task_ids"]:
+        result["outcome"] = "completed"
+    else:
+        result["outcome"] = "no_change"
     if task_id and result["skipped"] and not dry_run:
         blockers = result["skipped"][task_id]
         raise ValueError(f"Task {task_id!r} cannot be cleaned: {', '.join(blockers)}")

@@ -9,7 +9,8 @@
     "idempotency_key": "key-1",
     "task_ids": ["task-1"],
     "preview": null,
-    "error": null
+    "error": null,
+    "activation": null
   },
   "rejected": {
     "schema_version": 1,
@@ -21,7 +22,8 @@
     "idempotency_key": "key-2",
     "task_ids": [],
     "preview": null,
-    "error": {"code": "invalid_input", "message": "manifest is invalid"}
+    "error": {"code": "invalid_input", "message": "manifest is invalid"},
+    "activation": null
   },
   "pending": {
     "schema_version": 1,
@@ -33,7 +35,8 @@
     "idempotency_key": "key-2",
     "task_ids": [],
     "preview": null,
-    "error": {"code": "submission_pending", "message": "retry the same request"}
+    "error": {"code": "submission_pending", "message": "retry the same request"},
+    "activation": null
   },
   "unknown": {
     "schema_version": 1,
@@ -45,7 +48,8 @@
     "idempotency_key": "key-3",
     "task_ids": [],
     "preview": null,
-    "error": {"code": "commit_unknown", "message": "retry with key-3"}
+    "error": {"code": "commit_unknown", "message": "retry with key-3"},
+    "activation": null
   },
   "preview": {
     "schema_version": 1,
@@ -78,6 +82,7 @@
       "worker_additions": [{"machine_name": "gpu-1", "scheduling_role": "primary", "gpu_limit_gpus": null}],
       "evidence_gaps": []
     },
-    "error": null
+    "error": null,
+    "activation": null
   }
 }

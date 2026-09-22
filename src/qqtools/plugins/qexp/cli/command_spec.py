@@ -1,15 +1,36 @@
-"""Small parser binding records used by the qexp command tree.
-
-This is intentionally a command-tree aid, not a plugin framework.  A parser
-leaf stores the one handler/context/output contract that the CLI can inspect
-without maintaining a second command classification table.
-"""
+"""Typed command registration records used by the qexp parser."""
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from typing import Any
+from enum import Enum
+from typing import Any, Iterable
+
+from .output import OutputKind
+
+
+class OutputMode(str, Enum):
+    FINITE = "finite"
+    RAW = "raw"
+    CONTINUOUS = "continuous"
+    DIAGNOSTIC = "diagnostic"
+
+
+class ContextKind(str, Enum):
+    MACHINE = "machine"
+    SETUP = "setup"
+    NONE = "none"
+    PROJECT_WRITE = "project-write"
+    PROJECT_READ = "project-read"
+    SECTION = "section"
+    REGISTERED_PROJECT = "registered-project"
+    EXPLICIT_PROJECT = "explicit-project"
+
+
+class CommandAudience(str, Enum):
+    NORMAL = "normal"
+    DEBUG = "debug"
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,13 +38,24 @@ class CommandSpec:
     """Static contract attached to one parser leaf."""
 
     handler: str
-    context: str
-    output: str
+    context: ContextKind
+    modes: frozenset[OutputMode]
+    output_kinds: frozenset[OutputKind]
+    audience: CommandAudience = CommandAudience.NORMAL
+
+
+def _as_frozenset(value: Enum | Iterable[Enum], enum_type: type[Enum]) -> frozenset[Any]:
+    if isinstance(value, enum_type):
+        return frozenset({value})
+    values = frozenset(value)
+    if not all(isinstance(item, enum_type) for item in values):
+        raise TypeError(f"command metadata must use {enum_type.__name__} members")
+    return values
 
 
 def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
     """Build the disclosure block shared by every executable leaf."""
-    machine_wide = spec.context == "machine" or spec.handler.startswith("agent_config_")
+    machine_wide = spec.context is ContextKind.MACHINE or spec.handler.startswith("agent_config_")
     explicit_project = spec.handler in {
         "admin_check",
         "admin_repair",
@@ -45,10 +77,10 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
     elif explicit_project:
         scope = "One explicitly selected Project."
         prerequisite = "Pass --project PATH; cwd, environment, and saved-context fallback are not accepted."
-    elif spec.context in {"project-read", "project-write", "section"}:
+    elif spec.context in {ContextKind.PROJECT_READ, ContextKind.PROJECT_WRITE, ContextKind.SECTION}:
         scope = "The selected Project."
         prerequisite = "Select a Project with --project, QEXP_SHARED_ROOT, saved context, or cwd discovery."
-    elif spec.context == "registered-project":
+    elif spec.context is ContextKind.REGISTERED_PROJECT:
         scope = "One Project registered in the local MachineRuntime."
         prerequisite = "Pass --project PATH after registering the Project on this machine."
     else:
@@ -75,14 +107,32 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
         activation = "May activate the local machine agent to converge accepted work."
     else:
         activation = "Does not implicitly activate an agent unless the command result requires lifecycle convergence."
-    if spec.output == "diagnostic":
+    if spec.modes == frozenset({OutputMode.DIAGNOSTIC}):
         output = "Non-executing compatibility diagnostic on stderr."
-    elif spec.output == "raw-logs" or spec.handler == "agent_run":
-        output = "Continuous/raw stream; finite JSON wrapping does not apply."
     elif spec.handler == "task_show":
-        output = "Finite human/JSON result by default; --watch is a terminal-only continuous stream."
-    else:
+        output = (
+            "Finite human/JSON result by default; --watch is a terminal-only continuous stream that rejects --format."
+        )
+    elif spec.handler == "task_logs":
+        output = (
+            "Raw application bytes on stdout, with qexp diagnostics and stream boundaries on stderr; "
+            "--format does not apply."
+        )
+    elif spec.handler == "agent_run":
+        output = (
+            "Foreground debugging stream with no finite startup record; --format does not apply, and "
+            "interrupting the agent does not signal launched runners. Ordinary background use is `qexp agent start`."
+        )
+    elif spec.handler == "agent_restart":
+        output = (
+            "Finite process-replacement result; readiness may remain pending and is observed with `qexp agent status`."
+        )
+    elif spec.handler in {"status", "agent_status"}:
+        output = "Finite status result with configured mode, distinct observed mode, and readiness evidence."
+    elif OutputMode.FINITE in spec.modes:
         output = "Finite result supports --format human or --format json."
+    else:
+        output = "Continuous/raw stream; finite JSON wrapping does not apply."
     positional: list[str] = []
     for action in parser._actions:
         if action.option_strings or action.dest in {"help", argparse.SUPPRESS}:
@@ -130,7 +180,7 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
         "admin_migrate_agent": "qexp admin migrate agent --project PATH --machine NAME",
     }
     example = example_overrides.get(spec.handler, " ".join((parser.prog, *positional, *required_options)))
-    if spec.context == "registered-project" or (explicit_project and "--project" not in example):
+    if spec.context is ContextKind.REGISTERED_PROJECT or (explicit_project and "--project" not in example):
         example += " --project PATH"
     return "\n".join(
         (
@@ -143,13 +193,35 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
     )
 
 
-def bind_command(parser: Any, *, handler: str, context: str, output: str) -> Any:
-    """Attach one command specification to an argparse parser."""
-    spec = CommandSpec(handler, context, output)
+def bind_command(
+    parser: Any,
+    *,
+    handler: str,
+    context: ContextKind,
+    modes: OutputMode | Iterable[OutputMode],
+    output_kinds: OutputKind | Iterable[OutputKind] = (),
+    audience: CommandAudience = CommandAudience.NORMAL,
+) -> Any:
+    """Attach one typed command specification to an argparse parser."""
+    if not isinstance(context, ContextKind):
+        raise TypeError("command metadata context must use a ContextKind member")
+    spec = CommandSpec(
+        handler,
+        context,
+        _as_frozenset(modes, OutputMode),
+        _as_frozenset(output_kinds, OutputKind),
+        audience,
+    )
     parser.set_defaults(command_spec=spec)
     parser.epilog = _detailed_help(parser, spec)
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
     return parser
 
 
-__all__ = ["CommandSpec", "bind_command"]
+__all__ = [
+    "CommandAudience",
+    "CommandSpec",
+    "ContextKind",
+    "OutputMode",
+    "bind_command",
+]

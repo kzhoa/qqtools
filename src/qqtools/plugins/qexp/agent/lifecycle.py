@@ -99,6 +99,18 @@ from .recovery_capture import inspect_recovery_capture
 from .recovery_enrollment import RecoveryEnrollment
 
 
+class MachineAgentStartBlockedError(RuntimeError):
+    """A declared local replacement transaction prevents agent startup."""
+
+
+class MachineAgentStartError(RuntimeError):
+    """The agent process could not be spawned or establish authority."""
+
+
+class MachineAgentStopError(RuntimeError):
+    """The running agent process could not be stopped within policy."""
+
+
 def get_machine_agent_status(
     runtime: MachineRuntime | str | Path | None = None, *, probe_local_pid: bool = True
 ) -> dict[str, Any]:
@@ -233,7 +245,7 @@ def run_machine_agent_loop(
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     machine_runtime.require_initialized()
     if machine_runtime.paths["replacement_transaction"].exists():
-        raise RuntimeError("machine agent activation is blocked by a pending machine replacement.")
+        raise MachineAgentStartBlockedError("machine agent activation is blocked by a pending machine replacement.")
     machine_runtime.ensure_layout(create_identity=False)
     agent_config = load_agent_config(machine_runtime)
     try:
@@ -243,7 +255,7 @@ def run_machine_agent_loop(
     pid_path = machine_runtime.paths["pid"]
     current_identity = _active_machine_identity(machine_runtime)
     if current_identity is not None and current_identity[0] != os.getpid():
-        raise RuntimeError(f"machine agent is already running with pid {current_identity[0]}.")
+        raise MachineAgentStartError(f"machine agent is already running with pid {current_identity[0]}.")
     instance_id = uuid.uuid4().hex
     started_at = utc_now()
     control_plane: _MachineControlPlane | None = None
@@ -576,7 +588,7 @@ def start_machine_agent(
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     machine_runtime.require_initialized()
     if machine_runtime.paths["replacement_transaction"].exists():
-        raise RuntimeError("machine agent start is blocked by a pending machine replacement.")
+        raise MachineAgentStartBlockedError("machine agent start is blocked by a pending machine replacement.")
     with machine_runtime.agent_lifecycle_guard():
         return _start_machine_agent_locked(
             machine_runtime,
@@ -601,7 +613,7 @@ def ensure_machine_agent_started(
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     machine_runtime.require_initialized()
     if machine_runtime.paths["replacement_transaction"].exists():
-        raise RuntimeError("machine agent start is blocked by a pending machine replacement.")
+        raise MachineAgentStartBlockedError("machine agent start is blocked by a pending machine replacement.")
     with machine_runtime.agent_lifecycle_guard():
         status = get_machine_agent_status(machine_runtime)
         if status["is_running"]:
@@ -633,11 +645,13 @@ def _stop_machine_agent_locked(machine_runtime: MachineRuntime, *, timeout: floa
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         return True
+    except OSError as exc:
+        raise MachineAgentStopError(f"machine agent {pid} could not be signalled: {exc}") from exc
     deadline = time.monotonic() + timeout
     while _pid_start_time_ticks(pid) == start_ticks and time.monotonic() < deadline:
         time.sleep(0.05)
     if _pid_start_time_ticks(pid) == start_ticks:
-        raise TimeoutError(f"machine agent {pid} did not stop within {timeout} seconds.")
+        raise MachineAgentStopError(f"machine agent {pid} did not stop within {timeout} seconds.")
     return True
 
 
@@ -662,6 +676,8 @@ def restart_machine_agent(
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     machine_runtime.require_initialized()
     with machine_runtime.agent_lifecycle_guard():
+        if machine_runtime.paths["replacement_transaction"].exists():
+            raise MachineAgentStartBlockedError("machine agent restart is blocked by a pending machine replacement.")
         identity = _active_machine_identity(machine_runtime)
         previous_pid = identity[0] if identity is not None else None
         _stop_machine_agent_locked(machine_runtime, timeout=10.0)
