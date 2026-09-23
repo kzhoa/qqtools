@@ -1823,6 +1823,7 @@ def test_machine_dispatch_waits_for_current_generation_authority_recovery(tmp_pa
     try:
         result = dispatch_machine_cycle_locked(runtime, available_gpus=[0], executor=executor, supervise=False)
         assert any(item["status"] == "authority_recovering" for item in result)
+        assert runtime.last_cycle_had_demand
         assert executor.launched == []
         assert not load_task(cfg, task.task_id).claim_control.get("active_claim")
         plane._run_authority_cycle()

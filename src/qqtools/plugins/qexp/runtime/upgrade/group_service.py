@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -18,9 +19,28 @@ from ...runtime.group_discovery.activation import (
     transition_group_service_state_locked,
     writer_floor_satisfied,
 )
+from ...runtime.group_namespace import group_directory, is_group_authority_isolated
 from .contracts import DeterministicUpgradeError, MigrationPlugin, MigrationSpec, PhaseResult, UpgradeContext
 
 GROUP_SERVICE_TARGET_PROTOCOL = "metadata:group-service-v1"
+
+
+def _has_group(root, *, storage=None) -> bool:
+    """Inspect at most the identity entry and one canonical Group record."""
+
+    directory = group_directory(root, storage=storage)
+    with os.scandir(directory) as entries:
+        for _ in range(2):
+            try:
+                entry = next(entries)
+            except StopIteration:
+                return False
+            if entry.name == ".authority-identity":
+                continue
+            if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False):
+                return True
+            raise RuntimeError(f"canonical Group namespace contains an invalid entry: {entry.name}")
+    return False
 
 
 def _next_probe_at() -> str:
@@ -78,6 +98,8 @@ class GroupServiceMigration(MigrationPlugin):
     def is_applicable(self, cfg) -> bool:
         if not writer_floor_satisfied():
             return False
+        if not is_group_authority_isolated(cfg.shared_root) or not _has_group(cfg.shared_root):
+            return False
         try:
             return not is_group_service_active(cfg.shared_root)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
@@ -85,6 +107,10 @@ class GroupServiceMigration(MigrationPlugin):
 
     def is_applicable_with_storage(self, cfg, storage) -> bool:
         if not writer_floor_satisfied():
+            return False
+        if not is_group_authority_isolated(cfg.shared_root, storage=storage) or not _has_group(
+            cfg.shared_root, storage=storage
+        ):
             return False
         try:
             return not is_group_service_active(cfg.shared_root, storage=storage)

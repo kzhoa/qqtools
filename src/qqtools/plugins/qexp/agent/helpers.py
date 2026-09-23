@@ -63,7 +63,7 @@ def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool
     """Retain unfinished recovery and reservations before on-demand idle exit."""
     if getattr(runtime, "pending_launch_handoffs", {}):
         return False
-    if getattr(runtime, "upgrade_pending_projects", set()):
+    if getattr(runtime, "upgrade_idle_blocked_projects", set()):
         return False
     if getattr(runtime, "recovery_enrollment_pending_projects", set()):
         return False

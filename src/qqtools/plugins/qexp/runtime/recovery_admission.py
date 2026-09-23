@@ -14,7 +14,7 @@ from .locks import schema_lock
 from .paths import machine_registration_path, shared_paths
 from .responsibility_store import DurableIO
 from .store import atomic_replace, read_json
-from .upgrade.framework import UpgradeCoordinator
+from .upgrade.framework import UpgradeCoordinator, pending_upgrade_requires_completion
 from .upgrade.production import UpgradeJournalMigration
 
 if TYPE_CHECKING:
@@ -32,7 +32,7 @@ def _upgrade_blocker(cfg: RootConfig) -> str | None:
     if UpgradeJournalMigration().is_applicable(cfg):
         return "upgrade_manifest_not_ready"
     status = UpgradeCoordinator(cfg).status()
-    if status.get("pending") or status.get("migration_blocked"):
+    if pending_upgrade_requires_completion(status):
         return "upgrade_coordinator_pending"
     return None
 

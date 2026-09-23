@@ -10,7 +10,19 @@ from typing import Any
 
 from ...agent.context import MachineRuntime, ProjectBinding
 from ...runtime.store import atomic_replace, read_json
-from .framework import UpgradeCoordinator
+from .framework import UpgradeCoordinator, pending_upgrade_requires_completion
+
+
+def _idle_blocked_project_ids(projects: list[dict[str, Any]], pending_ids: set[str]) -> set[str]:
+    """Return pending upgrades that must retain an on-demand agent."""
+
+    blocked: set[str] = set()
+    by_id = {item.get("project_id"): item for item in projects}
+    for project_id in pending_ids:
+        status = by_id.get(project_id)
+        if not isinstance(status, dict) or pending_upgrade_requires_completion(status):
+            blocked.add(project_id)
+    return blocked
 
 
 def _probe_deadline(status: dict[str, Any]) -> float | None:
@@ -197,6 +209,7 @@ def discover_registered_upgrades(runtime: MachineRuntime, *, force: bool = False
             for binding in bindings
             if binding.project_id in runtime.upgrade_discovery_projects
         ]
+        runtime.upgrade_idle_blocked_projects = _idle_blocked_project_ids(projects, pending_ids)
         inaccessible_projects = [item for item in projects if item.get("state") == "inaccessible"]
         return {
             "projects": projects,
@@ -230,6 +243,7 @@ def discover_registered_upgrades(runtime: MachineRuntime, *, force: bool = False
         projects.append(status)
     runtime.upgrade_registry_revision = revision
     runtime.upgrade_pending_projects = pending_ids
+    runtime.upgrade_idle_blocked_projects = _idle_blocked_project_ids(projects, pending_ids)
     runtime.upgrade_runnable_projects = runnable_ids
     runtime.upgrade_admission_blocked_projects = {
         status["project_id"] for status in projects if status.get("admission_blocked")
@@ -280,6 +294,7 @@ def advance_registered_upgrades(
     }
     if not pending_ids:
         runtime.upgrade_pending_projects = set()
+        runtime.upgrade_idle_blocked_projects = set()
         return {
             "projects": [],
             "slices": 0,
@@ -341,6 +356,11 @@ def advance_registered_upgrades(
             pending_ids.discard(binding.project_id)
         cursor = binding.project_id
     runtime.upgrade_pending_projects = pending_ids
+    current_projects = {
+        item.get("project_id"): item for item in discovered_projects if isinstance(item.get("project_id"), str)
+    }
+    current_projects.update({item["project_id"]: item for item in results if isinstance(item.get("project_id"), str)})
+    runtime.upgrade_idle_blocked_projects = _idle_blocked_project_ids(list(current_projects.values()), pending_ids)
     next_runnable = set(runnable_ids)
     for item in results:
         if item.get("pending") and item.get("can_run"):

@@ -316,6 +316,33 @@ def _status_from_journal(cfg: RootConfig, journal: dict[str, Any] | None) -> dic
     }
 
 
+def pending_upgrade_requires_completion(status: dict[str, Any]) -> bool:
+    """Return whether pending upgrade work must finish before agent idle exit.
+
+    Healthy ``group-service-v1`` activation is resumable maintenance with a
+    supported legacy path.  It may continue on a later normal agent start.
+    Missing, damaged, paused, or other pending migrations retain the existing
+    fail-closed residency and recovery-admission behavior.
+    """
+
+    if not status.get("pending"):
+        return False
+    if (
+        status.get("state") in {"inaccessible", "repair_required", "paused", "pause_pending"}
+        or status.get("admission_blocked")
+        or status.get("migration_blocked")
+    ):
+        return True
+    migrations = status.get("migrations")
+    if not isinstance(migrations, list):
+        return True
+    pending = [item for item in migrations if isinstance(item, dict) and item.get("state") != "completed"]
+    if not pending or any(isinstance(item.get("error"), str) for item in pending):
+        return True
+    names = {item.get("name") for item in pending}
+    return not names or not names.issubset({"group-service-v1"})
+
+
 class UpgradeCoordinator:
     """Advance one project's declared migrations in bounded, crash-resumable slices."""
 

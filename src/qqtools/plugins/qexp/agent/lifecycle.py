@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, ContextManager
@@ -478,16 +479,21 @@ def run_machine_agent_loop(
                 scheduler_wakeup.wait(wait_seconds)
         finally:
             recovery_enrollment.stop()
-            if submission_control_worker is not None:
-                submission_control_worker.stop()
-            if observation_worker is not None:
-                observation_worker.stop()
-            if discovery_worker is not None:
-                discovery_worker.stop()
-            if upgrade_worker is not None:
-                upgrade_worker.stop()
-            if notification_worker is not None:
-                notification_worker.stop()
+            background_workers = [
+                worker
+                for worker in (
+                    submission_control_worker,
+                    observation_worker,
+                    discovery_worker,
+                    upgrade_worker,
+                    notification_worker,
+                )
+                if worker is not None
+            ]
+            # These services own disjoint worker threads. Signal and join them
+            # concurrently so their bounded shutdown waits cannot accumulate.
+            with ThreadPoolExecutor(max_workers=max(1, len(background_workers))) as pool:
+                list(pool.map(lambda worker: worker.stop(), background_workers))
             if control_plane is not None:
                 control_plane.stop()
             try:
@@ -510,7 +516,8 @@ def run_machine_agent_loop(
                         _, registered = machine_runtime.load_registry()
                     except (OSError, RuntimeError, ValueError):
                         registered = []
-                    for binding in registered:
+
+                    def publish_stop(binding: ProjectBinding) -> None:
                         try:
                             cfg = _helpers._binding_config(machine_runtime, binding)
                             with machine_runtime.binding_write_guard(binding) as is_eligible:
@@ -533,7 +540,12 @@ def run_machine_agent_loop(
                                         gpu_policy=gpu_policy_snapshot,
                                     )
                         except (OSError, RuntimeError, ValueError):
-                            continue
+                            return
+
+                    # Project snapshots have disjoint roots. Bound shutdown
+                    # latency without changing each snapshot's durable fence.
+                    with ThreadPoolExecutor(max_workers=min(4, max(1, len(registered)))) as pool:
+                        list(pool.map(publish_stop, registered))
                 if is_pid_published:
                     pid_path.unlink(missing_ok=True)
                 if is_status_published:

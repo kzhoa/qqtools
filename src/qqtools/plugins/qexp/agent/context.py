@@ -128,6 +128,11 @@ class MachineRuntime:
         self.upgrade_registry_revision: int | None = None
         self.upgrade_discovery_complete = False
         self.upgrade_pending_projects: set[str] = set()
+        # Pending Group service activation is resumable maintenance and must
+        # not by itself retain an otherwise idle on-demand agent.  Discovery
+        # classifies pending upgrades that still carry an idle-exit obligation
+        # into this separate set.
+        self.upgrade_idle_blocked_projects: set[str] = set()
         self.recovery_enrollment_pending_projects: set[str] = set()
         self.upgrade_runnable_projects: set[str] = set()
         self.upgrade_probe_deadlines: dict[str, float] = {}

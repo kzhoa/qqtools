@@ -50,6 +50,7 @@ from ..runtime.ready import (
     advance_ready_index_build,
     classify_ready_marker,
     peek_primary_ready_marker,
+    peek_ready_marker,
     read_ready_index_state,
     ready_index_route_revision,
 )
@@ -659,6 +660,29 @@ def _probe_primary_demand(
     return PrimaryDemandProbe("no_primary_demand", tuple(diagnostics[-32:]))
 
 
+def _authority_recovery_has_possible_demand(readable: dict[str, RootConfig], project_ids: set[str]) -> bool:
+    """Fail closed unless every recovering project's ready routes are empty."""
+
+    # This one-shot idle proof may inspect both routes for several recovering
+    # projects. Keep the fixed operation cap while allowing loaded machines a
+    # full second to prove emptiness; timeout remains fail closed.
+    budget = SliceBudget(WorkBudgetPolicy(soft_deadline_ms=1000))
+    for project_id in sorted(project_ids):
+        cfg = readable.get(project_id)
+        if cfg is None:
+            return True
+        try:
+            if read_ready_index_state(cfg) != "active":
+                return True
+            for scope in ("shared", "home"):
+                peek = peek_ready_marker(cfg, project_id, scope, None, budget)
+                if peek.reference is not None or peek.unresolved or peek.exhausted or not peek.wrapped:
+                    return True
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return True
+    return False
+
+
 def _build_borrow_admission_grant(
     runtime: MachineRuntime,
     dispatchable: dict[str, RootConfig],
@@ -1042,7 +1066,16 @@ def _dispatch_machine_cycle_locked(
         excluded_pending=pending_identities,
         launch_recovered=launch_batch.launch,
     )
-    runtime.last_cycle_had_demand = runtime.last_cycle_had_demand or bool(results) or any(recovered.values())
+    authority_recovering = {
+        item["project_id"]
+        for item in results
+        if item.get("status") == "authority_recovering" and isinstance(item.get("project_id"), str)
+    }
+    has_other_result = any(item.get("status") != "authority_recovering" for item in results)
+    authority_recovery_has_demand = _authority_recovery_has_possible_demand(readable, authority_recovering)
+    runtime.last_cycle_had_demand = (
+        runtime.last_cycle_had_demand or has_other_result or any(recovered.values()) or authority_recovery_has_demand
+    )
     with diagnostic_span("machine.reservations.snapshot"):
         snapshot = reconcile_snapshot(runtime.root)
     reservation_policy, policy_view = _observe_gpu_policy(
@@ -1155,7 +1188,15 @@ def _dispatch_machine_cycle_locked(
             )
         )
         diagnostic_increment(f"scheduler.primary_probe.{lane}.{probe.state}")
-        if probe.state in {"runnable_now", "waiting_for_aggregation"} or (has_capacity and probe.state == "unresolved"):
+        unresolved_only_for_empty_authority = bool(probe.diagnostics) and all(
+            item.get("reason") == "project_not_probeable"
+            and item.get("project_id") in authority_recovering
+            and not authority_recovery_has_demand
+            for item in probe.diagnostics
+        )
+        if probe.state in {"runnable_now", "waiting_for_aggregation"} or (
+            has_capacity and probe.state == "unresolved" and not unresolved_only_for_empty_authority
+        ):
             runtime.last_cycle_had_demand = True
         budget = SliceBudget(WorkBudgetPolicy())
         for admission_role in dispatch_plan.admission_roles:

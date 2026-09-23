@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Thread
 
 from ..runtime.recovery_admission import fence_recovery_admission
+from ..runtime.responsibility_capture import CaptureBusy
 from .context import MachineRuntime, ProjectBinding
 from .recovery_capture import RecoveryCapture, RecoveryProgress
 
 PROJECTS_PER_PASS = 4
 PASS_INTERVAL_SECONDS = 1.0
+ACTIVE_RETRY_SECONDS = 0.05
+BUSY_RETRY_SECONDS = 0.01
+PRODUCTIVE_YIELD_SECONDS = 0.01
 
 
 class RecoveryEnrollment:
@@ -104,28 +109,59 @@ class RecoveryEnrollment:
             selected = ordered[:PROJECTS_PER_PASS]
             self._next_project = ordered[len(selected) % len(ordered)].project_id
             should_prepare_only = len(unvisited) > len(selected)
+            prepared: dict[ProjectBinding, RecoveryProgress | Exception] = {}
+            if should_prepare_only:
+                # Registration roots are disjoint. Prepare the bounded first
+                # batch concurrently before capture work begins.
+                with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+                    futures = {
+                        binding: pool.submit(self._advance_binding, binding, should_prepare_only=True)
+                        for binding in selected
+                    }
+                    for binding, future in futures.items():
+                        try:
+                            prepared[binding] = future.result()
+                        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                            prepared[binding] = exc
             for binding in selected:
                 if self._stop.is_set():
                     break
+                retry_delay = PASS_INTERVAL_SECONDS
                 try:
-                    progress = self._advance_binding(binding, should_prepare_only=should_prepare_only)
+                    prepared_result = prepared.get(binding)
+                    if isinstance(prepared_result, Exception):
+                        raise prepared_result
+                    progress = (
+                        prepared_result
+                        if isinstance(prepared_result, RecoveryProgress)
+                        else self._advance_binding(binding, should_prepare_only=False)
+                    )
                     if progress is RecoveryProgress.WAITING:
                         if self.runtime.registration_status(binding)["state"] == "superseded":
                             progress = RecoveryProgress.COMPLETE
+                except CaptureBusy:
+                    # Capture and cleanup share a short-lived parent lock. Keep
+                    # the bounded worker responsive when a peer owns one slice.
+                    progress = RecoveryProgress.WAITING
+                    retry_delay = BUSY_RETRY_SECONDS
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     progress = RecoveryProgress.WAITING
+                    if binding in self._captures:
+                        retry_delay = ACTIVE_RETRY_SECONDS
                 self._preparation_attempted.add(binding)
+                if progress is RecoveryProgress.WAITING and binding in self._captures:
+                    retry_delay = min(retry_delay, ACTIVE_RETRY_SECONDS)
                 if progress is RecoveryProgress.COMPLETE:
                     self._settled = self._settled.union((binding,))
                 self._retry_at[binding] = (
-                    time.monotonic() + PASS_INTERVAL_SECONDS if progress is RecoveryProgress.WAITING else 0.0
+                    time.monotonic() + retry_delay if progress is RecoveryProgress.WAITING else 0.0
                 )
         pending = [binding for binding in bindings if binding not in self._settled]
         if not pending:
             return None
         next_due = min(self._retry_at.get(binding, 0.0) for binding in pending)
         # Productive batches yield briefly to peers but never wait for dispatch.
-        return max(0.05, min(PASS_INTERVAL_SECONDS, next_due - time.monotonic()))
+        return max(PRODUCTIVE_YIELD_SECONDS, min(PASS_INTERVAL_SECONDS, next_due - time.monotonic()))
 
     def _advance_binding(self, binding: ProjectBinding, *, should_prepare_only: bool) -> RecoveryProgress:
         """Run one bounded project step; durable guards remain the authority."""

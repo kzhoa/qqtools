@@ -326,7 +326,7 @@ class WriterCaptureCheckpoint:
         with ExitStack() as stack:
             for parent in sorted({root.parent for root in roots}):
                 if not stack.enter_context(_capture_parent_guard(parent, is_exclusive=True)):
-                    raise Conflict("writer capture or cleanup is busy")
+                    raise CaptureBusy("writer capture or cleanup is busy")
             try:
                 from .responsibility_completion import COMPLETION_FILE
 
