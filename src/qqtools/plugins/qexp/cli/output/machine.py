@@ -141,10 +141,60 @@ def _validate_machine_show(result: Any) -> None:
         _required(value, key, "machine-show payload")
 
 
+def _validate_identity_diagnosis(result: Any) -> None:
+    value = _mapping(result, "machine identity diagnosis payload")
+    for key in (
+        "outcome",
+        "reason",
+        "runtime_root",
+        "selection_source",
+        "affected_file",
+        "evidence_sources",
+        "checks",
+        "planned_changes",
+        "next_action",
+        "configuration_scope",
+    ):
+        _required(value, key, "machine identity diagnosis payload")
+    if value["outcome"] not in {"healthy", "blocked", "failed"}:
+        raise ValueError("machine identity diagnosis outcome must be healthy, blocked, or failed.")
+    if not isinstance(value["evidence_sources"], list) or not all(
+        isinstance(source, str) for source in value["evidence_sources"]
+    ):
+        raise TypeError("machine identity diagnosis evidence_sources must be a list of strings.")
+    if not isinstance(value["planned_changes"], list):
+        raise TypeError("machine identity diagnosis planned_changes must be a list.")
+    for index, item in enumerate(_sequence(value["checks"], "machine identity diagnosis checks")):
+        check = _mapping(item, f"machine identity diagnosis checks[{index}]")
+        for key in ("name", "status", "detail"):
+            _required(check, key, f"machine identity diagnosis checks[{index}]")
+
+
+def _render_identity_diagnosis(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    checks = [f"{item['name']}: {item['status']} — {item['detail']}" for item in result["checks"]]
+    return _details(
+        (
+            ("Outcome", result["outcome"]),
+            ("Reason", result["reason"]),
+            ("Runtime root", result["runtime_root"]),
+            ("Selection source", result["selection_source"]),
+            ("Affected file", result["affected_file"]),
+            ("Replacement phase", result.get("replacement_phase")),
+            ("Replacement target", result.get("replacement_target")),
+            ("Configuration", "not checked"),
+        ),
+        (("Evidence sources", result["evidence_sources"]),),
+        (("Checks", checks),),
+        (("Planned changes", result["planned_changes"] or "none"),),
+        (("Next action", result["next_action"]),),
+    )
+
+
 CONTRACTS = {
     OutputKind.MACHINES: OutputContract(_validate_machines, _render_machines),
     OutputKind.STATUS: OutputContract(_validate_status, _render_status),
     OutputKind.MACHINE_SHOW: OutputContract(_validate_machine_show, _render_machine_show),
+    OutputKind.MACHINE_IDENTITY_DIAGNOSIS: OutputContract(_validate_identity_diagnosis, _render_identity_diagnosis),
 }
 
 __all__ = ["CONTRACTS"]

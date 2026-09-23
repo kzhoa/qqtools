@@ -8,6 +8,8 @@ from typing import Any
 
 from ..runtime.store import read_json
 
+_DIAGNOSIS_GUIDANCE = " Run 'qexp admin repair identity --dry-run' for a read-only diagnosis."
+
 
 class MachineRuntimeIdentityError(RuntimeError):
     """Existing runtime state cannot establish a usable machine identity."""
@@ -25,18 +27,18 @@ def load_identity_record(path: Path) -> dict[str, Any] | None:
         # A dangling link is damaged state, not permission to create an identity.
         if path.is_symlink():
             raise MachineRuntimeIdentityError(
-                f"machine runtime identity is inaccessible at {path}; check its target and mount."
+                f"machine runtime identity is inaccessible at {path}; check its target and mount." + _DIAGNOSIS_GUIDANCE
             ) from None
         return None
     except OSError as exc:
         raise MachineRuntimeIdentityError(
             f"machine runtime identity is unreadable at {path}; "
-            "check QEXP_MACHINE_RUNTIME_ROOT, mount availability and access permissions."
+            "check QEXP_MACHINE_RUNTIME_ROOT, mount availability and access permissions." + _DIAGNOSIS_GUIDANCE
         ) from exc
     except ValueError as exc:
         raise MachineRuntimeIdentityError(
             f"machine runtime identity is malformed at {path}; "
-            "preserve runtime data and recover the original identity from a verified backup."
+            "preserve runtime data and recover the original identity from a verified backup." + _DIAGNOSIS_GUIDANCE
         ) from exc
     record = value.get("machine_runtime")
     if isinstance(record, dict):
@@ -57,7 +59,7 @@ def load_identity_record(path: Path) -> dict[str, Any] | None:
             return record
     raise MachineRuntimeIdentityError(
         f"machine runtime identity is malformed at {path}; "
-        "preserve runtime data and recover the original identity from a verified backup."
+        "preserve runtime data and recover the original identity from a verified backup." + _DIAGNOSIS_GUIDANCE
     )
 
 
@@ -79,6 +81,7 @@ def require_fresh_runtime(root: Path) -> None:
                         f"machine runtime identity is missing at {root / 'identity.json'}, "
                         f"but existing runtime data remains at {path}; "
                         "preserve runtime data and recover the original identity before continuing."
+                        + _DIAGNOSIS_GUIDANCE
                     )
         except FileNotFoundError:
             # Only an absent root establishes a fresh runtime. A disappearing
@@ -87,9 +90,10 @@ def require_fresh_runtime(root: Path) -> None:
                 return
             raise MachineRuntimeIdentityError(
                 f"cannot inspect machine runtime data at {directory}; check mount availability and retry."
+                + _DIAGNOSIS_GUIDANCE
             ) from None
         except OSError as exc:
             raise MachineRuntimeIdentityError(
                 f"cannot inspect machine runtime data at {directory}; "
-                "check QEXP_MACHINE_RUNTIME_ROOT, mount availability and access permissions."
+                "check QEXP_MACHINE_RUNTIME_ROOT, mount availability and access permissions." + _DIAGNOSIS_GUIDANCE
             ) from exc

@@ -108,6 +108,19 @@ no durable runtime data; inaccessible evidence cannot prove an empty runtime. In
 rechecks this condition under the lifecycle lock, without bypassing a validated replacement
 transaction's resume protocol. Read/format failures never authorize a replacement identity.
 
+The machine-level `qexp admin repair identity --dry-run` diagnostic is read-only
+and independent of Project selection and Agent configuration. It checks the
+identity representation, current-generation pointer, local binding registry and
+host continuity before reporting `healthy`. For a seed-derived identity, the
+host-bound digest can be checked against the current generation. An explicit
+stored runtime ID may have been staged independently of its seed during
+replacement; a matching ID and generation alone leave host continuity
+unverified. Such a record is blocked rather than treated as healthy. A pending
+replacement retains its own resume protocol and blocks identity diagnosis.
+The command does not create layout, identity or lock files and does not certify
+Agent readiness. Automatic restoration is not supported by this diagnostic
+contract; no local archive or observed runtime ID is a trusted recovery source.
+
 ## Lifecycle terminal boundary and notifications
 
 Every attempt-backed terminal transition (`succeeded`, `failed`, or `cancelled`) is committed

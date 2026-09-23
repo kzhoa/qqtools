@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -89,6 +90,7 @@ LOCAL_HANDLERS = frozenset(
         "admin_migrate_schema6_attest",
         "admin_migrate_schema6_resume",
         "admin_migrate_agent",
+        "admin_repair",
         "retired_add-project",
         "retired_list-projects",
         "retired_enable-project",
@@ -295,6 +297,20 @@ def dispatch_local(
     """Dispatch a command that does not use ordinary Project selection."""
     if handler not in LOCAL_HANDLERS:
         raise ValueError(f"unsupported local handler {handler!r}.")
+    if handler == "admin_repair" and getattr(args, "repair_target", None) == "identity":
+        if not args.dry_run:
+            raise CliUsageError("automatic restoration is unavailable; pass --dry-run for identity diagnosis.")
+        from ..agent.identity_diagnosis import diagnose_machine_identity
+
+        if args.machine_runtime_root is not None:
+            selection_source = "--machine-runtime-root"
+        elif os.environ.get("QEXP_MACHINE_RUNTIME_ROOT"):
+            selection_source = "QEXP_MACHINE_RUNTIME_ROOT"
+        else:
+            selection_source = "default"
+        result = diagnose_machine_identity(args.machine_runtime_root, selection_source=selection_source)
+        exit_code = 0 if result["outcome"] == "healthy" else 1
+        return CommandOutcome(exit_code, CliOutput(OutputKind.MACHINE_IDENTITY_DIAGNOSIS, result))
     if handler == "init":
         # QQTOOLS-COMPAT-0014: the former project-bound init spelling is
         # retained only as a bounded diagnostic during the transition.

@@ -47,6 +47,7 @@ class OutputKind(str, Enum):
     CONTEXT = "context"
     DOCTOR_VERIFY = "doctor-verify"
     DOCTOR_REPAIR = "doctor-repair"
+    MACHINE_IDENTITY_DIAGNOSIS = "machine-identity-diagnosis"
     CLEAN = "clean"
     CONFIG = "config"
     TASK_WAIT = "task-wait"

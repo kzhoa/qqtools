@@ -43,6 +43,7 @@ def _leaf_spec_map(
         dynamic_outputs = {
             frozenset({OutputKind.AGENT_OPERATION, OutputKind.AGENT_READINESS}): "agent-operation",
             frozenset({OutputKind.DOCTOR_VERIFY}): "doctor-check",
+            frozenset({OutputKind.DOCTOR_REPAIR, OutputKind.MACHINE_IDENTITY_DIAGNOSIS}): "doctor-repair",
             frozenset({OutputKind.TASK_LIST, OutputKind.TASK_PAGE}): "task-list",
             frozenset({OutputKind.TASK_SHOW, OutputKind.TASK_WATCH}): "task-show",
             frozenset(
@@ -247,7 +248,7 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     )
 
     assert (
-        hashlib.sha256(text.encode()).hexdigest() == "323bcd7966b4b2adf80dd3943da737106883c884b687ec7abad294f08b7a4730"
+        hashlib.sha256(text.encode()).hexdigest() == "957d2a48a01001467e6c1f2b7aff54a4a574f9a21578cfe249713abdf0c49cae"
     )
 
 
@@ -261,6 +262,21 @@ def test_root_help_has_descriptions_without_suppressed_placeholders(capsys) -> N
     assert "==SUPPRESS==" not in output
     for command in ("status", "task", "group", "machine", "agent", "config", "admin"):
         assert command in output
+
+
+def test_admin_repair_help_discloses_both_scopes() -> None:
+    parser = build_parser()
+    admin = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction)).choices[
+        "admin"
+    ]
+    repair = next(action for action in admin._actions if isinstance(action, argparse._SubParsersAction)).choices[
+        "repair"
+    ]
+    help_text = repair.format_help()
+
+    assert "qexp admin repair identity --dry-run" in help_text
+    assert "Project metadata repair requires --project PATH" in help_text
+    assert "Identity diagnosis requires --dry-run and no Project" in help_text
 
 
 def test_short_daily_options_have_command_local_meanings() -> None:

@@ -314,12 +314,21 @@ def main(argv: list[str] | None = None) -> int:
             and args.scope == "global"
         ):
             return _finalize_outcome(args, dispatch_config_notifications(args))
-        is_local = handler in LOCAL_HANDLERS and (
-            not handler.startswith("config_") or getattr(args, "section", None) == "agent"
+        is_identity_repair = handler == "admin_repair" and getattr(args, "repair_target", None) == "identity"
+        is_local = (
+            handler in LOCAL_HANDLERS
+            and (not handler.startswith("config_") or getattr(args, "section", None) == "agent")
+            and (handler != "admin_repair" or is_identity_repair)
         )
         if is_local:
             return _finalize_outcome(args, dispatch_local(handler, args))
-        if handler in {"admin_check", "admin_repair", "admin_clean"} and getattr(args, "project", None) is None:
+        if handler == "admin_repair" and getattr(args, "dry_run", False):
+            raise CliUsageError("--dry-run is only valid with 'qexp admin repair identity'.")
+        if (
+            handler in {"admin_check", "admin_repair", "admin_clean"}
+            and not is_identity_repair
+            and getattr(args, "project", None) is None
+        ):
             raise CliUsageError(f"admin {handler.removeprefix('admin_')} requires explicit --project PATH.")
         if handler == "submit":
             try:

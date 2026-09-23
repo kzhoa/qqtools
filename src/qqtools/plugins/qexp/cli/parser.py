@@ -906,7 +906,20 @@ def build_parser() -> argparse.ArgumentParser:
     admin = commands.add_parser("admin", help="Run bounded Project maintenance and machine upgrade operations.")
     admin_sub = admin.add_subparsers(dest="admin_action", required=True)
     for name in ("check", "repair"):
-        action = admin_sub.add_parser(name, help=f"Run bounded metadata {name} checks.")
+        action_help = (
+            "Repair bounded Project metadata or diagnose MachineRuntime identity (automatic restoration unavailable)."
+            if name == "repair"
+            else f"Run bounded metadata {name} checks."
+        )
+        action = admin_sub.add_parser(name, help=action_help)
+        if name == "repair":
+            action.add_argument(
+                "repair_target",
+                nargs="?",
+                choices=("identity",),
+                help="Diagnose MachineRuntime identity; automatic restoration is unavailable and --dry-run is required.",
+            )
+            action.add_argument("--dry-run", action="store_true")
         action.add_argument("--strict", action="store_true")
         action.add_argument("--max-work-items", type=int, default=64)
         _add_output_format(action)
@@ -915,7 +928,11 @@ def build_parser() -> argparse.ArgumentParser:
             handler=f"admin_{name}",
             context=ContextKind.PROJECT_WRITE if name == "repair" else ContextKind.PROJECT_READ,
             modes=OutputMode.FINITE,
-            output_kinds=OutputKind.DOCTOR_VERIFY if name == "check" else OutputKind.DOCTOR_REPAIR,
+            output_kinds=(
+                OutputKind.DOCTOR_VERIFY
+                if name == "check"
+                else {OutputKind.DOCTOR_REPAIR, OutputKind.MACHINE_IDENTITY_DIAGNOSIS}
+            ),
         )
     clean = admin_sub.add_parser(
         "clean",

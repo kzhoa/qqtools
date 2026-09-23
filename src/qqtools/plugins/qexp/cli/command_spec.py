@@ -58,7 +58,6 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
     machine_wide = spec.context is ContextKind.MACHINE or spec.handler.startswith("agent_config_")
     explicit_project = spec.handler in {
         "admin_check",
-        "admin_repair",
         "admin_clean",
         "admin_operation_show",
     } or spec.handler.startswith("admin_migrate_")
@@ -71,6 +70,11 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
     elif spec.handler == "init":
         scope = "The MachineRuntime selected by --machine-runtime-root."
         prerequisite = "Pass an explicit --machine NAME; no Project selection is used."
+    elif spec.handler == "admin_repair":
+        scope = "Selected MachineRuntime identity for identity --dry-run; one explicit Project for metadata repair."
+        prerequisite = (
+            "Identity diagnosis requires --dry-run and no Project; Project metadata repair requires --project PATH."
+        )
     elif machine_wide:
         scope = "Machine-wide; --project does not narrow this operation."
         prerequisite = "Initialize the MachineRuntime with `qexp init --machine NAME` first."
@@ -172,6 +176,7 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
         "use": "qexp use --project PATH",
         "submit": "qexp submit --project PATH -- COMMAND [ARG...]",
         "config_set": "qexp config set progress --interval-seconds 30 --project PATH",
+        "admin_repair": "qexp admin repair identity --dry-run",
         "admin_migrate_schema": "qexp admin migrate schema --project PATH --to-schema 6",
         "admin_migrate_schema6_attest": (
             "qexp admin migrate schema6 attest --project PATH --machine NAME "

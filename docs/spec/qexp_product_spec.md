@@ -137,6 +137,28 @@ Errors identify the affected path and direct access failures to runtime selectio
 permission checks, or damaged identity to preservation and recovery of the original identity.
 Validation must not synthesize identity or change durable runtime data on these failures.
 
+`qexp admin repair identity --dry-run` diagnoses the selected MachineRuntime without
+requiring a Project or loading Agent configuration. Select the root with
+`--machine-runtime-root` or `QEXP_MACHINE_RUNTIME_ROOT`; otherwise the default
+machine root is used. The result reports the selected path and source, inspected
+evidence, passed and blocked checks, and one next action. JSON output uses
+`--format=json`. A verified identity is `healthy` with exit status 0. Fresh,
+damaged, inconsistent, pending-replacement, or host-unverified state is `blocked`
+with exit status 1; an inspection failure is `failed` with exit status 1.
+`healthy` covers identity, current-generation, binding, and host-continuity checks
+only. It does not certify Agent configuration or readiness. The diagnosis makes
+no filesystem changes. `qexp admin repair identity` without `--dry-run` is a
+usage error because automatic identity restoration is unavailable. Project
+metadata maintenance remains `qexp --project PATH admin repair`.
+
+If diagnosis reports `host_continuity_unverified`, preserve the runtime and seek
+machine-level evidence of its original host; matching IDs and paths alone do not
+authorize repair. `host_mismatch` requires investigation on the original host.
+For `replacement_pending`, resume the recorded `qexp init --machine NAME`
+transaction with its original target and policy. Neither result authorizes
+copying an archived identity into the current generation or replacing identity
+to make the diagnostic pass.
+
 `--detach-old-runtime` is an explicit recovery-responsibility exception for a copied environment.
 It permits unresolved evidence to be preserved in an isolated archive when local execution is
 known not to be live. It does not finalize work, release resources, adopt ownership, or prove that

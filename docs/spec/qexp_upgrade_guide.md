@@ -50,6 +50,24 @@ runtime identity. Retry a failed register or start step without repeating init. 
 only recovery copy of unfinished work; ordinary initialization requires the original runtime to
 finish terminal publication, claim archival, reservation release, and recovery cleanup first.
 
+## Diagnose a damaged MachineRuntime identity
+
+Run the read-only diagnostic on the machine that owns the runtime:
+
+```bash
+qexp admin repair identity --dry-run --format json
+```
+
+Use `--machine-runtime-root PATH` when diagnosing a selected nondefault root. The
+result shows that path, how it was selected, each identity evidence check, and a
+next action. `healthy` has exit status 0 and covers identity only; Agent
+configuration and readiness are outside its scope. `blocked` or `failed` has
+exit status 1. A blocked result does not authorize `qexp init` as a recovery
+shortcut: `init` creates a new identity. A pending replacement must resume its
+recorded target through the existing `init` procedure. Automatic identity
+restoration is unavailable, so the same command without `--dry-run` is a usage
+error and changes nothing.
+
 ## Machine-rolling coordinator for supported future protocols
 
 For a release covered by the machine-rolling coordinator contract, the normal operation on each
