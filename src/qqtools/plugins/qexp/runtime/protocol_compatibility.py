@@ -16,6 +16,7 @@ TASK_DEPENDENCIES_CAPABILITY = "task-dependencies-v1"
 GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
 LOCAL_RECOVERY_CAPABILITY = "local-recovery-v1"
 GROUP_AUTHORITY_CAPABILITY = "group-authority-v2"
+GROUP_SERVICE_CAPABILITY = "group-service-v1"
 READY_WRITER_CAPABILITY = "ready-v1"
 CURRENT_READY_WRITER_CAPABILITY = "ready-v2"
 OBSERVATION_CAPABILITY = "task-observation-v1"
@@ -30,6 +31,7 @@ SUPPORTED_REQUIRED_CAPABILITIES = frozenset(
         GROUP_READY_MEMBERS_CAPABILITY,
         LOCAL_RECOVERY_CAPABILITY,
         GROUP_AUTHORITY_CAPABILITY,
+        GROUP_SERVICE_CAPABILITY,
         OBSERVATION_CAPABILITY,
         SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
     }
@@ -71,6 +73,7 @@ def manifest_schema_digest(schema: dict[str, Any]) -> str:
             not in {
                 LOCAL_RECOVERY_CAPABILITY,
                 GROUP_AUTHORITY_CAPABILITY,
+                GROUP_SERVICE_CAPABILITY,
                 OBSERVATION_CAPABILITY,
                 SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
             }

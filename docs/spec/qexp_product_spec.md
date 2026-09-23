@@ -1658,6 +1658,8 @@ Default behavior:
   disabling a Project does not change it
 - in on-demand mode, unresolved demand, maintenance errors, or local execution evidence prevent
   idle exit
+- retained Group history and optional `group-service-v1` maintenance locators do not by themselves
+  prevent idle exit; a later normal start resumes their durable work
 - qexp does not remotely wake other machines
 
 Daemon mode is the default; on-demand is explicit:

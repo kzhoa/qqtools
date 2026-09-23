@@ -1,6 +1,6 @@
 # qexp Group Service Quiescence Protocol
 
-Status: proposed; implementation requires protocol and compatibility approval.
+Status: approved for implementation and compatibility activation on 2026-09-23.
 
 ## Purpose and boundary
 
@@ -353,7 +353,7 @@ activation. `daemon` remains resident; `on_demand` may exit only through its exi
 
 ## Activation, mixed versions and repair
 
-### Compatibility decision proposed for approval
+### Approved compatibility decision
 
 The protocol requires a new permanent `group-service-v1` writer capability and a temporary
 `QQTOOLS-COMPAT-0017` rolling-activation item. The supported source is 1.3.21 and the target is

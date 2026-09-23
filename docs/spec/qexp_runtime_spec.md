@@ -1683,30 +1683,33 @@ refer to a cleaned Task and does not establish current Task existence or state.
 
 Before committed Submission finalization clears its Group pending locator, it
 publishes discoverable membership debt. Submission does not wait for historical
-backfill. Initial background discovery reads retained Submission sources;
-completed bootstrap uses the active debt directory on subsequent passes and
-restarts. Interrupted debt consumption retains either the debt or an already
-durable publication. Source confirmation uses byte/operation slices, while
-membership publication uses bounded per-row record operations.
+backfill. Before `group-service-v1` activation, background discovery retains its
+historical Group and Submission sweeps. The fenced activation in
+[the Group service quiescence protocol](qexp_group_service_quiescence.md) performs
+the final resumable history capture. After the activation record becomes
+`active`, ordinary discovery consumes only the fixed-shard Group service locators
+and per-Group debt; it never recreates the historical Submission sweep. Interrupted
+debt consumption retains either the debt or an already durable publication.
+Source confirmation uses byte/operation slices, while membership publication
+uses bounded per-row record operations.
 
 The service runs outside scheduling and renewal paths and does not independently
 keep an otherwise idle on-demand agent alive. Stopping the agent requests source
 cleanup without affecting running Tasks. Group cancellation and Worker removal
-consume this coverage in the canonical namespace. The worker retains per-Group
-confirmation state and rotates after one step. Each Group alternates discovery
-and maintenance visits; a large source, pending finalization, or maintenance
-failure cannot monopolize logical service. Registry refresh preserves unchanged
-bindings and discovers new Groups while earlier bootstraps remain unfinished.
-Removed or disabled bindings stop receiving work and release owned resources
-cooperatively. This cache scales with known Groups; it is not a fixed-memory
-promise for an unlimited Group count.
+consume this coverage in the canonical namespace. The single Group service
+thread visits activated lanes in the repeating ratio two control turns, one
+membership turn, and one maintenance turn. It retains at most 64 Group sessions,
+16 parser or recovery owners, 16 closing owners, 64 candidates per source, and
+256 service descriptors. Excess work stays in the durable locators and is
+revisited fairly. Repeated failures back off through 1, 2, 4, 8, 16 and 32 seconds,
+capped at 60 seconds. Removed or disabled bindings release owned resources
+cooperatively.
 
-One machine turn admits at most one Group-directory discovery step, one Group
-work step, and one cooperative cleanup step. Source steps retain their 256 KiB,
+One machine turn admits at most one locator, advances one bounded Group operation,
+and advances one cooperative close. Source steps retain their 256 KiB,
 32-operation and 20 ms soft-deadline limits; Group publication retains its existing
 per-record bounds. No Group receives a dedicated thread. These are cooperative
-work limits, not a bound on blocking filesystem calls or fsync latency. Large
-machine-scale qualification remains required before complete feature promotion.
+work limits, not a bound on blocking filesystem calls or fsync latency.
 
 Ready classification, scheduler eligibility, availability transitions and dependency
 checks use bounded Submission visibility. The authoritative operation JSON remains
@@ -1746,12 +1749,14 @@ whole-machine latency and I/O qualification remain separate acceptance evidence.
 ### 11.3.3 Discovery metadata maintenance
 
 Maintenance runs on the background discovery worker, outside scheduling and
-renewal. It alternates four bounded lanes: resolved change prefixes, completed
-cancellation receipts, confirmed-source audit scratch, and obsolete change
-journal generations. Each step processes one directory entry, event, or deletion;
-recursive bulk removal is forbidden. Failure preserves retryable responsibility
-and a diagnostic under the identity-bound coverage `maintenance/status.json`.
-Unchanged idle visits do not rewrite diagnostic records.
+renewal. A `maintenance` Group service locator admits its four bounded lanes:
+resolved change prefixes, completed cancellation receipts, confirmed-source
+audit scratch, and obsolete change journal generations. Each step processes one
+directory entry, event, or deletion; recursive bulk removal is forbidden. Its
+identity-bound quiescence checkpoint survives eviction, and the shared locator is
+acknowledged only after a complete pass proves no eligible debt remains. Failure
+preserves retryable responsibility and a bounded diagnostic. Unchanged idle
+visits do not rewrite diagnostic records.
 
 Journal reclamation scans the existing active Group-operation directory across
 steps. A complete pass requires unchanged directory identity and revision,

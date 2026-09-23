@@ -362,6 +362,11 @@ def _finalize_submission_group_locked(cfg: Any, submission: dict[str, Any]) -> N
         )
     group = read_json(group_file)
     normalize_group_record(group)
+    from .group_discovery.service import publish_group_locator_for_transition
+
+    # QQTOOLS-COMPAT-0017: the membership locator is dual-published before
+    # finalization clears the existing pending-commit recovery owner.
+    publish_group_locator_for_transition(cfg, group_name, "membership", "submission_finalize")
     pending = group["group"].get("pending_submission_commit") or {}
     if not pending:
         return
@@ -549,6 +554,11 @@ def _execute_submission_locked(
 
     if group_name:
         with group_lock(cfg.shared_root, group_name):
+            from .group_discovery.service import publish_group_locator_for_transition
+
+            # QQTOOLS-COMPAT-0017: publish before the first Group pending or
+            # staged membership write; the submission operation owns recovery.
+            publish_group_locator_for_transition(cfg, group_name, "membership", "submission_commit")
             if plan.create_group or plan.worker_set_additions:
                 is_submission_group_publication_root(cfg, is_required=True)
             group_file = group_path(cfg.shared_root, group_name)

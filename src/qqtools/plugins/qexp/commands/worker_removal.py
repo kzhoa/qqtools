@@ -36,6 +36,15 @@ def can_bind_worker_removal(cfg: RootConfig) -> bool:
 
 def _persist_operation(cfg: RootConfig, operation: dict[str, Any]) -> None:
     control = operation["group_control"]
+    group_name = control.get("group_name")
+    if isinstance(group_name, str) and group_name:
+        from ..runtime.group_discovery.service import publish_group_locator_for_transition
+
+        # QQTOOLS-COMPAT-0017: keep removal recovery discoverable before its
+        # active operation is replaced or archived.
+        publish_group_locator_for_transition(cfg, group_name, "control", "group_operation")
+        if control.get("state") in {"completed", "superseded"}:
+            publish_group_locator_for_transition(cfg, group_name, "maintenance", "metadata_cleanup")
     control["updated_at"] = utc_now()
     operation["meta"]["revision"] += 1
     operation["meta"]["updated_at"] = control["updated_at"]
@@ -121,6 +130,10 @@ def begin_worker_removal_locked(
         from .worker_removal_discovery import initialize_removal_discovery
 
         initialize_removal_discovery(cfg, operation["group_control"], data)
+        from ..runtime.group_discovery.service import publish_group_locator_for_transition
+
+        # QQTOOLS-COMPAT-0017: publish before creating Worker removal intent.
+        publish_group_locator_for_transition(cfg, data["group"]["name"], "control", "group_operation")
         write_active_operation(cfg, "group_control", operation_id, operation)
     _reconcile_locked(cfg, data, operation, allow_settlement=False)
     return {**data, "worker_control": _control_snapshot(operation["group_control"])}

@@ -13,16 +13,18 @@ import json
 import os
 import stat
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator
 
+from ..directory_capture import read_directory_entry
 from ..group_namespace import group_authority_identity, is_group_authority_isolated
 from ..locks import exclusive, group_writer_lock
 from ..paths import shared_paths, submission_path
-from ..records import validate_group_name, validate_identifier
+from ..records import utc_now, validate_group_name, validate_identifier
 from ..store import atomic_replace, read_json, read_json_limited, require_json_size
 from .coverage import GroupCoverage
 from .receipt import decode_receipt
@@ -34,6 +36,8 @@ _MAX_RECEIPT_BYTES = 16 * 1024
 _LANE_IDLE_SECONDS = 1.0
 _TREE_MAX_DEPTH = 8
 _STATUS_VERSION = 1
+_QUIESCENCE_VERSION = 1
+_MAINTENANCE_LANES = ("journal", "receipts", "sources", "generations")
 _REVISION_KEYS = frozenset({"device", "inode", "size", "mtime_ns", "ctime_ns"})
 _PENDING_STATES = frozenset({"preparing", "converging", "waiting_ack", "blocked"})
 _CANCEL_TERMINAL_STATES = frozenset({"completed"})
@@ -59,6 +63,7 @@ class _DirectoryRevision:
 
     device: int
     inode: int
+    size: int
     mtime_ns: int
     ctime_ns: int
 
@@ -74,20 +79,19 @@ class _LaneResult:
 @dataclass(slots=True)
 class _TreeFrame:
     path: Path
-    iterator: os.ScandirIterator | None = None
+    offset: int = 0
     depth: int = 0
     identity: tuple[int, int] | None = None
 
 
 class _DirectoryScanner:
-    """Keep one directory iterator and consume no more than one entry at a time."""
+    """Consume one entry per call through a durable Linux directory cookie."""
 
-    __slots__ = ("path", "_iterator", "_opened", "_missing", "_closed")
+    __slots__ = ("path", "offset", "_missing", "_closed")
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, offset: int = 0):
         self.path = path
-        self._iterator: os.ScandirIterator | None = None
-        self._opened = False
+        self.offset = offset
         self._missing = False
         self._closed = False
 
@@ -99,39 +103,31 @@ class _DirectoryScanner:
     def missing(self) -> bool:
         return self._missing
 
-    def next_entry(self) -> os.DirEntry[str] | None | _Missing:
+    @property
+    def open_descriptor_count(self) -> int:
+        return 0
+
+    def next_entry(self) -> Any | None | _Missing:
         """Return one entry, EOF, or an absent-directory sentinel."""
 
         if self._closed:
             return None
-        if self._iterator is None and not self._opened:
-            self._opened = True
-            try:
-                info = self.path.lstat()
-            except FileNotFoundError:
-                self._missing = True
-                self.close()
-                return _MISSING
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                raise ValueError(f"maintenance directory is not a real directory: {self.path}")
-            self._iterator = os.scandir(self.path)
-        iterator = self._iterator
-        if iterator is None:
-            return None
         try:
-            return next(iterator)
-        except StopIteration:
+            name, next_offset = read_directory_entry(self.path, self.offset)
+        except FileNotFoundError:
+            self._missing = True
+            self.close()
+            return _MISSING
+        self.offset = next_offset
+        if name is None:
             self.close()
             return None
+        return SimpleNamespace(name=name, path=str(self.path / name))
 
     def close(self) -> None:
         if self._closed:
             return
-        iterator = self._iterator
-        self._iterator = None
         self._closed = True
-        if iterator is not None:
-            iterator.close()
 
 
 class _TreeCleaner:
@@ -146,6 +142,10 @@ class _TreeCleaner:
         self._initialized = False
         self._done = False
         self._closed = False
+
+    @property
+    def open_descriptor_count(self) -> int:
+        return 0
 
     @property
     def is_closed(self) -> bool:
@@ -182,23 +182,13 @@ class _TreeCleaner:
                 if ancestor.identity is not None and ancestor.identity != (info.st_dev, info.st_ino):
                     raise ValueError(f"cleanup directory identity changed: {ancestor.path}")
                 ancestor.identity = (info.st_dev, info.st_ino)
-            if frame.iterator is None:
-                try:
-                    info = frame.path.lstat()
-                except FileNotFoundError:
-                    self._stack.pop()
-                    continue
-                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                    raise ValueError(f"cleanup directory was replaced: {frame.path}")
-                frame.iterator = os.scandir(frame.path)
-
             try:
-                entry = next(frame.iterator)
-            except StopIteration:
-                iterator = frame.iterator
-                frame.iterator = None
-                if iterator is not None:
-                    iterator.close()
+                name, next_offset = read_directory_entry(frame.path, frame.offset)
+            except FileNotFoundError:
+                self._stack.pop()
+                continue
+            frame.offset = next_offset
+            if name is None:
                 self._stack.pop()
                 if frame.path == self.root:
                     if self.remove_root:
@@ -210,7 +200,8 @@ class _TreeCleaner:
                 _remove_directory(frame.path)
                 return "progressed", True
 
-            name = _entry_name(entry)
+            if not isinstance(name, str) or not name or name in {".", ".."} or "/" in name:
+                raise ValueError("maintenance directory entry name is invalid")
             child = frame.path / name
             try:
                 info = child.lstat()
@@ -235,11 +226,6 @@ class _TreeCleaner:
         if self._closed:
             return
         self._closed = True
-        for frame in self._stack:
-            iterator = frame.iterator
-            frame.iterator = None
-            if iterator is not None:
-                iterator.close()
         self._stack.clear()
 
 
@@ -323,12 +309,34 @@ class GroupMaintenance:
         self._capture_root_revision: _DirectoryRevision | None = None
         self._capture_operation_revision: _DirectoryRevision | None = None
         self._capture_changed = False
+        self._quiescence: dict[str, Any] | None = None
+        self._quiescence_generation: int | None = None
 
     @property
     def is_closed(self) -> bool:
         """Whether all maintenance-owned iterators have been released."""
 
         return self._closed
+
+    @property
+    def open_descriptor_count(self) -> int:
+        """Return descriptors currently owned by this maintenance session."""
+
+        scanners = (
+            self._journal_pass.scanner if self._journal_pass is not None else None,
+            self._receipt_scan,
+            self._source_scan,
+            self._generation_scan,
+            self._capture_scan,
+            self._capture_operation_scan,
+        )
+        count = sum(scanner.open_descriptor_count for scanner in scanners if scanner is not None)
+        cleaners = (
+            self._receipt_job.cleaner if self._receipt_job is not None else None,
+            self._source_job.cleaner if self._source_job is not None else None,
+            self._generation_job,
+        )
+        return count + sum(cleaner.open_descriptor_count for cleaner in cleaners if cleaner is not None)
 
     def request_close(self) -> None:
         """Request cooperative iterator cleanup."""
@@ -339,7 +347,7 @@ class GroupMaintenance:
         if not self._has_open_resources():
             self._closed = True
 
-    def advance(self) -> dict[str, object]:
+    def advance(self, *, locator_generation: int | None = None) -> dict[str, object]:
         """Perform one bounded step from the next round-robin lane."""
 
         if self._closed:
@@ -349,9 +357,12 @@ class GroupMaintenance:
             self._closed = True
             return self._result("closed", None, "closed")
 
+        if locator_generation is not None:
+            self._begin_quiescence(locator_generation)
+
         lane_index = self._next_lane
         self._next_lane = (self._next_lane + 1) % 4
-        lane = ("journal", "receipts", "sources", "generations")[lane_index]
+        lane = _MAINTENANCE_LANES[lane_index]
         self._counters[lane]["steps"] += 1
         if time.monotonic() < self._cooldown[lane_index]:
             return self._result("waiting", "cooldown", lane)
@@ -379,7 +390,306 @@ class GroupMaintenance:
             persisted = self._persist_diagnostic("progressed", outcome.reason or "deleted", lane)
             if persisted is not None:
                 outcome = _LaneResult("error", persisted, deleted=True, diagnostic=False)
+        if locator_generation is not None:
+            self._checkpoint_quiescence(lane, outcome)
         return self._result(outcome.state, outcome.reason, lane)
+
+    def _quiescence_path(self) -> Path:
+        return self._coverage.directory / "maintenance" / "quiescence-v1.json"
+
+    def _quiescence_identity(self) -> dict[str, Any]:
+        return {**self._require_identity_without_group(), "group": self._group}
+
+    @staticmethod
+    def _revision_value(value: _DirectoryRevision | None) -> dict[str, int] | None:
+        if value is None:
+            return None
+        return {
+            "device": value.device,
+            "inode": value.inode,
+            "size": value.size,
+            "mtime_ns": value.mtime_ns,
+            "ctime_ns": value.ctime_ns,
+        }
+
+    def _lane_directory(self, lane: str) -> Path:
+        directory = self._coverage_directory_required()
+        if lane == "journal":
+            return shared_paths(self._root)["group_control_active"]
+        if lane == "receipts":
+            return directory / "operations"
+        if lane == "sources":
+            return directory / "maintenance" / "sources"
+        if lane == "generations":
+            return directory / "rechecks"
+        raise ValueError(f"unknown maintenance quiescence lane: {lane}")
+
+    def _new_quiescence(self, generation: int) -> dict[str, Any]:
+        return {
+            "version": _QUIESCENCE_VERSION,
+            "identity": self._quiescence_identity(),
+            "locator_generation": generation,
+            "pass_id": uuid.uuid4().hex,
+            "next_lane": _MAINTENANCE_LANES[self._next_lane],
+            "lanes": {
+                lane: {
+                    "state": "pending",
+                    "directory_revision": None,
+                    "cookie": 0,
+                    "job": None,
+                    "accumulator": {},
+                }
+                for lane in _MAINTENANCE_LANES
+            },
+        }
+
+    def _valid_quiescence(self, value: object, generation: int) -> bool:
+        if type(value) is not dict or set(value) != {
+            "version",
+            "identity",
+            "locator_generation",
+            "pass_id",
+            "next_lane",
+            "lanes",
+        }:
+            return False
+        if (
+            value["version"] != _QUIESCENCE_VERSION
+            or value["identity"] != self._quiescence_identity()
+            or value["locator_generation"] != generation
+            or value["next_lane"] not in _MAINTENANCE_LANES
+        ):
+            return False
+        try:
+            parsed = uuid.UUID(value["pass_id"])
+        except (ValueError, TypeError, AttributeError):
+            return False
+        if parsed.int == 0 or value["pass_id"] not in {parsed.hex, str(parsed)}:
+            return False
+        lanes = value["lanes"]
+        if type(lanes) is not dict or set(lanes) != set(_MAINTENANCE_LANES):
+            return False
+        lane_fields = {"state", "directory_revision", "cookie", "job", "accumulator"}
+        revision_fields = {"device", "inode", "size", "mtime_ns", "ctime_ns"}
+        for lane in _MAINTENANCE_LANES:
+            item = lanes[lane]
+            if type(item) is not dict or set(item) != lane_fields:
+                return False
+            revision = item["directory_revision"]
+            if revision is not None and (
+                type(revision) is not dict
+                or set(revision) != revision_fields
+                or any(type(part) is not int or part < 0 for part in revision.values())
+            ):
+                return False
+            job = item["job"]
+            if job is not None:
+                if type(job) is not dict:
+                    return False
+                if lane == "receipts":
+                    if set(job) != {"operation_id"} or not isinstance(job["operation_id"], str):
+                        return False
+                elif lane == "sources":
+                    if (
+                        set(job) != {"operation_id", "revision"}
+                        or not isinstance(job["operation_id"], str)
+                        or type(job["revision"]) is not dict
+                        or set(job["revision"]) != _REVISION_KEYS
+                        or any(type(part) is not int or part < 0 for part in job["revision"].values())
+                    ):
+                        return False
+                elif lane == "generations":
+                    if set(job) != {"generation"} or not isinstance(job["generation"], str):
+                        return False
+                else:
+                    return False
+            if (
+                item["state"] not in {"pending", "scanning", "complete"}
+                or type(item["cookie"]) is not int
+                or item["cookie"] < 0
+                or type(item["accumulator"]) is not dict
+            ):
+                return False
+        return True
+
+    def _begin_quiescence(self, generation: int) -> None:
+        if type(generation) is not int or generation < 1:
+            raise ValueError("maintenance locator generation must be a positive integer")
+        if not self._canonical_ready():
+            raise RuntimeError("maintenance quiescence requires canonical Group authority")
+        if self._quiescence_generation == generation and self._quiescence is not None:
+            return
+        try:
+            value = read_json_limited(
+                self._quiescence_path(),
+                max_bytes=_MAX_RECORD_BYTES,
+                record_type="group_maintenance_quiescence",
+            )
+        except (FileNotFoundError, OSError, RuntimeError, ValueError, KeyError, TypeError):
+            value = None
+        if not self._valid_quiescence(value, generation):
+            value = self._new_quiescence(generation)
+        else:
+            for lane, item in value["lanes"].items():
+                if item["state"] != "complete":
+                    continue
+                current = self._revision_value(_directory_revision(self._lane_directory(lane), allow_missing=True))
+                if current != item["directory_revision"]:
+                    value = self._new_quiescence(generation)
+                    break
+        self._quiescence = value
+        self._quiescence_generation = generation
+        self._next_lane = _MAINTENANCE_LANES.index(value["next_lane"])
+        self._persist_quiescence()
+
+    def _persist_quiescence(self) -> None:
+        value = self._quiescence
+        if value is None:
+            return
+        require_json_size(value, max_bytes=_MAX_RECORD_BYTES, record_type="group_maintenance_quiescence")
+        path = self._quiescence_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_replace(path, value)
+
+    def _lane_has_open_resources(self, lane: str) -> bool:
+        if lane == "journal":
+            return self._journal_pass is not None
+        if lane == "receipts":
+            return self._receipt_scan is not None or self._receipt_job is not None
+        if lane == "sources":
+            return any(
+                item is not None
+                for item in (
+                    self._source_scan,
+                    self._source_job,
+                    self._capture_scan,
+                    self._capture_operation_scan,
+                )
+            )
+        return self._generation_scan is not None or self._generation_job is not None
+
+    def _resume_cookie(self, lane: str, directory: Path) -> int:
+        value = self._quiescence
+        if value is None:
+            return 0
+        item = value["lanes"][lane]
+        current = self._revision_value(_directory_revision(directory, allow_missing=True))
+        if item["state"] == "scanning" and item["directory_revision"] == current:
+            return item["cookie"]
+        return 0
+
+    def _lane_cookie(self, lane: str) -> int:
+        scanner = {
+            "journal": self._journal_pass.scanner if self._journal_pass is not None else None,
+            "receipts": self._receipt_scan,
+            "sources": self._source_scan,
+            "generations": self._generation_scan,
+        }[lane]
+        return scanner.offset if scanner is not None else 0
+
+    def _lane_job_identity(self, lane: str) -> dict[str, Any] | None:
+        if lane == "receipts" and self._receipt_job is not None:
+            return {"operation_id": self._receipt_job.operation_id}
+        if lane == "sources" and self._source_job is not None:
+            return {
+                "operation_id": self._source_job.operation_id,
+                "revision": _revision_dict(self._source_job.revision),
+            }
+        if lane == "generations" and self._generation_root is not None:
+            return {"generation": self._generation_root.name}
+        return None
+
+    def _lane_accumulator(self, lane: str, outcome: _LaneResult) -> dict[str, Any]:
+        accumulator: dict[str, Any] = {"state": outcome.state, "reason": outcome.reason}
+        if lane == "journal" and self._journal_pass is not None:
+            current = self._journal_pass
+            accumulator.update(
+                generation=current.position.generation,
+                tail=current.position.tail,
+                minimum=current.minimum,
+                count=current.count,
+            )
+        return accumulator
+
+    def _lane_is_quiescent(self, lane: str, outcome: _LaneResult) -> bool:
+        terminal = {
+            "journal": {"journal_idle", "journal_retention_reached"},
+            "receipts": {"receipt_idle", "receipt_directory_missing", "receipt_scan_complete"},
+            "sources": {"source_cleanup_idle", "source_cleanup_directory_missing", "source_cleanup_scan_complete"},
+            "generations": {"journal_idle", "rechecks_directory_missing", "obsolete_generation_scan_complete"},
+        }
+        if outcome.state == "error" or outcome.reason not in terminal[lane] or self._lane_has_open_resources(lane):
+            return False
+        if lane == "sources" and self._capture_complete is not True:
+            return False
+        return True
+
+    def _checkpoint_quiescence(self, lane: str, outcome: _LaneResult) -> None:
+        value = self._quiescence
+        if value is None:
+            return
+        item = value["lanes"][lane]
+        if self._lane_is_quiescent(lane, outcome):
+            item.update(
+                state="complete",
+                directory_revision=self._revision_value(
+                    _directory_revision(self._lane_directory(lane), allow_missing=True)
+                ),
+                cookie=0,
+                job=None,
+                accumulator={"result": outcome.reason},
+            )
+            self._last_errors.pop(lane, None)
+        else:
+            job = self._lane_job_identity(lane)
+            item.update(
+                state="scanning",
+                directory_revision=self._revision_value(
+                    _directory_revision(self._lane_directory(lane), allow_missing=True)
+                ),
+                # A selected mutating job restarts the lane from zero after a
+                # crash; its authoritative debt record is the progress proof.
+                cookie=0 if job is not None else self._lane_cookie(lane),
+                job=job,
+                accumulator=self._lane_accumulator(lane, outcome),
+            )
+        value["next_lane"] = _MAINTENANCE_LANES[self._next_lane]
+        self._persist_quiescence()
+
+    def acknowledge_if_quiescent(self, locator_generation: int) -> bool:
+        """Retire one maintenance locator after its durable pass remains stable."""
+
+        self._begin_quiescence(locator_generation)
+        cfg = SimpleNamespace(shared_root=self._root)
+        with group_writer_lock(cfg, self._group, blocking=False) as acquired:
+            if not acquired:
+                return False
+
+            def retirement_ready() -> bool:
+                value = self._quiescence
+                if (
+                    value is None
+                    or value["locator_generation"] != locator_generation
+                    or self._has_open_resources()
+                    or self._last_errors
+                    or any(value["lanes"][lane]["state"] != "complete" for lane in _MAINTENANCE_LANES)
+                ):
+                    return False
+                for lane in _MAINTENANCE_LANES:
+                    current = self._revision_value(_directory_revision(self._lane_directory(lane), allow_missing=True))
+                    if current != value["lanes"][lane]["directory_revision"]:
+                        return False
+                return True
+
+            from . import locator
+
+            return locator.acknowledge_group_locator_locked(
+                cfg,
+                self._group,
+                "maintenance",
+                locator_generation,
+                retirement_ready=retirement_ready,
+            )
 
     def _advance_journal(self) -> _LaneResult:
         if not self._canonical_ready():
@@ -437,8 +747,32 @@ class GroupMaintenance:
             _directory_revision(active_path, allow_missing=False)
             _sync_directory(active_path)
             active_revision = _directory_revision(active_path, allow_missing=False)
-            scanner = _DirectoryScanner(active_path)
-            self._journal_pass = _JournalPass(position, active_path, active_revision, scanner, position.tail)
+            offset = self._resume_cookie("journal", active_path)
+            minimum = position.tail
+            count = 0
+            if offset and self._quiescence is not None:
+                accumulator = self._quiescence["lanes"]["journal"]["accumulator"]
+                if (
+                    accumulator.get("generation") == position.generation
+                    and accumulator.get("tail") == position.tail
+                    and type(accumulator.get("minimum")) is int
+                    and type(accumulator.get("count")) is int
+                    and accumulator["minimum"] >= 0
+                    and accumulator["count"] >= 0
+                ):
+                    minimum = accumulator["minimum"]
+                    count = accumulator["count"]
+                else:
+                    offset = 0
+            scanner = _DirectoryScanner(active_path, offset=offset)
+            self._journal_pass = _JournalPass(
+                position,
+                active_path,
+                active_revision,
+                scanner,
+                minimum,
+                count=count,
+            )
             return None
 
     def _inspect_active_record(self, current: _JournalPass, entry: os.DirEntry[str]) -> None:
@@ -510,11 +844,7 @@ class GroupMaintenance:
         if revision != current.active_revision:
             return False
         latest = self._rechecks.snapshot(initialize=False)
-        return (
-            latest is not None
-            and latest.generation == current.position.generation
-            and current.count == len(current.names)
-        )
+        return latest is not None and latest.generation == current.position.generation
 
     def _reclaim_journal(self, current: _JournalPass) -> _LaneResult:
         if current.minimum < 0:
@@ -574,7 +904,7 @@ class GroupMaintenance:
             if _directory_revision(directory, allow_missing=True) is None:
                 self._set_cooldown(1)
                 return _LaneResult("waiting", "receipt_idle")
-            self._receipt_scan = _DirectoryScanner(directory)
+            self._receipt_scan = _DirectoryScanner(directory, offset=self._resume_cookie("receipts", directory))
         with self._writer_lock() as acquired:
             if not acquired:
                 return _LaneResult("waiting", "group_writer_busy")
@@ -664,7 +994,7 @@ class GroupMaintenance:
             if _directory_revision(directory, allow_missing=True) is None:
                 self._set_cooldown(2)
                 return _LaneResult("waiting", "source_cleanup_idle")
-            self._source_scan = _DirectoryScanner(directory)
+            self._source_scan = _DirectoryScanner(directory, offset=self._resume_cookie("sources", directory))
         entry = self._source_scan.next_entry()
         if entry is _MISSING:
             self._source_scan = None
@@ -897,7 +1227,9 @@ class GroupMaintenance:
                     self._set_cooldown(3)
                     return _LaneResult("waiting", "rechecks_directory_missing")
                 self._generation_number = position.generation
-                self._generation_scan = _DirectoryScanner(directory)
+                self._generation_scan = _DirectoryScanner(
+                    directory, offset=self._resume_cookie("generations", directory)
+                )
         with self._writer_lock() as acquired:
             if not acquired:
                 return _LaneResult("waiting", "group_writer_busy")
@@ -1088,21 +1420,28 @@ def enqueue_source_cleanup(root: Path, group: str, operation_id: str, revision: 
         raise TypeError("revision must be a SourceRevision")
     if not is_group_authority_isolated(root):
         return
-    coverage = GroupCoverage(root, group)
-    directory = coverage.directory
-    record = {
-        "version": 1,
-        "group": group,
-        "operation_id": operation_id,
-        "revision": _revision_dict(revision),
-    }
-    require_json_size(record, max_bytes=_MAX_RECORD_BYTES, record_type="source_cleanup_debt")
-    sources = directory / "maintenance" / "sources"
-    _ensure_directory_chain(sources, directory)
-    path = sources / f"{_source_debt_digest(operation_id, revision)}.json"
-    atomic_replace(path, record)
-    _sync_directory(directory / "maintenance")
-    _sync_directory(directory)
+    cfg = SimpleNamespace(shared_root=root)
+    with group_writer_lock(cfg, group):
+        from .service import publish_group_locator_for_transition
+
+        # QQTOOLS-COMPAT-0017: create the maintenance wake-up before adding
+        # source cleanup debt or clearing the active membership source owner.
+        publish_group_locator_for_transition(cfg, group, "maintenance", "source_cleanup")
+        coverage = GroupCoverage(root, group)
+        directory = coverage.directory
+        record = {
+            "version": 1,
+            "group": group,
+            "operation_id": operation_id,
+            "revision": _revision_dict(revision),
+        }
+        require_json_size(record, max_bytes=_MAX_RECORD_BYTES, record_type="source_cleanup_debt")
+        sources = directory / "maintenance" / "sources"
+        _ensure_directory_chain(sources, directory)
+        path = sources / f"{_source_debt_digest(operation_id, revision)}.json"
+        atomic_replace(path, record)
+        _sync_directory(directory / "maintenance")
+        _sync_directory(directory)
 
 
 def _entry_name(entry: os.DirEntry[str]) -> str:
@@ -1134,7 +1473,7 @@ def _directory_revision(path: Path, *, allow_missing: bool) -> _DirectoryRevisio
         raise
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise ValueError(f"maintenance path is not a directory: {path}")
-    return _DirectoryRevision(info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+    return _DirectoryRevision(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 def _sync_directory(path: Path) -> None:

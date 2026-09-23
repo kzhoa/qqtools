@@ -23,6 +23,7 @@ from .framework import (
     register_migration,
     upgrade_journal_path,
 )
+from .group_service import GROUP_SERVICE_TARGET_PROTOCOL, GroupServiceMigration
 from .machine import (
     MachineUpgradeBudget,
     MachineUpgradeWorker,
@@ -59,4 +60,6 @@ __all__ = [
     "register_migration",
     "UPGRADE_JOURNAL_CAPABILITY",
     "UpgradeJournalMigration",
+    "GROUP_SERVICE_TARGET_PROTOCOL",
+    "GroupServiceMigration",
 ]

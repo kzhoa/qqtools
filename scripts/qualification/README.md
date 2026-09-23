@@ -44,6 +44,22 @@ runner I/O is excluded. Pagination asserts complete truth traversal and bounded
 index work for each page. Run large qualifications sequentially to avoid workload
 interference.
 
+## Group service quiescence
+
+```bash
+PYTHONPATH=src ~/.cache/qqtools/tox/unit/bin/python \
+  -m scripts.qualification.profile_group_service_quiescence \
+  --output /tmp/qexp-group-service-quiescence
+```
+
+The output directory must not exist. The default qualification measures locator
+traversal with 0, 1,000, 10,000, and 100,000 retained Groups, performs 100,000
+accelerated locator lifecycles, and runs a 24-hour real-process soak. It retains
+source hashes, filesystem/cache conditions, descriptor, thread, RSS, traversal,
+churn, and soak samples in `results.json`. Run the large profile sequentially and
+retain its output as release evidence. Smaller `--histories`, `--cycles`, and
+`--soak-seconds` values are development smoke checks rather than Phase C evidence.
+
 ## Released writer gate qualification
 
 `probe_qexp_writer_fences.py` characterizes actual source from local release refs,

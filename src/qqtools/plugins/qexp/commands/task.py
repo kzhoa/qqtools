@@ -311,10 +311,16 @@ def edit_dependencies(
             candidate = TaskRecord.from_dict(task.to_dict())
             candidate.depends_on_task_ids = updated
             validate_group_dependencies(cfg, task.group_name, [candidate])
-            task.depends_on_task_ids = updated
-            task.meta["revision"] += 1
-            task.meta["updated_at"] = utc_now()
-            save_task(cfg, task)
+            with record_task_change(
+                cfg,
+                task,
+                "dependency_edit",
+                details={"action": action},
+            ):
+                task.depends_on_task_ids = updated
+                task.meta["revision"] += 1
+                task.meta["updated_at"] = utc_now()
+                save_task(cfg, task)
             return task
 
 

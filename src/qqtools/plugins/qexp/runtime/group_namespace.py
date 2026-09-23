@@ -53,11 +53,11 @@ def _identity(path: Path) -> dict[str, int] | None:
     return {"device": value.st_dev, "inode": value.st_ino}
 
 
-def _directory_identity(path: Path) -> dict[str, Any] | None:
+def _directory_identity(path: Path, *, storage: Any | None = None) -> dict[str, Any] | None:
     if _identity(path) is None:
         return None
     try:
-        value = read_json_limited(path / _IDENTITY_FILE, max_bytes=4096)["group_directory"]
+        value = _read_limited(path / _IDENTITY_FILE, max_bytes=4096, storage=storage)["group_directory"]
     except FileNotFoundError as exc:
         raise RuntimeError("Group authority directory identity is missing") from exc
     if (
@@ -73,9 +73,15 @@ def _directory_identity(path: Path) -> dict[str, Any] | None:
     return value
 
 
-def _read_journal(root: Path) -> dict[str, Any] | None:
+def _read_limited(path: Path, *, max_bytes: int, storage: Any | None = None) -> dict[str, Any]:
+    if storage is not None:
+        return storage.read_json_limited(path, max_bytes=max_bytes)
+    return read_json_limited(path, max_bytes=max_bytes)
+
+
+def _read_journal(root: Path, *, storage: Any | None = None) -> dict[str, Any] | None:
     try:
-        value = read_json_limited(journal_path(root), max_bytes=8192)["group_authority"]
+        value = _read_limited(journal_path(root), max_bytes=8192, storage=storage)["group_authority"]
     except FileNotFoundError:
         return None
     if (
@@ -95,12 +101,12 @@ def _read_journal(root: Path) -> dict[str, Any] | None:
     return value
 
 
-def group_directory(root: Path) -> Path:
+def group_directory(root: Path, *, storage: Any | None = None) -> Path:
     """Select current truth, including an interrupted atomic directory move."""
-    journal = _read_journal(root)
+    journal = _read_journal(root, storage=storage)
     if journal is None:
         try:
-            schema = read_json_limited(root / "schema/version.json", max_bytes=16384)["schema"]
+            schema = _read_limited(root / "schema/version.json", max_bytes=16384, storage=storage)["schema"]
         except FileNotFoundError:
             schema = {}
         if GROUP_AUTHORITY_CAPABILITY in schema.get("required_capabilities", []):
@@ -108,22 +114,22 @@ def group_directory(root: Path) -> Path:
         return root / "groups"
     destination = root / _GROUP_DIRECTORY
     identity = journal["source_identity"]
-    target = _directory_identity(destination)
+    target = _directory_identity(destination, storage=storage)
     if target is not None:
         if target != identity:
             raise RuntimeError("Group authority destination identity changed")
         return destination
     source = root / "groups"
-    if journal["phase"] == "prepared" and _directory_identity(source) == identity:
+    if journal["phase"] == "prepared" and _directory_identity(source, storage=storage) == identity:
         # The rename can occur between the two stats. Prefer its destination.
-        target = _directory_identity(destination)
+        target = _directory_identity(destination, storage=storage)
         if target is not None:
             if target != identity:
                 raise RuntimeError("Group authority destination identity changed")
             return destination
         return source
     # Retry the destination after a concurrent source rename.
-    if _directory_identity(destination) == identity:
+    if _directory_identity(destination, storage=storage) == identity:
         return destination
     raise RuntimeError("Group authority directory is missing or changed")
 
@@ -227,18 +233,18 @@ def has_group_authority_cutover(root: Path) -> bool:
     return _read_journal(root) is not None
 
 
-def is_group_authority_isolated(root: Path) -> bool:
-    journal = _read_journal(root)
+def is_group_authority_isolated(root: Path, *, storage: Any | None = None) -> bool:
+    journal = _read_journal(root, storage=storage)
     if journal is None or journal["phase"] != "completed":
         return False
-    if group_directory(root) != root / _GROUP_DIRECTORY:
+    if group_directory(root, storage=storage) != root / _GROUP_DIRECTORY:
         raise RuntimeError("Group authority completed without its canonical directory")
     return True
 
 
-def group_authority_identity(root: Path) -> dict[str, Any]:
-    journal = _read_journal(root)
-    if journal is None or not is_group_authority_isolated(root):
+def group_authority_identity(root: Path, *, storage: Any | None = None) -> dict[str, Any]:
+    journal = _read_journal(root, storage=storage)
+    if journal is None or not is_group_authority_isolated(root, storage=storage):
         raise RuntimeError("Group authority namespace is not active")
     return {"project_id": journal["project_id"], "directory_identity": journal["source_identity"]}
 

@@ -147,10 +147,20 @@ def record_task_change(
         yield
         return
 
+    # QQTOOLS-COMPAT-0017: dual-publish while the historical Group service
+    # remains enabled; publication becomes mandatory after the writer fence.
+    from .service import publish_group_locator_for_transition
+
+    publish_group_locator_for_transition(cfg, task.group_name, "control", "task_change")
+
     journal = GroupRechecks(cfg.shared_root, task.group_name)
     if journal.snapshot() is None:
         yield
         return
+
+    # The recheck ticket becomes eligible for metadata reclamation once its
+    # settlement closes; publish maintenance work before beginning that ticket.
+    publish_group_locator_for_transition(cfg, task.group_name, "maintenance", "metadata_cleanup")
 
     persisted_task = load_task(cfg, task.task_id)
     evidence = _before_evidence(cfg, persisted_task, {} if details is None else details)

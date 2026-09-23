@@ -7,12 +7,21 @@ the source writers it declares.
 
 from __future__ import annotations
 
+import json
+import os
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from ...config_types import RootConfig
-from ...runtime.store import atomic_replace, authorized_migration_json_io, json_encoded_size, read_json_limited
+from ...runtime.store import (
+    JSONRecordSizeError,
+    atomic_replace,
+    authorized_migration_json_io,
+    json_encoded_size,
+    read_json_limited,
+)
 
 MigrationPhase = Literal[
     "expansion",
@@ -195,9 +204,56 @@ class UpgradeStorage:
         with authorized_migration_json_io():
             return read_json_limited(path, max_bytes=size)
 
+    def read_json_limited(self, path: Path, *, max_bytes: int) -> dict[str, Any]:
+        """Read one bounded, non-symlink JSON record through the migration budget."""
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise ValueError("max_bytes must be a positive integer")
+        self._budget.consume_metadata_ops()
+        with authorized_migration_json_io():
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise RuntimeError(f"migration JSON record is not a regular file: {path}")
+                self._budget.consume_io_bytes(metadata.st_size)
+                if metadata.st_size > max_bytes:
+                    raise JSONRecordSizeError(
+                        f"JSON record exceeds its {max_bytes}-byte limit: {path}.",
+                        record_type="migration_record",
+                        actual_bytes=metadata.st_size,
+                        limit_bytes=max_bytes,
+                    )
+                encoded = bytearray()
+                while len(encoded) <= max_bytes:
+                    chunk = os.read(descriptor, min(8192, max_bytes + 1 - len(encoded)))
+                    if not chunk:
+                        break
+                    encoded.extend(chunk)
+            finally:
+                os.close(descriptor)
+        if len(encoded) > max_bytes:
+            raise JSONRecordSizeError(
+                f"JSON record exceeds its {max_bytes}-byte limit: {path}.",
+                record_type="migration_record",
+                actual_bytes=len(encoded),
+                limit_bytes=max_bytes,
+            )
+        try:
+            value = json.loads(encoded)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"migration JSON record is malformed: {path}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"migration JSON record is not an object: {path}")
+        return value
+
     def exists(self, path: Path) -> bool:
         self._budget.consume_metadata_ops()
         return path.exists()
+
+    def account_metadata_ops(self, count: int) -> None:
+        """Charge non-JSON filesystem work performed by a migration adapter."""
+
+        self._budget.consume_metadata_ops(count)
 
     def atomic_replace(self, path: Path, value: dict[str, Any]) -> None:
         size = json_encoded_size(value)

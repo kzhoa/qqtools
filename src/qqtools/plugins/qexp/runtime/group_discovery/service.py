@@ -15,16 +15,19 @@ cleanup deterministic when the worker is stopped during a source projection.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from ...agent.context import MachineRuntime, ProjectBinding
+from ..directory_capture import read_directory_entry
 from ..group_namespace import (
     GroupNotPublished,
     GroupPublicationUnavailable,
@@ -33,6 +36,7 @@ from ..group_namespace import (
     is_group_authority_isolated,
     read_group,
 )
+from ..locks import group_writer_lock
 from ..paths import group_path, shared_paths, submission_path
 from ..records import validate_group_name, validate_identifier
 from ..store import atomic_replace, read_json_limited, require_json_size
@@ -57,9 +61,15 @@ _DEBT_DIRECTORY_NAME = "active"
 _DEBT_RESCAN_SECONDS = 0.25
 # These bounds cap cooperative work requested per slice; they are not hard
 # latency guarantees for filesystem calls or synchronization.
-_WORKER_WAIT_SECONDS = 0.01
+_WORKER_WAIT_SECONDS = 0.001
 _WORKER_IDLE_SECONDS = 1.0
 _WORKER_COOLDOWN_SECONDS = 1.0
+_LOCATOR_LANE_CYCLE = ("control", "control", "membership", "maintenance")
+_MAX_RESIDENT_GROUPS = 64
+_MAX_PARSER_OWNERS = 16
+_MAX_CLOSE_WORK = 16
+_MAX_LOCATOR_CANDIDATES = 64
+_MAX_SERVICE_DESCRIPTORS = 256
 
 
 @dataclass(slots=True)
@@ -70,8 +80,17 @@ class _GroupServiceEntry:
     binding_key: tuple[str, str, str]
     binding: ProjectBinding
     group: str
-    service: Any
-    maintenance: Any
+    service: Any | None
+    maintenance: Any | None
+    locator_records: dict[str, dict[str, Any]] = field(default_factory=dict)
+    locator_observed_at: dict[str, float] = field(default_factory=dict)
+    locator_mode: bool = False
+    pending_lane: str | None = None
+    control_generation: int | None = None
+    control_sequence: int = 1
+    retry_delay: float = 1.0
+    locator_retry_delay: dict[str, float] = field(default_factory=dict)
+    locator_cooldown_until: dict[str, float] = field(default_factory=dict)
     service_turn: bool = True
     cooldown_until: float = 0.0
     restart_after_close: bool = False
@@ -188,15 +207,67 @@ def publish_submission_debt(root: Path, group: str, operation_id: str) -> Path |
     return path
 
 
+def publish_group_locator_for_transition(
+    cfg: Any,
+    group: str,
+    lane: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Dual-publish a Group service locator at an existing Group writer fence.
+
+    Before the compatibility fence is installed, the historical discovery path
+    remains authoritative and an unavailable locator layout is tolerated. Once
+    activation fences old writers, locator publication becomes part of the
+    transition and failure must stop the covered effect.
+
+    The caller must already hold the schema and Group writer fences. This helper
+    deliberately takes no additional lock so locator generation and retirement
+    remain serialized by the existing Group lock.
+    """
+
+    if not is_group_authority_isolated(cfg.shared_root):
+        return None
+
+    from . import activation, locator
+
+    activation_path = cfg.shared_root / "schema" / "group-service.json"
+    try:
+        activation_record = read_json_limited(activation_path, max_bytes=_MAX_RECORD_BYTES)
+    except FileNotFoundError:
+        fenced = False
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        # A present but unreadable activation record cannot lower the writer
+        # floor. Fail closed as though the fence had already been installed.
+        fenced = True
+    else:
+        state = activation_record.get("state")
+        fenced = state != "preparing"
+
+    active = activation.is_group_service_active(cfg.shared_root)
+    try:
+        return locator.publish_group_locator_locked(cfg, group, lane, reason)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        if fenced or active:
+            raise
+        return None
+
+
 class GroupDiscoveryService:
     """Advance one Group's source qualification and membership coverage."""
 
-    def __init__(self, root: Path, group: str) -> None:
+    def __init__(self, root: Path, group: str, *, mode: str = "legacy", locator_generation: int | None = None) -> None:
         self._root = _absolute_path(root, "root")
         validated_group = validate_group_name(group)
         if validated_group is None:
             raise ValueError("group must be a nonempty identifier")
         self._group = validated_group
+        if mode not in {"legacy", "locator"}:
+            raise ValueError("Group discovery mode must be 'legacy' or 'locator'")
+        if mode == "locator" and (type(locator_generation) is not int or locator_generation < 1):
+            raise ValueError("locator mode requires a positive locator generation")
+        self._mode = mode
+        self._locator_generation = locator_generation
+        self._debt_offset = 0
 
         self._coverage: Any | None = None
         self._coverage_directory: Path | None = None
@@ -244,6 +315,83 @@ class GroupDiscoveryService:
 
         return self._closed
 
+    @property
+    def owns_source_parser(self) -> bool:
+        """Whether this service currently retains its one source recovery owner."""
+
+        return self._source is not None and not self._source.is_closed
+
+    def update_locator_generation(self, generation: int) -> None:
+        """Refresh the generation observed by the active locator traversal."""
+
+        if self._mode != "locator" or type(generation) is not int or generation < 1:
+            raise ValueError("a positive generation is required for locator mode")
+        changed = self._locator_generation is not None and generation != self._locator_generation
+        self._locator_generation = generation
+        if changed and self._phase == "blocked" and self._active is None and self._source is None:
+            self._diagnostic_state = None
+            self._diagnostic_reason = None
+            self._debt_offset = 0
+            self._phase = "locator_debt"
+
+    def acknowledge_if_quiescent(self) -> bool:
+        """Acknowledge this membership locator only after shared proof is complete."""
+
+        if self._mode != "locator" or self._locator_generation is None:
+            return False
+        from . import activation, locator
+
+        cfg = SimpleNamespace(shared_root=self._root)
+        with group_writer_lock(cfg, self._group, blocking=False) as acquired:
+            if not acquired or not activation.is_group_service_active(self._root):
+                return False
+
+            def retirement_ready() -> bool:
+                if (
+                    not self._initialized
+                    or self._active is not None
+                    or self._source is not None
+                    or self._sweep is not None
+                    or self._pending_candidates
+                    or self._phase != "ready"
+                    or self._diagnostic_state in {"error", "ambiguous"}
+                ):
+                    return False
+                status = self._coverage_status()
+                if not bool(_status_field(status, "is_complete", False)) or _status_field(status, "reason") is not None:
+                    return False
+                debt_directory = _debt_directory(self._root, self._group)
+                try:
+                    name, _offset = read_directory_entry(debt_directory, 0)
+                except FileNotFoundError:
+                    name = None
+                if name is not None:
+                    return False
+                group = read_group(self._root, self._group)
+                pending = group.get("group", {}).get("pending_submission_commit")
+                if pending:
+                    return False
+                creation_owner = group.get("group", {}).get("creation_operation_id")
+                if creation_owner:
+                    operation = read_json_limited(
+                        submission_path(self._root, creation_owner), max_bytes=_MAX_RECORD_BYTES
+                    )
+                    submission = operation.get("submission")
+                    if not isinstance(submission, dict) or submission.get("state") not in {"committed", "aborted"}:
+                        return False
+                return True
+
+            try:
+                return locator.acknowledge_group_locator_locked(
+                    cfg,
+                    self._group,
+                    "membership",
+                    self._locator_generation,
+                    retirement_ready=retirement_ready,
+                )
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                return False
+
     def request_close(self) -> None:
         """Request cooperative cleanup; the next advances perform all I/O."""
 
@@ -263,6 +411,14 @@ class GroupDiscoveryService:
         try:
             if not self._initialized:
                 return self._initialize()
+            if (
+                self._mode == "locator"
+                and self._active is None
+                and self._source is None
+                and not self._pending_candidates
+                and self._phase in {"locator_debt", "ready", "coverage", "gap"}
+            ):
+                return self._advance_locator_debt()
             if self._diagnostic_state in {"error", "ambiguous"} and self._phase == "blocked":
                 return self._remember_status(self._diagnostic_state, self._diagnostic_reason)
             if self._active is not None and self._source is None and self._phase != "blocked":
@@ -292,6 +448,12 @@ class GroupDiscoveryService:
     def _initialize(self) -> dict[str, object]:
         from .coverage import GroupCoverage
 
+        if self._mode == "locator":
+            from .activation import is_group_service_active
+
+            if not is_group_service_active(self._root):
+                raise RuntimeError("locator-mode Group discovery requires active group-service-v1 evidence")
+
         # Construction is intentionally pure.  Canonical authority and the
         # coverage directory are validated only when the first service slice
         # is requested.
@@ -301,19 +463,65 @@ class GroupDiscoveryService:
         self._coverage_directory.mkdir(parents=True, exist_ok=True)
         self._background_path = self._coverage_directory / "background.json"
         self._active_path = self._coverage_directory / "active-source.json"
-        self._load_background()
+        if self._mode == "legacy":
+            self._load_background()
         self._load_active()
         self._initialized = True
         if self._active is not None:
             self._phase = "active_source"
-            self._start_sweep("debt" if self._bootstrap_complete else "bootstrap")
+            if self._mode == "legacy":
+                self._start_sweep("debt" if self._bootstrap_complete else "bootstrap")
             return self._remember_status("waiting", "resuming_source")
+        if self._mode == "locator":
+            self._phase = "locator_debt"
+            return self._remember_status("waiting", "initialized")
         self._phase = "ready" if self._bootstrap_complete else "bootstrap_sweep"
         if not self._bootstrap_complete:
             self._start_sweep("bootstrap")
         else:
             self._start_sweep("debt")
         return self._remember_status("waiting", "initialized")
+
+    def _advance_locator_debt(self) -> dict[str, object]:
+        """Inspect one durable membership debt entry without scanning history."""
+        directory = _debt_directory(self._root, self._group)
+        try:
+            name, next_offset = read_directory_entry(directory, self._debt_offset)
+        except FileNotFoundError:
+            self._debt_offset = 0
+            self._phase = "coverage"
+            return self._advance_locator_coverage()
+        self._debt_offset = next_offset
+        if name is None:
+            self._debt_offset = 0
+            self._phase = "coverage"
+            return self._advance_locator_coverage()
+        if not name.endswith(".json"):
+            return self._record_error(f"membership debt entry is malformed: {name!r}")
+        try:
+            validate_identifier(name[:-5], "source operation_id")
+        except (TypeError, ValueError) as exc:
+            return self._record_error(f"membership debt entry is malformed: {exc}")
+        candidate = directory / name
+        self._pending_candidates.append((candidate, True))
+        self._phase = "ready"
+        return self._start_pending_candidate()
+
+    def _advance_locator_coverage(self) -> dict[str, object]:
+        if self._coverage is None:
+            raise RuntimeError("coverage is unavailable")
+        try:
+            self._coverage.advance(max_members=_COVERAGE_ADVANCE_MEMBERS)
+        except Exception as exc:
+            return self._record_error(f"coverage advance failed: {type(exc).__name__}: {exc}")
+        status = self._coverage_status()
+        complete = bool(_status_field(status, "is_complete", False))
+        if complete and self._diagnostic_state not in {"error", "ambiguous"}:
+            self._phase = "ready"
+            return self._remember_status("complete", None, status)
+        self._phase = "blocked"
+        reason = _status_field(status, "reason") or "membership_coverage_incomplete_without_source_debt"
+        return self._record_error(str(reason))
 
     def _load_background(self) -> None:
         path = self._background_path
@@ -708,6 +916,12 @@ class GroupDiscoveryService:
         self._clear_active()
         if debt and debt_path is not None:
             self._delete_debt(Path(debt_path))
+        if self._mode == "locator":
+            # Source-debt removal changes its directory revision, so restart
+            # from zero instead of trusting a cookie across that mutation.
+            self._debt_offset = 0
+            self._phase = "locator_debt"
+            return self._remember_status("waiting", "source_finished")
         if self._sweep is not None and not self._sweep_complete and sweep_kind in {"bootstrap", "debt"}:
             self._phase = "bootstrap_sweep" if sweep_kind == "bootstrap" else "debt_sweep"
         else:
@@ -840,6 +1054,40 @@ class MachineGroupDiscoveryWorker:
         self._closing_binding_keys: set[tuple[str, str, str]] = set()
         self._close_work_counts: dict[tuple[str, str, str], int] = {}
         self._bindings_by_key: dict[tuple[str, str, str], ProjectBinding] = {}
+        self._locator_traversals: dict[tuple[tuple[str, str, str], str], Any] = {}
+        self._lane_turns: dict[tuple[str, str, str], int] = {}
+        self._pending_locator: tuple[str, dict[str, Any]] | None = None
+        self._active_project_slice = False
+        self._lane_metrics: dict[str, dict[str, int | float]] = {
+            lane: {
+                "pending_locators_encountered": 0,
+                "resident_entries": 0,
+                "completions": 0,
+                "retries": 0,
+                "evictions": 0,
+                "bytes": 0,
+                "reads": 0,
+                "writes": 0,
+                "descriptor_high_water": 0,
+                "cap_refusals": 0,
+                "oldest_pending_age_seconds": 0.0,
+            }
+            for lane in ("control", "membership", "maintenance")
+        }
+
+    @property
+    def metrics(self) -> dict[str, dict[str, int | float]]:
+        """Return the maintained counters without scanning shared history."""
+
+        now = time.monotonic()
+        for lane in self._lane_metrics:
+            observed = [
+                entry.locator_observed_at[lane] for entry in self._entries.values() if lane in entry.locator_observed_at
+            ]
+            self._lane_metrics[lane]["oldest_pending_age_seconds"] = max(
+                (now - started for started in observed), default=0.0
+            )
+        return {lane: dict(values) for lane, values in self._lane_metrics.items()}
 
     @property
     def is_alive(self) -> bool:
@@ -899,8 +1147,14 @@ class MachineGroupDiscoveryWorker:
                 if selected is not None:
                     _, binding, group = selected
                     self._admit_group(binding, group)
+                    if self._pending_locator is not None:
+                        lane, record = self._pending_locator
+                        self._advance_active_locator(binding, group, lane, record)
+                    elif not self._active_project_slice:
+                        self._advance_one_entry()
+                else:
+                    self._advance_one_entry()
                 self._restart_one_due()
-                self._advance_one_entry()
                 has_work = bool(bindings or self._entries or self._restart_due or self._close_queue or sweeps)
                 if self._stop.wait(_WORKER_WAIT_SECONDS if has_work else _WORKER_IDLE_SECONDS):
                     break
@@ -938,12 +1192,16 @@ class MachineGroupDiscoveryWorker:
             for key, entry in tuple(self._restart_due.items()):
                 if entry.binding_key == binding_key:
                     self._restart_due.pop(key, None)
-            sweep = sweeps.pop(binding_key, None)
-            if sweep is not None:
-                self._queue_sweep_close(sweep, binding_key, block_binding=True)
+            sweep = sweeps.get(binding_key)
+            if sweep is not None and self._queue_sweep_close(sweep, binding_key, block_binding=True):
+                sweeps.pop(binding_key, None)
             if self._close_work_counts.get(binding_key, 0) == 0:
                 self._closing_binding_keys.discard(binding_key)
+        for binding_key, sweep in tuple(sweeps.items()):
+            if binding_key not in current and self._queue_sweep_close(sweep, binding_key, block_binding=True):
+                sweeps.pop(binding_key, None)
         self._bindings_by_key = current
+        self._lane_turns = {key: turn for key, turn in self._lane_turns.items() if key in current}
 
     def _eligible_binding(self, binding: ProjectBinding) -> bool:
         """Check one binding's live eligibility without scanning the registry."""
@@ -964,6 +1222,81 @@ class MachineGroupDiscoveryWorker:
                 result.append(binding)
         return result
 
+    def _resident_entry_count(self) -> int:
+        entries = {id(entry): entry for entry in self._entries.values()}
+        entries.update({id(entry): entry for entry in self._restart_due.values()})
+        entries.update({id(work.owner): work.owner for work in self._close_work_index.values() if work.kind == "entry"})
+        return len(entries)
+
+    def _parser_owner_count(self) -> int:
+        entries = {id(entry): entry for entry in self._entries.values()}
+        entries.update({id(work.owner): work.owner for work in self._close_work_index.values() if work.kind == "entry"})
+        return sum(1 for entry in entries.values() if entry.service is not None and entry.service.owns_source_parser)
+
+    @staticmethod
+    def _activation_state(root: Path) -> str | None:
+        path = root / "schema" / "group-service.json"
+        try:
+            value = read_json_limited(path, max_bytes=_MAX_RECORD_BYTES)
+        except FileNotFoundError:
+            return None
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return "degraded"
+        if not isinstance(value, dict):
+            return "degraded"
+        state = value.get("state")
+        return state if state in {"preparing", "fenced", "building", "active", "degraded"} else "degraded"
+
+    def _close_legacy_binding_owners(
+        self,
+        binding_key: tuple[str, str, str],
+        sweeps: dict[tuple[str, str, str], SubmissionSourceSweep],
+    ) -> None:
+        sweep = sweeps.get(binding_key)
+        if sweep is not None and self._queue_sweep_close(sweep, binding_key):
+            sweeps.pop(binding_key, None)
+        for entry in tuple(self._entries.values()):
+            if entry.binding_key == binding_key and not entry.locator_mode:
+                if len(self._close_work_index) >= _MAX_CLOSE_WORK:
+                    return
+                self._queue_entry_close(entry)
+
+    def _advance_active_traversal(
+        self,
+        index: int,
+        binding: ProjectBinding,
+        key: tuple[str, str, str],
+    ) -> tuple[int, ProjectBinding, str] | None:
+        turn = self._lane_turns.get(key, 0)
+        lane = _LOCATOR_LANE_CYCLE[turn]
+        self._lane_turns[key] = (turn + 1) % len(_LOCATOR_LANE_CYCLE)
+        traversal_key = (key, lane)
+        try:
+            from .locator import GroupLocatorTraversal
+
+            traversal = self._locator_traversals.get(traversal_key)
+            if traversal is None:
+                traversal = GroupLocatorTraversal(binding.shared_root, lane)
+                self._locator_traversals[traversal_key] = traversal
+            record = traversal.advance()
+            self._lane_metrics[lane]["reads"] += 1
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            self._lane_metrics[lane]["retries"] += 1
+            return None
+        if record is None:
+            return None
+        self._lane_metrics[lane]["pending_locators_encountered"] += 1
+        self._lane_metrics[lane]["bytes"] += len(json.dumps(record, sort_keys=True, separators=(",", ":")).encode())
+        group = record["identity"]["group"]
+        try:
+            read_group(binding.shared_root, group)
+        except (FileNotFoundError, GroupNotPublished, GroupPublicationUnavailable):
+            # Preserve the locator and let this lane retry after other digests.
+            self._lane_metrics[lane]["retries"] += 1
+            return None
+        self._pending_locator = (lane, record)
+        return index, binding, group
+
     def _next_group(
         self,
         bindings: list[ProjectBinding],
@@ -971,6 +1304,8 @@ class MachineGroupDiscoveryWorker:
         complete_at: dict[tuple[str, str, str], float],
         start: int,
     ) -> tuple[int, ProjectBinding, str] | None:
+        self._pending_locator = None
+        self._active_project_slice = False
         if not bindings:
             return None
         index = start % len(bindings)
@@ -978,9 +1313,23 @@ class MachineGroupDiscoveryWorker:
         key = self._binding_key(binding)
         if key in self._closing_binding_keys:
             return None
-        if key not in sweeps and complete_at.get(key, 0.0) > time.monotonic():
+        known_activation_state = self._activation_state(binding.shared_root)
+        if (
+            known_activation_state not in {"active", "degraded"}
+            and key not in sweeps
+            and complete_at.get(key, 0.0) > time.monotonic()
+        ):
             return None
         if not self._eligible_binding(binding):
+            return None
+        activation_state = known_activation_state
+        if activation_state == "active":
+            self._active_project_slice = True
+            self._close_legacy_binding_owners(key, sweeps)
+            return self._advance_active_traversal(index, binding, key)
+        if activation_state == "degraded":
+            self._active_project_slice = True
+            self._close_legacy_binding_owners(key, sweeps)
             return None
         if key not in sweeps:
             try:
@@ -997,9 +1346,9 @@ class MachineGroupDiscoveryWorker:
                 soft_deadline=time.monotonic() + _SOURCE_SLICE_SECONDS,
             )
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-            sweeps.pop(key, None)
             complete_at[key] = time.monotonic() + _WORKER_COOLDOWN_SECONDS
-            self._queue_sweep_close(sweep, key)
+            if self._queue_sweep_close(sweep, key):
+                sweeps.pop(key, None)
             return None
         if step.candidates:
             group = step.candidates[0].stem
@@ -1012,20 +1361,33 @@ class MachineGroupDiscoveryWorker:
             sweeps.pop(key, None)
             complete_at[key] = time.monotonic() + _WORKER_COOLDOWN_SECONDS
         elif step.state == "failed":
-            sweeps.pop(key, None)
             complete_at[key] = time.monotonic() + _WORKER_COOLDOWN_SECONDS
-            self._queue_sweep_close(sweep, key)
+            if self._queue_sweep_close(sweep, key):
+                sweeps.pop(key, None)
         return None
 
-    def _new_entry(self, binding: ProjectBinding, group: str) -> _GroupServiceEntry:
-        service = GroupDiscoveryService(binding.shared_root, group)
-        try:
+    def _new_entry(
+        self,
+        binding: ProjectBinding,
+        group: str,
+        *,
+        locator_lane: str | None = None,
+        locator_record: dict[str, Any] | None = None,
+    ) -> _GroupServiceEntry:
+        locator_mode = locator_record is not None
+        service: GroupDiscoveryService | None = None
+        maintenance: Any | None = None
+        if not locator_mode:
+            service = GroupDiscoveryService(binding.shared_root, group)
+        elif locator_lane == "membership":
+            service = GroupDiscoveryService(
+                binding.shared_root,
+                group,
+                mode="locator",
+                locator_generation=locator_record["generation"],
+            )
+        if not locator_mode or locator_lane == "maintenance":
             maintenance = self._new_maintenance(binding.shared_root, group)
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-            service.request_close()
-            if not service.is_closed:
-                self._queue_simple_close("service", service, self._binding_key(binding))
-            raise
         return _GroupServiceEntry(
             key=self._group_key(binding, group),
             binding_key=self._binding_key(binding),
@@ -1033,6 +1395,10 @@ class MachineGroupDiscoveryWorker:
             group=group,
             service=service,
             maintenance=maintenance,
+            locator_records={locator_lane: locator_record} if locator_record is not None and locator_lane else {},
+            locator_observed_at={locator_lane: time.monotonic()} if locator_record is not None and locator_lane else {},
+            locator_mode=locator_mode,
+            pending_lane=locator_lane,
         )
 
     @staticmethod
@@ -1044,7 +1410,63 @@ class MachineGroupDiscoveryWorker:
 
     def _admit_group(self, binding: ProjectBinding, group: str) -> None:
         key = self._group_key(binding, group)
+        if self._pending_locator is not None:
+            lane, record = self._pending_locator
+            existing = self._entries.get(key)
+            candidate_count = sum(len(entry.locator_records) for entry in self._entries.values())
+            if existing is None and (
+                key in self._closing_group_keys
+                or self._resident_entry_count() >= _MAX_RESIDENT_GROUPS
+                or candidate_count >= _MAX_LOCATOR_CANDIDATES
+            ):
+                self._lane_metrics[lane]["cap_refusals"] += 1
+                if key not in self._closing_group_keys:
+                    self._evict_one_locator_entry(exclude=key)
+                return
+            if (
+                existing is not None
+                and lane not in existing.locator_records
+                and candidate_count >= _MAX_LOCATOR_CANDIDATES
+            ):
+                self._lane_metrics[lane]["cap_refusals"] += 1
+                self._evict_one_locator_entry(exclude=key)
+                return
+            if existing is None:
+                try:
+                    existing = self._new_entry(
+                        binding,
+                        group,
+                        locator_lane=lane,
+                        locator_record=record,
+                    )
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    self._lane_metrics[lane]["retries"] += 1
+                    return
+                self._entries[key] = existing
+                self._entry_queue.append(existing)
+            else:
+                existing.locator_mode = True
+                existing.locator_records[lane] = record
+                existing.locator_observed_at.setdefault(lane, time.monotonic())
+                existing.pending_lane = lane
+                if lane == "membership":
+                    if existing.service is None:
+                        existing.service = GroupDiscoveryService(
+                            binding.shared_root,
+                            group,
+                            mode="locator",
+                            locator_generation=record["generation"],
+                        )
+                    else:
+                        existing.service.update_locator_generation(record["generation"])
+                elif lane == "maintenance" and existing.maintenance is None:
+                    existing.maintenance = self._new_maintenance(binding.shared_root, group)
+            self._refresh_lane_residency()
+            return
         if key in self._entries or key in self._restart_due or key in self._closing_group_keys:
+            return
+        if self._resident_entry_count() >= _MAX_RESIDENT_GROUPS:
+            self._lane_metrics["membership"]["cap_refusals"] += 1
             return
         try:
             entry = self._new_entry(binding, group)
@@ -1052,6 +1474,28 @@ class MachineGroupDiscoveryWorker:
             return
         self._entries[key] = entry
         self._entry_queue.append(entry)
+
+    def _evict_one_locator_entry(self, *, exclude: tuple[str, str, str, str]) -> bool:
+        """Release one durable-locator owner so a later Group can enter the cap."""
+
+        if len(self._close_work_index) >= _MAX_CLOSE_WORK:
+            return False
+        for entry in tuple(self._entry_queue):
+            if entry.key == exclude or not entry.locator_mode or self._entries.get(entry.key) is not entry:
+                continue
+            self._queue_entry_close(entry)
+            return True
+        return False
+
+    def _refresh_lane_residency(self) -> None:
+        descriptors = self._service_descriptor_count()
+        for lane in self._lane_metrics:
+            self._lane_metrics[lane]["resident_entries"] = sum(
+                lane in entry.locator_records for entry in self._entries.values()
+            )
+            self._lane_metrics[lane]["descriptor_high_water"] = max(
+                self._lane_metrics[lane]["descriptor_high_water"], descriptors
+            )
 
     def _restart_one_due(self) -> None:
         if not self._restart_due:
@@ -1087,6 +1531,19 @@ class MachineGroupDiscoveryWorker:
             self._entry_queue.append(entry)
             if not self._eligible_binding(entry.binding):
                 continue
+            if entry.binding_key in self._closing_binding_keys:
+                self._queue_entry_close(entry, block_binding=True)
+                return
+            if entry.locator_mode:
+                if not entry.locator_records:
+                    self._queue_entry_close(entry)
+                    return
+                lane = entry.pending_lane or next(iter(entry.locator_records), None)
+                record = entry.locator_records.get(lane) if lane is not None else None
+                if lane is not None and record is not None:
+                    self._advance_active_locator(entry.binding, entry.group, lane, record)
+                    return
+                continue
             try:
                 read_group(entry.binding.shared_root, entry.group)
                 if not group_path(entry.binding.shared_root, entry.group).exists():
@@ -1118,6 +1575,261 @@ class MachineGroupDiscoveryWorker:
                 return
             return
 
+    def _advance_active_locator(
+        self,
+        binding: ProjectBinding,
+        group: str,
+        lane: str,
+        observed: dict[str, Any],
+    ) -> None:
+        key = self._group_key(binding, group)
+        entry = self._entries.get(key)
+        if entry is None or not entry.locator_mode:
+            return
+        now = time.monotonic()
+        if entry.locator_cooldown_until.get(lane, 0.0) > now:
+            return
+        from . import locator
+
+        try:
+            current = locator.read_group_locator(binding.shared_root, group, lane)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            self._schedule_entry_retry(entry, lane)
+            return
+        if current is None:
+            entry.locator_records.pop(lane, None)
+            entry.locator_observed_at.pop(lane, None)
+            entry.locator_retry_delay.pop(lane, None)
+            entry.locator_cooldown_until.pop(lane, None)
+            entry.pending_lane = next(iter(entry.locator_records), None)
+            self._refresh_lane_residency()
+            if lane == "membership" and entry.service is not None:
+                self._queue_entry_close(entry)
+            elif not entry.locator_records:
+                self._queue_entry_close(entry)
+            return
+        observed = current
+        entry.locator_records[lane] = current
+        entry.pending_lane = lane
+        self._refresh_lane_residency()
+        if lane == "membership":
+            service = entry.service
+            if service is None:
+                service = GroupDiscoveryService(
+                    binding.shared_root,
+                    group,
+                    mode="locator",
+                    locator_generation=observed["generation"],
+                )
+                entry.service = service
+            else:
+                service.update_locator_generation(observed["generation"])
+            parser_owners = self._parser_owner_count()
+            if not service.owns_source_parser and parser_owners >= _MAX_PARSER_OWNERS:
+                self._lane_metrics[lane]["cap_refusals"] += 1
+                return
+            if self._service_descriptor_count() >= _MAX_SERVICE_DESCRIPTORS:
+                self._lane_metrics[lane]["cap_refusals"] += 1
+                return
+            result = self._advance_current(service)
+            state = result.get("state")
+            if state == "complete":
+                try:
+                    acknowledged = service.acknowledge_if_quiescent()
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    acknowledged = False
+                if acknowledged:
+                    entry.locator_records.pop(lane, None)
+                    entry.locator_observed_at.pop(lane, None)
+                    entry.locator_retry_delay.pop(lane, None)
+                    entry.locator_cooldown_until.pop(lane, None)
+                    entry.pending_lane = next(iter(entry.locator_records), None)
+                    entry.service = None
+                    self._lane_metrics[lane]["completions"] += 1
+                    self._lane_metrics[lane]["writes"] += 1
+                    self._refresh_lane_residency()
+                    if not entry.locator_records:
+                        self._queue_entry_close(entry)
+                return
+            if state in {"error", "ambiguous"}:
+                self._schedule_entry_retry(entry, lane)
+            else:
+                entry.locator_retry_delay[lane] = 1.0
+                entry.locator_cooldown_until.pop(lane, None)
+            return
+        if lane == "control":
+            if self._advance_control_locator(entry, observed):
+                entry.locator_records.pop(lane, None)
+                entry.locator_observed_at.pop(lane, None)
+                entry.locator_retry_delay.pop(lane, None)
+                entry.locator_cooldown_until.pop(lane, None)
+                entry.pending_lane = next(iter(entry.locator_records), None)
+                self._lane_metrics[lane]["completions"] += 1
+                self._lane_metrics[lane]["writes"] += 1
+                self._refresh_lane_residency()
+                if not entry.locator_records:
+                    self._queue_entry_close(entry)
+            return
+        if lane == "maintenance":
+            maintenance = entry.maintenance
+            if maintenance is None:
+                maintenance = self._new_maintenance(binding.shared_root, group)
+                entry.maintenance = maintenance
+            try:
+                result = maintenance.advance(locator_generation=observed["generation"])
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                self._schedule_entry_retry(entry, lane)
+                return
+            if result.get("state") in {"error", "ambiguous", "waiting"}:
+                self._schedule_entry_retry(entry, lane)
+                return
+            entry.locator_retry_delay[lane] = 1.0
+            entry.locator_cooldown_until.pop(lane, None)
+            try:
+                acknowledged = maintenance.acknowledge_if_quiescent(observed["generation"])
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                acknowledged = False
+            if acknowledged:
+                entry.locator_records.pop(lane, None)
+                entry.locator_observed_at.pop(lane, None)
+                entry.locator_retry_delay.pop(lane, None)
+                entry.locator_cooldown_until.pop(lane, None)
+                entry.pending_lane = next(iter(entry.locator_records), None)
+                entry.maintenance = None
+                self._lane_metrics[lane]["completions"] += 1
+                self._lane_metrics[lane]["writes"] += 1
+                self._refresh_lane_residency()
+                if not entry.locator_records:
+                    self._queue_entry_close(entry)
+            return
+        raise RuntimeError(f"unknown Group service lane {lane!r}")
+
+    def _service_descriptor_count(self) -> int:
+        entries = {id(entry): entry for entry in self._entries.values()}
+        entries.update({id(work.owner): work.owner for work in self._close_work_index.values() if work.kind == "entry"})
+        return sum(
+            (1 if entry.service is not None and entry.service.owns_source_parser else 0)
+            + (entry.maintenance.open_descriptor_count if entry.maintenance is not None else 0)
+            for entry in entries.values()
+        )
+
+    def _schedule_entry_retry(self, entry: _GroupServiceEntry, lane: str) -> None:
+        delay = entry.locator_retry_delay.get(lane, 1.0)
+        entry.locator_cooldown_until[lane] = time.monotonic() + delay
+        entry.locator_retry_delay[lane] = min(delay * 2, 60.0)
+        self._lane_metrics[lane]["retries"] += 1
+
+    def _advance_control_locator(self, entry: _GroupServiceEntry, observed: dict[str, Any]) -> bool:
+        binding = entry.binding
+        group = entry.group
+        cfg = binding.root_config()
+        try:
+            from ...commands.group import reconcile_group_cancel_operations
+
+            reconcile_group_cancel_operations(
+                cfg,
+                group,
+                include_legacy=False,
+                reservation_runtime_root=cfg.runtime_root,
+            )
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            self._schedule_entry_retry(entry, "control")
+            return False
+
+        with group_writer_lock(cfg, group, blocking=False) as acquired:
+            if not acquired:
+                self._schedule_entry_retry(entry, "control")
+                return False
+            from .rechecks import GroupRechecks
+
+            journal = GroupRechecks(cfg.shared_root, group)
+            position = journal.snapshot()
+            if position is None:
+                entry.control_generation = None
+                entry.control_sequence = 1
+                return self._acknowledge_control_locked(cfg, entry, observed, journal, None)
+            retention = journal.retention(position)
+            if entry.control_generation != position.generation:
+                entry.control_generation = position.generation
+                entry.control_sequence = retention.deleted + 1
+            if entry.control_sequence <= retention.deleted:
+                entry.control_sequence = retention.deleted + 1
+            if entry.control_sequence <= position.tail:
+                sequence = entry.control_sequence
+                try:
+                    event = journal.read(position, sequence)
+                except (OSError, RuntimeError, ValueError, KeyError):
+                    self._schedule_entry_retry(entry, "control")
+                    return False
+                if event.get("state") == "in_flight":
+                    from ..locks import task_lock
+                    from .changes import settle_task_change
+
+                    task_id = event.get("task_id")
+                    if not isinstance(task_id, str):
+                        self._schedule_entry_retry(entry, "control")
+                        return False
+                    with task_lock(cfg.shared_root, task_id, blocking=False) as has_task_lock:
+                        if not has_task_lock:
+                            self._schedule_entry_retry(entry, "control")
+                            return False
+                        settled, _results = settle_task_change(cfg, event)
+                    if not settled:
+                        self._schedule_entry_retry(entry, "control")
+                        return False
+                entry.control_sequence += 1
+                entry.locator_retry_delay["control"] = 1.0
+                entry.locator_cooldown_until.pop("control", None)
+                return False
+            return self._acknowledge_control_locked(cfg, entry, observed, journal, position)
+
+    def _acknowledge_control_locked(
+        self,
+        cfg: Any,
+        entry: _GroupServiceEntry,
+        observed: dict[str, Any],
+        journal: Any,
+        position: Any | None,
+    ) -> bool:
+        from . import locator
+
+        def retirement_ready() -> bool:
+            latest = journal.snapshot()
+            if position is None:
+                if latest is not None:
+                    return False
+            elif (
+                latest is None
+                or latest.generation != position.generation
+                or latest.tail != position.tail
+                or entry.control_generation != latest.generation
+                or entry.control_sequence <= latest.tail
+            ):
+                return False
+            from ..operation_store import iter_active_operation_paths
+            from ..store import read_json
+
+            for operation_path in iter_active_operation_paths(cfg, "group_control", include_legacy=False):
+                operation = read_json(operation_path)
+                control = operation.get("group_control", {})
+                if control.get("group_name") == entry.group and control.get("state") not in {
+                    "completed",
+                    "superseded",
+                }:
+                    return False
+            return True
+
+        try:
+            return locator.acknowledge_group_locator_locked(
+                cfg,
+                entry.group,
+                "control",
+                observed["generation"],
+                retirement_ready=retirement_ready,
+            )
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return False
+
     def _queue_entry_close(
         self,
         entry: _GroupServiceEntry,
@@ -1125,18 +1837,21 @@ class MachineGroupDiscoveryWorker:
         restart: bool = False,
         block_binding: bool = False,
     ) -> None:
+        close_id = ("entry", id(entry))
+        if close_id in self._close_work_index:
+            return
+        if len(self._close_work_index) >= _MAX_CLOSE_WORK:
+            return
         if self._entries.get(entry.key) is entry:
             self._entries.pop(entry.key, None)
+        for lane in entry.locator_records:
+            self._lane_metrics[lane]["evictions"] += 1
         if block_binding:
             self._closing_binding_keys.add(entry.binding_key)
             entry.restart_after_close = False
             self._restart_due.pop(entry.key, None)
         elif restart:
             entry.restart_after_close = True
-        close_id = ("entry", id(entry))
-        existing = self._close_work_index.get(close_id)
-        if existing is not None:
-            return
         self._close_work_index[close_id] = _CloseWork(
             "entry",
             entry,
@@ -1152,20 +1867,25 @@ class MachineGroupDiscoveryWorker:
         binding_key: tuple[str, str, str],
         *,
         block_binding: bool = False,
-    ) -> None:
-        if block_binding:
-            self._closing_binding_keys.add(binding_key)
+    ) -> bool:
         close_id = ("sweep", id(sweep))
         if close_id in self._close_work_index:
-            return
+            return True
+        if len(self._close_work_index) >= _MAX_CLOSE_WORK:
+            return False
+        if block_binding:
+            self._closing_binding_keys.add(binding_key)
         work = _CloseWork("sweep", sweep, binding_key=binding_key)
         self._close_work_index[close_id] = work
         self._close_queue.append(work)
         self._close_work_counts[binding_key] = self._close_work_counts.get(binding_key, 0) + 1
+        return True
 
     def _queue_simple_close(self, kind: str, owner: Any, binding_key: tuple[str, str, str]) -> None:
         close_id = (kind, id(owner))
         if close_id in self._close_work_index:
+            return
+        if len(self._close_work_index) >= _MAX_CLOSE_WORK:
             return
         work = _CloseWork(kind, owner, binding_key=binding_key)
         self._close_work_index[close_id] = work
@@ -1189,6 +1909,10 @@ class MachineGroupDiscoveryWorker:
         if work.kind == "entry":
             entry = work.owner
             if work.phase == "service":
+                if entry.service is None:
+                    work.phase = "maintenance"
+                    work.requested = False
+                    return False
                 if not work.requested:
                     entry.service.request_close()
                     work.requested = True
@@ -1201,6 +1925,8 @@ class MachineGroupDiscoveryWorker:
                     work.phase = "maintenance"
                     work.requested = False
                 return False
+            if entry.maintenance is None:
+                return True
             if not work.requested:
                 entry.maintenance.request_close()
                 work.requested = True
@@ -1290,7 +2016,9 @@ class MachineGroupDiscoveryWorker:
         return state in {"error", "closed"}
 
     @staticmethod
-    def _close_service(service: GroupDiscoveryService) -> None:
+    def _close_service(service: GroupDiscoveryService | None) -> None:
+        if service is None:
+            return
         service.request_close()
         while not service.is_closed:
             try:
@@ -1315,6 +2043,8 @@ class MachineGroupDiscoveryWorker:
 
     @staticmethod
     def _close_maintenance(maintenance: Any) -> None:
+        if maintenance is None:
+            return
         maintenance.request_close()
         while not maintenance.is_closed:
             try:

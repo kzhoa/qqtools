@@ -26,6 +26,7 @@ from .contracts import (
     UpgradeSliceBudget,
     UpgradeStorage,
 )
+from .group_service import GroupServiceMigration
 from .production import UpgradeJournalMigration
 
 UPGRADE_JOURNAL_VERSION = 1
@@ -107,7 +108,7 @@ class MigrationRegistry:
         return tuple(ordered)
 
 
-DEFAULT_MIGRATIONS = MigrationRegistry([UpgradeJournalMigration()])
+DEFAULT_MIGRATIONS = MigrationRegistry([UpgradeJournalMigration(), GroupServiceMigration()])
 
 
 def register_migration(plugin: MigrationPlugin) -> None:
@@ -345,6 +346,20 @@ class UpgradeCoordinator:
                             "blockers": status["blockers"] + [f"completed_migration_drift:{name}" for name in drifted],
                         }
                     )
+            else:
+                protocol = _current_protocol(self.cfg)
+                status["available_migrations"] = [
+                    {
+                        "name": plugin.spec.name,
+                        "source_protocol": plugin.spec.source_protocol,
+                        "target_protocol": plugin.spec.target_protocol,
+                        "phase": plugin.spec.phases[0],
+                        "state": "runnable",
+                    }
+                    for plugin in self.registry.values()
+                    if (protocol in plugin.spec.compatible_readers or protocol == plugin.spec.source_protocol)
+                    and _is_applicable(plugin, self.cfg)
+                ]
             return status
         except OSError as exc:
             # A registered root can be temporarily unavailable. Preserve that distinction so

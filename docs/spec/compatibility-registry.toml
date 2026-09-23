@@ -1,4 +1,27 @@
-next_id = 17
+next_id = 18
+
+[[items]]
+id = "QQTOOLS-COMPAT-0017"
+component = "qexp.group-service-quiescence"
+kind = "runtime_protocol"
+status = "compatibility_active"
+summary = "Temporary mixed-version writer fence while obligation-driven Group locator service becomes the required discovery path."
+introduced_in = "1.3.22"
+legacy_removed_in = "1.4.0"
+transition_purged_in = "1.5.0"
+marker = "QQTOOLS-COMPAT-0017"
+owner = "qexp.runtime.group_discovery"
+verification = ["tests/integration/qexp/test_group_service_quiescence.py"]
+normal_level = "L1"
+recovery_level = "L1"
+source_versions = ["1.3.21"]
+target_version = "1.3.22"
+mixed_version_range = ["1.3.21-1.3.22.x"]
+normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
+machine_status_command = "qexp admin upgrade status"
+recovery_command = "qexp admin upgrade advance"
+workload_continuity = true
+interruption_budget_seconds = 1.0
 
 [[items]]
 id = "QQTOOLS-COMPAT-0016"

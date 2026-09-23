@@ -15,9 +15,14 @@ the candidate-reachable dependency closure and has regression coverage for
 unrelated malformed history, deep graphs, cycles, and record identity.
 
 Phase B1 produced the reviewed
-[Group service quiescence protocol](../../spec/qexp_group_service_quiescence.md),
-which remains proposed. Its compatibility decision was not approved, so the
-Phase B2 runtime implementation and Phase C qualification were not started.
+[Group service quiescence protocol](../../spec/qexp_group_service_quiescence.md).
+Its protocol and compatibility decision were approved on 2026-09-23. Phase B2
+now routes active discovery through three generation-fenced locator lanes owned by
+the machine upgrade coordinator, with bounded residency, per-Project fairness,
+durable maintenance checkpoints and explicit degraded repair. Phase C adds the
+0/1,000/10,000/100,000 Group fixtures, a 100,000-lifecycle stress case and the
+retained 24-hour soak command. The accelerated scale and lifecycle cases passed;
+the full 24-hour wall-clock soak remains separate retained release evidence.
 The proposal below is retained as historical planning context; current public
 specifications describe shipped behavior.
 
@@ -344,16 +349,16 @@ qualification commands/results as reproducible release evidence under test gover
 
 ## Delivery checklist and boundaries
 
-- [ ] Confirm Phase A call graph and relevant dependency mutation/locking invariants; capture baseline.
-- [ ] Implement targeted validation with focused safety and history-independence regression tests.
-- [ ] Deliver and review B1 records, producer/consumer inventory, locks, state machines, crash matrix,
+- [x] Confirm Phase A call graph and relevant dependency mutation/locking invariants; capture baseline.
+- [x] Implement targeted validation with focused safety and history-independence regression tests.
+- [x] Deliver and review B1 records, producer/consumer inventory, locks, state machines, crash matrix,
   residency classification, budgets, and mixed-version activation; obtain required compatibility approvals.
-- [ ] Only after B1 approval, implement B2 service retirement/wake-up and validate every handoff.
+- [x] Only after B1 approval, implement B2 service retirement/wake-up and validate every handoff.
 - [ ] Establish Phase C resource budgets, fair service, failure isolation, safe reclamation, and
   pressure diagnostics; run accelerated churn and real-time soak qualification.
-- [ ] Align public runtime/product specs, contract matrix, and active/history acceptance evidence with
+- [x] Align public runtime/product specs, contract matrix, and active/history acceptance evidence with
   delivered scope. Register temporary compatibility behavior only if introduced.
-- [ ] Run appropriate focused checks and required promotion gates; report all three phases
+- [x] Run appropriate focused checks and required promotion gates; report all three phases
   independently. Phase A may ship first, but the long-lived-agent objective is not complete until
   obligation-driven service and long-run resource convergence are qualified.
 

@@ -128,6 +128,12 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
         operation = read_json(operation_path)
         cleanup = operation.get("cleanup", {})
         if cleanup.get("state") != "completed":
+            if task.group_name:
+                from ..runtime.group_discovery.service import publish_group_locator_for_transition
+
+                # QQTOOLS-COMPAT-0017: refresh maintenance discovery before
+                # repairing Task cleanup ownership from an existing operation.
+                publish_group_locator_for_transition(cfg, task.group_name, "maintenance", "metadata_cleanup")
             task.control["cleanup_operation_id"] = cleanup.get("operation_id")
             task.control["cleanup_state"] = cleanup.get("state")
             task.meta["revision"] += 1
@@ -157,6 +163,12 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
         },
     }
     operation_path = active_operation_path(cfg, "cleanup", task.task_id)
+    if task.group_name:
+        from ..runtime.group_discovery.service import publish_group_locator_for_transition
+
+        # QQTOOLS-COMPAT-0017: the maintenance locator precedes cleanup's first
+        # durable operation or Task-side ownership effect.
+        publish_group_locator_for_transition(cfg, task.group_name, "maintenance", "metadata_cleanup")
     write_active_operation(cfg, "cleanup", task.task_id, operation)
     task.control["cleanup_operation_id"] = operation["cleanup"]["operation_id"]
     task.control["cleanup_state"] = "preparing"
@@ -308,6 +320,13 @@ def _finalize_cleanup_operation(cfg: RootConfig, operation: dict[str, Any]) -> l
 
     cleanup = operation["cleanup"]
     task_id = cleanup["task_id"]
+    group_name = cleanup.get("group_name")
+    if isinstance(group_name, str) and group_name:
+        from ..runtime.group_discovery.service import publish_group_locator_for_transition
+
+        # QQTOOLS-COMPAT-0017: refresh cleanup discovery before retiring the
+        # cleanup owner and its Group membership evidence.
+        publish_group_locator_for_transition(cfg, group_name, "maintenance", "metadata_cleanup")
     path = task_path(cfg.shared_root, task_id)
     task: TaskRecord | None = None
     if path.exists():
