@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v1.3.22
+
+- feat: make qexp dependency validation read only the candidate-reachable same-Group closure and
+  replace recurring historical Group sweeps with a generation-fenced three-lane locator service,
+  bounded fair maintenance, upgrade-coordinator activation, and explicit degraded repair.
+- fix: preserve qexp shared-Task home eligibility and submission failure diagnostics across
+  placement, availability, and transactional Group publication paths.
 - ci: stop testing Python 3.11; the minimum tested version is Python 3.12.
   Package metadata continues to permit Python 3.11 installations.
 - breaking: remove the ineffective `qexp agent run --format human|json` surface and define
