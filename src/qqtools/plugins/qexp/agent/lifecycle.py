@@ -33,6 +33,8 @@ from ..machine_dispatch_plan import (
     reduce_dispatch_cursor,
 )
 from ..machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
+from ..notification_migration import NotificationMaintenanceWorker, notification_migration_status
+from ..notifications import notification_runtime
 from ..project_maintenance import maintain_project, reconcile_reservation
 from ..runtime.group_discovery.service import MachineGroupDiscoveryWorker
 from ..runtime.group_namespace import inspect_group_authority
@@ -130,6 +132,10 @@ def get_machine_agent_status(
     if not isinstance(process_status, dict):
         process_status = {}
     upgrade = inspect_registered_upgrades(machine_runtime)
+    try:
+        notification_migration = notification_migration_status(machine_runtime)
+    except (OSError, RuntimeError, ValueError):
+        notification_migration = {"state": "unavailable", "pending": True}
     waiting_for_first_registration = bool(process_status.get("waiting_for_first_registration")) if running else False
     projects = []
     for binding in bindings:
@@ -225,6 +231,7 @@ def get_machine_agent_status(
         "registry_revision": revision,
         "projects": projects,
         "upgrade": upgrade,
+        "notification_migration": notification_migration,
         "gpu_policy": gpu_policy,
         "warnings": list(gpu_policy.get("warnings", [])),
     }
@@ -271,6 +278,7 @@ def run_machine_agent_loop(
     cycle_completed = False
     idle_since: float | None = None
     upgrade_worker: MachineUpgradeWorker | None = None
+    notification_worker: NotificationMaintenanceWorker | None = None
     discovery_worker: MachineGroupDiscoveryWorker | None = None
     observation_worker: MachineObservationWorker | None = None
     submission_control_worker: MachineSubmissionControlWorker | None = None
@@ -283,7 +291,7 @@ def run_machine_agent_loop(
         stop_reason = "stopped_by_signal"
         scheduler_wakeup.set()
 
-    with machine_runtime.scheduler_authority(blocking=False) as acquired:
+    with machine_runtime.scheduler_authority(blocking=False) as acquired, notification_runtime(machine_runtime.root):
         if not acquired:
             raise RuntimeError("machine scheduler authority is already held.")
         start_ticks = _pid_start_time_ticks(os.getpid())
@@ -359,6 +367,11 @@ def run_machine_agent_loop(
                             upgrade_worker.start()
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     pass
+                if (
+                    notification_worker is None or not notification_worker.is_alive
+                ) and time.monotonic() >= machine_runtime.notification_next_pass_at:
+                    notification_worker = NotificationMaintenanceWorker(machine_runtime)
+                    notification_worker.start()
                 try:
                     with machine_runtime.migration_read_guard() as is_migration_clear:
                         if is_migration_clear:
@@ -473,6 +486,8 @@ def run_machine_agent_loop(
                 discovery_worker.stop()
             if upgrade_worker is not None:
                 upgrade_worker.stop()
+            if notification_worker is not None:
+                notification_worker.stop()
             if control_plane is not None:
                 control_plane.stop()
             try:

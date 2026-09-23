@@ -11,6 +11,7 @@ from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime import submission_plan
 from qqtools.plugins.qexp.runtime.paths import group_path, submission_path, task_path
 from qqtools.plugins.qexp.runtime.store import read_json
+from qqtools.plugins.qexp.runtime.submission import SubmissionFinalizationError
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -525,13 +526,16 @@ tasks:
 
     monkeypatch.setattr(submission_runtime, "atomic_replace", fail_group_finalizer)
 
-    with pytest.raises(OSError, match="simulated Group finalizer failure"):
+    with pytest.raises(SubmissionFinalizationError, match="simulated Group finalizer failure") as failure:
         batch_submit(cfg, manifest, group="exp", idempotency_key=key)
 
     operation_files = list((cfg.shared_root / "operations" / "submissions").glob("*.json"))
     assert len(operation_files) == 1
     operation = read_json(operation_files[0])["submission"]
     assert operation["state"] == "committed"
+    assert failure.value.operation_id == operation["operation_id"]
+    assert failure.value.idempotency_key == key
+    assert isinstance(failure.value.__cause__, OSError)
     group = read_json(group_path(cfg.shared_root, "exp"))
     assert group["group"]["pending_submission_commit"]["operation_id"] == operation["operation_id"]
     assert set(group["group"]["worker_set"]) == {"g2"}
@@ -567,8 +571,10 @@ tasks:
         original_atomic_replace(path, value)
 
     monkeypatch.setattr(submission_runtime, "atomic_replace", fail_group_finalizer)
-    with pytest.raises(OSError, match="simulated Group finalizer failure"):
+    with pytest.raises(SubmissionFinalizationError, match="simulated Group finalizer failure") as failure:
         batch_submit(cfg, manifest, group="exp", idempotency_key="cancel-finalizer")
+    assert failure.value.idempotency_key == "cancel-finalizer"
+    assert isinstance(failure.value.__cause__, OSError)
 
     monkeypatch.setattr(submission_runtime, "atomic_replace", original_atomic_replace)
     group = group_control(cfg, "exp", "cancel")

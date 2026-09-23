@@ -716,10 +716,139 @@ def build_parser() -> argparse.ArgumentParser:
         output_kinds=OutputKind.CPU_LANE,
     )
 
-    config = commands.add_parser("config", help="Inspect or set typed Project and global agent configuration.")
+    notifications = commands.add_parser(
+        "notifications",
+        help="Set up, inspect, test, and maintain Feishu notifications.",
+        description=(
+            "Convenience commands for Feishu notifications. Global scope applies to the selected MachineRuntime; "
+            "select --scope project explicitly to operate on a Project. Use qexp config show/set/reset notifications "
+            "for detailed configuration fields."
+        ),
+    )
+    notifications_sub = notifications.add_subparsers(dest="notifications_action", required=True)
+    notification_scope_help = "Policy scope; global applies to the selected MachineRuntime."
+    notification_setup = notifications_sub.add_parser("setup", help="Set up and enable notifications.")
+    notification_setup.add_argument(
+        "--scope",
+        choices=("global", "project"),
+        default="global",
+        help=notification_scope_help,
+    )
+    notification_webhook = notification_setup.add_mutually_exclusive_group()
+    notification_webhook.add_argument("--webhook", type=str, metavar="URL")
+    notification_webhook.add_argument("--webhook-stdin", action="store_true")
+    notification_webhook.add_argument("--webhook-env", metavar="NAME")
+    notification_signing = notification_setup.add_mutually_exclusive_group()
+    notification_signing.add_argument("--secret-env", metavar="NAME")
+    notification_signing.add_argument("--unsigned", action="store_true")
+    _add_output_format(notification_setup)
+    bind_command(
+        notification_setup,
+        handler="notifications_setup",
+        context=ContextKind.MACHINE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.CONFIG,
+    )
+
+    notification_show = notifications_sub.add_parser("show", help="Show notification configuration.")
+    notification_show.add_argument(
+        "--scope",
+        choices=("global", "project"),
+        default="global",
+        help=notification_scope_help,
+    )
+    _add_output_format(notification_show)
+    bind_command(
+        notification_show,
+        handler="notifications_show",
+        context=ContextKind.MACHINE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.CONFIG,
+    )
+
+    notification_test = notifications_sub.add_parser("test", help="Send a notification test message.")
+    notification_test.add_argument(
+        "--scope",
+        choices=("global", "project"),
+        default="global",
+        help=notification_scope_help,
+    )
+    _add_output_format(notification_test)
+    bind_command(
+        notification_test,
+        handler="notifications_test",
+        context=ContextKind.MACHINE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.CONFIG,
+    )
+
+    notification_set = notifications_sub.add_parser("set", help="Edit notification settings.")
+    notification_set.add_argument(
+        "--scope",
+        choices=("global", "project"),
+        default="global",
+        help=notification_scope_help,
+    )
+    notification_enabled = notification_set.add_mutually_exclusive_group()
+    notification_enabled.add_argument("--enabled", action="store_true", default=None)
+    notification_enabled.add_argument("--disabled", action="store_true", default=None)
+    notification_set.add_argument("--webhook-env", metavar="NAME")
+    notification_set_signing = notification_set.add_mutually_exclusive_group()
+    notification_set_signing.add_argument("--secret-env", metavar="NAME")
+    notification_set_signing.add_argument("--unsigned", action="store_true")
+    notification_set.add_argument("--timeout-seconds", type=float)
+    _add_output_format(notification_set)
+    bind_command(
+        notification_set,
+        handler="notifications_set",
+        context=ContextKind.MACHINE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.CONFIG,
+    )
+
+    notification_reset = notifications_sub.add_parser("reset", help="Reset notification settings.")
+    notification_reset.add_argument(
+        "--scope",
+        choices=("global", "project"),
+        default="global",
+        help=notification_scope_help,
+    )
+    _add_output_format(notification_reset)
+    bind_command(
+        notification_reset,
+        handler="notifications_reset",
+        context=ContextKind.MACHINE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.CONFIG,
+    )
+
+    notification_resolve = notifications_sub.add_parser(
+        "resolve", help="Resolve a notification configuration conflict."
+    )
+    notification_resolve.add_argument(
+        "--scope",
+        choices=("global", "project"),
+        default="global",
+        help=notification_scope_help,
+    )
+    notification_resolve.add_argument("--prefer", choices=("canonical", "legacy"), required=True)
+    _add_output_format(notification_resolve)
+    bind_command(
+        notification_resolve,
+        handler="notifications_resolve",
+        context=ContextKind.MACHINE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.CONFIG,
+    )
+
+    config = commands.add_parser(
+        "config",
+        help="Inspect or set typed Project and global agent configuration.",
+    )
     config_sub = config.add_subparsers(dest="config_action", required=True)
     config_show = config_sub.add_parser("show", help="Show all Project sections or one typed section.")
     config_show.add_argument("section", nargs="?", choices=configuration_commands.CONFIG_SECTIONS)
+    config_show.add_argument("--scope", choices=("global", "project"), default="project")
     _add_output_format(config_show)
     bind_command(
         config_show,
@@ -730,6 +859,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config_set = config_sub.add_parser("set", help="Set typed options in one configuration section.")
     config_set.add_argument("section", choices=configuration_commands.CONFIG_SECTIONS)
+    config_set.add_argument("--scope", choices=("global", "project"), default="project")
     config_set.add_argument("--provider")
     config_set.add_argument("--name")
     config_set.add_argument("--agent-mode", choices=("daemon", "on_demand"))
@@ -762,6 +892,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config_reset = config_sub.add_parser("reset", help="Reset one typed configuration override.")
     config_reset.add_argument("section", choices=configuration_commands.CONFIG_SECTIONS)
+    config_reset.add_argument("--scope", choices=("global", "project"), default="project")
     config_reset.add_argument("--provider")
     _add_output_format(config_reset)
     bind_command(
@@ -932,7 +1063,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Add common options to every ordinary parser level so options can appear
     # before or after a command path.  Setup parsers retain their feature-owned
     # explicit options; ``use`` has its own --project selector.
-    ordinary = {"status", "task", "group", "machine", "agent", "config", "admin", "submit"}
+    ordinary = {"status", "task", "group", "machine", "agent", "notifications", "config", "admin", "submit"}
     for name in ordinary:
         _add_common_options(commands.choices[name], include_format=True)
     _add_common_options(parser, include_format=False)

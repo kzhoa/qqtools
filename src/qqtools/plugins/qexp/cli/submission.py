@@ -25,7 +25,7 @@ from ..runtime.submission import (
     SubmissionRejected,
     SubmissionUnknown,
 )
-from ..runtime.submission_plan import semantic_digest
+from ..runtime.submission_plan import SubmissionTargetInvalid, semantic_digest
 from ..submission_contracts import SubmissionRequest, submission_result_payload
 from .outcome import CommandOutcome
 from .output import CliOutput, OutputKind
@@ -484,6 +484,7 @@ def dispatch_submission(
         SubmissionFinalizationError,
         SubmissionPending,
         SubmissionRejected,
+        SubmissionTargetInvalid,
         SubmissionUnknown,
     ) as exc:
         raise SubmissionCommandError(exc) from exc

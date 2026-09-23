@@ -25,6 +25,10 @@ from .store import read_json
 _SUBMISSION_STATES = frozenset({"preparing", "committing", "committed", "aborted", "blocked"})
 
 
+class SubmissionTargetInvalid(ValueError):
+    """The requested placement cannot be admitted in the current Project."""
+
+
 def _freeze(value: Any) -> Any:
     """Recursively convert JSON-like values to immutable containers."""
     if isinstance(value, Mapping):
@@ -255,21 +259,25 @@ def _validate_target_machine_record(cfg: Any, machine_name: str) -> None:
 
     record_path = machine_path(cfg.shared_root, machine_name)
     if not record_path.exists():
-        raise ValueError(f"home machine {machine_name!r} has no current-generation Project machine record.")
+        raise SubmissionTargetInvalid(
+            f"home machine {machine_name!r} has no current-generation Project machine record."
+        )
     try:
         record = read_json(record_path)
         machine = record["machine"]
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"home machine {machine_name!r} has an invalid Project machine record.") from exc
+        raise SubmissionTargetInvalid(f"home machine {machine_name!r} has an invalid Project machine record.") from exc
     if not isinstance(machine, dict):
-        raise ValueError(f"home machine {machine_name!r} has an invalid Project machine record.")
+        raise SubmissionTargetInvalid(f"home machine {machine_name!r} has an invalid Project machine record.")
     if (
         machine.get("machine_name") != machine_name
         or machine.get("project_id") != stable_id
         or machine.get("shared_root") != str(cfg.shared_root)
         or machine.get("agent_runtime") != "machine"
     ):
-        raise ValueError(f"home machine {machine_name!r} does not have a current-generation Project machine record.")
+        raise SubmissionTargetInvalid(
+            f"home machine {machine_name!r} does not have a current-generation Project machine record."
+        )
 
 
 def _active_workers(group: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -316,10 +324,12 @@ def _validate_placement_against_workers(
         home = item["home_machine"]
         if group_name is None:
             if item["sharing_mode"] != "private":
-                raise ValueError("ungrouped tasks must use private placement.")
+                raise SubmissionTargetInvalid("ungrouped tasks must use private placement.")
             continue
         if home not in planned_workers:
-            raise ValueError(f"tasks home_machine {home!r} is not an active worker in Group {group_name!r}.")
+            raise SubmissionTargetInvalid(
+                f"tasks home_machine {home!r} is not an active worker in Group {group_name!r}."
+            )
         if item["sharing_mode"] == "private":
             continue
         fallback = item["fallback_machines"]
@@ -327,7 +337,7 @@ def _validate_placement_against_workers(
             continue
         for machine in fallback:
             if machine not in planned_workers:
-                raise ValueError(
+                raise SubmissionTargetInvalid(
                     f"tasks fallback_machines contains {machine!r}, which is not an active "
                     f"worker in Group {group_name!r}."
                 )

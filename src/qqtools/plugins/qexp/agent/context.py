@@ -133,6 +133,7 @@ class MachineRuntime:
         self.upgrade_probe_deadlines: dict[str, float] = {}
         self.upgrade_probe_budget = 4
         self.upgrade_next_pass_at = 0.0
+        self.notification_next_pass_at = 0.0
         self.upgrade_admission_blocked_projects: set[str] = set()
         self.supervisor_generations: dict[str, str | None] = {}
         # A direct runner may need more than one scheduler cycle to publish its

@@ -7,6 +7,7 @@ from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.paths import group_path, submission_path, task_path
 from qqtools.plugins.qexp.runtime.store import read_json
+from qqtools.plugins.qexp.runtime.submission import SubmissionFinalizationError
 from qqtools.plugins.qexp.runtime.tasks import load_task
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -95,7 +96,7 @@ def test_group_submission_finalizer_failure_reuses_committed_tasks_and_plan(
         raise OSError("injected finalizer failure")
 
     monkeypatch.setattr(submission_runtime, "finalize_submission_group", fail_finalizer)
-    with pytest.raises(OSError, match="injected finalizer failure"):
+    with pytest.raises(SubmissionFinalizationError, match="injected finalizer failure") as failure:
         batch_submit(
             cfg,
             manifest,
@@ -103,6 +104,8 @@ def test_group_submission_finalizer_failure_reuses_committed_tasks_and_plan(
             idempotency_key="retained-committed-batch",
             on_prepared=capture_prepared,
         )
+    assert failure.value.idempotency_key == "retained-committed-batch"
+    assert isinstance(failure.value.__cause__, OSError)
 
     assert prepared
     operation_id = prepared[0]

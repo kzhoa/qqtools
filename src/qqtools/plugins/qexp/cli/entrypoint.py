@@ -16,10 +16,12 @@ from ..agent.identity import MachineRuntimeIdentityError
 from ..commands import context as context_commands
 from ..commands import wait as wait_commands
 from ..config_types import RootConfig
+from ..notifications import notification_runtime
 from ..runtime.observation.api import ObservationError
 from .command_spec import CommandSpec, ContextKind, OutputMode
 from .errors import CliOperationalError, CliUsageError, classify_cli_error
 from .local_handlers import LOCAL_HANDLERS, dispatch_local
+from .notification_handlers import dispatch_config_notifications, dispatch_notifications
 from .outcome import CommandOutcome, validate_command_outcome
 from .output import CliOutput, OutputKind, render
 from .parser import (
@@ -304,6 +306,14 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        if handler.startswith("notifications_"):
+            return _finalize_outcome(args, dispatch_notifications(args))
+        if (
+            handler.startswith("config_")
+            and getattr(args, "section", None) == "notifications"
+            and args.scope == "global"
+        ):
+            return _finalize_outcome(args, dispatch_config_notifications(args))
         is_local = handler in LOCAL_HANDLERS and (
             not handler.startswith("config_") or getattr(args, "section", None) == "agent"
         )
@@ -327,8 +337,10 @@ def main(argv: list[str] | None = None) -> int:
         resolved_cfg = cfg
         if handler == "submit":
             args._submission_cfg_resolved = True
-            return _finalize_outcome(args, dispatch_submission(args, cfg, execution_context))
-        return _finalize_outcome(args, dispatch_project(args, cfg, execution_context, selection_source))
+            with notification_runtime(execution_context.machine_runtime.root):
+                return _finalize_outcome(args, dispatch_submission(args, cfg, execution_context))
+        with notification_runtime(execution_context.machine_runtime.root):
+            return _finalize_outcome(args, dispatch_project(args, cfg, execution_context, selection_source))
     except ObservationError as exc:
         if handler == "task_wait" and getattr(args, "format", "human") == "json":
             return _emit_wait_error(

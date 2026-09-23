@@ -1,4 +1,27 @@
-next_id = 16
+next_id = 17
+
+[[items]]
+id = "QQTOOLS-COMPAT-0016"
+component = "qexp.notification-policy-cutover"
+kind = "local_state"
+status = "compatibility_active"
+summary = "Import legacy per-project Feishu notification settings into private runtime policy while reconciling supported older writers."
+introduced_in = "1.3.22"
+legacy_removed_in = "1.3.23"
+transition_purged_in = "1.3.24"
+marker = "QQTOOLS-COMPAT-0016"
+owner = "qexp.notification_compat"
+verification = ["tests/unit/qexp/test_notification_compat.py", "tests/integration/qexp/test_notification_setup.py"]
+normal_level = "L1"
+recovery_level = "L1"
+source_versions = ["1.3.21"]
+target_version = "1.3.22"
+mixed_version_range = ["1.3.21-1.3.23"]
+normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
+machine_status_command = "qexp notifications show"
+recovery_command = "qexp notifications resolve --scope project --prefer canonical|legacy"
+workload_continuity = true
+interruption_budget_seconds = 1.0
 
 [[items]]
 id = "QQTOOLS-COMPAT-0012"

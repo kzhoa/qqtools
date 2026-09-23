@@ -192,9 +192,15 @@ def dispatch_project(
 
     if handler.startswith("config_"):
         section = getattr(args, "section", None)
+        if section == "notifications":
+            from .notification_handlers import dispatch_config_notifications
+
+            return dispatch_config_notifications(args, cfg=cfg, runtime=execution_context.machine_runtime)
         if handler == "config_show":
             result = configuration_commands.show_config(section, cfg=cfg, runtime=execution_context.machine_runtime)
         elif handler == "config_set":
+            if args.secret_env is not None and args.unset_secret_env:
+                raise CliUsageError("--secret-env and --unset-secret-env are mutually exclusive")
             if args.enabled and args.disabled:
                 raise CliUsageError("--enabled and --disabled are mutually exclusive")
             values = {
@@ -214,12 +220,14 @@ def dispatch_project(
                     "renewal_commit_margin_seconds": args.renewal_commit_margin_seconds,
                     "webhook_env": args.webhook_env,
                     "credential_source": args.credential_source,
-                    "secret_env": None if args.unset_secret_env else args.secret_env,
+                    "secret_env": args.secret_env,
                     "acknowledge_shared_secret_risk": args.acknowledge_shared_secret_risk or None,
                     "shared_webhook": args.shared_webhook,
                 }.items()
                 if value is not None
             }
+            if args.unset_secret_env:
+                values["secret_env"] = None
             if args.webhook_stdin:
                 if args.credential_source != "shared_file":
                     raise CliUsageError("--webhook-stdin requires --credential-source shared_file")

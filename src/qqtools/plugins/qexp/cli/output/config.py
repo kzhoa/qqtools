@@ -90,6 +90,7 @@ def _render_config(result: Mapping[str, Any], _presentation: Mapping[str, object
                 ("Source", result.get("source")),
                 ("Applies to", result.get("applies_to")),
                 ("Values", result.get("effective_values", result.get("values"))),
+                ("Retention", result.get("retention")),
             )
         )
     return _render_named_operation(result, "config")

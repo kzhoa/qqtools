@@ -136,6 +136,36 @@ def test_remote_home_requires_a_current_generation_machine_record(
     assert not list((shared_root / "tasks").glob("*.json"))
 
 
+def test_remote_home_missing_record_has_structured_input_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    shared_root, runtime = _setup_project(tmp_path, machines=("g3",))
+
+    assert (
+        main(
+            _args(
+                shared_root,
+                runtime,
+                "submit",
+                "--no-activate",
+                "--home-machine",
+                "g4",
+                "--format",
+                "json",
+                "--",
+                "echo",
+                "missing",
+            )
+        )
+        == 2
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["outcome"] == "rejected"
+    assert result["error"]["code"] == "invalid_input"
+    assert "no current-generation Project machine record" in result["error"]["message"]
+    assert not list((shared_root / "tasks").glob("*.json"))
+
+
 def test_empty_home_machine_is_rejected_instead_of_defaulting_to_current(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

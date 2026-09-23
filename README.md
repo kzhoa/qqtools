@@ -257,37 +257,54 @@ qexp admin clean --project /path/to/project --task-id TASK_ID --dry-run
 qexp admin clean --project /path/to/project --older-than-days 30 --limit 100
 ```
 
-Terminal notifications are disabled by default. Configure the machine-local Feishu Incoming
-Webhook from the agent environment (the default, recommended mode):
+Terminal notifications are disabled by default. After `qexp init --machine NAME` has initialized
+the selected MachineRuntime, set up Feishu once without selecting a Project:
 
 ```bash
-qexp config set notifications --enabled
-qexp config set notifications --provider feishu --enabled \
-  --webhook-env QEXP_FEISHU_WEBHOOK --secret-env QEXP_FEISHU_SECRET
-export QEXP_FEISHU_WEBHOOK='https://open.feishu.cn/open-apis/bot/v2/hook/...'
-export QEXP_FEISHU_SECRET='...'
-qexp config show notifications
+qexp notifications setup    # Hidden webhook prompt; enables the global default.
+qexp notifications test     # Optional: send a labeled test from this CLI process.
 ```
 
-For installations that deliberately accept the shared-root credential risk, a webhook can instead
-be persisted under that machine's `.qexp/machines/<machine>/secrets/` directory. The URL is read
-from standard input so it does not enter shell history; the explicit acknowledgement is required:
+For automation, supply a webhook through standard input. A direct `--webhook URL` argument also
+works, but can be recorded in shell history and process arguments; use it only when that exposure
+is acceptable. Missing input without an interactive terminal fails rather than hanging.
 
 ```bash
-printf '%s\n' 'https://open.feishu.cn/open-apis/bot/v2/hook/...' |
-  qexp config set notifications --provider feishu \
-    --enabled --credential-source shared_file --webhook-stdin --acknowledge-shared-secret-risk
+qexp notifications setup --webhook-stdin < /path/to/webhook-input
+qexp notifications show
 ```
 
-This file is requested as owner-private (`0600`) but remains on the shared control root. Anyone
-with access to that storage or its backups may be able to read it. `qexp config show notifications`
-never prints the URL. A signing secret, when configured, remains environment-only.
+The default webhook is saved in an owner-private immutable credential under the selected
+MachineRuntime (normally `~/.qqtools/qexp-machine`), not copied into each Project. Its location
+may itself be backed by shared storage; the path is not proof of host isolation. New and existing
+Projects without overrides inherit the global setting. To select a different Project robot, run
+`qexp notifications setup --scope project` inside that Project (or pass `--project PATH`). To
+disable just that Project, run `qexp notifications set --scope project --disabled`; to restore
+inheritance, run `qexp notifications reset --scope project`. Convenience commands default to
+global even when invoked inside a Project; `config show/set/reset notifications` defaults to
+project and supports explicit `--scope global` for low-level configuration.
+
+For optional Feishu signing, pass `--secret-env NAME` to setup and provide that variable to the
+sending process. Replacing a signed destination requires choosing a new `--secret-env NAME` or
+explicit `--unsigned`. `notifications show` redacts URLs and secret values. A test verifies the
+invoking CLI's effective policy and environment only; it does not establish another agent's
+environment readiness or verify every Project when testing the global default.
 
 The webhook and secret are read by the process that commits the terminal transition. Non-sensitive
-configuration is read at dispatch time, so changes affect future terminal events. Environment
-variable value changes require restarting that agent; restarting the agent does not terminate the
-running task process. Delivery is synchronous and no-throw with at-most-one send attempt: crashes
+configuration and private-file credentials are read at dispatch time, so changing those files does
+not require an agent restart. Environment variable value changes require restarting the agent
+process; restarting the agent does not terminate the running task process. Delivery is synchronous
+and no-throw with at-most-one send attempt: crashes
 or network ambiguity can permanently lose a notification, and qexp does not retry it.
+
+Before version 1.3.24, supported old binaries may still write legacy Project-machine records.
+Version 1.3.22 imports them automatically when an agent restarts and reconciles later old writes;
+a conflict after a canonical edit blocks delivery for that Project until explicitly resolved with
+`qexp notifications resolve --scope project --prefer canonical|legacy`. The old shared webhook file
+is retained while old readers are supported. New private credentials removed by reset or
+replacement are retained until eligible for bounded maintenance cleanup (24 hours for never-used
+staging orphans; seven days after a formerly active credential becomes unreferenced). A reset does
+not delete secrets immediately. Check `qexp notifications show` for the selected runtime's state.
 
 Feishu notifications are sent as interactive cards with status colour, Markdown field labels, and
 terminal Task metadata. The card's `Notification Machine Time` field is the event's `finished_at` value from the

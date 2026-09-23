@@ -117,13 +117,30 @@ immutable lifecycle event. Reservation release, local process-manifest updates, 
 dispatch occur after Group/Task locks are released. Hook and notifier failures are isolated from
 authoritative state.
 
-The process that successfully commits the transition dispatches using its own machine configuration;
-therefore a controller cancelling a remote pre-launch Attempt sends the notification. Events retain
-both execution and dispatching machine names. Machine notification configuration is additive and
-default-off. Feishu uses the environment by default; an explicitly acknowledged `shared_file`
-webhook source may persist a URL in that machine's shared control-root secrets directory, while a
-signing secret remains environment-only. Notification records use an atomic claimed key and provide
-at-most-one HTTP send attempt, without retry or exactly-once delivery guarantees.
+The process that successfully commits the transition dispatches using its own MachineRuntime
+notification policy; therefore a controller cancelling a remote pre-launch Attempt sends the
+notification. Events retain both execution and dispatching machine names. The canonical global
+policy is default-off and Projects inherit unless an explicit sparse override exists. A destination
+is a complete provider/source/webhook/signing bundle. New webhook credentials are immutable,
+owner-private files beneath that runtime, not files on a Project shared control root; environment
+sources and signing variables remain process-local. Policy revisions atomically activate already
+published credentials. The policy lock protects reads of credential bytes against concurrent
+publication and cleanup; network I/O happens only after releasing it. Reset preserves a tombstone;
+never-activated orphans become eligible for cleanup after 24 hours, formerly referenced credentials
+seven days after last reference removal. Unknown reachability retains credentials. Notification
+records still use an atomic claimed key and provide at-most-one automatic HTTP send attempt,
+without retry or exactly-once delivery guarantees.
+
+During the 1.3.22–1.3.23 mixed-version window, a new reader reconciles older Project-machine
+notification records under the Project-machine lock before the runtime policy lock. A changed old
+source after a canonical Project edit records a conflict and blocks that Project's notification,
+not Task supervision or another Project. Old binaries retain their original shared-file behavior
+and cannot read new global policy. Restarting the global agent on each upgraded machine performs
+bounded registered-Project discovery without draining running training; an inaccessible Project
+stays pending. `qexp notifications resolve --scope project --prefer canonical|legacy` acknowledges
+the current source under both locks. Version 1.3.23 removes old input aliases for new writers but
+retains old-writer reconciliation; version 1.3.24 removes online watching but retains a historical
+importer for declared old data. Continuing pre-1.3.22 writers after the 1.3.24 cutoff is unsupported.
 
 ## 3. Deployment Model
 

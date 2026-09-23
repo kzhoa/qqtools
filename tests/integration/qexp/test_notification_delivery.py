@@ -2,19 +2,22 @@ from types import SimpleNamespace
 
 import pytest
 
+from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.machine_config import init_shared_root
 from qqtools.plugins.qexp.notification_config import (
     shared_feishu_webhook_path,
     update_notifications,
     write_shared_feishu_webhook,
 )
-from qqtools.plugins.qexp.notifications import NotificationHook
+from qqtools.plugins.qexp.notifications import NotificationHook, notification_runtime
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
-def test_shared_file_credential_source_uses_owner_private_webhook(tmp_path):
+def test_legacy_shared_file_imports_into_owner_private_webhook(tmp_path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
     update_notifications(
         cfg,
         lambda current: {
@@ -31,7 +34,8 @@ def test_shared_file_credential_source_uses_owner_private_webhook(tmp_path):
             },
         },
     )
-    write_shared_feishu_webhook(cfg, "https://example.invalid/shared-webhook")
+    webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/shared-webhook"
+    write_shared_feishu_webhook(cfg, webhook)
     calls = []
 
     class Notifier:
@@ -53,7 +57,8 @@ def test_shared_file_credential_source_uses_owner_private_webhook(tmp_path):
         execution_started_at=None,
         duration_ms=None,
     )
-    NotificationHook(registry={"feishu": Notifier()}).handle(cfg, event)
+    with notification_runtime(runtime.root):
+        NotificationHook(registry={"feishu": Notifier()}).handle(cfg, event)
 
-    assert calls == [("https://example.invalid/shared-webhook", None, 5)]
+    assert calls == [(webhook, None, 5)]
     assert shared_feishu_webhook_path(cfg).exists()

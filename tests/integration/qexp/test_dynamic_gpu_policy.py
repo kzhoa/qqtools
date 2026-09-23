@@ -48,6 +48,10 @@ def test_gpu_policy_cli_rejects_invalid_lists_without_replacing_policy(tmp_path,
         assert main([*common, "set", "--visible", invalid]) == 2
         capsys.readouterr()
 
+    assert main([*common, "set", "--visible", "0,0", "--format", "json"]) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "invalid_argument"
+
     assert main([*common, "show", "--format", "json"]) == 0
     shown = json.loads(capsys.readouterr().out)
     assert shown["revision"] == 1

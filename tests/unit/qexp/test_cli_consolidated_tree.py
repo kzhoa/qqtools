@@ -188,6 +188,12 @@ def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
         ("agent", "config", "gpus", "reset"): ("agent_config_gpus_reset", "machine", "gpu-policy"),
         ("agent", "config", "cpu", "show"): ("agent_config_cpu_show", "machine", "cpu-lane"),
         ("agent", "config", "cpu", "set"): ("agent_config_cpu_set", "machine", "cpu-lane"),
+        ("notifications", "setup"): ("notifications_setup", "machine", "config"),
+        ("notifications", "show"): ("notifications_show", "machine", "config"),
+        ("notifications", "test"): ("notifications_test", "machine", "config"),
+        ("notifications", "set"): ("notifications_set", "machine", "config"),
+        ("notifications", "reset"): ("notifications_reset", "machine", "config"),
+        ("notifications", "resolve"): ("notifications_resolve", "machine", "config"),
         ("config", "show"): ("config_show", "section", "config"),
         ("config", "set"): ("config_set", "section", "config"),
         ("config", "reset"): ("config_reset", "section", "config"),
@@ -241,7 +247,7 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     )
 
     assert (
-        hashlib.sha256(text.encode()).hexdigest() == "2b772ba9fb7e2dd17b6120c29128e41d40469550668b2c10c74e797d3df8eb42"
+        hashlib.sha256(text.encode()).hexdigest() == "323bcd7966b4b2adf80dd3943da737106883c884b687ec7abad294f08b7a4730"
     )
 
 

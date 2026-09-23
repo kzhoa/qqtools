@@ -16,6 +16,7 @@ from qqtools.plugins.qexp.runtime.group_discovery.service import (
 )
 from qqtools.plugins.qexp.runtime.paths import submission_path
 from qqtools.plugins.qexp.runtime.store import read_json
+from qqtools.plugins.qexp.runtime.submission import SubmissionFinalizationError
 from tests.helpers.qexp_discovery import isolated_group, set_tail, source_file
 
 pytestmark = pytest.mark.integration
@@ -173,8 +174,10 @@ def test_failed_debt_publication_retains_pending_and_recovery_completes(tmp_path
 
     with monkeypatch.context() as crashing:
         crashing.setattr(service_module, "publish_submission_debt", fail)
-        with pytest.raises(OSError, match="debt publication interrupted"):
+        with pytest.raises(SubmissionFinalizationError, match="debt publication interrupted") as failure:
             submit(cfg, ["true"], group="experiment", idempotency_key="crashed-finalizer")
+    assert failure.value.idempotency_key == "crashed-finalizer"
+    assert isinstance(failure.value.__cause__, OSError)
     group = read_json(group_path(cfg.shared_root, "experiment"))["group"]
     assert group["pending_submission_commit"]
     operation = group["pending_submission_commit"]["operation_id"]

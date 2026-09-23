@@ -4,20 +4,35 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from ..agent.context import MachineRuntime
 from ..config_types import RootConfig
 from ..events import write_notification_diagnostic
-from ..notification_config import load_shared_feishu_webhook, validate_notifications
+from ..notification_reconciliation import LegacyConflictError, reconcile_legacy
+from ..notification_resolver import NotificationResolutionError, resolve_delivery, resolve_policy
 from ..runtime.paths import shared_paths
 from ..runtime.store import CASConflict, atomic_replace, create_if_absent, read_json
 from .base import Notifier
 from .feishu import FeishuNotifier, NotificationTransportError
 
 REGISTRY: dict[str, Notifier] = {"feishu": FeishuNotifier()}
+_selected_runtime_root: ContextVar[Path | None] = ContextVar("qexp_notification_runtime_root", default=None)
+
+
+@contextmanager
+def notification_runtime(runtime_root: Path):
+    """Use the CLI's selected MachineRuntime for inline terminal commits."""
+    token = _selected_runtime_root.set(runtime_root)
+    try:
+        yield
+    finally:
+        _selected_runtime_root.reset(token)
 
 
 def notification_key(notifier: str, event: Any) -> str:
@@ -74,88 +89,73 @@ class NotificationHook:
 
     def handle(self, cfg: RootConfig, event: Any) -> None:
         registry = self.registry if self.registry is not None else REGISTRY
+        key = notification_key("feishu", event)
         try:
-            from ..layout import load_machine_record
-
-            raw = (load_machine_record(cfg) or {}).get("notifications")
-            config = validate_notifications(raw, allow_unknown=True)
+            runtime = MachineRuntime(_selected_runtime_root.get())
+            project_id = reconcile_legacy(runtime, cfg)
+            effective = resolve_policy(runtime.root, project_id)
+        except LegacyConflictError:
+            _safe_diagnostic(cfg, "notification_skipped", event, key, "legacy_conflict", "skipped")
+            return
         except Exception:
-            _safe_diagnostic(
-                cfg, "notification_skipped", event, notification_key("feishu", event), "invalid_config", "skipped"
+            _safe_diagnostic(cfg, "notification_skipped", event, key, "invalid_config", "skipped")
+            return
+        if not effective["enabled"]:
+            return
+        try:
+            snapshot = resolve_delivery(runtime.root, project_id)
+        except NotificationResolutionError as exc:
+            _safe_diagnostic(cfg, "notification_skipped", event, key, exc.code, "skipped")
+            return
+        except (OSError, ValueError):
+            _safe_diagnostic(cfg, "notification_skipped", event, key, "invalid_config", "skipped")
+            return
+        provider = registry.get("feishu")
+        if provider is None:
+            _safe_diagnostic(cfg, "notification_skipped", event, key, "unknown_provider", "skipped")
+            return
+        if not claim_notification(cfg, "feishu", event, key):
+            _safe_diagnostic(cfg, "notification_skipped", event, key, "already_claimed", "skipped")
+            return
+        _safe_diagnostic(cfg, "notification_claimed", event, key, "send_claimed", "claimed")
+        try:
+            result = provider.send(
+                event,
+                webhook=snapshot["webhook"],
+                secret=snapshot["secret"],
+                timeout_seconds=snapshot["timeout_seconds"],
             )
-            return
-        if not config["enabled"]:
-            return
-        for provider_name, provider_cfg in config["providers"].items():
-            key = notification_key(provider_name, event)
-            if not isinstance(provider_cfg, dict):
-                _safe_diagnostic(cfg, "notification_skipped", event, key, "unknown_provider", "skipped")
-                continue
-            if not provider_cfg.get("enabled"):
-                continue
-            provider = registry.get(provider_name)
-            if provider is None:
-                _safe_diagnostic(cfg, "notification_skipped", event, key, "unknown_provider", "skipped")
-                continue
-            credential_source = provider_cfg["credential_source"]
-            if credential_source == "env":
-                webhook = os.environ.get(provider_cfg["webhook_env"])
-                reason_code = "missing_webhook_env"
-            else:
-                try:
-                    webhook = load_shared_feishu_webhook(cfg)
-                    reason_code = "shared_webhook_unavailable"
-                except (OSError, ValueError):
-                    webhook = None
-                    reason_code = "shared_webhook_unavailable"
-            if not webhook:
-                _safe_diagnostic(cfg, "notification_skipped", event, key, reason_code, "skipped")
-                continue
-            secret = None
-            if provider_cfg.get("secret_env"):
-                secret = os.environ.get(provider_cfg["secret_env"])
-                if not secret:
-                    _safe_diagnostic(cfg, "notification_skipped", event, key, "missing_secret_env", "skipped")
-                    continue
-            if not claim_notification(cfg, provider_name, event, key):
-                _safe_diagnostic(cfg, "notification_skipped", event, key, "already_claimed", "skipped")
-                continue
-            _safe_diagnostic(cfg, "notification_claimed", event, key, "send_claimed", "claimed")
-            try:
-                result = provider.send(
-                    event, webhook=webhook, secret=secret, timeout_seconds=provider_cfg["timeout_seconds"]
-                )
-            except NotificationTransportError as exc:
-                _finish_claim(cfg, key, "failed", exc.reason_code)
-                _safe_diagnostic(
-                    cfg,
-                    "notification_failed",
-                    event,
-                    key,
-                    exc.reason_code,
-                    "failed",
-                    http_status=exc.http_status,
-                    business_code=exc.business_code,
-                    error_type=exc.error_type,
-                )
-                continue
-            except Exception:
-                _finish_claim(cfg, key, "failed", "network_error")
-                _safe_diagnostic(
-                    cfg, "notification_failed", event, key, "network_error", "failed", error_type="provider_error"
-                )
-                continue
-            _finish_claim(cfg, key, "sent", "delivered", **result)
+        except NotificationTransportError as exc:
+            _finish_claim(cfg, key, "failed", exc.reason_code)
             _safe_diagnostic(
                 cfg,
-                "notification_sent",
+                "notification_failed",
                 event,
                 key,
-                "delivered",
-                "sent",
-                http_status=result.get("http_status"),
-                business_code=result.get("business_code"),
+                exc.reason_code,
+                "failed",
+                http_status=exc.http_status,
+                business_code=exc.business_code,
+                error_type=exc.error_type,
             )
+            return
+        except Exception:
+            _finish_claim(cfg, key, "failed", "network_error")
+            _safe_diagnostic(
+                cfg, "notification_failed", event, key, "network_error", "failed", error_type="provider_error"
+            )
+            return
+        _finish_claim(cfg, key, "sent", "delivered", **result)
+        _safe_diagnostic(
+            cfg,
+            "notification_sent",
+            event,
+            key,
+            "delivered",
+            "sent",
+            http_status=result.get("http_status"),
+            business_code=result.get("business_code"),
+        )
 
 
 def _safe_diagnostic(

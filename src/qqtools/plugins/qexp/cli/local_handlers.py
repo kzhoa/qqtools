@@ -584,7 +584,10 @@ def dispatch_local(
                 result = reset_gpu_policy(runtime, expected_revision=args.expected_revision)
                 action = "reset"
             else:
-                configured = () if args.none else parse_gpu_id_list(args.visible)
+                try:
+                    configured = () if args.none else parse_gpu_id_list(args.visible)
+                except ValueError as exc:
+                    raise CliUsageError(str(exc)) from exc
                 result = set_gpu_policy(runtime, configured, expected_revision=args.expected_revision)
                 action = "updated"
             result["machine_runtime_root"] = str(runtime.root)

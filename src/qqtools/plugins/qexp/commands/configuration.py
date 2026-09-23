@@ -308,7 +308,12 @@ def show_config(
         complete = True
         for name in PROJECT_CONFIG_SECTIONS:
             try:
-                values = _show_project(name, project_cfg)
+                if name == "notifications":
+                    from .notifications import show_notifications
+
+                    values = show_notifications(runtime, "project", project_cfg)
+                else:
+                    values = _show_project(name, project_cfg)
             except Exception as exc:
                 complete = False
                 sections[name] = {

@@ -198,7 +198,7 @@ def test_feishu_rejects_conflicting_business_codes_as_invalid_response():
     assert error.value.error_type == "invalid_response"
 
 
-def test_malformed_unknown_provider_does_not_abort_dispatch(monkeypatch):
+def test_malformed_unknown_provider_fails_closed_without_aborting_dispatch(monkeypatch):
     cfg = SimpleNamespace()
     diagnostics = []
 
@@ -226,8 +226,8 @@ def test_malformed_unknown_provider_does_not_abort_dispatch(monkeypatch):
     assert diagnostics == [
         (
             "notification_skipped",
-            notification_key("future_provider", _event()),
-            "unknown_provider",
+            notification_key("feishu", _event()),
+            "invalid_config",
             "skipped",
         )
     ]

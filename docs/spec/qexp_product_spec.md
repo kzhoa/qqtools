@@ -1701,13 +1701,19 @@ compensation.
 Project configuration uses fixed typed sections: `lease`, `notifications`, `progress`, `tmux`,
 and `launch-handoff`. Unqualified `config show` reports every Project section independently;
 one malformed section makes the aggregate incomplete without substituting a plausible default.
-The explicit global `agent` section never resolves a Project. Notification providers are selected
-only with `--provider` on that section, and provider changes do not enable notifications globally.
+The explicit global `agent` section never resolves a Project. Notifications have one enabled
+switch and one complete Feishu destination per scope. `qexp notifications setup` enables a global
+default for the selected MachineRuntime without a Project; the convenience family defaults to
+global, while `config show/set/reset notifications` retains its Project default and permits
+`--scope global`. A Project's sparse explicit fields override global values, but destination and
+signing remain one indivisible credential bundle. An explicit disable or invalid Project override
+never sends to a different global robot.
 
 `config reset SECTION` removes the explicit override and restores inheritance or the built-in
 default after validating the existing state. It is not a write of today's default value. Resetting
-notifications does not delete separately stored credentials, and provider reset preserves other
-providers. `config reset agent` is invalid because agent name and identity have no implicit reset.
+notifications is a revisioned tombstone and does not immediately delete separately stored
+credentials; eligible private credentials are cleaned up later. `config reset agent` is invalid
+because agent name and identity have no implicit reset.
 Configuration writes retain verified binding, locking, active-claim, and policy-specific guards;
 they never rewrite policies frozen into existing Attempts.
 
