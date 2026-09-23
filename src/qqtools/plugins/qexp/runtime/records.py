@@ -551,5 +551,6 @@ def new_submission(
             "staged_task_count": len(resolved_context["task_ids"]),
             "committed_at": None,
             "failure_reason": None,
+            "failure_diagnostic": None,
         },
     }

@@ -17,6 +17,7 @@ from ..manifest import UNSET, normalize_command_submission, parse_submission_man
 from ..project_resolution import resolve_submission_project
 from ..runtime.group_namespace import GroupNotPublished
 from ..runtime.paths import idempotency_path, submission_path
+from ..runtime.ready import ReadyMemberPublicationError, validate_failure_diagnostic
 from ..runtime.store import read_json
 from ..runtime.submission import (
     IdempotencyConflict,
@@ -168,6 +169,12 @@ def _known_submission_state(args: argparse.Namespace, exc: BaseException) -> dic
             task_ids = context.get("task_ids")
             if isinstance(task_ids, list) and all(isinstance(item, str) for item in task_ids):
                 result["task_ids"] = task_ids
+        persisted_diagnostic = operation.get("failure_diagnostic")
+        if persisted_diagnostic is not None:
+            try:
+                result["failure_diagnostic"] = validate_failure_diagnostic(persisted_diagnostic).to_dict()
+            except (TypeError, ValueError):
+                pass
     except (OSError, KeyError, TypeError, ValueError):
         pass
     return result
@@ -223,6 +230,17 @@ def _submission_error_payload(args: argparse.Namespace, exc: BaseException) -> t
     disposition = None
     if outcome == "committed":
         disposition = "none" if group_name is None else "created" if known.get("create_group") is True else "reused"
+    diagnostic = None
+    if isinstance(exc, ReadyMemberPublicationError):
+        try:
+            diagnostic = validate_failure_diagnostic(exc.diagnostic).to_dict()
+        except (TypeError, ValueError):
+            diagnostic = None
+    if diagnostic is None:
+        diagnostic = known.get("failure_diagnostic")
+    error: dict[str, Any] = {"code": code, "message": str(exc)}
+    if diagnostic is not None:
+        error["diagnostic"] = diagnostic
     payload = submission_result_payload(
         mode=mode,
         outcome=outcome,
@@ -232,7 +250,7 @@ def _submission_error_payload(args: argparse.Namespace, exc: BaseException) -> t
         idempotency_key=key,
         task_ids=known.get("task_ids", []) if outcome == "committed" else [],
         preview=None,
-        error={"code": code, "message": str(exc)},
+        error=error,
     )
     return payload, exit_code
 
@@ -496,6 +514,7 @@ def dispatch_submission(
         SubmissionRejected,
         SubmissionTargetInvalid,
         SubmissionUnknown,
+        ReadyMemberPublicationError,
     ) as exc:
         raise SubmissionCommandError(exc) from exc
     # Activation is a post-commit follow-up.  It must never relabel a

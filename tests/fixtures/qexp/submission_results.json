@@ -25,6 +25,39 @@
     "error": {"code": "invalid_input", "message": "manifest is invalid"},
     "activation": null
   },
+  "publication_failure": {
+    "schema_version": 1,
+    "mode": "file",
+    "outcome": "rejected",
+    "project": {"path": "/projects/a", "source": "cli"},
+    "group": {"name": "exp", "source": "manifest", "disposition": null},
+    "operation": {"id": "submission-4", "state": "aborted"},
+    "idempotency_key": "key-4",
+    "task_ids": [],
+    "preview": null,
+    "error": {
+      "code": "submission_aborted",
+      "message": "Group 'exp' ready-member publication failed; grouped mutation is disabled.",
+      "diagnostic": {
+        "version": 1,
+        "component": "group_ready_members",
+        "operation": "publish",
+        "stage": "entry_validate",
+        "check_id": "write.member_page.size",
+        "reason_code": "member_page_too_large",
+        "facts": {"record_type": "member_page", "actual_bytes": 65537, "limit_bytes": 65536},
+        "exception_type": "JSONRecordSizeError",
+        "task_id": "task-42",
+        "generation": 1,
+        "group_name": "exp",
+        "input_index": 3,
+        "errno": null,
+        "json_line": null,
+        "json_column": null
+      }
+    },
+    "activation": null
+  },
   "pending": {
     "schema_version": 1,
     "mode": "file",

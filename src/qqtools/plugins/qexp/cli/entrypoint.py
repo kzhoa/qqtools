@@ -18,6 +18,7 @@ from ..commands import wait as wait_commands
 from ..config_types import RootConfig
 from ..notifications import notification_runtime
 from ..runtime.observation.api import ObservationError
+from ..runtime.ready import format_failure_diagnostic
 from .command_spec import CommandSpec, ContextKind, OutputMode
 from .errors import CliOperationalError, CliUsageError, classify_cli_error
 from .local_handlers import LOCAL_HANDLERS, dispatch_local
@@ -376,13 +377,24 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_user_error(exc, getattr(args, "format", "human"))
     except SubmissionCommandError as exc:
         payload, exit_code = _submission_error_payload(args, exc.error)
+        diagnostic_line = None
+        error_value = payload.get("error")
+        if isinstance(error_value, dict) and error_value.get("diagnostic") is not None:
+            try:
+                diagnostic_line = format_failure_diagnostic(error_value["diagnostic"])
+            except (TypeError, ValueError):
+                diagnostic_line = None
         if getattr(args, "quiet", False):
             print(f"qexp: {exc}", file=sys.stderr)
+            if diagnostic_line is not None:
+                print(diagnostic_line, file=sys.stderr)
         elif getattr(args, "format", "human") == "json":
             print(json.dumps(payload))
             print(f"qexp: {exc}", file=sys.stderr)
         else:
             print(f"qexp: {exc}", file=sys.stderr)
+            if diagnostic_line is not None:
+                print(diagnostic_line, file=sys.stderr)
         return exit_code
     except KeyboardInterrupt as exc:
         if handler == "submit":

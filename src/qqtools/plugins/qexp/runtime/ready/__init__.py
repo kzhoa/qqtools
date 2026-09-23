@@ -15,6 +15,17 @@ from .diagnostics import (
     storage_diagnostic,
     writer_diagnostic,
 )
+from .group_member_diagnostics import (
+    CHECK_REGISTRY,
+    PublicationTracker,
+    ReadyMemberCheckError,
+    ReadyMemberFailureDiagnostic,
+    ReadyMemberPublicationError,
+    format_failure_diagnostic,
+    parse_degraded_reason,
+    serialize_degraded_reason,
+    validate_failure_diagnostic,
+)
 from .group_members_rebuild import (
     advance_group_ready_members_build,
     audit_group_ready_members,
@@ -98,6 +109,10 @@ __all__ = [
     "ReadyClassification",
     "ReadyClassificationResult",
     "ReadyDiagnostic",
+    "ReadyMemberCheckError",
+    "ReadyMemberFailureDiagnostic",
+    "ReadyMemberPublicationError",
+    "PublicationTracker",
     "ReadyCursor",
     "ReadyIndexState",
     "ReadyMarkerRef",
@@ -105,6 +120,7 @@ __all__ = [
     "ReadyProbeBudgetExhausted",
     "ReadyScope",
     "DIAGNOSTIC_VERSION",
+    "CHECK_REGISTRY",
     "MAX_REASON_BYTES",
     "MAX_REASONS",
     "advance_ready_index_build",
@@ -157,4 +173,8 @@ __all__ = [
     "write_ready_marker",
     "build_diagnostic",
     "writer_diagnostic",
+    "format_failure_diagnostic",
+    "parse_degraded_reason",
+    "serialize_degraded_reason",
+    "validate_failure_diagnostic",
 ]

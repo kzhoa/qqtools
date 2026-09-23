@@ -37,6 +37,12 @@ def test_submission_result_fixtures_satisfy_json_and_human_contracts() -> None:
         assert json.loads(render(output, "json")) == payload
         assert render(output, "human")
 
+    diagnostic = render(CliOutput(OutputKind.SUBMISSION, fixtures["publication_failure"]), "human")
+    assert "stage=entry_validate" in diagnostic
+    assert "check=write.member_page.size" in diagnostic
+    assert "reason=member_page_too_large" in diagnostic
+    assert "actual_bytes=65537" in diagnostic
+
 
 def test_cpu_lane_human_output_requires_and_renders_policy_fields() -> None:
     rendered = render(

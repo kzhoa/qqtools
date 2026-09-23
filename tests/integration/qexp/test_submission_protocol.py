@@ -37,6 +37,8 @@ def test_bulk_submission_has_one_operation_and_no_batch_identity(tmp_path: Path)
     assert tasks.target_group == "exp"
     assert tasks.state == "committed"
     assert tasks.to_dict()["task_ids"] == [task.task_id for task in tasks]
+    operation = read_json(submission_path(cfg.shared_root, tasks.operation_id))["submission"]
+    assert operation["failure_diagnostic"] is None
     assert not list((cfg.shared_root / "groups").glob("*.batch.json"))
 
 

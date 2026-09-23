@@ -2,12 +2,112 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .core import OutputContract, OutputKind
 from .primitives import _details, _mapping, _required, _required_mapping, _required_sequence, _sequence, _value
+
+_DIAGNOSTIC_FIELDS = {
+    "version",
+    "component",
+    "operation",
+    "stage",
+    "check_id",
+    "reason_code",
+    "facts",
+    "exception_type",
+    "task_id",
+    "generation",
+    "group_name",
+    "input_index",
+    "errno",
+    "json_line",
+    "json_column",
+}
+_DIAGNOSTIC_TOKEN = re.compile(r"^[A-Za-z0-9._-]+$")
+_DIAGNOSTIC_FACT_CHOICES = {
+    "record_type": {
+        "member_page",
+        "member_catalog",
+        "member_locator",
+        "member_header",
+        "member_directory",
+        "member_writable_index",
+        "member_global_state",
+    },
+    "field": {
+        "task_id",
+        "queue_scope",
+        "home_machine",
+        "partition",
+        "marker_name",
+        "submission_operation_id",
+    },
+    "queue_field": {"head", "tail", "free", "count"},
+}
+_DIAGNOSTIC_INTEGER_FACTS = {
+    "actual_bytes",
+    "limit_bytes",
+    "expected_revision",
+    "observed_revision",
+    "member_count",
+    "page",
+}
+
+
+def _failure_diagnostic(value: object) -> Mapping[str, Any]:
+    diagnostic = _mapping(value, "submission payload.error.diagnostic")
+    if set(diagnostic) != _DIAGNOSTIC_FIELDS:
+        raise ValueError("submission payload.error.diagnostic fields are invalid")
+    if (
+        diagnostic["version"] != 1
+        or diagnostic["component"] != "group_ready_members"
+        or diagnostic["operation"] != "publish"
+    ):
+        raise ValueError("submission payload.error.diagnostic identity is invalid")
+    for key in ("stage", "check_id", "reason_code", "exception_type", "task_id", "group_name"):
+        if not isinstance(diagnostic[key], str) or not _DIAGNOSTIC_TOKEN.fullmatch(diagnostic[key]):
+            raise ValueError(f"submission payload.error.diagnostic.{key} must be a non-empty string")
+    if type(diagnostic["generation"]) is not int or diagnostic["generation"] < 0:
+        raise ValueError("submission payload.error.diagnostic.generation is invalid")
+    for key in ("input_index", "errno", "json_line", "json_column"):
+        item = diagnostic[key]
+        if item is not None and (type(item) is not int or item < 0):
+            raise ValueError(f"submission payload.error.diagnostic.{key} is invalid")
+    facts = _mapping(diagnostic["facts"], "submission payload.error.diagnostic.facts")
+    if len(facts) > 8:
+        raise ValueError("submission payload.error.diagnostic.facts is invalid")
+    for key, item in facts.items():
+        if key in _DIAGNOSTIC_INTEGER_FACTS:
+            if type(item) is not int or item < 0:
+                raise ValueError("submission payload.error.diagnostic.facts is invalid")
+        elif key not in _DIAGNOSTIC_FACT_CHOICES or item not in _DIAGNOSTIC_FACT_CHOICES[key]:
+            raise ValueError("submission payload.error.diagnostic.facts is invalid")
+    return diagnostic
+
+
+def _format_failure_diagnostic(value: object) -> str:
+    diagnostic = _failure_diagnostic(value)
+    fields = [
+        f"component={diagnostic['component']}",
+        f"operation={diagnostic['operation']}",
+        f"stage={diagnostic['stage']}",
+        f"check={diagnostic['check_id']}",
+        f"reason={diagnostic['reason_code']}",
+        f"exception={diagnostic['exception_type']}",
+        f"task={diagnostic['task_id']}",
+        f"generation={diagnostic['generation']}",
+    ]
+    for key in ("input_index", "errno", "json_line", "json_column"):
+        if diagnostic[key] is not None:
+            fields.append(f"{key}={diagnostic[key]}")
+    facts = diagnostic["facts"]
+    if facts:
+        fields.append("facts=" + ",".join(f"{key}={facts[key]}" for key in sorted(facts)))
+    return "Diagnostic: " + " ".join(fields)
 
 
 def _render_submission(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
@@ -82,7 +182,11 @@ def _render_submission(result: Mapping[str, Any], presentation: Mapping[str, obj
         return "\n".join(lines)
     error = result.get("error") or {}
     message = error.get("message") if isinstance(error, Mapping) else None
-    return f"Submission {outcome}: {_value(message)}"
+    lines = [f"Submission {outcome}: {_value(message)}"]
+    diagnostic = error.get("diagnostic") if isinstance(error, Mapping) else None
+    if diagnostic is not None:
+        lines.append(_format_failure_diagnostic(diagnostic))
+    return "\n".join(lines)
 
 
 def _validate_submission(result: Any) -> None:
@@ -167,10 +271,12 @@ def _validate_submission(result: Any) -> None:
     error = value["error"]
     if error is not None:
         error = _mapping(error, "submission payload.error")
-        if set(error) != {"code", "message"}:
+        if set(error) not in ({"code", "message"}, {"code", "message", "diagnostic"}):
             raise ValueError("submission payload.error fields are invalid")
         if not isinstance(error["code"], str) or not isinstance(error["message"], str):
             raise ValueError("submission payload.error must contain string code and message")
+        if "diagnostic" in error:
+            _failure_diagnostic(error["diagnostic"])
     activation = value["activation"]
     if activation is not None:
         activation = _mapping(activation, "submission payload.activation")

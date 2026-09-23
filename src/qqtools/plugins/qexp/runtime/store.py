@@ -21,6 +21,16 @@ class CASConflict(RuntimeError):
     """Raised when a revisioned update lost a race."""
 
 
+class JSONRecordSizeError(ValueError):
+    """Raised when a JSON record exceeds an explicit byte budget."""
+
+    def __init__(self, message: str, *, record_type: str, actual_bytes: int, limit_bytes: int) -> None:
+        super().__init__(message)
+        self.record_type = record_type
+        self.actual_bytes = actual_bytes
+        self.limit_bytes = limit_bytes
+
+
 @contextmanager
 def migration_json_io_guard() -> Iterator[None]:
     """Reject direct JSON-store access while a migration callback is executing."""
@@ -52,6 +62,7 @@ def atomic_replace(
     value: dict[str, Any],
     *,
     before_replace: Callable[[os.stat_result], None] | None = None,
+    io_step_observer: Callable[[str], None] | None = None,
 ) -> os.stat_result | None:
     _require_migration_json_io_authorization()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -60,14 +71,22 @@ def atomic_replace(
     temporary_stat: os.stat_result | None = None
     try:
         with os.fdopen(fd, "wb") as handle:
+            if io_step_observer is not None:
+                io_step_observer("temp_write")
             handle.write(encoded)
             handle.flush()
             with diagnostic_span("store.fsync"):
+                if io_step_observer is not None:
+                    io_step_observer("file_fsync")
                 os.fsync(handle.fileno())
             temporary_stat = os.fstat(handle.fileno())
         if before_replace is not None:
             before_replace(temporary_stat)
+        if io_step_observer is not None:
+            io_step_observer("replace")
         os.replace(temporary, path)
+        if io_step_observer is not None:
+            io_step_observer("directory_fsync")
         directory_fd = os.open(path.parent, os.O_DIRECTORY)
         try:
             with diagnostic_span("store.fsync"):
@@ -122,15 +141,37 @@ def replace_snapshot_if_changed(path: Path, value: dict[str, Any]) -> bool:
 
 
 @diagnostic_span("store.read_json_limited")
-def read_json_limited(path: Path, *, max_bytes: int) -> dict[str, Any]:
+def read_json_limited(
+    path: Path,
+    *,
+    max_bytes: int,
+    record_type: str = "json_record",
+    io_step_observer: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     """Read one JSON object after enforcing a durable record-size limit."""
     _require_migration_json_io_authorization()
     if type(max_bytes) is not int or max_bytes <= 0:
         raise ValueError("max_bytes must be a positive integer.")
+    if not isinstance(record_type, str) or not record_type:
+        raise ValueError("record_type must be a non-empty string.")
+    if io_step_observer is not None:
+        io_step_observer("read")
     with path.open("rb") as handle:
         encoded = handle.read(max_bytes + 1)
-    if len(encoded) > max_bytes:
-        raise ValueError(f"JSON record exceeds its {max_bytes}-byte limit: {path}.")
+        oversized = len(encoded) > max_bytes
+        actual_bytes = len(encoded)
+        if oversized:
+            try:
+                actual_bytes = os.fstat(handle.fileno()).st_size
+            except OSError:
+                pass
+    if oversized:
+        raise JSONRecordSizeError(
+            f"JSON record exceeds its {max_bytes}-byte limit: {path}.",
+            record_type=record_type,
+            actual_bytes=actual_bytes if actual_bytes >= 0 else len(encoded),
+            limit_bytes=max_bytes,
+        )
     value = json.loads(encoded.decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"Expected JSON object at {path}.")
@@ -144,8 +185,14 @@ def json_encoded_size(value: dict[str, Any]) -> int:
 
 def require_json_size(value: dict[str, Any], *, max_bytes: int, record_type: str) -> None:
     """Reject a record that cannot fit its documented persistence budget."""
-    if json_encoded_size(value) > max_bytes:
-        raise ValueError(f"projection_encoding_unsupported:{record_type}")
+    actual_bytes = json_encoded_size(value)
+    if actual_bytes > max_bytes:
+        raise JSONRecordSizeError(
+            f"projection_encoding_unsupported:{record_type}",
+            record_type=record_type,
+            actual_bytes=actual_bytes,
+            limit_bytes=max_bytes,
+        )
 
 
 @diagnostic_span("store.create_if_absent")

@@ -1279,6 +1279,13 @@ Rules:
 - incompatible later Group changes leave completion recoverably blocked; they do not
   silently rewrite the stored submission plan
 - a new invocation without the previous key is a new submission
+- if pre-commit publication of one grouped ready Task fails, the first failure receipt identifies
+  the affected Task and generation, its zero-based resolved input position when available, and the
+  stable publication stage, check, reason, and exception class; arbitrary exception text, Task
+  commands, paths, and environment values are never included
+- the same bounded diagnostic is retained by the aborted Submission Operation and projection
+  degraded reason when those independent writes succeed; failure of either write does not erase the
+  diagnostic returned by the submitting process or imply that the corresponding state is durable
 - manifest hashes are not implicit idempotency keys
 - `doctor` exposes interrupted operation IDs and keys for recovery
 - success output reports Group, created Task count, home machines, and spillover summary
@@ -1300,7 +1307,8 @@ pending, unknown, and preview results never present provisional IDs as committed
 `source`. `group` always contains nullable `name`, `source`, and committed-only `disposition`.
 `operation` is null before durable identification or contains `id` and nullable verified `state`.
 `task_ids` contains committed IDs in input order only for `committed`; `preview` is non-null only
-for successful preview; and `error` is null on success or contains stable `code` and `message`.
+for successful preview; and `error` is null on success or contains stable `code` and `message`, plus
+an optional versioned `diagnostic` for a group-ready-member publication failure.
 Preview contains normalized `tasks` with input indexes and per-field sources, `group_action`,
 `worker_additions`, and `evidence_gaps`.
 
@@ -1767,6 +1775,13 @@ Group cancellation, worker removal, and cleanup have a bounded read-only diagnos
 - `qexp config show [SECTION]`
 - `qexp config set SECTION [--provider NAME] ...`
 - `qexp config reset SECTION [--provider NAME]`
+
+Submission results keep their version-1 envelope and existing `error.code`. A failure with portable
+publication evidence adds optional `error.diagnostic`, whose fields match the persisted Submission
+diagnostic. JSON mode emits that object within its one stdout value. Human mode writes one concise
+`Diagnostic:` line after the existing error message; `--quiet` keeps stdout reserved for raw values
+and writes the diagnostic only to stderr. Default output never includes a traceback or unrestricted
+exception message, and submission diagnostics are not copied to application log streams.
 
 The progress policy defaults to 30 seconds and accepts finite values greater than or equal
 to 1. It applies to subsequent launches and retries, while an already-running Attempt keeps

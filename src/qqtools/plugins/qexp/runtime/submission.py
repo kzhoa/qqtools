@@ -17,6 +17,7 @@ from .locks import group_lock, group_writer_lock, idempotency_lock, schema_write
 from .operation_store import operation_exists
 from .paths import group_path, idempotency_path, submission_path, task_path
 from .ready import (
+    ReadyMemberPublicationError,
     assert_ready_writer_compatible,
     commit_ready_publication,
     delete_ready_marker,
@@ -439,6 +440,52 @@ def _load_plan_tasks(cfg: Any, plan: SubmissionPlan) -> list[TaskRecord]:
         ) from exc
 
 
+def _cleanup_aborted_submission(
+    cfg: Any,
+    operation_id: str,
+    plan: SubmissionPlan,
+    resolved: list[dict[str, Any]],
+) -> None:
+    """Remove provisional Group and Task truth after a durable abort."""
+    group_name = plan.target_group
+    if group_name:
+        with group_lock(cfg.shared_root, group_name):
+            group_file = group_path(cfg.shared_root, group_name)
+            if group_file.exists():
+                group = read_json(group_file)
+                normalize_group_record(group)
+                has_pending_commit = (group["group"].get("pending_submission_commit") or {}).get(
+                    "operation_id"
+                ) == operation_id
+                creation_owner = group["group"].get("creation_operation_id")
+                if has_pending_commit and plan.create_group and creation_owner == operation_id:
+                    group_file.unlink()
+                else:
+                    removed_worker = _remove_operation_added_workers(group, operation_id, plan)
+                    if has_pending_commit or removed_worker:
+                        group["group"]["pending_submission_commit"] = None
+                        group["meta"]["revision"] += 1
+                        group["meta"]["updated_at"] = utc_now()
+                        _write_group_record(cfg, group_file, group)
+    for item in resolved:
+        task_id = item["task_id"]
+        path = task_path(cfg.shared_root, task_id)
+        with task_lock(cfg.shared_root, task_id):
+            try:
+                current = TaskRecord.from_dict(read_json(path))
+            except FileNotFoundError:
+                remove_deadline_index(cfg, task_id)
+                continue
+            if current.submission_operation_id == operation_id:
+                remove_deadline_index(cfg, task_id)
+                try:
+                    delete_ready_marker(cfg, task_id, current.ready_generation)
+                except (OSError, KeyError, TypeError, ValueError):
+                    pass
+                assert_ready_writer_compatible(cfg)
+                path.unlink(missing_ok=True)
+
+
 def _execute_submission_locked(
     cfg: Any,
     operation: dict[str, Any],
@@ -681,48 +728,42 @@ def _execute_submission_locked(
                 stage_and_commit()
         _finalize_committed_submission(cfg, operation["submission"])
         return _submission_result(staged, operation["submission"])
+    except ReadyMemberPublicationError as exc:
+        if commit_durable or operation["submission"].get("state") == "blocked":
+            raise
+        diagnostic_error = exc
+        input_index = next(
+            (index for index, item in enumerate(resolved) if item.get("task_id") == exc.diagnostic.task_id),
+            None,
+        )
+        if input_index is not None:
+            try:
+                diagnostic_error = exc.with_input_index(input_index)
+            except (TypeError, ValueError):
+                diagnostic_error = exc
+        submission["state"] = "aborted"
+        submission["failure_reason"] = str(exc)
+        if submission.get("failure_diagnostic") is None:
+            submission["failure_diagnostic"] = diagnostic_error.diagnostic.to_dict()
+        try:
+            publish_submission(cfg, operation)
+        except Exception:
+            diagnostic_error.add_secondary("submission_abort_persistence_failed")
+            cause = exc.__cause__ or exc
+            raise diagnostic_error from cause
+        try:
+            _cleanup_aborted_submission(cfg, operation_id, plan, resolved)
+        except Exception:
+            diagnostic_error.add_secondary("submission_cleanup_failed")
+        cause = exc.__cause__ or exc
+        raise diagnostic_error from cause
     except Exception as exc:
         if commit_durable or operation["submission"].get("state") == "blocked":
             raise
         operation["submission"]["state"] = "aborted"
         operation["submission"]["failure_reason"] = str(exc)
         publish_submission(cfg, operation)
-        if group_name:
-            with group_lock(cfg.shared_root, group_name):
-                group_file = group_path(cfg.shared_root, group_name)
-                if group_file.exists():
-                    group = read_json(group_file)
-                    normalize_group_record(group)
-                    has_pending_commit = (group["group"].get("pending_submission_commit") or {}).get(
-                        "operation_id"
-                    ) == operation_id
-                    creation_owner = group["group"].get("creation_operation_id")
-                    if has_pending_commit and plan.create_group and creation_owner == operation_id:
-                        group_file.unlink()
-                    else:
-                        removed_worker = _remove_operation_added_workers(group, operation_id, plan)
-                        if has_pending_commit or removed_worker:
-                            group["group"]["pending_submission_commit"] = None
-                            group["meta"]["revision"] += 1
-                            group["meta"]["updated_at"] = utc_now()
-                            _write_group_record(cfg, group_file, group)
-        for item in resolved:
-            task_id = item["task_id"]
-            path = task_path(cfg.shared_root, task_id)
-            with task_lock(cfg.shared_root, task_id):
-                try:
-                    current = TaskRecord.from_dict(read_json(path))
-                except FileNotFoundError:
-                    remove_deadline_index(cfg, task_id)
-                    continue
-                if current.submission_operation_id == operation_id:
-                    remove_deadline_index(cfg, task_id)
-                    try:
-                        delete_ready_marker(cfg, task_id, current.ready_generation)
-                    except (OSError, KeyError, TypeError, ValueError):
-                        pass
-                    assert_ready_writer_compatible(cfg)
-                    path.unlink(missing_ok=True)
+        _cleanup_aborted_submission(cfg, operation_id, plan, resolved)
         raise
 
 

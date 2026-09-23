@@ -788,6 +788,27 @@ submission:
   staged_task_count: int
   committed_at: str | null
   failure_reason: str | null
+  failure_diagnostic: null | object # absent only on historical operations
+```
+
+When `failure_diagnostic` is present, its exact version-1 shape is:
+
+```yaml
+version: 1
+component: group_ready_members
+operation: publish
+stage: str
+check_id: str
+reason_code: str
+facts: object
+exception_type: str
+task_id: str
+generation: int
+group_name: str
+input_index: int | null
+errno: int | null
+json_line: int | null
+json_column: int | null
 ```
 
 The idempotency mapping lives at:
@@ -830,6 +851,13 @@ Submission rules:
 - the same key and raw request reuse the stored resolved context across machines
 - the same key with different raw input fails with an idempotency conflict
 - retries never reinterpret `current` or recompute Worker Set changes
+- new operations initialize `failure_diagnostic` to null; an absent field on a historical operation
+  means diagnostic evidence is unavailable and is never synthesized from `failure_reason`
+- the first pre-commit group-ready-member publication failure stores its version-1 diagnostic in
+  the same operation write that records `aborted`; reconciliation, cleanup, repair, and retries
+  retain that first diagnostic, while blocked and committed operations are never rewritten to add it
+- supported whole-operation writers retain unknown additive fields, so this field needs no backfill
+  or temporary dual-format writer
 
 ### 8.6 Group Control Operation Truth
 
@@ -2680,6 +2708,30 @@ partition, count, digest, identity, and locator consistency are checked before a
 mutation consumes members. An invalid member projection is durably marked `degraded` before Group
 truth is changed; primary probes then return unresolved and deny new borrow admission. Exact
 identity and member revision checks make delayed cleanup a no-op after slot reuse.
+
+A pre-commit Submission publication failure creates one bounded diagnostic before attempting to
+mark this projection degraded. Its stage is the last explicitly entered publication boundary:
+`projection_check`, `group_load`, `locator_validate`, `page_select`, `entry_validate`,
+`locator_write`, `member_page_write`, `member_catalog_write`, `member_header_write`, or
+`global_state_commit`. A source-owned check ID and reason code distinguish validation and storage
+sites without parsing exception text. The diagnostic contains only its version, component,
+operation, stage, check, reason, sanitized exception class, validated Group/Task/generation,
+nullable Submission input index, nullable non-negative errno or JSON line/column, and
+reason-specific allowlisted facts. It is limited to 4 KiB and never contains exception messages,
+tracebacks, record contents, command arguments, paths, environment values, or digest values.
+
+The projection's degraded-reason copy is a canonical version-1 serialization of at most 512 UTF-8
+bytes. It retains reason, stage, and check before optional exception, Task, storage, and fact fields;
+identifier shortening is deterministic. It omits the Submission input index because publication
+does not read the operation while holding projection locks. Locator persistence still precedes
+member-page, catalog, and header size checks and writes. Those size checks remain
+`entry_validate`; only the corresponding persistence call enters its write stage.
+
+Failure to encode or persist the degraded reason, abort record, or eligible cleanup remains a
+failure and cannot replace the primary in-memory publication diagnostic. Cleanup begins only after
+the aborted operation write succeeds. The typed publication error carries the enriched diagnostic
+to the submitting process even when later storage reads fail; this evidence alone is not proof that
+either the degraded or aborted state became durable.
 
 New roots initialize an empty active projection. Existing roots use the resumable
 `group-ready-members` upgrade: it writes `building`, installs the required capability as the
