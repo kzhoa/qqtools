@@ -255,7 +255,9 @@ def preview_specs(
             request,
             idempotency_key=idempotency_key or "preview",
             operation_id="preview",
-            allocate_task_ids=False,
+            # Validate progress policy against ephemeral IDs; unset IDs are removed
+            # from the preview below, and this path never reserves or persists them.
+            allocate_task_ids=True,
             persist_clock_evidence=False,
             acquire_group_lock=False,
             policy_snapshot=policy_snapshot,

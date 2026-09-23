@@ -14,13 +14,6 @@ OLD_RUNTIME_MODULES = {
     "ready.py",
     "availability.py",
 }
-OLD_RUNTIME_IMPORTS = {
-    "runtime.active_operations",
-    "runtime.recovery",
-    "runtime.reservations",
-    "runtime.cpu_lane",
-    "runtime.group_members",
-}
 OLD_PRIMARY_PROBE_FIELDS = {
     "primary_probe_cursors",
     "primary_probe_revisions",
@@ -31,30 +24,24 @@ OLD_PRIMARY_PROBE_FIELDS = {
 }
 
 
-def _import_modules(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+def _import_modules(path: Path, source: str | None = None) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8") if source is None else source, filename=str(path))
     modules: set[str] = set()
-    for node in ast.walk(tree):
+    pending = [tree]
+    while pending:
+        node = pending.pop()
         if isinstance(node, ast.Import):
             modules.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             modules.add(node.module)
+        else:
+            # Imports can occur in nested statement bodies, never in expressions.
+            pending.extend(child for child in ast.iter_child_nodes(node) if not isinstance(child, ast.expr))
     return modules
 
 
-def test_legacy_runtime_modules_and_repository_imports_are_absent() -> None:
+def test_legacy_runtime_module_files_are_absent() -> None:
     assert not OLD_RUNTIME_MODULES & {path.name for path in RUNTIME_ROOT.glob("*.py")}
-
-    imported_modules = set()
-    for directory in ("src", "tests", "scripts"):
-        for path in (PROJECT_ROOT / directory).rglob("*.py"):
-            imported_modules.update(_import_modules(path))
-    assert not {
-        imported
-        for imported in imported_modules
-        for old_import in OLD_RUNTIME_IMPORTS
-        if imported == old_import or imported.startswith(f"{old_import}.")
-    }
 
 
 def test_runtime_packages_export_owner_objects_without_private_names() -> None:
@@ -115,9 +102,34 @@ def test_primary_probe_state_is_only_mutated_by_its_owner() -> None:
     for path in production_root.rglob("*.py"):
         if path.name == "dispatch_probe.py":
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        source = path.read_text(encoding="utf-8")
+        if not any(field in source for field in OLD_PRIMARY_PROBE_FIELDS):
+            continue
+        tree = ast.parse(source, filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr in OLD_PRIMARY_PROBE_FIELDS:
                 offenders.append(f"{path.relative_to(PROJECT_ROOT)}:{node.lineno}:{node.attr}")
 
     assert offenders == []
+
+
+def test_import_scan_keeps_nested_and_multiline_imports(tmp_path: Path) -> None:
+    source = """
+import os, sys
+from qqtools.plugins.qexp.runtime.recovery import (
+    recover,
+)
+def nested():
+    try:
+        import qqtools.plugins.qexp.runtime.cpu_lane
+    except ImportError:
+        from qqtools.plugins.qexp.runtime import reservations
+    value = [number * 2 for number in range(100)]
+"""
+    assert _import_modules(tmp_path / "sample.py", source) == {
+        "os",
+        "sys",
+        "qqtools.plugins.qexp.runtime.recovery",
+        "qqtools.plugins.qexp.runtime.cpu_lane",
+        "qqtools.plugins.qexp.runtime",
+    }

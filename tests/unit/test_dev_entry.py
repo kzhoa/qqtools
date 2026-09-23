@@ -49,7 +49,17 @@ def test_entry_forwards_pytest_arguments_and_exit_code(entry, monkeypatch, args)
 
     monkeypatch.setattr(entry, "run", run)
     assert entry.main(["test", *args]) == 5
-    assert calls == [[sys.executable, "-m", "tox", "run", "-e", "unit", "--", *args]]
+    assert calls == [
+        [sys.executable, "-m", "tox", "run", "--workdir", str(entry.tox_work_dir()), "-e", "unit", "--", *args]
+    ]
+
+
+def test_tox_work_dir_is_shared_in_user_cache(entry, monkeypatch, tmp_path):
+    monkeypatch.setattr(entry.Path, "home", lambda: tmp_path / "home")
+    first = entry.tox_work_dir()
+    assert first == tmp_path / "home" / ".cache" / "qqtools" / "tox"
+    monkeypatch.setattr(entry, "ROOT", tmp_path / "other-checkout")
+    assert entry.tox_work_dir() == first
 
 
 @pytest.mark.parametrize("command", ["env", "preflight"])
@@ -84,7 +94,7 @@ def test_platform_prerequisites(monkeypatch, platform, tmux, expected):
     assert expected in run_preflight.check_prerequisites()
 
 
-def test_release_profile_uses_exact_release_validator_and_excludes_large_observation_scale(monkeypatch):
+def test_release_profile_uses_exact_release_validator_and_full_qexp_gate(monkeypatch):
     commands = []
     monkeypatch.setattr(run_preflight, "check_prerequisites", lambda: None)
     monkeypatch.setattr(
@@ -112,12 +122,24 @@ def test_release_profile_uses_exact_release_validator_and_excludes_large_observa
     rendered = [" ".join(command) for command in commands]
     validator = next(index for index, command in enumerate(rendered) if "check_release_commit.py validate" in command)
     common = next(index for index, command in enumerate(rendered) if "ruff check" in command)
+    slow_integration = next(
+        index for index, command in enumerate(rendered) if "test_qexp_live_progress.py::" in command
+    )
     full_qexp = next(index for index, command in enumerate(rendered) if "qexp_integration_gate.py" in command)
-    assert validator < common < full_qexp
+    assert validator < common < slow_integration < full_qexp
+    assert all(node in commands[slow_integration] for node in run_preflight.RELEASE_SLOW_INTEGRATION_NODES)
+    assert "--durations=20" in commands[slow_integration]
     assert "--budget-seconds 600" in rendered[full_qexp]
-    assert commands[full_qexp][-1] == f"--deselect={run_preflight.RELEASE_EXCLUDED_OBSERVATION_SCALE_NODE}"
-    assert sum(argument.startswith("--deselect=") for argument in commands[full_qexp]) == 1
+    assert not any(argument.startswith("--deselect=") for argument in commands[full_qexp])
     assert not any("--lifecycle-gate=representative" in command for command in rendered)
+
+
+def test_feature_preflight_reports_twenty_integration_durations_and_excludes_slow_nodes():
+    commands = run_preflight._commands("feature", None, None, None)
+    integration = next(command for command in commands if "tests/integration" in command)
+    assert "--durations=20" in integration
+    assert "not slow and not gpu and not ddp" in integration
+    assert not any(node in command for command in commands for node in run_preflight.RELEASE_SLOW_INTEGRATION_NODES)
 
 
 def test_release_profile_requires_release_identity(monkeypatch):
@@ -151,3 +173,39 @@ def test_existing_ide_environment_is_reused_and_explicitly_targeted(entry, monke
     monkeypatch.setattr(entry, "run", lambda command: calls.append(command) or 0)
     assert entry.main(["env"]) == 0
     assert calls == [["uv", "pip", "install", "--python", str(python), "-e", ".[full]", "pytest-xdist"]]
+
+
+def test_preflight_reuses_unit_environment(entry, monkeypatch):
+    monkeypatch.setattr(entry, "check_prerequisites", lambda: None)
+    commands = []
+    monkeypatch.setattr(entry, "run", lambda command: commands.append(command) or 0)
+    assert entry.main(["preflight"]) == 0
+    assert commands == [
+        [
+            sys.executable,
+            "-m",
+            "tox",
+            "run",
+            "--workdir",
+            str(entry.tox_work_dir()),
+            "-e",
+            "unit",
+            "--override",
+            "testenv:unit.commands=python scripts/ci/run_preflight.py",
+        ]
+    ]
+
+
+def test_feature_qexp_checks_share_one_process_and_release_does_not_repeat_them():
+    paths = {
+        "tests/integration/qexp/test_resource_isolation.py",
+        "tests/integration/qexp/test_store_crash_boundaries.py",
+        "tests/integration/qexp/test_machine_lab.py",
+    }
+    feature = run_preflight._commands("feature", None, None, None)
+    selected = [command for command in feature if paths.intersection(command)]
+    assert len(selected) == 1
+    assert paths.issubset(selected[0])
+    release = run_preflight._commands("release", "base", "head", "kzhoa")
+    assert not any(paths.intersection(command) for command in release)
+    assert sum("scripts/qexp_integration_gate.py" in command for command in release) == 1

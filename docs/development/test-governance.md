@@ -42,6 +42,15 @@ effective state, output, or side effects, not merely absence of exceptions.
 E2E covers public delivery boundaries without duplicating internal combinations
 already proven by Unit or Integration.
 
+Do not add regression tests solely to preserve the cleanup history of a completed
+refactor, such as asserting that old module files, imports, names, or source text
+remain absent. Verify these cleanup tasks with a one-time search or review; do
+not turn them into recurring repository scans. Retire existing checks when their
+migration purpose ends instead of moving them behind `slow` or `stress` markers.
+Keep tests that protect current behavior, supported compatibility contracts, or
+explicit architectural boundaries; those tests must identify the continuing
+contract they enforce rather than merely forbid a historical implementation.
+
 Historical `tests/integration/functional/` remains Integration; do not create a
 fourth layer. Do not add test cases directly under `tests/` or into helpers.
 Exploratory scripts are not sufficient long-term regression protection; move
@@ -141,12 +150,95 @@ lanes for affected public delivery boundaries and whenever policy requires them.
 For a versioned release, Dev Preflight recognizes the owner-only metadata commit
 and runs the release source profile against its exact SHA. That profile checks
 version and changelog consistency, compatibility and export contracts, static and
-governance rules, Unit, general Integration, and qexp Integration except the
-100,000-record indexed-pagination case. This accepted release-gate exclusion
-does not change the test or the complete manual `qexp-integration` lane; see
-[active-history acceptance](../spec/qexp_active_history_acceptance.md#current-gate-scope).
+governance rules, Unit, general Integration, the marked slow qpipeline/qexp
+real-training and LMDB process cases, and qexp Integration.
 Tagged publishing separately runs `release-e2e` against the selected wheel before
 publication. These distinct gates cannot substitute for one another.
+
+The qpipeline/qexp real-training case and LMDB child-process/GC cases are marked
+`slow`. Feature preflight excludes them from the general Integration collection;
+run their nodes explicitly when changing those workflows. Release preflight runs
+them once. Source and installed-artifact pytest configurations print the 20 slowest
+setup/call/teardown durations in every phase. Override with `--durations=100`
+when investigating a larger set.
+
+The complete local responsibility storage crash/replay, power-cut, persisted-image,
+initialization, cleanup, and stage-build matrices are marked `slow`. Feature
+preflight retains representative real-process crashes immediately before and at
+the durable-intent barrier for publication, handoff, and cross-page retirement.
+Run the complete storage file when changing storage/recovery behavior; release
+preflight explicitly selects every slow matrix once. The randomized removal and
+page-reuse test keeps a 65-record, one-reuse-round functional case; its original
+140-record, four-round qualification is opt-in `stress`.
+
+## Avoid repeated test startup work
+
+Feature preflight collects qexp resource isolation, store crash boundaries, and
+machine-lab checks in one pytest process. Torch multiprocessing tests and the
+lifecycle gate retain separate processes for their isolation and gate semantics.
+Release runs the full qexp gate instead of repeating the feature subset.
+
+The local responsibility storage crash matrix preloads pytest and storage module
+definitions into the forkserver before its first child. Each crash boundary still
+uses a fresh child, real filesystem operations, and the original recovery
+assertions. If a forkserver is already running, the preload request does not
+change it; this optimization is not required for correctness.
+
+The qdataset process checks share one parent probe per start method, while graph
+collation and file-lock serialization still use separate fresh workers. Both
+`spawn` and `forkserver` remain covered; the forkserver preloads module definitions.
+These two cases are marked `slow` and selected explicitly by release preflight.
+Feature preflight keeps the lightweight `fork` multi-worker read check. When
+changing Dataset, DataLoader, file-lock behavior, or their dependencies, run
+`./scripts/dev test tests/integration/torch/test_qdataset_process_boundaries.py`.
+This selection is manual; feature preflight does not detect affected files.
+Progress retry tests use short per-reporter retry delays while preserving retry,
+backoff, cap, reset, and bounded shutdown assertions. Production timing defaults
+are unchanged.
+
+The JSON scanner keeps a three-block fragmentation case in normal validation;
+the two 8 MiB memory qualifications are `stress`. Authority overload coverage
+keeps a small saturated-cache/backlog scenario with a reduced test work budget;
+the original 256-active-attempt scenario is `stress`. Both retain mixed lease
+modes, renewal deadlines, deferred admission, continued discovery, and stale-clock
+isolation assertions. These scale cases remain available with `--run-stress`.
+
+## Optional stress qualification
+
+When adding or maintaining tests, contributors must classify expensive cases:
+
+- Apply `@pytest.mark.stress` to scale, sustained-load, throughput, and large
+  working-set qualifications whose purpose is measuring capacity or performance.
+- Apply `@pytest.mark.slow` to functional correctness tests whose execution cost
+  makes them unsuitable for the fast development loop. Use pytest duration
+  reports to inform this classification; do not classify by filename alone.
+- For mixed parameter matrices, mark only the expensive parameters with
+  `pytest.param(..., marks=pytest.mark.stress)` or `pytest.mark.slow`; retain
+  ordinary functional and boundary parameters in normal validation.
+
+Choose markers by test purpose, not merely elapsed time. A slow crash-recovery
+correctness test requires `slow`, not `stress`. Neither marker permits weakening
+assertions or removing required lifecycle coverage.
+
+`stress` marks scale, sustained-load, throughput, and large working-set
+qualification. Source pytest runs deselect these cases by default, including
+feature and release preflight. Opt in explicitly:
+
+```bash
+./scripts/dev test tests/integration/qexp --run-stress -m stress -q --durations=20
+```
+
+Select a file or node to bound an experiment; `--run-stress` permits stress cases,
+while `-m stress` selects only those cases. A path or `-m stress` alone does not
+opt in. Deselected cases are not passing evidence. These experiments are manual,
+not an additional release gate. Keep each selected case within ten minutes.
+
+`slow` is separate: it describes functional tests unsuitable for a fast loop and
+does not globally exclude them. Unit currently includes slow functional tests;
+general Integration and the release profile use their documented selections.
+Keep small functional and boundary regressions in normal validation when moving
+large parameters to `stress`. Crash-recovery, durability, and lifecycle tests
+must not be reclassified solely because they start subprocesses or run slowly.
 
 ## qexp resource and lifecycle protection
 
@@ -154,13 +246,12 @@ Before implementing or changing qexp Integration tests, apply the isolation and
 cleanup requirements in this section. Lightweight checks on restricted platforms
 must not be reported as real Linux lifecycle evidence.
 
-Use the stable `qexp-unit`, `qexp-integration`, and `qexp-machine-lab` tox lanes
-for their corresponding scopes; [tests/readme.md](../../tests/readme.md) lists
-entry points. `qexp-unit` is the default module check. Select Integration files
-by changed collaboration, persistence, CLI, or scheduling behavior. Use complete
-`qexp-integration` when impact requires it or the user requests it. The release
-profile has the explicit exclusion described above; `qexp-machine-lab` is a
-convenience lane within Integration.
+Use `./scripts/dev test tests/unit/qexp -q` for qexp Unit tests and select
+Integration files by changed collaboration, persistence, CLI, or scheduling
+behavior. Use complete `qexp-integration` when impact requires it or the user
+requests it; [tests/readme.md](../../tests/readme.md) lists entry points. The
+release profile also excludes opt-in `stress` cases. Machine lab tests
+remain part of qexp Integration and can be selected by path.
 
 Every qexp Integration test must own isolated temporary roots, HOME/XDG,
 runtime roots, tmux resources, and ledger-based cleanup checks. Never use the

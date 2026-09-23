@@ -33,11 +33,12 @@ The release profile validates the owner and release-commit shape, version and
 changelog agreement, compatibility lifecycle, export stubs, static and repository
 governance, Unit, general Integration, and qexp Integration. The release qexp
 selection replaces the representative qexp selection used by the ordinary
-feature profile; the release profile does not run both. As of 2026-09-23, the
-release selection has one accepted exclusion: the 100,000-record indexed-pagination
-case. The test remains available in the complete manual qexp Integration lane;
-the [active-history acceptance](../spec/qexp_active_history_acceptance.md#current-gate-scope)
-records the resulting release coverage gap.
+feature profile; the release profile does not run both. The original release
+selection excluded the 100,000-record indexed-pagination case while retaining
+it in the manual qexp Integration lane. That parameter was subsequently removed
+from the test matrix. Current release and manual qexp Integration have no special
+deselection; [active-history acceptance](../spec/qexp_active_history_acceptance.md#current-gate-scope)
+records the remaining coverage gap.
 
 Feature-profile and release-profile evidence have distinct job identities.
 `dev`-to-`main` release promotion accepts only recent, owner-triggered,

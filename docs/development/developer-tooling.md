@@ -64,10 +64,14 @@ upgrade an existing interpreter to the newest patch release; maintainers update
 uv/Python periodically. No `.python-version` or global default Python is needed.
 
 The script calls tox through `sys.executable` from the repository root. `unit`
-and `preflight` inherit that Python version and use separate cached `.tox`
-environments. Tox owns their lifecycle and commands; tox-uv delegates creation
+and `preflight` commands both execute in the `unit` tox environment at
+`~/.cache/qqtools/tox/unit`. This keeps large dependencies on the user's home
+filesystem and reuses them across local worktrees. Run commands that may update
+the shared tox environment serially across worktrees. Direct tox commands still
+use the repository `.tox/` unless given `--workdir ~/.cache/qqtools/tox`.
+Tox owns the environment lifecycle and commands; tox-uv delegates creation
 and dependency installation to uv. The backend's uv version is pinned, while the
-initial uv launcher is provided by the developer. Both environments install the full project extras so optional-feature unit tests
+initial uv launcher is provided by the developer. The shared environment installs the full project extras so optional-feature unit tests
 have their dependencies. A cold run can download large PyTorch packages; “quick”
 describes the unit-test scope, not first-time dependency installation.
 
@@ -79,26 +83,23 @@ deliberately use pytest options to override this daily-test configuration.
 
 ### Reuse a compatible tox environment from an independent worktree
 
-An independent feature worktree has its own `.tox/` path, so `./scripts/dev test`
-there may install a second copy of the same test dependencies. For focused
-development tests, prefer an existing compatible tox interpreter from the main
-checkout when dependencies, Python version, and test lane have not changed. Run
-pytest from the feature worktree and point `PYTHONPATH` at that worktree's `src/`:
+All local worktrees use the same default user-cache tox path. For focused tests,
+run pytest from the feature worktree using the existing compatible interpreter
+and point `PYTHONPATH` at that worktree's `src/`:
 
 ```bash
 cd /path/to/feature-worktree
-QQTOOLS_BASE_CHECKOUT=/path/to/existing/qqtools
-PYTHONPATH="$PWD/src" "$QQTOOLS_BASE_CHECKOUT/.tox/unit/bin/python" -c \
+PYTHONPATH="$PWD/src" ~/.cache/qqtools/tox/unit/bin/python -c \
   'import qqtools; print(qqtools.__file__)'
-PYTHONPATH="$PWD/src" "$QQTOOLS_BASE_CHECKOUT/.tox/unit/bin/python" -m pytest \
+PYTHONPATH="$PWD/src" ~/.cache/qqtools/tox/unit/bin/python -m pytest \
   tests/unit/path/to/test_file.py -q
 ```
 
 The printed module path must start with the feature worktree's `src/qqtools`.
 Use the corresponding existing lane interpreter for focused Integration tests.
-This reuses dependencies without installing into or changing the main checkout's
-tox environment. If its interpreter or dependencies are incompatible, use
-`./scripts/dev test` in the feature worktree to create its own environment.
+This reuses dependencies without reinstalling the shared tox environment. If
+its interpreter or dependencies are incompatible, run `./scripts/dev test`
+serially so tox can update the shared environment for that checkout.
 Complete preflight and configured promotion gates still use their standard
 entry points and exact candidate checkout.
 
@@ -147,12 +148,17 @@ For initial provisioning only, maintainers can run:
 ./scripts/dev env
 uv run --no-project --python 3.13 --with 'tox==4.61.5' \
   --with 'tox-uv==1.36.0' --with 'uv==0.12.16' \
-  python -m tox run -e unit,preflight --notest
+  python -m tox run --workdir ~/.cache/qqtools/tox -e unit --notest
 ```
 
 This does not validate the repository; run the standard test/preflight commands
 after installation. Switching from virtualenv/pip may recreate old tox environments
-once. Separate environments remain isolated, but reuse uv's download/install cache.
+once. The standard entry point selects different commands in the same named tox
+environment; assigning two environment names the same directory would cause tox
+to rebuild on every switch. Direct `tox -e preflight` uses a small tool-only
+wrapper that delegates to `unit`, without another full dependency installation.
+Run commands serially. Installed-wheel and CI environments remain isolated,
+but reuse uv's download/install cache.
 For a cache on a different filesystem from the environments, `UV_LINK_MODE=copy`
 explicitly accepts copying. For link-based reuse, place a personal `UV_CACHE_DIR`
 on the same filesystem as the environments, provided it supports linking. Neither
@@ -168,20 +174,20 @@ validation preserves `tmp/` diagnostics instead of deleting them afterward.
 The unused pytest-cov dependency and obsolete pip-cache override are removed;
 tox-uv uses the uv cache settings described above.
 The CI release profile uses the same shared Python runner as ordinary preflight
-and replaces representative qexp coverage with the qexp integration gate, excluding
-only the accepted 100,000-record indexed-pagination case. The manual
-`qexp-integration` lane still includes it.
+and replaces representative qexp coverage with the qexp integration gate.
 `release-e2e` inherits the installed E2E environment and still accepts
 `--installpkg` for the exact wheel selected by publishing.
 
-For local Python compatibility checks, run:
+For local Python compatibility checks, select each interpreter explicitly:
 
 ```bash
-tox run-parallel -e 'py{311,312,313,314}-artifact-smoke'
+uv run --no-project --python 3.11 --with 'tox==4.61.5' --with 'tox-uv==1.36.0' --with 'uv==0.12.16' python -m tox run -e artifact-smoke
+uv run --no-project --python 3.12 --with 'tox==4.61.5' --with 'tox-uv==1.36.0' --with 'uv==0.12.16' python -m tox run -e artifact-smoke
+uv run --no-project --python 3.14 --with 'tox==4.61.5' --with 'tox-uv==1.36.0' --with 'uv==0.12.16' python -m tox run -e artifact-smoke
 ```
 
-These lanes install wheels, verify that imports come from site-packages, and
-exercise `qexp --help`. They do not run four copies of the source Unit suite or
+This lane installs a wheel, verifies that imports come from site-packages, and
+exercises `qexp --help`. It does not rerun the source Unit suite or
 install pytest/coverage tools. Missing interpreters fail instead of silently
 skipping a claimed compatibility check; install the requested Python with uv
 beforehand. Full source validation stays on Python 3.13. CI keeps Python 3.13

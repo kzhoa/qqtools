@@ -23,6 +23,13 @@ Ledger, DurableIO = prototype.Ledger, prototype.DurableIO
 Conflict, Unavailable = prototype.Conflict, prototype.Unavailable
 
 
+@pytest.fixture(scope="module", autouse=True)
+def preload_crash_worker_imports():
+    # Forkserver children otherwise repeat these imports at every crash boundary.
+    # Preload definitions only; each child still opens its own ledger.
+    multiprocessing.set_forkserver_preload(["__main__", "pytest", "qqtools.plugins.qexp.runtime.responsibility_store"])
+
+
 def identities(count: int, bucket: int = 0) -> list[str]:
     result = []
     value = 0
@@ -127,10 +134,17 @@ def test_stale_cursor_generation_and_exact_retry(tmp_path):
         other.page(0, cursor)
 
 
-def test_churn_random_removal_and_page_reuse(tmp_path):
+@pytest.mark.parametrize(
+    "count,reuse_rounds",
+    [
+        pytest.param(65, 1, id="cross-page-reuse"),
+        pytest.param(140, 4, id="repeated-churn", marks=pytest.mark.stress),
+    ],
+)
+def test_churn_random_removal_and_page_reuse(tmp_path, count, reuse_rounds):
     ledger = Ledger.create(tmp_path / "ledger")
     randomizer = random.Random(487)
-    names = identities(140)
+    names = identities(count)
     live = {}
     for identity in names:
         live[identity] = ledger.publish(identity, {})
@@ -142,7 +156,7 @@ def test_churn_random_removal_and_page_reuse(tmp_path):
         assert_compact(ledger.root, len(live))
         if index % 20 == 0:
             ledger = Ledger(ledger.root)
-    for _ in range(4):
+    for _ in range(reuse_rounds):
         for identity in names[:70]:
             generation = ledger.publish(identity, {})
             assert ledger.retire(identity, ledger.handoff(identity, generation))
@@ -284,7 +298,31 @@ def run_child(target, *args):
         child.close()
 
 
+@pytest.mark.parametrize("case", ["publish_page", "handoff", "retire_cross"])
+def test_process_crash_around_durable_intent_recovers(tmp_path, case):
+    seed = tmp_path / "seed"
+    identity = prepare(seed, case)
+    before = scan(Ledger(seed))
+    expected_root = tmp_path / "expected"
+    shutil.copytree(seed, expected_root)
+    trace = DurableIO(lambda _: None)
+    operation(Ledger(expected_root, trace), case, identity)
+    after = scan(Ledger(expected_root))
+    intent = trace.events.index("pending:directory_fsync") + 1
+    for boundary in (intent - 1, intent):
+        trial = tmp_path / f"cut-{boundary}"
+        shutil.copytree(seed, trial)
+        assert run_child(crash_child, trial, case, identity, boundary) == 86
+        actual = scan(Ledger(trial))
+        assert actual in (before, after)
+        if boundary >= intent:
+            assert actual == after
+        assert scan(Ledger(trial)) == actual
+        assert_compact(trial, len(actual))
+
+
 @pytest.mark.parametrize("case", ["reject_writer_entry", "reject_writer_bucket"])
+@pytest.mark.slow
 def test_incomplete_writer_marker_survives_transaction_and_replay_crashes(tmp_path, case):
     seed = tmp_path / "seed"
     identity = prepare(seed, case)
@@ -355,6 +393,7 @@ def test_incomplete_writer_marker_survives_transaction_and_replay_crashes(tmp_pa
         "retire_dual",
     ],
 )
+@pytest.mark.slow
 def test_process_crash_at_every_storage_boundary(tmp_path, case):
     seed = tmp_path / "seed"
     identity = prepare(seed, case)
@@ -391,6 +430,7 @@ def test_process_crash_at_every_storage_boundary(tmp_path, case):
         "attach_writer_source",
     ],
 )
+@pytest.mark.slow
 def test_replay_itself_can_crash_repeatedly(tmp_path, case):
     seed = tmp_path / "seed"
     identity = prepare(seed, case)
@@ -520,6 +560,7 @@ def test_continuous_mutation_invalidates_dense_cursors(tmp_path):
 
 
 @pytest.mark.parametrize("case", ["publish_page", "handoff", "retire_cross"])
+@pytest.mark.slow
 def test_power_cut_model_restores_last_synced_directory(tmp_path, case):
     """Model one allowed power-loss outcome: discard unsynced namespace changes.
 
@@ -697,6 +738,7 @@ def test_round_robin_service_does_not_starve_other_buckets_or_hide_failures(tmp_
 
 
 @pytest.mark.parametrize("case", ["publish_page", "handoff", "retire_cross", "handoff_cross", "retire_dual"])
+@pytest.mark.slow
 def test_redo_recovers_every_mixture_of_persisted_after_images(tmp_path, case):
     seed = tmp_path / "seed"
     identity = prepare(seed, case)
@@ -748,6 +790,7 @@ def crash_initialization(root, boundary):
     initialize_with_io(root, DurableIO(crash))
 
 
+@pytest.mark.slow
 def test_initialization_resumes_after_every_process_crash_boundary(tmp_path):
     io = DurableIO(lambda _: None)
     initialize_with_io(tmp_path / "trace", io)
@@ -889,6 +932,7 @@ def crash_cleanup(runtime, request, boundary):
     complete_cleanup(Ledger(runtime / "members", DurableIO(crash)), runtime, request)
 
 
+@pytest.mark.slow
 def test_cleanup_process_crashes_preserve_receipt_until_durable_deletion(tmp_path):
     from qqtools.plugins.qexp.runtime.responsibility_cleanup import CleanupRequest, complete_cleanup
 
@@ -1120,6 +1164,7 @@ def test_resumable_stage_build_preserves_generations_during_mutation(tmp_path):
     assert ledger.io.counts["writes"] == 0
 
 
+@pytest.mark.slow
 def test_stage_build_replays_every_process_crash_without_changing_ownership(tmp_path):
     seed = tmp_path / "seed"
     identity = prepare(seed, "build_stage")

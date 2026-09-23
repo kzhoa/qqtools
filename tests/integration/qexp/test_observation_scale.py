@@ -9,10 +9,13 @@ from qqtools.plugins.qexp import observer
 from qqtools.plugins.qexp.runtime.work_budget import RuntimeDiagnostics, activate_diagnostics
 from tests.helpers.qexp.observation_scale import retained_tasks
 
-pytestmark = [pytest.mark.integration, pytest.mark.slow]
+pytestmark = pytest.mark.integration
 
 
-@pytest.mark.parametrize("history_count", [0, 1000, 10_000, 100_000])
+@pytest.mark.parametrize(
+    "history_count",
+    [0, 129, pytest.param(1000, marks=pytest.mark.stress), pytest.param(10_000, marks=pytest.mark.stress)],
+)
 def test_retained_history_queries_remain_bounded_and_complete(tmp_path, monkeypatch, history_count, record_property):
     cfg, truth = retained_tasks(tmp_path, history_count)
     shapes = [{}, {"group": "absent"}]

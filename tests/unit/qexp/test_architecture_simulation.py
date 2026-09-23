@@ -13,8 +13,6 @@ from tests.helpers.qexp.architecture import (
     plan_crash_window_recovery,
 )
 
-pytestmark = pytest.mark.slow
-
 
 @pytest.mark.parametrize("seed", range(64))
 def test_reference_model_generated_scenarios_replay_for_expanded_seed_set(seed: int) -> None:

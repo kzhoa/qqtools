@@ -66,7 +66,9 @@ def test_continuous_cli_routes_defaults_and_explicit_values(tmp_path: Path, monk
     terminal = TerminalOutput()
     monkeypatch.setattr(cli_entrypoint.sys, "stdout", terminal)
 
-    def watch(_cfg, task_id, *, interval_seconds, follow_retries):
+    def watch(_cfg, task_id, *, interval_seconds, follow_retries, details, observer_attempt_id):
+        assert details is False
+        assert observer_attempt_id is None
         calls.append((task_id, interval_seconds, follow_retries))
         return 0
 

@@ -79,7 +79,8 @@ def test_get_duration_by_device_interface(monkeypatch):
             get_interface_for_device=lambda _device: DummyDeviceInterface,
         )
     )
-    monkeypatch.setattr(qb.torch, "_dynamo", dummy_dynamo)
+    # setattr would resolve Torch's lazy attribute before replacing it.
+    monkeypatch.setitem(vars(qb.torch), "_dynamo", dummy_dynamo)
 
     duration = qb.get_duration_by_device_interface(2, fn, device="cuda", warm_up=False)
     assert duration == 0.004

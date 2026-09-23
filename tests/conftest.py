@@ -25,6 +25,7 @@ TEST_SOURCE_ROOT_ENV = "QQTOOLS_TEST_SOURCE_ROOT"
 
 
 def pytest_addoption(parser):
+    parser.addoption("--run-stress", action="store_true", help="Include optional stress/performance qualification")
     parser.addoption(
         "--lifecycle-gate",
         choices=("representative", "full", "installed"),
@@ -101,8 +102,13 @@ class _TimingJson:
         self.path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def pytest_collection_modifyitems(items):
+def pytest_collection_modifyitems(config, items):
     """Derive Integration ownership from the canonical filesystem layer."""
+    if not config.getoption("--run-stress"):
+        deselected = [item for item in items if item.get_closest_marker("stress") is not None]
+        if deselected:
+            items[:] = [item for item in items if item.get_closest_marker("stress") is None]
+            config.hook.pytest_deselected(items=deselected)
     integration_root = (PROJECT_ROOT / "tests" / "integration").resolve()
     for item in items:
         path = Path(str(item.path)).resolve()

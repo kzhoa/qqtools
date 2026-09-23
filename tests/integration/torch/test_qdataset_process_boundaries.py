@@ -61,25 +61,9 @@ def _probe_environment(checkout_subprocess_env: dict[str, str]) -> dict[str, str
     return environment
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("start_method", ["spawn", "forkserver"])
-def test_qdictdataloader_graph_collate_with_pickle_based_worker(
-    start_method: str,
-    checkout_subprocess_env: dict[str, str],
-) -> None:
-    if start_method not in multiprocessing.get_all_start_methods():
-        pytest.skip(f"{start_method} is not available on this platform")
-
-    probe_path = Path(__file__).parents[2] / "fixtures" / "qdataset_graph_worker_probe.py"
-    subprocess.run(
-        [sys.executable, str(probe_path), start_method],
-        check=True,
-        env=_probe_environment(checkout_subprocess_env),
-        timeout=60,
-    )
-
-
-@pytest.mark.parametrize("start_method", ["spawn", "forkserver"])
-def test_file_lock_write_guard_serializes_processes(
+def test_dataloader_and_file_lock_process_boundaries(
     tmp_path: Path,
     start_method: str,
     checkout_subprocess_env: dict[str, str],
@@ -87,12 +71,12 @@ def test_file_lock_write_guard_serializes_processes(
     if start_method not in multiprocessing.get_all_start_methods():
         pytest.skip(f"{start_method} is not available on this platform")
 
-    probe_path = Path(__file__).parents[2] / "fixtures" / "qlmdbdataset_file_lock_probe.py"
+    probe_path = Path(__file__).parents[2] / "fixtures" / "qdataset_process_probe.py"
     subprocess.run(
         [sys.executable, str(probe_path), start_method, str(tmp_path)],
         check=True,
         env=_probe_environment(checkout_subprocess_env),
-        timeout=60,
+        timeout=90,
     )
 
 

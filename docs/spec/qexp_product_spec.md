@@ -1215,7 +1215,8 @@ Rules:
 - `--no-activate` persists the Task without requesting local agent activation from that command
   invocation; an already-running eligible agent may still claim the Task
 - `--dry-run` performs resolution and read-only validation without registration, activation,
-  Task, Group, operation, idempotency, or clock-evidence writes
+  Task, Group, operation, idempotency, or clock-evidence writes. Internal temporary
+  Task IDs may be used for plan validation; omitted input IDs remain null in preview output.
 
 The submission-owned option matrix is:
 

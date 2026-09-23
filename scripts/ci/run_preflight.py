@@ -21,10 +21,22 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PYTHON = sys.executable
-RELEASE_EXCLUDED_OBSERVATION_SCALE_NODE = (
-    "tests/integration/qexp/test_observation_scale.py::"
-    "test_retained_history_queries_remain_bounded_and_complete[100000]"
+RELEASE_SLOW_INTEGRATION_NODES = (
+    "tests/integration/torch/test_qdataset_process_boundaries.py::test_dataloader_and_file_lock_process_boundaries",
+    "tests/integration/functional/test_qpipeline/test_qexp_live_progress.py::"
+    "test_unchanged_qpipeline_command_reaches_task_show_progress",
+    "tests/integration/test_lmdb_reader_lifecycle.py::test_child_reopens_parent_readers_without_invalidating_parent",
+    "tests/integration/test_lmdb_reader_lifecycle.py::test_gc_finalizer_cannot_deadlock_or_invalidate_inflight_lease",
+    "tests/integration/test_local_responsibility_storage.py::test_incomplete_writer_marker_survives_transaction_and_replay_crashes",
+    "tests/integration/test_local_responsibility_storage.py::test_process_crash_at_every_storage_boundary",
+    "tests/integration/test_local_responsibility_storage.py::test_replay_itself_can_crash_repeatedly",
+    "tests/integration/test_local_responsibility_storage.py::test_power_cut_model_restores_last_synced_directory",
+    "tests/integration/test_local_responsibility_storage.py::test_redo_recovers_every_mixture_of_persisted_after_images",
+    "tests/integration/test_local_responsibility_storage.py::test_initialization_resumes_after_every_process_crash_boundary",
+    "tests/integration/test_local_responsibility_storage.py::test_cleanup_process_crashes_preserve_receipt_until_durable_deletion",
+    "tests/integration/test_local_responsibility_storage.py::test_stage_build_replays_every_process_crash_without_changing_ownership",
 )
+
 
 COMMANDS: tuple[tuple[str, ...], ...] = (
     (PYTHON, "-m", "ruff", "check", "src", "tests", "scripts"),
@@ -43,11 +55,17 @@ COMMANDS: tuple[tuple[str, ...], ...] = (
         "-m",
         "not slow and not gpu and not ddp",
         "-q",
-        "--durations=100",
+        "--durations=20",
     ),
-    (PYTHON, "-m", "pytest", "tests/integration/qexp/test_resource_isolation.py", "-q"),
-    (PYTHON, "-m", "pytest", "tests/integration/qexp/test_store_crash_boundaries.py", "-q"),
-    (PYTHON, "-m", "pytest", "tests/integration/qexp/test_machine_lab.py", "-q"),
+    (
+        PYTHON,
+        "-m",
+        "pytest",
+        "tests/integration/qexp/test_resource_isolation.py",
+        "tests/integration/qexp/test_store_crash_boundaries.py",
+        "tests/integration/qexp/test_machine_lab.py",
+        "-q",
+    ),
     (
         PYTHON,
         "-m",
@@ -60,7 +78,7 @@ COMMANDS: tuple[tuple[str, ...], ...] = (
     ),
 )
 
-COMMON_COMMANDS: tuple[tuple[str, ...], ...] = COMMANDS[:-4]
+COMMON_COMMANDS: tuple[tuple[str, ...], ...] = COMMANDS[:-2]
 
 
 def check_prerequisites() -> str | None:
@@ -108,12 +126,12 @@ def _commands(
             release_actor,
         ),
         *COMMON_COMMANDS,
+        (PYTHON, "-m", "pytest", *RELEASE_SLOW_INTEGRATION_NODES, "-q", "--durations=20"),
         (
             PYTHON,
             "scripts/qexp_integration_gate.py",
             "--budget-seconds",
             "600",
-            f"--deselect={RELEASE_EXCLUDED_OBSERVATION_SCALE_NODE}",
         ),
     )
 

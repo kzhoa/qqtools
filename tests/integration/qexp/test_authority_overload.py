@@ -16,7 +16,16 @@ from qqtools.plugins.qexp.runtime.tasks import load_task
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
-def test_mixed_leases_survive_saturated_discovery_and_fail_closed_without_clock(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "active_count,work_limit,arrivals_per_turn",
+    [
+        pytest.param(16, 12, 2, id="bounded-backlog"),
+        pytest.param(256, 64, 8, id="sustained-overload", marks=pytest.mark.stress),
+    ],
+)
+def test_mixed_leases_survive_saturated_discovery_and_fail_closed_without_clock(
+    tmp_path, monkeypatch, active_count, work_limit, arrivals_per_turn
+):
     now = [datetime.now(timezone.utc).replace(microsecond=0)]
     elapsed = [0.0]
 
@@ -31,12 +40,13 @@ def test_mixed_leases_survive_saturated_discovery_and_fail_closed_without_clock(
     monkeypatch.setattr(authority_work, "time", SimpleNamespace(monotonic=lambda: elapsed[0]))
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     paths = local_paths(cfg.runtime_root)
-    supervisor = AuthoritySupervisor(cfg, work_limit=64)
+    supervisor = AuthoritySupervisor(cfg, work_limit=work_limit)
     supervisor.recover_startup()
+    monkeypatch.setattr(supervisor._work, "_active_limit", active_count)
     attempts = []
     healthy_capability = scheduler.clock_capability
     unavailable = ClockCapability("unavailable", "injected_stale_clock")
-    for number in range(256):
+    for number in range(active_count):
         mode = "bounded_lease" if number % 2 == 0 else "holder_bound"
         monkeypatch.setattr(
             scheduler, "clock_capability", healthy_capability if number % 2 == 0 else lambda *_args: unavailable
@@ -89,10 +99,12 @@ def test_mixed_leases_survive_saturated_discovery_and_fail_closed_without_clock(
         for turn in range(1, 41):
             elapsed[0] = float(turn)
             now[0] += timedelta(seconds=1)
-            # Eight arrivals exceed this lane's ordinary five/six turns per slice.
-            for arrival in range(8):
+            # Arrivals exceed discovery's share of the selected per-tick work budget.
+            for arrival in range(arrivals_per_turn):
                 task = submit(cfg, ["echo", "arrival"])
-                attempt = scheduler.claim_task(cfg, task.task_id, [256 + (turn - 1) * 8 + arrival])
+                attempt = scheduler.claim_task(
+                    cfg, task.task_id, [active_count + (turn - 1) * arrivals_per_turn + arrival]
+                )
                 assert attempt is not None
                 assert scheduler.authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
                 claim = load_task(cfg, task.task_id).claim_control["active_claim"]
@@ -126,7 +138,7 @@ def test_mixed_leases_survive_saturated_discovery_and_fail_closed_without_clock(
                 assert elapsed[0] - times[-1] <= 18
         assert supervisor.metrics["renewal.renewed"] > 0
         assert supervisor.metrics["renewal.not_required"] > 0
-        assert supervisor.work_snapshot["active_cache_size"] == 256
+        assert supervisor.work_snapshot["active_cache_size"] == active_count
         assert supervisor.work_snapshot["cleanup_failures"] > 0
         assert supervisor.work_snapshot["active_admission_deferred"] > 0
         materialized = 0

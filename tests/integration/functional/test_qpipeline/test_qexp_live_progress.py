@@ -45,6 +45,7 @@ def _qexp_integration_prerequisites(qexp_healthy_clock, qexp_resource_scope, mon
     )
 
 
+@pytest.mark.slow
 def test_unchanged_qpipeline_command_reaches_task_show_progress(tmp_path, monkeypatch):
     if not sys.platform.startswith("linux"):
         pytest.skip("qexp process guardian requires Linux")

@@ -269,6 +269,7 @@ def test_close_closes_owned_handles(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert all(handle.closed for handle in trace.handles)
 
 
+@pytest.mark.stress
 def test_large_audit_keeps_digest_working_set_bounded(tmp_path: Path, checkout_subprocess_env):
     # tracemalloc observes the entire process, including unrelated suite threads
     # and instrumentation. Measure the audit in its own process at the same bound.

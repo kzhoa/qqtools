@@ -337,8 +337,8 @@ def test_task_id_fingerprint_uses_decoded_bytes_across_source_encodings(tmp_path
     assert plain_sequence_end.digest == escaped_sequence_end.digest == _fingerprint(b"1")
 
 
-def test_large_selected_arrays_do_not_require_array_retention(tmp_path: Path) -> None:
-    count = 100_000
+@pytest.mark.parametrize("count", [128, pytest.param(100_000, marks=pytest.mark.stress)])
+def test_large_selected_arrays_do_not_require_array_retention(tmp_path: Path, count: int) -> None:
     payload_object = _fixture_submission(
         task_ids=[f"task-{index}" for index in range(count)],
         sequences=list(range(1, count + 1)),

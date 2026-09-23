@@ -22,6 +22,10 @@ def run(command: list[str]) -> int:
     return subprocess.run(command, cwd=ROOT, check=False).returncode
 
 
+def tox_work_dir() -> Path:
+    return Path.home() / ".cache" / "qqtools" / "tox"
+
+
 def prepare_env() -> int:
     venv = ROOT / ".venv"
     python = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
@@ -58,7 +62,18 @@ def main(argv: list[str] | None = None) -> int:
         if error:
             print(error, file=sys.stderr)
             return 1
-    command = [sys.executable, "-m", "tox", "run", "-e", "unit" if options.command == "test" else "preflight"]
+    command = [
+        sys.executable,
+        "-m",
+        "tox",
+        "run",
+        "--workdir",
+        str(tox_work_dir()),
+        "-e",
+        "unit",
+    ]
+    if options.command == "preflight":
+        command.extend(["--override", "testenv:unit.commands=python scripts/ci/run_preflight.py"])
     if options.command == "test":
         args = options.args[1:] if options.args[:1] == ["--"] else options.args
         command.extend(["--", *args])

@@ -202,7 +202,7 @@ does not permit other direct changes to `dev`.
    no feature-promotion provenance, the workflow selects the release profile for
    that exact SHA. It validates the version, changelog, compatibility registry,
    export stubs, static and governance checks, Unit, general Integration, and
-   qexp Integration except the accepted 100,000-record indexed-pagination case.
+   qexp Integration.
    Do not begin `dev`-to-`main` promotion until the run
    succeeds. If it fails, keep the release blocked; code fixes must use feature
    promotion, and any permitted metadata correction creates a new SHA that must

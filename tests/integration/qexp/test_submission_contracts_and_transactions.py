@@ -170,8 +170,9 @@ def test_file_mode_absent_working_directory_uses_selected_project_root(
     assert task["spec"]["working_directory"] == str(project.resolve())
 
 
+@pytest.mark.parametrize("live_progress", [None, True, False])
 def test_dry_run_is_read_only_and_reports_precedence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], live_progress: bool | None
 ) -> None:
     project, cfg, machine_runtime = _project(tmp_path)
     activation = _disable_activation(monkeypatch)
@@ -189,6 +190,9 @@ tasks:
 """,
         encoding="utf-8",
     )
+    if live_progress is not None:
+        with manifest.open("a", encoding="utf-8") as handle:
+            handle.write(f"    live_progress: {str(live_progress).lower()}\n")
     before = sorted(path.relative_to(cfg.shared_root) for path in cfg.shared_root.rglob("*.json"))
 
     assert (

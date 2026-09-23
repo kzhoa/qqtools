@@ -115,6 +115,7 @@ def test_rank_nonzero_and_fork_inheritance_are_noops(tmp_path, monkeypatch):
 
 def test_invalid_and_missing_channel_do_not_raise(tmp_path):
     reporter = progress._Reporter(tmp_path / "absent" / "progress.json")
+    reporter._failure_delay_seconds = 0.01
     assert not reporter.update(stage="train", current=-1)
     reporter.update(stage="train", current=1)
     reporter.close(timeout=1)
@@ -126,6 +127,7 @@ def test_broken_storage_does_not_escape_to_caller(tmp_path, monkeypatch):
 
     monkeypatch.setattr(progress, "replace_advisory_snapshot", fail)
     reporter = progress._Reporter(tmp_path / "progress.json")
+    reporter._failure_delay_seconds = 0.01
     reporter.update(stage="train", current=1)
     reporter.close(timeout=1)
     assert reporter._thread is not None
@@ -136,25 +138,27 @@ def test_broken_storage_does_not_escape_to_caller(tmp_path, monkeypatch):
 def test_failed_storage_backs_off_and_keeps_latest_update(tmp_path, monkeypatch):
     attempts = []
     first_failure = threading.Event()
+    release_failure = threading.Event()
     success = threading.Event()
 
     def write(path, value, **kwargs):
         attempts.append((time.monotonic(), value["current"]))
         if len(attempts) == 1:
             first_failure.set()
+            assert release_failure.wait(2)
             raise OSError("unavailable")
         success.set()
 
     monkeypatch.setattr(progress, "replace_advisory_snapshot", write)
     reporter = progress._Reporter(tmp_path / "progress.json", interval_seconds=30)
+    reporter._failure_delay_seconds = 0.05
     assert reporter.update(stage="train", current=1)
     assert first_failure.wait(1)
     assert reporter.update(stage="train", current=2)
-    time.sleep(0.2)
-    assert len(attempts) == 1
+    release_failure.set()
     assert success.wait(2)
     assert [value for _, value in attempts] == [1, 2]
-    assert attempts[1][0] - attempts[0][0] >= 0.95
+    assert attempts[1][0] - attempts[0][0] >= 0.045
     reporter.close(timeout=1)
 
 
@@ -172,6 +176,7 @@ def test_failed_storage_backoff_escalates_caps_and_resets_after_success(tmp_path
 
     monkeypatch.setattr(progress, "replace_advisory_snapshot", write)
     reporter = progress._Reporter(tmp_path / "progress.json", interval_seconds=30)
+    reporter._failure_delay_seconds = 0.01
     assert reporter.update(stage="train", current=1)
     assert succeeded.wait(2)
     intervals = [later - earlier for earlier, later in zip(attempted_at, attempted_at[1:])]

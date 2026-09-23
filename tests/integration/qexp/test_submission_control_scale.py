@@ -17,10 +17,13 @@ from qqtools.plugins.qexp.runtime.paths import submission_path
 from qqtools.plugins.qexp.runtime.ready import classify_ready_marker, routes
 from qqtools.plugins.qexp.runtime.store import read_json
 
-pytestmark = [pytest.mark.integration, pytest.mark.slow]
+pytestmark = pytest.mark.integration
 
 
-@pytest.mark.parametrize("retained", [0, 1000, 10_000, 100_000])
+@pytest.mark.parametrize(
+    "retained",
+    [0, 256, *[pytest.param(count, marks=pytest.mark.stress) for count in (1000, 10_000, 100_000)]],
+)
 def test_bulk_history_has_bounded_admission_reads(tmp_path, monkeypatch, retained, record_property):
     cfg = init_shared_root(tmp_path / "project/.qexp", "worker", runtime_root=tmp_path / "runtime")
     task = submit(cfg, ["true"], task_id="survivor")

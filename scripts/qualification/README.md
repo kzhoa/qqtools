@@ -7,7 +7,7 @@ They qualify same-host filesystem/process behavior, not cross-host durability.
 ## Active responsibility cost and churn
 
 ```bash
-PYTHONPATH=src .tox/unit/bin/python -m scripts.qualification.profile_local_responsibility \
+PYTHONPATH=src ~/.cache/qqtools/tox/unit/bin/python -m scripts.qualification.profile_local_responsibility \
   --output /tmp/responsibility-profile --cycles 10000 --samples 3 --live 4 64 65 256
 ```
 
@@ -22,16 +22,18 @@ and small samples do not establish cold-start or tail-latency guarantees.
 ## Retained history and Task pagination
 
 ```bash
-PYTHONPATH=src .tox/unit/bin/python -m pytest \
+PYTHONPATH=src ~/.cache/qqtools/tox/unit/bin/python -m pytest \
   -p tests.helpers.qexp.authority_measurement \
   -p tests.helpers.qexp.history_qualification \
   tests/integration/qexp/test_authority_workload.py \
   --settled-history-count=100000 --settled-history-submissions=bulk \
   --authority-workload-output=/tmp/history-100000-bulk.json
-PYTHONPATH=src .tox/unit/bin/python -m pytest \
-  tests/integration/qexp/test_observation_scale.py -q
+PYTHONPATH=src ~/.cache/qqtools/tox/unit/bin/python -m pytest \
+  tests/integration/qexp/test_observation_scale.py --run-stress -m stress -q
 ```
 
+Routine pagination covers 0 and 129 retained Tasks; manual stress qualification
+covers 1,000 and 10,000.
 Run machine counts 0, 1000, 10000 and 100000, with both bulk and single Submission
 shapes at nonzero counts. The fixture prepares quiescent authoritative records and
 complete observation indexes before measurement. It is not a benchmark of creating
@@ -48,7 +50,7 @@ interference.
 without installing it or accessing existing project runtimes:
 
 ```bash
-PYTHONPATH=src .tox/unit/bin/python -m scripts.qualification.probe_qexp_writer_fences \
+PYTHONPATH=src ~/.cache/qqtools/tox/unit/bin/python -m scripts.qualification.probe_qexp_writer_fences \
   --output /tmp/qexp-writer-fences --ref v1.3.18 --ref v1.3.17
 ```
 
@@ -66,7 +68,7 @@ released machine agents and a released runner, then restart with current source.
 They require a short output path for tmux sockets, for example:
 
 ```bash
-PYTHONPATH=src .tox/unit/bin/python -m scripts.qualification.probe_qexp_writer_fences \
+PYTHONPATH=src ~/.cache/qqtools/tox/unit/bin/python -m scripts.qualification.probe_qexp_writer_fences \
   --output /tmp/qgn-rollout --ref v1.3.17 --ref v1.3.18 \
   --case live_namespace_upgrade --case paused_namespace_upgrade
 ```

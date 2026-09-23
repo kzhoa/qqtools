@@ -28,6 +28,13 @@ Run the following commands from the repository root.
 
 `test` defaults to Unit tests; explicit paths/node IDs select other source tests.
 `preflight` is the complete shared gate and accepts no extra arguments.
+The qpipeline/qexp real-training case and LMDB process/GC cases carry the
+`slow` marker: feature preflight excludes them, release preflight runs them once,
+and maintainers run their node IDs explicitly when changing those workflows.
+All source and installed-artifact pytest phases report their 20 longest durations.
+Use `--durations=100` for a longer report. Complete storage crash matrices are
+`slow`: run the storage file when changing recovery behavior; release runs all
+matrices, while feature preflight retains representative crash coverage.
 
 ## qexp startup profiling
 
@@ -70,16 +77,17 @@ With Python 3.13 and the tooling dependencies prepared, maintainers may invoke
 repository-defined tox environments directly:
 
 ```bash
-tox run -e qexp-unit
+./scripts/dev test tests/unit/qexp -q
 tox run -e qexp-integration
-tox run -e qexp-machine-lab
+./scripts/dev test tests/integration/qexp/test_machine_lab.py -q
 tox run -e artifact-e2e
-tox run-parallel -e 'py{311,312,313,314}-artifact-smoke'
+tox run -e artifact-smoke
 tox run -e release-e2e --installpkg /path/to/selected.whl
 ```
 
-Bare `tox` runs only the complete source preflight. The explicit Python matrix
-checks installed-package imports and CLI startup; missing interpreters fail.
+Bare `tox` runs only the complete source preflight. Run `artifact-smoke` under
+each supported Python version for installed-package imports and CLI startup;
+missing interpreters fail.
 
 The complete qexp Integration gate runs ordinary and lifecycle collections as
 two four-worker phases. It lets both phases finish and rejects a successful run
@@ -91,3 +99,15 @@ Default source pytest collection excludes E2E. `artifact-e2e` builds a wheel
 from the checkout; `release-e2e` validates the selected exact wheel. See
 [test governance](../docs/development/test-governance.md#integration-ci-and-release-gates)
 for when each gate is required.
+
+### Optional stress experiments
+
+Large scale and memory qualifications marked `stress` are excluded by default,
+including release. Run a selected experiment explicitly, for example:
+
+```bash
+./scripts/dev test tests/integration/qexp/test_observation_scale.py --run-stress -m stress -q --durations=20
+```
+
+Small boundary cases remain in regular validation. See
+[test governance](../docs/development/test-governance.md#optional-stress-qualification).

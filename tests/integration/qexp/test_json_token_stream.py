@@ -372,15 +372,18 @@ def test_structural_validation_is_outside_the_lexical_layer(tmp_path: Path):
 
 
 @pytest.mark.parametrize("raw_mode", [False, True])
-def test_giant_string_has_bounded_memory_and_no_event_retention(tmp_path: Path, raw_mode: bool):
+@pytest.mark.parametrize(
+    "blocks", [pytest.param(3, id="fragment-boundaries"), pytest.param(128, id="8MiB", marks=pytest.mark.stress)]
+)
+def test_giant_string_has_bounded_memory_and_no_event_retention(tmp_path: Path, raw_mode: bool, blocks: int):
     path = tmp_path / "giant-string.json"
     with path.open("wb") as handle:
         handle.write(b'"')
         block = b"a" * 65_536
-        for _ in range(128):
+        for _ in range(blocks):
             handle.write(block)
         handle.write(b'"')
-    expected_size = 8 * 1024 * 1024 + 2
+    expected_size = blocks * 65_536 + 2
     counters = {"spans": 0, "final": 0, "covered": 0}
     raw_counters = {"fragments": 0, "covered": 0}
     digest = hashlib.blake2b(digest_size=16)
@@ -409,9 +412,9 @@ def test_giant_string_has_bounded_memory_and_no_event_retention(tmp_path: Path, 
         tracemalloc.stop()
 
     assert expected_size == path.stat().st_size
-    assert counters == {"spans": 129, "final": 1, "covered": expected_size}
+    assert counters == {"spans": blocks + 1, "final": 1, "covered": expected_size}
     assert raw_counters == (
-        {"fragments": 129, "covered": expected_size} if raw_mode else {"fragments": 0, "covered": 0}
+        {"fragments": blocks + 1, "covered": expected_size} if raw_mode else {"fragments": 0, "covered": 0}
     )
     assert digest.digest()
     assert max(source.requests) <= 65_536
