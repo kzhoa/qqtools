@@ -141,7 +141,10 @@ lanes for affected public delivery boundaries and whenever policy requires them.
 For a versioned release, Dev Preflight recognizes the owner-only metadata commit
 and runs the release source profile against its exact SHA. That profile checks
 version and changelog consistency, compatibility and export contracts, static and
-governance rules, Unit, general Integration, and complete qexp Integration.
+governance rules, Unit, general Integration, and qexp Integration except the
+100,000-record indexed-pagination case. This accepted release-gate exclusion
+does not change the test or the complete manual `qexp-integration` lane; see
+[active-history acceptance](../spec/qexp_active_history_acceptance.md#current-gate-scope).
 Tagged publishing separately runs `release-e2e` against the selected wheel before
 publication. These distinct gates cannot substitute for one another.
 
@@ -155,8 +158,9 @@ Use the stable `qexp-unit`, `qexp-integration`, and `qexp-machine-lab` tox lanes
 for their corresponding scopes; [tests/readme.md](../../tests/readme.md) lists
 entry points. `qexp-unit` is the default module check. Select Integration files
 by changed collaboration, persistence, CLI, or scheduling behavior. Use complete
-`qexp-integration` when impact requires it, the user requests it, or release
-policy mandates it. `qexp-machine-lab` is a convenience lane within Integration.
+`qexp-integration` when impact requires it or the user requests it. The release
+profile has the explicit exclusion described above; `qexp-machine-lab` is a
+convenience lane within Integration.
 
 Every qexp Integration test must own isolated temporary roots, HOME/XDG,
 runtime roots, tmux resources, and ledger-based cleanup checks. Never use the

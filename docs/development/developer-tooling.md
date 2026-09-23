@@ -143,7 +143,9 @@ validation preserves `tmp/` diagnostics instead of deleting them afterward.
 The unused pytest-cov dependency and obsolete pip-cache override are removed;
 tox-uv uses the uv cache settings described above.
 The CI release profile uses the same shared Python runner as ordinary preflight
-and replaces representative qexp coverage with the complete qexp integration gate.
+and replaces representative qexp coverage with the qexp integration gate, excluding
+only the accepted 100,000-record indexed-pagination case. The manual
+`qexp-integration` lane still includes it.
 `release-e2e` inherits the installed E2E environment and still accepts
 `--installpkg` for the exact wheel selected by publishing.
 

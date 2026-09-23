@@ -67,6 +67,18 @@ Each page is bounded to 50 results, at most 1089 counted index pages and less th
 13 MiB of counted index reads, with directory enumeration forbidden. Unfiltered
 first-page index reads at 0/1k/10k/100k were 563/7957/8231/8494 bytes respectively.
 
+## Current gate scope
+
+As of 2026-09-23, the release source gate excludes only
+`test_retained_history_queries_remain_bounded_and_complete[100000]` from the
+qexp Integration phase. The 0, 1,000 and 10,000 pagination cases and all other
+qexp Integration tests remain required. The 100,000-record case is unchanged and
+can still be run manually using the [qualification command](../../scripts/qualification/README.md#retained-history-and-task-pagination).
+The earlier 100,000-record result above remains historical qualification evidence,
+not a promise that each new release revalidates full pagination at that scale.
+The accepted coverage gap is that a new regression affecting only complete
+100,000-record indexed pagination may reach a release without an automated failure.
+
 The surviving-Task bulk admission matrix also passed. Source sizes were
 1692/482695/4811696/48101697 bytes; the three admission consumers read 5076 bytes
 in total for the small source and zero source payload bytes in every larger case.

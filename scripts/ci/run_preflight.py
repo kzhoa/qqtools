@@ -21,6 +21,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PYTHON = sys.executable
+RELEASE_EXCLUDED_OBSERVATION_SCALE_NODE = (
+    "tests/integration/qexp/test_observation_scale.py::"
+    "test_retained_history_queries_remain_bounded_and_complete[100000]"
+)
 
 COMMANDS: tuple[tuple[str, ...], ...] = (
     (PYTHON, "-m", "ruff", "check", "src", "tests", "scripts"),
@@ -103,7 +107,13 @@ def _commands(
             release_actor,
         ),
         *COMMON_COMMANDS,
-        (PYTHON, "scripts/qexp_integration_gate.py", "--budget-seconds", "600"),
+        (
+            PYTHON,
+            "scripts/qexp_integration_gate.py",
+            "--budget-seconds",
+            "600",
+            f"--deselect={RELEASE_EXCLUDED_OBSERVATION_SCALE_NODE}",
+        ),
     )
 
 

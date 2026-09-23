@@ -84,7 +84,7 @@ def test_platform_prerequisites(monkeypatch, platform, tmux, expected):
     assert expected in run_preflight.check_prerequisites()
 
 
-def test_release_profile_uses_exact_release_validator_and_full_qexp(monkeypatch):
+def test_release_profile_uses_exact_release_validator_and_excludes_large_observation_scale(monkeypatch):
     commands = []
     monkeypatch.setattr(run_preflight, "check_prerequisites", lambda: None)
     monkeypatch.setattr(
@@ -115,6 +115,8 @@ def test_release_profile_uses_exact_release_validator_and_full_qexp(monkeypatch)
     full_qexp = next(index for index, command in enumerate(rendered) if "qexp_integration_gate.py" in command)
     assert validator < common < full_qexp
     assert "--budget-seconds 600" in rendered[full_qexp]
+    assert commands[full_qexp][-1] == f"--deselect={run_preflight.RELEASE_EXCLUDED_OBSERVATION_SCALE_NODE}"
+    assert sum(argument.startswith("--deselect=") for argument in commands[full_qexp]) == 1
     assert not any("--lifecycle-gate=representative" in command for command in rendered)
 
 
