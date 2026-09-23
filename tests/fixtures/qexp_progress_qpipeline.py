@@ -2,15 +2,37 @@
 
 from __future__ import annotations
 
+import faulthandler
+import os
+import sys
 import tempfile
+import time
+
+_START = time.monotonic()
+
+
+def _phase(name: str) -> None:
+    print(f"qexp-progress-fixture {time.monotonic() - _START:.3f}s {name}", flush=True)
+
+
+_phase("imports-start")
+_DIAGNOSTIC = os.environ.get("QEXP_PROGRESS_DIAGNOSTIC") == "1"
+if _DIAGNOSTIC:
+    faulthandler.dump_traceback_later(20, file=sys.stderr)
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+_phase("torch-import-done")
+
 import qqtools as qt
 from qqtools.plugins.qpipeline import qPipeline
 from qqtools.plugins.qpipeline.task.qtask import qTaskBase
+
+_phase("imports-done")
+if _DIAGNOSTIC:
+    faulthandler.cancel_dump_traceback_later()
 
 
 class TinyTask(qTaskBase):
@@ -24,6 +46,9 @@ class TinyTask(qTaskBase):
         self.test_loader = None
 
     def batch_forward(self, model, batch_data):
+        if not getattr(self, "_first_batch_seen", False):
+            self._first_batch_seen = True
+            _phase("first-batch")
         features, targets = batch_data
         return {"prediction": model(features), "target": targets}
 
@@ -57,6 +82,7 @@ class TinyPipeline(qPipeline):
 
 
 def main() -> None:
+    _phase("main-start")
     with tempfile.TemporaryDirectory(prefix="qexp-qpipeline-") as directory:
         args = qt.qDict(
             {
@@ -81,7 +107,10 @@ def main() -> None:
                 "task": {},
             }
         )
-        TinyPipeline(args, mode="train").fit()
+        pipeline = TinyPipeline(args, mode="train")
+        _phase("fit-start")
+        pipeline.fit()
+        _phase("fit-done")
 
 
 if __name__ == "__main__":

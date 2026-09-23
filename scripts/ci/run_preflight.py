@@ -43,6 +43,7 @@ COMMANDS: tuple[tuple[str, ...], ...] = (
         "-m",
         "not slow and not gpu and not ddp",
         "-q",
+        "--durations=100",
     ),
     (PYTHON, "-m", "pytest", "tests/integration/qexp/test_resource_isolation.py", "-q"),
     (PYTHON, "-m", "pytest", "tests/integration/qexp/test_store_crash_boundaries.py", "-q"),

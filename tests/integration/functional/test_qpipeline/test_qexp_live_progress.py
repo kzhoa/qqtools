@@ -13,6 +13,7 @@ from qqtools.plugins.qexp.observer import inspect_task
 from qqtools.plugins.qexp.runner import run_attempt
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.progress import ProgressProjector
+from qqtools.plugins.qexp.runtime.resources.cpu_lane import set_cpu_lane_capacity
 from qqtools.plugins.qexp.runtime.store import read_json
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
 
@@ -47,12 +48,13 @@ def _qexp_integration_prerequisites(qexp_healthy_clock, qexp_resource_scope, mon
 def test_unchanged_qpipeline_command_reaches_task_show_progress(tmp_path, monkeypatch):
     if not sys.platform.startswith("linux"):
         pytest.skip("qexp process guardian requires Linux")
-    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    cfg = init_shared_root(tmp_path / ".qexp", "cpu-host", runtime_root=tmp_path / "rt")
+    set_cpu_lane_capacity(cfg.runtime_root, capacity=1)
     source_root = str(Path(__file__).resolve().parents[4] / "src")
     monkeypatch.setenv("PYTHONPATH", source_root + os.pathsep + os.environ.get("PYTHONPATH", ""))
     fixture = Path(__file__).resolve().parents[3] / "fixtures" / "qexp_progress_qpipeline.py"
-    task = submit(cfg, [sys.executable, str(fixture)])
-    attempt = claim_task(cfg, task.task_id, [0])
+    task = submit(cfg, [sys.executable, str(fixture)], requested_gpus=0, requested_cpus=1)
+    attempt = claim_task(cfg, task.task_id, [])
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     launch_id = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"][
         "authorization"
