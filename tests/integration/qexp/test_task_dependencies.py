@@ -9,11 +9,16 @@ from qqtools.plugins.qexp.commands.cleanup import clean
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import cancel, edit_dependencies, submit
 from qqtools.plugins.qexp.machine_config import init_shared_root
+from qqtools.plugins.qexp.runtime import dependencies as dependency_runtime
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
-from qqtools.plugins.qexp.runtime.dependencies import dependency_gate
+from qqtools.plugins.qexp.runtime import tasks as task_runtime
+from qqtools.plugins.qexp.runtime.dependencies import dependency_gate, validate_group_dependencies
 from qqtools.plugins.qexp.runtime.locks import group_lock
+from qqtools.plugins.qexp.runtime.paths import task_path
+from qqtools.plugins.qexp.runtime.records import TaskRecord
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
+from qqtools.plugins.qexp.runtime.work_budget import RuntimeDiagnostics, activate_diagnostics
 from qqtools.plugins.qexp.scheduler import claim_task
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -29,6 +34,96 @@ def _probe_group_lock(root: Path, group_name: str, connection) -> None:
     with group_lock(root, group_name, blocking=False) as acquired:
         connection.send(acquired)
     connection.close()
+
+
+def _candidate(task: TaskRecord, task_id: str, dependencies: list[str]) -> TaskRecord:
+    candidate = TaskRecord.from_dict(task.to_dict())
+    candidate.task_id = task_id
+    candidate.depends_on_task_ids = dependencies
+    return candidate
+
+
+def test_dependency_validation_reads_only_reachable_task_truth(tmp_path: Path) -> None:
+    cfg = _group_config(tmp_path)
+    parent = submit(cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path)
+    unrelated = task_path(cfg.shared_root, "unrelated")
+    unrelated.write_text("not json", encoding="utf-8")
+
+    without_dependencies = _candidate(parent, "independent", [])
+    diagnostics = RuntimeDiagnostics()
+    with activate_diagnostics(diagnostics):
+        validate_group_dependencies(cfg, "experiment", [without_dependencies])
+
+    assert diagnostics.counters["store.iter_json.calls"] == 0
+    assert diagnostics.counters["task_json_read.records"] == 0
+
+    with_dependency = _candidate(parent, "child", [parent.task_id])
+    diagnostics = RuntimeDiagnostics()
+    with activate_diagnostics(diagnostics):
+        validate_group_dependencies(cfg, "experiment", [with_dependency])
+
+    assert diagnostics.counters["store.iter_json.calls"] == 0
+    assert diagnostics.counters["task_json_read.records"] == 1
+
+
+def test_dependency_validation_detects_reachable_multi_hop_cycle(tmp_path: Path) -> None:
+    cfg = _group_config(tmp_path)
+    tail = submit(cfg, ["echo", "tail"], task_id="tail", group="experiment", working_dir=tmp_path)
+    middle = submit(
+        cfg,
+        ["echo", "middle"],
+        task_id="middle",
+        group="experiment",
+        working_dir=tmp_path,
+        depends_on_task_ids=[tail.task_id],
+    )
+    tail.depends_on_task_ids = ["candidate"]
+    atomic_replace(task_path(cfg.shared_root, tail.task_id), tail.to_dict())
+    candidate = _candidate(middle, "candidate", [middle.task_id])
+
+    with pytest.raises(ValueError, match="cycle"):
+        validate_group_dependencies(cfg, "experiment", [candidate])
+
+
+def test_dependency_validation_rejects_mismatched_task_identity(tmp_path: Path) -> None:
+    cfg = _group_config(tmp_path)
+    parent = submit(cfg, ["echo", "parent"], task_id="parent", group="experiment", working_dir=tmp_path)
+    atomic_replace(task_path(cfg.shared_root, "alias"), parent.to_dict())
+    candidate = _candidate(parent, "candidate", ["alias"])
+
+    with pytest.raises(ValueError, match="dependency Task 'alias' does not exist"):
+        validate_group_dependencies(cfg, "experiment", [candidate])
+
+
+def test_dependency_validation_handles_large_relevant_closure_iteratively(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _group_config(tmp_path)
+    seed = submit(cfg, ["echo", "seed"], task_id="seed", group="experiment", working_dir=tmp_path)
+    records = {
+        f"node-{index:04d}": _candidate(
+            seed,
+            f"node-{index:04d}",
+            [] if index == 1_099 else [f"node-{index + 1:04d}"],
+        )
+        for index in range(1_100)
+    }
+    reads: list[str] = []
+
+    def read_reachable(_cfg, task_id: str) -> TaskRecord:
+        reads.append(task_id)
+        return records[task_id]
+
+    monkeypatch.setattr(task_runtime, "load_task", read_reachable)
+    monkeypatch.setattr(dependency_runtime, "is_committed_submission_task", lambda *_args: True)
+    monkeypatch.setattr(dependency_runtime, "operation_exists", lambda *_args: False)
+    candidate = _candidate(seed, "candidate", ["node-0000"])
+
+    validate_group_dependencies(cfg, "experiment", [candidate])
+
+    assert len(reads) == 1_100
+    assert len(set(reads)) == 1_100
 
 
 def test_dependency_gate_blocks_claim_and_reports_cancelled_parent(tmp_path: Path) -> None:

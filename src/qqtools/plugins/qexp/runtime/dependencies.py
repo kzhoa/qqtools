@@ -8,9 +8,7 @@ from typing import Iterable, Iterator
 
 from .locks import group_lock, task_lock
 from .operation_store import operation_exists
-from .paths import shared_paths
 from .records import TaskRecord, validate_identifier
-from .store import iter_json, read_json
 from .submission_control import read_submission_state
 
 
@@ -35,13 +33,21 @@ def normalize_dependency_ids(value: object) -> list[str]:
     return sorted(result)
 
 
-def _group_tasks(cfg: object, group_name: str) -> dict[str, TaskRecord]:
-    result: dict[str, TaskRecord] = {}
-    for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
-        task = TaskRecord.from_dict(read_json(path))
-        if task.group_name == group_name:
-            result[task.task_id] = task
-    return result
+def _load_dependency_task(
+    cfg: object,
+    task_id: str,
+    task_cache: dict[str, TaskRecord | None],
+) -> TaskRecord | None:
+    """Read exact Task truth once, caching missing records as absent edges."""
+    if task_id not in task_cache:
+        from .tasks import load_task
+
+        try:
+            task = load_task(cfg, task_id)
+            task_cache[task_id] = task if task.task_id == task_id else None
+        except FileNotFoundError:
+            task_cache[task_id] = None
+    return task_cache[task_id]
 
 
 def is_committed_submission_task(cfg: object, task: TaskRecord) -> bool:
@@ -55,24 +61,43 @@ def is_committed_submission_task(cfg: object, task: TaskRecord) -> bool:
         return False
 
 
-def _check_no_cycle(tasks: dict[str, TaskRecord]) -> None:
-    visiting: set[str] = set()
-    visited: set[str] = set()
+def _check_no_cycle(
+    cfg: object,
+    group_name: str,
+    candidate_ids: Iterable[str],
+    task_cache: dict[str, TaskRecord | None],
+) -> None:
+    """Check cycles in the candidate-reachable same-Group dependency graph."""
+    states: dict[str, str] = {}
 
-    def visit(task_id: str) -> None:
-        if task_id in visiting:
-            raise ValueError("depends_on_task_ids creates a dependency cycle.")
-        if task_id in visited:
-            return
-        visiting.add(task_id)
-        for parent in tasks[task_id].depends_on_task_ids:
-            if parent in tasks:
-                visit(parent)
-        visiting.remove(task_id)
-        visited.add(task_id)
+    for candidate_id in candidate_ids:
+        if states.get(candidate_id) == "visited":
+            continue
 
-    for task_id in tasks:
-        visit(task_id)
+        candidate = task_cache[candidate_id]
+        states[candidate_id] = "visiting"
+        stack: list[tuple[str, Iterator[str]]] = [(candidate_id, iter(candidate.depends_on_task_ids))]
+        while stack:
+            task_id, dependencies = stack[-1]
+            try:
+                dependency_id = next(dependencies)
+            except StopIteration:
+                states[task_id] = "visited"
+                stack.pop()
+                continue
+
+            dependency = _load_dependency_task(cfg, dependency_id, task_cache)
+            if dependency is None or dependency.group_name != group_name:
+                continue
+
+            state = states.get(dependency_id)
+            if state == "visiting":
+                raise ValueError("depends_on_task_ids creates a dependency cycle.")
+            if state == "visited":
+                continue
+
+            states[dependency_id] = "visiting"
+            stack.append((dependency_id, iter(dependency.depends_on_task_ids)))
 
 
 def validate_group_dependencies(
@@ -86,15 +111,16 @@ def validate_group_dependencies(
         if any(task.depends_on_task_ids for task in candidates):
             raise ValueError("ungrouped tasks cannot declare dependencies.")
         return
-    tasks = _group_tasks(cfg, group_name)
-    candidate_ids = {task.task_id for task in candidates}
+
     for task in candidates:
         if task.group_name != group_name:
             raise ValueError("dependency candidate has a different Group.")
-        tasks[task.task_id] = task
+
+    candidate_ids = {task.task_id for task in candidates}
+    task_cache: dict[str, TaskRecord | None] = {task.task_id: task for task in candidates}
     for task in candidates:
         for dependency_id in task.depends_on_task_ids:
-            dependency = tasks.get(dependency_id)
+            dependency = _load_dependency_task(cfg, dependency_id, task_cache)
             if dependency is None:
                 raise ValueError(f"dependency Task {dependency_id!r} does not exist in Group {group_name!r}.")
             if dependency.group_name != group_name:
@@ -109,7 +135,7 @@ def validate_group_dependencies(
                 or operation_exists(cfg, "cleanup", dependency_id)
             ):
                 raise ValueError(f"dependency Task {dependency_id!r} is being cleaned.")
-    _check_no_cycle(tasks)
+    _check_no_cycle(cfg, group_name, (task.task_id for task in candidates), task_cache)
 
 
 def dependency_gate(cfg: object, task: TaskRecord) -> DependencyGate:

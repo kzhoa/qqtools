@@ -1253,6 +1253,20 @@ Doctor reads, validates, and clears a terminal operation's pending Group commit 
 the same schema and Group writer fences; it must not overwrite a Group snapshot read before those
 fences were acquired.
 
+Grouped dependency validation materializes the frozen candidate set, overlays every candidate by
+Task ID, and follows only dependency edges reachable from that overlay. Noncandidate vertices are
+loaded from authoritative Task truth by exact ID and cached for the validation call. Cycle
+detection covers the complete reachable closure, including paths from existing Tasks back into a
+candidate, without enumerating the Project Task directory. Candidate-declared references retain
+same-Group, committed-Submission, cleanup, missing-record, and self-dependency validation. Both the
+preparation check and the publication-time check under the Group lock use this algorithm.
+
+This boundary intentionally assigns unrelated historical corruption to explicit integrity audit
+and repair. A malformed reachable record still fails validation, while a missing or cross-Group
+transitive vertex ends that graph edge as it did when the vertex was absent from the former
+full-Group map. Dependency-free candidates read no existing Task truth. Work therefore grows with
+the candidate set and relevant dependency closure rather than retained Project history.
+
 ### 10.3 Stage and Commit
 
 The runtime then:

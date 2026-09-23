@@ -1254,6 +1254,12 @@ Rules:
 - the normalized choice is stored as a durable per-Task override; it does not update Group
   defaults, existing Tasks, or later independent submissions to the same Group
 - the command validates the complete input before commit
+- dependency validation overlays the complete submitted Task set on current truth and follows the
+  dependency graph reachable from those candidates by exact Task ID; candidate references retain
+  same-Group, committed-submission, cleanup, self-dependency, and cycle checks
+- unrelated retained Task history is outside ordinary submission validation and cannot make a
+  fixed submission perform a Task-directory scan or fail because unrelated history is malformed;
+  explicit integrity audit and repair own corruption outside the candidate-reachable graph
 - Tasks are not claimable until the internal Submission Operation commits
 - `--idempotency-key` is the explicit retry contract for scripts and uncertain outcomes
 - when omitted, the CLI creates a random key, durably creates the Submission Operation,
