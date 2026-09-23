@@ -20,15 +20,15 @@ def group_allows(group: dict[str, Any], task: TaskRecord, machine: str) -> bool:
     worker = record["worker_set"].get(machine)
     if not worker or worker["state"] != "active":
         return False
-    if task.placement_runtime["queue_scope"] == "home":
-        return task.placement_policy["home_machine"] == machine
-    fallback = task.placement_policy["fallback_constraint"]
-    return fallback == "group" or machine in fallback
+    return task_machine_matches(task, machine)
 
 
 def task_machine_matches(task: TaskRecord, machine: str) -> bool:
     """Return whether placement policy permits this machine for a task."""
+    is_home_machine = task.placement_policy["home_machine"] == machine
     if task.placement_runtime["queue_scope"] == "home":
-        return task.placement_policy["home_machine"] == machine
+        return is_home_machine
+    if is_home_machine:
+        return True
     fallback = task.placement_policy["fallback_constraint"]
     return fallback == "group" or machine in fallback

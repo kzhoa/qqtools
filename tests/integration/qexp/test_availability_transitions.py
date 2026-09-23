@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
@@ -14,17 +15,17 @@ from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.cli.errors import CliUsageError
 from qqtools.plugins.qexp.cli.project_handlers import _split_machine_list
 from qqtools.plugins.qexp.commands import task as task_commands
-from qqtools.plugins.qexp.commands.group import change_worker, create_group
+from qqtools.plugins.qexp.commands.group import change_worker, create_group, group_control
 from qqtools.plugins.qexp.doctor import repair_metadata, verify_integrity
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
 from qqtools.plugins.qexp.runtime.availability import offer_deadlines
 from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime
 from qqtools.plugins.qexp.runtime.availability.offer_deadlines import rebuild_deadline_indexes
 from qqtools.plugins.qexp.runtime.operation_store import active_operation_path, write_active_operation
-from qqtools.plugins.qexp.runtime.paths import shared_paths
+from qqtools.plugins.qexp.runtime.paths import attempt_path, shared_paths
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
-from qqtools.plugins.qexp.scheduler import claim_task, fail_attempt
+from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, fail_attempt
 from tests.helpers.qexp.clock import set_offer_evaluation_time
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -489,6 +490,79 @@ def test_cli_share_accepts_comma_separated_helper_machines(tmp_path: Path, monke
     )
 
     assert load_task(cfg, task.task_id).placement_policy["fallback_constraint"] == ["g2", "g3"]
+
+
+def test_cli_share_with_explicit_helper_preserves_home_claim_and_launch(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g3", runtime_root=tmp_path / "home-runtime")
+    _existing_group(cfg)
+    change_worker(cfg, "exp", "g2", "add")
+    change_worker(cfg, "exp", "g4", "add")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active",
+        lambda cfg, *, reason, **kwargs: True,
+    )
+
+    assert main([*_base_args(cfg), "task", "share", task.task_id, "--with", "g2"]) == 0
+
+    stored = load_task(cfg, task.task_id)
+    assert stored.placement_runtime["queue_scope"] == "shared"
+    assert stored.placement_policy["fallback_constraint"] == ["g2"]
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    expected_attempt_path = attempt_path(cfg.shared_root, task.task_id, 1)
+    assert sorted(expected_attempt_path.parent.glob("*.json")) == [expected_attempt_path]
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+
+
+def test_explicit_helper_can_claim_shared_task(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g3", runtime_root=tmp_path / "home-runtime")
+    _existing_group(cfg)
+    change_worker(cfg, "exp", "g2", "add")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    task_commands.share(cfg, task.task_id, helper_machines=["g2"])
+    helper_cfg = replace(cfg, machine_name="g2", runtime_root=tmp_path / "helper-runtime")
+
+    attempt = claim_task(helper_cfg, task.task_id, [0])
+
+    assert attempt is not None
+    assert attempt.machine_name == "g2"
+
+
+def test_unlisted_worker_rejection_does_not_prevent_home_claim(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g3", runtime_root=tmp_path / "home-runtime")
+    _existing_group(cfg)
+    change_worker(cfg, "exp", "g2", "add")
+    change_worker(cfg, "exp", "g4", "add")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    task_commands.share(cfg, task.task_id, helper_machines=["g2"])
+    unlisted_cfg = replace(cfg, machine_name="g4", runtime_root=tmp_path / "unlisted-runtime")
+
+    assert claim_task(unlisted_cfg, task.task_id, [0]) is None
+    stored = load_task(cfg, task.task_id)
+    assert stored.claim_control["active_claim"] is None
+    assert not attempt_path(cfg.shared_root, task.task_id, 1).exists()
+
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert attempt.machine_name == "g3"
+
+
+@pytest.mark.parametrize("barrier", ["group_pause", "home_drain"])
+def test_home_launch_revalidation_rejects_changed_group_authority(tmp_path: Path, barrier: str):
+    cfg = init_shared_root(tmp_path / ".qexp", "g3", runtime_root=tmp_path / "home-runtime")
+    _existing_group(cfg)
+    change_worker(cfg, "exp", "g2", "add")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    task_commands.share(cfg, task.task_id, helper_machines=["g2"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    if barrier == "group_pause":
+        group_control(cfg, "exp", "pause")
+    else:
+        change_worker(cfg, "exp", "g3", "drain")
+
+    assert not authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
 
 
 def test_cli_share_rejects_empty_comma_separated_helper_machine():

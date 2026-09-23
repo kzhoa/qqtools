@@ -125,6 +125,19 @@ def test_queued_placement_blockers_follow_fallback_contract(tmp_path, sharing):
         assert load_task(cfg, task.task_id).state["projection"] == "queued"
 
 
+def test_removing_listed_helper_keeps_active_home_as_alternative_executor(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    change_worker(cfg, "experiment", "g2", "add")
+    task = submit(cfg, ["true"], group="experiment")
+    share(cfg, task.task_id, helper_machines=["g2"])
+    discover(cfg)
+
+    operation_id = change_worker(cfg, "experiment", "g2", "remove")["worker_control"]["operation_id"]
+
+    assert finish(cfg, operation_id)["blockers"] == []
+    assert load_task(cfg, task.task_id).state["projection"] == "queued"
+
+
 def test_later_committed_members_extend_removal_watermark(tmp_path):
     cfg = isolated_group(tmp_path, tail=0)
     change_worker(cfg, "experiment", "g2", "add")
