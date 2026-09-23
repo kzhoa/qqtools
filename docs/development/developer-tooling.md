@@ -180,8 +180,10 @@ and replaces representative qexp coverage with the qexp integration gate.
 
 For local Python compatibility checks, select each interpreter explicitly:
 
+Python 3.12 is the minimum tested version. Package metadata continues to allow
+Python 3.11 installations, but CI no longer validates that interpreter.
+
 ```bash
-uv run --no-project --python 3.11 --with 'tox==4.61.5' --with 'tox-uv==1.36.0' --with 'uv==0.12.16' python -m tox run -e artifact-smoke
 uv run --no-project --python 3.12 --with 'tox==4.61.5' --with 'tox-uv==1.36.0' --with 'uv==0.12.16' python -m tox run -e artifact-smoke
 uv run --no-project --python 3.14 --with 'tox==4.61.5' --with 'tox-uv==1.36.0' --with 'uv==0.12.16' python -m tox run -e artifact-smoke
 ```
@@ -191,7 +193,7 @@ exercises `qexp --help`. It does not rerun the source Unit suite or
 install pytest/coverage tools. Missing interpreters fail instead of silently
 skipping a claimed compatibility check; install the requested Python with uv
 beforehand. Full source validation stays on Python 3.13. CI keeps Python 3.13
-installed E2E plus smoke checks on 3.11, 3.12, and 3.14. This is installation and
+installed E2E plus smoke checks on 3.12 and 3.14. This is installation and
 CLI-startup compatibility evidence, not full functional coverage on every minor.
 
 The unused `check_qexp_shared_filesystem.py` probe has been removed following

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- ci: stop testing Python 3.11; the minimum tested version is Python 3.12.
+  Package metadata continues to permit Python 3.11 installations.
 - breaking: remove the ineffective `qexp agent run --format human|json` surface and define
   foreground agent execution as a debug stream without a finite startup document.
 - fix: derive finite qexp human and JSON output from the same typed command result and exit policy;

@@ -59,8 +59,9 @@ explicitly. Prefer Python 3.11-compatible forms such as `list[str]`,
 `dict[str, int]`, and `str | None` in new code; do not bulk-convert untouched
 annotations for consistency alone.
 
-The package supports Python 3.11 and later, while the standard development
-tooling uses Python 3.13. Do not introduce newer syntax or standard-library APIs
+Package metadata allows installation on Python 3.11 and later, but CI tests only
+Python 3.12 and later; Python 3.11 compatibility is not verified. Standard
+development tooling uses Python 3.13. Do not introduce newer syntax or standard-library APIs
 into library code without accounting for the package's declared minimum version.
 
 Use `Any` only where a boundary is intentionally dynamic. Prefer a concrete

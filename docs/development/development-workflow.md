@@ -122,8 +122,8 @@ within the last 24 hours, for the identical commit SHA. Feature and release sour
 evidence are distinct jobs in `dev-preflight.yml`; a release accepts only a
 completed release-profile job. An attested feature promotion whose duplicate job
 was skipped is not release evidence. Artifact evidence comes from
-`repository-governance.yml` release dispatches and must include all three Python
-smoke jobs and the Python 3.13 installed E2E job. Evidence jobs must finish
+`repository-governance.yml` release dispatches and must include the Python 3.12
+and 3.14 smoke jobs and the Python 3.13 installed E2E job. Evidence jobs must finish
 successfully; skipped jobs are not evidence. The run attempt is fixed while
 waiting, and the newest eligible run takes precedence over older successes.
 

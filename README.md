@@ -19,9 +19,12 @@
 </div>
 
 # ✨qqtools✨
-[![PyPI Downloads](https://static.pepy.tech/personalized-badge/qqtools?period=total&units=ABBREVIATION&left_color=GREY&right_color=BRIGHTGREEN&left_text=PyPI+Downloads)](https://pepy.tech/projects/qqtools) ![PyPI - Monthly Downloads](https://img.shields.io/pypi/dm/qqtools?color=3cb371&label=Monthly) ![Python version](https://img.shields.io/badge/python->=3.11-blue)
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/qqtools?period=total&units=ABBREVIATION&left_color=GREY&right_color=BRIGHTGREEN&left_text=PyPI+Downloads)](https://pepy.tech/projects/qqtools) ![PyPI - Monthly Downloads](https://img.shields.io/pypi/dm/qqtools?color=3cb371&label=Monthly) ![Tested Python versions](https://img.shields.io/badge/tested_python->=3.12-blue)
 
 A lightweight library, crafted and battle-tested daily by *qq*, to make PyTorch life a little easier.
+
+Python 3.12+ is the tested baseline. Package metadata still permits installation
+on Python 3.11, but CI no longer verifies that version.
 
 It started from the frustration of PyG’s tightly coupled CUDA ecosystem—carefully matching CUDA versions, installing wheel builds from the official index, and repeatedly reinstalling dependencies like `torch-scatter` whenever anything changed. This project brings back a clean, one-line `pip install ...` experience, with no need to worry about CUDA compatibility.
 

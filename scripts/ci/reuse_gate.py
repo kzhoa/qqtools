@@ -15,7 +15,6 @@ GATES = {
     "feature-preflight": ("CPU-only preflight (Python 3.13)",),
     "release-preflight": ("Release preflight (Python 3.13)",),
     "artifact": (
-        "artifact-e2e-dev-release / artifact smoke (Python 3.11)",
         "artifact-e2e-dev-release / artifact smoke (Python 3.12)",
         "artifact-e2e-dev-release / artifact smoke (Python 3.14)",
         "artifact-e2e-dev-release / artifact e2e (Python 3.13)",
