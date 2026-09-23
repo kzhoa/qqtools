@@ -9,6 +9,8 @@
   bounded fair maintenance, upgrade-coordinator activation, and explicit degraded repair.
 - fix: preserve qexp shared-Task home eligibility and submission failure diagnostics across
   placement, availability, and transactional Group publication paths.
+- fix: let idle on-demand qexp agents defer healthy Group-service activation while retaining
+  damaged upgrades, recovery obligations, queued demand, and durable stop publication.
 - ci: stop testing Python 3.11; the minimum tested version is Python 3.12.
   Package metadata continues to permit Python 3.11 installations.
 - breaking: remove the ineffective `qexp agent run --format human|json` surface and define
