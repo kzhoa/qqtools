@@ -53,6 +53,14 @@ closing reporter remains the singleton sentinel and new reports are rejected
 until that daemon actually exits. This preserves both bounded shutdown and the
 single-writer invariant.
 
+An explicit application `flush(timeout=...)` retains its bounded wait for a final
+write. qPipeline's automatic connector cleanup and its process-exit handler only
+request close and do not wait for a blocked writer or handoff lock. The last
+advisory position may therefore be absent when training exits; training success
+and failure are independent of delivery.
+Processes that use only the public `update()` retain the bounded exit flush;
+the nonwaiting exit policy applies after qPipeline has accepted a managed report.
+
 Application updates use a non-blocking state lock and never perform mailbox file
 I/O on the application thread. The first accepted update may pay normal Python
 thread-startup cost. There is one pending latest-value slot, not an unbounded
@@ -236,9 +244,25 @@ automatic cancellation, speed, or ETA is included in Phase 1.
 
 ## qPipeline
 
-A rank-zero best-effort peer observer consumes existing runner facts. It calls the
-same process-level `qqtools.qexp.progress.update()` API available to user code.
-There is no qPipeline-owned Reporter and no second mailbox writer.
+A rank-zero best-effort observation plugin consumes committed runner facts. It
+shares the process-level reporter used by `qqtools.qexp.progress.update()` calls
+from user code. There is no qPipeline-owned Reporter and no second mailbox writer.
+Only an active `QEXP_PROGRESS_PATH` channel on rank zero creates this connector.
+
+`train_runner(..., *, observation_plugins=None)` selects the explicit default
+integration providers. An empty sequence disables optional connectors; a
+nonempty sequence uses exactly those factories in order. Existing built-in
+rendering and checkpoint observers remain active. Each factory receives a
+read-only `ObservationContext` with rank, max steps, and max epochs, then returns
+an inactive result or an instance with a stable identifier, immutable
+event/callback subscriptions, and `close()`. Optional plugins may subscribe to
+committed facts with best-effort callback failure handling. They cannot subscribe
+to `progress_tick`, `table_update`, or control events, because those events can
+change metric-reduction demand or execution policy. A failed plugin is skipped
+atomically; acquired instances close in reverse order. Callback failures disable
+the failing callback while peers continue. Plugins must perform only bounded
+primitive extraction and nonblocking handoff in synchronous callbacks; the
+interface does not preempt arbitrary Python callback code.
 
 Training uses optimizer `global_step`, reliable `max_steps` when available, and
 `unit=step`. Human messages use one-based active epoch and batch positions while
@@ -253,6 +277,15 @@ adapter reports counts per loader and emits no invented completion for an empty
 loader. After evaluation it restores the latest known training context. The
 adapter never reads Rich/Tqdm renderer state, and external producers continue to
 use only the framework-neutral five-field application payload.
+
+`evaluation_batch_committed` is a rank-local fact emitted after each successfully
+processed evaluation loader iteration, including a dedup padding iteration. It
+contains only validation/test stage, epoch, global step, zero-based batch index,
+and loader-local total batches. It carries no metrics or tensors and adds no
+distributed reduction. The connector maps its index to one-based progress using
+the matching loader and standard/EMA context. A missing matching start falls back
+to the fact counters without a loader message. A failed evaluation emits no
+synthetic completion; count alone does not mean its metric aggregation succeeded.
 
 ## Project reporting policy
 
@@ -307,11 +340,13 @@ Run the focused feature suite:
   tests/unit/qexp/test_progress_protocol.py \
   tests/unit/qexp/test_progress_producer.py \
   tests/unit/qexp/test_progress_projector.py \
-  tests/unit/qexp/test_progress_adapter.py \
   tests/unit/plugins/qpipeline/runner/test_runner_contracts.py \
+  tests/unit/plugins/qpipeline/runner/test_observation_plugins.py \
+  tests/unit/plugins/qpipeline/runner/test_qexp_progress.py \
   tests/integration/qexp/test_live_progress.py \
   tests/integration/qexp/test_output_format.py \
   tests/integration/functional/test_runner/test_multi_eval_loaders.py \
+  tests/integration/functional/test_runner/test_observation_collectives.py \
   tests/integration/functional/test_runner/test_progress_render_mode.py
 ```
 

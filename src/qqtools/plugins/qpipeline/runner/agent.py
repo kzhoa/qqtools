@@ -28,6 +28,7 @@ from .contracts import (
     EarlyStopDecision,
     EpochCommittedFact,
     EpochStartedFact,
+    EvaluationBatchCommittedFact,
     EvaluationCommittedFact,
     EvaluationStartedFact,
     EventListenerBindings,
@@ -473,6 +474,18 @@ class RunningAgent:
                         eval_avg_bank.update_from_dict(raw_batch_metrics)
                         if eval_tensor_bank:
                             eval_tensor_bank.add(self.task.batch_cache(out, batch_data))
+
+                    if self.observers.has("evaluation_batch_committed"):
+                        self.observers.dispatch(
+                            "evaluation_batch_committed",
+                            EvaluationBatchCommittedFact(
+                                stage=stage if isinstance(stage, Stage) else Stage(stage),
+                                epoch=self.state.epoch,
+                                global_step=self.state.global_step,
+                                batch_index=batch_idx,
+                                total_batches=total_batches,
+                            ),
+                        )
 
                     scalar_batch_metrics = _get_scalar_metrics(raw_batch_metrics)
                     avg_metrics = (

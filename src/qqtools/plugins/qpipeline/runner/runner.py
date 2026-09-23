@@ -8,6 +8,7 @@ Special Features
 """
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
@@ -28,6 +29,12 @@ from ..types import Stage
 from .agent import NaNDetectedError, RunningAgent
 from .contracts import EventListenerBindings, ObserverBindings, TaskValidationContext
 from .hooks import RunnerHooks
+from .observation_plugins import (
+    ObservationContext,
+    ObservationPluginFactory,
+    install_observation_plugins,
+    validate_observation_plugin_factories,
+)
 from .runner_utils.best_model import BestModelTracker
 from .runner_utils.ckp_manager import CheckpointManager, CheckpointPlugin, CheckpointPolicy
 from .runner_utils.common import _getattr_or_default, _is_periodic_trigger, move_batch_to_device
@@ -37,7 +44,6 @@ from .runner_utils.eval_formatter import EvalSummaryObserver
 from .runner_utils.evaluation import EvaluationResult
 from .runner_utils.metrics_jsonl import MetricsJsonlLogger, MetricsJsonlObserver
 from .runner_utils.progress import ProgressTracker
-from .runner_utils.qexp_progress import bind_qexp_progress
 from .runner_utils.types import RunConfig, RunMode, RunningState, TerminalEvent, TerminalReason, TrainRunnerResult
 
 __all__ = ["train_runner", "MetricsJsonlObserver"]
@@ -396,6 +402,8 @@ def train_runner(
     accum_grad: Optional[int] = None,
     log_granularity: Optional[List[Literal["eval", "batch"]]] = ["eval"],
     auto_offload: bool = False,
+    *,
+    observation_plugins: Sequence[ObservationPluginFactory] | None = None,
 ) -> TrainRunnerResult:
     """
     Self-contained training runner.
@@ -433,6 +441,13 @@ def train_runner(
     Returns:
         Structured training result with terminal contract fields
     """
+    if observation_plugins is None:
+        from ..integrations.observation import default_observation_plugins
+
+        observation_factories = default_observation_plugins()
+    else:
+        observation_factories = validate_observation_plugin_factories(observation_plugins)
+
     # Handle compatibility parameters
     if args is None:
         raise ValueError("The 'args' parameter is required to configure the runner.")
@@ -635,96 +650,104 @@ def train_runner(
     if task.has_implemented("on_early_stop"):
         observers.bind("early_stop", task.on_early_stop, policy="settled_fatal")
 
-    qexp_progress_observer = bind_qexp_progress(observers, config)
-    progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type, rank=config.rank)
-    observers.bind("epoch_started", progress_tracker.on_epoch_start)
-    observers.bind("progress_tick", progress_tracker.on_progress_tick)
-    observers.bind("table_update", progress_tracker.on_table_update)
-    observers.bind("epoch_committed", progress_tracker.on_epoch_end)
-    observers.bind("evaluation_started", progress_tracker.on_eval_start)
-    observers.bind("evaluation_committed", progress_tracker.on_eval_end)
-
-    eval_summary_observer = EvalSummaryObserver(
-        logger=logger,
-        target_key=checkpoint_target,
+    observation_lifecycle = install_observation_plugins(
+        observation_factories,
+        ObservationContext(rank=config.rank, max_steps=config.max_steps, max_epochs=config.max_epochs),
+        observers,
     )
-    observers.bind("evaluation_committed", eval_summary_observer.on_evaluation_committed)
-    if log_granularity and metrics_logger is not None:
-        metrics_observer = MetricsJsonlObserver(
-            logger=metrics_logger,
-            run_config=config,
-            log_granularity=log_granularity,
+    try:
+        progress_tracker = ProgressTracker(logger, config.print_freq, render_type=config.render_type, rank=config.rank)
+        observers.bind("epoch_started", progress_tracker.on_epoch_start)
+        observers.bind("progress_tick", progress_tracker.on_progress_tick)
+        observers.bind("table_update", progress_tracker.on_table_update)
+        observers.bind("epoch_committed", progress_tracker.on_epoch_end)
+        observers.bind("evaluation_started", progress_tracker.on_eval_start)
+        observers.bind("evaluation_committed", progress_tracker.on_eval_end)
+
+        eval_summary_observer = EvalSummaryObserver(
+            logger=logger,
+            target_key=checkpoint_target,
         )
-        if "eval" in log_granularity:
-            observers.bind("evaluation_committed", metrics_observer.on_evaluation_committed)
-        if "batch" in log_granularity:
-            observers.bind("train_boundary", metrics_observer.on_train_boundary)
-
-    def _step_validation_scheduler(context: TaskValidationContext) -> None:
-        if effective_scheduler is None or effective_scheduler.step_on != SCHEDULER_STEP_ON_VALID_END:
-            return
-        metric = context.evaluation.target_value(scheduler_target)
-        if metric is None:
-            logger.debug(
-                "Plateau scheduler skipped: target=%r default=skip_metric_step epoch=%s step=%s.",
-                scheduler_target,
-                context.epoch,
-                context.global_step,
+        observers.bind("evaluation_committed", eval_summary_observer.on_evaluation_committed)
+        if log_granularity and metrics_logger is not None:
+            metrics_observer = MetricsJsonlObserver(
+                logger=metrics_logger,
+                run_config=config,
+                log_granularity=log_granularity,
             )
-            return
-        effective_scheduler.step_main(metrics=metric)
+            if "eval" in log_granularity:
+                observers.bind("evaluation_committed", metrics_observer.on_evaluation_committed)
+            if "batch" in log_granularity:
+                observers.bind("train_boundary", metrics_observer.on_train_boundary)
 
-    early_stop_controller = EarlyStopController(
-        early_stopper=early_stopper,
-        target=_qconfig_get(early_stop_config, "target", "val_metric"),
-        logger=logger,
-    )
-    event_listeners.freeze()
-    observers.freeze()
+        def _step_validation_scheduler(context: TaskValidationContext) -> None:
+            if effective_scheduler is None or effective_scheduler.step_on != SCHEDULER_STEP_ON_VALID_END:
+                return
+            metric = context.evaluation.target_value(scheduler_target)
+            if metric is None:
+                logger.debug(
+                    "Plateau scheduler skipped: target=%r default=skip_metric_step epoch=%s step=%s.",
+                    scheduler_target,
+                    context.epoch,
+                    context.global_step,
+                )
+                return
+            effective_scheduler.step_main(metrics=metric)
 
-    # Create training agent
-    agent = RunningAgent(
-        model=model,
-        task=task,
-        loss_fn=loss_fn,
-        optimizer=optimizer,
-        scheduler=effective_scheduler,
-        config=config,
-        device=device,
-        ema_model=ema_model,
-        auto_offload=auto_offload,
-        logger=logger,
-        best_model_tracker=best_model_tracker,
-        hooks=hooks,
-        event_listeners=event_listeners,
-        observers=observers,
-        early_stop_controller=early_stop_controller,
-        validation_scheduler_step=_step_validation_scheduler,
-        node_aligned_output_keys=node_aligned_output_keys,
-    )
+        early_stop_controller = EarlyStopController(
+            early_stopper=early_stopper,
+            target=_qconfig_get(early_stop_config, "target", "val_metric"),
+            logger=logger,
+        )
+        event_listeners.freeze()
+        observers.freeze()
 
-    checkpoint_plugin = CheckpointPlugin(
-        checkpoint_manager=checkpoint_manager,
-        model=model,
-        task=task,
-        state=agent.state,
-        policy=checkpoint_policy,
-        optimizer=optimizer,
-        scheduler=effective_scheduler,
-        ema_model=ema_model,
-        early_stopper=early_stopper,
-        best_model_tracker=agent.best_model_tracker,
-        logger=logger,
-        event_logger=metrics_logger,
-    )
-    checkpoint_plugin.register(hooks)
-    hooks.freeze()
-    hooks.validate_distributed_plan(config.distributed)
-    profiler = None
-    terminal_event: Optional[TerminalEvent] = None
-    terminal_cause: Optional[TerminalCause] = None
-    primary_exception: Optional[BaseException] = None
-    primary_traceback = None
+        # Create training agent
+        agent = RunningAgent(
+            model=model,
+            task=task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            scheduler=effective_scheduler,
+            config=config,
+            device=device,
+            ema_model=ema_model,
+            auto_offload=auto_offload,
+            logger=logger,
+            best_model_tracker=best_model_tracker,
+            hooks=hooks,
+            event_listeners=event_listeners,
+            observers=observers,
+            early_stop_controller=early_stop_controller,
+            validation_scheduler_step=_step_validation_scheduler,
+            node_aligned_output_keys=node_aligned_output_keys,
+        )
+
+        checkpoint_plugin = CheckpointPlugin(
+            checkpoint_manager=checkpoint_manager,
+            model=model,
+            task=task,
+            state=agent.state,
+            policy=checkpoint_policy,
+            optimizer=optimizer,
+            scheduler=effective_scheduler,
+            ema_model=ema_model,
+            early_stopper=early_stopper,
+            best_model_tracker=agent.best_model_tracker,
+            logger=logger,
+            event_logger=metrics_logger,
+        )
+        checkpoint_plugin.register(hooks)
+        hooks.freeze()
+        hooks.validate_distributed_plan(config.distributed)
+        profiler = None
+        terminal_event: Optional[TerminalEvent] = None
+        terminal_cause: Optional[TerminalCause] = None
+        primary_exception: Optional[BaseException] = None
+        primary_traceback = None
+    except BaseException:
+        observation_lifecycle.close()
+        raise
 
     try:
         progress_tracker, profiler = _prepare_training_session(
@@ -758,11 +781,7 @@ def train_runner(
                 owns_logger=owns_logger,
             )
         finally:
-            if qexp_progress_observer is not None:
-                try:
-                    qexp_progress_observer.close()
-                except Exception:
-                    pass
+            observation_lifecycle.close()
 
     logger_error: Optional[BaseException] = None
     if metrics_logger is not None:

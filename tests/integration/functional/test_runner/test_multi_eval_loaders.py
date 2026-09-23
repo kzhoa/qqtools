@@ -71,6 +71,46 @@ def test_evaluation_boundaries_identify_each_loader_and_model_before_ticks():
     assert boundary.total_batches == 0
 
 
+def test_metric_free_batch_facts_cover_completed_iterations_without_progress_ticks():
+    task = SimpleTask(num_samples=256)
+    facts = []
+    observers = ObserverBindings()
+    observers.bind("evaluation_batch_committed", facts.append)
+    observers.freeze()
+    agent = _make_agent(task, observers=observers)
+
+    agent._evaluate_loader(agent.model, task.val_loader, Stage.VAL)
+
+    assert len(facts) == len(task.val_loader)
+    assert [fact.batch_index for fact in facts] == list(range(len(task.val_loader)))
+    assert {fact.stage for fact in facts} == {Stage.VAL}
+    assert {fact.total_batches for fact in facts} == {len(task.val_loader)}
+    assert all(not hasattr(fact, "batch_metrics") for fact in facts)
+
+
+def test_failed_evaluation_does_not_emit_a_fact_for_failed_iteration():
+    task = SimpleTask(num_samples=256)
+    facts = []
+    observers = ObserverBindings()
+    observers.bind("evaluation_batch_committed", facts.append)
+    observers.freeze()
+    agent = _make_agent(task, observers=observers)
+    original = task.batch_metric
+    calls = 0
+
+    def fail_second(out, batch):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("batch failed")
+        return original(out, batch)
+
+    task.batch_metric = fail_second
+    with pytest.raises(RuntimeError, match="batch failed"):
+        agent._evaluate_loader(agent.model, task.val_loader, Stage.VAL)
+    assert [fact.batch_index for fact in facts] == [0]
+
+
 def test_multi_loader_evaluation_preserves_order_and_uses_stage_score():
     task = SimpleTask(num_samples=40)
     task.val_loader = {"b2": task.test_loader, "b1": task.val_loader}

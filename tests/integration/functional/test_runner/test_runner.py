@@ -485,6 +485,127 @@ class TestTrainRunner:
             assert "[DEBUG] Training loop stopping at epoch 2" in log_text
             assert "Training completed:" not in log_text
 
+    def test_direct_runner_uses_exact_custom_observation_sequence(self, tmp_path):
+        calls = []
+
+        class SyntheticObserver:
+            identifier = "synthetic"
+
+            def __init__(self):
+                self.subscriptions = (("epoch_started", lambda fact: calls.append(("epoch", fact.epoch))),)
+
+            def close(self):
+                calls.append(("close", None))
+
+        def factory(context):
+            calls.append(("factory", context.rank))
+            return SyntheticObserver()
+
+        task, model, loss_fn, optimizer = self._create_training_components()
+        result = train_runner(
+            model=model,
+            task=task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            args=self.args,
+            max_epochs=1,
+            save_dir=str(tmp_path),
+            run_mode="epoch",
+            observation_plugins=(factory,),
+        )
+
+        assert result["final_epoch"] == 1
+        assert calls[0] == ("factory", 0)
+        assert ("epoch", 0) in calls
+        assert calls[-1] == ("close", None)
+
+    def test_empty_observation_sequence_disables_optional_factories(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("QEXP_PROGRESS_PATH", str(tmp_path / "progress.json"))
+        task, model, loss_fn, optimizer = self._create_training_components()
+
+        result = train_runner(
+            model=model,
+            task=task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            args=self.args,
+            max_epochs=1,
+            save_dir=str(tmp_path),
+            run_mode="epoch",
+            observation_plugins=(),
+        )
+
+        assert result["final_epoch"] == 1
+        assert not (tmp_path / "progress.json").exists()
+
+    def test_default_observation_provider_reaches_direct_runner(self, tmp_path, monkeypatch):
+        updates = []
+        monkeypatch.setenv("QEXP_PROGRESS_PATH", str(tmp_path / "progress.json"))
+        monkeypatch.setattr(
+            "qqtools.qexp.progress._offer_managed_progress",
+            lambda **fields: updates.append(fields) or True,
+        )
+        task, model, loss_fn, optimizer = self._create_training_components()
+
+        result = train_runner(
+            model=model,
+            task=task,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            args=self.args,
+            max_epochs=1,
+            save_dir=str(tmp_path),
+            run_mode="epoch",
+        )
+
+        assert result["final_epoch"] == 1
+        assert any(update["stage"] == "train" for update in updates)
+        assert any(update["stage"] == "validation" for update in updates)
+
+    def test_optional_observer_closes_when_later_runner_setup_fails(self, tmp_path, monkeypatch):
+        closes = []
+
+        class SyntheticObserver:
+            identifier = "synthetic"
+            subscriptions = ()
+
+            def close(self):
+                closes.append("closed")
+
+        def fail_progress_tracker(*args, **kwargs):
+            raise RuntimeError("renderer setup failed")
+
+        monkeypatch.setattr(runner_module, "ProgressTracker", fail_progress_tracker)
+        task, model, loss_fn, optimizer = self._create_training_components()
+
+        with pytest.raises(RuntimeError, match="renderer setup failed"):
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=1,
+                save_dir=str(tmp_path),
+                observation_plugins=(lambda _: SyntheticObserver(),),
+            )
+        assert closes == ["closed"]
+
+    def test_malformed_observation_sequence_is_rejected_as_public_argument(self, tmp_path):
+        task, model, loss_fn, optimizer = self._create_training_components()
+
+        with pytest.raises(TypeError, match="observation_plugins"):
+            train_runner(
+                model=model,
+                task=task,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                args=self.args,
+                max_epochs=1,
+                save_dir=str(tmp_path),
+                observation_plugins=object(),
+            )
+
     def test_train_runner_rejects_non_boolean_regular_checkpoint_retention(self):
         task, model, loss_fn, optimizer = self._create_training_components()
         self.args.runner.checkpoint = {"regular_latest_only": "false"}

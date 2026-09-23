@@ -6,6 +6,8 @@ operations.  None of these objects expose mutable runner state or a generic sign
 
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Literal, Mapping, Optional
@@ -106,6 +108,15 @@ class EvaluationStartedFact:
     loader_name: Optional[str] = None
     loader_index: Optional[int] = None
     model_variant: Optional[Literal["standard", "ema"]] = None
+
+
+@dataclass(kw_only=True, frozen=True, slots=True)
+class EvaluationBatchCommittedFact:
+    stage: Stage
+    epoch: int
+    global_step: int
+    batch_index: int
+    total_batches: int
 
 
 @dataclass(kw_only=True, frozen=True, slots=True)
@@ -234,8 +245,10 @@ class EventListenerBindings:
 class _ObserverRegistration:
     callback: Callable[[object], None]
     policy: Literal["best_effort", "settled_fatal"]
+    optional: bool = False
     is_enabled: bool = True
     has_reported_failure: bool = False
+    diagnostic: tuple[str, str] | None = None
 
 
 class ObserverBindings:
@@ -247,14 +260,27 @@ class ObserverBindings:
         "table_update",
         "train_boundary",
         "evaluation_started",
+        "evaluation_batch_committed",
         "evaluation_committed",
         "epoch_committed",
         "early_stop",
     )
+    _OPTIONAL_NAMES = frozenset(
+        (
+            "epoch_started",
+            "train_boundary",
+            "evaluation_started",
+            "evaluation_batch_committed",
+            "evaluation_committed",
+            "epoch_committed",
+        )
+    )
+    _DIAGNOSTIC_LIMIT = 64
 
     def __init__(self, logger: Optional[Any] = None) -> None:
         self._logger = logger
         self._registrations: dict[str, list[_ObserverRegistration]] = {name: [] for name in self._NAMES}
+        self._optional_diagnostics: deque[tuple[_ObserverRegistration, tuple[str, str]]] = deque()
         self._is_frozen = False
 
     def bind(
@@ -269,6 +295,41 @@ class ObserverBindings:
         if name not in self._registrations:
             raise ValueError(f"Unknown observer binding: {name!r}.")
         self._registrations[name].append(_ObserverRegistration(callback=callback, policy=policy))
+
+    def bind_optional_bundle(
+        self,
+        subscriptions: Iterable[tuple[str, Callable[[object], None]]],
+        *,
+        policy: Literal["best_effort"] = "best_effort",
+    ) -> None:
+        """Atomically bind one optional observation plugin's committed-fact callbacks."""
+        if self._is_frozen:
+            raise RuntimeError("Observer bindings are frozen.")
+        if type(policy) is not str or policy != "best_effort":
+            raise ValueError("Optional observer callbacks only support the 'best_effort' policy.")
+
+        try:
+            bundle = tuple(subscriptions)
+        except Exception as error:
+            raise TypeError("Optional observer subscriptions must be an iterable of event/callback pairs.") from error
+
+        validated: list[tuple[str, Callable[[object], None]]] = []
+        for subscription in bundle:
+            if type(subscription) is not tuple or len(subscription) != 2:
+                raise TypeError("Each optional observer subscription must be a two-item tuple.")
+            name, callback = subscription
+            if type(name) is not str or name not in self._OPTIONAL_NAMES:
+                raise ValueError("Optional observers may subscribe only to supported committed-fact events.")
+            if not callable(callback):
+                raise TypeError("Optional observer callbacks must be callable.")
+            validated.append((name, callback))
+
+        registrations = [
+            (name, _ObserverRegistration(callback=callback, policy="best_effort", optional=True))
+            for name, callback in validated
+        ]
+        for name, registration in registrations:
+            self._registrations[name].append(registration)
 
     def freeze(self) -> None:
         self._is_frozen = True
@@ -289,9 +350,33 @@ class ObserverBindings:
                 registration.callback(fact)
             except Exception as error:
                 registration.is_enabled = False
-                if not registration.has_reported_failure and self._logger is not None:
+                if not registration.has_reported_failure:
                     registration.has_reported_failure = True
-                    self._logger.debug("Observer %s disabled after failure: %s", name, error, exc_info=True)
+                    if registration.optional:
+                        registration.diagnostic = (name, "callback_failure")
+                        if len(self._optional_diagnostics) == self._DIAGNOSTIC_LIMIT:
+                            expired_registration, expired_diagnostic = self._optional_diagnostics.popleft()
+                            if expired_registration.diagnostic == expired_diagnostic:
+                                expired_registration.diagnostic = None
+                        self._optional_diagnostics.append((registration, registration.diagnostic))
+                    elif self._logger is not None:
+                        self._logger.debug("Observer %s disabled after failure: %s", name, error, exc_info=True)
+
+    def drain_optional_diagnostics(self, *, limit: int = _DIAGNOSTIC_LIMIT) -> tuple[tuple[str, str], ...]:
+        """Drain a bounded set of primitive optional-callback diagnostics without logging."""
+        if type(limit) is not int or limit < 0:
+            raise ValueError("Diagnostic limit must be a non-negative integer.")
+        remaining = min(limit, self._DIAGNOSTIC_LIMIT)
+        if remaining == 0:
+            return ()
+        drained: list[tuple[str, str]] = []
+        while self._optional_diagnostics and remaining:
+            registration, diagnostic = self._optional_diagnostics.popleft()
+            if registration.diagnostic == diagnostic:
+                registration.diagnostic = None
+                drained.append(diagnostic)
+                remaining -= 1
+        return tuple(drained)
 
     def dispatch_terminal(
         self,

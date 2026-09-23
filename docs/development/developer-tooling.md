@@ -77,6 +77,31 @@ Its pytest default `testpaths` is `tests/unit`, even with options such as `-q` o
 parser. Relative test paths are relative to the repository root. Maintainers may
 deliberately use pytest options to override this daily-test configuration.
 
+### Reuse a compatible tox environment from an independent worktree
+
+An independent feature worktree has its own `.tox/` path, so `./scripts/dev test`
+there may install a second copy of the same test dependencies. For focused
+development tests, prefer an existing compatible tox interpreter from the main
+checkout when dependencies, Python version, and test lane have not changed. Run
+pytest from the feature worktree and point `PYTHONPATH` at that worktree's `src/`:
+
+```bash
+cd /path/to/feature-worktree
+QQTOOLS_BASE_CHECKOUT=/path/to/existing/qqtools
+PYTHONPATH="$PWD/src" "$QQTOOLS_BASE_CHECKOUT/.tox/unit/bin/python" -c \
+  'import qqtools; print(qqtools.__file__)'
+PYTHONPATH="$PWD/src" "$QQTOOLS_BASE_CHECKOUT/.tox/unit/bin/python" -m pytest \
+  tests/unit/path/to/test_file.py -q
+```
+
+The printed module path must start with the feature worktree's `src/qqtools`.
+Use the corresponding existing lane interpreter for focused Integration tests.
+This reuses dependencies without installing into or changing the main checkout's
+tox environment. If its interpreter or dependencies are incompatible, use
+`./scripts/dev test` in the feature worktree to create its own environment.
+Complete preflight and configured promotion gates still use their standard
+entry points and exact candidate checkout.
+
 `env` creates `.venv` with the entry point's interpreter, or reuses an existing
 Python 3.13 environment. It installs editable `.[full]` and pytest-xdist explicitly
 into that environment, regardless of any activated environment. Rerun after

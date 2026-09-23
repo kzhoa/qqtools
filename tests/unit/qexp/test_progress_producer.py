@@ -10,6 +10,10 @@ from qqtools.qexp import progress
 from qqtools.qexp._progress_protocol import read_advisory_snapshot
 
 
+def _render_managed_test_message(parts):
+    return str(parts[0])
+
+
 @pytest.fixture(autouse=True)
 def clean_reporter(monkeypatch):
     progress.flush(timeout=0)
@@ -245,6 +249,48 @@ def test_close_does_not_wait_unbounded_for_state_lock(tmp_path):
         reporter._lock.release()
 
 
+def test_managed_close_does_not_wait_for_blocked_writer(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        release.wait(3)
+
+    monkeypatch.setattr(progress, "replace_advisory_snapshot", blocked)
+    monkeypatch.setenv("QEXP_PROGRESS_PATH", str(tmp_path / "progress.json"))
+    assert progress._offer_managed_progress(
+        stage="train", current=1, message_parts=("ready",), render_message=_render_managed_test_message
+    )
+    assert entered.wait(1)
+    reporter = progress._reporter
+
+    start = time.monotonic()
+    progress._close_managed_progress()
+    assert time.monotonic() - start < 0.1
+    assert progress._reporter is reporter
+    assert progress.update(stage="train", current=2) is False
+
+    release.set()
+    progress.flush(timeout=1)
+
+
+def test_managed_close_does_not_wait_for_reporter_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("QEXP_PROGRESS_PATH", str(tmp_path / "progress.json"))
+    assert progress._offer_managed_progress(
+        stage="train", current=1, message_parts=("ready",), render_message=_render_managed_test_message
+    )
+    reporter = progress._reporter
+    assert progress._reporter_lock.acquire(blocking=False)
+    try:
+        start = time.monotonic()
+        progress._close_managed_progress()
+        assert time.monotonic() - start < 0.1
+        assert reporter._close_requested.is_set()
+    finally:
+        progress._reporter_lock.release()
+    progress.flush(timeout=1)
+
+
 def test_normal_updates_are_coalesced(tmp_path, monkeypatch):
     writes = []
     first = threading.Event()
@@ -303,3 +349,58 @@ def test_identical_updates_do_not_create_ordinary_rewrites(tmp_path, monkeypatch
     reporter.close(timeout=1)
 
     assert len(writes) == 1
+
+
+def test_latest_accepted_value_replaces_a_pending_change_even_if_previously_written(tmp_path, monkeypatch):
+    writes = []
+    first = threading.Event()
+
+    def capture(path, value, **kwargs):
+        writes.append(value["current"])
+        first.set()
+
+    monkeypatch.setattr(progress, "replace_advisory_snapshot", capture)
+    reporter = progress._Reporter(tmp_path / "progress.json", interval_seconds=30)
+    assert reporter.update(stage="train", current=1)
+    assert first.wait(1)
+    deadline = time.monotonic() + 1
+    while reporter._last_written_key is None and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert reporter._last_written_key is not None
+    assert reporter.update(stage="train", current=2)
+    assert reporter.update(stage="train", current=1)
+    reporter.close(timeout=1)
+
+    assert writes[0] == 1
+    assert writes[-1] == 1
+    assert 2 not in writes
+
+
+def test_latest_accepted_value_survives_inflight_different_write(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    writes = []
+
+    def capture(path, value, **kwargs):
+        writes.append(value["current"])
+        if value["current"] == 2:
+            entered.set()
+            release.wait(3)
+
+    monkeypatch.setattr(progress, "replace_advisory_snapshot", capture)
+    reporter = progress._Reporter(tmp_path / "progress.json", interval_seconds=30)
+    assert reporter.update(stage="train", current=1)
+    deadline = time.monotonic() + 1
+    while reporter._last_written_key is None and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert reporter._last_written_key is not None
+
+    with reporter._lock:
+        reporter._next_due = float("-inf")
+    assert reporter.update(stage="train", current=2)
+    assert entered.wait(1)
+    assert reporter.update(stage="train", current=1)
+    release.set()
+    reporter.close(timeout=1)
+
+    assert writes[:2] == [1, 2]
+    assert writes[-1] == 1
