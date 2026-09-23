@@ -42,6 +42,9 @@ progress.flush()
 The supported application surface is `update()` and `flush()`. The implementation
 is standard-library-only and does not import qexp scheduling or a training
 framework. Without `QEXP_PROGRESS_PATH`, `update()` is a no-op returning `False`.
+String fields accept strings and string subclasses (including `StrEnum`); the
+producer extracts plain text without invoking overridden conversion methods.
+Arbitrary objects are not implicitly converted to text.
 The return value means only that a latest-value report was accepted in process;
 it does not prove that the value reached disk, the agent, or a viewer.
 

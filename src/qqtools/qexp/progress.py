@@ -206,6 +206,11 @@ class _Reporter:
             return False
         try:
             if _message_parts is None:
+                # Preserve the public string contract without retaining subclasses
+                # or invoking their overridden conversion/encoding methods.
+                stage = str.__str__(stage) if isinstance(stage, str) else stage
+                unit = str.__str__(unit) if isinstance(unit, str) else unit
+                message = str.__str__(message) if isinstance(message, str) else message
                 if _render_message is not None or not _valid_progress_fields(stage, current, total, unit, message):
                     return False
             else:

@@ -3,6 +3,7 @@ import os
 import threading
 import time
 from collections import Counter
+from enum import StrEnum
 
 import pytest
 
@@ -404,3 +405,36 @@ def test_latest_accepted_value_survives_inflight_different_write(tmp_path, monke
 
     assert writes[:2] == [1, 2]
     assert writes[-1] == 1
+
+
+def test_public_update_accepts_string_subclasses_without_executing_overrides(tmp_path, monkeypatch):
+    class Phase(StrEnum):
+        TRAIN = "train"
+
+    class Text(str):
+        def __str__(self):
+            raise AssertionError("must not execute user conversion")
+
+        def encode(self, *args, **kwargs):
+            raise AssertionError("must not execute user encoding")
+
+        def __eq__(self, other):
+            raise AssertionError("must not retain user comparison")
+
+    path = tmp_path / "progress.json"
+    monkeypatch.setenv("QEXP_PROGRESS_PATH", str(path))
+    assert progress.update(stage=Phase.TRAIN, current=1, total=2, unit=Text("step"), message=Text("ready"))
+    progress.flush(timeout=1)
+    payload = read_advisory_snapshot(path)
+    assert (payload["stage"], payload["unit"], payload["message"]) == ("train", "step", "ready")
+
+
+def test_managed_update_rejects_nonprimitive_text(tmp_path):
+    class Phase(StrEnum):
+        TRAIN = "train"
+
+    reporter = progress._Reporter(tmp_path / "progress.json")
+    assert not reporter.update(
+        stage=Phase.TRAIN, _message_parts=("ready",), _render_message=_render_managed_test_message
+    )
+    assert reporter._thread is None
