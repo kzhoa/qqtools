@@ -127,6 +127,16 @@ shared registrations, Tasks, claims, or reservations. Verified or ambiguous live
 always blocks replacement. Ordinary replacement also requires all recovery and terminal-publication
 obligations to be settled.
 
+Machine identity checks distinguish a fresh runtime from unreadable or malformed identity.
+Only a missing identity with no remaining runtime data receives initialization guidance.
+A missing identity alongside configuration, inventory, generations, reservations or execution
+records is a recovery failure; `init`, including `--yes`, must not treat it as fresh setup.
+Empty layout directories and lifecycle lock files alone do not establish prior identity.
+A validated pending identity-replacement transaction retains its existing resume path.
+Errors identify the affected path and direct access failures to runtime selection, mount and
+permission checks, or damaged identity to preservation and recovery of the original identity.
+Validation must not synthesize identity or change durable runtime data on these failures.
+
 `--detach-old-runtime` is an explicit recovery-responsibility exception for a copied environment.
 It permits unresolved evidence to be preserved in an isolated archive when local execution is
 known not to be live. It does not finalize work, release resources, adopt ownership, or prove that

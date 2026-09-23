@@ -163,11 +163,11 @@ def _write_locked(runtime: Any, config: AgentConfig) -> AgentConfig:
 def load_agent_config(runtime: Any, *, require_initialized: bool = True) -> AgentConfig:
     """Load global config, performing one compatibility migration when needed."""
     machine_runtime = _as_runtime(runtime)
+    if require_initialized:
+        machine_runtime.require_identity()
     stored = _stored_config(machine_runtime)
     if stored is not None:
         return stored
-    if require_initialized and not machine_runtime.has_identity:
-        raise RuntimeError("qexp machine runtime is uninitialized; run 'qexp init --machine NAME'.")
     # A pre-feature registry is the sole read-time migration exception.  It
     # preserves its effective runtime ID before creating the new config.
     has_registry = machine_runtime.paths["registry"].exists()

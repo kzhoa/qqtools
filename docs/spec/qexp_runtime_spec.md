@@ -102,6 +102,12 @@ API.
    runtime-path observations cannot shorten that interval. A failure leaves a diagnosable
    incomplete state.
 
+Identity validation reads and validates the persisted identity before operational configuration
+loading. Missing identity permits fresh initialization only when a read-only inspection finds
+no durable runtime data; inaccessible evidence cannot prove an empty runtime. Initialization
+rechecks this condition under the lifecycle lock, without bypassing a validated replacement
+transaction's resume protocol. Read/format failures never authorize a replacement identity.
+
 ## Lifecycle terminal boundary and notifications
 
 Every attempt-backed terminal transition (`succeeded`, `failed`, or `cancelled`) is committed

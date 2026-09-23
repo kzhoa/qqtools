@@ -28,6 +28,7 @@ from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.work_budget import AdaptiveBatchSizer
 from .bindings import ProjectBinding
 from .dispatch_probe import PrimaryProbeSession
+from .identity import MachineRuntimeUninitializedError, load_identity_record, require_fresh_runtime
 from .registration import (
     RECOVERY_REGISTRATION_PROTOCOL,
     RECOVERY_REGISTRATION_VERSION,
@@ -44,10 +45,6 @@ LEGACY_AGENT_EVIDENCE = (
     "authority_diagnostics",
 )
 LEGACY_RUNNER_INBOX = ("registrations", "observations", "launch_intents", "events")
-
-
-class MachineRuntimeUninitializedError(RuntimeError):
-    """A machine-scoped command requires an initialized runtime identity."""
 
 
 class ProjectBindingRequiredError(ValueError):
@@ -188,12 +185,17 @@ class MachineRuntime:
         instance_id = value.get("instance_id") if isinstance(value, dict) else None
         return isinstance(instance_id, str) and bool(instance_id)
 
-    def require_initialized(self) -> None:
-        """Reject operational use of an uninitialized machine runtime."""
-        if not self.has_identity:
+    def require_identity(self) -> None:
+        """Distinguish fresh runtimes from missing, unreadable or corrupt identity."""
+        if load_identity_record(self.paths["identity"]) is None:
+            require_fresh_runtime(self.root)
             raise MachineRuntimeUninitializedError(
-                "qexp machine runtime is uninitialized; run 'qexp init --machine NAME'."
+                f"qexp machine runtime is uninitialized at {self.root}; run 'qexp init --machine NAME'."
             )
+
+    def require_initialized(self) -> None:
+        """Reject operational use unless identity and global configuration are valid."""
+        self.require_identity()
         from .config import load_agent_config
 
         load_agent_config(self, require_initialized=True)

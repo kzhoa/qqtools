@@ -29,6 +29,7 @@ from .config import (
     validate_agent_name,
 )
 from .context import MachineRuntime
+from .identity import load_identity_record, require_fresh_runtime
 from .inventory import (
     ProjectInventoryEntry,
     canonical_shared_root,
@@ -61,26 +62,7 @@ def _runtime(value: MachineRuntime | str | Path | None) -> MachineRuntime:
 
 
 def _identity_record(runtime: MachineRuntime) -> dict[str, Any] | None:
-    path = runtime.paths["identity"]
-    if not path.exists():
-        return None
-    value = read_json(path)
-    if not isinstance(value, dict):
-        raise SetupOperationalError("machine runtime identity is malformed.")
-    record = value.get("machine_runtime")
-    if not isinstance(record, dict):
-        raise SetupOperationalError("machine runtime identity is malformed.")
-    seed = record.get("instance_id")
-    effective = record.get("runtime_id")
-    if not isinstance(seed, str) or not seed:
-        raise SetupOperationalError("machine runtime identity is malformed.")
-    if effective is not None and (
-        not isinstance(effective, str)
-        or len(effective) != 64
-        or any(char not in "0123456789abcdef" for char in effective)
-    ):
-        raise SetupOperationalError("machine runtime identity has an invalid public runtime ID.")
-    return record
+    return load_identity_record(runtime.paths["identity"])
 
 
 def _effective_runtime_id(seed: str) -> str:
@@ -236,6 +218,8 @@ def machine_init_facts(runtime: MachineRuntime | str | Path | None) -> dict[str,
     """Read replacement facts without creating a machine runtime."""
     machine_runtime = _runtime(runtime)
     old_id = _current_runtime_id(machine_runtime)
+    if old_id is None and _read_replacement(machine_runtime) is None:
+        require_fresh_runtime(machine_runtime.root)
     config: AgentConfig | None = None
     try:
         config = load_agent_config(machine_runtime, require_initialized=False)
@@ -414,6 +398,8 @@ def initialize_machine(
     if yes is not None:
         confirmed = confirmed or yes
 
+    if _identity_record(machine_runtime) is None and _read_replacement(machine_runtime) is None:
+        require_fresh_runtime(machine_runtime.root)
     with machine_runtime.agent_lifecycle_guard():
         transaction = _read_replacement(machine_runtime)
         if transaction is not None:
@@ -430,6 +416,7 @@ def initialize_machine(
             old_id = transaction.get("old_runtime_id")
         reported_old_id = transaction.get("old_runtime_id") if transaction is not None else old_id
         if old_id is None and transaction is None:
+            require_fresh_runtime(machine_runtime.root)
             # Empty detachment is intentionally a no-op and is never persisted.
             _ensure_machine_dirs(machine_runtime)
             if selected_mode is None:

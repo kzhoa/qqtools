@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..agent.context import ExecutionContext, MachineRuntime, ProjectBindingRequiredError
+from ..agent.identity import MachineRuntimeIdentityError
 from ..commands import context as context_commands
 from ..commands import wait as wait_commands
 from ..config_types import RootConfig
@@ -392,6 +393,8 @@ def main(argv: list[str] | None = None) -> int:
         if handler == "task_list" and (args.page_size is not None or args.cursor is not None):
             code = "invalid_argument" if isinstance(exc, ValueError) else "index_unavailable"
             return _emit_observation_error(ObservationError(code, str(exc)), args.format)
+        if isinstance(exc, MachineRuntimeIdentityError):
+            return _emit_user_error(CliOperationalError(str(exc)), getattr(args, "format", "human"))
         raise
     finally:
         _ACTIVE_COMMAND_SPEC.reset(command_spec_token)
