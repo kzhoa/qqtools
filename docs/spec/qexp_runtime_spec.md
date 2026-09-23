@@ -2833,6 +2833,85 @@ Mock-only tests are insufficient for the coordination release gate.
 - hostile multi-tenant isolation
 - scientific metric, artifact, or checkpoint management
 
+## Live-progress selection and Group policy
+
+The optional Group default is separate from authoritative Group truth at
+`<shared-root>/group-observation/<group-name>.json`. Its version-1 JSON object
+has exactly `version`, `revision`, `group_identity`, and `live_progress`, with a
+4 KiB encoded/read limit. `version` is exact integer 1; `revision` is a positive
+signed-64-bit integer; `live_progress` is an exact boolean. `group_identity` has
+exactly `name`, immutable `meta.created_at`, and nullable
+`creation_operation_id` copied from the published Group. A stale identity is
+ignored with a diagnostic; a missing record means false. A malformed record is
+an error for Group configuration commands and an unavailable advisory default
+for submission. There is no eager migration or policy scan.
+
+Setters serialize on a dedicated per-Group policy lock, read the currently
+published Group, validate the existing record, increment its revision (or begin
+at one for a new identity), revalidate the published identity, and durably
+replace the policy record. Revision overflow rejects the set. The setter reports
+the identity/revision it changed. A concurrent replacement can obsolete that
+write but cannot apply it to the next Group incarnation. Task cleanup retains
+the default. Any later policy cleanup compares stored identity under the policy
+lock and never performs policy I/O while holding an authoritative lock. Neither
+sets nor reads modify `dispatch_epoch`, `worker_set_epoch`, Group `meta.revision`,
+or submission admission preconditions.
+
+A fresh submission with inheriting Tasks takes one policy snapshot before any
+authoritative submission, Group, or Task lock. The read has a 100 ms submitting
+thread wait budget for the whole batch. Blocking filesystem work runs in at
+most one outstanding daemon read worker per submitting process; a blocked slot
+is never replaced or joined at exit. A timeout, occupied slot, or read failure
+freezes false for all inheriting Tasks, with bounded diagnostic. Explicit
+requests skip the read. During Group resolution, a snapshot applies only when
+its identity equals the resolved Group; a mismatch freezes false. A successful
+read sees one complete atomic revision. Policy commit order and submission
+commit order need not coincide. Dry-run previews only and reserves no revision.
+
+The first `preparing` Submission Operation atomically stores a top-level
+`live_progress_selection` object alongside the strict `task_observation`
+namespace. Version 1 has exactly `version`, `selection_digest`, and `tasks`.
+Each ordered Task entry has exactly `task_id`, nullable `requested`, boolean
+`enabled`, `source` (`explicit`, `group`, `default`, or `unavailable`), and nullable
+`group_policy`. The latter is non-null only for `group` and contains exact
+`group_identity` and positive `revision`. Explicit entries equal their request;
+all other sources require null request, and default/unavailable entries disable
+observation. The ordered IDs exactly match resolved Task IDs without duplicates.
+The lowercase SHA-256 digest covers UTF-8 JSON of only the tasks array, with
+sorted keys, compact separators, `ensure_ascii=False`, and no nonfinite values.
+The namespace is immutable after preparation and follows Operation retention.
+Unknown fields/versions, bad types, mismatched identities, or a bad digest turn
+only this advisory selection off with a bounded diagnostic. Historical missing
+metadata is off and is never resampled from today's Group default. Task truth,
+the strict resolved-context digest, and tmux metadata formats remain unchanged.
+
+Canonical raw submission input contains each non-null explicit
+`live_progress` request after CLI/manifest precedence and omits null. Group
+policy, revision, and resolved booleans never enter the raw digest. Thus a
+changed explicit request conflicts under the same idempotency key, while a
+later Group default does not. Reuse an existing Operation before reading policy.
+Recheck under the keyed lock; if another caller won, discard a speculative
+snapshot and use the winner's stored selection. A crash before durable
+preparation may resample; recovery after it and Task retries cannot. No progress
+snapshot participates in submission recovery. Supported old writers must retain
+this additive namespace when updating an Operation; mixed versions may lose
+richer observation but cannot change training eligibility.
+
+Frozen-enabled Tasks alone may receive a separate optional v2 context and
+mailbox outside authoritative launch locks. Channel failure or delay cannot
+block valid training launch. Provisioning must not wait synchronously for
+observation I/O, and viewer/window creation cannot delay heartbeat, lease, or
+dispatch. Off Tasks add no extended runtime context, callbacks, scan, or viewer.
+The existing detached runner, log descriptors, guardian, and cancellation
+authority remain unchanged. The agent projects snapshots on its independent
+observation thread; failed, stale, or missing progress is never execution truth.
+
+Required evidence covers one-revision batch selection, set/read and identity
+replacement races, timeout with a blocked filesystem read, one worker slot and
+late result discard, same-key replay and crash recovery, old metadata fallback,
+Task retry, and absence of policy I/O under authority locks. Policy revision
+must not invalidate an otherwise valid submission commit.
+
 ## Task observation publication and indexed traversal
 
 Task JSON remains authoritative. `indexes/task-observation` contains only a

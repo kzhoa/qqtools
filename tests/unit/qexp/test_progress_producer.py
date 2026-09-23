@@ -128,6 +128,62 @@ def test_broken_storage_does_not_escape_to_caller(tmp_path, monkeypatch):
     reporter = progress._Reporter(tmp_path / "progress.json")
     reporter.update(stage="train", current=1)
     reporter.close(timeout=1)
+    assert reporter._thread is not None
+    reporter._thread.join(timeout=5)
+    assert not reporter._thread.is_alive()
+
+
+def test_failed_storage_backs_off_and_keeps_latest_update(tmp_path, monkeypatch):
+    attempts = []
+    first_failure = threading.Event()
+    success = threading.Event()
+
+    def write(path, value, **kwargs):
+        attempts.append((time.monotonic(), value["current"]))
+        if len(attempts) == 1:
+            first_failure.set()
+            raise OSError("unavailable")
+        success.set()
+
+    monkeypatch.setattr(progress, "replace_advisory_snapshot", write)
+    reporter = progress._Reporter(tmp_path / "progress.json", interval_seconds=30)
+    assert reporter.update(stage="train", current=1)
+    assert first_failure.wait(1)
+    assert reporter.update(stage="train", current=2)
+    time.sleep(0.2)
+    assert len(attempts) == 1
+    assert success.wait(2)
+    assert [value for _, value in attempts] == [1, 2]
+    assert attempts[1][0] - attempts[0][0] >= 0.95
+    reporter.close(timeout=1)
+
+
+def test_failed_storage_backoff_escalates_caps_and_resets_after_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(progress, "_INITIAL_RETRY_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(progress, "_MAX_RETRY_DELAY_SECONDS", 0.06)
+    attempted_at = []
+    succeeded = threading.Event()
+
+    def write(_path, _value, **_kwargs):
+        attempted_at.append(time.monotonic())
+        if len(attempted_at) <= 7:
+            raise OSError("unavailable")
+        succeeded.set()
+
+    monkeypatch.setattr(progress, "replace_advisory_snapshot", write)
+    reporter = progress._Reporter(tmp_path / "progress.json", interval_seconds=30)
+    assert reporter.update(stage="train", current=1)
+    assert succeeded.wait(2)
+    intervals = [later - earlier for earlier, later in zip(attempted_at, attempted_at[1:])]
+    assert len(intervals) == 7
+    assert all(
+        actual >= expected * 0.8 for actual, expected in zip(intervals, [0.01, 0.02, 0.04, 0.06, 0.06, 0.06, 0.06])
+    )
+    deadline = time.monotonic() + 1
+    while reporter._failure_delay_seconds != 0.01 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert reporter._failure_delay_seconds == 0.01
+    reporter.close(timeout=1)
 
 
 def test_blocked_storage_keeps_a_bounded_latest_slot(tmp_path, monkeypatch):

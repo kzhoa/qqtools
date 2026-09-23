@@ -1,6 +1,6 @@
 """Pure adapter/TTY tests; no training, GPU, or external services required."""
 
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -168,6 +168,50 @@ def test_fact_adapter_preserves_training_and_loader_local_evaluation(monkeypatch
         EpochCommittedFact(completed_epoch=3, next_epoch=4, global_step=7340, epoch_metrics={})
     )
     assert sink.updates[-1]["message"] == "Epoch 4/10 completed"
+
+
+def test_selected_adapter_emits_only_already_computed_cpu_metrics(monkeypatch):
+    monkeypatch.setenv("QEXP_PROGRESS_V2_PATH", "/unused-v2")
+    sink = Sink()
+    monkeypatch.setattr(progress_api, "_offer_managed_progress", sink.offer)
+    observer = _observer(monkeypatch)
+    callbacks = dict(observer.subscriptions)
+    assert "progress_tick" not in callbacks
+    callbacks["train_boundary"](
+        TrainBoundaryCommittedFact(
+            global_step=2,
+            epoch=0,
+            batch_index=1,
+            total_batches=10,
+            did_optimizer_step=True,
+            batch_metrics=MappingProxyType({"loss": 0.25}),
+            lr=0.001,
+        )
+    )
+    assert sink.updates[-1]["metrics"] == {"loss": 0.25, "lr": 0.001}
+    assert sink.updates[-1]["_metrics_source_count"] == 2
+    assert sink.updates[-1]["current"] == 2
+
+
+def test_selected_adapter_preserves_bounded_source_omission_count(monkeypatch):
+    monkeypatch.setenv("QEXP_PROGRESS_V2_PATH", "/unused-v2")
+    sink = Sink()
+    monkeypatch.setattr(progress_api, "_offer_managed_progress", sink.offer)
+    observer = _observer(monkeypatch)
+    metrics = MappingProxyType({f"metric_{index}": index for index in range(33)})
+    dict(observer.subscriptions)["train_boundary"](
+        TrainBoundaryCommittedFact(
+            global_step=2,
+            epoch=0,
+            batch_index=1,
+            total_batches=10,
+            did_optimizer_step=True,
+            batch_metrics=metrics,
+            lr=None,
+        )
+    )
+    assert len(sink.updates[-1]["metrics"]) == 32
+    assert sink.updates[-1]["_metrics_source_count"] == 33
 
 
 def test_empty_evaluation_and_unmatched_start_fallback(monkeypatch):

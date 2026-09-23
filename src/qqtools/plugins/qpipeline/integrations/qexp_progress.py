@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
+from itertools import islice
+from types import MappingProxyType
 from typing import Any
 
 from ..runner.contracts import (
@@ -18,6 +21,23 @@ from ..runner.observation_plugins import ObservationContext
 from ..types import Stage
 
 _MAX_PROGRESS_INTEGER = 2**63 - 1
+_MAX_PROGRESS_METRICS = 32
+
+
+def _progress_metrics(metrics: object, learning_rate: object = None) -> tuple[dict[object, object], int]:
+    """Copy bounded committed facts, retaining their original omission count."""
+    copied: dict[object, object] = {}
+    source_count = 0
+    if type(metrics) in (dict, MappingProxyType):
+        source_count = len(metrics)
+        copied.update(islice(metrics.items(), _MAX_PROGRESS_METRICS))
+
+    if len(copied) < _MAX_PROGRESS_METRICS:
+        if type(learning_rate) is int or (type(learning_rate) is float and math.isfinite(learning_rate)):
+            if "lr" not in copied:
+                copied["lr"] = learning_rate
+                source_count += 1
+    return copied, source_count
 
 
 def _as_int(value: object) -> int | None:
@@ -160,6 +180,7 @@ class QexpProgressObserver:
 
     def __init__(self, progress_api: Any, context: ObservationContext) -> None:
         self._progress_api = progress_api
+        self._has_v2_channel = bool(os.environ.get("QEXP_PROGRESS_V2_PATH"))
         self._max_epochs = _as_int(context.max_epochs)
         self._max_steps = _as_int(context.max_steps)
         self._training_context: _TrainingContext | None = None
@@ -183,10 +204,15 @@ class QexpProgressObserver:
             context.total_batches,
         )
 
-    def _emit_training(self) -> None:
+    def _emit_training(
+        self, metrics: dict[object, object] | None = None, metrics_source_count: int | None = None
+    ) -> None:
         context = self._training_context
         if context is None:
             return
+        metrics_kwargs = (
+            {"metrics": metrics, "_metrics_source_count": metrics_source_count} if self._has_v2_channel else {}
+        )
         self._progress_api._offer_managed_progress(
             stage="train",
             current=context.global_step,
@@ -194,6 +220,7 @@ class QexpProgressObserver:
             unit="step",
             message_parts=self._training_parts(context),
             render_message=_render_message,
+            **metrics_kwargs,
         )
 
     def _evaluation_parts(self, context: _EvaluationContext) -> tuple[str | int | None, ...]:
@@ -238,17 +265,19 @@ class QexpProgressObserver:
     def on_train_boundary(self, fact: object) -> None:
         if type(fact) is not TrainBoundaryCommittedFact:
             return
+        metrics, source_count = _progress_metrics(fact.batch_metrics, fact.lr) if self._has_v2_channel else (None, None)
         self._training_context = _TrainingContext(
             epoch=_as_position(fact.epoch),
             global_step=_as_int(fact.global_step),
             batch_index=_as_position(fact.batch_index),
             total_batches=_as_int(fact.total_batches),
         )
-        self._emit_training()
+        self._emit_training(metrics=metrics, metrics_source_count=source_count)
 
     def on_epoch_committed(self, fact: object) -> None:
         if type(fact) is not EpochCommittedFact:
             return
+        metrics, source_count = _progress_metrics(fact.epoch_metrics) if self._has_v2_channel else (None, None)
         completed_epoch = _as_position(fact.completed_epoch)
         if completed_epoch is None and self._training_context is not None:
             completed_epoch = self._training_context.epoch
@@ -262,7 +291,7 @@ class QexpProgressObserver:
             total_batches=None,
             is_completed=True,
         )
-        self._emit_training()
+        self._emit_training(metrics=metrics, metrics_source_count=source_count)
 
     def on_evaluation_started(self, fact: object) -> None:
         if type(fact) is not EvaluationStartedFact:

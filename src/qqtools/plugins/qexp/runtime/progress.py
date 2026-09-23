@@ -507,7 +507,14 @@ class ProgressProjector:
             _local_path(self.cfg, "progress-contexts", attempt_id).unlink(missing_ok=True)
         except OSError:
             pass
-        shutil.rmtree(local_progress_path(self.cfg.runtime_root, attempt_id).parent, ignore_errors=True)
+        mailbox = local_progress_path(self.cfg.runtime_root, attempt_id)
+        try:
+            mailbox.unlink(missing_ok=True)
+            mailbox.parent.rmdir()
+        except OSError:
+            # A selected Attempt may still have a v2 mailbox in this directory.
+            # Final Task cleanup owns removal of the whole local mailbox tree.
+            pass
         for directory in ("progress-observed", "progress-diagnostics"):
             try:
                 _local_path(self.cfg, directory, attempt_id).unlink(missing_ok=True)

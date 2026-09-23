@@ -6,7 +6,7 @@ import shlex
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from ...progress_format import format_progress_details
+from ...progress_format import format_progress_compact, format_progress_details, select_progress_observation
 from .core import OutputContract, OutputKind
 from .primitives import (
     _details,
@@ -95,7 +95,26 @@ def _render_task_page(result: Mapping[str, Any], presentation: Mapping[str, obje
     return "\n".join(lines)
 
 
-def _render_task_show(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+def _task_progress(result: Mapping[str, Any]) -> tuple[Mapping[str, Any] | None, int | None]:
+    """Resolve the whole progress candidate shared by one-shot and watch output."""
+    progress = result.get("progress")
+    progress_extended = result.get("progress_extended")
+    selected_version = result.get("selected_progress_version")
+    if "selected_progress_version" not in result:
+        selected_version = 1 if isinstance(progress, Mapping) and progress.get("status") == "available" else None
+    if type(selected_version) is not int:
+        selected_version = None
+    return (
+        select_progress_observation(
+            progress if isinstance(progress, Mapping) else None,
+            progress_extended if isinstance(progress_extended, Mapping) else None,
+            selected_version,
+        ),
+        selected_version,
+    )
+
+
+def _render_task_show(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
     task = result.get("task", result)
     spec = task.get("spec", {})
     placement = task.get("placement_policy", {})
@@ -128,6 +147,18 @@ def _render_task_show(result: Mapping[str, Any], _presentation: Mapping[str, obj
             default={},
         )
     terminal = state.get("projection") in {"succeeded", "failed", "cancelled"}
+    progress_observation, progress_version = _task_progress(result)
+    if presentation.get("details"):
+        progress_fields = format_progress_details(
+            progress_observation,
+            progress_version=progress_version,
+            include_metrics=True,
+        )
+    else:
+        progress_fields = format_progress_compact(
+            progress_observation,
+            progress_version=progress_version,
+        )
     return _details(
         (
             ("Task ID", task.get("task_id")),
@@ -152,11 +183,11 @@ def _render_task_show(result: Mapping[str, Any], _presentation: Mapping[str, obj
             ("Dependency gate", result.get("dependency_gate")),
             ("Exit code", current_attempt.get("exit_code") if terminal else None),
         ),
-        format_progress_details(result.get("progress")),
+        progress_fields,
     )
 
 
-def _render_task_watch(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+def _render_task_watch(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
     """Render one compact current Task frame without performing reads."""
     attempt = result.get("selected_attempt")
     attempt_values = (
@@ -173,6 +204,18 @@ def _render_task_watch(result: Mapping[str, Any], _presentation: Mapping[str, ob
     observation_reason = result.get("observation_reason")
     if observation_reason is not None:
         observation = f"{observation} ({observation_reason})"
+    progress_observation, progress_version = _task_progress(result)
+    if presentation.get("details"):
+        progress_fields = format_progress_details(
+            progress_observation,
+            progress_version=progress_version,
+            include_metrics=True,
+        )
+    else:
+        progress_fields = format_progress_compact(
+            progress_observation,
+            progress_version=progress_version,
+        )
     return _details(
         (
             ("Task ID", result.get("task_id")),
@@ -182,7 +225,7 @@ def _render_task_watch(result: Mapping[str, Any], _presentation: Mapping[str, ob
         ),
         attempt_values,
         (("Observation", observation),),
-        format_progress_details(result.get("progress")),
+        progress_fields,
     )
 
 
@@ -316,6 +359,13 @@ def _validate_task_show(result: Any) -> None:
     _required(control, "cancellation_operation_id", "task-show payload.task.control")
     _required_mapping(value, "dependency_gate", "task-show payload")
     _required_mapping(value, "progress", "task-show payload")
+    if "progress_extended" in value:
+        _mapping(value["progress_extended"], "task-show payload.progress_extended")
+    selected_progress_version = value.get("selected_progress_version")
+    if selected_progress_version is not None and (
+        type(selected_progress_version) is not int or selected_progress_version not in {1, 2}
+    ):
+        raise ValueError("task-show payload.selected_progress_version must be 1, 2, or null")
     observation = _required_mapping(value, "observation", "task-show payload")
     override = _required(observation, "tmux_override", "task-show payload.observation")
     if override not in {"enabled", "disabled", "inherit"}:
@@ -336,6 +386,13 @@ def _validate_task_watch(result: Any) -> None:
     _required(value, "revision", "task-watch payload")
     _required_bool(value, "terminal", "task-watch payload")
     _required_mapping(value, "progress", "task-watch payload")
+    if "progress_extended" in value:
+        _mapping(value["progress_extended"], "task-watch payload.progress_extended")
+    selected_progress_version = value.get("selected_progress_version")
+    if selected_progress_version is not None and (
+        type(selected_progress_version) is not int or selected_progress_version not in {1, 2}
+    ):
+        raise ValueError("task-watch payload.selected_progress_version must be 1, 2, or null")
     attempt = _required(value, "selected_attempt", "task-watch payload")
     if attempt is not None:
         attempt_value = _mapping(attempt, "task-watch payload.selected_attempt")

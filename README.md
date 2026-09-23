@@ -436,6 +436,15 @@ qexp task show TASK_ID --watch
 qexp task logs TASK_ID --follow
 ```
 
+For a new Task, enable the independent progress viewer and metric snapshots with
+`qexp submit --live-progress -- python entry.py --config configs/train.yaml`.
+Use `qexp task show TASK_ID --details` for all reported metrics, or add
+`--watch` for a refreshing detailed view. To make this the default for future
+submissions to a Group, run `qexp group config set GROUP progress --live-progress`.
+Applications outside qpipeline can report already-computed numeric metrics with
+`qqtools.qexp.progress.update(stage="train", current=step, metrics={"loss": loss_value})`.
+These reports are advisory and do not change training output or control.
+
 ```text
 Progress status: available
 Stage: validation

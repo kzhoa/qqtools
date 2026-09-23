@@ -116,11 +116,17 @@ def test_executor_uses_tmux_when_available(tmp_path: Path, monkeypatch):
         tmux_available=lambda: True,
         spawn_runner=spawn_runner,
         observer_decision=lambda _cfg, _task_id: {"enabled": True, "source": "task_override"},
+        find_observer_window=lambda *_args: None,
+        mark_observer_window=lambda *_args: True,
     )
 
     result = executor.launch_attempt(_cfg(tmp_path), "task-1", _attempt())
 
-    assert result == "@7"
+    assert result == "pid:4321"
+    deadline = time.monotonic() + 1
+    while not created and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert created
     assert created[0][:3] == ("task-1", "experiments", str(tmp_path))
     assert "tail" in created[0][3]
     assert "--pid=4321" in created[0][3]
@@ -161,6 +167,9 @@ def test_executor_falls_back_to_detached_runner_without_tmux(tmp_path: Path, mon
     assert spawned[0]["cwd"] == str(cfg.project_root)
     assert spawned[0]["env"]["QEXP_CURRENT_AGENT_ENV"] == "detached-current"
     assert spawned[0]["start_new_session"] is True
+    deadline = time.monotonic() + 1
+    while not diagnostics and time.monotonic() < deadline:
+        time.sleep(0.001)
     assert diagnostics == ["tmux launch observer unavailable: tmux/libtmux unavailable"]
 
 
@@ -197,6 +206,8 @@ def test_observer_decision_is_resolved_per_task_without_executor_cache(tmp_path:
         create_window=lambda task_id, *_args: windows.append(task_id) or f"@{len(windows)}",
         tmux_available=lambda: probes.append(None) or True,
         observer_decision=lambda _cfg, task_id: {"enabled": decisions[task_id], "source": "task_override"},
+        find_observer_window=lambda *_args: None,
+        mark_observer_window=lambda *_args: True,
     )
 
     executor.attach_observer(
@@ -212,6 +223,9 @@ def test_observer_decision_is_resolved_per_task_without_executor_cache(tmp_path:
         LaunchHandle("detached", _FakeProcess(1002), runner_process=_FakeProcess(1002)),
     )
 
+    deadline = time.monotonic() + 1
+    while not windows and time.monotonic() < deadline:
+        time.sleep(0.001)
     assert windows == ["visible"]
     assert len(probes) == 1
 

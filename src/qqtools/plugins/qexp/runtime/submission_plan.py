@@ -13,9 +13,18 @@ from typing import Any, Mapping
 
 from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_task_dependencies_root
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
+from ..task_live_progress import (
+    build_live_progress_selection,
+    disabled_live_progress_selection,
+    validate_live_progress_request,
+    validate_live_progress_selection,
+    warn_invalid_live_progress_selection,
+    warn_live_progress_policy_unavailable,
+)
 from ..task_observation import build_task_observation, decode_task_observation, validate_tmux_override
 from .dependencies import normalize_dependency_ids
 from .group_namespace import read_group, read_group_raw
+from .group_observation_policy import group_identity
 from .locks import group_lock
 from .paths import group_path, machine_path
 from .ready.group_members import assert_group_ready_members_writable
@@ -103,6 +112,11 @@ def _canonical_specs(specs: list[Mapping[str, Any]]) -> tuple[Mapping[str, Any],
         item = dict(raw)
         item["home_machine"] = item.get("home_machine", "current")
         item["tmux_override"] = validate_tmux_override(item.get("tmux_override"))
+        live_progress = validate_live_progress_request(item.get("live_progress"))
+        if live_progress is None:
+            item.pop("live_progress", None)
+        else:
+            item["live_progress"] = live_progress
         canonical.append(_freeze(item))
     return tuple(canonical)
 
@@ -423,6 +437,7 @@ class SubmissionPlan:
     planned_worker_set: tuple[str, ...]
     worker_set_additions: Mapping[str, Mapping[str, Any]]
     worker_set_declared: bool = False
+    live_progress_selection: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_ids", tuple(self.task_ids))
@@ -435,6 +450,12 @@ class SubmissionPlan:
         object.__setattr__(self, "planned_worker_set", tuple(self.planned_worker_set))
         object.__setattr__(self, "worker_set_additions", _freeze(self.worker_set_additions))
         object.__setattr__(self, "worker_set_declared", bool(self.worker_set_declared))
+        selection = self.live_progress_selection
+        if selection is None:
+            selection = disabled_live_progress_selection(self.task_ids)
+        else:
+            selection = validate_live_progress_selection(_thaw(selection), self.task_ids, group_name=self.target_group)
+        object.__setattr__(self, "live_progress_selection", _freeze(selection))
 
     @property
     def idempotency_key(self) -> str:
@@ -484,6 +505,7 @@ def _resolve_submission_plan(
     allocate_task_ids: bool,
     persist_clock_evidence: bool,
     acquire_group_lock: bool = True,
+    policy_snapshot: Mapping[str, Any] | None = None,
 ) -> SubmissionPlan:
     """Resolve a plan using only caller-selected read/write side effects."""
     if not isinstance(request, SubmissionRequest):
@@ -539,6 +561,91 @@ def _resolve_submission_plan(
         worker_additions = {}
         _validate_placement_against_workers(resolved, group_name=None, planned_workers={submitting_machine: {}})
 
+    live_progress_entries: list[dict[str, Any]] = []
+    policy_diagnostic: str | None = None
+    for item, raw_spec in zip(resolved, request.specs, strict=True):
+        requested = validate_live_progress_request(raw_spec.get("live_progress"))
+        if requested is not None:
+            live_progress_entries.append(
+                {
+                    "task_id": item["task_id"],
+                    "requested": requested,
+                    "enabled": requested,
+                    "source": "explicit",
+                    "group_policy": None,
+                }
+            )
+            continue
+
+        if not request.group_name or group is None:
+            source = "default"
+            enabled = False
+            group_policy = None
+        elif not isinstance(policy_snapshot, Mapping):
+            source = "unavailable"
+            enabled = False
+            group_policy = None
+            policy_diagnostic = "Group policy snapshot was not provided"
+        else:
+            snapshot_status = policy_snapshot.get("status")
+            if snapshot_status == "missing":
+                source = "default"
+                enabled = False
+                group_policy = None
+            elif snapshot_status == "available":
+                record = policy_snapshot.get("record")
+                try:
+                    if not isinstance(record, Mapping) or set(record) != {
+                        "version",
+                        "revision",
+                        "group_identity",
+                        "live_progress",
+                    }:
+                        raise ValueError("Group live-progress policy snapshot is malformed")
+                    if type(record["version"]) is not int or record["version"] != 1:
+                        raise ValueError("Group live-progress policy snapshot version is unsupported")
+                    identity = record["group_identity"]
+                    revision = record["revision"]
+                    policy_enabled = record["live_progress"]
+                    current_identity = group_identity(group)
+                    if not isinstance(identity, Mapping) or dict(identity) != current_identity:
+                        raise ValueError("Group live-progress policy identity does not match the resolved Group")
+                    if (
+                        type(revision) is not int
+                        or not 1 <= revision <= (1 << 63) - 1
+                        or type(policy_enabled) is not bool
+                    ):
+                        raise ValueError("Group live-progress policy snapshot is malformed")
+                except (TypeError, ValueError) as exc:
+                    source = "unavailable"
+                    enabled = False
+                    group_policy = None
+                    policy_diagnostic = str(exc)
+                else:
+                    source = "group"
+                    enabled = policy_enabled
+                    group_policy = {"group_identity": current_identity, "revision": revision}
+            else:
+                source = "unavailable"
+                enabled = False
+                group_policy = None
+                reason = policy_snapshot.get("reason")
+                policy_diagnostic = reason if isinstance(reason, str) and reason else "Group policy read failed"
+
+        live_progress_entries.append(
+            {
+                "task_id": item["task_id"],
+                "requested": None,
+                "enabled": enabled,
+                "source": source,
+                "group_policy": group_policy,
+            }
+        )
+
+    if policy_diagnostic is not None:
+        warn_live_progress_policy_unavailable(policy_diagnostic)
+    live_progress_selection = build_live_progress_selection(live_progress_entries, group_name=request.group_name)
+
     if any(item["offer_after_seconds"] is not None for item in resolved):
         capability = clock_capability(cfg)
         if not capability.is_healthy or capability.observation is None:
@@ -567,6 +674,7 @@ def _resolve_submission_plan(
         planned_worker_set=tuple(sorted(planned_workers)),
         worker_set_additions=worker_additions,
         worker_set_declared=request.worker_set_declared,
+        live_progress_selection=live_progress_selection,
     )
     context = _resolved_context(plan)
     return SubmissionPlan(
@@ -585,10 +693,17 @@ def _resolve_submission_plan(
         planned_worker_set=plan.planned_worker_set,
         worker_set_additions=plan.worker_set_additions,
         worker_set_declared=plan.worker_set_declared,
+        live_progress_selection=plan.live_progress_selection,
     )
 
 
-def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency_key: str) -> SubmissionPlan:
+def prepare_submission_plan(
+    cfg: Any,
+    request: SubmissionRequest,
+    *,
+    idempotency_key: str,
+    policy_snapshot: Mapping[str, Any] | None = None,
+) -> SubmissionPlan:
     """Resolve one new submission while the submission fence is held."""
     return _resolve_submission_plan(
         cfg,
@@ -597,6 +712,7 @@ def prepare_submission_plan(cfg: Any, request: SubmissionRequest, *, idempotency
         operation_id=new_id(),
         allocate_task_ids=True,
         persist_clock_evidence=True,
+        policy_snapshot=policy_snapshot,
     )
 
 
@@ -622,6 +738,7 @@ def encode_submission_plan(plan: SubmissionPlan) -> dict[str, Any]:
     if operation["submission"]["resolved_context_digest"] != plan.resolved_context_digest:
         raise RuntimeError("encoded submission plan resolved context digest is inconsistent.")
     operation["task_observation"] = build_task_observation(plan.task_ids, plan.tmux_overrides)
+    operation["live_progress_selection"] = _thaw(plan.live_progress_selection)
     return _thaw(operation)
 
 
@@ -850,6 +967,17 @@ def decode_submission_plan(operation: Mapping[str, Any]) -> SubmissionPlan:
             raise RuntimeError("submission task_observation metadata is invalid.") from exc
         tmux_overrides = tuple(item["tmux_override"] for item in decoded_metadata["tasks"])
 
+    if "live_progress_selection" not in operation:
+        live_progress_selection = disabled_live_progress_selection(task_ids)
+    else:
+        try:
+            live_progress_selection = validate_live_progress_selection(
+                operation["live_progress_selection"], task_ids, group_name=target_group
+            )
+        except Exception as exc:
+            warn_invalid_live_progress_selection(exc)
+            live_progress_selection = disabled_live_progress_selection(task_ids)
+
     create_group = context["create_group"]
     if type(create_group) is not bool:
         raise ValueError("submission create_group must be a boolean.")
@@ -925,4 +1053,5 @@ def decode_submission_plan(operation: Mapping[str, Any]) -> SubmissionPlan:
         planned_worker_set=tuple(planned_workers),
         worker_set_additions=additions,
         worker_set_declared=worker_set_declared,
+        live_progress_selection=live_progress_selection,
     )

@@ -22,6 +22,7 @@ from .runtime.paths import (
 )
 from .runtime.progress import inspect_progress
 from .runtime.progress_types import ProgressObservation
+from .runtime.progress_v2 import inspect_progress_v2
 from .runtime.records import AttemptRecord, TaskRecord, normalize_group_record
 from .runtime.resources.reservations import reservation_snapshot
 from .runtime.store import iter_json, read_json
@@ -68,6 +69,11 @@ def _unavailable_current_view(task: TaskRecord, reason: str) -> dict[str, Any]:
         "observation_state": "unavailable",
         "reason": "identity_mismatch",
     }
+    progress_extended = {
+        "status": "unavailable",
+        "observation_state": "unavailable",
+        "reason": "identity_mismatch",
+    }
     return {
         "task_id": task.task_id,
         "name": task.name,
@@ -79,7 +85,88 @@ def _unavailable_current_view(task: TaskRecord, reason: str) -> dict[str, Any]:
         "observation_reason": reason,
         "selected_attempt": None,
         "progress": progress,
+        "progress_extended": progress_extended,
+        "selected_progress_version": None,
     }
+
+
+def _reported_at(
+    observation: Any,
+    *,
+    protocol_version: int,
+    attempt_id: str | None,
+    attempt_number: int | None,
+) -> datetime | None:
+    """Parse a validated candidate timestamp for whole-observation selection."""
+    if (
+        not isinstance(observation, dict)
+        or observation.get("status") != "available"
+        or type(observation.get("protocol_version")) is not int
+        or observation["protocol_version"] != protocol_version
+        or (attempt_id is not None and observation.get("attempt_id") != attempt_id)
+        or (
+            attempt_number is not None
+            and (type(observation.get("attempt_number")) is not int or observation["attempt_number"] != attempt_number)
+        )
+    ):
+        return None
+    stamp = observation.get("reported_at")
+    if not isinstance(stamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if parsed.utcoffset() is None:
+            return None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    return parsed
+
+
+def _selected_progress_version(
+    progress: Any,
+    progress_extended: Any,
+    *,
+    attempt_id: str | None = None,
+    attempt_number: int | None = None,
+) -> int | None:
+    """Select the newest valid whole candidate, preferring v2 when report times tie."""
+    progress_at = _reported_at(
+        progress,
+        protocol_version=1,
+        attempt_id=attempt_id,
+        attempt_number=attempt_number,
+    )
+    extended_at = _reported_at(
+        progress_extended,
+        protocol_version=2,
+        attempt_id=attempt_id,
+        attempt_number=attempt_number,
+    )
+    if progress_at is None:
+        return 2 if extended_at is not None else None
+    if extended_at is None:
+        return 1
+    return 2 if extended_at >= progress_at else 1
+
+
+def _inspect_progress_candidates(
+    cfg: RootConfig,
+    task: TaskRecord,
+    *,
+    attempt: AttemptRecord | None = None,
+) -> tuple[ProgressObservation, dict[str, Any], int | None]:
+    """Read each protocol independently, then select one complete observation."""
+    progress: ProgressObservation = inspect_progress(cfg, task)
+    progress_extended = inspect_progress_v2(cfg, task)
+    selected_version = _selected_progress_version(
+        progress,
+        progress_extended,
+        attempt_id=attempt.attempt_id if attempt is not None else task.attempt_control.get("current_attempt_id"),
+        attempt_number=attempt.attempt_number
+        if attempt is not None
+        else task.attempt_control.get("current_attempt_number"),
+    )
+    return progress, progress_extended, selected_version
 
 
 def _read_current_attempt(cfg: RootConfig, task: TaskRecord) -> tuple[AttemptRecord | None, str | None]:
@@ -199,8 +286,15 @@ def inspect_current_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
                 "observation_state": "unavailable",
                 "reason": "identity_mismatch",
             }
+            progress_extended = {
+                "status": "unavailable",
+                "observation_state": "unavailable",
+                "reason": "identity_mismatch",
+            }
+            selected_version = None
         else:
-            progress = inspect_progress(cfg, latest_task)
+            progress, progress_extended, selected_version = _inspect_progress_candidates(cfg, latest_task)
+        observation = progress_extended if selected_version == 2 else progress
         return {
             "task_id": latest_task.task_id,
             "name": latest_task.name,
@@ -208,14 +302,17 @@ def inspect_current_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
             "reason": latest_task.state.get("reason"),
             "revision": latest_task.meta.get("revision"),
             "terminal": latest_task.state["projection"] in _TERMINAL_PHASES,
-            "observation_state": progress["observation_state"],
-            "observation_reason": progress.get("reason"),
+            "observation_state": observation["observation_state"],
+            "observation_reason": observation.get("reason"),
             "selected_attempt": None,
             "progress": progress,
+            "progress_extended": progress_extended,
+            "selected_progress_version": selected_version,
         }
 
     selected = _selected_attempt_view(cfg, latest_task, attempt)
-    progress = inspect_progress(cfg, latest_task)
+    progress, progress_extended, selected_version = _inspect_progress_candidates(cfg, latest_task, attempt=attempt)
+    observation = progress_extended if selected_version == 2 else progress
     return {
         "task_id": latest_task.task_id,
         "name": latest_task.name,
@@ -223,10 +320,12 @@ def inspect_current_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
         "reason": latest_task.state.get("reason"),
         "revision": latest_task.meta.get("revision"),
         "terminal": latest_task.state["projection"] in _TERMINAL_PHASES,
-        "observation_state": progress["observation_state"],
-        "observation_reason": progress.get("reason"),
+        "observation_state": observation["observation_state"],
+        "observation_reason": observation.get("reason"),
         "selected_attempt": selected,
         "progress": progress,
+        "progress_extended": progress_extended,
+        "selected_progress_version": selected_version,
     }
 
 
@@ -289,8 +388,10 @@ def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
     task = load_task(cfg, task_id)
     result = task.to_dict()
     result["observation"] = {"tmux_override": task_tmux_observation_label(cfg, task_id)}
-    progress: ProgressObservation = inspect_progress(cfg, task)
+    progress, progress_extended, selected_version = _inspect_progress_candidates(cfg, task)
     result["progress"] = progress
+    result["progress_extended"] = progress_extended
+    result["selected_progress_version"] = selected_version
     gate = dependency_gate(cfg, task)
     result["dependency_gate"] = {"state": gate.state, "reasons": list(gate.reasons)}
     attempts_dir = shared_paths(cfg.shared_root)["attempts"] / task_id

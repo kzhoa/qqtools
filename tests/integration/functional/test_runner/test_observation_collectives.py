@@ -26,7 +26,7 @@ from .conftest import SimpleModel, SimpleTask
 pytestmark = pytest.mark.integration
 
 
-def _rank_run(rank: int, directory: str) -> None:
+def _rank_run(rank: int, directory: str, modes: tuple[str, ...]) -> None:
     root = Path(directory)
     dist.init_process_group(
         "gloo",
@@ -53,8 +53,9 @@ def _rank_run(rank: int, directory: str) -> None:
         task = SimpleTask(num_samples=256)
         outcomes = {}
         for with_builtins in (False, True):
-            for mode in ("disabled", "qexp", "factory_failure", "callback_failure"):
+            for mode in modes:
                 torch.manual_seed(1234 + rank)
+                os.environ.pop("QEXP_PROGRESS_V2_PATH", None)
                 model = SimpleModel()
                 calls.clear()
                 observers = ObserverBindings()
@@ -68,8 +69,10 @@ def _rank_run(rank: int, directory: str) -> None:
                     observers.bind("evaluation_started", tracker.on_eval_start)
                     observers.bind("evaluation_committed", tracker.on_eval_end)
                 if rank == 0 and mode != "disabled":
-                    if mode == "qexp":
+                    if mode in {"qexp", "qexp_v2"}:
                         os.environ["QEXP_PROGRESS_PATH"] = str(root / "progress.json")
+                        if mode == "qexp_v2":
+                            os.environ["QEXP_PROGRESS_V2_PATH"] = str(root / "progress-v2.json")
                         factories = (qexp_progress_factory,)
                     elif mode == "factory_failure":
 
@@ -124,10 +127,20 @@ def _rank_run(rank: int, directory: str) -> None:
         dist.destroy_process_group()
 
 
-def test_rank_zero_connector_and_failures_preserve_collective_path(tmp_path):
+@pytest.mark.parametrize(
+    "modes",
+    [
+        ("disabled", "qexp", "factory_failure", "callback_failure"),
+        ("disabled", "qexp_v2"),
+    ],
+    ids=("existing-plugins", "qexp-v2"),
+)
+def test_rank_zero_connector_and_failures_preserve_collective_path(tmp_path, modes):
     if not sys.platform.startswith("linux"):
         pytest.skip("gloo process-group regression requires Linux")
-    process_context = mp.start_processes(_rank_run, args=(str(tmp_path),), nprocs=2, join=False, start_method="fork")
+    process_context = mp.start_processes(
+        _rank_run, args=(str(tmp_path), modes), nprocs=2, join=False, start_method="fork"
+    )
     try:
         deadline = time.monotonic() + 90
         while not process_context.join(timeout=1):
@@ -143,6 +156,6 @@ def test_rank_zero_connector_and_failures_preserve_collective_path(tmp_path):
         for with_builtins in (False, True):
             baseline = outcomes[f"{with_builtins}:disabled"]
             assert baseline["calls"], "the baseline must exercise real collectives"
-            for mode in ("qexp", "factory_failure", "callback_failure"):
+            for mode in modes:
                 assert outcomes[f"{with_builtins}:{mode}"]["calls"] == baseline["calls"]
                 assert outcomes[f"{with_builtins}:{mode}"]["metrics"] == baseline["metrics"]

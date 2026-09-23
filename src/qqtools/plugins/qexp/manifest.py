@@ -17,7 +17,14 @@ from .task_observation import validate_tmux_override
 
 _ROOT_KEYS = {"group", "defaults", "tasks"}
 _GROUP_KEYS = {"name", "workers"}
-_DEFAULTS_KEYS = {"requested_gpus", "requested_cpus", "working_directory", "placement", "tmux"}
+_DEFAULTS_KEYS = {
+    "requested_gpus",
+    "requested_cpus",
+    "working_directory",
+    "placement",
+    "tmux",
+    "live_progress",
+}
 _TASK_KEYS = {
     "task_id",
     "name",
@@ -31,6 +38,7 @@ _TASK_KEYS = {
     "offer_after_seconds",
     "depends_on_task_ids",
     "tmux",
+    "live_progress",
 }
 _PLACEMENT_KEYS = {"home_machine", "sharing"}
 _SHARING_KEYS = {"mode", "fallback_machines", "offer"}
@@ -153,6 +161,13 @@ def _offer_after(value: Any, path: str) -> int | None:
 def _tmux(value: Any, path: str) -> bool | None:
     """Validate a manifest tmux value without accepting YAML number/string coercion."""
     return validate_tmux_override(value, path)
+
+
+def _live_progress(value: Any, path: str) -> bool | None:
+    """Validate an optional manifest live-progress choice without coercion."""
+    if value is None or type(value) is bool:
+        return value
+    raise ValueError(f"{path} must be a boolean or null.")
 
 
 def _depends_on(value: Any, path: str) -> list[str]:
@@ -347,6 +362,7 @@ def parse_submission_manifest(
     *,
     group_name: str | None | object = UNSET,
     tmux_override: bool | None | object = UNSET,
+    live_progress_override: bool | None | object = UNSET,
     requested_gpus: int | None | object = UNSET,
     requested_cpus: int | None | object = UNSET,
     home_machine: str | None | object = UNSET,
@@ -368,6 +384,10 @@ def parse_submission_manifest(
         manifest_path = invocation_cwd / manifest_path
     manifest_path = manifest_path.resolve()
     tmux_value = validate_tmux_override(None if tmux_override is UNSET else tmux_override, "tmux_override")
+    live_progress_value = _live_progress(
+        None if live_progress_override is UNSET else live_progress_override,
+        "live_progress_override",
+    )
     for label, value in (("requested_gpus", requested_gpus), ("requested_cpus", requested_cpus)):
         if value is not UNSET and value is not None and (type(value) is not int or value < 0):
             if label == "requested_cpus" and type(value) is int and value >= 1:
@@ -418,6 +438,9 @@ def parse_submission_manifest(
     )
     _validate_group_placement(default_placement, "defaults.placement")
     default_tmux = _tmux(defaults.get("tmux"), "defaults.tmux") if "tmux" in defaults else None
+    default_live_progress = None
+    if "live_progress" in defaults:
+        default_live_progress = _live_progress(defaults["live_progress"], "defaults.live_progress")
     if "requested_gpus" in defaults:
         default_gpus = _requested_gpus(defaults["requested_gpus"], "defaults.requested_gpus")
     else:
@@ -447,6 +470,11 @@ def parse_submission_manifest(
         _validate_group_placement(task_placement, task_path)
         placement = _merge_placement(default_placement, task_placement)
         task_tmux = _tmux(entry.get("tmux"), f"{task_path}.tmux") if "tmux" in entry else None
+        task_live_progress = (
+            _live_progress(entry.get("live_progress"), f"{task_path}.live_progress")
+            if "live_progress" in entry
+            else None
+        )
         if tmux_override is not UNSET:
             effective_tmux, tmux_source = tmux_value, "cli"
         elif task_tmux is not None:
@@ -455,6 +483,14 @@ def parse_submission_manifest(
             effective_tmux, tmux_source = default_tmux, "defaults"
         else:
             effective_tmux, tmux_source = None, "project_policy"
+        if live_progress_value is not None:
+            effective_live_progress, live_progress_source = live_progress_value, "cli"
+        elif task_live_progress is not None:
+            effective_live_progress, live_progress_source = task_live_progress, "task"
+        elif default_live_progress is not None:
+            effective_live_progress, live_progress_source = default_live_progress, "defaults"
+        else:
+            effective_live_progress, live_progress_source = None, "group"
 
         if requested_gpus is not UNSET:
             effective_gpus, gpu_source = requested_gpus, "cli"
@@ -531,6 +567,8 @@ def parse_submission_manifest(
             "fallback_machines": placement.get("fallback_machines", "group"),
             "offer_after_seconds": placement.get("offer_after_seconds"),
         }
+        if effective_live_progress is not None:
+            item["live_progress"] = effective_live_progress
         if "sharing_mode" not in item or item["sharing_mode"] is None:
             raise ValueError(f"{task_path}.placement.sharing.mode cannot be null.")
         _sharing_mode(item["sharing_mode"], f"{task_path}.sharing.mode")
@@ -576,6 +614,7 @@ def parse_submission_manifest(
                 else "builtin",
                 "depends_on_task_ids": "task" if "depends_on_task_ids" in entry else "builtin",
                 "tmux_override": tmux_source,
+                "live_progress": live_progress_source,
             }
         )
     return ManifestNormalization(
@@ -609,6 +648,7 @@ def normalize_command_submission(
     offer_after_seconds: int | None = None,
     depends_on_task_ids: list[str] | None = None,
     tmux_override: bool | None = None,
+    live_progress_override: bool | None = None,
     invocation_cwd: Path | None = None,
     project_directory: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
@@ -627,6 +667,7 @@ def normalize_command_submission(
     validate_group_name(group)
     _requested_gpus(requested_gpus, "requested_gpus")
     _requested_cpus(requested_cpus, "requested_cpus")
+    live_progress_value = _live_progress(live_progress_override, "live_progress_override")
     item = {
         "task_id": task_id,
         "name": name,
@@ -641,6 +682,8 @@ def normalize_command_submission(
         "depends_on_task_ids": _depends_on(depends_on_task_ids or [], "depends_on_task_ids"),
         "tmux_override": _tmux(tmux_override, "tmux_override"),
     }
+    if live_progress_value is not None:
+        item["live_progress"] = live_progress_value
     _validate_effective_placement(item, "command placement")
     _validate_lane(item, 0)
     return item, {
@@ -656,6 +699,7 @@ def normalize_command_submission(
         "offer_after_seconds": "cli" if offer_after_seconds is not None else "builtin",
         "depends_on_task_ids": "cli" if depends_on_task_ids else "builtin",
         "tmux_override": "cli" if tmux_override is not None else "project_policy",
+        "live_progress": "cli" if live_progress_value is not None else "group",
     }
 
 

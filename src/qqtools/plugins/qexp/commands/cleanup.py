@@ -25,6 +25,7 @@ from ..runtime.operation_store import (
 )
 from ..runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
 from ..runtime.progress import cleanup_local_progress, cleanup_shared_progress
+from ..runtime.progress_v2 import cleanup_local_progress_v2, cleanup_shared_progress_v2
 from ..runtime.ready import assert_ready_writer_compatible, retire_current_ready_generation
 from ..runtime.records import SCHEMA_VERSION, AttemptRecord, TaskRecord, new_id, utc_now
 from ..runtime.responsibility import responsibility_root
@@ -274,6 +275,7 @@ def _cleanup_local_resources_guarded(
     for log_path in sorted((cfg.runtime_root / "logs").glob(f"{task_id}-*.log")):
         log_path.unlink(missing_ok=True)
         removed.append(str(log_path))
+    removed.extend(cleanup_local_progress_v2(cfg, task_id, attempt_ids))
     removed.extend(cleanup_local_progress(cfg, task_id, attempt_ids))
     return removed, []
 
@@ -374,6 +376,7 @@ def _finalize_cleanup_operation(cfg: RootConfig, operation: dict[str, Any]) -> l
             shutil.rmtree(logs_dir)
             removed.append(str(logs_dir))
         removed.extend(cleanup_shared_progress(cfg, task_id))
+        removed.extend(cleanup_shared_progress_v2(cfg, task_id))
         write_event(
             cfg,
             "task_cleaned",

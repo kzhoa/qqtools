@@ -27,6 +27,7 @@ class OutputKind(str, Enum):
     GROUP_CANCEL = "group-cancel"
     GROUP_WORKER_CHANGE = "group-worker-change"
     GROUP_MACHINES = "group-machines"
+    GROUP_PROGRESS_POLICY = "group-progress-policy"
     MACHINES = "machines"
     AGENT_OPERATION = "agent-operation"
     AGENT_STATUS = "agent-status"

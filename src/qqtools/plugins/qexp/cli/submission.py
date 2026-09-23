@@ -391,6 +391,7 @@ def _prepare_submission_request(
                 offer_after_seconds=args.offer_after_seconds,
                 depends_on_task_ids=[] if args.depends_on is None else args.depends_on,
                 tmux_override=args.tmux_override,
+                live_progress_override=args.live_progress_override,
                 invocation_cwd=invocation_cwd,
                 project_directory=selection.path,
             )
@@ -416,6 +417,15 @@ def _prepare_submission_request(
                 group_name=args.group if args.group is not None else UNSET,
                 tmux_override=(
                     args.tmux_override if _submission_option_supplied(raw_argv, "--tmux", "--no-tmux") else UNSET
+                ),
+                live_progress_override=(
+                    args.live_progress_override
+                    if _submission_option_supplied(
+                        raw_argv,
+                        "--live-progress",
+                        "--no-live-progress",
+                    )
+                    else UNSET
                 ),
                 requested_gpus=args.gpus if _submission_option_supplied(raw_argv, "--gpus") else UNSET,
                 requested_cpus=args.cpus if _submission_option_supplied(raw_argv, "--cpus") else UNSET,

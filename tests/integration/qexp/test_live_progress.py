@@ -57,6 +57,7 @@ def launch(cfg, task, monkeypatch, *, code=0, payload=None, expected_interval="3
         assert kwargs["env"]["QEXP_PROGRESS_PATH"] == str(local_progress_path(cfg.runtime_root, attempt.attempt_id))
         assert kwargs["env"]["QEXP_PROGRESS_INTERVAL_SECONDS"] == expected_interval
         assert "QEXP_PROGRESS_FD" not in kwargs["env"]
+        assert "QEXP_PROGRESS_V2_PATH" not in kwargs["env"]
         if payload is not None:
             replace_advisory_snapshot(Path(kwargs["env"]["QEXP_PROGRESS_PATH"]), payload)
         kwargs["stdout"].write(b"application event\n")
@@ -257,6 +258,8 @@ def test_query_normalizes_optional_payload_fields_and_formatter_keeps_json_canon
         "message": None,
     }
     assert "Progress status: available" in render(CliOutput(OutputKind.TASK_SHOW, view), "human")
+    detailed = render(CliOutput(OutputKind.TASK_SHOW, view, {"details": True}), "human")
+    assert "Metrics: unavailable" in detailed
 
     def fail_if_formatted(*_args, **_kwargs):
         raise AssertionError("JSON rendering invoked human progress formatting")

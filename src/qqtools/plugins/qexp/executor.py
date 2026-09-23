@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -17,9 +18,13 @@ from typing import Any, Callable
 from .config_types import RootConfig
 from .launch_policy import resolve_launch_handoff_policy, validate_launch_handoff_timeout_seconds
 from .layout import shared_attempt_log_path
-from .runtime.paths import local_paths
+from .observer_provisioning import observer_lock, submit_observer_job
+from .runtime.paths import attempt_path, local_paths
 from .runtime.records import AttemptRecord
+from .runtime.store import read_json
+from .runtime.tasks import load_task
 from .runtime.work_budget import diagnostic_span
+from .task_live_progress import read_task_live_progress
 from .task_observation import resolve_task_tmux_observation
 from .tmux import create_window_for_task, is_tmux_launch_available, kill_window, send_command_to_window, window_exists
 
@@ -97,6 +102,97 @@ class LaunchHandoff:
     intent_path: Path
     deadline: float
     handle: LaunchHandle | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ObserverAttachment:
+    """A viewer window for one frozen Task Attempt, created or reused."""
+
+    session_name: str
+    window_id: str
+    task_id: str
+    attempt_id: str
+
+
+def _automatic_observer_attempt_is_current(cfg: RootConfig, task_id: str, attempt_id: str) -> bool | None:
+    """Return an identity check result, or ``None`` when no Task record exists."""
+    try:
+        task = load_task(cfg, task_id)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return False
+    current_attempt_id = task.attempt_control.get("current_attempt_id")
+    current_attempt_number = task.attempt_control.get("current_attempt_number")
+    if current_attempt_id is None or type(current_attempt_number) is not int or current_attempt_number < 1:
+        return False
+    if current_attempt_id != attempt_id:
+        return False
+    try:
+        current_attempt = AttemptRecord.from_dict(
+            read_json(attempt_path(cfg.shared_root, task_id, current_attempt_number))
+        )
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return False
+    return current_attempt.task_id == task_id and current_attempt.attempt_id == attempt_id
+
+
+def _read_frozen_live_progress(cfg: RootConfig, task_id: str, attempt_id: str) -> bool:
+    """Read the frozen choice and retain one bounded Attempt diagnostic if invalid."""
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always", RuntimeWarning)
+        enabled = read_task_live_progress(cfg, task_id)
+    if captured:
+        append_launch_diagnostic(cfg, task_id, attempt_id, str(captured[0].message))
+    return enabled
+
+
+_TMUX_TASK_OPTION = "@qqtools_task_id"
+_TMUX_ATTEMPT_OPTION = "@qqtools_attempt_id"
+
+
+def _tmux_option_value(value: object) -> str | None:
+    """Normalize the small string representation returned by libtmux."""
+    if hasattr(value, "value"):
+        value = value.value
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    return value or None
+
+
+def _find_tmux_observer_window(session_name: str, task_id: str, attempt_id: str) -> str | None:
+    """Find a qexp viewer window tagged with the same Task Attempt."""
+    from .tmux import require_libtmux
+
+    server = require_libtmux().Server()
+    session = server.sessions.get(session_name=session_name, default=None)
+    if session is None:
+        return None
+    for window in session.windows:
+        if (
+            _tmux_option_value(window.show_option(_TMUX_TASK_OPTION)) == task_id
+            and _tmux_option_value(window.show_option(_TMUX_ATTEMPT_OPTION)) == attempt_id
+        ):
+            return str(window.window_id)
+    return None
+
+
+def _mark_tmux_observer_window(window_id: str, task_id: str, attempt_id: str) -> bool:
+    """Tag a qexp viewer window for explicit same-Attempt reuse."""
+    from .tmux import require_libtmux
+
+    server = require_libtmux().Server()
+    window = server.windows.get(window_id=window_id, default=None)
+    if window is None:
+        return False
+    window.set_option(_TMUX_TASK_OPTION, task_id)
+    window.set_option(_TMUX_ATTEMPT_OPTION, attempt_id)
+    return True
 
 
 class ExecutorLaunchError(RuntimeError):
@@ -203,6 +299,8 @@ class Executor:
     check_window: Callable[[str | None], bool] = window_exists
     tmux_available: Callable[[], bool] = is_tmux_launch_available
     observer_decision: Callable[[RootConfig, str], dict[str, Any]] = resolve_task_tmux_observation
+    find_observer_window: Callable[[str, str, str], str | None] = _find_tmux_observer_window
+    mark_observer_window: Callable[[str, str, str], bool | None] = _mark_tmux_observer_window
     spawn_runner: Callable[..., Any] = subprocess.Popen
 
     def build_runner_command(
@@ -219,13 +317,34 @@ class Executor:
         return f"exec {' '.join(shlex.quote(part) for part in parts)} >> {shlex.quote(str(log_path))} 2>&1"
 
     @staticmethod
-    def build_observer_command(cfg: RootConfig, task_id: str, attempt_id: str, process_id: int) -> str:
-        """Build a non-interactive tmux log observer bound to the runner PID."""
+    def build_observer_command(cfg: RootConfig, task_id: str, attempt_id: str, process_id: int | None = None) -> str:
+        """Build a non-interactive tmux log observer bound to an optional runner PID."""
         tail = shutil.which("tail")
         if tail is None:
             raise RuntimeError("tail is unavailable for tmux launch observation")
         log_path = shared_attempt_log_path(cfg, task_id, attempt_id)
-        parts = [tail, f"--pid={process_id}", "-n", "+1", "-F", str(log_path)]
+        parts = [tail]
+        if process_id is not None:
+            parts.append(f"--pid={process_id}")
+        parts.extend(("-n", "+1", "-F", str(log_path)))
+        return f"exec {' '.join(shlex.quote(part) for part in parts)}"
+
+    @staticmethod
+    def build_live_progress_command(cfg: RootConfig, task_id: str, attempt_id: str) -> str:
+        """Build the independent Task progress viewer command."""
+        parts = [
+            sys.executable,
+            "-m",
+            "qqtools.plugins.qexp.cli",
+            "--project",
+            str(cfg.project_root),
+            "task",
+            "show",
+            task_id,
+            "--watch",
+            "--observer-attempt-id",
+            attempt_id,
+        ]
         return f"exec {' '.join(shlex.quote(part) for part in parts)}"
 
     def build_runner_argv(
@@ -262,8 +381,49 @@ class Executor:
             if launch_failure_handle(failure) is None and isinstance(failure, ExecutorLaunchError):
                 failure.handle = handle
             raise failure
-        self.attach_observer(cfg, task_id, attempt.attempt_id, handle, session_name)
+        self.provision_observer(cfg, task_id, attempt.attempt_id, handle, session_name)
         return handle.display_reference
+
+    def provision_observer(
+        self,
+        cfg: RootConfig,
+        task_id: str,
+        attempt_id: str,
+        handle: LaunchHandle,
+        session_name: str = "experiments",
+    ) -> bool:
+        """Queue automatic observer creation without waiting for tmux I/O."""
+        key = (str(cfg.shared_root), task_id, attempt_id)
+
+        def create_observer() -> None:
+            try:
+                self.attach_observer(cfg, task_id, attempt_id, handle, session_name)
+            except Exception as exc:
+                append_launch_diagnostic(
+                    cfg,
+                    task_id,
+                    attempt_id,
+                    f"tmux launch observer unavailable: {type(exc).__name__}: {exc}",
+                )
+
+        try:
+            accepted = submit_observer_job(key, create_observer)
+        except Exception as exc:
+            append_launch_diagnostic(
+                cfg,
+                task_id,
+                attempt_id,
+                f"tmux observer provisioning unavailable: {type(exc).__name__}: {exc}",
+            )
+            return False
+        if not accepted:
+            append_launch_diagnostic(
+                cfg,
+                task_id,
+                attempt_id,
+                "tmux observer provisioning unavailable: bounded worker is occupied",
+            )
+        return accepted
 
     def initiate_attempt(
         self, cfg: RootConfig, task_id: str, attempt: AttemptRecord, session_name: str = "experiments"
@@ -325,6 +485,15 @@ class Executor:
         session_name: str = "experiments",
     ) -> None:
         """Best-effort tmux observation after the runner has accepted its handoff."""
+        identity = _automatic_observer_attempt_is_current(cfg, task_id, attempt_id)
+        if identity is False:
+            append_launch_diagnostic(
+                cfg,
+                task_id,
+                attempt_id,
+                "tmux launch observer skipped: Attempt is no longer current",
+            )
+            return
         try:
             decision = self.observer_decision(cfg, task_id)
             if not isinstance(decision, dict) or type(decision.get("enabled")) is not bool:
@@ -351,13 +520,45 @@ class Executor:
                 )
                 return
             process = handle.runner_process if handle.runner_process is not None else handle.reference
-            command = self.build_observer_command(cfg, task_id, attempt_id, process.pid)
-            window_id = self.create_window(task_id, session_name, str(cfg.project_root), command)
-            if not isinstance(window_id, str) or not window_id:
-                raise RuntimeError("tmux did not return a window id")
-            handle.backend = "tmux"
-            handle.reference = window_id
-            handle.observer_window_id = window_id
+            process_id = getattr(process, "pid", None)
+            if type(process_id) is not int or process_id <= 0:
+                process_id = None
+            with observer_lock(cfg.shared_root, task_id, attempt_id):
+                # The launch can be delayed while the machine transitions the
+                # Task.  Recheck before touching tmux so a stale runner cannot
+                # create a viewer after a newer Attempt owns the Task.
+                identity = _automatic_observer_attempt_is_current(cfg, task_id, attempt_id)
+                if identity is False:
+                    append_launch_diagnostic(
+                        cfg,
+                        task_id,
+                        attempt_id,
+                        "tmux launch observer skipped: Attempt is no longer current",
+                    )
+                    return
+                existing_window_id = self.find_observer_window(session_name, task_id, attempt_id)
+                if isinstance(existing_window_id, str) and existing_window_id:
+                    handle.backend = "tmux"
+                    handle.reference = existing_window_id
+                    handle.observer_window_id = existing_window_id
+                    return
+                command = (
+                    self.build_live_progress_command(cfg, task_id, attempt_id)
+                    if _read_frozen_live_progress(cfg, task_id, attempt_id)
+                    else self.build_observer_command(cfg, task_id, attempt_id, process_id)
+                )
+                window_id = self.create_window(task_id, session_name, str(cfg.project_root), command)
+                if not isinstance(window_id, str) or not window_id:
+                    raise RuntimeError("tmux did not return a window id")
+                try:
+                    if self.mark_observer_window(window_id, task_id, attempt_id) is False:
+                        raise RuntimeError("tmux observer window could not be tagged")
+                except Exception:
+                    self.destroy_window(window_id)
+                    raise
+                handle.backend = "tmux"
+                handle.reference = window_id
+                handle.observer_window_id = window_id
         except Exception as exc:
             append_launch_diagnostic(
                 cfg,
@@ -365,6 +566,69 @@ class Executor:
                 attempt_id,
                 f"tmux launch observer unavailable: {type(exc).__name__}: {exc}",
             )
+
+    def attach_task_observer(
+        self,
+        cfg: RootConfig,
+        task_id: str,
+        session_name: str = "experiments",
+    ) -> ObserverAttachment:
+        """Create one explicit viewer window for the Task's current Attempt.
+
+        The returned window is detached from the caller, so creating or
+        recreating it never detaches another tmux client.  A CLI may attach to
+        ``session_name`` with tmux's read-only flag after this method returns.
+        """
+        if not self.tmux_available():
+            raise RuntimeError("tmux/libtmux unavailable")
+        try:
+            task = load_task(cfg, task_id)
+            current_number = task.attempt_control.get("current_attempt_number")
+            if type(current_number) is not int or current_number < 1:
+                raise RuntimeError(f"Task {task_id!r} has no current Attempt to observe")
+            attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task_id, current_number)))
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Task {task_id!r} has no readable current Attempt") from exc
+        except (OSError, TypeError, ValueError, KeyError, AttributeError) as exc:
+            raise RuntimeError(f"Task {task_id!r} current Attempt is malformed or unreadable") from exc
+        current_id = task.attempt_control.get("current_attempt_id")
+        projection = task.state.get("projection")
+        if current_id is None and projection not in {"succeeded", "failed", "cancelled"}:
+            raise RuntimeError(f"Task {task_id!r} has no current Attempt to observe")
+        if current_id is not None and current_id != attempt.attempt_id:
+            raise RuntimeError(f"Task {task_id!r} current Attempt identity changed")
+        if attempt.task_id != task_id or attempt.attempt_number != current_number:
+            raise RuntimeError(f"Task {task_id!r} current Attempt identity is malformed")
+
+        with observer_lock(cfg.shared_root, task_id, attempt.attempt_id):
+            latest_task = load_task(cfg, task_id)
+            if latest_task.attempt_control.get(
+                "current_attempt_number"
+            ) != current_number or latest_task.attempt_control.get("current_attempt_id") not in {
+                None,
+                attempt.attempt_id,
+            }:
+                raise RuntimeError(f"Task {task_id!r} current Attempt changed while attaching")
+
+            existing_window_id = self.find_observer_window(session_name, task_id, attempt.attempt_id)
+            if isinstance(existing_window_id, str) and existing_window_id:
+                return ObserverAttachment(session_name, existing_window_id, task_id, attempt.attempt_id)
+
+            command = (
+                self.build_live_progress_command(cfg, task_id, attempt.attempt_id)
+                if _read_frozen_live_progress(cfg, task_id, attempt.attempt_id)
+                else self.build_observer_command(cfg, task_id, attempt.attempt_id)
+            )
+            window_id = self.create_window(task_id, session_name, str(cfg.project_root), command)
+            if not isinstance(window_id, str) or not window_id:
+                raise RuntimeError("tmux did not return a window id")
+            try:
+                if self.mark_observer_window(window_id, task_id, attempt.attempt_id) is False:
+                    raise RuntimeError("tmux observer window could not be tagged")
+            except Exception:
+                self.destroy_window(window_id)
+                raise
+            return ObserverAttachment(session_name, window_id, task_id, attempt.attempt_id)
 
     @staticmethod
     def _launch_handoff(
@@ -463,6 +727,7 @@ __all__ = [
     "ExecutorLaunchHandoffTimeoutError",
     "LaunchHandle",
     "LaunchHandoff",
+    "ObserverAttachment",
     "append_launch_diagnostic",
     "append_launch_failure_diagnostic",
     "launch_failure_handle",

@@ -1,4 +1,109 @@
-# qexp live application progress (v1)
+# qexp live application progress
+
+## V2 metric snapshots and independent viewer
+
+This section defines the v2 extension. The v1 API, paths, payload limits,
+envelope, and reader behavior below remain a permanent supported contract.
+Extended reporting is selected per Task; it adds no required execution
+capability, training PTY, mandatory stdout/stderr sink, delivery acknowledgement,
+or historical metric store. qexp owns display. A framework-neutral producer
+offers already-computed CPU primitives, and no reader or renderer feeds back to
+training. Supported rolling validation targets the released 1.3.21 source and
+the next release. A 1.3.21 machine can operate on a project initialized by
+1.3.21 during rollout. A project newly initialized by the next release already
+requires `submission-group-publication-v1`, so 1.3.21 cannot join that new
+project; this existing root-capability boundary is outside the progress
+extension. Old/new producer, agent, Operation writer, and reader cases must
+be exercised with installed source versions before claiming L1 continuity.
+
+`progress.update(stage, current=None, total=None, unit=None, message=None,
+metrics=None)` adds only the optional keyword `metrics`; `flush()` remains.
+Without a v2 channel, metrics are ignored without inspection and v1 reporting
+continues. Without either channel, update is a no-op. An invalid base rejects
+the whole offer (`False`); metric-only errors can accept base progress with
+explicit incompleteness. Return `True` still means only process-local handoff.
+Updates replace the whole metric set, including when metrics is omitted or null.
+
+The v2 producer wire payload has exactly nine fields: `protocol_version` (exact
+integer 2), `update_id` (the v1 1–128 character ASCII identifier), `stage`,
+`current`, `total`, `unit`, `message`, `metrics`, and `completeness`. Base fields
+retain v1 types, control-character rejection, and UTF-8 byte limits (stage 64,
+unit 32, message 1024); current and total are null or exact nonnegative signed
+64-bit integers with current no greater than known total. Metric names match
+`[A-Za-z_][A-Za-z0-9_.:/-]{0,63}`. Values are exact built-in signed-64-bit
+integers or finite built-in binary64 floats; bool, null, strings, nested data,
+Tensor/NumPy scalars, and custom conversions are rejected. A producer accepts
+only a built-in dict, inspects at most its first 32 entries in insertion order,
+and retains no mutable caller container. Cheap length/type guards precede
+potentially costly primitive scans. Detected concurrent dict mutation rejects
+the offer; callers must keep it stable during the call.
+
+`completeness` has exactly `complete` (bool), `omitted_metrics` (nonnegative
+signed-64-bit integer or null), and `reasons` (unique list from
+`invalid_metrics`, `metric_limit`, `size_limit`). Complete requires zero
+omissions and no reasons. Incomplete requires a reason and positive omissions
+or null; null is allowed only with `invalid_metrics` and empty metrics.
+`metric_limit` and `size_limit` require a known positive count. A bad metrics
+container yields empty metrics, null omission count, and `invalid_metrics`.
+Otherwise omissions equal original dict length minus retained entries; more
+than 32 inputs adds `metric_limit`. The background writer removes accepted
+metrics from the end until encoded payload fits 8 KiB, adds `size_limit`, and
+discards a base that cannot fit. Readers strictly reject oversized records,
+duplicate or unknown keys, invalid types/completeness, and more than 32 metrics
+as a whole. They never perform producer-style partial normalization.
+
+The runner provides `QEXP_PROGRESS_V2_PATH` only for a frozen-enabled Task with
+a provisioned v2 context. The existing `QEXP_PROGRESS_PATH` and interval remain;
+nested launch strips both path variables. The new local paths are
+`progress/<attempt-id>/latest-v2.json`,
+`progress-v2-contexts/<attempt-id>.json`, and
+`progress-v2-observed/<attempt-id>.json`; the shared path is
+`progress-v2/<task-id>/<attempt-id>.json`. Existing v1 paths and formats never
+change. A single process singleton captures once and uses one latest slot and
+one daemon writer for both outputs, deriving v1 and v2 with the same update ID.
+Each output keeps independent success and 1/2/4/.../60-second failure backoff
+bookkeeping. One failed output cannot force repeated writes of a successful
+one. There is no atomic pair, guaranteed delivery, automatic writer respawn, or
+new synchronous observation wait. Ordinary 30-second publication and 2-second
+viewer refresh remain independent.
+
+The v2 shared envelope has the same exact outer keys, identity, fencing, and
+timestamps as v1 with outer `protocol_version: 2`. Its `progress` contains the
+seven base/metrics/completeness fields, omitting inner version and update ID;
+`source_update_id` remains outside. The complete shared record is at most
+16 KiB. `advanced_at` changes only with stage/current/total/unit, while
+`reported_at` may change for metrics. Agent projection is independent of
+heartbeat/leases, uses the same per-Task advisory lock, context-first cleanup,
+byte-bounded regular-file reads, and Attempt/registration authorization as v1.
+Only enabled Attempts add v2 scanning state. Old cleanup may leave v2 files;
+readers still reject cleaned Tasks and unauthorized Attempts.
+
+For one authorized Attempt, compare valid v1 and v2 candidates by original
+accepted `reported_at`, preferring v2 on a tie. Render one whole candidate. A
+newer v1 has metrics unavailable; never join it to older v2 metrics. Failed v2
+validation does not refresh v1 timestamps. Finite JSON preserves the existing
+`progress` object and adds independent `progress_extended` with matching
+status/reason conventions plus `selected_progress_version`. A viewer reads at
+a bounded cadence, never acknowledges delivery, and can be killed or stopped
+without affecting training. With no valid report it shows absence; with a read
+or validation failure it shows an explicit unavailable reason; stale accepted
+values keep their original age. Rich and text renderers expose the same data.
+
+Acceptance includes a non-qPipeline producer with custom stage, known/unknown
+total, metrics and message; old API and v1-only paths; exact protocol limits;
+malformed wire cases; one-output failure; old/new package combinations;
+Attempt/retry/registration mismatch; and Torch single-process/distributed
+fixtures with unchanged steps, checkpoints, collectives, FDs, and outcomes.
+Measure disabled/enabled throughput at 1/4/16 Tasks and 0/1/2 clients,
+producer-call latency, CPU/RSS, I/O, and process/thread count. Measure
+synchronized tail-step latency in one representative cell and briefly verify
+the actual qexp viewer with read-only clients. Each matrix cell must take less
+than ten minutes. The steady-state median throughput target is at most 3%
+regression in repeated comparable runs; excessive noise or uncertainty at the
+threshold is inconclusive, not a pass. Confirm that the selected GPU has no
+unrelated compute process during accepted measurements. One bounded, stable
+confirmation series may resolve an inconclusive cell; retain and report the
+initial uncertainty rather than silently discarding it.
 
 ## Scope and ownership
 

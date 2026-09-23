@@ -23,6 +23,7 @@ from ..commands import watch as watch_commands
 from ..config_types import RootConfig
 from ..doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
 from ..progress_policy import validate_interval_seconds
+from ..runtime import group_observation_policy
 from ..runtime.observation.api import ObservationError
 from .errors import CliUsageError
 from .outcome import CommandOutcome
@@ -396,6 +397,8 @@ def dispatch_project(
                             args.task_id,
                             interval_seconds=args.interval_seconds,
                             follow_retries=args.follow_retries,
+                            details=args.details,
+                            observer_attempt_id=args.observer_attempt_id,
                         )
                     )
                 except KeyboardInterrupt:
@@ -403,7 +406,18 @@ def dispatch_project(
                     return CommandOutcome(130)
                 except BrokenPipeError:
                     return CommandOutcome(0)
-            return CommandOutcome(0, CliOutput(OutputKind.TASK_SHOW, observer.inspect_task(cfg, args.task_id)))
+            return CommandOutcome(
+                0,
+                CliOutput(
+                    OutputKind.TASK_SHOW,
+                    observer.inspect_task(cfg, args.task_id),
+                    {"details": args.details},
+                ),
+            )
+        elif handler == "task_attach":
+            from ..commands.attach import attach_task
+
+            return CommandOutcome(attach_task(cfg, args.task_id))
         elif handler == "task_logs":
             if args.follow:
                 try:
@@ -428,7 +442,17 @@ def dispatch_project(
             return CommandOutcome(wait_exit, CliOutput(OutputKind.TASK_WAIT, result))
         return CommandOutcome(0)
     if handler.startswith("group_"):
-        if handler == "group_create":
+        if handler == "group_config_show":
+            result = group_observation_policy.inspect_group_policy(cfg.shared_root, args.group_name)
+            return CommandOutcome(0, CliOutput(OutputKind.GROUP_PROGRESS_POLICY, result))
+        elif handler == "group_config_set":
+            result = group_observation_policy.set_group_policy(
+                cfg.shared_root,
+                args.group_name,
+                args.live_progress_choice,
+            )
+            return CommandOutcome(0, CliOutput(OutputKind.GROUP_PROGRESS_POLICY, result))
+        elif handler == "group_create":
             result = group_commands.create_group(cfg, args.name, args.workers)
             kind = OutputKind.GROUP_STATE_CHANGE
             result = {"action": "create", "outcome": "completed", **result}

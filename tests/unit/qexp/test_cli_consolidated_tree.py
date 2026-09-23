@@ -143,6 +143,7 @@ def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
         ("submit",): ("submit", "project-write", "submission"),
         ("status",): ("status", "project-read", "status"),
         ("task", "cancel"): ("task_cancel", "project-write", "task-operation"),
+        ("task", "attach"): ("task_attach", "project-read", "raw-logs"),
         ("task", "retry"): ("task_retry", "project-write", "task-operation"),
         ("task", "share"): ("task_share", "project-write", "availability"),
         ("task", "unshare"): ("task_unshare", "project-write", "availability"),
@@ -156,6 +157,8 @@ def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
         ("task", "dependencies", "add"): ("task_dependencies_add", "project-write", "dependencies"),
         ("task", "dependencies", "remove"): ("task_dependencies_remove", "project-write", "dependencies"),
         ("group", "create"): ("group_create", "project-write", "group-operation"),
+        ("group", "config", "show"): ("group_config_show", "project-read", "group-operation"),
+        ("group", "config", "set"): ("group_config_set", "project-write", "group-operation"),
         ("group", "list"): ("group_list", "project-read", "group-list"),
         ("group", "show"): ("group_show", "project-read", "group-show"),
         ("group", "seal"): ("group_seal", "project-write", "group-operation"),
@@ -248,7 +251,7 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     )
 
     assert (
-        hashlib.sha256(text.encode()).hexdigest() == "957d2a48a01001467e6c1f2b7aff54a4a574f9a21578cfe249713abdf0c49cae"
+        hashlib.sha256(text.encode()).hexdigest() == "b66e2bb76fd7df397c5d4b98711f2c33d7fb617f2ac737f9083b51b44f1bf8bb"
     )
 
 

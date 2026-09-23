@@ -17,7 +17,70 @@ from .primitives import (
     _sequence,
     _table,
     _task_summary,
+    _value,
 )
+
+_MAX_GROUP_PROGRESS_POLICY_REVISION = (1 << 63) - 1
+_GROUP_PROGRESS_POLICY_FIELDS = frozenset({"live_progress", "revision", "source", "applies_to", "group_identity"})
+_GROUP_IDENTITY_FIELDS = frozenset({"name", "created_at", "creation_operation_id"})
+
+
+def _validate_group_progress_policy(result: Any) -> None:
+    label = "group-progress-policy payload"
+    if type(result) is not dict:
+        raise TypeError(f"{label} must be a dictionary")
+    fields = frozenset(result)
+    if fields not in {_GROUP_PROGRESS_POLICY_FIELDS, _GROUP_PROGRESS_POLICY_FIELDS | {"diagnostic"}}:
+        raise ValueError(f"{label} must contain the policy fields and optional diagnostic")
+
+    live_progress = result["live_progress"]
+    if type(live_progress) is not bool:
+        raise TypeError(f"{label}.live_progress must be a boolean")
+
+    revision = result["revision"]
+    if type(revision) is not int or not 0 <= revision <= _MAX_GROUP_PROGRESS_POLICY_REVISION:
+        raise ValueError(f"{label}.revision must be a non-negative signed-64-bit integer")
+
+    source = result["source"]
+    if type(source) is not str or source not in {"default", "configured"}:
+        raise ValueError(f"{label}.source must be 'default' or 'configured'")
+
+    applies_to = result["applies_to"]
+    if type(applies_to) is not str or applies_to != "new_submissions":
+        raise ValueError(f"{label}.applies_to must be 'new_submissions'")
+
+    identity = result["group_identity"]
+    if type(identity) is not dict or set(identity) != _GROUP_IDENTITY_FIELDS:
+        raise ValueError(f"{label}.group_identity must contain exactly name, created_at, and creation_operation_id")
+    for key in ("name", "created_at"):
+        value = identity[key]
+        if type(value) is not str or not value:
+            raise ValueError(f"{label}.group_identity.{key} must be a non-empty string")
+    creation_operation_id = identity["creation_operation_id"]
+    if creation_operation_id is not None and (type(creation_operation_id) is not str or not creation_operation_id):
+        raise ValueError(f"{label}.group_identity.creation_operation_id must be a non-empty string or null")
+
+    if "diagnostic" in result:
+        diagnostic = result["diagnostic"]
+        if type(diagnostic) is not str or len(diagnostic) > 160:
+            raise ValueError(f"{label}.diagnostic must be a string of at most 160 characters")
+
+
+def _render_group_progress_policy(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    identity = result["group_identity"]
+    identity_text = ", ".join(
+        f"{key}={_value(identity[key])}" for key in ("name", "created_at", "creation_operation_id")
+    )
+    lines = [
+        f"Live progress: {_value(result['live_progress'])}",
+        f"Revision: {result['revision']}",
+        f"Source: {result['source']}",
+        f"Applies to: {result['applies_to']}",
+        f"Group identity: {identity_text}",
+    ]
+    if "diagnostic" in result:
+        lines.append(f"Diagnostic: {result['diagnostic']}")
+    return "\n".join(lines)
 
 
 def _group_values(result: Mapping[str, Any], presentation: Mapping[str, object]) -> tuple[Any, ...]:
@@ -243,6 +306,10 @@ CONTRACTS = {
     OutputKind.GROUP_CANCEL: OutputContract(_validate_group_operation, _render_group_operation),
     OutputKind.GROUP_WORKER_CHANGE: OutputContract(_validate_group_worker_change, _render_group_operation),
     OutputKind.GROUP_MACHINES: OutputContract(_validate_group_machines, _render_group_machines),
+    OutputKind.GROUP_PROGRESS_POLICY: OutputContract(
+        _validate_group_progress_policy,
+        _render_group_progress_policy,
+    ),
 }
 
 __all__ = ["CONTRACTS"]

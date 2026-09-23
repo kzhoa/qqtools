@@ -341,6 +341,18 @@ def build_parser() -> argparse.ArgumentParser:
     tmux_values.add_argument("--tmux", dest="tmux_override", action="store_true")
     tmux_values.add_argument("--no-tmux", dest="tmux_override", action="store_false")
     submit.set_defaults(tmux_override=None)
+    live_progress_values = submit.add_mutually_exclusive_group()
+    live_progress_values.add_argument(
+        "--live-progress",
+        dest="live_progress_override",
+        action="store_true",
+    )
+    live_progress_values.add_argument(
+        "--no-live-progress",
+        dest="live_progress_override",
+        action="store_false",
+    )
+    submit.set_defaults(live_progress_override=None)
     submit.add_argument("argv", nargs=argparse.REMAINDER)
     bind_command(
         submit,
@@ -440,8 +452,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     show.add_argument("task_id")
     show.add_argument("--watch", action="store_true")
+    show.add_argument("--details", action="store_true", help="Show all available current progress metrics.")
     show.add_argument("--interval-seconds", default=None)
     show.add_argument("--follow-retries", action="store_true")
+    show.add_argument("--observer-attempt-id", default=None, help=argparse.SUPPRESS)
     _add_output_format(show)
     bind_command(
         show,
@@ -449,6 +463,15 @@ def build_parser() -> argparse.ArgumentParser:
         context=ContextKind.PROJECT_READ,
         modes={OutputMode.FINITE, OutputMode.CONTINUOUS},
         output_kinds={OutputKind.TASK_SHOW, OutputKind.TASK_WATCH},
+    )
+    attach = task_sub.add_parser("attach", help="Join a Task observer pane read-only without affecting training.")
+    attach.add_argument("task_id")
+    bind_command(
+        attach,
+        handler="task_attach",
+        context=ContextKind.PROJECT_READ,
+        modes=OutputMode.CONTINUOUS,
+        output_kinds=(),
     )
     logs = task_sub.add_parser(
         "logs",
@@ -528,6 +551,34 @@ def build_parser() -> argparse.ArgumentParser:
         context=ContextKind.PROJECT_READ,
         modes=OutputMode.FINITE,
         output_kinds=OutputKind.GROUP_SHOW,
+    )
+    group_config = group_sub.add_parser("config", help="Inspect or set Group defaults for new submissions.")
+    group_config_sub = group_config.add_subparsers(dest="group_config_action", required=True)
+    group_config_show = group_config_sub.add_parser("show", help="Show a Group submission policy.")
+    group_config_show.add_argument("group_name")
+    group_config_show.add_argument("resource", choices=("progress",))
+    _add_output_format(group_config_show)
+    bind_command(
+        group_config_show,
+        handler="group_config_show",
+        context=ContextKind.PROJECT_READ,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.GROUP_PROGRESS_POLICY,
+    )
+    group_config_set = group_config_sub.add_parser("set", help="Set a Group submission policy.")
+    group_config_set.add_argument("group_name")
+    group_config_set.add_argument("resource", choices=("progress",))
+    group_live_progress = group_config_set.add_mutually_exclusive_group(required=True)
+    group_live_progress.add_argument("--live-progress", dest="live_progress_choice", action="store_true")
+    group_live_progress.add_argument("--no-live-progress", dest="live_progress_choice", action="store_false")
+    group_config_set.set_defaults(live_progress_choice=None)
+    _add_output_format(group_config_set)
+    bind_command(
+        group_config_set,
+        handler="group_config_set",
+        context=ContextKind.PROJECT_WRITE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.GROUP_PROGRESS_POLICY,
     )
     for name in ("seal", "reopen", "pause", "resume", "cancel", "retry"):
         action = group_sub.add_parser(name, help=f"{name.capitalize()} Group control state.")

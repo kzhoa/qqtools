@@ -1497,6 +1497,72 @@ visible reserved unreserved
 
 `unreserved` means not reserved by qexp. It does not mean physically idle.
 
+### Training-safe live observation
+
+The extended live view is opt-in observation for new Tasks. It never changes the
+submitted command's `output_mode`, stdout/stderr descriptors, training control,
+or cancellation authority. The application may report progress without an
+observer, and exiting a viewer leaves training running. Existing progress-v1 and
+Attempt logs remain available. A Task without structured reports keeps its log
+view; attachment does not instrument an already running process.
+
+`qexp submit --live-progress` and `--no-live-progress` are mutually exclusive
+for command and file input. Omission inherits. A manifest accepts exact boolean
+or null at `defaults.live_progress` and `tasks[].live_progress`; omission and
+null inherit. Strings, numbers, and duplicate YAML keys are errors. Resolution
+order is invocation, Task, manifest default, Group default, then false. The
+choice is frozen with the first preparing Submission Operation and survives
+replay, queuing, and retries. Explicit submission choices never mutate a Group.
+Changing a Group default affects only new submissions. A missing Group created
+by submission starts with false; unavailable optional policy freezes false for
+inheriting Tasks with a bounded diagnostic, while explicit Task choices survive.
+
+For an existing published Group, `qexp group config show GROUP progress` reports
+the effective boolean, policy revision, source (`default` or `configured`), and
+`applies_to: new_submissions` in finite human or JSON output. `qexp group config
+set GROUP progress --live-progress|--no-live-progress` requires exactly one of
+the two flags and returns the changed Group identity and revision. Missing,
+malformed, oversized, unsupported, or unreadable configuration is an explicit
+command error except that a missing policy record means the built-in false
+default. Policy setters do not alter Group truth or its revision.
+
+`qexp task show TASK` retains all established Task information and prints a
+finite compact progress portion. `--details` prints all accepted current metrics
+and completeness information once; `--watch` refreshes a compact human view;
+`--watch --details` refreshes the detailed view. Details change presentation
+only, never collection. `--watch --format` and redirected watch output remain
+invalid. Finite JSON stays a single ANSI-free structured result: its existing
+`progress` field keeps the v1 shape, with separate `progress_extended` and
+`selected_progress_version` (`1`, `2`, or null) fields. A missing extension is
+unavailable, not a fabricated empty metric set.
+
+The viewer selects the latest whole, authorized Attempt observation by accepted
+report time, preferring v2 on a tie. It never joins old metrics to newer v1
+progress. The compact view shows stage, current/total/unit, message, and report
+age; details show every accepted metric and omission reason. Unknown totals do
+not create a percentage. An old report retains its original absolute time and
+age; the 2-second viewer refresh does not imply a new report. No countdown,
+interpolation, inferred stall, or forced 100% terminal progress is shown.
+Terminal Task truth and final advisory progress are displayed separately.
+
+Rich is only a renderer. With no Rich, ANSI capable terminals use an in-place
+text table; terminals without supported cursor control append a timestamped
+block only on new data or a Task/observation-state transition. Finite redirected
+human output and JSON contain no cursor controls. Frames are bounded to the
+viewport, sanitize producer text, disclose omitted rows, handle resize, and
+restore terminal styling on exit. A renderer failure ends or degrades only the
+viewer. `qexp task attach TASK` creates or joins a tmux viewer read-only without
+detaching other clients. Multiple authorized SSH clients share one pane and do
+not create extra collectors or accelerate publication. Different Unix accounts
+need separately configured tmux authorization.
+
+Acceptance requires command and manifest precedence, idempotent frozen choices,
+Group set/read races, unavailable policy fallback, finite/detail/watch and JSON
+parity, no-Rich and no-cursor rendering, truthful stale/terminal states, two
+concurrent tmux clients, viewer kill/stop/recreation, and unchanged training
+identity, outcome, and FDs under observer faults. A selected observer may lose
+snapshots but must never hold training waiting for its reader or renderer.
+
 ## 15. Product Boundaries
 
 ### 15.1 One Shared Root Per Project

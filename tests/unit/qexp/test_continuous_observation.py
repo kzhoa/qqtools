@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import observer
+from qqtools.plugins.qexp.cli.parser import build_parser
 from qqtools.plugins.qexp.commands import logs
 from qqtools.plugins.qexp.commands.logs import follow_logs
 from qqtools.plugins.qexp.commands.watch import watch_task
@@ -16,6 +17,16 @@ from qqtools.plugins.qexp.runtime.records import AttemptRecord, TaskRecord, Task
 
 def _cfg(tmp_path: Path) -> RootConfig:
     return RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
+
+
+@pytest.mark.parametrize("watch", [False, True])
+def test_task_show_details_combines_with_finite_and_watch_modes(watch: bool) -> None:
+    argv = ["task", "show", "task-1", "--details"]
+    if watch:
+        argv.append("--watch")
+    args = build_parser().parse_args(argv)
+    assert args.details is True
+    assert args.watch is watch
 
 
 def _records(tmp_path: Path) -> tuple[TaskRecord, AttemptRecord]:
@@ -236,7 +247,56 @@ def test_watch_renders_queued_retry_without_old_attempt_and_exits_on_terminal(
     assert output.getvalue().count("Task ID: task-1") == 2
     assert "Attempt: none" in output.getvalue()
     assert "Attempt ID: attempt-2" in output.getvalue()
-    assert output.getvalue().count("\x1b[2J\x1b[H") == 1
+    assert "\x1b" not in output.getvalue()
+
+
+def test_non_cursor_watch_appends_only_on_snapshot_or_task_transition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    base = {
+        "task_id": "task-1",
+        "name": "demo",
+        "phase": "running",
+        "reason": None,
+        "revision": 1,
+        "terminal": False,
+        "observation_state": "no_report",
+        "observation_reason": "no_snapshot",
+        "selected_attempt": None,
+        "progress": _progress(),
+    }
+    frames = iter((base, dict(base), {**base, "phase": "succeeded", "terminal": True}))
+    monkeypatch.setattr(observer, "inspect_current_task", lambda *_args: next(frames))
+    output = StringIO()
+    sleeps: list[float] = []
+
+    assert watch_task(_cfg(tmp_path), "task-1", stdout=output, sleep=sleeps.append) == 0
+
+    assert sleeps == [2, 2]
+    assert output.getvalue().count("Task ID: task-1") == 2
+    assert "\x1b" not in output.getvalue()
+
+
+def test_attempt_pinned_viewer_exits_before_showing_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    base = _follow_payload(tmp_path / "task.log", terminal=False)
+    newer = _follow_payload(tmp_path / "task.log", terminal=False, attempt=2)
+    frames = iter((base, newer))
+    monkeypatch.setattr(observer, "inspect_current_task", lambda *_args: next(frames))
+    output = StringIO()
+    sleeps: list[float] = []
+
+    assert (
+        watch_task(
+            _cfg(tmp_path),
+            "task-1",
+            observer_attempt_id="attempt-1",
+            stdout=output,
+            sleep=sleeps.append,
+        )
+        == 0
+    )
+
+    assert sleeps == [2]
+    assert "Attempt ID: attempt-1" in output.getvalue()
+    assert "attempt-2" not in output.getvalue()
 
 
 @pytest.mark.parametrize(

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import Any
 
 from ..runtime.progress import ProgressProjector, has_local_progress_mailbox, resolve_progress_binding
+from ..runtime.progress_v2 import ProgressV2Projector, has_local_progress_v2_mailbox
 from . import helpers
 
 
@@ -17,6 +19,7 @@ class ProgressObservationLoop:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="qexp-machine-progress", daemon=True)
         self._projectors: dict[tuple[str, str | None], ProgressProjector] = {}
+        self._v2_projectors: dict[tuple[str, str | None], ProgressV2Projector] = {}
         self._cursor = 0
 
     def start(self) -> None:
@@ -43,6 +46,8 @@ class ProgressObservationLoop:
         current = {(binding.project_id, binding.registration_generation) for binding in bindings}
         for key in set(self._projectors) - current:
             self._projectors.pop(key).close()
+        for key in set(self._v2_projectors) - current:
+            self._v2_projectors.pop(key).close()
         if not bindings:
             return
         for offset in range(min(16, len(bindings))):
@@ -55,21 +60,35 @@ class ProgressObservationLoop:
                 # The cheap gate is entirely machine-local. Projects that never
                 # publish progress cause no additional shared registration polls.
                 runtime_root = self._runtime.project_paths(binding.project_id)["root"]
-                if not has_local_progress_mailbox(runtime_root):
+                has_v1_mailbox = has_local_progress_mailbox(runtime_root)
+                has_v2_contexts = (Path(runtime_root) / "progress-v2-contexts").is_dir()
+                has_v2_mailbox = has_local_progress_v2_mailbox(runtime_root) if has_v2_contexts else False
+                if not has_v1_mailbox and not has_v2_mailbox:
                     continue
                 if not self._runtime.binding_write_eligible(binding):
                     continue
                 key = binding.project_id, binding.registration_generation
-                projector = self._projectors.get(key)
-                if projector is None:
-                    cfg = helpers._binding_config(self._runtime, binding)
-                    projector = ProgressProjector(
-                        cfg,
-                        resolver=self._resolver(binding),
-                        registration_generation=binding.registration_generation,
-                    )
-                    self._projectors[key] = projector
-                projector.tick()
+                cfg = helpers._binding_config(self._runtime, binding)
+                if has_v1_mailbox:
+                    projector = self._projectors.get(key)
+                    if projector is None:
+                        projector = ProgressProjector(
+                            cfg,
+                            resolver=self._resolver(binding),
+                            registration_generation=binding.registration_generation,
+                        )
+                        self._projectors[key] = projector
+                    projector.tick()
+                if has_v2_mailbox:
+                    projector_v2 = self._v2_projectors.get(key)
+                    if projector_v2 is None:
+                        projector_v2 = ProgressV2Projector(
+                            cfg,
+                            resolver=self._resolver(binding),
+                            registration_generation=binding.registration_generation,
+                        )
+                        self._v2_projectors[key] = projector_v2
+                    projector_v2.tick()
             except Exception:
                 continue
         self._cursor = (self._cursor + min(16, len(bindings))) % len(bindings)
@@ -84,4 +103,6 @@ class ProgressObservationLoop:
                 self._stop.wait(1.0)
         finally:
             for projector in self._projectors.values():
+                projector.close()
+            for projector in self._v2_projectors.values():
                 projector.close()

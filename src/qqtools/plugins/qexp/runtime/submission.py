@@ -12,6 +12,7 @@ from ..task_observation import validate_tmux_override
 from .availability import remove_deadline_index, sync_deadline_index
 from .dependencies import validate_group_dependencies
 from .group_namespace import provisional_group_reader
+from .group_observation_policy import read_policy_snapshot
 from .locks import group_lock, group_writer_lock, idempotency_lock, schema_writer_lock, task_lock, task_locks
 from .operation_store import operation_exists
 from .paths import group_path, idempotency_path, submission_path, task_path
@@ -246,6 +247,9 @@ def preview_specs(
                 raise RuntimeError("idempotency mapping does not identify a readable submission operation.") from exc
 
     if frozen_plan is None:
+        policy_snapshot = None
+        if request.group_name and any(item.get("live_progress") is None for item in request.specs):
+            policy_snapshot = read_policy_snapshot(cfg.shared_root, request.group_name)
         plan = _resolve_submission_plan(
             cfg,
             request,
@@ -254,6 +258,7 @@ def preview_specs(
             allocate_task_ids=False,
             persist_clock_evidence=False,
             acquire_group_lock=False,
+            policy_snapshot=policy_snapshot,
         )
     else:
         plan = frozen_plan
@@ -856,6 +861,13 @@ def submit_specs(
         raise ValueError("idempotency_key must be a string or null.")
     raw_digest = request.raw_request_digest
     mapping_path = idempotency_path(cfg.shared_root, semantic_digest({"project": str(cfg.shared_root), "key": key}))
+    policy_snapshot = None
+    if (
+        request.group_name
+        and any(item.get("live_progress") is None for item in request.specs)
+        and not mapping_path.exists()
+    ):
+        policy_snapshot = read_policy_snapshot(cfg.shared_root, request.group_name)
     with _submission_protocol_lock(cfg, mapping_path.stem):
         if mapping_path.exists():
             mapping = read_json(mapping_path)
@@ -895,7 +907,12 @@ def submit_specs(
                     idempotency_key=key,
                 )
         else:
-            plan = prepare_submission_plan(cfg, request, idempotency_key=key)
+            plan = prepare_submission_plan(
+                cfg,
+                request,
+                idempotency_key=key,
+                policy_snapshot=policy_snapshot,
+            )
             operation = encode_submission_plan(plan)
             _reject_cleanup_tombstones(cfg, _plan_specs(plan))
             create_if_absent(submission_path(cfg.shared_root, plan.operation_id), operation)

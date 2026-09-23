@@ -40,6 +40,7 @@ from ..machine_dispatch_plan import (
     reduce_dispatch_cursor,
 )
 from ..machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
+from ..observer_provisioning import submit_observer_job
 from ..project_maintenance import maintain_project, reconcile_reservation
 from ..runtime.group_namespace import read_group
 from ..runtime.locks import exclusive
@@ -112,6 +113,48 @@ class _PendingLaunchHandoff:
     compensation_committed: bool = False
     retry_not_before: float = 0.0
     retry_failures: int = 0
+
+
+def _queue_observer_provisioning(
+    executor: Executor,
+    pending: _PendingLaunchHandoff,
+) -> bool:
+    """Queue observer creation while keeping dispatch poll non-blocking."""
+    handle = pending.handle
+    if handle is None:
+        return False
+    provision = getattr(executor, "provision_observer", None)
+    if callable(provision):
+        try:
+            provision(pending.cfg, pending.task_id, pending.attempt_id, handle)
+        except Exception as exc:
+            append_launch_failure_diagnostic(pending.cfg, pending.task_id, pending.attempt_id, exc)
+        return True
+
+    attach = getattr(executor, "attach_observer", None)
+    if not callable(attach):
+        return False
+    key = (str(pending.cfg.shared_root), pending.task_id, pending.attempt_id)
+
+    def attach_later() -> None:
+        try:
+            attach(pending.cfg, pending.task_id, pending.attempt_id, handle)
+        except Exception as exc:
+            append_launch_failure_diagnostic(pending.cfg, pending.task_id, pending.attempt_id, exc)
+
+    try:
+        accepted = submit_observer_job(key, attach_later)
+    except Exception as exc:
+        append_launch_failure_diagnostic(pending.cfg, pending.task_id, pending.attempt_id, exc)
+        return False
+    if not accepted:
+        append_launch_failure_diagnostic(
+            pending.cfg,
+            pending.task_id,
+            pending.attempt_id,
+            RuntimeError("bounded observer provisioning worker is occupied"),
+        )
+    return accepted
 
 
 class _LaunchHandoffBatch:
@@ -241,12 +284,7 @@ class _LaunchHandoffBatch:
                 self._defer_retry(pending, now)
                 continue
             if published:
-                attach_observer = getattr(self._executor, "attach_observer", None)
-                if pending.handle is not None and callable(attach_observer):
-                    try:
-                        attach_observer(pending.cfg, pending.task_id, pending.attempt_id, pending.handle)
-                    except Exception as exc:
-                        append_launch_failure_diagnostic(pending.cfg, pending.task_id, pending.attempt_id, exc)
+                _queue_observer_provisioning(self._executor, pending)
                 self._remove(pending)
                 continue
 

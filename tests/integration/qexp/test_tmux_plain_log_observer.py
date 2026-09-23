@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import pty
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -13,7 +16,9 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status, start_machine_agent, stop_machine_agent
+from qqtools.plugins.qexp.executor import Executor
 from qqtools.plugins.qexp.layout import shared_attempt_log_path
+from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.store import read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -138,6 +143,11 @@ def test_enabled_tmux_observer_streams_plain_log_without_owning_training(
         assert "stdout-α" in text
         assert "stderr-traceback-marker" in text
         assert "stdout-after-append" in text
+        attachment = Executor().attach_task_observer(cfg, task.task_id)
+        _wait_for(lambda: "stdout-after-append" in _capture(attachment.window_id), "completed log viewer")
+        time.sleep(0.2)
+        assert _tmux("list-windows", "-a", "-F", "#{window_id}").returncode == 0
+        assert Executor().attach_task_observer(cfg, task.task_id).window_id == attachment.window_id
     finally:
         append.touch()
         finish.touch()
@@ -161,3 +171,130 @@ def test_enabled_tmux_observer_streams_plain_log_without_owning_training(
                 "tmux cleanup",
                 timeout=5,
             )
+
+
+def test_selected_viewer_two_read_only_clients_and_recreation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, qexp_resource_scope
+) -> None:
+    if sys.platform != "linux" or shutil.which("tmux") is None or not is_libtmux_available():
+        pytest.fail("live viewer evidence requires Linux, tmux, and libtmux")
+    monkeypatch.setenv("QEXP_VISIBLE_GPUS", "0")
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "rt")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.ensure_binding(cfg.shared_root, "gpu-1")
+    ready, finish = tmp_path / "ready", tmp_path / "finish"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import time\nfrom pathlib import Path\nfrom qqtools.qexp import progress\n"
+            f"ready,finish=map(Path,{[str(ready), str(finish)]!r})\n"
+            "assert progress.update(stage='train',current=1,total=2,unit='step',message='ready')\n"
+            "ready.touch()\n"
+            "deadline=time.monotonic()+30\n"
+            "while not finish.exists():\n"
+            "    if time.monotonic()>deadline: raise SystemExit(93)\n"
+            "    time.sleep(.02)\n"
+        ),
+    ]
+    task = submission_runtime.submit_specs(
+        cfg,
+        [
+            {
+                "command": command,
+                "working_directory": str(cfg.project_root),
+                "tmux_override": True,
+                "live_progress": True,
+            }
+        ],
+    )[0]
+    agent = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
+    clients: list[tuple[subprocess.Popen, int]] = []
+    try:
+        _wait_for(ready.exists, "training start")
+        _wait_for(lambda: load_task(cfg, task.task_id).state["projection"] == "running", "running truth")
+        window: str | None = None
+
+        def viewer_has_report() -> bool:
+            nonlocal window
+            window = _observer_window(task.task_id)
+            return window is not None and "Stage: train" in _capture(window)
+
+        _wait_for(viewer_has_report, "selected viewer report")
+        assert window is not None
+        assert "unrecognized arguments" not in _capture(window)
+        assert "usage:" not in _capture(window)
+
+        for _ in range(2):
+            master, slave = pty.openpty()
+            client = subprocess.Popen(
+                ["tmux", "attach-session", "-r", "-t", window],
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                env={**os.environ, "TERM": "xterm"},
+            )
+            os.close(slave)
+            clients.append((client, master))
+
+        def client_count() -> int:
+            result = _tmux("list-clients", "-F", "#{client_readonly}")
+            assert result.returncode == 0, result.stderr
+            assert all(line == "1" for line in result.stdout.splitlines())
+            return len(result.stdout.splitlines())
+
+        _wait_for(lambda: client_count() == 2, "two read-only clients")
+        first, first_master = clients.pop(0)
+        first.terminate()
+        first.wait(timeout=3)
+        os.close(first_master)
+        _wait_for(lambda: client_count() == 1, "remaining read-only client")
+        assert load_task(cfg, task.task_id).state["projection"] == "running"
+
+        viewer_pid_result = _tmux("display-message", "-p", "-t", window, "#{pane_pid}")
+        assert viewer_pid_result.returncode == 0, viewer_pid_result.stderr
+        viewer_pid = int(viewer_pid_result.stdout.strip())
+        assert viewer_pid > 0
+        os.kill(viewer_pid, signal.SIGSTOP)
+        try:
+            time.sleep(0.2)
+            assert load_task(cfg, task.task_id).state["projection"] == "running"
+        finally:
+            os.kill(viewer_pid, signal.SIGCONT)
+        os.kill(viewer_pid, signal.SIGKILL)
+        _wait_for(lambda: _observer_window(task.task_id) is None, "killed viewer exit")
+        attachment = Executor().attach_task_observer(cfg, task.task_id)
+        assert attachment.attempt_id == load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
+        _wait_for(lambda: "Stage: train" in _capture(attachment.window_id), "recreated viewer report")
+        assert load_task(cfg, task.task_id).state["projection"] == "running"
+        assert _tmux("kill-server").returncode == 0
+        assert load_task(cfg, task.task_id).state["projection"] == "running"
+        restarted = Executor().attach_task_observer(cfg, task.task_id)
+        _wait_for(lambda: "Stage: train" in _capture(restarted.window_id), "viewer after tmux restart")
+        assert load_task(cfg, task.task_id).state["projection"] == "running"
+        finish.touch()
+        _wait_for(lambda: load_task(cfg, task.task_id).state["projection"] == "succeeded", "training completion")
+    finally:
+        finish.touch()
+        for client, master in clients:
+            if client.poll() is None:
+                client.terminate()
+            try:
+                client.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                client.kill()
+                client.wait(timeout=3)
+            os.close(master)
+        if get_machine_agent_status(runtime)["is_running"]:
+            stop_machine_agent(runtime, timeout=5)
+        if agent.poll() is None:
+            agent.kill()
+        agent.wait(timeout=5)
+        for socket_path in qexp_resource_scope.tmux_root.rglob("*"):
+            if socket_path.is_socket():
+                subprocess.run(["tmux", "-S", str(socket_path), "kill-server"], capture_output=True, timeout=5)
+        _wait_for(
+            lambda: not _has_active_unix_socket(qexp_resource_scope.tmux_root),
+            "tmux cleanup",
+            timeout=5,
+        )
