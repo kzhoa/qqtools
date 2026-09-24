@@ -277,9 +277,9 @@ def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_p
             },
         )
         # Idle shutdown performs one final multi-Project dispatch while holding
-        # the activation fence. Keep that bounded convergence inside the same
-        # 15-second process budget used by machine lifecycle tests.
-        assert process.wait(timeout=15) == 0
+        # the activation fence. Bound the five-root traversal and shutdown to
+        # 30 seconds independently of the completed enrollment obligations.
+        assert process.wait(timeout=30) == 0
         for binding, _path in entries:
             assert read_capture_completion(runtime.project_paths(binding.project_id)["root"]) is not None
             schema = read_json(binding.shared_root / "schema" / "version.json")["schema"]

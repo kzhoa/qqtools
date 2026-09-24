@@ -17,6 +17,7 @@ from pathlib import Path
 DEFAULT_BUDGET_SECONDS = 600.0
 DEFAULT_HARD_TIMEOUT_SECONDS = 1200.0
 REPORT_ENV = "QEXP_GATE_REPORT_DIR"
+FAILURE_LOG_TAIL_BYTES = 40_000
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -54,6 +55,30 @@ def _report_dir(value: Path | None) -> Path:
 
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _print_failure_log_tails(phases: list[dict[str, object]], report_dir: Path) -> None:
+    """Expose bounded pytest diagnostics when CI cannot retain report files."""
+
+    for phase in phases:
+        if phase.get("status") == "passed":
+            continue
+        name = phase.get("name")
+        if not isinstance(name, str):
+            continue
+        for stream in ("stdout", "stderr"):
+            path = report_dir / f"{name}-{stream}.log"
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    size = handle.tell()
+                    handle.seek(max(0, size - FAILURE_LOG_TAIL_BYTES))
+                    content = handle.read(FAILURE_LOG_TAIL_BYTES).decode("utf-8", errors="replace")
+            except OSError as exc:
+                print(f"--- qexp {name} {stream} unavailable: {exc} ---", file=sys.stderr)
+                continue
+            print(f"--- qexp {name} {stream} tail ---", file=sys.stderr)
+            print(content, file=sys.stderr, end="" if content.endswith("\n") else "\n")
 
 
 def _phase_evidence_errors(name: str, report_dir: Path) -> list[str]:
@@ -240,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
             f"reports: {report_dir}",
             file=sys.stderr,
         )
+        _print_failure_log_tails(phases, report_dir)
     return 0 if overall_status == "passed" else 1
 
 

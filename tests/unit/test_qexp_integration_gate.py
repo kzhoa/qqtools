@@ -82,6 +82,28 @@ def test_gate_preserves_failed_phase_even_when_later_phase_passes(tmp_path: Path
     assert [phase["name"] for phase in summary["phases"]] == ["ordinary", "lifecycle"]
 
 
+def test_gate_prints_bounded_failed_phase_log_tails(tmp_path: Path, monkeypatch, capsys) -> None:
+    results = iter((_phase("ordinary", "failed"), _phase("lifecycle")))
+
+    def run_phase(name, *_args):
+        if name == "ordinary":
+            (tmp_path / "ordinary-stdout.log").write_text(
+                "discarded\n" + "x" * qexp_integration_gate.FAILURE_LOG_TAIL_BYTES + "\nfailed-test\n",
+                encoding="utf-8",
+            )
+            (tmp_path / "ordinary-stderr.log").write_text("traceback\n", encoding="utf-8")
+        return next(results)
+
+    monkeypatch.setattr(qexp_integration_gate, "_run_phase", run_phase)
+
+    assert qexp_integration_gate.main(["--report-dir", str(tmp_path)]) == 1
+
+    diagnostic = capsys.readouterr().err
+    assert "discarded" not in diagnostic
+    assert "failed-test" in diagnostic
+    assert "traceback" in diagnostic
+
+
 def test_gate_completes_both_phases_before_rejecting_soft_budget(tmp_path: Path, monkeypatch, capsys) -> None:
     times = iter((0.0, 2.0))
     calls: list[str] = []
