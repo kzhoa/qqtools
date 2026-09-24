@@ -14,7 +14,8 @@
 - fix: retry bounded transient qexp log-follow observations across Task claim and Attempt
   publication while preserving strict failure for persistent inconsistent state.
 - fix: serialize the final on-demand qexp idle dispatch with agent activation so newly queued Tasks
-  are either claimed by the current process or start a replacement after bounded shutdown completes.
+  are either claimed by the current process or start a replacement after bounded multi-Project
+  shutdown completes.
 - ci: stop testing Python 3.11; the minimum tested version is Python 3.12.
   Package metadata continues to permit Python 3.11 installations.
 - breaking: remove the ineffective `qexp agent run --format human|json` surface and define
