@@ -57,7 +57,14 @@ def test_installed_wheel_cli_flow(tmp_path):
             "action": "show",
             "scope": "project",
             "section": "tmux",
+            "source": "default",
+            "applies_to": "new_observer_decisions",
             "values": {
+                "enabled": False,
+                "source": "default",
+                "applies_to": "new_observer_decisions",
+            },
+            "effective_values": {
                 "enabled": False,
                 "source": "default",
                 "applies_to": "new_observer_decisions",
