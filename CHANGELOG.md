@@ -11,6 +11,8 @@
   placement, availability, and transactional Group publication paths.
 - fix: let idle on-demand qexp agents defer healthy Group-service activation while retaining
   damaged upgrades, recovery obligations, queued demand, and durable stop publication.
+- fix: retry bounded transient qexp log-follow observations across Task claim and Attempt
+  publication while preserving strict failure for persistent inconsistent state.
 - ci: stop testing Python 3.11; the minimum tested version is Python 3.12.
   Package metadata continues to permit Python 3.11 installations.
 - breaking: remove the ineffective `qexp agent run --format human|json` surface and define
