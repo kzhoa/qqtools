@@ -257,8 +257,7 @@ def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_p
             },
         )
         # Capture proof precedes Group activation and retained-source release.
-        # Keep those obligations inside the existing 15-second enrollment budget;
-        # the unchanged five-second idle budget starts after all three finish.
+        # Keep those obligations inside the existing 15-second enrollment budget.
         wait_until(
             "all-enrollment-obligations-settled",
             lambda: all(enrollment_has_settled(binding) for binding, _path in entries),
@@ -277,7 +276,10 @@ def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_p
                 for binding, _path in entries
             },
         )
-        assert process.wait(timeout=5) == 0
+        # Idle shutdown performs one final multi-Project dispatch while holding
+        # the activation fence. Keep that bounded convergence inside the same
+        # 15-second process budget used by machine lifecycle tests.
+        assert process.wait(timeout=15) == 0
         for binding, _path in entries:
             assert read_capture_completion(runtime.project_paths(binding.project_id)["root"]) is not None
             schema = read_json(binding.shared_root / "schema" / "version.json")["schema"]
