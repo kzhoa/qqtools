@@ -43,6 +43,17 @@ def make_env(base: Path) -> dict[str, str]:
         encoding="utf-8",
     )
     chronyc.chmod(0o755)
+    nvidia_smi = bin_dir / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = '--query-gpu=index' ] && [ \"$2\" = '--format=csv,noheader' ]; then\n"
+        "    printf '0\\n'\n"
+        "    exit 0\n"
+        "fi\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
     env = os.environ.copy()
     for name in ("PYTHONPATH", "TMUX", "TMUX_PANE"):
         env.pop(name, None)

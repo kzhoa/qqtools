@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from qexp_e2e import ensure_site_packages_import, initialize_machine_project, make_env, run, stop_agent
+from qexp_e2e import ensure_site_packages_import, initialize_machine_project, jrun, make_env, run, stop_agent
 
 pytestmark = [pytest.mark.e2e, pytest.mark.host_exclusive]
 
@@ -29,6 +29,9 @@ def test_installed_wheel_allows_one_default_host_authority(tmp_path) -> None:
         initialize_machine_project(first, env=env, agent_mode="daemon")
         initialize_machine_project(second, env=env, agent_mode="daemon")
         run([*first, "agent", "start"], env=env)
+        gpu_policy = jrun([*first, "agent", "status"], env=env)["gpu_policy"]
+        assert gpu_policy["discovered_gpu_ids"] == [0]
+        assert gpu_policy["visible_gpu_ids"] == [0]
 
         rejected = run([*second, "agent", "start"], env=env, check=False)
         assert rejected.returncode != 0
