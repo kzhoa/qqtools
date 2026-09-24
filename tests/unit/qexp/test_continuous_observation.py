@@ -275,6 +275,43 @@ def test_non_cursor_watch_appends_only_on_snapshot_or_task_transition(tmp_path: 
     assert "\x1b" not in output.getvalue()
 
 
+def test_watch_preserves_project_header_and_marks_only_the_first_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = {
+        "task_id": "task-1",
+        "name": "demo",
+        "phase": "running",
+        "reason": None,
+        "revision": 1,
+        "terminal": False,
+        "observation_state": "no_report",
+        "observation_reason": "no_snapshot",
+        "selected_attempt": None,
+        "progress": _progress(),
+    }
+    frames = iter((base, {**base, "phase": "succeeded", "terminal": True}))
+    monkeypatch.setattr(observer, "inspect_current_task", lambda *_args: next(frames))
+    output = StringIO()
+    presented: list[str] = []
+
+    assert (
+        watch_task(
+            _cfg(tmp_path),
+            "task-1",
+            project_line="Project: /work/a (from parent directory)",
+            on_first_frame_rendered=lambda: presented.append("first"),
+            stdout=output,
+            sleep=lambda _seconds: None,
+        )
+        == 0
+    )
+
+    assert output.getvalue().count("Project: /work/a (from parent directory)") == 2
+    assert presented == ["first"]
+
+
 def test_attempt_pinned_viewer_exits_before_showing_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     base = _follow_payload(tmp_path / "task.log", terminal=False)
     newer = _follow_payload(tmp_path / "task.log", terminal=False, attempt=2)

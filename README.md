@@ -134,7 +134,10 @@ qexp submit --name demo3 -- python train.py -c config3.yaml
 `qexp init` creates the local machine identity and global agent configuration only. `project init`
 creates shared Project truth, `project register` enrolls it in this machine, and `qexp use
 --project <project/.qexp>` selects the default Project for ordinary commands. Selection neither
-creates nor enrolls a Project.
+creates nor enrolls a Project. When an ordinary command selects one Project implicitly, qexp prints
+the canonical Project directory and its source to stderr before work begins, for example
+`Project: /mnt/share/myproject (from ~/.qqtools/qexp-context.json)`. Explicit `--project` commands
+do not add this notice. JSON, quiet Task IDs, and application logs remain unchanged on stdout.
 
 Each qexp Machine has one global `qexp agent` process and one resource pool shared by all enrolled
 Projects. A Project created by an older release with legacy agent metadata uses the one-time
@@ -488,6 +491,11 @@ should remain open for a later retry. The refresh interval changes viewer reads,
 application's progress reporting policy. Closing either viewer, or a qexp-created tmux log
 window, never stops training. Buffered application output can still appear late, and finite
 `qexp task logs TASK_ID` remains available for a later complete read.
+
+The watch frame always includes its canonical Project directory. A direct implicit watch also
+shows the selection source; an explicitly bound viewer shows Project identity without claiming a
+caller's source. qexp-created tmux windows include the Project in their persistent window title,
+and viewer reuse is keyed by stable Project, Task, and Attempt identity.
 
 For one-off runtime config edits, `qpipeline` also supports dotted CLI overrides after normal
 parser handling:

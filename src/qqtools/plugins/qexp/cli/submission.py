@@ -6,6 +6,7 @@ import argparse
 import os
 import shlex
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ from ..runtime.submission import (
     SubmissionUnknown,
 )
 from ..runtime.submission_plan import SubmissionTargetInvalid, semantic_digest
-from ..submission_contracts import SubmissionRequest, submission_result_payload
+from ..submission_contracts import ProjectSelection, SubmissionRequest, submission_result_payload
 from .outcome import CommandOutcome
 from .output import CliOutput, OutputKind
 
@@ -341,7 +342,11 @@ def _submission_error_mode(args: argparse.Namespace) -> str | None:
 
 
 def _prepare_submission_request(
-    args: argparse.Namespace, raw_argv: list[str], *, invocation_cwd: Path | None = None
+    args: argparse.Namespace,
+    raw_argv: list[str],
+    *,
+    invocation_cwd: Path | None = None,
+    on_project_resolved: Callable[[ProjectSelection], None] | None = None,
 ) -> SubmissionRequest:
     """Validate modes/options and normalize a submission before cfg resolution."""
     if args.command_spec.handler != "submit":
@@ -382,7 +387,10 @@ def _prepare_submission_request(
     explicit_project = args.project if args.project is not None else getattr(args, "shared_root", None)
     environment_value = os.environ.get("QEXP_SHARED_ROOT")
     args._submission_resolution_started = True
-    saved_context = load_context() if explicit_project is None and environment_value is None else None
+    try:
+        saved_context = load_context() if explicit_project is None and environment_value is None else None
+    except (OSError, TypeError, ValueError) as exc:
+        raise SubmissionInputError(str(exc)) from exc
     try:
         selection = resolve_submission_project(
             explicit_project=explicit_project,
@@ -393,7 +401,10 @@ def _prepare_submission_request(
         )
     except ValueError as exc:
         raise SubmissionInputError(str(exc)) from exc
+    args._submission_project_selection = selection
     args._submission_project_resolved = True
+    if on_project_resolved is not None:
+        on_project_resolved(selection)
     if mode == "command":
         try:
             item, field_sources = normalize_command_submission(

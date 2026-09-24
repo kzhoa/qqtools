@@ -21,6 +21,8 @@ def watch_task(
     details: bool = False,
     follow_retries: bool = False,
     observer_attempt_id: str | None = None,
+    project_line: str | None = None,
+    on_first_frame_rendered: Callable[[], None] | None = None,
     stdout: TextIO = sys.stdout,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
@@ -29,6 +31,7 @@ def watch_task(
         return 0
     renderer = WatchRenderer(stdout=stdout, stderr=sys.stderr)
     seen_observer_attempt = False
+    has_rendered_frame = False
     try:
         while True:
             payload = observer.inspect_current_task(cfg, task_id)
@@ -40,11 +43,17 @@ def watch_task(
                 if selected_id is None and seen_observer_attempt:
                     return 0
                 seen_observer_attempt |= selected_id == observer_attempt_id
-            presentation = {"details": details} if details else {}
+            presentation: dict[str, object] = {"details": details} if details else {}
+            if project_line is not None:
+                presentation["project_line"] = project_line
             safe_payload = sanitize_payload_for_frame(payload)
             frame = render(CliOutput(OutputKind.TASK_WATCH, safe_payload, presentation), "human")
             try:
                 renderer.render(payload, frame)
+                if not has_rendered_frame:
+                    has_rendered_frame = True
+                    if on_first_frame_rendered is not None:
+                        on_first_frame_rendered()
             except BrokenPipeError:
                 return 0
             except OSError as exc:

@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .cli.project_presentation import encode_display_text
+from .layout import context_path
 from .submission_contracts import ProjectSelection
 
 _SCHEMA_RELATIVE_PATH = Path("schema") / "version.json"
@@ -33,7 +35,13 @@ def _looks_like_locator(value: Path) -> bool:
 def _select(value: str | Path, source: str, *, invocation_cwd: Path) -> ProjectSelection:
     root = _canonical_candidate(value, invocation_cwd=invocation_cwd)
     if not _is_initialized(root):
-        raise ValueError(f"selected Project locator {Path(value)!s} is not an initialized .qexp root: {root}")
+        display_value = encode_display_text(str(Path(value).expanduser()))
+        display_root = encode_display_text(str(root))
+        context = f"; context file: {encode_display_text(str(context_path()))}" if source == "saved" else ""
+        raise ValueError(
+            f"selected Project locator (source: {source}) {display_value} is not an initialized .qexp root: "
+            f"{display_root}{context}"
+        )
     return ProjectSelection(root.parent, source)  # type: ignore[arg-type]
 
 
@@ -43,7 +51,10 @@ def _ancestor_selection(start: Path, source: str) -> ProjectSelection | None:
         marker = directory / ".qexp"
         if marker.exists():
             if not marker.is_dir() or not _is_initialized(marker):
-                raise ValueError(f"discovered Project locator {marker} is not an initialized .qexp root.")
+                display_marker = encode_display_text(str(marker))
+                raise ValueError(
+                    f"discovered Project locator (source: {source}) {display_marker} is not an initialized .qexp root."
+                )
             return ProjectSelection(marker.parent, source)  # type: ignore[arg-type]
     return None
 
@@ -89,7 +100,7 @@ def resolve_submission_project(
     if manifest_path is not None:
         manifest = _manifest_candidate(manifest_path, invocation_cwd=cwd)
         if not manifest.exists():
-            raise ValueError(f"submission manifest does not exist: {manifest}")
+            raise ValueError(f"submission manifest does not exist: {encode_display_text(str(manifest))}")
         selected = _ancestor_selection(manifest.parent, "manifest_ancestor")
         if selected is not None:
             return selected

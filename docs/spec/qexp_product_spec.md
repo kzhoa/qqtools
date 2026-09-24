@@ -1438,6 +1438,11 @@ larger than 256 KiB, and reads at most 2 MiB in total. Missing optional evidence
 partial result with null totals and reasons, never invented zero totals or an inferred stopped
 agent. Invalid required Project identity remains an error.
 
+When Project selection is implicit, human `status` renders the source in its existing Project row
+and omits a duplicate Selection source row. JSON status retains the structured selection source and
+receives the ordinary Project notice on stderr. If status fails after selection but before rendering,
+the selected Project line is emitted on stderr before the error.
+
 Initiating Group cancellation, worker removal, and Task cleanup results include an opaque versioned
 `operation_reference` plus the internal operation ID. The reference binds Project identity,
 operation kind, exact storage key, and operation ID without granting authority. `admin operation
@@ -1470,7 +1475,9 @@ distinct operator vocabulary for `No results`, `No matches in this page`, `Unava
 
 `task show --watch` refreshes a compact human Task view on terminal stdout. It follows the
 stable Task ID, shows authoritative Task phase and reason, and includes only a consistently
-selected current or terminal Attempt and its advisory progress. It rejects `--format` because no
+selected current or terminal Attempt and its advisory progress. Its persistent header shows the
+canonical Project directory; an implicit direct watch includes its actual selection source, while
+an explicitly bound viewer omits a source suffix. It rejects `--format` because no
 structured event-stream contract exists. `task logs` and `task logs --follow` reject `--format`;
 they emit application log bytes to stdout as they become readable and send qexp boundaries and
 diagnostics to stderr; redirected stdout is supported. Both commands poll shared storage and
@@ -1484,6 +1491,11 @@ Attempt changes and replaced or truncated log files are announced as stream boun
 lost before a viewer can read them are not recoverable. `task logs --follow --tail N` applies the
 tail limit to every new Attempt or file generation, while finite `task logs` remains the complete
 read available after publication has settled.
+
+Tmux observer reuse is identified by authoritative stable Project ID, Task ID, and Attempt ID.
+An untagged legacy window or a window from another Project is ineligible for reuse and remains
+untouched. Newly created live-progress and log-only windows retain their canonical Project directory
+in a viewer-local persistent title; qexp does not change session-global tmux status settings.
 
 A selected nonterminal Attempt may wait for its log to appear. Permission failures, malformed
 references, and non-file targets stop the viewer with an observation error. Other temporary
@@ -1627,6 +1639,22 @@ directory normalize to the same Project. An explicit, environmental, or discover
 target fails instead of falling through; read-only discovery creates nothing. Common options may
 occur before or after the command path, before a submission payload separator. Equal duplicates
 normalize to one value and conflicting duplicates fail. Tokens after `submit --` remain literal.
+
+After a valid implicit selection, a command operating on that one Project presents
+`Project: <canonical-project-directory>` once before binding-dependent work. Environment, parent
+directory, manifest directory, and saved-context selection append `(from $QEXP_SHARED_ROOT)`,
+`(from parent directory)`, `(from manifest directory)`, or the home-abbreviated context-file path.
+Discovery in invocation cwd itself has no suffix. The default channel is stderr so finite JSON,
+quiet IDs, and application-log stdout retain their existing byte contracts. Human status and Task
+watch use their integrated Project fields instead. Explicit selection adds no default notice;
+machine/global, multi-Project, setup, inventory, saved-context management, help, syntax-error, and
+pre-selection failure paths do not perform discovery merely to print one.
+
+Displayed Project, source-file, and locator paths are one-line encoded. Backslash, LF, CR, and TAB
+use `\\`, `\n`, `\r`, and `\t`; other C0/C1 controls use lowercase `\xhh`; Unicode line and
+paragraph separators and format controls use lowercase four- or eight-digit Unicode escapes.
+Other Unicode and spaces remain unchanged, with no enclosing quotes or re-escaping of generated
+backslashes.
 
 `qexp use --project <project/.qexp>` is a local default-project selector. It writes only a
 canonical `shared_root`; it does not validate or register the Project, create a machine record, or
@@ -1847,6 +1875,10 @@ they never rewrite policies frozen into existing Attempts.
 `task show --watch` is a terminal-only continuous view and rejects `--format`. `task logs` and
 `task logs --follow` are raw application-byte streams: stdout is reserved for application bytes,
 while qexp diagnostics and stream boundaries use stderr. They do not provide JSON wrapping.
+Implicit Project selection is reported once on stderr before log reading or following begins;
+Attempt changes, retry following, and file replacement do not repeat it. `task attach` reports the
+caller's implicit source before tmux entry, while the shared viewer retains Project identity without
+inheriting caller-specific provenance.
 
 `qexp task list --format=json` returns stable Task summary records. In addition to identity,
 placement, phase, claim, and GPU fields, each record includes `depends_on_task_ids`,

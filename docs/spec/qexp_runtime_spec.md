@@ -1154,6 +1154,10 @@ Task-scoped `task show --watch` and `task logs --follow` commands independently 
 current Attempt through Task truth, so a retry can move those viewers to a new Attempt without
 repurposing an existing Attempt-bound tmux window. All viewer paths remain outside execution
 authority and perform no Task, Attempt, claim, lease, process, or reservation writes.
+Tmux observer discovery and reuse require window-local tags for the authoritative stable Project
+ID, Task ID, and Attempt ID. Windows missing any tag or carrying another Project ID are not reused,
+retagged, inferred from titles, or destroyed. New log-only and live-progress windows also retain a
+viewer-local Project title without changing session-global tmux status.
 Observer policy is resolved once for each new post-handoff decision and is not polled by heartbeat,
 lease renewal, or recurring supervision. Retry retains the Task's explicit override; inheritance
 uses the then-current project policy. Agent restart does not replay a completed attachment boundary,

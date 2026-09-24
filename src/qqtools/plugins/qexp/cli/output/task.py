@@ -216,8 +216,13 @@ def _render_task_watch(result: Mapping[str, Any], presentation: Mapping[str, obj
             progress_observation,
             progress_version=progress_version,
         )
+    project_line = presentation.get("project_line")
+    project_value = None
+    if isinstance(project_line, str):
+        project_value = project_line.removeprefix("Project: ")
     return _details(
         (
+            ("Project", project_value),
             ("Task ID", result.get("task_id")),
             ("Name", result.get("name")),
             ("Phase", result.get("phase")),

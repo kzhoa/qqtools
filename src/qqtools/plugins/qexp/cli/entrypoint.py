@@ -8,6 +8,7 @@ import json
 import os
 import shlex
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from ..agent.identity import MachineRuntimeIdentityError
 from ..commands import context as context_commands
 from ..commands import wait as wait_commands
 from ..config_types import RootConfig
+from ..layout import context_path
 from ..notifications import notification_runtime
 from ..runtime.observation.api import ObservationError
 from ..runtime.ready import format_failure_diagnostic
@@ -34,6 +36,7 @@ from .parser import (
     build_parser,
 )
 from .project_handlers import _validate_continuous_options, dispatch_project
+from .project_presentation import ProjectPresentationState, format_project_line
 from .submission import (
     SubmissionCommandError,
     SubmissionInputError,
@@ -162,13 +165,20 @@ def _active_mode(args: argparse.Namespace) -> OutputMode:
     raise RuntimeError(f"command {handler!r} has ambiguous output modes")
 
 
-def _finalize_outcome(args: argparse.Namespace, outcome: CommandOutcome) -> int:
+def _finalize_outcome(
+    args: argparse.Namespace,
+    outcome: CommandOutcome,
+    *,
+    on_presented: Callable[[], None] | None = None,
+) -> int:
     """Validate and emit a handler outcome exactly once at the CLI boundary."""
     mode = _active_mode(args)
     validate_command_outcome(args.command_spec, mode, outcome)
     if mode is OutputMode.FINITE:
         output_format = getattr(args, "format", "human")
         print(render(outcome.output, output_format))
+        if on_presented is not None:
+            on_presented()
     return outcome.exit_code
 
 
@@ -183,23 +193,20 @@ def _machine_assertion(args: argparse.Namespace) -> str | None:
 
 def _requires_verified_binding(args: argparse.Namespace) -> bool:
     """Use the leaf's registered context policy as the sole write classification."""
+    if args.command_spec.handler.startswith("notifications_"):
+        return getattr(args, "scope", "global") == "project"
     if args.command_spec.handler in {"config_set", "config_reset"}:
         return getattr(args, "section", None) != "agent"
     return args.command_spec.context is ContextKind.PROJECT_WRITE
 
 
-def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[object, ExecutionContext, str]:
-    submission_request = getattr(args, "_submission_request", None)
-    if args.command_spec.handler == "submit" and submission_request is not None:
-        selection = context_commands.ProjectSelection(
-            submission_request.project.control_root,
-            submission_request.project.source,
-        )
-    else:
-        try:
-            selection = context_commands.resolve_project(getattr(args, "project", None))
-        except context_commands.ProjectSelectionError as exc:
-            raise CliUsageError(str(exc)) from exc
+def _resolve_cfg(
+    args: argparse.Namespace,
+    selection: context_commands.ProjectSelection,
+    *,
+    require_binding: bool,
+) -> tuple[RootConfig, ExecutionContext]:
+    """Build execution configuration for an already resolved Project selection."""
     assertion = _machine_assertion(args)
     machine_runtime = MachineRuntime(getattr(args, "machine_runtime_root", None))
 
@@ -218,7 +225,7 @@ def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[ob
                 f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}.\n"
                 f"Use '--home-machine {assertion}' to select Task placement."
             )
-        return execution_context.cfg, execution_context, selection.source
+        return execution_context.cfg, execution_context
 
     # Read-only project commands should use the binding-owned local runtime when one is
     # available, while remaining usable for observation before local registration.
@@ -230,7 +237,7 @@ def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[ob
         verified_machine = execution_context.cfg.machine_name
         if assertion is not None and assertion != verified_machine:
             raise CliUsageError(f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}.")
-        return execution_context.cfg, execution_context, selection.source
+        return execution_context.cfg, execution_context
 
     # Read-only project observation must remain possible without a local binding. The sentinel is
     # never used as an authority source because this branch is not used for mutations.
@@ -242,7 +249,46 @@ def _resolve_cfg(args: argparse.Namespace, *, require_binding: bool) -> tuple[ob
         runtime_root=runtime,
         require_initialized=True,
     )
-    return cfg, ExecutionContext(cfg, machine_runtime), selection.source
+    return cfg, ExecutionContext(cfg, machine_runtime)
+
+
+def _defer_project_presentation(args: argparse.Namespace) -> bool:
+    """Return whether successful output must carry Project identity itself."""
+    handler = args.command_spec.handler
+    return (handler == "status" and getattr(args, "format", "human") == "human") or (
+        handler == "task_show" and bool(getattr(args, "watch", False))
+    )
+
+
+def _present_selection(
+    selection: context_commands.ProjectSelection,
+    args: argparse.Namespace,
+    invocation_cwd: Path,
+) -> tuple[ProjectPresentationState, bool]:
+    """Prepare one Project line and emit it unless the output mode defers it."""
+    line = format_project_line(
+        selection.shared_root.parent,
+        selection.source,
+        invocation_cwd,
+        context_path(),
+    )
+    presentation = ProjectPresentationState(line)
+    is_deferred = _defer_project_presentation(args)
+    if not is_deferred and selection.source not in {"explicit", "cli"}:
+        print(line, file=sys.stderr, flush=True)
+        presentation.mark_presented()
+    return presentation, is_deferred
+
+
+def _emit_deferred_fallback(
+    presentation: ProjectPresentationState | None,
+    *,
+    is_deferred: bool,
+) -> None:
+    """Expose a selected Project when deferred output failed before presenting it."""
+    if is_deferred and presentation is not None and not presentation.is_presented:
+        print(presentation.line, file=sys.stderr, flush=True)
+        presentation.mark_presented()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -274,9 +320,20 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         _set_parse_modes(None)
     resolved_cfg: RootConfig | None = None
-    selection_source: str | None = None
+    project_presentation: ProjectPresentationState | None = None
+    presentation_deferred = False
     handler = args.command_spec.handler
     command_spec_token = _ACTIVE_COMMAND_SPEC.set(args.command_spec)
+
+    def present_submission_selection(submission_selection: Any) -> None:
+        nonlocal project_presentation, presentation_deferred
+        selection = context_commands.ProjectSelection(
+            submission_selection.control_root,
+            submission_selection.source,
+        )
+        args._resolved_project_selection = selection
+        project_presentation, presentation_deferred = _present_selection(selection, args, invocation_cwd)
+
     try:
         explicit_format = any(token == "--format" or token.startswith("--format=") for token in raw_argv)
         if explicit_format and handler == "agent_run":
@@ -307,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        if handler.startswith("notifications_"):
+        if handler.startswith("notifications_") and args.scope == "global":
             return _finalize_outcome(args, dispatch_notifications(args))
         if (
             handler.startswith("config_")
@@ -331,14 +388,40 @@ def main(argv: list[str] | None = None) -> int:
             and getattr(args, "project", None) is None
         ):
             raise CliUsageError(f"admin {handler.removeprefix('admin_')} requires explicit --project PATH.")
+        if handler == "admin_operation_show" and getattr(args, "project", None) is None:
+            raise CliUsageError("admin operation show requires explicit --project PATH.")
+        invocation_cwd = Path.cwd().expanduser().resolve()
         if handler == "submit":
             try:
-                _prepare_submission_request(args, raw_argv, invocation_cwd=Path.cwd())
+                _prepare_submission_request(
+                    args,
+                    raw_argv,
+                    invocation_cwd=invocation_cwd,
+                    on_project_resolved=present_submission_selection,
+                )
             except SubmissionInputError as exc:
                 raise SubmissionCommandError(exc) from exc
+            submission_selection = args._submission_request.project
+            selection = context_commands.ProjectSelection(
+                submission_selection.control_root,
+                submission_selection.source,
+            )
+            args._resolved_project_selection = selection
+        else:
+            try:
+                selection = context_commands.resolve_project(
+                    getattr(args, "project", None),
+                    invocation_cwd=invocation_cwd,
+                )
+            except context_commands.ProjectSelectionError as exc:
+                raise CliUsageError(str(exc)) from exc
+            args._resolved_project_selection = selection
+            project_presentation, presentation_deferred = _present_selection(selection, args, invocation_cwd)
         try:
-            cfg, execution_context, selection_source = _resolve_cfg(
-                args, require_binding=_requires_verified_binding(args)
+            cfg, execution_context = _resolve_cfg(
+                args,
+                selection,
+                require_binding=_requires_verified_binding(args),
             )
         except CliUsageError as exc:
             if handler == "submit":
@@ -349,9 +432,42 @@ def main(argv: list[str] | None = None) -> int:
             args._submission_cfg_resolved = True
             with notification_runtime(execution_context.machine_runtime.root):
                 return _finalize_outcome(args, dispatch_submission(args, cfg, execution_context))
+        if handler.startswith("notifications_"):
+            with notification_runtime(execution_context.machine_runtime.root):
+                return _finalize_outcome(
+                    args,
+                    dispatch_notifications(
+                        args,
+                        cfg=cfg,
+                        runtime=execution_context.machine_runtime,
+                    ),
+                )
+        is_human_status = handler == "status" and getattr(args, "format", "human") == "human"
+        is_watch = handler == "task_show" and bool(getattr(args, "watch", False))
+        is_implicit = selection.source not in {"explicit", "cli"}
+        project_line = (
+            project_presentation.line
+            if project_presentation is not None and (is_watch or is_human_status and is_implicit)
+            else None
+        )
+        on_project_presented = (
+            project_presentation.mark_presented if project_presentation is not None and is_watch else None
+        )
+        on_status_presented = (
+            project_presentation.mark_presented if project_presentation is not None and is_human_status else None
+        )
         with notification_runtime(execution_context.machine_runtime.root):
-            return _finalize_outcome(args, dispatch_project(args, cfg, execution_context, selection_source))
+            outcome = dispatch_project(
+                args,
+                cfg,
+                execution_context,
+                selection.source,
+                project_line=project_line,
+                on_project_presented=on_project_presented,
+            )
+            return _finalize_outcome(args, outcome, on_presented=on_status_presented)
     except ObservationError as exc:
+        _emit_deferred_fallback(project_presentation, is_deferred=presentation_deferred)
         if handler == "task_wait" and getattr(args, "format", "human") == "json":
             return _emit_wait_error(
                 task_id=getattr(args, "task_id", None),
@@ -364,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         return _emit_observation_error(exc, getattr(args, "format", "human"))
     except (CliUsageError, CliOperationalError) as exc:
+        _emit_deferred_fallback(project_presentation, is_deferred=presentation_deferred)
         if handler == "task_wait" and getattr(args, "format", "human") == "json":
             return _emit_wait_error(
                 task_id=getattr(args, "task_id", None),
@@ -376,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         return _emit_user_error(exc, getattr(args, "format", "human"))
     except SubmissionCommandError as exc:
+        _emit_deferred_fallback(project_presentation, is_deferred=presentation_deferred)
         payload, exit_code = _submission_error_payload(args, exc.error)
         diagnostic_line = None
         error_value = payload.get("error")
@@ -410,8 +528,12 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"qexp: {payload['error']['message']}", file=sys.stderr)
             return 130
+        if handler == "task_show" and bool(getattr(args, "watch", False)):
+            _emit_deferred_fallback(project_presentation, is_deferred=presentation_deferred)
+            return 130
         raise
     except (ValueError, RuntimeError, OSError) as exc:
+        _emit_deferred_fallback(project_presentation, is_deferred=presentation_deferred)
         if handler == "task_wait" and getattr(args, "format", "human") == "json":
             invalid_timeout = isinstance(exc, ValueError) and "timeout" in str(exc).lower()
             return _emit_wait_error(
@@ -428,6 +550,9 @@ def main(argv: list[str] | None = None) -> int:
             return _emit_observation_error(ObservationError(code, str(exc)), args.format)
         if isinstance(exc, MachineRuntimeIdentityError):
             return _emit_user_error(CliOperationalError(str(exc)), getattr(args, "format", "human"))
+        raise
+    except Exception:
+        _emit_deferred_fallback(project_presentation, is_deferred=presentation_deferred)
         raise
     finally:
         _ACTIVE_COMMAND_SPEC.reset(command_spec_token)

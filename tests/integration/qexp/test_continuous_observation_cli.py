@@ -66,9 +66,21 @@ def test_continuous_cli_routes_defaults_and_explicit_values(tmp_path: Path, monk
     terminal = TerminalOutput()
     monkeypatch.setattr(cli_entrypoint.sys, "stdout", terminal)
 
-    def watch(_cfg, task_id, *, interval_seconds, follow_retries, details, observer_attempt_id):
+    def watch(
+        _cfg,
+        task_id,
+        *,
+        interval_seconds,
+        follow_retries,
+        details,
+        observer_attempt_id,
+        project_line,
+        on_first_frame_rendered,
+    ):
         assert details is False
         assert observer_attempt_id is None
+        assert project_line == f"Project: {cfg.project_root}"
+        on_first_frame_rendered()
         calls.append((task_id, interval_seconds, follow_retries))
         return 0
 
@@ -102,7 +114,7 @@ def test_continuous_cli_routes_defaults_and_explicit_values(tmp_path: Path, monk
 
 
 def test_continuous_cli_translates_interruptions_without_traceback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
@@ -119,8 +131,10 @@ def test_continuous_cli_translates_interruptions_without_traceback(
         "watch_task",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt),
     )
-    assert cli_entrypoint.main([*base, "task", "show", task.task_id, "--watch"]) == 130
+    monkeypatch.chdir(cfg.project_root)
+    assert cli_entrypoint.main([*base[2:], "task", "show", task.task_id, "--watch"]) == 130
     assert terminal.getvalue() == "\x1b[0m\n"
+    assert capsys.readouterr().err == f"Project: {cfg.project_root}\n"
 
     monkeypatch.setattr(
         project_handlers.log_commands,

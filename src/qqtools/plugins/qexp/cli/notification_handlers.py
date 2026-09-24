@@ -6,24 +6,13 @@ import getpass
 import sys
 from typing import Any
 
-from ..agent.context import MachineRuntime, ProjectBindingRequiredError
-from ..commands import context as context_commands
+from ..agent.context import MachineRuntime
 from ..commands import notifications as notification_commands
 from ..config_types import RootConfig
 from ..notification_reconciliation import resolve_legacy_conflict
 from .errors import CliOperationalError, CliUsageError
 from .outcome import CommandOutcome
 from .output import CliOutput, OutputKind
-
-
-def _project_context(args: Any, runtime: MachineRuntime) -> RootConfig | None:
-    if args.scope == "global":
-        return None
-    try:
-        selected = context_commands.resolve_project(getattr(args, "project", None))
-        return runtime.verified_execution_context(selected.shared_root).cfg
-    except (context_commands.ProjectSelectionError, ProjectBindingRequiredError) as exc:
-        raise CliUsageError(str(exc)) from exc
 
 
 def _webhook_input(args: Any) -> str | None:
@@ -42,19 +31,22 @@ def _webhook_input(args: Any) -> str | None:
     return webhook
 
 
-def dispatch_notifications(args: Any) -> CommandOutcome:
+def dispatch_notifications(
+    args: Any, *, cfg: RootConfig | None = None, runtime: MachineRuntime | None = None
+) -> CommandOutcome:
     """Map convenience arguments into one scope-aware notification service."""
-    runtime = MachineRuntime(getattr(args, "machine_runtime_root", None))
+    selected_runtime = runtime or MachineRuntime(getattr(args, "machine_runtime_root", None))
     try:
-        runtime.require_initialized()
+        selected_runtime.require_initialized()
     except (OSError, RuntimeError, ValueError) as exc:
         raise CliOperationalError(str(exc)) from exc
-    cfg = _project_context(args, runtime)
+    if args.scope == "project" and cfg is None:
+        raise CliUsageError("Project notification scope requires an entrypoint-resolved Project.")
     action = args.command_spec.handler.removeprefix("notifications_")
     try:
         if action == "setup":
             result = notification_commands.setup_notifications(
-                runtime,
+                selected_runtime,
                 args.scope,
                 cfg=cfg,
                 webhook=_webhook_input(args),
@@ -63,12 +55,12 @@ def dispatch_notifications(args: Any) -> CommandOutcome:
                 unsigned=args.unsigned,
             )
         elif action == "show":
-            result = notification_commands.show_notifications(runtime, args.scope, cfg=cfg)
+            result = notification_commands.show_notifications(selected_runtime, args.scope, cfg=cfg)
         elif action == "test":
-            result = notification_commands.test_notifications(runtime, args.scope, cfg=cfg)
+            result = notification_commands.test_notifications(selected_runtime, args.scope, cfg=cfg)
         elif action == "set":
             result = notification_commands.set_notifications(
-                runtime,
+                selected_runtime,
                 args.scope,
                 cfg=cfg,
                 enabled=True if args.enabled else False if args.disabled else None,
@@ -78,12 +70,12 @@ def dispatch_notifications(args: Any) -> CommandOutcome:
                 timeout_seconds=args.timeout_seconds,
             )
         elif action == "reset":
-            result = notification_commands.reset_notifications(runtime, args.scope, cfg=cfg)
+            result = notification_commands.reset_notifications(selected_runtime, args.scope, cfg=cfg)
         elif action == "resolve":
             if cfg is None:
                 raise CliUsageError("Notification legacy conflicts exist only in project scope; use --scope project.")
-            resolve_legacy_conflict(runtime, cfg, prefer=args.prefer)
-            result = notification_commands.show_notifications(runtime, "project", cfg=cfg)
+            resolve_legacy_conflict(selected_runtime, cfg, prefer=args.prefer)
+            result = notification_commands.show_notifications(selected_runtime, "project", cfg=cfg)
             result.update({"action": "resolve", "outcome": "resolved", "preferred": args.prefer})
         else:
             raise CliUsageError("Unknown notification operation.")
@@ -103,7 +95,7 @@ def dispatch_config_notifications(
         raise CliOperationalError(str(exc)) from exc
     scope = args.scope
     if scope == "project" and cfg is None:
-        cfg = _project_context(args, selected_runtime)
+        raise CliUsageError("Project notification config requires an entrypoint-resolved Project.")
     if args.command_spec.handler == "config_show":
         result = notification_commands.show_notifications(selected_runtime, scope, cfg=cfg)
     elif args.command_spec.handler == "config_reset":

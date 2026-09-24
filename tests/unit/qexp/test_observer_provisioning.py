@@ -6,7 +6,10 @@ from pathlib import Path
 from qqtools.plugins.qexp.cli.parser import build_parser
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.executor import Executor, LaunchHandle
+from qqtools.plugins.qexp.layout import project_id
 from qqtools.plugins.qexp.observer_provisioning import observer_lock, observer_lock_path
+from qqtools.plugins.qexp.runtime.paths import shared_paths
+from qqtools.plugins.qexp.runtime.store import atomic_replace
 
 
 class _Process:
@@ -14,7 +17,13 @@ class _Process:
 
 
 def _cfg(tmp_path: Path) -> RootConfig:
-    return RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
+    cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
+    identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
+    atomic_replace(
+        identity_path,
+        {"project": {"project_id": project_id(cfg.shared_root), "shared_root": str(cfg.shared_root)}},
+    )
+    return cfg
 
 
 def test_slow_window_creation_does_not_block_launch_caller(tmp_path):

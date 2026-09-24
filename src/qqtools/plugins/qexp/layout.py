@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .cli.project_presentation import encode_display_text
 from .config_types import RootConfig
 from .lease import default_lease_policy_document
 from .runtime.group_namespace import group_directory
@@ -602,30 +603,43 @@ def load_root_config(
 _CONTEXT_PATH = Path.home() / ".qqtools" / "qexp-context.json"
 
 
-def save_context(shared_root: str | Path) -> Path:
-    """Save the canonical local default-project locator."""
-    _CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    root = Path(shared_root).expanduser().resolve()
-    atomic_replace(_CONTEXT_PATH, {"shared_root": str(root)})
+def context_path() -> Path:
+    """Return the current local Project-context file locator."""
     return _CONTEXT_PATH
 
 
+def save_context(shared_root: str | Path) -> Path:
+    """Save the canonical local default-project locator."""
+    locator = context_path()
+    locator.parent.mkdir(parents=True, exist_ok=True)
+    root = Path(shared_root).expanduser().resolve()
+    atomic_replace(locator, {"shared_root": str(root)})
+    return locator
+
+
 def load_context() -> dict[str, Any] | None:
-    if not _CONTEXT_PATH.exists():
+    locator = context_path()
+    if not locator.exists():
         return None
-    context = read_json(_CONTEXT_PATH)
+    display_locator = encode_display_text(str(locator))
+    try:
+        context = read_json(locator)
+    except ValueError as exc:
+        detail = encode_display_text(str(exc))
+        raise ValueError(f"qexp CLI context at {display_locator} is malformed: {detail}") from exc
     if not isinstance(context, dict):
-        raise ValueError("qexp CLI context must be an object.")
+        raise ValueError(f"qexp CLI context at {display_locator} must be an object.")
     shared_root = context.get("shared_root")
     if not isinstance(shared_root, str) or not shared_root:
-        raise ValueError("qexp CLI context shared_root must be a non-empty string.")
+        raise ValueError(f"qexp CLI context at {display_locator} shared_root must be a non-empty string.")
     return context
 
 
 def clear_context() -> bool:
-    if not _CONTEXT_PATH.exists():
+    locator = context_path()
+    if not locator.exists():
         return False
-    _CONTEXT_PATH.unlink()
+    locator.unlink()
     return True
 
 

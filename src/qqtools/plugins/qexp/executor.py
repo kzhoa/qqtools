@@ -11,15 +11,18 @@ import sys
 import threading
 import time
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .cli.project_presentation import encode_display_text, format_project_line
 from .config_types import RootConfig
 from .launch_policy import resolve_launch_handoff_policy, validate_launch_handoff_timeout_seconds
+from .layout import project_id as layout_project_id
 from .layout import shared_attempt_log_path
 from .observer_provisioning import observer_lock, submit_observer_job
-from .runtime.paths import attempt_path, local_paths
+from .runtime.paths import attempt_path, local_paths, shared_paths
 from .runtime.records import AttemptRecord
 from .runtime.store import read_json
 from .runtime.tasks import load_task
@@ -151,6 +154,37 @@ def _read_frozen_live_progress(cfg: RootConfig, task_id: str, attempt_id: str) -
 
 _TMUX_TASK_OPTION = "@qqtools_task_id"
 _TMUX_ATTEMPT_OPTION = "@qqtools_attempt_id"
+_TMUX_PROJECT_OPTION = "@qqtools_project_id"
+
+
+def _load_stable_project_id(cfg: RootConfig) -> str:
+    """Load and validate the selected Project's authoritative stable identity."""
+    identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
+    try:
+        identity = read_json(identity_path)
+    except FileNotFoundError as exc:
+        raise ValueError("Project identity is missing.") from exc
+    except (OSError, ValueError) as exc:
+        raise ValueError("Project identity is malformed or unreadable.") from exc
+
+    if not isinstance(identity, Mapping):
+        raise ValueError("Project identity is malformed.")
+    project = identity.get("project")
+    if not isinstance(project, Mapping):
+        raise ValueError("Project identity is malformed.")
+    stable_project_id = project.get("project_id")
+    stored_shared_root = project.get("shared_root")
+    if not isinstance(stable_project_id, str) or not stable_project_id:
+        raise ValueError("Project identity has no valid stable identity.")
+    if not isinstance(stored_shared_root, str):
+        raise ValueError("Project identity has no valid shared root.")
+    try:
+        canonical_shared_root = Path(stored_shared_root).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("Project identity has an invalid shared root.") from exc
+    if canonical_shared_root != cfg.shared_root or stable_project_id != layout_project_id(cfg.shared_root):
+        raise ValueError("Project identity does not match the selected Project.")
+    return stable_project_id
 
 
 def _tmux_option_value(value: object) -> str | None:
@@ -165,8 +199,8 @@ def _tmux_option_value(value: object) -> str | None:
     return value or None
 
 
-def _find_tmux_observer_window(session_name: str, task_id: str, attempt_id: str) -> str | None:
-    """Find a qexp viewer window tagged with the same Task Attempt."""
+def _find_tmux_observer_window(session_name: str, stable_project_id: str, task_id: str, attempt_id: str) -> str | None:
+    """Find a qexp viewer window tagged with the same Project, Task, and Attempt."""
     from .tmux import require_libtmux
 
     server = require_libtmux().Server()
@@ -175,15 +209,22 @@ def _find_tmux_observer_window(session_name: str, task_id: str, attempt_id: str)
         return None
     for window in session.windows:
         if (
-            _tmux_option_value(window.show_option(_TMUX_TASK_OPTION)) == task_id
+            _tmux_option_value(window.show_option(_TMUX_PROJECT_OPTION)) == stable_project_id
+            and _tmux_option_value(window.show_option(_TMUX_TASK_OPTION)) == task_id
             and _tmux_option_value(window.show_option(_TMUX_ATTEMPT_OPTION)) == attempt_id
         ):
             return str(window.window_id)
     return None
 
 
-def _mark_tmux_observer_window(window_id: str, task_id: str, attempt_id: str) -> bool:
-    """Tag a qexp viewer window for explicit same-Attempt reuse."""
+def _mark_tmux_observer_window(
+    window_id: str,
+    stable_project_id: str,
+    task_id: str,
+    attempt_id: str,
+    viewer_title: str,
+) -> bool:
+    """Tag and name a newly created qexp viewer window for explicit reuse."""
     from .tmux import require_libtmux
 
     server = require_libtmux().Server()
@@ -192,6 +233,11 @@ def _mark_tmux_observer_window(window_id: str, task_id: str, attempt_id: str) ->
         return False
     window.set_option(_TMUX_TASK_OPTION, task_id)
     window.set_option(_TMUX_ATTEMPT_OPTION, attempt_id)
+    window.set_option("automatic-rename", "off")
+    window.rename_window(viewer_title)
+    # Publish Project identity last so a lookup cannot see a partially tagged
+    # window as reusable while its tags or persistent title are still being set.
+    window.set_option(_TMUX_PROJECT_OPTION, stable_project_id)
     return True
 
 
@@ -299,8 +345,8 @@ class Executor:
     check_window: Callable[[str | None], bool] = window_exists
     tmux_available: Callable[[], bool] = is_tmux_launch_available
     observer_decision: Callable[[RootConfig, str], dict[str, Any]] = resolve_task_tmux_observation
-    find_observer_window: Callable[[str, str, str], str | None] = _find_tmux_observer_window
-    mark_observer_window: Callable[[str, str, str], bool | None] = _mark_tmux_observer_window
+    find_observer_window: Callable[[str, str, str, str], str | None] = _find_tmux_observer_window
+    mark_observer_window: Callable[[str, str, str, str, str], bool | None] = _mark_tmux_observer_window
     spawn_runner: Callable[..., Any] = subprocess.Popen
 
     def build_runner_command(
@@ -519,6 +565,8 @@ class Executor:
                     cfg, task_id, attempt_id, "tmux launch observer unavailable: tmux/libtmux unavailable"
                 )
                 return
+            stable_project_id = _load_stable_project_id(cfg)
+            viewer_title = f"{format_project_line(cfg.project_root)} | Task: {encode_display_text(task_id)}"
             process = handle.runner_process if handle.runner_process is not None else handle.reference
             process_id = getattr(process, "pid", None)
             if type(process_id) is not int or process_id <= 0:
@@ -536,7 +584,7 @@ class Executor:
                         "tmux launch observer skipped: Attempt is no longer current",
                     )
                     return
-                existing_window_id = self.find_observer_window(session_name, task_id, attempt_id)
+                existing_window_id = self.find_observer_window(session_name, stable_project_id, task_id, attempt_id)
                 if isinstance(existing_window_id, str) and existing_window_id:
                     handle.backend = "tmux"
                     handle.reference = existing_window_id
@@ -551,7 +599,10 @@ class Executor:
                 if not isinstance(window_id, str) or not window_id:
                     raise RuntimeError("tmux did not return a window id")
                 try:
-                    if self.mark_observer_window(window_id, task_id, attempt_id) is False:
+                    if (
+                        self.mark_observer_window(window_id, stable_project_id, task_id, attempt_id, viewer_title)
+                        is False
+                    ):
                         raise RuntimeError("tmux observer window could not be tagged")
                 except Exception:
                     self.destroy_window(window_id)
@@ -600,6 +651,8 @@ class Executor:
         if attempt.task_id != task_id or attempt.attempt_number != current_number:
             raise RuntimeError(f"Task {task_id!r} current Attempt identity is malformed")
 
+        stable_project_id = _load_stable_project_id(cfg)
+        viewer_title = f"{format_project_line(cfg.project_root)} | Task: {encode_display_text(task_id)}"
         with observer_lock(cfg.shared_root, task_id, attempt.attempt_id):
             latest_task = load_task(cfg, task_id)
             if latest_task.attempt_control.get(
@@ -610,7 +663,7 @@ class Executor:
             }:
                 raise RuntimeError(f"Task {task_id!r} current Attempt changed while attaching")
 
-            existing_window_id = self.find_observer_window(session_name, task_id, attempt.attempt_id)
+            existing_window_id = self.find_observer_window(session_name, stable_project_id, task_id, attempt.attempt_id)
             if isinstance(existing_window_id, str) and existing_window_id:
                 return ObserverAttachment(session_name, existing_window_id, task_id, attempt.attempt_id)
 
@@ -623,7 +676,10 @@ class Executor:
             if not isinstance(window_id, str) or not window_id:
                 raise RuntimeError("tmux did not return a window id")
             try:
-                if self.mark_observer_window(window_id, task_id, attempt.attempt_id) is False:
+                if (
+                    self.mark_observer_window(window_id, stable_project_id, task_id, attempt.attempt_id, viewer_title)
+                    is False
+                ):
                     raise RuntimeError("tmux observer window could not be tagged")
             except Exception:
                 self.destroy_window(window_id)

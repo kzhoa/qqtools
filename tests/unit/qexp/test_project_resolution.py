@@ -66,6 +66,24 @@ def test_explicit_malformed_project_does_not_fall_through(tmp_path: Path) -> Non
         )
 
 
+def test_malformed_locator_diagnostic_encodes_control_characters(tmp_path: Path) -> None:
+    malformed = tmp_path / "malformed\nproject\t\u200b"
+
+    with pytest.raises(ValueError) as failure:
+        resolve_submission_project(
+            explicit_project=malformed,
+            manifest_path=None,
+            invocation_cwd=tmp_path,
+            environment_value=None,
+            saved_context=None,
+        )
+
+    message = str(failure.value)
+    assert "\n" not in message
+    assert "\t" not in message
+    assert r"malformed\nproject\t\u200b" in message
+
+
 def test_resolution_is_read_only_when_no_candidate_exists(tmp_path: Path) -> None:
     cwd = tmp_path / "empty" / "nested"
     cwd.mkdir(parents=True)

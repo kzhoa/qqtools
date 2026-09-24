@@ -63,7 +63,7 @@ def _validate_machines(result: Any) -> None:
         _validate_machine(item, f"machines payload[{index}]")
 
 
-def _render_status(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
     project = result.get("project", {})
     participation = result.get("local_participation", {})
     agent = result.get("local_agent", {})
@@ -76,12 +76,26 @@ def _render_status(result: Mapping[str, Any], _presentation: Mapping[str, object
     task_state = observation.get("state") if isinstance(observation, Mapping) else observation
     task_reason = observation.get("reason") if isinstance(observation, Mapping) else None
     actions = result.get("next_actions") or []
+    project_line = presentation.get("project_line")
+    is_implicit_presentation = presentation.get("implicit_project") is True and isinstance(project_line, str)
+    project_path = (
+        project_line.removeprefix("Project: ")
+        if is_implicit_presentation
+        else (project.get("path") if isinstance(project, Mapping) else project)
+    )
     sections = [
         (
             ("Outcome", result.get("status")),
-            ("Project", project.get("path") if isinstance(project, Mapping) else project),
+            ("Project", project_path),
             ("Project ID", project.get("project_id") if isinstance(project, Mapping) else None),
-            ("Selection source", project.get("selection_source") if isinstance(project, Mapping) else None),
+            (
+                "Selection source",
+                None
+                if is_implicit_presentation
+                else project.get("selection_source")
+                if isinstance(project, Mapping)
+                else None,
+            ),
         ),
         (
             ("Participation", participation_state),

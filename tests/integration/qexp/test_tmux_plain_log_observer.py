@@ -17,7 +17,7 @@ from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status, start_machine_agent, stop_machine_agent
 from qqtools.plugins.qexp.executor import Executor
-from qqtools.plugins.qexp.layout import shared_attempt_log_path
+from qqtools.plugins.qexp.layout import project_id, shared_attempt_log_path
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.store import read_json
@@ -42,10 +42,10 @@ def _tmux(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _observer_window(task_id: str) -> str | None:
-    result = _tmux("list-windows", "-a", "-F", "#{window_id}\t#{window_name}")
+    result = _tmux("list-windows", "-a", "-F", "#{window_id}\t#{@qqtools_task_id}")
     for line in result.stdout.splitlines():
-        window_id, _, name = line.partition("\t")
-        if name == task_id:
+        window_id, _, tagged_task_id = line.partition("\t")
+        if tagged_task_id == task_id:
             return window_id
     return None
 
@@ -54,6 +54,19 @@ def _capture(window_id: str) -> str:
     result = _tmux("capture-pane", "-p", "-t", window_id, "-S", "-200")
     assert result.returncode == 0, result.stderr
     return result.stdout
+
+
+def _window_identity(window_id: str) -> tuple[str, str, str]:
+    result = _tmux(
+        "display-message",
+        "-p",
+        "-t",
+        window_id,
+        "#{window_name}\t#{@qqtools_project_id}\t#{automatic-rename}",
+    )
+    assert result.returncode == 0, result.stderr
+    title, tagged_project_id, automatic_rename = result.stdout.rstrip("\n").split("\t", 2)
+    return title, tagged_project_id, automatic_rename
 
 
 def test_enabled_tmux_observer_streams_plain_log_without_owning_training(
@@ -122,6 +135,15 @@ def test_enabled_tmux_observer_streams_plain_log_without_owning_training(
 
         _wait_for(pane_has_initial_output, "initial pane output")
         assert window is not None
+        expected_identity = (
+            f"Project: {cfg.project_root} | Task: {task.task_id}",
+            project_id(cfg.shared_root),
+            "0",
+        )
+        _wait_for(
+            lambda: _window_identity(window) == expected_identity,
+            "plain-log viewer Project identity",
+        )
         append.touch()
         _wait_for(lambda: "stdout-after-append" in _capture(window), "appended pane output")
 
@@ -145,6 +167,10 @@ def test_enabled_tmux_observer_streams_plain_log_without_owning_training(
         assert "stdout-after-append" in text
         attachment = Executor().attach_task_observer(cfg, task.task_id)
         _wait_for(lambda: "stdout-after-append" in _capture(attachment.window_id), "completed log viewer")
+        _wait_for(
+            lambda: _window_identity(attachment.window_id) == expected_identity,
+            "explicit plain-log viewer Project identity",
+        )
         time.sleep(0.2)
         assert _tmux("list-windows", "-a", "-F", "#{window_id}").returncode == 0
         assert Executor().attach_task_observer(cfg, task.task_id).window_id == attachment.window_id
@@ -222,6 +248,15 @@ def test_selected_viewer_two_read_only_clients_and_recreation(
 
         _wait_for(viewer_has_report, "selected viewer report")
         assert window is not None
+        expected_identity = (
+            f"Project: {cfg.project_root} | Task: {task.task_id}",
+            project_id(cfg.shared_root),
+            "0",
+        )
+        _wait_for(
+            lambda: _window_identity(window) == expected_identity,
+            "live viewer Project identity",
+        )
         assert "unrecognized arguments" not in _capture(window)
         assert "usage:" not in _capture(window)
 
@@ -266,11 +301,19 @@ def test_selected_viewer_two_read_only_clients_and_recreation(
         attachment = Executor().attach_task_observer(cfg, task.task_id)
         assert attachment.attempt_id == load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
         _wait_for(lambda: "Stage: train" in _capture(attachment.window_id), "recreated viewer report")
+        _wait_for(
+            lambda: _window_identity(attachment.window_id) == expected_identity,
+            "explicit live viewer Project identity",
+        )
         assert load_task(cfg, task.task_id).state["projection"] == "running"
         assert _tmux("kill-server").returncode == 0
         assert load_task(cfg, task.task_id).state["projection"] == "running"
         restarted = Executor().attach_task_observer(cfg, task.task_id)
         _wait_for(lambda: "Stage: train" in _capture(restarted.window_id), "viewer after tmux restart")
+        _wait_for(
+            lambda: _window_identity(restarted.window_id) == expected_identity,
+            "restarted live viewer Project identity",
+        )
         assert load_task(cfg, task.task_id).state["projection"] == "running"
         finish.touch()
         _wait_for(lambda: load_task(cfg, task.task_id).state["projection"] == "succeeded", "training completion")

@@ -6,6 +6,7 @@ import argparse
 import re
 import shlex
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from .. import observer
@@ -181,6 +182,9 @@ def dispatch_project(
     cfg: RootConfig,
     execution_context: ExecutionContext,
     selection_source: str,
+    *,
+    project_line: str | None = None,
+    on_project_presented: Callable[[], None] | None = None,
 ) -> CommandOutcome:
     """Dispatch a handler after the entry point resolved Project authority."""
     handler = args.command_spec.handler
@@ -399,11 +403,13 @@ def dispatch_project(
                             follow_retries=args.follow_retries,
                             details=args.details,
                             observer_attempt_id=args.observer_attempt_id,
+                            project_line=project_line,
+                            on_first_frame_rendered=on_project_presented,
                         )
                     )
                 except KeyboardInterrupt:
                     _restore_watch_terminal()
-                    return CommandOutcome(130)
+                    raise
                 except BrokenPipeError:
                     return CommandOutcome(0)
             return CommandOutcome(
@@ -595,7 +601,8 @@ def dispatch_project(
             selection_source=selection_source,
             machine_runtime=execution_context.machine_runtime,
         )
-        return CommandOutcome(0, CliOutput(OutputKind.STATUS, result))
+        presentation = {"project_line": project_line, "implicit_project": True} if project_line is not None else {}
+        return CommandOutcome(0, CliOutput(OutputKind.STATUS, result, presentation))
     if handler in {"machine_list", "machine_show"}:
         if handler == "machine_list":
             result = observer.list_machines(cfg)

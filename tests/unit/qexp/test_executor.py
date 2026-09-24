@@ -5,11 +5,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from qqtools.plugins.qexp import executor as executor_module
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.executor import Executor, LaunchHandle, LaunchHandoff
 from qqtools.plugins.qexp.launch_policy import set_launch_handoff_policy
+from qqtools.plugins.qexp.layout import project_id
+from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.records import SCHEMA_VERSION, AttemptRecord
+from qqtools.plugins.qexp.runtime.store import atomic_replace
 
 
 class _FakeProcess:
@@ -85,7 +89,108 @@ def _attempt() -> AttemptRecord:
 
 
 def _cfg(tmp_path: Path) -> RootConfig:
-    return RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "rt")
+    cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "rt")
+    identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
+    atomic_replace(
+        identity_path,
+        {"project": {"project_id": project_id(cfg.shared_root), "shared_root": str(cfg.shared_root)}},
+    )
+    return cfg
+
+
+class _FakeTmuxWindow:
+    def __init__(self, window_id: str, options: dict[str, str | None]):
+        self.window_id = window_id
+        self.options = options
+        self.title: str | None = None
+
+    def show_option(self, name: str) -> str | None:
+        return self.options.get(name)
+
+    def set_option(self, name: str, value: str) -> None:
+        self.options[name] = value
+
+    def rename_window(self, title: str) -> None:
+        self.title = title
+
+
+class _FakeTmuxCollection:
+    def __init__(self, values: list[object]):
+        self.values = values
+
+    def get(self, **criteria):
+        default = criteria.pop("default", None)
+        for value in self.values:
+            if all(getattr(value, key) == expected for key, expected in criteria.items()):
+                return value
+        return default
+
+
+def test_tmux_lookup_requires_matching_project_task_and_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    legacy = _FakeTmuxWindow(
+        "@legacy",
+        {"@qqtools_task_id": "task-1", "@qqtools_attempt_id": "attempt-1"},
+    )
+    other_project = _FakeTmuxWindow(
+        "@other",
+        {
+            "@qqtools_project_id": "project-b",
+            "@qqtools_task_id": "task-1",
+            "@qqtools_attempt_id": "attempt-1",
+        },
+    )
+    matching = _FakeTmuxWindow(
+        "@matching",
+        {
+            "@qqtools_project_id": "project-a",
+            "@qqtools_task_id": "task-1",
+            "@qqtools_attempt_id": "attempt-1",
+        },
+    )
+    session = SimpleNamespace(session_name="experiments", windows=[legacy, other_project, matching])
+    server = SimpleNamespace(sessions=_FakeTmuxCollection([session]))
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.tmux.require_libtmux",
+        lambda: SimpleNamespace(Server=lambda: server),
+    )
+
+    assert executor_module._find_tmux_observer_window("experiments", "project-a", "task-1", "attempt-1") == "@matching"
+    assert executor_module._find_tmux_observer_window("experiments", "missing", "task-1", "attempt-1") is None
+    assert legacy.options == {"@qqtools_task_id": "task-1", "@qqtools_attempt_id": "attempt-1"}
+    assert other_project.options["@qqtools_project_id"] == "project-b"
+
+
+def test_tmux_mark_publishes_project_identity_and_persistent_title(monkeypatch: pytest.MonkeyPatch) -> None:
+    window = _FakeTmuxWindow("@new", {})
+    server = SimpleNamespace(windows=_FakeTmuxCollection([window]))
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.tmux.require_libtmux",
+        lambda: SimpleNamespace(Server=lambda: server),
+    )
+
+    assert executor_module._mark_tmux_observer_window(
+        "@new",
+        "project-a",
+        "task-1",
+        "attempt-1",
+        "Project: /work/a | Task: task-1",
+    )
+    assert window.options == {
+        "@qqtools_task_id": "task-1",
+        "@qqtools_attempt_id": "attempt-1",
+        "automatic-rename": "off",
+        "@qqtools_project_id": "project-a",
+    }
+    assert window.title == "Project: /work/a | Task: task-1"
+
+
+def test_stable_project_identity_rejects_a_non_object_record(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    identity_path = shared_paths(cfg.shared_root)["project"] / "identity.json"
+    identity_path.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="malformed"):
+        executor_module._load_stable_project_id(cfg)
 
 
 def test_executor_uses_tmux_when_available(tmp_path: Path, monkeypatch):
