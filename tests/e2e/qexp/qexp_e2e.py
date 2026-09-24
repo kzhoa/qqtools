@@ -10,6 +10,7 @@ from pathlib import Path
 
 # A release-wheel task starts an agent and a runner in fresh Python interpreters.
 TASK_TERMINAL_TIMEOUT_SECONDS = 90.0
+COMMAND_TIMEOUT_SECONDS = TASK_TERMINAL_TIMEOUT_SECONDS + 30.0
 
 
 def ensure_site_packages_import() -> str:
@@ -67,7 +68,19 @@ def make_layout(base: Path) -> tuple[Path, Path, Path]:
 
 
 def run(args: list[str], *, env: dict[str, str], check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(args, text=True, capture_output=True, env=env)
+    try:
+        result = subprocess.run(
+            args,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"command timed out after {COMMAND_TIMEOUT_SECONDS:.0f}s: {' '.join(args)}\n"
+            f"stdout:\n{error.stdout or ''}\nstderr:\n{error.stderr or ''}"
+        ) from error
     if check and result.returncode != 0:
         raise RuntimeError(
             f"command failed: {' '.join(args)}\n"

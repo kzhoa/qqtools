@@ -22,6 +22,8 @@ from ..runtime.records import AttemptRecord, TaskRecord
 from ..runtime.store import iter_json, read_json
 from ..runtime.tasks import load_task
 
+_FOLLOW_OBSERVATION_RETRIES = 3
+
 
 def _latest_attempt_for_logs(cfg: RootConfig, task: TaskRecord) -> AttemptRecord:
     number = task.attempt_control.get("current_attempt_number")
@@ -403,16 +405,36 @@ def follow_logs(
         transient_error_key = None
         terminal_failure_key = None
 
-    def revalidate_open(descriptor: _LogDescriptor, latest: list[Mapping[str, Any] | None]) -> bool:
-        payload = observer.inspect_current_task(cfg, task_id)
-        latest[0] = payload
-        return _same_descriptor(descriptor, _descriptor_from_payload(payload))
-
     def report_wait(key: tuple[Any, ...], message: str) -> None:
         nonlocal wait_notice_key
         if wait_notice_key != key:
             _notice(stderr, message)
             wait_notice_key = key
+
+    observation_failures = 0
+
+    def inspect_follow_task() -> Mapping[str, Any]:
+        nonlocal observation_failures
+        while True:
+            try:
+                payload = observer.inspect_current_task(cfg, task_id)
+            except observer.CurrentObservationError as exc:
+                observation_failures += 1
+                if observation_failures > _FOLLOW_OBSERVATION_RETRIES:
+                    raise
+                report_wait(
+                    ("observation-error", type(exc).__name__, str(exc)),
+                    f"Task {task_id!r} observation is temporarily inconsistent; retrying selection.",
+                )
+                sleep(interval_seconds)
+                continue
+            observation_failures = 0
+            return payload
+
+    def revalidate_open(descriptor: _LogDescriptor, latest: list[Mapping[str, Any] | None]) -> bool:
+        payload = inspect_follow_task()
+        latest[0] = payload
+        return _same_descriptor(descriptor, _descriptor_from_payload(payload))
 
     def report_transient(descriptor: _LogDescriptor, exc: OSError) -> None:
         nonlocal transient_error_key
@@ -463,7 +485,7 @@ def follow_logs(
 
     try:
         while True:
-            payload = pending_payload if pending_payload is not None else observer.inspect_current_task(cfg, task_id)
+            payload = pending_payload if pending_payload is not None else inspect_follow_task()
             pending_payload = None
             descriptor = _descriptor_from_payload(payload)
             accept_descriptor(descriptor)
@@ -504,7 +526,7 @@ def follow_logs(
                 except _SelectionChanged:
                     pending_payload = latest[0]
                     if pending_payload is None:
-                        pending_payload = observer.inspect_current_task(cfg, task_id)
+                        pending_payload = inspect_follow_task()
                     continue
                 except _GenerationChanged:
                     continue
@@ -553,7 +575,7 @@ def follow_logs(
                     f"log for Task {task_id!r} Attempt {descriptor.attempt_id!r} cannot be read: {exc}"
                 ) from exc
             except OSError as exc:
-                latest_payload = observer.inspect_current_task(cfg, task_id)
+                latest_payload = inspect_follow_task()
                 latest_descriptor = _descriptor_from_payload(latest_payload)
                 if not _same_descriptor(descriptor, latest_descriptor):
                     accept_descriptor(latest_descriptor)
@@ -563,7 +585,7 @@ def follow_logs(
                 wait_for_transient(descriptor, bool(latest_payload.get("terminal")), exc)
                 continue
 
-            latest_payload = observer.inspect_current_task(cfg, task_id)
+            latest_payload = inspect_follow_task()
             latest_descriptor = _descriptor_from_payload(latest_payload)
             if not _same_descriptor(descriptor, latest_descriptor):
                 accept_descriptor(latest_descriptor)

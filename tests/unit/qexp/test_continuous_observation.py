@@ -380,6 +380,48 @@ def test_follow_discards_chunk_when_attempt_changes_before_emit(
     assert "Attempt boundary" in stderr.getvalue()
 
 
+def test_follow_discards_chunk_when_post_read_observation_retries_then_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first.log"
+    second = tmp_path / "second.log"
+    first.write_text("must-not-leak\n")
+    second.write_text("new-attempt\n")
+    first_payload = _follow_payload(first, terminal=False, attempt=1)
+    second_payload = _follow_payload(second, terminal=True, attempt=2)
+    calls = 0
+
+    def inspect(*_args):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise observer.CurrentObservationError("publication in progress")
+        return first_payload if calls <= 2 else second_payload
+
+    monkeypatch.setattr(observer, "inspect_current_task", inspect)
+    stdout, stderr = StringIO(), StringIO()
+    sleeps: list[float] = []
+
+    assert (
+        follow_logs(
+            _cfg(tmp_path),
+            "task-1",
+            tail_lines=100,
+            stdout=stdout,
+            stderr=stderr,
+            sleep=sleeps.append,
+            chunk_size=64,
+        )
+        == 0
+    )
+
+    assert stdout.getvalue() == "new-attempt\n"
+    assert "must-not-leak" not in stdout.getvalue()
+    assert sleeps == [2]
+    assert "temporarily inconsistent" in stderr.getvalue()
+    assert "Attempt boundary" in stderr.getvalue()
+
+
 def test_terminal_concurrent_transition_reselects_before_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "terminal.log"
     path.write_text("final-byte\n")
@@ -410,6 +452,64 @@ def test_terminal_concurrent_transition_reselects_before_exit(tmp_path: Path, mo
     assert stdout.getvalue() == "final-byte\n"
     assert sleeps == [2]
     assert "retrying selection" in stderr.getvalue()
+
+
+def test_follow_retries_transient_inconsistent_observation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "terminal.log"
+    path.write_text("final-byte\n")
+    stable = _follow_payload(path, terminal=True)
+    frames = iter(
+        (
+            observer.CurrentObservationError("running Task has inconsistent active claim"),
+            stable,
+            stable,
+            stable,
+        )
+    )
+
+    def inspect(*_args):
+        frame = next(frames)
+        if isinstance(frame, BaseException):
+            raise frame
+        return frame
+
+    monkeypatch.setattr(observer, "inspect_current_task", inspect)
+    stdout, stderr = StringIO(), StringIO()
+    sleeps: list[float] = []
+
+    assert (
+        follow_logs(
+            _cfg(tmp_path),
+            "task-1",
+            stdout=stdout,
+            stderr=stderr,
+            sleep=sleeps.append,
+        )
+        == 0
+    )
+
+    assert stdout.getvalue() == "final-byte\n"
+    assert sleeps == [2]
+    assert "temporarily inconsistent; retrying selection" in stderr.getvalue()
+
+
+def test_follow_rejects_persistently_inconsistent_observation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def inspect(*_args):
+        raise observer.CurrentObservationError("stable corruption")
+
+    monkeypatch.setattr(observer, "inspect_current_task", inspect)
+    sleeps: list[float] = []
+
+    with pytest.raises(observer.CurrentObservationError, match="stable corruption"):
+        follow_logs(
+            _cfg(tmp_path),
+            "task-1",
+            stdout=StringIO(),
+            stderr=StringIO(),
+            sleep=sleeps.append,
+        )
+
+    assert sleeps == [2, 2, 2]
 
 
 def test_follow_reopens_replaced_generation_with_tail_rule(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
