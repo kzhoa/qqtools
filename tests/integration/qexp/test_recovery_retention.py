@@ -4,6 +4,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
@@ -11,6 +12,7 @@ from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
 from qqtools.plugins.qexp.events import flush_local_events
+from qqtools.plugins.qexp.runtime.locks import exclusive
 from qqtools.plugins.qexp.runtime.paths import local_paths
 from qqtools.plugins.qexp.runtime.resources.cpu_lane import attach_cpu, release_cpu, reserve_cpu, set_cpu_lane_capacity
 from qqtools.plugins.qexp.runtime.responsibility import responsibility_root
@@ -56,6 +58,55 @@ def test_binding_removal_fence_survives_unlinking_the_partition(tmp_path, monkey
         patch.setattr(context.shutil, "rmtree", remove)
         assert runtime.remove_binding(binding.project_id) == binding
     assert checked == [root] and not root.exists()
+
+
+def test_binding_removal_waits_for_responsibility_initialization(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.agent import context
+
+    _, runtime, binding, root = binding_fixture(tmp_path)
+    initialization_lock = root / "locks" / "responsibility-initialize.lock"
+    initialization_wait_started = Event()
+    removal_started = Event()
+    removal_progressed = Event()
+    failures = []
+    original_exclusive = context.exclusive
+    original_rmtree = context.shutil.rmtree
+
+    @contextmanager
+    def track_exclusive(path, *, blocking=True):
+        if path == initialization_lock:
+            initialization_wait_started.set()
+            removal_progressed.set()
+        with original_exclusive(path, blocking=blocking) as acquired:
+            yield acquired
+
+    def remove(path, *args, **kwargs):
+        removal_started.set()
+        removal_progressed.set()
+        return original_rmtree(path, *args, **kwargs)
+
+    def remove_binding():
+        try:
+            runtime.remove_binding(binding.project_id)
+        except BaseException as exc:
+            failures.append(exc)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(context, "exclusive", track_exclusive)
+        patch.setattr(context.shutil, "rmtree", remove)
+        with exclusive(initialization_lock):
+            worker = Thread(target=remove_binding)
+            worker.start()
+            assert removal_progressed.wait(timeout=5)
+            assert initialization_wait_started.is_set()
+            assert not removal_started.is_set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert removal_started.is_set()
+    assert runtime.load_registry()[1] == []
+    assert not root.exists()
 
 
 @pytest.mark.parametrize("is_corrupt", [False, True])

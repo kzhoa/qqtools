@@ -676,6 +676,11 @@ class MachineRuntime:
                         "cannot remove project with active local evidence: legacy_migration_unavailable"
                     ) from exc
                 capture_roots = [project_root] if roots is None else [project_root, roots[0]["root"]]
+                initialization_lock = project_root / "locks" / "responsibility-initialize.lock"
+                # A background worker may have passed its binding check before
+                # disable. Let its bounded Ledger initialization finish before
+                # checking blockers or walking the project tree. The registry
+                # guard prevents a later worker from becoming eligible.
                 if is_path_present(project_root / COMPLETION_FILE):
                     try:
                         release_completed_source(project_root)
@@ -695,20 +700,23 @@ class MachineRuntime:
                                 + ", ".join(active)
                             )
                         raise CaptureBusy("cannot remove project while writer capture is pending")
-                    blockers = self.binding_blockers(binding)
-                    if blockers:
-                        raise RuntimeError("cannot remove project with active local evidence: " + ", ".join(blockers))
-                    if is_path_present(project_root):
-                        try:
-                            shutil.rmtree(project_root)
-                        except OSError as exc:
-                            if exc.errno != errno.ENOTEMPTY:
-                                raise
-                            # A worker that passed its binding check before the
-                            # disable may finish one bounded staging write while
-                            # removal walks the tree. Release lifecycle locks and
-                            # retry after that writer observes the registry.
-                            raise CaptureBusy("project runtime removal is busy") from exc
+                    with exclusive(initialization_lock):
+                        blockers = self.binding_blockers(binding)
+                        if blockers:
+                            raise RuntimeError(
+                                "cannot remove project with active local evidence: " + ", ".join(blockers)
+                            )
+                        if is_path_present(project_root):
+                            try:
+                                shutil.rmtree(project_root)
+                            except OSError as exc:
+                                if exc.errno != errno.ENOTEMPTY:
+                                    raise
+                                # A worker that passed its binding check before
+                                # disable may finish one bounded staging write.
+                                # Release lifecycle locks and retry after that
+                                # writer observes the registry.
+                                raise CaptureBusy("project runtime removal is busy") from exc
                 self.registration.save_registry_locked(revision + 1, [item for item in bindings if item != binding])
         return binding
 
