@@ -28,6 +28,8 @@
   explicit override and Project-resolution contracts, and transactionally publish missing Groups.
 - feat: make qexp-created tmux log observers a project option disabled by default, with durable
   per-Task and batch submission overrides while preserving detached execution and live viewers.
+- feat: expose qexp configuration source and application timing in the typed result envelope while
+  retaining `values` and adding the explicit `effective_values` compatibility alias.
 
 ## v1.3.21
 
