@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, ContextManager
@@ -285,6 +286,7 @@ def run_machine_agent_loop(
     submission_control_worker: MachineSubmissionControlWorker | None = None
     recovery_enrollment = RecoveryEnrollment(machine_runtime)
     emitted_gpu_warning_fingerprint: str | None = None
+    idle_shutdown_guard = None
 
     def request_stop(_signum: int, _frame: object) -> None:
         nonlocal stop, stop_reason
@@ -292,7 +294,19 @@ def run_machine_agent_loop(
         stop_reason = "stopped_by_signal"
         scheduler_wakeup.set()
 
-    with machine_runtime.scheduler_authority(blocking=False) as acquired, notification_runtime(machine_runtime.root):
+    @contextmanager
+    def retain_idle_shutdown_guard():
+        try:
+            yield
+        finally:
+            if idle_shutdown_guard is not None:
+                idle_shutdown_guard.__exit__(None, None, None)
+
+    with (
+        retain_idle_shutdown_guard(),
+        machine_runtime.scheduler_authority(blocking=False) as acquired,
+        notification_runtime(machine_runtime.root),
+    ):
         if not acquired:
             raise RuntimeError("machine scheduler authority is already held.")
         start_ticks = _pid_start_time_ticks(os.getpid())
@@ -469,9 +483,20 @@ def run_machine_agent_loop(
                     if idle_since is None:
                         idle_since = time.monotonic()
                     elif time.monotonic() - idle_since >= loop_interval:
-                        stop = True
-                        stop_reason = "idle"
-                        continue
+                        idle_shutdown_guard = _confirm_idle_shutdown(
+                            machine_runtime,
+                            has_consumed_binding=has_consumed_binding,
+                            available_gpus=available_gpus,
+                            executor=executor,
+                            instance_id=instance_id,
+                            loop_interval=loop_interval,
+                            started_at=started_at,
+                        )
+                        if idle_shutdown_guard is not None:
+                            stop = True
+                            stop_reason = "idle"
+                            continue
+                        idle_since = None
                 else:
                     idle_since = None
                 pending_wait = getattr(machine_runtime, "pending_launch_wait_seconds", None)
@@ -576,6 +601,57 @@ def run_machine_agent_loop(
                 finally:
                     if previous_term is not None:
                         signal.signal(signal.SIGTERM, previous_term)
+
+
+def _confirm_idle_shutdown(
+    runtime: MachineRuntime,
+    *,
+    has_consumed_binding: bool,
+    available_gpus: list[int] | None,
+    executor: Executor | None,
+    instance_id: str,
+    loop_interval: float,
+    started_at: str,
+) -> ContextManager[bool] | None:
+    """Recheck demand while excluding a concurrent activation decision.
+
+    Submission publishes its durable ready work before entering the same
+    lifecycle guard in ``ensure_machine_agent_started``.  Holding the guard
+    from this final dispatch through stopped-status publication closes the
+    window where activation could accept an agent that had already committed
+    to idle shutdown.
+    """
+
+    # The process already owns scheduler authority. Lifecycle operations take
+    # this lock before waiting for that process, so an idle check must never
+    # wait here and invert the lifecycle/scheduler lock order.
+    guard = runtime.agent_lifecycle_guard(blocking=False)
+    acquired = guard.__enter__()
+    if not acquired:
+        guard.__exit__(None, None, None)
+        return None
+    try:
+        with runtime.migration_read_guard() as is_migration_clear:
+            if not is_migration_clear:
+                guard.__exit__(None, None, None)
+                return None
+            _dispatch.dispatch_machine_cycle_locked(
+                runtime,
+                available_gpus=available_gpus,
+                executor=executor,
+                instance_id=instance_id,
+                heartbeat_interval_seconds=loop_interval,
+                started_at=started_at,
+                supervise=False,
+                publish_snapshots=False,
+            )
+        if not _machine_is_true_idle(runtime, has_consumed_binding=has_consumed_binding):
+            guard.__exit__(None, None, None)
+            return None
+        return guard
+    except BaseException:
+        guard.__exit__(*sys.exc_info())
+        raise
 
 
 def _start_machine_agent_locked(

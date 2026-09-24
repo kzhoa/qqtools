@@ -16,6 +16,7 @@ from qqtools.plugins.qexp.agent.context import (
     resolve_machine_runtime_root,
 )
 from qqtools.plugins.qexp.agent.lifecycle import (
+    _confirm_idle_shutdown,
     _MachineControlPlane,
     _pid_start_time_ticks,
     _publish_project_snapshots,
@@ -1708,6 +1709,74 @@ def test_restart_and_activation_share_one_lifecycle_lock(tmp_path: Path, monkeyp
     assert errors == []
     assert state["max_active_calls"] == 1
     assert state["is_running"] is True
+
+
+@pytest.mark.parametrize("demand_arrives", [False, True])
+def test_idle_shutdown_rechecks_demand_under_activation_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, demand_arrives: bool
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
+    runtime.last_cycle_had_demand = False
+
+    def dispatch(_runtime, **_kwargs) -> None:
+        with runtime.agent_lifecycle_guard(blocking=False) as acquired:
+            assert not acquired
+        runtime.last_cycle_had_demand = demand_arrives
+
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle._dispatch.dispatch_machine_cycle_locked", dispatch)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.agent.lifecycle._machine_is_true_idle",
+        lambda _runtime, *, has_consumed_binding: has_consumed_binding and not runtime.last_cycle_had_demand,
+    )
+
+    guard = _confirm_idle_shutdown(
+        runtime,
+        has_consumed_binding=True,
+        available_gpus=[0],
+        executor=None,
+        instance_id="idle-race-test",
+        loop_interval=0.1,
+        started_at="2026-01-01T00:00:00Z",
+    )
+
+    if demand_arrives:
+        assert guard is None
+        with runtime.agent_lifecycle_guard(blocking=False) as acquired:
+            assert acquired
+        return
+    assert guard is not None
+    try:
+        with runtime.agent_lifecycle_guard(blocking=False) as acquired:
+            assert not acquired
+    finally:
+        guard.__exit__(None, None, None)
+    with runtime.agent_lifecycle_guard(blocking=False) as acquired:
+        assert acquired
+
+
+def test_idle_shutdown_defers_when_lifecycle_operation_owns_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.agent.lifecycle._dispatch.dispatch_machine_cycle_locked",
+        lambda *_args, **_kwargs: pytest.fail("idle confirmation dispatched without the lifecycle lock"),
+    )
+
+    with runtime.agent_lifecycle_guard():
+        guard = _confirm_idle_shutdown(
+            runtime,
+            has_consumed_binding=True,
+            available_gpus=[0],
+            executor=None,
+            instance_id="idle-lock-test",
+            loop_interval=0.1,
+            started_at="2026-01-01T00:00:00Z",
+        )
+
+    assert guard is None
 
 
 def test_restart_waits_for_old_agent_process_after_identity_is_cleared(
