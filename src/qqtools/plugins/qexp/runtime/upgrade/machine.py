@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from bisect import bisect_left, insort
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Event, Thread
@@ -39,6 +40,266 @@ def _probe_deadline(status: dict[str, Any]) -> float | None:
 def _inaccessible_probe_deadline() -> float:
     """Bound retries for a registered root whose storage is temporarily unavailable."""
     return time.monotonic() + 5.0
+
+
+class _ProbeDeadlineMap(dict[str, float]):
+    """Keep the due-probe heap synchronized with process-local deadline writes."""
+
+    def __init__(self, runtime: MachineRuntime) -> None:
+        super().__init__()
+        self._runtime = runtime
+
+    def __setitem__(self, project_id: str, deadline: float) -> None:
+        super().__setitem__(project_id, deadline)
+        _schedule_probe_deadline(self._runtime, project_id, deadline)
+
+    def pop(self, project_id: str, *default: float) -> float:
+        present = project_id in self
+        value = super().pop(project_id, *default)
+        if present:
+            _invalidate_probe_deadline(self._runtime, project_id)
+        return value
+
+    def clear(self) -> None:
+        project_ids = tuple(self)
+        super().clear()
+        for project_id in project_ids:
+            _invalidate_probe_deadline(self._runtime, project_id)
+
+    def update(self, values: Any = (), **kwargs: float) -> None:
+        for project_id, deadline in dict(values, **kwargs).items():
+            self[project_id] = deadline
+
+
+def _schedule_probe_deadline(runtime: MachineRuntime, project_id: str, deadline: float) -> None:
+    schedule = getattr(runtime, "upgrade_probe_schedule", None)
+    positions = getattr(runtime, "upgrade_probe_schedule_positions", None)
+    if not isinstance(schedule, list) or not isinstance(positions, dict):
+        return
+
+    _remove_probe_schedule_entry(runtime, project_id)
+    sequence = getattr(runtime, "upgrade_probe_schedule_sequence", 0) + 1
+    runtime.upgrade_probe_schedule_sequence = sequence
+    schedule.append((deadline, sequence, project_id))
+    index = len(schedule) - 1
+    positions[project_id] = index
+    _sift_probe_schedule_up(runtime, index)
+
+
+def _invalidate_probe_deadline(runtime: MachineRuntime, project_id: str) -> None:
+    _remove_probe_schedule_entry(runtime, project_id)
+
+
+def _sift_probe_schedule_up(runtime: MachineRuntime, index: int) -> None:
+    schedule = runtime.upgrade_probe_schedule
+    positions = runtime.upgrade_probe_schedule_positions
+    while index:
+        parent = (index - 1) // 2
+        if schedule[parent] <= schedule[index]:
+            return
+        schedule[parent], schedule[index] = schedule[index], schedule[parent]
+        positions[schedule[parent][2]] = parent
+        positions[schedule[index][2]] = index
+        index = parent
+
+
+def _sift_probe_schedule_down(runtime: MachineRuntime, index: int) -> None:
+    schedule = runtime.upgrade_probe_schedule
+    positions = runtime.upgrade_probe_schedule_positions
+    while True:
+        left = index * 2 + 1
+        right = left + 1
+        smallest = index
+        if left < len(schedule) and schedule[left] < schedule[smallest]:
+            smallest = left
+        if right < len(schedule) and schedule[right] < schedule[smallest]:
+            smallest = right
+        if smallest == index:
+            return
+        schedule[index], schedule[smallest] = schedule[smallest], schedule[index]
+        positions[schedule[index][2]] = index
+        positions[schedule[smallest][2]] = smallest
+        index = smallest
+
+
+def _remove_probe_schedule_entry(runtime: MachineRuntime, project_id: str) -> None:
+    schedule = getattr(runtime, "upgrade_probe_schedule", None)
+    positions = getattr(runtime, "upgrade_probe_schedule_positions", None)
+    if not isinstance(schedule, list) or not isinstance(positions, dict):
+        return
+    index = positions.pop(project_id, None)
+    if index is None:
+        return
+    last_entry = schedule.pop()
+    if index == len(schedule):
+        return
+    schedule[index] = last_entry
+    positions[last_entry[2]] = index
+    parent = (index - 1) // 2
+    if index and schedule[index] < schedule[parent]:
+        _sift_probe_schedule_up(runtime, index)
+    else:
+        _sift_probe_schedule_down(runtime, index)
+
+
+def _pop_due_probe(runtime: MachineRuntime) -> tuple[float, int, str]:
+    schedule = runtime.upgrade_probe_schedule
+    due_entry = schedule[0]
+    _remove_probe_schedule_entry(runtime, due_entry[2])
+    return due_entry
+
+
+def _replace_sorted_project_id(project_ids: list[str], project_id: str, include: bool) -> None:
+    index = bisect_left(project_ids, project_id)
+    present = index < len(project_ids) and project_ids[index] == project_id
+    if include and not present:
+        insort(project_ids, project_id)
+    elif not include and present:
+        project_ids.pop(index)
+
+
+def _update_discovery_summary_project(
+    runtime: MachineRuntime,
+    status: dict[str, Any],
+    *,
+    update_runtime_sets: bool = True,
+) -> None:
+    """Update one cached project and its sorted result summaries in place."""
+    project_id = status.get("project_id")
+    if not isinstance(project_id, str):
+        return
+    project_indexes = getattr(runtime, "upgrade_discovery_project_index", None)
+    if not isinstance(project_indexes, dict):
+        return
+    project_index = project_indexes.get(project_id)
+    if not isinstance(project_index, int):
+        return
+
+    projects = runtime.upgrade_discovery_project_list
+    pending = bool(status.get("pending"))
+    projects[project_index] = status
+    runtime.upgrade_discovery_projects[project_id] = status
+
+    pending_project_ids = runtime.upgrade_discovery_pending_project_ids
+    _replace_sorted_project_id(pending_project_ids, project_id, pending)
+    if update_runtime_sets:
+        if pending:
+            runtime.upgrade_pending_projects.add(project_id)
+        else:
+            runtime.upgrade_pending_projects.discard(project_id)
+
+    runnable = pending and bool(status.get("can_run"))
+    _replace_sorted_project_id(runtime.upgrade_discovery_runnable_project_ids, project_id, runnable)
+    if update_runtime_sets:
+        if runnable:
+            runtime.upgrade_runnable_projects.add(project_id)
+        else:
+            runtime.upgrade_runnable_projects.discard(project_id)
+
+    admission_blocked = pending and bool(status.get("admission_blocked"))
+    if update_runtime_sets:
+        if admission_blocked:
+            runtime.upgrade_admission_blocked_projects.add(project_id)
+        else:
+            runtime.upgrade_admission_blocked_projects.discard(project_id)
+
+    if update_runtime_sets:
+        if pending and pending_upgrade_requires_completion(status):
+            runtime.upgrade_idle_blocked_projects.add(project_id)
+        else:
+            runtime.upgrade_idle_blocked_projects.discard(project_id)
+
+    inaccessible_positions = runtime.upgrade_discovery_inaccessible_positions
+    inaccessible_index = bisect_left(inaccessible_positions, project_index)
+    was_inaccessible = (
+        inaccessible_index < len(inaccessible_positions) and inaccessible_positions[inaccessible_index] == project_index
+    )
+    is_inaccessible = status.get("state") == "inaccessible"
+    if is_inaccessible:
+        if was_inaccessible:
+            runtime.upgrade_discovery_inaccessible_projects[inaccessible_index] = status
+        else:
+            inaccessible_positions.insert(inaccessible_index, project_index)
+            runtime.upgrade_discovery_inaccessible_projects.insert(inaccessible_index, status)
+    elif was_inaccessible:
+        inaccessible_positions.pop(inaccessible_index)
+        runtime.upgrade_discovery_inaccessible_projects.pop(inaccessible_index)
+
+    summary = runtime.upgrade_discovery_summary
+    inaccessible = bool(runtime.upgrade_discovery_inaccessible_projects)
+    has_pending = bool(pending_project_ids)
+    summary["aggregate_state"] = "inaccessible" if inaccessible else "pending" if has_pending else "complete"
+    summary["all_roots_complete"] = not inaccessible and not has_pending
+
+
+def _cached_discovery_result(runtime: MachineRuntime) -> dict[str, Any]:
+    return dict(runtime.upgrade_discovery_summary)
+
+
+def _rebuild_discovery_cache(
+    runtime: MachineRuntime,
+    revision: int,
+    bindings: tuple[ProjectBinding, ...],
+    projects: list[dict[str, Any]],
+) -> None:
+    project_ids = tuple(binding.project_id for binding in bindings)
+    project_index = {project_id: index for index, project_id in enumerate(project_ids)}
+    project_by_id = {status["project_id"]: status for status in projects if isinstance(status.get("project_id"), str)}
+    ordered_projects = [project_by_id[project_id] for project_id in project_ids if project_id in project_by_id]
+    # Discovery returns one status per binding. Keeping the index aligned with
+    # the registry makes later status replacements constant-time.
+    if len(ordered_projects) != len(project_ids):
+        project_ids = tuple(project_id for project_id in project_ids if project_id in project_by_id)
+        project_index = {project_id: index for index, project_id in enumerate(project_ids)}
+
+    pending_ids = {status["project_id"] for status in ordered_projects if status.get("pending")}
+    runnable_ids = {status["project_id"] for status in ordered_projects if status.get("can_run")}
+    admission_blocked_ids = {status["project_id"] for status in ordered_projects if status.get("admission_blocked")}
+    inaccessible_entries = [
+        (index, status) for index, status in enumerate(ordered_projects) if status.get("state") == "inaccessible"
+    ]
+
+    runtime.upgrade_pending_projects = pending_ids
+    runtime.upgrade_idle_blocked_projects = _idle_blocked_project_ids(ordered_projects, pending_ids)
+    runtime.upgrade_runnable_projects = runnable_ids
+    runtime.upgrade_admission_blocked_projects = admission_blocked_ids
+    runtime.upgrade_discovery_project_ids = project_ids
+    runtime.upgrade_discovery_project_index = project_index
+    runtime.upgrade_discovery_project_list = ordered_projects
+    runtime.upgrade_discovery_projects = project_by_id
+    runtime.upgrade_discovery_pending_project_ids = sorted(pending_ids)
+    runtime.upgrade_discovery_runnable_project_ids = sorted(runnable_ids)
+    runtime.upgrade_discovery_inaccessible_positions = [index for index, _ in inaccessible_entries]
+    runtime.upgrade_discovery_inaccessible_projects = [status for _, status in inaccessible_entries]
+    runtime.upgrade_binding_by_id = {binding.project_id: binding for binding in bindings}
+
+    runtime.upgrade_probe_schedule = []
+    runtime.upgrade_probe_schedule_positions = {}
+    runtime.upgrade_probe_schedule_sequence = 0
+    deadlines = _ProbeDeadlineMap(runtime)
+    runtime.upgrade_probe_deadlines = deadlines
+    for status in ordered_projects:
+        if not status.get("pending"):
+            continue
+        deadline = _probe_deadline(status)
+        deadlines[status["project_id"]] = deadline if deadline is not None else _inaccessible_probe_deadline()
+
+    inaccessible = bool(runtime.upgrade_discovery_inaccessible_projects)
+    has_pending = bool(runtime.upgrade_discovery_pending_project_ids)
+    runtime.upgrade_discovery_summary = {
+        "projects": ordered_projects,
+        "inaccessible_projects": runtime.upgrade_discovery_inaccessible_projects,
+        "pending_project_ids": runtime.upgrade_discovery_pending_project_ids,
+        "runnable_project_ids": runtime.upgrade_discovery_runnable_project_ids,
+        "aggregate_state": "inaccessible" if inaccessible else "pending" if has_pending else "complete",
+        "all_roots_complete": not inaccessible and not has_pending,
+        "discovery_source": "machine_registry",
+    }
+    runtime.upgrade_discovery_complete = True
+    # Publish the registry revision last.  Readers that could not acquire the
+    # discovery lock treat the cache as unknown for the whole rebuild, so they
+    # can never accept a new revision with partially replaced cache contents.
+    runtime.upgrade_registry_revision = revision
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,28 +411,68 @@ def inspect_registered_upgrades(runtime: MachineRuntime) -> dict[str, Any]:
 
 
 def discover_registered_upgrades(runtime: MachineRuntime, *, force: bool = False) -> dict[str, Any]:
+    """Serialize cache mutation while letting hot readers reuse a busy cache."""
+    acquired = runtime.upgrade_discovery_lock.acquire(blocking=force)
+    if not acquired:
+        if getattr(runtime, "upgrade_discovery_complete", False):
+            current_revision = runtime.load_registry_snapshot()[0]
+            if (
+                not runtime.upgrade_discovery_unknown
+                and getattr(runtime, "upgrade_registry_revision", None) == current_revision
+            ):
+                return _cached_discovery_result(runtime)
+            runtime.upgrade_discovery_unknown = True
+            stale = _cached_discovery_result(runtime)
+            stale["discovery_stale"] = True
+            stale["aggregate_state"] = "unknown"
+            stale["all_roots_complete"] = False
+            return stale
+        runtime.upgrade_discovery_lock.acquire()
+        acquired = True
+    try:
+        runtime.upgrade_discovery_unknown = True
+        while True:
+            starting_revision = runtime.load_registry_snapshot()[0]
+            result = _discover_registered_upgrades_locked(runtime, force=force)
+            if runtime.load_registry_snapshot()[0] == starting_revision:
+                runtime.upgrade_discovery_unknown = False
+                return result
+            force = True
+    finally:
+        if acquired:
+            runtime.upgrade_discovery_lock.release()
+
+
+def _discover_registered_upgrades_locked(runtime: MachineRuntime, *, force: bool = False) -> dict[str, Any]:
     """Perform startup or binding-change discovery and cache only bounded metadata."""
-    revision, bindings = runtime.load_registry()
+    revision, bindings = runtime.load_registry_snapshot()
     if (
         not force
         and getattr(runtime, "upgrade_discovery_complete", False)
         and getattr(runtime, "upgrade_registry_revision", None) == revision
     ):
-        pending_ids = set(getattr(runtime, "upgrade_pending_projects", set()))
-        deadlines = getattr(runtime, "upgrade_probe_deadlines", {})
-        # Keep the last bounded status for every registered binding.  The fast
-        # path below probes only due pending roots, but callers still need the
-        # last known inaccessible and complete roots to distinguish a partial
-        # discovery from an empty/all-complete result.
-        cached_projects = getattr(runtime, "upgrade_discovery_projects", {})
-        if not isinstance(cached_projects, dict):
-            cached_projects = {}
-        due_ids = [
-            project_id
-            for project_id in sorted(pending_ids)
-            if deadlines.get(project_id, float("inf")) <= time.monotonic()
-        ]
-        for binding in (item for item in bindings if item.project_id in due_ids[: runtime.upgrade_probe_budget]):
+        deadlines = runtime.upgrade_probe_deadlines
+        schedule = runtime.upgrade_probe_schedule
+        binding_by_id = runtime.upgrade_binding_by_id
+        pending_ids = runtime.upgrade_pending_projects
+        probe_budget = max(0, runtime.upgrade_probe_budget)
+        probes = 0
+        stale_entries = 0
+        now = time.monotonic()
+        while schedule and probes < probe_budget and stale_entries < probe_budget:
+            deadline, _sequence, project_id = schedule[0]
+            if deadline > now:
+                break
+            _pop_due_probe(runtime)
+            if deadlines.get(project_id) != deadline or project_id not in pending_ids:
+                stale_entries += 1
+                if project_id not in pending_ids:
+                    deadlines.pop(project_id, None)
+                continue
+            probes += 1
+            binding = binding_by_id.get(project_id)
+            if binding is None:
+                continue
             try:
                 coordinator = UpgradeCoordinator(binding.root_config())
                 status = coordinator.status()
@@ -180,48 +481,16 @@ def discover_registered_upgrades(runtime: MachineRuntime, *, force: bool = False
                     # bounded applicability check after storage recovers instead of caching idle.
                     status = coordinator.discover()
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                deadlines[binding.project_id] = _inaccessible_probe_deadline()
+                deadlines[project_id] = _inaccessible_probe_deadline()
                 continue
-            cached_projects[binding.project_id] = status
+            status["project_id"] = project_id
+            _update_discovery_summary_project(runtime, status)
             if not status.get("pending"):
-                pending_ids.discard(binding.project_id)
-                runtime.upgrade_runnable_projects.discard(binding.project_id)
-                runtime.upgrade_admission_blocked_projects.discard(binding.project_id)
-                deadlines.pop(binding.project_id, None)
+                deadlines.pop(project_id, None)
             else:
-                deadlines[binding.project_id] = _probe_deadline(status) or time.monotonic()
-                if status.get("can_run"):
-                    runtime.upgrade_runnable_projects.add(binding.project_id)
-                else:
-                    runtime.upgrade_runnable_projects.discard(binding.project_id)
-                if status.get("admission_blocked"):
-                    runtime.upgrade_admission_blocked_projects.add(binding.project_id)
-                else:
-                    runtime.upgrade_admission_blocked_projects.discard(binding.project_id)
-        runtime.upgrade_pending_projects = pending_ids
-        runtime.upgrade_discovery_projects = {
-            binding.project_id: cached_projects[binding.project_id]
-            for binding in bindings
-            if binding.project_id in cached_projects
-        }
-        projects = [
-            runtime.upgrade_discovery_projects[binding.project_id]
-            for binding in bindings
-            if binding.project_id in runtime.upgrade_discovery_projects
-        ]
-        runtime.upgrade_idle_blocked_projects = _idle_blocked_project_ids(projects, pending_ids)
-        inaccessible_projects = [item for item in projects if item.get("state") == "inaccessible"]
-        return {
-            "projects": projects,
-            "inaccessible_projects": inaccessible_projects,
-            "pending_project_ids": sorted(pending_ids),
-            "runnable_project_ids": sorted(getattr(runtime, "upgrade_runnable_projects", set())),
-            "aggregate_state": "inaccessible" if inaccessible_projects else "pending" if pending_ids else "complete",
-            "all_roots_complete": not inaccessible_projects and not pending_ids,
-            "discovery_source": "machine_registry",
-        }
-    pending_ids: set[str] = set()
-    runnable_ids: set[str] = set()
+                deadlines[project_id] = _probe_deadline(status) or time.monotonic()
+        return _cached_discovery_result(runtime)
+
     projects: list[dict[str, Any]] = []
     for binding in bindings:
         try:
@@ -236,39 +505,10 @@ def discover_registered_upgrades(runtime: MachineRuntime, *, force: bool = False
                 "next_probe_at": None,
                 "error": str(exc),
             }
-        if status.get("pending"):
-            pending_ids.add(binding.project_id)
-        if status.get("can_run"):
-            runnable_ids.add(binding.project_id)
+        status["project_id"] = binding.project_id
         projects.append(status)
-    runtime.upgrade_registry_revision = revision
-    runtime.upgrade_pending_projects = pending_ids
-    runtime.upgrade_idle_blocked_projects = _idle_blocked_project_ids(projects, pending_ids)
-    runtime.upgrade_runnable_projects = runnable_ids
-    runtime.upgrade_admission_blocked_projects = {
-        status["project_id"] for status in projects if status.get("admission_blocked")
-    }
-    runtime.upgrade_probe_deadlines = {
-        status["project_id"]: (
-            _probe_deadline(status) if _probe_deadline(status) is not None else _inaccessible_probe_deadline()
-        )
-        for status in projects
-        if status.get("pending")
-    }
-    runtime.upgrade_discovery_projects = {
-        status["project_id"]: status for status in projects if isinstance(status.get("project_id"), str)
-    }
-    runtime.upgrade_discovery_complete = True
-    inaccessible_projects = [item for item in projects if item.get("state") == "inaccessible"]
-    return {
-        "projects": projects,
-        "inaccessible_projects": inaccessible_projects,
-        "pending_project_ids": sorted(pending_ids),
-        "runnable_project_ids": sorted(runnable_ids),
-        "aggregate_state": "inaccessible" if inaccessible_projects else "pending" if pending_ids else "complete",
-        "all_roots_complete": not inaccessible_projects and not pending_ids,
-        "discovery_source": "machine_registry",
-    }
+    _rebuild_discovery_cache(runtime, revision, bindings, projects)
+    return _cached_discovery_result(runtime)
 
 
 def advance_registered_upgrades(
@@ -277,9 +517,27 @@ def advance_registered_upgrades(
     force_discovery: bool = False,
     budget: MachineUpgradeBudget | None = None,
 ) -> dict[str, Any]:
+    """Advance upgrades without allowing an older discovery to replace a newer cache."""
+    with runtime.upgrade_discovery_lock:
+        runtime.upgrade_discovery_unknown = True
+        starting_revision = runtime.load_registry_snapshot()[0]
+        result = _advance_registered_upgrades_locked(runtime, force_discovery=force_discovery, budget=budget)
+        while runtime.load_registry_snapshot()[0] != starting_revision:
+            starting_revision = runtime.load_registry_snapshot()[0]
+            _discover_registered_upgrades_locked(runtime, force=True)
+        runtime.upgrade_discovery_unknown = False
+        return result
+
+
+def _advance_registered_upgrades_locked(
+    runtime: MachineRuntime,
+    *,
+    force_discovery: bool = False,
+    budget: MachineUpgradeBudget | None = None,
+) -> dict[str, Any]:
     """Discover applicable work and advance pending projects in fair bounded slices."""
     budget = budget or MachineUpgradeBudget()
-    discovery = discover_registered_upgrades(runtime, force=force_discovery)
+    discovery = _discover_registered_upgrades_locked(runtime, force=force_discovery)
     _revision, bindings = runtime.load_registry()
     pending_ids: set[str] = set(discovery.get("pending_project_ids", ()))
     discovered_projects = list(discovery.get("projects", ()))
@@ -378,6 +636,8 @@ def advance_registered_upgrades(
             runtime.upgrade_admission_blocked_projects.add(item["project_id"])
         else:
             runtime.upgrade_admission_blocked_projects.discard(item["project_id"])
+    for item in results:
+        _update_discovery_summary_project(runtime, item, update_runtime_sets=False)
     if cursor is not None:
         _save_upgrade_cursor(runtime, cursor)
     worker_state = "runnable" if any(item.get("state") in {"runnable"} for item in results) else "waiting"

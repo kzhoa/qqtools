@@ -190,6 +190,24 @@ runtime is `daemon`; `on_demand` is explicit. Legacy per-binding modes migrate o
 daemon binding selects daemon, otherwise enabled bindings select on-demand; stored bindings are the
 fallback and an empty inventory selects daemon.
 
+The running agent may make an idle registered binding dormant after every service
+lane proves quiescence against the same durable Project activation checkpoint.
+Dormancy only evicts hot machine-local service context. New shared work advances
+the checkpoint and is found by a fair cold poll with a budget of four dormant
+bindings per scheduler cycle; the fallback revisit envelope is
+`ceil(dormant_bindings / 4)` cycles plus filesystem latency. A stopped agent is
+not remotely awakened. New borrow claims remain blocked whenever an enabled
+binding is omitted from primary-demand inspection. See the
+[binding working-set contract](qexp_working_set.md).
+
+Activation delivery is per registration generation. Each consumer advances a
+contiguous shared cursor only after all local service lanes have persisted their
+handoff. The Project periodically compacts at most 256 activation events into a
+durable authoritative-index reconstruction snapshot. Offline and newly
+registered consumers below that floor must reconcile the snapshot coverage and
+replay the retained suffix before dormancy. Removing a binding retires only its
+exact consumer generation through a crash-recoverable machine-local intent.
+
 `agent start` is detached and idempotent. Its positive `--timeout` defaults to 30 seconds. Success
 requires a fresh response from the current runtime generation, acknowledgement of the requested
 policy revision, and authority validation plus an initial scheduler reconciliation for every

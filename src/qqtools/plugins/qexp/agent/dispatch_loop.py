@@ -927,29 +927,22 @@ def _dispatch_machine_cycle_locked(
     if getattr(runtime, "pending_launch_handoffs", {}):
         runtime.last_cycle_had_demand = True
     with diagnostic_span("machine.registry.load"):
-        _, registered = runtime.load_registry()
-    supervised = [
+        registry_revision, registered = runtime.load_registry_snapshot()
+    runtime.working_set.reconcile(registered, revision=registry_revision)
+    runtime.working_set.poll_dormant(limit=4)
+    resident_supervised = [
         binding
-        for binding in registered
-        if (binding.enabled or runtime.binding_state(binding) == "draining")
-        and runtime.registration_status(binding)["state"] != "superseded"
+        for binding in runtime.working_set.resident_bindings()
+        if runtime.registration_status(binding)["state"] != "superseded"
     ]
+    omitted_dormant_enabled = runtime.working_set.has_dormant_enabled_binding()
+    supervised = resident_supervised
     if supervisors is not None:
         supervised_ids = {binding.project_id for binding in supervised}
         for project_id in set(supervisors) - supervised_ids:
             del supervisors[project_id]
             getattr(runtime, "supervisor_generations", {}).pop(project_id, None)
     if not supervised:
-        for binding in registered:
-            if runtime.registration_status(binding)["state"] == "superseded":
-                continue
-            try:
-                if runtime.binding_write_eligible(binding, renew=True):
-                    _helpers._binding_config(runtime, binding)
-                    runtime.last_cycle_consumed_binding = True
-                    break
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                continue
         try:
             _observe_gpu_policy(
                 runtime,
@@ -965,7 +958,12 @@ def _dispatch_machine_cycle_locked(
     dispatchable: dict[str, RootConfig] = {}
     results: list[dict[str, Any]] = []
     upgrade_blocked: dict[str, dict[str, Any]] = {}
+    scheduler_turns = {
+        binding.project_id: runtime.working_set.begin_turn(binding, "scheduler") for binding in supervised
+    }
     for binding in supervised:
+        if not binding.enabled and runtime.binding_state(binding) != "draining":
+            continue
         if not runtime.binding_write_eligible(binding, renew=True):
             results.append(
                 {
@@ -1031,11 +1029,14 @@ def _dispatch_machine_cycle_locked(
             if (
                 ready_generations is not None
                 and ready_generations.get(binding.project_id) != binding.registration_generation
+                and binding.enabled
             ):
                 results.append({"project_id": binding.project_id, "launched": [], "status": "authority_recovering"})
                 continue
+            if not binding.enabled:
+                continue
             dispatchable[binding.project_id] = cfg
-            if binding.project_id in runtime.upgrade_admission_blocked_projects:
+            if runtime.upgrade_discovery_unknown or binding.project_id in runtime.upgrade_admission_blocked_projects:
                 upgrade_blocked[binding.project_id] = {"admission_blocked": True, "state": "cached"}
         except (OSError, RuntimeError, ValueError) as exc:
             results.append(
@@ -1172,8 +1173,13 @@ def _dispatch_machine_cycle_locked(
             if has_capacity
             else PrimaryDemandProbe("unresolved")
         )
+        if omitted_dormant_enabled and probe.state == "no_primary_demand":
+            probe = PrimaryDemandProbe(
+                "unresolved",
+                (*probe.diagnostics, {"reason": "dormant_primary_binding_not_probed"}),
+            )
         borrow_admission_grant = None
-        if probe.state == "no_primary_demand":
+        if has_capacity and not omitted_dormant_enabled and probe.state == "no_primary_demand":
             borrow_admission_grant = _build_borrow_admission_grant(
                 runtime, admission_dispatchable, probe, enabled_ids - set(upgrade_blocked), lane=lane
             )
@@ -1194,8 +1200,9 @@ def _dispatch_machine_cycle_locked(
             and not authority_recovery_has_demand
             for item in probe.diagnostics
         )
-        if probe.state in {"runnable_now", "waiting_for_aggregation"} or (
-            has_capacity and probe.state == "unresolved" and not unresolved_only_for_empty_authority
+        if has_capacity and (
+            probe.state in {"runnable_now", "waiting_for_aggregation"}
+            or (probe.state == "unresolved" and not unresolved_only_for_empty_authority)
         ):
             runtime.last_cycle_had_demand = True
         budget = SliceBudget(WorkBudgetPolicy())
@@ -1244,7 +1251,76 @@ def _dispatch_machine_cycle_locked(
             started_at=started_at,
             write_guard=lambda project_id: runtime.binding_write_guard(readable_bindings[project_id]),
         )
+    _acknowledge_scheduler_turns(runtime, supervised, scheduler_turns, result_by_project, recovered)
     return results
+
+
+def _acknowledge_scheduler_turns(
+    runtime: MachineRuntime,
+    bindings: list[ProjectBinding],
+    turns: dict[str, Any],
+    results: dict[str, dict[str, Any]],
+    recovered: dict[str, list[str]],
+) -> None:
+    """Retire only scheduler turns with no local or primary-probe obligation."""
+    try:
+        reservations = reservation_snapshot(runtime.root).reservations
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        reservations = None
+    pending_handoffs = runtime.pending_launch_identities()
+    reservations_unknown = reservations is None or any(not isinstance(item, dict) for item in reservations)
+    reservation_projects = (
+        set()
+        if reservations is None
+        else {
+            item.get("project_id")
+            for item in reservations
+            if isinstance(item, dict)
+            and item.get("state") in ("active", "provisional")
+            and isinstance(item.get("project_id"), str)
+        }
+    )
+    handoff_projects = {identity[0] for identity in pending_handoffs}
+    upgrade_or_recovery = (
+        set(runtime.upgrade_pending_projects)
+        | set(runtime.upgrade_idle_blocked_projects)
+        | set(runtime.upgrade_runnable_projects)
+        | set(runtime.upgrade_admission_blocked_projects)
+        | set(runtime.recovery_enrollment_pending_projects)
+        | set(runtime.upgrade_probe_deadlines)
+    )
+    for binding in bindings:
+        turn = turns.get(binding.project_id)
+        if turn is None:
+            continue
+        project_id = binding.project_id
+        result = results.get(project_id)
+        has_reservation = reservations_unknown or project_id in reservation_projects
+        has_handoff = project_id in handoff_projects
+        has_recovered = bool(recovered.get(project_id))
+        has_launched = bool(result and result.get("launched"))
+        has_flag = project_id in upgrade_or_recovery
+        if has_reservation or has_handoff or has_recovered or has_launched or has_flag:
+            try:
+                runtime.working_set.activate(binding, "scheduler_obligation")
+            except ValueError:
+                pass
+        route_quiescent = not binding.enabled or all(
+            (route := runtime.primary_probe.route((project_id, scope, lane))).is_complete and route.recheck is None
+            for lane in ("gpu", "cpu")
+            for scope in ("shared", "home")
+        )
+        result_quiescent = not binding.enabled or (result is not None and result.get("status") == "dispatched")
+        quiescent = bool(
+            result_quiescent
+            and route_quiescent
+            and not has_reservation
+            and not has_handoff
+            and not has_recovered
+            and not has_launched
+            and not has_flag
+        )
+        runtime.working_set.acknowledge(turn, quiescent=quiescent)
 
 
 def dispatch_machine_cycle(

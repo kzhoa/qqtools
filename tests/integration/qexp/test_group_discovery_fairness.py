@@ -108,12 +108,44 @@ def test_disabled_binding_stops_service_and_closes_existing_owners(tmp_path, mon
     _, worker, instances, calls, runtime, binding = setup_worker(tmp_path, monkeypatch)
     stop = worker._stop
     monkeypatch.setattr(
-        runtime, "load_registry", lambda: (2, [replace(binding, enabled=False)]) if stop.turn >= 100 else (1, [binding])
+        runtime,
+        "load_registry_snapshot",
+        lambda: (2, (replace(binding, enabled=False),)) if stop.turn >= 100 else (1, (binding,)),
     )
     worker._run()
     assert instances
     assert all(item.is_closed for item in instances)
     assert all(turn < 100 for turn, _, _, _ in calls)
+
+
+def test_disabled_binding_ack_indexes_resources_once(tmp_path, monkeypatch):
+    _, worker, _, _, runtime, binding = setup_worker(tmp_path, monkeypatch)
+
+    class CountingEntries(dict):
+        values_calls = 0
+
+        def values(self):
+            self.values_calls += 1
+            return super().values()
+
+    class WorkingSet:
+        def begin_turn(self, item, lane):
+            return item, lane
+
+        def acknowledge(self, turn, *, quiescent):
+            assert quiescent is True
+            return True
+
+    entries = CountingEntries()
+    restarts = CountingEntries()
+    worker._entries = entries
+    worker._restart_due = restarts
+    runtime.working_set = WorkingSet()
+
+    worker._ack_disabled_bindings([replace(binding, enabled=False)] * 32, {})
+
+    assert entries.values_calls == 1
+    assert restarts.values_calls == 1
 
 
 def test_failed_close_is_retried_without_stopping_other_groups(tmp_path, monkeypatch):

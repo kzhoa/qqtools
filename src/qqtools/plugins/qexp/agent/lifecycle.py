@@ -277,6 +277,12 @@ def run_machine_agent_loop(
     observed_agent_mode = agent_config.agent_mode
     observed_inventory_revision = initial_inventory_revision
     reconciled_project_ids: list[str] = []
+    reconciled_inventory_revision: int | None = None
+    reconciled_registry_revision: int | None = None
+    reconciled_policy_revision: int | None = None
+    enabled_project_ids: set[str] = set()
+    enabled_projects_reconciled = False
+    readiness_view_initialized = False
     cycle_completed = False
     idle_since: float | None = None
     upgrade_worker: MachineUpgradeWorker | None = None
@@ -401,8 +407,9 @@ def run_machine_agent_loop(
                                 publish_snapshots=False,
                             )
                             cycle_completed = True
-                            if machine_runtime.last_cycle_consumed_binding or _consume_first_registered_binding(
-                                machine_runtime
+                            if not has_consumed_binding and (
+                                machine_runtime.last_cycle_consumed_binding
+                                or _consume_first_registered_binding(machine_runtime)
                             ):
                                 has_consumed_binding = True
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
@@ -428,32 +435,50 @@ def run_machine_agent_loop(
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     pass
                 try:
-                    observed_inventory_revision, observed_entries = load_inventory(machine_runtime)
-                    enabled_ids = {entry.project_id for entry in observed_entries if entry.enabled}
+                    observed_inventory_revision, observed_entries = machine_runtime.load_inventory_snapshot()
                     if cycle_completed:
-                        _registry_revision, observed_bindings = machine_runtime.load_registry()
-                        reconciled_project_ids = [
-                            entry.project_id
-                            for entry in observed_entries
-                            if entry.enabled
-                            and any(
-                                binding.project_id == entry.project_id
-                                and machine_runtime.registration_status(binding).get("write_eligible", False)
-                                for binding in observed_bindings
-                            )
-                        ]
-                        # A completed scheduler cycle acknowledges the exact
-                        # config revision observed at its start.  A current,
-                        # authority-valid binding is the durable proof that its
-                        # initial reconciliation was admitted.
-                        policy_revision_acknowledged = policy_revision_requested
-                    else:
-                        enabled_ids = {entry.project_id for entry in observed_entries if entry.enabled}
+                        registry_revision, observed_bindings = machine_runtime.load_registry_snapshot()
+                        if (
+                            not readiness_view_initialized
+                            or reconciled_inventory_revision != observed_inventory_revision
+                            or reconciled_registry_revision != registry_revision
+                            or reconciled_policy_revision != policy_revision_requested
+                        ):
+                            if (
+                                not readiness_view_initialized
+                                or reconciled_inventory_revision != observed_inventory_revision
+                            ):
+                                enabled_project_ids = {entry.project_id for entry in observed_entries if entry.enabled}
+                            bindings_by_project_id: dict[str, list[ProjectBinding]] = {}
+                            for binding in observed_bindings:
+                                bindings_by_project_id.setdefault(binding.project_id, []).append(binding)
+                            reconciled_project_ids = [
+                                entry.project_id
+                                for entry in observed_entries
+                                if entry.enabled
+                                and any(
+                                    machine_runtime.registration_status(binding).get("write_eligible", False)
+                                    for binding in bindings_by_project_id.get(entry.project_id, ())
+                                )
+                            ]
+                            enabled_projects_reconciled = enabled_project_ids.issubset(set(reconciled_project_ids))
+                            reconciled_inventory_revision = observed_inventory_revision
+                            reconciled_registry_revision = registry_revision
+                            reconciled_policy_revision = policy_revision_requested
+                            readiness_view_initialized = True
+                        if (
+                            reconciled_inventory_revision == observed_inventory_revision
+                            and reconciled_registry_revision == registry_revision
+                            and reconciled_policy_revision == policy_revision_requested
+                        ):
+                            # A completed cycle acknowledges only the durable view
+                            # whose enabled projects have been reconciled.
+                            policy_revision_acknowledged = policy_revision_requested
                     ready = bool(
                         cycle_completed
-                        and enabled_ids
+                        and enabled_project_ids
                         and policy_revision_acknowledged == policy_revision_requested
-                        and enabled_ids.issubset(set(reconciled_project_ids))
+                        and enabled_projects_reconciled
                     )
                     _publish_process_status(
                         machine_runtime,

@@ -118,7 +118,7 @@ class _MachineControlPlane:
             supervisor.close()
 
     def _supervised_bindings(self) -> list[ProjectBinding]:
-        revision, registered = self._runtime.load_registry()
+        revision, registered = self._runtime.load_registry_snapshot()
         if (
             self._registry_revision is not None
             and revision != self._registry_revision
@@ -126,9 +126,10 @@ class _MachineControlPlane:
         ):
             self._scheduler_wakeup.set()
         self._registry_revision = revision
+        self._runtime.working_set.reconcile(registered, revision=revision)
         # Registry discovery is machine-local. Shared status is checked inside
         # each project's turn, so it cannot delay selection of all projects.
-        return registered
+        return self._runtime.working_set.resident_bindings()
 
     def _has_local_evidence(self, binding: ProjectBinding, cfg: RootConfig, names: tuple[str, ...]) -> bool:
         for name in names:
@@ -137,7 +138,8 @@ class _MachineControlPlane:
             if scan is None:
                 scan = EvidenceScan(local_paths(cfg.runtime_root)[name], directories=name == "termination_decisions")
                 self._eligibility_scans[key] = scan
-            if scan.take(1).paths:
+            batch = scan.take(1)
+            if batch.paths or not batch.is_complete:
                 return True
         return False
 
@@ -213,6 +215,7 @@ class _MachineControlPlane:
         for project_id in set(self._outage_supervisors) - supervised_ids:
             self._outage_supervisors.pop(project_id).close()
         for binding in bindings[:16]:
+            authority_turn = self._runtime.working_set.begin_turn(binding, "authority")
             project_started = time.monotonic()
             eligibility_diagnostics = RuntimeDiagnostics()
             service_key = (binding.project_id, binding.registration_generation)
@@ -229,6 +232,8 @@ class _MachineControlPlane:
                 "phase_seconds": {},
                 "eligibility_inventory_checks": 0,
             }
+            supervisor: AuthoritySupervisor | None = None
+            explicit_quiescent = False
             try:
                 with _measure_authority_phase(project_sample, "registration_status"):
                     registration_status = self._runtime.registration_status(binding)
@@ -260,7 +265,23 @@ class _MachineControlPlane:
                     and not self._has_local_process(binding, cfg)
                     and not self._has_local_convergence_evidence(binding, cfg)
                 ):
+                    reservations = reservation_snapshot(self._runtime.root).reservations
+                    has_reservation = any(
+                        not isinstance(item, dict)
+                        or (
+                            item.get("project_id") == binding.project_id
+                            and item.get("state") in ("active", "provisional")
+                        )
+                        for item in reservations
+                    )
+                    previous_supervisor = self._supervisors.pop(binding.project_id, None)
+                    if previous_supervisor is not None:
+                        previous_supervisor.close()
+                    self._supervisor_generations.pop(binding.project_id, None)
+                    for key in [key for key in self._eligibility_scans if key[0] == binding.project_id]:
+                        self._eligibility_scans.pop(key).close()
                     project_sample["observation_status"] = "disabled_no_local_process"
+                    explicit_quiescent = not has_reservation
                     continue
                 with (
                     _measure_authority_phase(project_sample, "eligibility"),
@@ -343,6 +364,59 @@ class _MachineControlPlane:
                     pending_supervisor = self._supervisors.get(binding.project_id)
                     if pending_supervisor is not None:
                         pending_supervisor.cancel_pending_control()
+                quiescent = explicit_quiescent
+                if project_sample["observation_status"] == "tick_returned" and supervisor is not None:
+                    work = supervisor.work_snapshot
+                    lanes = work.get("lanes")
+                    no_failures = (
+                        work.get("discovery_error") is None
+                        and work.get("responsibility_discovery_failures") == 0
+                        and work.get("active_failures") == 0
+                        and work.get("cleanup_failures") == 0
+                        and isinstance(lanes, dict)
+                        and all(
+                            isinstance(lane, dict)
+                            and lane.get("failures") == 0
+                            and lane.get("oldest_failed_work_age_seconds") is None
+                            for lane in lanes.values()
+                        )
+                    )
+                    try:
+                        reservations = reservation_snapshot(self._runtime.root).reservations
+                        has_reservation = any(
+                            not isinstance(item, dict)
+                            or (
+                                item.get("project_id") == binding.project_id
+                                and item.get("state") in ("active", "provisional")
+                            )
+                            for item in reservations
+                        )
+                        cfg = _helpers._binding_config(self._runtime, binding)
+                        no_local_evidence = self._local_evidence_quiescent(
+                            binding,
+                            cfg,
+                            (
+                                "processes",
+                                "registrations",
+                                "observations",
+                                "launch_intents",
+                                "wrappers",
+                                "termination_decisions",
+                            ),
+                        )
+                        quiescent = bool(
+                            work.get("startup_complete") is True
+                            and work.get("active_cache_size") == 0
+                            and work.get("pending_control_attempt") is None
+                            and work.get("termination_backlog") == 0
+                            and work.get("active_admission_deferred") == 0
+                            and no_failures
+                            and not has_reservation
+                            and no_local_evidence
+                        )
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+                        quiescent = False
+                self._runtime.working_set.acknowledge(authority_turn, quiescent=quiescent)
                 project_sample["eligibility_operations"] = eligibility_diagnostics.snapshot()
                 project_sample["work_seconds"] = max(0.0, time.monotonic() - project_started)
                 sample["projects"].append(project_sample)
@@ -377,6 +451,18 @@ class _MachineControlPlane:
         except (OSError, RuntimeError, ValueError) as local_exc:
             project_sample["local_reconciliation"] = "unavailable"
             project_sample["local_error_type"] = type(local_exc).__name__
+
+    def _local_evidence_quiescent(self, binding: ProjectBinding, cfg: RootConfig, names: tuple[str, ...]) -> bool:
+        """Prove all selected local evidence lanes reached an empty EOF."""
+        for name in names:
+            scan = EvidenceScan(local_paths(cfg.runtime_root)[name], directories=name == "termination_decisions")
+            try:
+                page = scan.take(1)
+                if page.paths or not page.is_complete:
+                    return False
+            finally:
+                scan.close()
+        return True
 
     def _finish_authority_sample(self, sample: dict[str, Any], started: float, interval: float) -> None:
         sample["sampled_at"] = utc_now()
@@ -465,6 +551,12 @@ class _MachineControlPlane:
             bindings = self._supervised_bindings()
         except (OSError, RuntimeError, ValueError):
             return "registry_unavailable"
+        checked, renewed = self._runtime.working_set.renew_dormant_registrations(
+            limit=64,
+            heartbeat_interval_seconds=self._loop_interval,
+        )
+        diagnostic_increment("heartbeat.dormant_registration_checks", checked)
+        diagnostic_increment("heartbeat.dormant_registration_renewals", renewed)
         readable: dict[str, RootConfig] = {}
         readable_bindings: dict[str, ProjectBinding] = {}
         for binding in bindings:

@@ -63,24 +63,31 @@ def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool
     """Retain unfinished recovery and reservations before on-demand idle exit."""
     if getattr(runtime, "pending_launch_handoffs", {}):
         return False
+    if getattr(runtime, "upgrade_discovery_unknown", False):
+        return False
     if getattr(runtime, "upgrade_idle_blocked_projects", set()):
         return False
     if getattr(runtime, "recovery_enrollment_pending_projects", set()):
         return False
-    try:
-        _revision, bindings = runtime.load_registry()
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-        return False
     if not has_consumed_binding:
         # Startup waits until the current process has validated and consumed a binding.
         return False
-    # Residency is machine-global.  Per-binding legacy metadata remains useful
-    # for migration, but it must not decide whether this current agent exits.
+    if getattr(runtime, "last_cycle_had_demand", True):
+        return False
     try:
         global_policy = load_agent_config(runtime)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         return False
-    for binding in bindings:
+    try:
+        if not runtime.working_set.is_reconciled:
+            revision, bindings = runtime.load_registry_snapshot()
+            runtime.working_set.reconcile(bindings, revision=revision)
+        resident_bindings = runtime.working_set.resident_bindings()
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return False
+    if resident_bindings and not global_policy.exit_when_idle:
+        return False
+    for binding in resident_bindings:
         try:
             with closing(runtime.iter_recovery_blockers(binding, should_use_capture=True)) as blockers:
                 if next(blockers, None) is not None:
@@ -93,10 +100,6 @@ def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool
                 next(paths[name].glob("*.json"), None) is not None
                 for name in ("availability_active", "group_control_active", "cleanup_active")
             ):
-                return False
-            if not global_policy.exit_when_idle:
-                return False
-            if getattr(runtime, "last_cycle_had_demand", True):
                 return False
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             return False

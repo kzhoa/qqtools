@@ -17,6 +17,7 @@ from ..directory_capture import read_directory_entry
 from ..group_namespace import is_group_authority_isolated
 from ..locks import exclusive, schema_lock, schema_writer_lock
 from ..paths import shared_paths, task_path
+from ..project_activation import project_activation_transaction
 from ..protocol_compatibility import OBSERVATION_CAPABILITY
 from ..records import TaskRecord, validate_identifier
 from ..store import atomic_replace, read_json
@@ -593,8 +594,9 @@ def request_rebuild(cfg: RootConfig) -> dict[str, Any]:
                 state = projection.new_state(cfg, state="degraded")
             if state is None:
                 return {"state": "waiting", "reason": "observation_activation_deferred"}
-            updated = _revisioned(state, state="degraded", dirty=True, build=None)
-            projection.write_state(cfg, updated)
+            with project_activation_transaction(cfg, "observation_rebuild_request"):
+                updated = _revisioned(state, state="degraded", dirty=True, build=None)
+                projection.write_state(cfg, updated)
             return {"state": "degraded", "reason": "rebuild_requested", "revision": updated["revision"]}
 
 
@@ -635,18 +637,31 @@ class MachineObservationWorker:
         try:
             while not self._stop.is_set():
                 try:
-                    _revision, bindings = self._runtime.load_registry()
+                    revision, bindings = self._runtime.load_registry_snapshot()
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     if self._stop.wait(_WORKER_WAIT_SECONDS):
                         break
                     continue
-                self._reconcile(bindings)
-                selected = self._select(bindings)
+                self._runtime.working_set.reconcile(bindings, revision=revision)
+                resident = self._runtime.working_set.resident_bindings()
+                enabled = [binding for binding in resident if binding.enabled]
+                self._reconcile(enabled)
+                retained_identities = {
+                    (binding.project_id, binding.registration_generation, binding.shared_root)
+                    for binding in self._maintenance
+                }
+                for binding in resident:
+                    identity = (binding.project_id, binding.registration_generation, binding.shared_root)
+                    if not binding.enabled and identity not in retained_identities:
+                        turn = self._runtime.working_set.begin_turn(binding, "observation")
+                        self._runtime.working_set.acknowledge(turn, quiescent=True)
+                selected = self._select(enabled)
                 if selected is None:
                     if self._stop.wait(_WORKER_IDLE_SECONDS):
                         break
                     continue
                 binding = selected
+                turn = self._runtime.working_set.begin_turn(binding, "observation")
                 maintenance = self._maintenance[binding]
                 try:
                     with self._runtime.binding_write_guard(binding) as eligible:
@@ -660,6 +675,10 @@ class MachineObservationWorker:
                     self._idle_until[binding] = time.monotonic() + _ACTIVE_POLL_SECONDS
                 else:
                     self._idle_until.pop(binding, None)
+                self._runtime.working_set.acknowledge(
+                    turn,
+                    quiescent=result.get("state") == "active" and result.get("reason") == "idle",
+                )
                 if self._stop.wait(_WORKER_WAIT_SECONDS):
                     break
         finally:
@@ -670,12 +689,13 @@ class MachineObservationWorker:
         for binding in tuple(self._maintenance):
             if binding in current:
                 continue
-            maintenance = self._maintenance.pop(binding)
-            self._idle_until.pop(binding, None)
+            maintenance = self._maintenance[binding]
             try:
                 maintenance.close()
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                pass
+                continue
+            self._maintenance.pop(binding, None)
+            self._idle_until.pop(binding, None)
         for binding in bindings:
             if binding not in self._maintenance:
                 try:

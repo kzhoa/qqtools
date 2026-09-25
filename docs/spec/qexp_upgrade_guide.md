@@ -153,6 +153,25 @@ long as any Group refers to it.
 
 ## Do not treat every qqtools upgrade as an agent restart
 
+The binding working-set format is disposable machine-local coordination state.
+After installing a release that introduces it, restart each machine agent through
+the normal rolling procedure. Every current registration generation starts
+resident, revalidates authority and service obligations, and only then may become
+dormant. Do not copy `working-set-v1.json` between machine runtimes or registration
+generations. A missing or corrupt record causes conservative resident replay; it
+does not require a Project schema migration. The shared
+`operations/project-activation-v1/checkpoint.json` is preserved with the Project
+and must not be reset as a way to clear work.
+
+Preserve the complete `operations/project-activation-v1/` directory, including
+events, snapshots, membership, and consumer records. Do not delete an activation
+suffix or consumer cursor to speed an upgrade. Agents from before the journal
+format are handled by conservative epoch bootstrap only when the event directory
+is wholly absent; a partially missing journal is damage and requires repair.
+Rolling older writers remain discoverable through bounded cold reconciliation,
+but current agents should be restarted promptly so supported writers publish the
+recoverable activation transaction directly.
+
 Use the target protocol's documented activation procedure. An unchanged root
 protocol can use an agent restart; a new capability requires either an explicit
 upgrade or a qualified rolling admission protocol. The `local-recovery-v1`

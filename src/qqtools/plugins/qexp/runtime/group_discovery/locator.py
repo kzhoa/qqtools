@@ -523,6 +523,12 @@ class GroupLocatorTraversal:
         self._offset = 0
         self._identity: dict[str, Any] | None = None
         self._layout_digest: str | None = None
+        self._completed_passes = 0
+
+    @property
+    def completed_passes(self) -> int:
+        """Return the number of complete shard passes finished by this traversal."""
+        return self._completed_passes
 
     def advance(self) -> dict[str, Any] | None:
         """Inspect at most one directory entry and return a valid locator, if any."""
@@ -544,6 +550,8 @@ class GroupLocatorTraversal:
         shard_path = lane_root / f"{self._shard:02x}"
         entry, next_offset = read_directory_entry(shard_path, self._offset)
         if entry is None:
+            if self._shard == SHARD_COUNT - 1:
+                self._completed_passes += 1
             self._shard = (self._shard + 1) % SHARD_COUNT
             self._offset = 0
             return None

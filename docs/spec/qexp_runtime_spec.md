@@ -206,6 +206,20 @@ non-authoritative compatibility inputs.
 
 ### 3.4 MachineRuntime Root and Project Registry
 
+Machine-agent hot service follows the binding residency and durable activation
+contract in [qexp_working_set.md](qexp_working_set.md). Dormancy is scoped to one
+runtime, Project, and registration generation; it does not alter registration,
+enablement, placement, reservations, or shared truth. Readiness retains its
+current-generation validation even when a binding is dormant.
+
+The shared activation journal uses a recoverable pending/event/checkpoint
+transaction. Consumer membership and bounded snapshot compaction share its
+Project lock; a snapshot is durable before its event prefix is deleted. Machine
+registry parsing reuses an immutable tuple while the file witness and revision
+remain unchanged, and resident loops do not enumerate dormant bindings on that
+steady-state path. See the working-set contract for the exact replay, retirement,
+fallback polling, and stopped-agent guarantees.
+
 Machine-agent operation adds one disposable, user-local `MachineRuntime` per qexp Machine. Its
 root is `QEXP_MACHINE_RUNTIME_ROOT` when set, otherwise:
 

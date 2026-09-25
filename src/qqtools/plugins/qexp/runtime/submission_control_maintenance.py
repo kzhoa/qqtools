@@ -790,17 +790,34 @@ class MachineSubmissionControlWorker:
         try:
             while not self._stop.is_set():
                 try:
-                    _revision, bindings = self._runtime.load_registry()
+                    revision, bindings = self._runtime.load_registry_snapshot()
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     if self._stop.wait(_WORKER_WAIT_SECONDS):
                         break
                     continue
-                self._reconcile(bindings)
-                binding = self._select(bindings)
+                self._runtime.working_set.reconcile(bindings, revision=revision)
+                resident = self._runtime.working_set.resident_bindings()
+                enabled = [binding for binding in resident if binding.enabled]
+                self._reconcile(enabled)
+                retained_identities = {
+                    (binding.project_id, binding.registration_generation, binding.shared_root)
+                    for binding in self._maintenance
+                }
+                for dormant_candidate in resident:
+                    identity = (
+                        dormant_candidate.project_id,
+                        dormant_candidate.registration_generation,
+                        dormant_candidate.shared_root,
+                    )
+                    if not dormant_candidate.enabled and identity not in retained_identities:
+                        turn = self._runtime.working_set.begin_turn(dormant_candidate, "submission")
+                        self._runtime.working_set.acknowledge(turn, quiescent=True)
+                binding = self._select(enabled)
                 if binding is None:
                     if self._stop.wait(_WORKER_IDLE_SECONDS):
                         break
                     continue
+                turn = self._runtime.working_set.begin_turn(binding, "submission")
                 maintenance = self._maintenance[binding]
                 try:
                     with self._runtime.binding_write_guard(binding) as eligible:
@@ -814,6 +831,10 @@ class MachineSubmissionControlWorker:
                     self._idle_until[binding] = time.monotonic() + _WORKER_IDLE_SECONDS
                 else:
                     self._idle_until.pop(binding, None)
+                self._runtime.working_set.acknowledge(
+                    turn,
+                    quiescent=result.get("reason") == "pending_idle",
+                )
                 if self._stop.wait(_WORKER_WAIT_SECONDS):
                     break
         finally:
@@ -824,12 +845,13 @@ class MachineSubmissionControlWorker:
         for binding in tuple(self._maintenance):
             if binding in current:
                 continue
-            maintenance = self._maintenance.pop(binding)
-            self._idle_until.pop(binding, None)
+            maintenance = self._maintenance[binding]
             try:
                 maintenance.close()
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                pass
+                continue
+            self._maintenance.pop(binding, None)
+            self._idle_until.pop(binding, None)
         for binding in bindings:
             if binding not in self._maintenance:
                 try:

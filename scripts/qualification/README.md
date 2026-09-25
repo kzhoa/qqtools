@@ -60,6 +60,22 @@ churn, and soak samples in `results.json`. Run the large profile sequentially an
 retain its output as release evidence. Smaller `--histories`, `--cycles`, and
 `--soak-seconds` values are development smoke checks rather than Phase C evidence.
 
+## Dormant Project working set
+
+```bash
+PYTHONPATH=src ~/.cache/qqtools/tox/unit/bin/python \
+  -m scripts.qualification.profile_qexp_working_set \
+  --output /tmp/qexp-working-set --projects 1 100 1000 \
+  --cycles 200 --soak-cycles 10000
+```
+
+The profile creates isolated Project identities and real activation consumers,
+retires every binding through all five service lanes, and then measures the
+production dormant roster. It asserts four checkpoint reads per cycle, 64 lease
+renewals per heartbeat, a `ceil(N / 4)` wake bound, and a 100 ms steady-cycle p95.
+Setup and retirement are reported separately. The accelerated soak records its
+actual wall duration and is not long-duration uptime evidence.
+
 ## Released writer gate qualification
 
 `probe_qexp_writer_fences.py` characterizes actual source from local release refs,

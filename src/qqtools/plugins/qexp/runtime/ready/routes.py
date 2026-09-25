@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
 from ..locks import exclusive
 from ..paths import shared_paths
+from ..project_activation import project_activation_transaction
 from ..records import utc_now, validate_identifier
 from ..store import atomic_replace, read_json
 from ..work_budget import SliceBudget
@@ -401,25 +402,28 @@ def primary_route_update_transaction(
             locks.append(lock)
             allocator_file, allocator = load_or_create_allocator_under_lock(cfg.shared_root, route)
             ensure_primary_lane_revisions(allocator["ready_allocator"])
-            allocator["ready_allocator"]["primary_state"] = "updating"
-            atomic_replace(allocator_file, allocator)
             allocators.append((allocator_file, allocator))
-        try:
-            yield
-        except BaseException:
+        activation = project_activation_transaction(cfg, "ready_route_update") if route_keys else nullcontext()
+        with activation:
             for allocator_file, allocator in allocators:
-                allocator["ready_allocator"]["primary_state"] = "degraded"
+                allocator["ready_allocator"]["primary_state"] = "updating"
                 atomic_replace(allocator_file, allocator)
-            raise
-        else:
-            for allocator_file, allocator in allocators:
-                control = allocator["ready_allocator"]
-                control["primary_revision"] = control.get("primary_revision", control["revision"]) + 1
-                ensure_primary_lane_revisions(control)
-                for lane in lanes:
-                    control["primary_lane_revisions"][lane] += 1
-                control["primary_state"] = "active"
-                atomic_replace(allocator_file, allocator)
+            try:
+                yield
+            except BaseException:
+                for allocator_file, allocator in allocators:
+                    allocator["ready_allocator"]["primary_state"] = "degraded"
+                    atomic_replace(allocator_file, allocator)
+                raise
+            else:
+                for allocator_file, allocator in allocators:
+                    control = allocator["ready_allocator"]
+                    control["primary_revision"] = control.get("primary_revision", control["revision"]) + 1
+                    ensure_primary_lane_revisions(control)
+                    for lane in lanes:
+                        control["primary_lane_revisions"][lane] += 1
+                    control["primary_state"] = "active"
+                    atomic_replace(allocator_file, allocator)
     finally:
         for lock in reversed(locks):
             lock.__exit__(None, None, None)

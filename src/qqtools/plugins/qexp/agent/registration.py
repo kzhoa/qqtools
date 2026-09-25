@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
+import stat
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from qqtools.version import __version__
@@ -29,6 +32,7 @@ from ..runtime.paths import (
     machine_runtime_paths,
     shared_paths,
 )
+from ..runtime.project_activation_consumers import read_consumer_progress
 from ..runtime.records import utc_now
 from ..runtime.responsibility_store import DurableIO
 from ..runtime.store import atomic_replace, read_json
@@ -78,11 +82,17 @@ class MachineRegistration:
         *,
         ensure_layout: Callable[[], None],
         current_instance_id: Callable[[], str],
+        recover_removed_consumer: Callable[[RootConfig, str, str, list[ProjectBinding]], None] | None = None,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.paths = machine_runtime_paths(self.root)
         self._ensure_layout = ensure_layout
         self._current_instance_id = current_instance_id
+        self._recover_removed_consumer = recover_removed_consumer
+        self._registry_cache_lock = RLock()
+        self._registry_cache_witness: tuple[int, int, int, int, int] | None = None
+        self._registry_cache_revision: int | None = None
+        self._registry_cache_bindings: tuple[ProjectBinding, ...] | None = None
 
     @contextmanager
     def registry_guard(self, *, blocking: bool = True) -> Iterator[bool]:
@@ -91,25 +101,96 @@ class MachineRegistration:
             yield acquired
 
     def load_registry(self) -> tuple[int, list[ProjectBinding]]:
-        if not self.paths["registry"].exists():
-            return 0, []
-        value = read_json(self.paths["registry"])
-        registry = value.get("registry")
-        if not isinstance(registry, dict) or registry.get("version") != REGISTRY_VERSION:
-            raise RuntimeError("machine registry is malformed or unsupported.")
-        revision = registry.get("revision")
-        bindings = registry.get("bindings")
-        if not isinstance(revision, int) or revision < 0 or not isinstance(bindings, list):
-            raise RuntimeError("machine registry is malformed.")
-        try:
-            parsed = [ProjectBinding.from_dict(item) for item in bindings]
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("machine registry contains a malformed project binding.") from exc
-        return revision, parsed
+        """Load bindings as a fresh mutable list for existing callers."""
+        revision, bindings = self.load_registry_snapshot()
+        return revision, list(bindings)
+
+    def load_registry_snapshot(self) -> tuple[int, tuple[ProjectBinding, ...]]:
+        """Load an immutable snapshot, reusing its tuple while the file is unchanged."""
+        path = self.paths["registry"]
+        while True:
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                witness = None
+                with self._registry_cache_lock:
+                    if (
+                        self._registry_cache_witness == witness
+                        and self._registry_cache_revision is not None
+                        and self._registry_cache_bindings is not None
+                    ):
+                        return self._registry_cache_revision, self._registry_cache_bindings
+                revision, parsed = 0, ()
+                with self._registry_cache_lock:
+                    self._registry_cache_witness = None
+                    self._registry_cache_revision = revision
+                    self._registry_cache_bindings = parsed
+                return revision, parsed
+            if not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError("machine registry must be a regular non-symlink file.")
+            witness = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+            with self._registry_cache_lock:
+                if (
+                    self._registry_cache_witness == witness
+                    and self._registry_cache_revision is not None
+                    and self._registry_cache_bindings is not None
+                ):
+                    return self._registry_cache_revision, self._registry_cache_bindings
+            value = read_json(path)
+            registry = value.get("registry")
+            if not isinstance(registry, dict) or registry.get("version") != REGISTRY_VERSION:
+                raise RuntimeError("machine registry is malformed or unsupported.")
+            revision = registry.get("revision")
+            bindings = registry.get("bindings")
+            if not isinstance(revision, int) or revision < 0 or not isinstance(bindings, list):
+                raise RuntimeError("machine registry is malformed.")
+            try:
+                parsed = tuple(
+                    sorted(
+                        (ProjectBinding.from_dict(item) for item in bindings),
+                        key=lambda item: item.project_id,
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("machine registry contains a malformed project binding.") from exc
+            try:
+                after = path.lstat()
+            except FileNotFoundError:
+                continue
+            after_witness = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if not stat.S_ISREG(after.st_mode) or after_witness != witness:
+                continue
+            with self._registry_cache_lock:
+                if (
+                    self._registry_cache_witness == witness
+                    and self._registry_cache_revision is not None
+                    and self._registry_cache_bindings is not None
+                ):
+                    return self._registry_cache_revision, self._registry_cache_bindings
+                self._registry_cache_witness = witness
+                self._registry_cache_revision = revision
+                self._registry_cache_bindings = parsed
+            return revision, parsed
 
     def save_registry_locked(self, revision: int, bindings: list[ProjectBinding]) -> None:
         """Persist a registry revision while the caller retains the registry guard."""
-        atomic_replace(
+        with self._registry_cache_lock:
+            self._registry_cache_witness = None
+            self._registry_cache_revision = None
+            self._registry_cache_bindings = None
+        persisted = atomic_replace(
             self.paths["registry"],
             {
                 "registry": {
@@ -120,6 +201,25 @@ class MachineRegistration:
                 }
             },
         )
+        if persisted is None:
+            try:
+                persisted = self.paths["registry"].lstat()
+            except OSError:
+                persisted = None
+        with self._registry_cache_lock:
+            self._registry_cache_witness = (
+                None
+                if persisted is None
+                else (
+                    persisted.st_dev,
+                    persisted.st_ino,
+                    persisted.st_size,
+                    persisted.st_mtime_ns,
+                    persisted.st_ctime_ns,
+                )
+            )
+            self._registry_cache_revision = revision
+            self._registry_cache_bindings = tuple(sorted(bindings, key=lambda item: item.project_id))
 
     def _save_registration_transaction(
         self,
@@ -192,6 +292,7 @@ class MachineRegistration:
             ):
                 configs.append(cfg)
         with self._registration_guards(*configs):
+            current_revision, _current_bindings = self.load_registry()
             for item in registrations:
                 cfg = load_root_config(item["shared_root"], item["machine_name"])
                 registration_path = machine_registration_path(cfg.shared_root, cfg.machine_name)
@@ -208,7 +309,7 @@ class MachineRegistration:
                     record_path.unlink(missing_ok=True)
                 else:
                     save_machine_record(cfg, record)
-            self.save_registry_locked(revision, bindings)
+            self.save_registry_locked(max(revision, current_revision) + 1, bindings)
             path.unlink(missing_ok=True)
 
     def ensure_binding(
@@ -233,6 +334,8 @@ class MachineRegistration:
         with self.registry_guard():
             self.rollback_pending_locked()
             revision, bindings = self.load_registry()
+            if self._recover_removed_consumer is not None:
+                self._recover_removed_consumer(cfg, stable_id, runtime_instance_id, bindings)
             current = next(
                 (
                     item
@@ -367,6 +470,17 @@ class MachineRegistration:
             and current.runtime_root in {None, str(self.root)}
         ):
             same_owner = True
+        retired_same_owner = False
+        if same_owner and current is None and isinstance(registration, dict):
+            consumer = read_consumer_progress(
+                cfg.shared_root,
+                runtime_id=runtime_instance_id,
+                project_id=project_id,
+                registration_generation=registration["generation"],
+            )
+            retired_same_owner = bool(
+                consumer is not None and consumer["project_activation_consumer"]["state"] == "retired"
+            )
         if registration is not None and not same_owner:
             state = self.registration_state(registration)
             if not adopt_existing:
@@ -387,7 +501,7 @@ class MachineRegistration:
                 )
         generation = (
             registration.get("generation")
-            if same_owner and registration
+            if same_owner and registration and not retired_same_owner
             else current.registration_generation
             if same_owner and current is not None and current.registration_generation
             else uuid.uuid4().hex
@@ -408,7 +522,9 @@ class MachineRegistration:
             "runtime_root": str(self.root),
             "state": "eligible",
             "eligibility_expires_at": lease_expiry(policy),
-            "created_at": registration.get("created_at", now) if same_owner and registration else now,
+            "created_at": (
+                registration.get("created_at", now) if same_owner and registration and not retired_same_owner else now
+            ),
             "updated_at": now,
         }
         if version == RECOVERY_REGISTRATION_VERSION:
@@ -584,9 +700,14 @@ class MachineRegistration:
             **protocol,
         }
 
-    def refresh_binding_eligibility(self, binding: ProjectBinding) -> bool:
+    def refresh_binding_eligibility(
+        self,
+        binding: ProjectBinding,
+        *,
+        renewal_horizon_seconds: float = 0.0,
+    ) -> bool:
         """Renew a current generation, returning false for stale or replaced bindings."""
-        with self.binding_write_guard(binding) as is_eligible:
+        with self.binding_write_guard(binding, renewal_horizon_seconds=renewal_horizon_seconds) as is_eligible:
             return is_eligible
 
     def reactivate_binding(self, binding: ProjectBinding) -> bool:
@@ -617,8 +738,20 @@ class MachineRegistration:
             return True
 
     @contextmanager
-    def binding_write_guard(self, binding: ProjectBinding) -> Iterator[bool]:
+    def binding_write_guard(
+        self,
+        binding: ProjectBinding,
+        *,
+        renewal_horizon_seconds: float = 0.0,
+    ) -> Iterator[bool]:
         """Fence an authoritative write, renewing the current generation when due."""
+        if (
+            not isinstance(renewal_horizon_seconds, (int, float))
+            or isinstance(renewal_horizon_seconds, bool)
+            or not math.isfinite(renewal_horizon_seconds)
+            or renewal_horizon_seconds < 0
+        ):
+            raise ValueError("renewal_horizon_seconds must be a finite nonnegative number.")
         cfg = binding.root_config()
         policy = load_lease_policy(cfg)
         with self._registration_guard(cfg):
@@ -641,11 +774,15 @@ class MachineRegistration:
             previous_expiry = record["eligibility_expires_at"]
             expires_at = parse_utc(previous_expiry)
             next_expiry = lease_expiry(policy)
+            parsed_next_expiry = parse_utc(next_expiry)
             renew_at = expires_at - timedelta(seconds=policy.ttl_seconds - _registration_renewal_interval(policy))
+            now = datetime.now(timezone.utc)
+            horizon = now + timedelta(seconds=renewal_horizon_seconds)
             # Derive scheduling from fenced durable state, never cached authority.
-            # A shorter policy horizon also takes effect without waiting for renewal.
-            if parse_utc(next_expiry) != expires_at and (
-                datetime.now(timezone.utc) >= renew_at or parse_utc(next_expiry) < expires_at
+            # Dormant round-robin callers renew early when the current lease
+            # would not survive until their next bounded service opportunity.
+            if parsed_next_expiry != expires_at and (
+                now >= renew_at or expires_at <= horizon or parsed_next_expiry < expires_at
             ):
                 record = dict(record)
                 record["eligibility_expires_at"] = next_expiry
@@ -654,11 +791,20 @@ class MachineRegistration:
                 _observe_registration_renewal(previous_expiry, policy, is_reactivation=False)
             yield True
 
-    def binding_write_eligible(self, binding: ProjectBinding, *, renew: bool = False) -> bool:
+    def binding_write_eligible(
+        self,
+        binding: ProjectBinding,
+        *,
+        renew: bool = False,
+        renewal_horizon_seconds: float = 0.0,
+    ) -> bool:
         """Check current generation authority before an identity-scoped write."""
         if renew:
             try:
-                return self.refresh_binding_eligibility(binding)
+                return self.refresh_binding_eligibility(
+                    binding,
+                    renewal_horizon_seconds=renewal_horizon_seconds,
+                )
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 return False
         return bool(self.registration_status(binding).get("write_eligible"))

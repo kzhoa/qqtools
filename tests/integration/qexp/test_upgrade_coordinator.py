@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
 from qqtools.plugins.qexp.commands.task import submit as submit_task
 from qqtools.plugins.qexp.layout import read_schema_version
 from qqtools.plugins.qexp.runtime.locks import exclusive
@@ -148,6 +150,125 @@ def test_machine_upgrade_discovery_is_cached_until_registry_changes(tmp_path: Pa
     monkeypatch.setattr(UpgradeCoordinator, "status", should_not_probe)
     cached = discover_registered_upgrades(runtime)
     assert cached["pending_project_ids"] == first["pending_project_ids"]
+
+
+def test_cached_upgrade_discovery_does_not_iterate_unchanged_registry(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    discover_registered_upgrades(runtime)
+    revision, bindings = runtime.load_registry_snapshot()
+
+    class IterationForbidden(tuple):
+        def __iter__(self):
+            raise AssertionError("unchanged discovery iterated the full registry")
+
+    monkeypatch.setattr(runtime, "load_registry_snapshot", lambda: (revision, IterationForbidden(bindings)))
+
+    cached = discover_registered_upgrades(runtime)
+
+    assert cached["all_roots_complete"] is True
+
+
+def test_concurrent_upgrade_discovery_retries_after_registry_change(tmp_path: Path, monkeypatch) -> None:
+    first_cfg = _config(tmp_path / "first")
+    second_cfg = _config(tmp_path / "second")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(first_cfg.shared_root, first_cfg.machine_name)
+    discover_registered_upgrades(runtime)
+    entered = Event()
+    release = Event()
+    original_discover = UpgradeCoordinator.discover
+    first_call = True
+
+    def delayed_discover(coordinator):
+        nonlocal first_call
+        if first_call:
+            first_call = False
+            entered.set()
+            assert release.wait(5)
+        return original_discover(coordinator)
+
+    monkeypatch.setattr(UpgradeCoordinator, "discover", delayed_discover)
+    result = []
+    worker = Thread(target=lambda: result.append(discover_registered_upgrades(runtime, force=True)))
+    worker.start()
+    assert entered.wait(5)
+    runtime.add_binding(second_cfg.shared_root, second_cfg.machine_name)
+    stale = discover_registered_upgrades(runtime)
+    assert stale["discovery_stale"] is True
+    assert runtime.upgrade_discovery_unknown is True
+    release.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    revision, bindings = runtime.load_registry_snapshot()
+    assert runtime.upgrade_registry_revision == revision
+    assert runtime.upgrade_discovery_unknown is False
+    assert {item["project_id"] for item in result[0]["projects"]} == {binding.project_id for binding in bindings}
+
+
+def test_busy_upgrade_discovery_fails_closed_during_cache_publication(tmp_path: Path, monkeypatch) -> None:
+    cfg = _config(tmp_path)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    discover_registered_upgrades(runtime)
+    runtime.last_cycle_had_demand = False
+    assert _machine_is_true_idle(runtime, has_consumed_binding=True)
+    entered = Event()
+    release = Event()
+    original_setattr = MachineRuntime.__setattr__
+    pause_publication = True
+
+    def delayed_setattr(self, name, value):
+        original_setattr(self, name, value)
+        if self is runtime and pause_publication and name == "upgrade_pending_projects":
+            entered.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr(MachineRuntime, "__setattr__", delayed_setattr)
+    result = []
+    worker = Thread(target=lambda: result.append(discover_registered_upgrades(runtime, force=True)))
+    worker.start()
+    assert entered.wait(5)
+
+    stale = discover_registered_upgrades(runtime)
+
+    assert stale["discovery_stale"] is True
+    assert stale["aggregate_state"] == "unknown"
+    assert runtime.upgrade_discovery_unknown is True
+    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    pause_publication = False
+    release.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert runtime.upgrade_discovery_unknown is False
+    assert result[0]["all_roots_complete"] is True
+
+
+def test_upgrade_advance_rebuilds_until_registry_revision_is_stable(tmp_path: Path, monkeypatch) -> None:
+    configs = [_config(tmp_path / name) for name in ("first", "second", "third")]
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime.add_binding(configs[0].shared_root, configs[0].machine_name)
+    original_discover = UpgradeCoordinator.discover
+    calls = 0
+
+    def changing_discover(coordinator):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            cfg = configs[calls]
+            runtime.add_binding(cfg.shared_root, cfg.machine_name)
+        return original_discover(coordinator)
+
+    monkeypatch.setattr(UpgradeCoordinator, "discover", changing_discover)
+
+    advance_registered_upgrades(runtime, force_discovery=True)
+
+    revision, bindings = runtime.load_registry_snapshot()
+    assert runtime.upgrade_registry_revision == revision
+    assert runtime.upgrade_discovery_unknown is False
+    assert set(runtime.upgrade_discovery_projects) == {binding.project_id for binding in bindings}
 
 
 def test_machine_budget_rotates_projects_without_losing_queued_work(tmp_path: Path) -> None:

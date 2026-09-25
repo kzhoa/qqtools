@@ -27,6 +27,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from ...agent.context import MachineRuntime, ProjectBinding
+from ...agent.working_set import BindingTurn
 from ..directory_capture import read_directory_entry
 from ..group_namespace import (
     GroupNotPublished,
@@ -38,6 +39,7 @@ from ..group_namespace import (
 )
 from ..locks import group_writer_lock
 from ..paths import group_path, shared_paths, submission_path
+from ..project_activation import project_activation_transaction
 from ..records import validate_group_name, validate_identifier
 from ..store import atomic_replace, read_json_limited, require_json_size
 from .slice_io import SliceIO
@@ -228,28 +230,32 @@ def publish_group_locator_for_transition(
     if not is_group_authority_isolated(cfg.shared_root):
         return None
 
+    if lane not in {"control", "maintenance", "membership"}:
+        raise ValueError(f"unsupported Group service lane: {lane!r}")
+
     from . import activation, locator
 
-    activation_path = cfg.shared_root / "schema" / "group-service.json"
-    try:
-        activation_record = read_json_limited(activation_path, max_bytes=_MAX_RECORD_BYTES)
-    except FileNotFoundError:
-        fenced = False
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-        # A present but unreadable activation record cannot lower the writer
-        # floor. Fail closed as though the fence had already been installed.
-        fenced = True
-    else:
-        state = activation_record.get("state")
-        fenced = state != "preparing"
+    with project_activation_transaction(cfg, f"group_locator_{lane}"):
+        activation_path = cfg.shared_root / "schema" / "group-service.json"
+        try:
+            activation_record = read_json_limited(activation_path, max_bytes=_MAX_RECORD_BYTES)
+        except FileNotFoundError:
+            fenced = False
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            # A present but unreadable activation record cannot lower the writer
+            # floor. Fail closed as though the fence had already been installed.
+            fenced = True
+        else:
+            state = activation_record.get("state")
+            fenced = state != "preparing"
 
-    active = activation.is_group_service_active(cfg.shared_root)
-    try:
-        return locator.publish_group_locator_locked(cfg, group, lane, reason)
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-        if fenced or active:
-            raise
-        return None
+        active = activation.is_group_service_active(cfg.shared_root)
+        try:
+            return locator.publish_group_locator_locked(cfg, group, lane, reason)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            if fenced or active:
+                raise
+            return None
 
 
 class GroupDiscoveryService:
@@ -1056,6 +1062,8 @@ class MachineGroupDiscoveryWorker:
         self._bindings_by_key: dict[tuple[str, str, str], ProjectBinding] = {}
         self._locator_traversals: dict[tuple[tuple[str, str, str], str], Any] = {}
         self._lane_turns: dict[tuple[str, str, str], int] = {}
+        self._group_turns: dict[tuple[str, str, str], tuple[BindingTurn, dict[str, int]]] = {}
+        self._legacy_sweep_passes: dict[tuple[str, str, str], int] = {}
         self._pending_locator: tuple[str, dict[str, Any]] | None = None
         self._active_project_slice = False
         self._lane_metrics: dict[str, dict[str, int | float]] = {
@@ -1116,23 +1124,35 @@ class MachineGroupDiscoveryWorker:
         try:
             while not self._stop.is_set():
                 try:
-                    revision, registered = self._runtime.load_registry()
+                    revision, registered = self._runtime.load_registry_snapshot()
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     self._advance_close_one()
                     self._stop.wait(_WORKER_WAIT_SECONDS)
                     continue
-                if registry_revision is None or registry_revision != revision:
-                    self._reconcile_bindings(registered, sweeps)
+                self._runtime.working_set.reconcile(registered, revision=revision)
+                resident = self._runtime.working_set.resident_bindings()
+                disabled = [binding for binding in resident if not binding.enabled]
+                service_bindings = [binding for binding in resident if binding.enabled]
+                if registry_revision is None or registry_revision != revision or bindings != service_bindings:
+                    self._reconcile_bindings(service_bindings, sweeps)
                     sweep_complete_at = {
                         key: due for key, due in sweep_complete_at.items() if key in self._bindings_by_key
                     }
-                    bindings = registered
+                    bindings = service_bindings
                     registry_revision = revision
                     binding_cursor %= max(1, len(bindings))
 
                 # Cleanup receives one cooperative step even while healthy
                 # Groups continue to receive their own fair work quantum.
-                self._advance_close_one()
+                activity_keys: set[tuple[str, str, str]] = set()
+                closed_binding = self._advance_close_one()
+                if closed_binding is not None:
+                    activity_keys.add(closed_binding)
+                self._ack_disabled_bindings(disabled, sweeps)
+                turn_binding = bindings[binding_cursor % len(bindings)] if bindings else None
+                if turn_binding is not None:
+                    self._ensure_group_turn(turn_binding, sweeps, sweep_complete_at)
+                    retry_count_before = sum(values["retries"] for values in self._lane_metrics.values())
                 selected = self._next_group(
                     bindings,
                     sweeps,
@@ -1146,15 +1166,30 @@ class MachineGroupDiscoveryWorker:
                         binding_cursor = (selected[0] + 1) % len(bindings)
                 if selected is not None:
                     _, binding, group = selected
+                    activity_keys.add(self._binding_key(binding))
                     self._admit_group(binding, group)
                     if self._pending_locator is not None:
                         lane, record = self._pending_locator
                         self._advance_active_locator(binding, group, lane, record)
                     elif not self._active_project_slice:
-                        self._advance_one_entry()
+                        advanced_binding = self._advance_one_entry()
+                        if advanced_binding is not None:
+                            activity_keys.add(self._binding_key(advanced_binding))
                 else:
-                    self._advance_one_entry()
-                self._restart_one_due()
+                    advanced_binding = self._advance_one_entry()
+                    if advanced_binding is not None:
+                        activity_keys.add(self._binding_key(advanced_binding))
+                restarted_binding = self._restart_one_due()
+                if restarted_binding is not None:
+                    activity_keys.add(self._binding_key(restarted_binding))
+                if (
+                    turn_binding is not None
+                    and sum(values["retries"] for values in self._lane_metrics.values()) > retry_count_before
+                ):
+                    activity_keys.add(self._binding_key(turn_binding))
+                for binding_key in activity_keys:
+                    self._refresh_group_turn_for_key(binding_key, sweeps, sweep_complete_at)
+                self._ack_group_turns([] if turn_binding is None else [turn_binding], sweeps, sweep_complete_at)
                 has_work = bool(bindings or self._entries or self._restart_due or self._close_queue or sweeps)
                 if self._stop.wait(_WORKER_WAIT_SECONDS if has_work else _WORKER_IDLE_SECONDS):
                     break
@@ -1202,6 +1237,103 @@ class MachineGroupDiscoveryWorker:
                 sweeps.pop(binding_key, None)
         self._bindings_by_key = current
         self._lane_turns = {key: turn for key, turn in self._lane_turns.items() if key in current}
+        self._group_turns = {key: turn for key, turn in self._group_turns.items() if key in current}
+        self._legacy_sweep_passes = {key: count for key, count in self._legacy_sweep_passes.items() if key in current}
+        self._locator_traversals = {
+            key: traversal for key, traversal in self._locator_traversals.items() if key[0] in current
+        }
+
+    def _ensure_group_turn(
+        self,
+        binding: ProjectBinding,
+        sweeps: dict[tuple[str, str, str], SubmissionSourceSweep],
+        complete_at: dict[tuple[str, str, str], float],
+    ) -> None:
+        key = self._binding_key(binding)
+        if key not in self._group_turns:
+            self._refresh_group_turn_for_key(key, sweeps, complete_at)
+
+    def _refresh_group_turn_for_key(
+        self,
+        binding_key: tuple[str, str, str],
+        sweeps: dict[tuple[str, str, str], SubmissionSourceSweep],
+        complete_at: dict[tuple[str, str, str], float],
+    ) -> None:
+        binding = self._bindings_by_key.get(binding_key)
+        if binding is None:
+            return
+        previous = self._group_turns.get(binding_key)
+        if previous is not None:
+            self._runtime.working_set.acknowledge(previous[0], quiescent=False)
+        from .locator import LANES as locator_lanes
+
+        starts = {
+            lane: getattr(self._locator_traversals.get((binding_key, lane)), "completed_passes", 0)
+            for lane in locator_lanes
+        }
+        starts["legacy"] = self._legacy_sweep_passes.get(binding_key, 0)
+        self._group_turns[binding_key] = (self._runtime.working_set.begin_turn(binding, "group"), starts)
+
+    def _ack_group_turns(
+        self,
+        bindings: list[ProjectBinding],
+        sweeps: dict[tuple[str, str, str], SubmissionSourceSweep],
+        complete_at: dict[tuple[str, str, str], float],
+    ) -> None:
+        from .locator import LANES as locator_lanes
+
+        resource_binding_keys = self._resource_binding_keys(sweeps)
+        for binding in bindings:
+            binding_key = self._binding_key(binding)
+            turn_state = self._group_turns.get(binding_key)
+            if turn_state is None:
+                continue
+            turn, starting_passes = turn_state
+            if binding_key in resource_binding_keys:
+                self._refresh_group_turn_for_key(binding_key, sweeps, complete_at)
+                continue
+            activation_state = self._activation_state(binding.shared_root)
+            if activation_state == "active":
+                complete = all(
+                    getattr(self._locator_traversals.get((binding_key, lane)), "completed_passes", 0)
+                    >= starting_passes.get(lane, 0) + 1
+                    for lane in locator_lanes
+                )
+            elif activation_state in {None, "preparing", "fenced", "building"}:
+                complete = self._legacy_sweep_passes.get(binding_key, 0) > starting_passes.get("legacy", 0)
+            else:
+                complete = False
+            if not complete:
+                continue
+            if not self._runtime.working_set.acknowledge(turn, quiescent=True):
+                self._refresh_group_turn_for_key(binding_key, sweeps, complete_at)
+
+    def _ack_disabled_bindings(
+        self,
+        bindings: list[ProjectBinding],
+        sweeps: dict[tuple[str, str, str], SubmissionSourceSweep],
+    ) -> None:
+        """Acknowledge disabled bindings only after their owned resources close."""
+
+        resource_binding_keys = self._resource_binding_keys(sweeps)
+        for binding in bindings:
+            binding_key = self._binding_key(binding)
+            if binding_key in resource_binding_keys:
+                continue
+            turn = self._runtime.working_set.begin_turn(binding, "group")
+            self._runtime.working_set.acknowledge(turn, quiescent=True)
+
+    def _resource_binding_keys(
+        self,
+        sweeps: dict[tuple[str, str, str], SubmissionSourceSweep],
+    ) -> set[tuple[str, str, str]]:
+        """Index binding-owned resources once for linear acknowledgement passes."""
+
+        keys = {entry.binding_key for entry in self._entries.values()}
+        keys.update(entry.binding_key for entry in self._restart_due.values())
+        keys.update(key for key, count in self._close_work_counts.items() if count)
+        keys.update(sweeps)
+        return keys
 
     def _eligible_binding(self, binding: ProjectBinding) -> bool:
         """Check one binding's live eligibility without scanning the registry."""
@@ -1335,6 +1467,7 @@ class MachineGroupDiscoveryWorker:
             try:
                 sweeps[key] = SubmissionSourceSweep(group_directory(binding.shared_root), page_size=1)
             except (OSError, RuntimeError, ValueError, TypeError):
+                self._lane_metrics["control"]["retries"] += 1
                 complete_at[key] = time.monotonic() + _WORKER_COOLDOWN_SECONDS
                 return None
         sweep = sweeps[key]
@@ -1346,6 +1479,7 @@ class MachineGroupDiscoveryWorker:
                 soft_deadline=time.monotonic() + _SOURCE_SLICE_SECONDS,
             )
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            self._lane_metrics["control"]["retries"] += 1
             complete_at[key] = time.monotonic() + _WORKER_COOLDOWN_SECONDS
             if self._queue_sweep_close(sweep, key):
                 sweeps.pop(key, None)
@@ -1355,11 +1489,13 @@ class MachineGroupDiscoveryWorker:
             try:
                 read_group(binding.shared_root, group)
             except (FileNotFoundError, GroupNotPublished, GroupPublicationUnavailable):
+                self._lane_metrics["membership"]["retries"] += 1
                 return None
             return index, binding, group
         if step.state == "complete":
             sweeps.pop(key, None)
             complete_at[key] = time.monotonic() + _WORKER_COOLDOWN_SECONDS
+            self._legacy_sweep_passes[key] = self._legacy_sweep_passes.get(key, 0) + 1
         elif step.state == "failed":
             complete_at[key] = time.monotonic() + _WORKER_COOLDOWN_SECONDS
             if self._queue_sweep_close(sweep, key):
@@ -1497,33 +1633,34 @@ class MachineGroupDiscoveryWorker:
                 self._lane_metrics[lane]["descriptor_high_water"], descriptors
             )
 
-    def _restart_one_due(self) -> None:
+    def _restart_one_due(self) -> ProjectBinding | None:
         if not self._restart_due:
-            return
+            return None
         key = next(iter(self._restart_due))
         old = self._restart_due.pop(key)
         binding = self._bindings_by_key.get(old.binding_key)
         if binding != old.binding:
-            return
+            return None
         now = time.monotonic()
         if old.cooldown_until > now or not self._eligible_binding(binding):
             self._restart_due[key] = old
-            return
+            return None
         try:
             read_group(binding.shared_root, old.group)
             if not group_path(binding.shared_root, old.group).exists():
-                return
+                return binding
             entry = self._new_entry(binding, old.group)
         except FileNotFoundError:
-            return
+            return binding
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             old.cooldown_until = now + _WORKER_COOLDOWN_SECONDS
             self._restart_due[key] = old
-            return
+            return binding
         self._entries[key] = entry
         self._entry_queue.append(entry)
+        return binding
 
-    def _advance_one_entry(self) -> None:
+    def _advance_one_entry(self) -> ProjectBinding | None:
         for _ in range(len(self._entry_queue)):
             entry = self._entry_queue.popleft()
             if self._entries.get(entry.key) is not entry:
@@ -1533,16 +1670,16 @@ class MachineGroupDiscoveryWorker:
                 continue
             if entry.binding_key in self._closing_binding_keys:
                 self._queue_entry_close(entry, block_binding=True)
-                return
+                return entry.binding
             if entry.locator_mode:
                 if not entry.locator_records:
                     self._queue_entry_close(entry)
-                    return
+                    return entry.binding
                 lane = entry.pending_lane or next(iter(entry.locator_records), None)
                 record = entry.locator_records.get(lane) if lane is not None else None
                 if lane is not None and record is not None:
                     self._advance_active_locator(entry.binding, entry.group, lane, record)
-                    return
+                    return entry.binding
                 continue
             try:
                 read_group(entry.binding.shared_root, entry.group)
@@ -1565,15 +1702,16 @@ class MachineGroupDiscoveryWorker:
                 elif state in {"error", "closed"}:
                     entry.cooldown_until = time.monotonic() + _WORKER_COOLDOWN_SECONDS
                     self._queue_entry_close(entry, restart=True)
-                return
+                return entry.binding
             entry.service_turn = True
             try:
                 entry.maintenance.advance()
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 # Maintenance owns its own retry state. A transient maintenance
                 # failure never retires a healthy discovery service.
-                return
-            return
+                return entry.binding
+            return entry.binding
+        return None
 
     def _advance_active_locator(
         self,
@@ -1892,9 +2030,9 @@ class MachineGroupDiscoveryWorker:
         self._close_queue.append(work)
         self._close_work_counts[binding_key] = self._close_work_counts.get(binding_key, 0) + 1
 
-    def _advance_close_one(self) -> None:
+    def _advance_close_one(self) -> tuple[str, str, str] | None:
         if not self._close_queue:
-            return
+            return None
         work = self._close_queue.popleft()
         try:
             done = self._advance_close_work(work)
@@ -1904,6 +2042,7 @@ class MachineGroupDiscoveryWorker:
             self._finish_close_work(work)
         else:
             self._close_queue.append(work)
+        return work.binding_key
 
     def _advance_close_work(self, work: _CloseWork) -> bool:
         if work.kind == "entry":

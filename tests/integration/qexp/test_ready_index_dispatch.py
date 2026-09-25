@@ -12,6 +12,7 @@ from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent import dispatch_loop as machine_agent
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import dispatch_machine_cycle_locked
+from qqtools.plugins.qexp.agent.working_set import SERVICE_LANES
 from qqtools.plugins.qexp.commands import group as group_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import cancel, edit_dependencies, share
@@ -116,6 +117,120 @@ def test_machine_agent_admits_borrow_only_after_no_primary_demand(
         }
     ]
     assert executor.launched == [task.task_id]
+
+
+def test_machine_agent_denies_borrow_while_enabled_bindings_are_dormant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    borrow_cfg, borrow_task = _borrow_project(tmp_path, work)
+    _activate_ready(borrow_cfg)
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    borrow_binding = runtime.add_binding(borrow_cfg.shared_root, borrow_cfg.machine_name)
+    dormant = []
+    for index in range(5):
+        cfg = init_shared_root(
+            tmp_path / f"primary-{index}" / ".qexp",
+            "gpu-1",
+            runtime_root=tmp_path / f"primary-{index}-rt",
+        )
+        dormant.append(runtime.add_binding(cfg.shared_root, cfg.machine_name))
+
+    _, bindings = runtime.load_registry()
+    registry_revision, registry_snapshot = runtime.load_registry_snapshot()
+    runtime.working_set.reconcile(registry_snapshot, revision=registry_revision)
+    for binding in dormant:
+        for lane in SERVICE_LANES:
+            turn = runtime.working_set.begin_turn(binding, lane)
+            assert runtime.working_set.acknowledge(turn, quiescent=True)
+
+    def make_budget(policy: WorkBudgetPolicy | None = None) -> SliceBudget:
+        return SliceBudget(policy or WorkBudgetPolicy(), clock_ns=lambda: 0)
+
+    monkeypatch.setattr(machine_agent, "SliceBudget", make_budget)
+    executor = _RecordingExecutor()
+    results = dispatch_machine_cycle_locked(
+        runtime,
+        available_gpus=[0],
+        executor=executor,
+        supervise=False,
+        publish_snapshots=False,
+    )
+
+    assert results == [
+        {
+            "project_id": borrow_binding.project_id,
+            "launched": [],
+            "status": "dispatched",
+        }
+    ]
+    assert executor.launched == []
+    assert runtime.working_set.snapshot()["dormant_bindings"] == 5
+    assert (
+        read_json(borrow_cfg.shared_root / "tasks" / f"{borrow_task.task_id}.json")["task"]["state"]["projection"]
+        == "queued"
+    )
+
+
+def test_dormant_population_does_not_drive_dispatch_truth_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    bindings = []
+    for index in range(40):
+        cfg = init_shared_root(
+            tmp_path / f"project-{index}" / ".qexp",
+            "gpu-1",
+            runtime_root=tmp_path / f"project-{index}-runtime",
+        )
+        bindings.append(runtime.add_binding(cfg.shared_root, cfg.machine_name))
+    registry_revision, registry_snapshot = runtime.load_registry_snapshot()
+    runtime.working_set.reconcile(registry_snapshot, revision=registry_revision)
+    for binding in bindings:
+        for lane in SERVICE_LANES:
+            turn = runtime.working_set.begin_turn(binding, lane)
+            assert runtime.working_set.acknowledge(turn, quiescent=True)
+
+    original_status = runtime.registration_status
+    original_eligible = runtime.binding_write_eligible
+    reads = {"registration": 0, "eligibility": 0}
+
+    def counted_status(binding):
+        reads["registration"] += 1
+        return original_status(binding)
+
+    def counted_eligible(binding, *args, **kwargs):
+        reads["eligibility"] += 1
+        return original_eligible(binding, *args, **kwargs)
+
+    monkeypatch.setattr(runtime, "registration_status", counted_status)
+    monkeypatch.setattr(runtime, "binding_write_eligible", counted_eligible)
+    original_identity = runtime.working_set._identity
+    identity_reads = 0
+
+    def counted_identity(binding):
+        nonlocal identity_reads
+        identity_reads += 1
+        return original_identity(binding)
+
+    monkeypatch.setattr(runtime.working_set, "_identity", counted_identity)
+
+    assert (
+        dispatch_machine_cycle_locked(
+            runtime,
+            available_gpus=[],
+            supervise=False,
+            publish_snapshots=False,
+        )
+        == []
+    )
+    assert reads["registration"] <= 4
+    assert reads["eligibility"] <= 4
+    assert identity_reads <= 8
+    assert runtime.working_set.snapshot()["dormant_bindings"] == len(bindings)
 
 
 def test_temporary_primary_dependency_gate_is_rechecked_before_borrowing(

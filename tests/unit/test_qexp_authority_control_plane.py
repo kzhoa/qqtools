@@ -49,9 +49,34 @@ def plane_factory(monkeypatch, tmp_path):
             )
             for name in project_ids
         ]
+
+        class WorkingSet:
+            def reconcile(self, registered, *, revision):
+                assert revision >= 0
+                assert list(registered) == bindings
+
+            def resident_bindings(self):
+                return list(bindings)
+
+            def begin_turn(self, binding, lane):
+                assert lane == "authority"
+                return binding
+
+            def acknowledge(self, turn, *, quiescent):
+                assert turn in bindings
+                assert isinstance(quiescent, bool)
+                return True
+
+            def renew_dormant_registrations(self, *, limit, heartbeat_interval_seconds):
+                assert limit == 64
+                assert heartbeat_interval_seconds == interval
+                return 0, 0
+
         runtime = SimpleNamespace(
             root=tmp_path / "machine",
             instance_id="runtime-instance",
+            working_set=WorkingSet(),
+            load_registry_snapshot=lambda: (1, tuple(bindings)),
             registration_status=lambda binding: {"state": "eligible"},
             binding_write_eligible=lambda binding, **kwargs: True,
             reactivate_binding=lambda binding: True,
@@ -470,7 +495,7 @@ def test_large_registry_limits_shared_work_and_reaches_every_project(plane_facto
 
 def test_registry_discovery_never_reads_shared_status(plane_factory):
     case = plane_factory()
-    case.runtime.load_registry = lambda: (1, case.bindings)
+    case.runtime.load_registry_snapshot = lambda: (1, tuple(case.bindings))
 
     def shared_read(_binding):
         raise AssertionError("registry discovery performed project I/O")

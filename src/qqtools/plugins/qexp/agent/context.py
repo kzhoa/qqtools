@@ -10,6 +10,7 @@ import tempfile
 import time
 import uuid
 from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
@@ -18,7 +19,7 @@ from typing import Any, Iterator
 
 from ..config_types import RootConfig
 from ..infrastructure.host import host_instance_id as _host_instance_id
-from ..layout import load_machine_record, load_root_config
+from ..layout import load_machine_record, load_machine_registration, load_root_config
 from ..runtime.authority_scan import is_path_present, iter_evidence_files, validate_evidence_path
 from ..runtime.group_discovery.session_owner import GroupSourceOwner
 from ..runtime.locks import exclusive, shared
@@ -26,6 +27,7 @@ from ..runtime.paths import local_paths, machine_project_paths, machine_runtime_
 from ..runtime.records import utc_now
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.work_budget import AdaptiveBatchSizer
+from .activation_consumer_retirement import ActivationConsumerRetirements
 from .bindings import ProjectBinding
 from .dispatch_probe import PrimaryProbeSession
 from .identity import MachineRuntimeUninitializedError, load_identity_record, require_fresh_runtime
@@ -36,6 +38,7 @@ from .registration import (
     REGISTRY_VERSION,
     MachineRegistration,
 )
+from .working_set import BindingWorkingSet
 
 MACHINE_RUNTIME_ENV = "QEXP_MACHINE_RUNTIME_ROOT"
 LEGACY_AGENT_EVIDENCE = (
@@ -113,7 +116,12 @@ class MachineRuntime:
         self.root = resolve_machine_runtime_root(root)
         self._scheduler_authority_gate = RLock()
         self._scheduler_authority_pid: int | None = None
+        self._registry_guard_depth: ContextVar[int] = ContextVar(f"registry_guard_depth_{id(self)}", default=0)
         self._inventory_lock_depth = 0
+        self._inventory_cache_lock = RLock()
+        self._inventory_cache_witness: tuple[int, int, int, int, int] | None = None
+        self._inventory_cache_revision: int | None = None
+        self._inventory_cache_entries: tuple[Any, ...] | None = None
         self._config_lock_depth = 0
         self.paths = machine_runtime_paths(self.root)
         self.last_diagnostic_publish_ns: int | None = None
@@ -126,6 +134,8 @@ class MachineRuntime:
         # Upgrade discovery is metadata-only when no project has pending work.  These fields are
         # intentionally process-local; the project journal remains the source of truth.
         self.upgrade_registry_revision: int | None = None
+        self.upgrade_discovery_lock = RLock()
+        self.upgrade_discovery_unknown = False
         self.upgrade_discovery_complete = False
         self.upgrade_pending_projects: set[str] = set()
         # Pending Group service activation is resumable maintenance and must
@@ -148,11 +158,14 @@ class MachineRuntime:
         # context.py does not depend on the executor implementation.
         self.pending_launch_handoffs: dict[tuple[str, str], Any] = {}
         self.group_source_owner = GroupSourceOwner()
+        self.activation_consumer_retirements = ActivationConsumerRetirements(self.root)
         self.registration = MachineRegistration(
             self.root,
             ensure_layout=self.ensure_layout,
             current_instance_id=lambda: self.instance_id,
+            recover_removed_consumer=self._recover_removed_consumer_locked,
         )
+        self.working_set = BindingWorkingSet(self)
 
     @property
     def instance_id(self) -> str:
@@ -344,10 +357,69 @@ class MachineRuntime:
     @contextmanager
     def registry_guard(self, *, blocking: bool = True) -> Iterator[bool]:
         with self.registration.registry_guard(blocking=blocking) as acquired:
-            yield acquired
+            if not acquired:
+                yield False
+                return
+            token = self._registry_guard_depth.set(self._registry_guard_depth.get() + 1)
+            try:
+                yield True
+            finally:
+                self._registry_guard_depth.reset(token)
 
     def load_registry(self) -> tuple[int, list[ProjectBinding]]:
-        return self.registration.load_registry()
+        revision, snapshot = self.load_registry_snapshot()
+        return revision, list(snapshot)
+
+    def load_registry_snapshot(self) -> tuple[int, tuple[ProjectBinding, ...]]:
+        """Return the cached immutable registry view and recover retirement intents."""
+        revision, bindings = self.registration.load_registry_snapshot()
+        if self._registry_guard_depth.get() == 0:
+            self.activation_consumer_retirements.recover(bindings, self.registration)
+        return revision, bindings
+
+    def load_inventory_snapshot(self) -> tuple[int, tuple[Any, ...]]:
+        """Return an immutable inventory view without reparsing an unchanged file."""
+        from .inventory import load_inventory
+
+        path = self.paths["inventory"]
+        while True:
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                witness = None
+            else:
+                witness = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                )
+            with self._inventory_cache_lock:
+                if (
+                    witness is not None
+                    and self._inventory_cache_witness == witness
+                    and self._inventory_cache_revision is not None
+                    and self._inventory_cache_entries is not None
+                ):
+                    return self._inventory_cache_revision, self._inventory_cache_entries
+            revision, entries = load_inventory(self)
+            after = path.lstat()
+            after_witness = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if witness is not None and after_witness != witness:
+                continue
+            snapshot = tuple(entries)
+            with self._inventory_cache_lock:
+                self._inventory_cache_witness = after_witness
+                self._inventory_cache_revision = revision
+                self._inventory_cache_entries = snapshot
+            return revision, snapshot
 
     def _save_registry(self, revision: int, bindings: list[ProjectBinding]) -> None:
         self.registration.save_registry_locked(revision, bindings)
@@ -383,6 +455,33 @@ class MachineRuntime:
             machine_name,
             enabled=enabled,
             adopt_existing=adopt_existing,
+        )
+
+    def _recover_removed_consumer_locked(
+        self,
+        cfg: RootConfig,
+        project_id: str,
+        runtime_instance_id: str,
+        bindings: list[ProjectBinding],
+    ) -> None:
+        """Recover the exact shared generation before registration may reuse it."""
+        raw = load_machine_registration(cfg)
+        record = raw.get("registration") if isinstance(raw, dict) else None
+        if not isinstance(record, dict):
+            return
+        generation = record.get("generation")
+        if (
+            record.get("runtime_instance_id") != runtime_instance_id
+            or record.get("runtime_root") != str(self.root)
+            or not isinstance(generation, str)
+        ):
+            return
+        self.activation_consumer_retirements.recover_exact_locked(
+            runtime_id=runtime_instance_id,
+            project_id=project_id,
+            registration_generation=generation,
+            shared_root=cfg.shared_root,
+            snapshot=bindings,
         )
 
     def _acquire_registration(
@@ -507,8 +606,16 @@ class MachineRuntime:
     def registration_status(self, binding: ProjectBinding) -> dict[str, Any]:
         return self.registration.registration_status(binding)
 
-    def refresh_binding_eligibility(self, binding: ProjectBinding) -> bool:
-        return self.registration.refresh_binding_eligibility(binding)
+    def refresh_binding_eligibility(
+        self,
+        binding: ProjectBinding,
+        *,
+        renewal_horizon_seconds: float = 0.0,
+    ) -> bool:
+        return self.registration.refresh_binding_eligibility(
+            binding,
+            renewal_horizon_seconds=renewal_horizon_seconds,
+        )
 
     def reactivate_binding(self, binding: ProjectBinding) -> bool:
         return self.registration.reactivate_binding(binding)
@@ -518,8 +625,18 @@ class MachineRuntime:
         with self.registration.binding_write_guard(binding) as eligible:
             yield eligible
 
-    def binding_write_eligible(self, binding: ProjectBinding, *, renew: bool = False) -> bool:
-        return self.registration.binding_write_eligible(binding, renew=renew)
+    def binding_write_eligible(
+        self,
+        binding: ProjectBinding,
+        *,
+        renew: bool = False,
+        renewal_horizon_seconds: float = 0.0,
+    ) -> bool:
+        return self.registration.binding_write_eligible(
+            binding,
+            renew=renew,
+            renewal_horizon_seconds=renewal_horizon_seconds,
+        )
 
     def add_binding(
         self,
@@ -706,6 +823,7 @@ class MachineRuntime:
                             raise RuntimeError(
                                 "cannot remove project with active local evidence: " + ", ".join(blockers)
                             )
+                        self.activation_consumer_retirements.prepare(binding)
                         if is_path_present(project_root):
                             try:
                                 shutil.rmtree(project_root)
@@ -718,6 +836,7 @@ class MachineRuntime:
                                 # writer observes the registry.
                                 raise CaptureBusy("project runtime removal is busy") from exc
                 self.registration.save_registry_locked(revision + 1, [item for item in bindings if item != binding])
+                self.activation_consumer_retirements.complete(binding)
         return binding
 
     def binding_blockers(self, binding: ProjectBinding) -> list[str]:

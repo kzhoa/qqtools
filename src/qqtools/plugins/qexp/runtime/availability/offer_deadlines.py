@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 import os
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
@@ -11,6 +12,7 @@ from typing import Iterator
 from ...config_types import RootConfig
 from ..locks import schema_lock
 from ..paths import local_paths, shared_paths
+from ..project_activation import project_activation_transaction
 from ..records import TaskRecord
 from ..store import atomic_replace, iter_json, read_json
 
@@ -66,26 +68,52 @@ def _iter_bucket_paths(buckets: list[Path]) -> Iterator[Path]:
                     yield Path(entry.path)
 
 
-def remove_deadline_index(cfg: RootConfig, task_id: str) -> None:
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_directory_chain(directory: Path, root: Path) -> None:
+    directory.relative_to(root)
+    current = directory
+    while True:
+        _sync_directory(current)
+        if current == root:
+            return
+        current = current.parent
+
+
+def remove_deadline_index(cfg: RootConfig, task_id: str, *, _publish_activation: bool = True) -> None:
     stable = _deadline_index_path(cfg, task_id)
     if stable.exists() or stable.is_symlink():
-        try:
-            target = stable.resolve(strict=True)
-        except FileNotFoundError:
-            target = None
-        stable.unlink(missing_ok=True)
-        if target is not None:
-            target.unlink(missing_ok=True)
-            bucket = target.parent
-            home = bucket.parent
+        activation = (
+            project_activation_transaction(cfg, "offer_deadline_update") if _publish_activation else nullcontext()
+        )
+        with activation:
             try:
-                bucket.rmdir()
-            except OSError:
-                pass
-            try:
-                home.rmdir()
-            except OSError:
-                pass
+                target = stable.resolve(strict=True)
+            except FileNotFoundError:
+                target = None
+            stable.unlink(missing_ok=True)
+            if target is not None:
+                target.unlink(missing_ok=True)
+                bucket = target.parent
+                home = bucket.parent
+                _sync_directory(bucket)
+                try:
+                    bucket.rmdir()
+                except OSError:
+                    pass
+                _sync_directory(home)
+                try:
+                    home.rmdir()
+                except OSError:
+                    pass
+                _sync_directory(home.parent)
+            _sync_directory_chain(stable.parent, cfg.shared_root)
 
 
 def sync_deadline_index(cfg: RootConfig, task: TaskRecord) -> None:
@@ -113,12 +141,15 @@ def sync_deadline_index(cfg: RootConfig, task: TaskRecord) -> None:
                     return
             except (KeyError, TypeError, ValueError):
                 pass
-        remove_deadline_index(cfg, task.task_id)
-        atomic_replace(active, desired)
-        try:
-            path.symlink_to(active.relative_to(path.parent))
-        except FileExistsError:
-            pass
+        with project_activation_transaction(cfg, "offer_deadline_update"):
+            remove_deadline_index(cfg, task.task_id, _publish_activation=False)
+            atomic_replace(active, desired)
+            try:
+                path.symlink_to(active.relative_to(path.parent))
+            except FileExistsError:
+                pass
+            _sync_directory_chain(active.parent, cfg.shared_root)
+            _sync_directory_chain(path.parent, cfg.shared_root)
         return
     remove_deadline_index(cfg, task.task_id)
 
@@ -216,6 +247,6 @@ def rebuild_deadline_indexes(cfg: RootConfig) -> int:
             rebuilt += 1
     for index_file in iter_json(shared_paths(cfg.shared_root)["offer_deadlines"]):
         if index_file.stem not in indexed:
-            index_file.unlink(missing_ok=True)
+            remove_deadline_index(cfg, index_file.stem)
             rebuilt += 1
     return rebuilt
