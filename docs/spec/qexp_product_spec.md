@@ -173,6 +173,11 @@ name follows the global default, is explicit, or has unresolved legacy provenanc
 bindings keep their frozen effective names. A missing mount or name conflict is an entry-specific
 failure and does not roll back successful entries.
 
+`qexp project register PATH --machine NAME --adopt-existing` explicitly takes over one registration
+without active write eligibility for that logical name. It never replaces an actively eligible
+registration. The flag cannot be combined with `--from-pool` or multiple Project paths. Ordinary
+registration keeps the existing ownership guard.
+
 `project list` reports inventory-only, registered, disabled, and conflicting entries. `project
 remove ID_OR_PATH` removes an inventory-only entry without mounting or reading the Project. A
 current binding retains its existing disable, recovery, reservation, and process-safety checks.
@@ -1740,13 +1745,14 @@ qexp agent config gpus reset
 ```
 
 `qexp project register` is idempotent for a valid current binding, preserves its enablement and
-effective name, and reports the actual Project ID and shared path. It never replaces an uncertain
-owner through recovery adoption. Runtime identity is bound to both its local random identity and
-the current Linux host, so copying only the runtime directory cannot renew authority on another
-host. `qexp project enable <project-id-or-root>` revalidates registration authority before enabling
-new admission. An existing Project without the global-agent machine-record marker must use the one-time
-`qexp admin migrate agent --project PATH --machine NAME` command. It stops only a verified old agent process, imports local
-execution evidence, registers the Project, and then starts or wakes the global agent without
+effective name, and reports the actual Project ID and shared path. Ordinary registration never
+replaces another runtime's owner through recovery adoption. Runtime identity is bound to both its
+local random identity and the current Linux host, so copying only the runtime directory cannot renew
+authority on another host. `qexp project enable <project-id-or-root>` revalidates registration
+authority before enabling new admission. An existing Project without the global-agent machine-record
+marker must use the one-time `qexp admin migrate agent --project PATH --machine NAME` command. It
+stops only a verified old agent process, imports local execution evidence, registers the Project,
+and then starts or wakes the global agent without
 terminating already running training processes. Late immutable runner evidence is drained from
 the legacy runtime instead of permanently mirrored. Repeating a completed migration preserves
 the binding's current operator-controlled enabled or disabled state.

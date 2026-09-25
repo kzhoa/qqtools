@@ -9,6 +9,7 @@ import pytest
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.layout import load_root_config
+from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -206,6 +207,80 @@ def test_explicit_alias_is_frozen_and_pool_inputs_are_exclusive(
     conflict = _json(capsys)["error"]
     assert conflict["code"] == "invalid_argument"
     assert "mutually exclusive" in conflict["message"]
+
+
+def test_expired_registration_requires_explicit_single_project_adoption(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    old_runtime = tmp_path / "old-machine"
+    new_runtime = tmp_path / "new-machine"
+    project = tmp_path / "project"
+    assert main(_invoke(old_runtime, "init", "--machine", "g8", "--format=json")) == 0
+    capsys.readouterr()
+    assert main(_invoke(old_runtime, "project", "init", str(project), "--format=json")) == 0
+    capsys.readouterr()
+    assert main(_invoke(old_runtime, "project", "register", str(project), "--machine", "g8", "--format=json")) == 0
+    original = _json(capsys)["projects"][0]
+    registration_path = project / ".qexp" / "machines" / "g8" / "registration.json"
+
+    assert main(_invoke(new_runtime, "init", "--machine", "g8", "--format=json")) == 0
+    capsys.readouterr()
+    adoption_args = ("project", "register", str(project), "--machine", "g8", "--adopt-existing", "--format=json")
+    registration = read_json(registration_path)["registration"]
+    registration["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(registration_path, {"registration": registration})
+    assert main(_invoke(new_runtime, "project", "register", str(project), "--machine", "g8", "--format=json")) == 2
+    ordinary = _json(capsys)["projects"][0]
+    assert "explicit --adopt-existing is required" in ordinary["reason"]
+
+    assert main(_invoke(new_runtime, "project", "register", "--from-pool", "--adopt-existing", "--format=json")) == 2
+    assert _json(capsys)["error"]["code"] == "invalid_argument"
+    assert main(_invoke(new_runtime, "project", "register", str(project), "--adopt-existing", "--format=json")) == 2
+    assert _json(capsys)["error"]["code"] == "invalid_argument"
+    assert main(_invoke(new_runtime, *adoption_args)) == 0
+    adopted = _json(capsys)["projects"][0]
+    assert adopted["status"] == "registered"
+    assert adopted["machine_name"] == "g8"
+    assert adopted["registration_generation"] != original["registration_generation"]
+    runtime = MachineRuntime(new_runtime)
+    assert runtime.registration_status(runtime.load_registry()[1][0])["write_eligible"]
+    assert main(_invoke(new_runtime, "project", "register", str(project), "--machine", "g8", "--format=json")) == 0
+    repeated = _json(capsys)["projects"][0]
+    assert repeated["registration_generation"] == adopted["registration_generation"]
+
+
+def test_explicit_adoption_rejects_active_registration(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    old_runtime = tmp_path / "old-machine"
+    new_runtime = tmp_path / "new-machine"
+    project = tmp_path / "project"
+    assert main(_invoke(old_runtime, "init", "--machine", "g8", "--format=json")) == 0
+    capsys.readouterr()
+    assert main(_invoke(old_runtime, "project", "init", str(project), "--format=json")) == 0
+    capsys.readouterr()
+    assert main(_invoke(old_runtime, "project", "register", str(project), "--machine", "g8", "--format=json")) == 0
+    original = _json(capsys)["projects"][0]
+
+    assert main(_invoke(new_runtime, "init", "--machine", "g8", "--format=json")) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            _invoke(
+                new_runtime,
+                "project",
+                "register",
+                str(project),
+                "--machine",
+                "g8",
+                "--adopt-existing",
+                "--format=json",
+            )
+        )
+        == 2
+    )
+    active = _json(capsys)["projects"][0]
+    assert "active competing authority" in active["reason"]
+    registration_path = project / ".qexp" / "machines" / "g8" / "registration.json"
+    assert read_json(registration_path)["registration"]["generation"] == original["registration_generation"]
 
 
 def test_legacy_registry_migrates_to_unresolved_inventory_without_changing_binding(

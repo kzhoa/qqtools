@@ -190,6 +190,11 @@ unchanged. It therefore requires confirmation or `--yes`; use `qexp agent name -
 name-only change. Copied images with unfinished evidence require the explicit
 `--detach-old-runtime` decision; do not use it when the copy is the only recovery environment.
 
+If a new runtime must take over an expired Project registration for the same logical machine,
+register one Project explicitly with `qexp project register PATH --machine NAME --adopt-existing`.
+An actively eligible registration still blocks takeover. Ordinary `project register` never adopts
+another runtime's registration.
+
 `--machine` is a project-local logical worker name and, for operational commands, a compatibility
 assertion against the local MachineRuntime binding. It is not the Task target. Use
 `--home-machine` to place a Task independently:

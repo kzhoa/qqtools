@@ -263,6 +263,11 @@ def build_parser() -> argparse.ArgumentParser:
     project_register.add_argument("--from-pool", action="store_true")
     project_register.add_argument("--machine", dest="project_machine")
     project_register.add_argument("--name-source", choices=("default", "explicit"))
+    project_register.add_argument(
+        "--adopt-existing",
+        action="store_true",
+        help="Explicitly replace a prior ineligible Project registration for one named machine.",
+    )
     _add_output_format(project_register)
     bind_command(
         project_register,

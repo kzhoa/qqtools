@@ -719,6 +719,7 @@ def register_projects(
     from_pool: bool = False,
     machine_name: str | None = None,
     name_source: str | None = None,
+    adopt_existing: bool = False,
 ) -> dict[str, Any]:
     """Enroll explicit Projects or the saved local inventory incrementally."""
     machine_runtime = _runtime(runtime)
@@ -734,6 +735,8 @@ def register_projects(
         raise SetupUsageError("--machine and --name-source default are mutually exclusive.")
     if from_pool and (machine_name is not None or name_source is not None):
         raise SetupUsageError("--from-pool does not accept --machine or --name-source.")
+    if adopt_existing and (from_pool or len(selected_paths) != 1 or machine_name is None):
+        raise SetupUsageError("--adopt-existing requires one Project path and --machine NAME.")
     config = load_agent_config(machine_runtime)
     with machine_runtime.agent_lifecycle_guard():
         with machine_runtime.inventory_guard():
@@ -855,7 +858,7 @@ def register_projects(
                         entry.shared_root,
                         effective,
                         enabled=entry.enabled,
-                        adopt_existing=False,
+                        adopt_existing=adopt_existing,
                     )
                     result_status = "registered" if registration.binding.enabled else "disabled"
                     results.append(_result_for_binding(entry, registration.binding, status=result_status))

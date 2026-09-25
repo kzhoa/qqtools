@@ -397,6 +397,7 @@ def dispatch_local(
                     from_pool=args.from_pool,
                     machine_name=project_machine,
                     name_source=args.name_source,
+                    adopt_existing=args.adopt_existing,
                 )
             except SetupUsageError as exc:
                 raise CliUsageError(str(exc)) from exc

@@ -259,9 +259,11 @@ duplicate canonical roots are rejected. The project also owns a logical-machine 
 record under `machines/<name>/registration.json`, with a bounded write-eligibility expiry. A
 repeated registration by the same runtime renews its generation and retains the operator's
 enabled/disabled state. A different runtime cannot reclaim an owned name without
-`--adopt-existing` after the previous eligibility is invalid. Superseded generations cannot
-dispatch or publish machine-authoritative state. A claim or machine-state publication holds the
-registration fence from current-generation validation through its authoritative commit, so a
+`qexp project register PATH --machine NAME --adopt-existing` after the previous eligibility is
+invalid. The explicit command accepts one Project and preserves the active-eligibility fence.
+Superseded generations cannot dispatch or publish machine-authoritative state. A claim or
+machine-state publication holds the registration fence from current-generation validation through
+its authoritative commit, so a
 replacement generation cannot activate between validation and commit. Runtime state is derived as
 `enabled`, `draining`
 (disabled with local blockers), or `disabled` (disabled with no blockers). A binding may be removed

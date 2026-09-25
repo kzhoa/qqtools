@@ -251,7 +251,7 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     )
 
     assert (
-        hashlib.sha256(text.encode()).hexdigest() == "b66e2bb76fd7df397c5d4b98711f2c33d7fb617f2ac737f9083b51b44f1bf8bb"
+        hashlib.sha256(text.encode()).hexdigest() == "137c8bc0029e50bf6253dca8978a84b477e92f6cea09f48681239e4d1daea34f"
     )
 
 
