@@ -6,6 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from ..agent.diagnostics import parse_log_size
 from ..commands import configuration as configuration_commands
 from ..commands import context as context_commands
 from ..launch_policy import validate_launch_handoff_timeout_seconds
@@ -919,6 +920,11 @@ def build_parser() -> argparse.ArgumentParser:
     config_set.add_argument("--provider")
     config_set.add_argument("--name")
     config_set.add_argument("--agent-mode", choices=("daemon", "on_demand"))
+    config_set.add_argument(
+        "--log-max-size",
+        type=parse_log_size,
+        help=("Set the next agent instance's log rotation trigger (not a strict cap; arbitrary output may overshoot)."),
+    )
     config_boolean = config_set.add_mutually_exclusive_group()
     config_boolean.add_argument("--enabled", action="store_true", default=None)
     config_boolean.add_argument("--disabled", action="store_true", default=None)

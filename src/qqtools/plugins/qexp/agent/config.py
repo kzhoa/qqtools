@@ -13,6 +13,7 @@ from typing import Any
 
 from ..models import AGENT_MODE_DAEMON, AGENT_MODE_ON_DEMAND
 from ..runtime.store import atomic_replace, read_json
+from .diagnostics import DEFAULT_LOG_MAX_BYTES, format_log_size, parse_log_size
 
 AGENT_CONFIG_VERSION = 1
 AGENT_MODES = frozenset({AGENT_MODE_DAEMON, AGENT_MODE_ON_DEMAND})
@@ -44,10 +45,12 @@ class AgentConfig:
     agent_mode: str = DEFAULT_AGENT_MODE
     revision: int = 0
     provenance: str = "default"
+    log_max_bytes: int = DEFAULT_LOG_MAX_BYTES
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", validate_agent_name(self.name))
         object.__setattr__(self, "agent_mode", validate_agent_mode(self.agent_mode))
+        object.__setattr__(self, "log_max_bytes", parse_log_size(self.log_max_bytes))
         if type(self.revision) is not int or self.revision < 0:
             raise ValueError("agent config revision must be a non-negative integer.")
         if not isinstance(self.provenance, str) or not self.provenance:
@@ -62,6 +65,7 @@ class AgentConfig:
             "version": AGENT_CONFIG_VERSION,
             "name": self.name,
             "agent_mode": self.agent_mode,
+            "log_max_bytes": self.log_max_bytes,
             "revision": self.revision,
             "provenance": self.provenance,
         }
@@ -77,6 +81,7 @@ class AgentConfig:
             return cls(
                 name=value["name"],
                 agent_mode=value.get("agent_mode", DEFAULT_AGENT_MODE),
+                log_max_bytes=value.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES),
                 revision=value.get("revision", 0),
                 provenance=value.get("provenance", "default"),
             )
@@ -221,7 +226,13 @@ def initialize_agent_config(runtime: Any, name: str, *, agent_mode: str | None =
         revision = previous.revision + 1 if previous is not None else 0
         return _write_locked(
             machine_runtime,
-            AgentConfig(validated_name, selected_mode, revision=revision, provenance=provenance),
+            AgentConfig(
+                validated_name,
+                selected_mode,
+                log_max_bytes=previous.log_max_bytes if previous is not None else DEFAULT_LOG_MAX_BYTES,
+                revision=revision,
+                provenance=provenance,
+            ),
         )
 
 
@@ -230,12 +241,13 @@ def set_agent_config(
     *,
     name: str | None = None,
     agent_mode: str | None = None,
+    log_max_bytes: str | int | None = None,
 ) -> AgentConfig:
-    """Publish a revisioned name/mode update without replacing identity."""
+    """Publish a revisioned global agent configuration update."""
     machine_runtime = _as_runtime(runtime)
     machine_runtime.require_initialized()
-    if name is None and agent_mode is None:
-        raise ValueError("set_agent_config requires name or agent_mode.")
+    if name is None and agent_mode is None and log_max_bytes is None:
+        raise ValueError("set_agent_config requires name, agent_mode, or log_max_bytes.")
     with machine_runtime.config_guard():
         current = _stored_config(machine_runtime)
         if current is None:
@@ -243,6 +255,7 @@ def set_agent_config(
         updated = AgentConfig(
             validate_agent_name(name) if name is not None else current.name,
             validate_agent_mode(agent_mode) if agent_mode is not None else current.agent_mode,
+            log_max_bytes=parse_log_size(log_max_bytes) if log_max_bytes is not None else current.log_max_bytes,
             revision=current.revision + 1,
             provenance="configured",
         )
@@ -257,6 +270,8 @@ def agent_config_payload(runtime: Any) -> dict[str, Any]:
         "machine_runtime_root": str(machine_runtime.root),
         "agent_name": config.name,
         "agent_mode": config.agent_mode,
+        "log_max_bytes": config.log_max_bytes,
+        "log_max_size": format_log_size(config.log_max_bytes),
         "revision": config.revision,
         "provenance": config.provenance,
         "runtime_id": machine_runtime.instance_id,

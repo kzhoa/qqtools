@@ -235,6 +235,7 @@ class MachineRuntime:
             "projects",
             "upgrades",
             "diagnostics",
+            "diagnostic_instances",
             "archives",
             "generations",
         ):

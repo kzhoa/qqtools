@@ -95,7 +95,37 @@ def _render_agent_operation(result: Mapping[str, Any], _presentation: Mapping[st
 
 
 def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    return _render_agent_operation(result, _presentation)
+    rendered = _render_agent_operation(result, _presentation)
+    if result.get("stop_reason") is not None:
+        rendered = f"{rendered}\n\nStop reason: {result.get('stop_reason')}"
+    diagnostics = result.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        diagnostic_details = _details(
+            (
+                ("Diagnostic instance", diagnostics.get("instance_id")),
+                ("Diagnostics state", diagnostics.get("state")),
+                ("Diagnostic log", diagnostics.get("log_path")),
+                ("Persistent log available", diagnostics.get("log_available")),
+                (
+                    "Configured log rotation",
+                    diagnostics.get("configured_log_max_size", diagnostics.get("configured_log_max_bytes")),
+                ),
+                (
+                    "Effective log rotation",
+                    diagnostics.get("effective_log_max_size", diagnostics.get("effective_log_max_bytes")),
+                ),
+                ("Capture mode", diagnostics.get("capture_mode")),
+                ("Capture health", diagnostics.get("capture_health")),
+                ("Current diagnostic summary", diagnostics.get("summary")),
+                ("Last exit", diagnostics.get("last_exit")),
+                ("Last exit source", diagnostics.get("last_exit_source")),
+                ("Diagnostic coverage", diagnostics.get("coverage")),
+                ("Last exit stale", diagnostics.get("last_exit_stale")),
+            )
+        )
+        if diagnostic_details:
+            rendered = f"{rendered}\n\n{diagnostic_details}" if rendered else diagnostic_details
+    return rendered
 
 
 def _render_agent_config(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
@@ -104,6 +134,7 @@ def _render_agent_config(result: Mapping[str, Any], _presentation: Mapping[str, 
             ("Outcome", str(result.get("action", "shown")).replace("_", " ")),
             ("Agent name", result.get("agent_name")),
             ("Agent mode", result.get("agent_mode")),
+            ("Log rotation trigger", result.get("log_max_size", result.get("log_max_bytes"))),
         )
     )
 
@@ -215,9 +246,22 @@ def _validate_agent_config(result: Any) -> None:
     action = _required(value, "action", "agent-config payload")
     if action not in {"shown", "updated"}:
         raise ValueError("agent-config payload.action is invalid")
-    for key in ("machine_runtime_root", "agent_name", "agent_mode", "revision", "provenance", "runtime_id"):
+    for key in (
+        "machine_runtime_root",
+        "agent_name",
+        "agent_mode",
+        "revision",
+        "provenance",
+        "runtime_id",
+        "log_max_bytes",
+        "log_max_size",
+    ):
         _required(value, key, "agent-config payload")
     _required_int(value, "revision", "agent-config payload")
+    if type(value["log_max_bytes"]) is not int or value["log_max_bytes"] <= 0:
+        raise TypeError("agent-config payload.log_max_bytes must be a positive integer")
+    if not isinstance(value["log_max_size"], str):
+        raise TypeError("agent-config payload.log_max_size must be a string")
 
 
 def _validate_agent_readiness(result: Any) -> None:
@@ -243,6 +287,35 @@ def _validate_agent_status(result: Any) -> None:
         _validate_gpu_policy_view(value["gpu_policy"], "agent-status payload.gpu_policy")
     if "warnings" in value:
         _sequence(value["warnings"], "agent-status payload.warnings")
+    if "diagnostics" in value:
+        diagnostics = _mapping(value["diagnostics"], "agent-status payload.diagnostics")
+        if "log_available" in diagnostics and type(diagnostics["log_available"]) is not bool:
+            raise TypeError("agent-status payload.diagnostics.log_available must be a boolean")
+        for key in ("configured_log_max_bytes", "effective_log_max_bytes"):
+            if (
+                key in diagnostics
+                and not (key == "effective_log_max_bytes" and diagnostics[key] is None)
+                and (type(diagnostics[key]) is not int or diagnostics[key] <= 0)
+            ):
+                raise TypeError(f"agent-status payload.diagnostics.{key} must be a positive integer")
+        for key in ("available", "summary_synthetic", "last_exit_historical", "last_exit_stale", "historical"):
+            if key in diagnostics and type(diagnostics[key]) is not bool:
+                raise TypeError(f"agent-status payload.diagnostics.{key} must be a boolean")
+        for key in (
+            "instance_id",
+            "state",
+            "log_path",
+            "configured_log_max_size",
+            "effective_log_max_size",
+            "capture_mode",
+            "capture_health",
+            "last_exit_source",
+        ):
+            if key in diagnostics and diagnostics[key] is not None and not isinstance(diagnostics[key], str):
+                raise TypeError(f"agent-status payload.diagnostics.{key} must be a string or null")
+        for key in ("summary", "last_exit", "coverage"):
+            if key in diagnostics and diagnostics[key] is not None:
+                _mapping(diagnostics[key], f"agent-status payload.diagnostics.{key}")
 
 
 def _validate_cpu_lane(result: Any) -> None:

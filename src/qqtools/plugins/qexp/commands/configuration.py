@@ -9,6 +9,7 @@ from typing import Any
 
 from ..agent.config import agent_config_payload, set_agent_config, validate_agent_mode, validate_agent_name
 from ..agent.context import MachineRuntime
+from ..agent.diagnostics import parse_log_size
 from ..config_types import RootConfig
 from ..launch_policy import (
     reset_launch_handoff_policy,
@@ -65,7 +66,7 @@ _FEISHU_FIELDS = frozenset(
         "timeout_seconds",
     }
 )
-_AGENT_FIELDS = frozenset({"name", "agent_mode"})
+_AGENT_FIELDS = frozenset({"name", "agent_mode", "log_max_bytes"})
 
 
 def _require_section(section: str) -> str:
@@ -183,6 +184,8 @@ def _requested_changed_fields(
         normalized = requested_value
         if section == "lease" and field == "clock_provider_priority":
             normalized = _normalize_clock_provider_priority(requested_value)
+        elif section == "agent" and field == "log_max_bytes":
+            normalized = parse_log_size(requested_value)
         if normalized != _field_value(current, section, field, provider):
             changed.append(field)
     return changed
@@ -489,10 +492,12 @@ def _set_agent(runtime: MachineRuntime, values: Mapping[str, object]) -> dict[st
         raise ValueError("agent name must be a string")
     if "agent_mode" in values and not isinstance(values["agent_mode"], str):
         raise ValueError("agent agent_mode must be a string")
+    log_max_bytes = parse_log_size(values["log_max_bytes"]) if "log_max_bytes" in values else None
     set_agent_config(
         runtime,
         name=values.get("name"),
         agent_mode=values.get("agent_mode"),
+        log_max_bytes=log_max_bytes,
     )
     return agent_config_payload(runtime)
 
@@ -511,6 +516,8 @@ def _validate_set_options(
             validate_agent_name(options["name"])  # type: ignore[arg-type]
         if "agent_mode" in options:
             validate_agent_mode(options["agent_mode"])  # type: ignore[arg-type]
+        if "log_max_bytes" in options:
+            parse_log_size(options["log_max_bytes"])
         return
     if section == "lease":
         _validate_keys(options, _LEASE_FIELDS, "lease")

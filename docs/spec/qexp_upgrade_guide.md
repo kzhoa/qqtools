@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-21
+updated_at: 2026-09-25
 archived_at:
 ---
 
@@ -86,6 +86,16 @@ completed. The result may say `Ready: pending`. Observe later convergence first 
 ```bash
 qexp admin upgrade status --format json
 ```
+
+Releases with agent exit diagnostics add only optional machine-local configuration and diagnostic
+records; they do not change shared Project schemas or writer admission. Upgrade the package and
+restart each machine agent so the new process adopts the configured rotation threshold. Existing
+configuration without `log_max_bytes` reads as the 10 MiB default, and current writers preserve the
+field on later name or residency-policy updates. Older packages ignore the diagnostic namespace;
+downgrading loses diagnostic visibility and rotation behavior but does not reinterpret Project,
+Attempt, claim, reservation, or runner truth. Mixed package and running-agent versions are therefore
+supported only for the interval before the operator's normal machine-by-machine restart: status
+shows the running instance's effective value separately from the newly configured value.
 
 An exceptional recovery pass can advance every project visible in that machine registry while
 training processes continue:

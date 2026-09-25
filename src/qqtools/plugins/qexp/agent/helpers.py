@@ -147,6 +147,11 @@ def _publish_process_status(
     inventory_revision: int | None = None,
     reconciled_project_ids: list[str] | None = None,
     ready: bool | None = None,
+    stop_reason: str | None = None,
+    diagnostic_startup_sequence: int | None = None,
+    diagnostic_log_path: str | None = None,
+    effective_log_max_bytes: int | None = None,
+    capture_mode: str | None = None,
 ) -> None:
     """Publish live process identity and its process-local registration wait state."""
     machine_agent: dict[str, Any] = {
@@ -165,6 +170,11 @@ def _publish_process_status(
         "inventory_revision": inventory_revision,
         "reconciled_project_ids": reconciled_project_ids,
         "ready": ready,
+        "stop_reason": stop_reason,
+        "diagnostic_startup_sequence": diagnostic_startup_sequence,
+        "diagnostic_log_path": diagnostic_log_path,
+        "effective_log_max_bytes": effective_log_max_bytes,
+        "capture_mode": capture_mode,
     }
     machine_agent.update({key: value for key, value in optional.items() if value is not None})
     replace_snapshot_if_changed(runtime.paths["agent"] / "status.json", {"machine_agent": machine_agent})

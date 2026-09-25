@@ -251,7 +251,7 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     )
 
     assert (
-        hashlib.sha256(text.encode()).hexdigest() == "137c8bc0029e50bf6253dca8978a84b477e92f6cea09f48681239e4d1daea34f"
+        hashlib.sha256(text.encode()).hexdigest() == "d56032bb744acdde116e7de134e985861a82ff80cd085e445de0254ceb7f1c3b"
     )
 
 
@@ -406,6 +406,16 @@ def test_agent_parent_help_directs_ordinary_users_to_start(capsys) -> None:
     assert "foreground" in help_text.lower()
     assert "debugging" in help_text.lower()
     assert "qexp agent start" in help_text
+
+
+def test_agent_log_size_is_parsed_once_at_the_config_boundary() -> None:
+    parser = build_parser()
+
+    parsed = parser.parse_args(["config", "set", "agent", "--log-max-size", "10MiB"])
+
+    assert parsed.log_max_size == 10 * 1024 * 1024
+    with pytest.raises(SystemExit):
+        parser.parse_args(["config", "set", "agent", "--log-max-size", "10MB"])
 
 
 def test_main_dispatches_leaf_execution_from_command_spec_handler() -> None:

@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-22
+updated_at: 2026-09-25
 archived_at:
 ---
 
@@ -574,6 +574,36 @@ deterministic unweighted round-robin over enabled bindings sorted by stable proj
 layer is considered before borrow; a project with no eligible candidate, no fitting capacity, or a
 failed project-level claim does not block the remainder of its layer. Project-level eligibility and
 fenced claim protocols remain the final authority.
+
+#### Agent diagnostics and local log rotation
+
+Each agent startup attempt has one instance ID shared by its launcher, lifecycle status, diagnostic
+record, and private log directory. Detached stdout/stderr, including interpreter startup and fatal
+diagnostics, go to `/tmp/qqtools-qexp-<uid>/<runtime-key>/<instance-id>/agent.log`. The runtime key
+binds the canonical MachineRuntime root and runtime ID. Directories and files are owner-only and
+must reject symlink, wrong-owner, and non-regular-file substitution. Foreground `agent run` keeps
+its terminal streams and records only managed lifecycle diagnostics in the instance log.
+
+The machine-global `agent.log_max_bytes` setting defaults to 10 MiB and accepts an integer byte
+count or an integer with `KiB`, `MiB`, or `GiB`, inclusively bounded from 64 KiB through 1 GiB.
+`qexp config set agent --log-max-size SIZE` changes the next instance; it does not restart a running
+agent, and an idempotent `agent start` keeps the running instance's effective value. Rotation checks
+at most once per second and renames the active file to a unique `_agent_<UTC>_<sequence>.log` before
+rebinding stdout/stderr to a new `agent.log`. The threshold is a trigger, not a strict cap; arbitrary
+native output can overshoot it. qexp does not delete rotated archives or old instance directories,
+and `/tmp` cleanup or reboot may remove them.
+
+`qexp agent status` exposes one bounded optional `diagnostics` object in both human and JSON output:
+configured and effective rotation sizes, instance ID, log path and current path availability,
+capture mode and health, and the last admitted exit summary with its evidence source. Status checks
+path metadata but never opens or scans log contents. Missing terminal evidence is
+`abnormal_exit_unknown`; qexp does not infer OOM, signal, exit code, or exit time from a vanished PID
+or stale heartbeat. Startup failure text identifies the attempted private log path when available.
+
+Diagnostic capture and persistence are best effort. Failure is visible as degraded or unavailable
+coverage but never grants scheduler authority, changes Attempt or reservation ownership, signals a
+runner, or changes readiness and command exit-code semantics. Agent stop, crash, and restart retain
+the protected lifecycle-independence workflow.
 
 ### 6.7 Machine GPU Admission Policy
 
@@ -1756,6 +1786,8 @@ qexp project disable <project-id-or-root>
 qexp project remove <project-id-or-root>
 qexp agent start
 qexp agent status
+qexp config show agent
+qexp config set agent --log-max-size 10MiB
 qexp agent config gpus show
 qexp agent config gpus set --visible 0,2,3
 qexp agent config gpus set --none
@@ -1942,6 +1974,8 @@ retry. It performs direct bounded Task, selected-Attempt, and dependency reads. 
 - `qexp agent stop`
 - `qexp agent status`
 - `qexp agent name [--set-to NAME]`
+- `qexp config show agent`
+- `qexp config set agent [--name NAME] [--agent-mode daemon|on_demand] [--log-max-size SIZE]`
 - `qexp agent config cpu show | set`
 - `qexp agent config gpus show`
 - `qexp agent config gpus set --visible <ids> | --none [--expected-revision <revision>]`

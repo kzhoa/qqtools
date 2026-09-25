@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-21
+updated_at: 2026-09-25
 archived_at:
 ---
 
@@ -995,6 +995,11 @@ authoritative token and immutable evidence.
   agent/
     state.json
     agent.pid
+  diagnostics/
+    metadata.json
+    last-exit.json
+    instances/
+      <agent-instance-id>.json
   reservations/
     provisional/
       <reservation-id>.json
@@ -2632,6 +2637,55 @@ machine-by-machine package upgrade and global-agent restart; running Attempts re
 runner and reservation ownership. Downgrading to a policy-unaware agent is unsafe because that
 older agent ignores `gpu-policy.json` and may expose GPUs through its legacy environment/discovery
 path. No temporary compatibility reader or downgrade guard is provided.
+
+### 17.4 Agent Exit Evidence and Diagnostic Logs
+
+The MachineRuntime stores additive version-1 records under `diagnostics/instances/`, independently
+of Project truth. Each record binds runtime ID, host identity, startup sequence, instance ID,
+PID/start ticks when known, package version, lifecycle phase, admission, log path and capture health,
+effective rotation threshold, and separate `agent`, `launcher`, and `observer` writer namespaces. A bounded diagnostic
+lock follows the lifecycle lock in lock order and is never held across waits, signals, service joins,
+or Project writes. Each writer has a monotonic revision. A locked read-merge-atomic-replace update
+validates record identity, is idempotent, and cannot recreate an evicted record.
+
+The agent freezes `stop_reason` when it enters `stopping`: `idle`, `stopped_by_signal` with the
+handled signal, or `unhandled_exception` with bounded exception type/location. Full tracebacks stay
+in the private log. Cleanup outcome is independent: `pending`, `succeeded`, `failed`, or `unknown`,
+with bounded per-step results. Service stops, eligible Project stop publication, local status,
+identity-checked PID removal, log shutdown, and final diagnostic publication are attempted
+independently. A secondary cleanup error neither replaces a primary exception nor changes the
+frozen reason; failed cleanup prevents a successful finalization result. Machine and eligible
+Project snapshots receive the same frozen reason but not authoritative cleanup outcome.
+
+The launcher owns startup outcome, handshake timeout trigger, ordered signal attempts and delivery
+results, and child wait status. It records a process-handshake timeout before sending SIGTERM and
+retains later SIGKILL escalation. This does not alter the separate non-destructive public readiness
+timeout. The observer owns verified absence and coverage. It consults local process identity only
+when the recorded host identity matches the current host; missing or foreign host identity stays
+unknown. Proven same-host absence without terminal evidence adds `abnormal_exit_unknown` and an
+observation time while leaving actual exit time, code, and signal unknown. Permission failure, PID
+reuse ambiguity, and unverifiable identity remain
+`liveness_unknown`. Agent reason outranks generic launcher startup failure, and either direct source
+outranks inferred unknown evidence; evidence from all writers remains visible in the summary.
+
+Before a successor record is created under lifecycle ownership, retained predecessors are
+reconciled. The newest terminal admitted predecessor is copied into bounded `last-exit.json` before
+pruning. Retention keeps the latest 32 terminal records and, separately, 32 non-current unresolved
+records, plus the current admitted record. Monotonic startup sequence, not wall time, defines order.
+Constant-size coverage metadata saturates eviction counts and sequence ranges. Record update,
+last-exit refresh, and pruning are separate idempotent atomic replacements so the next startup can
+repair interruption between them. A failed observer update makes reconciliation degraded, skips
+summary refresh and pruning for that pass, and remains retryable at the next startup. Successful log
+capture cannot clear that degraded reconciliation state. Failed startup contenders cannot replace
+the last admitted exit.
+
+Detached capture uses a directly opened regular file, unbuffered Python, and early fatal-error
+diagnostics; it never uses an unread pipe. Rotation renames without copy-truncate, publishes a new
+same-directory file, then `dup2` rebinds stdout/stderr and fatal diagnostics. Concurrent unmanaged
+writes can cross that non-atomic descriptor boundary. Filesystem and `/tmp` cleanup failures degrade
+capture and retry with bounded backoff without entering scheduling. Rotated logs are not subject to
+automatic deletion. No diagnostic record is process authority or permission to modify Task,
+Attempt, claim, reservation, or runner state.
 
 ## 18. Events and Derived Data
 

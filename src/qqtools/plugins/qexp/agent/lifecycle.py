@@ -9,8 +9,9 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -87,6 +88,13 @@ from . import helpers as _helpers
 from .config import load_agent_config
 from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
 from .control_plane import _MachineControlPlane
+from .diagnostics import (
+    AgentLogService,
+    bounded_exception_evidence,
+    diagnostics_status,
+    prepare_agent_diagnostics,
+    update_diagnostic_evidence,
+)
 from .dispatch_loop import dispatch_machine_cycle
 from .helpers import (
     _active_machine_identity,
@@ -134,6 +142,14 @@ def get_machine_agent_status(
     if not isinstance(process_status, dict):
         process_status = {}
     upgrade = inspect_registered_upgrades(machine_runtime)
+    try:
+        diagnostics = diagnostics_status(
+            machine_runtime,
+            configured_log_max_bytes=agent_config.log_max_bytes,
+            active_identity=identity,
+        )
+    except Exception:
+        diagnostics = None
     try:
         notification_migration = notification_migration_status(machine_runtime)
     except (OSError, RuntimeError, ValueError):
@@ -213,7 +229,7 @@ def get_machine_agent_status(
             "warnings": [{"reason": "gpu_policy_unavailable", "message": "GPU policy status is unavailable."}],
             "agent_running": running,
         }
-    return {
+    result = {
         "machine_runtime_root": str(machine_runtime.root),
         "runtime_id": machine_runtime.instance_id,
         "configured_agent_mode": agent_config.agent_mode,
@@ -227,6 +243,7 @@ def get_machine_agent_status(
         "inventory_revision": inventory_revision,
         "reconciled_project_ids": process_status.get("reconciled_project_ids", []),
         "agent_state": "active" if running else "stopped",
+        "stop_reason": process_status.get("stop_reason"),
         "pid": pid,
         "is_running": running,
         "waiting_for_first_registration": waiting_for_first_registration if running else False,
@@ -237,6 +254,9 @@ def get_machine_agent_status(
         "gpu_policy": gpu_policy,
         "warnings": list(gpu_policy.get("warnings", [])),
     }
+    if diagnostics is not None:
+        result["diagnostics"] = diagnostics
+    return result
 
 
 def run_machine_agent_loop(
@@ -245,6 +265,14 @@ def run_machine_agent_loop(
     loop_interval: float = 5.0,
     available_gpus: list[int] | None = None,
     executor: Executor | None = None,
+    instance_id: str | None = None,
+    startup_sequence: int | None = None,
+    log_path: str | Path | None = None,
+    effective_log_max_bytes: int | None = None,
+    capture_mode: str | None = None,
+    initial_capture_health: str | None = None,
+    initial_capture_error: str | None = None,
+    initial_reconciliation_degraded: bool = False,
 ) -> None:
     """Run the persistent machine agent until SIGTERM or SIGINT."""
     if loop_interval <= 0:
@@ -257,6 +285,31 @@ def run_machine_agent_loop(
         raise MachineAgentStartBlockedError("machine agent activation is blocked by a pending machine replacement.")
     machine_runtime.ensure_layout(create_identity=False)
     agent_config = load_agent_config(machine_runtime)
+    instance_id = instance_id or uuid.uuid4().hex
+    if effective_log_max_bytes is None:
+        effective_log_max_bytes = agent_config.log_max_bytes
+    prepared = None
+    if startup_sequence is None:
+        selected_capture_mode = capture_mode or "foreground_managed_only"
+        prepared = prepare_agent_diagnostics(
+            machine_runtime,
+            instance_id=instance_id,
+            capture_mode=selected_capture_mode,
+            log_max_bytes=effective_log_max_bytes,
+        )
+        startup_sequence = prepared.startup_sequence
+        log_path = log_path if log_path is not None else prepared.log_path
+        capture_mode = capture_mode or prepared.capture_mode
+        initial_capture_health = prepared.capture_health
+        initial_capture_error = prepared.error
+        initial_reconciliation_degraded = prepared.reconciliation_degraded
+        prepared.close()
+    else:
+        capture_mode = capture_mode or "detached"
+        initial_capture_health = initial_capture_health or ("healthy" if log_path is not None else "degraded")
+        initial_capture_error = initial_capture_error or (
+            "log_unavailable" if initial_capture_health != "healthy" else None
+        )
     try:
         initial_inventory_revision, _initial_inventory = load_inventory(machine_runtime)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
@@ -265,12 +318,12 @@ def run_machine_agent_loop(
     current_identity = _active_machine_identity(machine_runtime)
     if current_identity is not None and current_identity[0] != os.getpid():
         raise MachineAgentStartError(f"machine agent is already running with pid {current_identity[0]}.")
-    instance_id = uuid.uuid4().hex
     started_at = utc_now()
     control_plane: _MachineControlPlane | None = None
     scheduler_wakeup = threading.Event()
     stop = False
     stop_reason: str | None = None
+    handled_signal: int | None = None
     has_consumed_binding = False
     policy_revision_requested = agent_config.revision
     policy_revision_acknowledged: int | None = None
@@ -293,11 +346,71 @@ def run_machine_agent_loop(
     recovery_enrollment = RecoveryEnrollment(machine_runtime)
     emitted_gpu_warning_fingerprint: str | None = None
     idle_shutdown_guard = None
+    agent_revision = 0
+    agent_revision_lock = threading.Lock()
+    cleanup_steps: dict[str, dict[str, Any]] = {}
+    cleanup_failures: list[str] = []
+    capture_health_state = {
+        "health": initial_capture_health,
+        "error": initial_capture_error,
+    }
 
-    def request_stop(_signum: int, _frame: object) -> None:
-        nonlocal stop, stop_reason
+    def capture_health_callback(health: str, error: str | None) -> None:
+        if initial_reconciliation_degraded:
+            capture_health_state["health"] = "degraded"
+            capture_health_state["error"] = (
+                "reconciliation_unavailable" if health == "healthy" else "reconciliation_and_capture_degraded"
+            )
+        else:
+            capture_health_state["health"] = health
+            capture_health_state["error"] = error
+        publish_agent_evidence(
+            capture_health=capture_health_state["health"],
+            capture_error=capture_health_state["error"],
+        )
+
+    log_service = (
+        AgentLogService(
+            log_path,
+            max_bytes=effective_log_max_bytes,
+            capture_mode=capture_mode,
+            health_callback=capture_health_callback,
+        )
+        if log_path is not None
+        else None
+    )
+
+    def publish_agent_evidence(**evidence: object) -> bool:
+        nonlocal agent_revision
+        with agent_revision_lock:
+            agent_revision += 1
+            revision = agent_revision
+        try:
+            return update_diagnostic_evidence(
+                machine_runtime,
+                instance_id=instance_id,
+                startup_sequence=startup_sequence,
+                writer="agent",
+                revision=revision,
+                evidence=evidence,
+            )
+        except Exception:
+            return False
+
+    def write_managed_log(message: str) -> None:
+        if log_service is None:
+            return
+        try:
+            log_service.write(message)
+        except Exception:
+            return
+
+    def request_stop(signum: int, _frame: object) -> None:
+        nonlocal stop, stop_reason, handled_signal
         stop = True
-        stop_reason = "stopped_by_signal"
+        if stop_reason is None:
+            stop_reason = "stopped_by_signal"
+            handled_signal = signum
         scheduler_wakeup.set()
 
     @contextmanager
@@ -322,6 +435,39 @@ def run_machine_agent_loop(
         previous_int = None
         is_pid_published = False
         is_status_published = False
+        primary_exception: BaseException | None = None
+        primary_traceback = None
+
+        def safe_error_facts(exc: BaseException) -> dict[str, Any]:
+            try:
+                facts = bounded_exception_evidence(exc)
+            except BaseException:
+                return {"exception_type": type(exc).__name__}
+            return facts if isinstance(facts, dict) else {"exception_type": type(exc).__name__}
+
+        def record_cleanup_step(name: str, exc: BaseException | None = None) -> None:
+            if exc is None:
+                cleanup_steps[name] = {"outcome": "succeeded"}
+                return
+            error_facts = safe_error_facts(exc)
+            cleanup_steps[name] = {
+                "outcome": "failed",
+                "error_type": error_facts.get("exception_type", type(exc).__name__),
+            }
+            cleanup_failures.append(name)
+
+        def run_cleanup_step(name: str, action: Callable[[], Any]) -> None:
+            try:
+                action()
+            except BaseException as exc:
+                record_cleanup_step(name, exc)
+            else:
+                record_cleanup_step(name)
+
+        def require_agent_diagnostic_write(**evidence: object) -> None:
+            if not publish_agent_evidence(**evidence):
+                raise RuntimeError("agent diagnostic publication was rejected")
+
         try:
             previous_term = signal.signal(signal.SIGTERM, request_stop)
             previous_int = signal.signal(signal.SIGINT, request_stop)
@@ -341,8 +487,30 @@ def run_machine_agent_loop(
                 inventory_revision=observed_inventory_revision,
                 reconciled_project_ids=reconciled_project_ids,
                 ready=False,
+                diagnostic_startup_sequence=startup_sequence,
+                diagnostic_log_path=str(log_path) if log_path is not None else None,
+                effective_log_max_bytes=effective_log_max_bytes,
+                capture_mode=capture_mode,
             )
             is_status_published = True
+            publish_agent_evidence(
+                phase="active",
+                admitted=True,
+                pid=os.getpid(),
+                pid_start_time_ticks=start_ticks,
+                capture_health=capture_health_state["health"],
+                capture_error=capture_health_state["error"],
+                log_path=str(log_path) if log_path is not None else None,
+                effective_log_max_bytes=effective_log_max_bytes,
+                capture_mode=capture_mode,
+            )
+            if log_service is not None:
+                try:
+                    log_service.start()
+                except Exception as exc:
+                    capture_health_state.update(health="degraded", error="log_service_start_failed")
+                    publish_agent_evidence(capture_health="degraded", capture_error="log_service_start_failed")
+                    write_managed_log(f"machine agent log service startup failed: {type(exc).__name__}\n")
             control_plane = _MachineControlPlane(
                 machine_runtime,
                 instance_id=instance_id,
@@ -431,6 +599,7 @@ def run_machine_agent_loop(
                             message = gpu_warnings[0].get("message") if isinstance(gpu_warnings[0], dict) else None
                             if isinstance(message, str) and message:
                                 print(f"Warning: {message}", file=sys.stderr, flush=True)
+                                write_managed_log(f"Warning: {message}\n")
                             emitted_gpu_warning_fingerprint = fingerprint
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     pass
@@ -494,6 +663,10 @@ def run_machine_agent_loop(
                         inventory_revision=observed_inventory_revision,
                         reconciled_project_ids=reconciled_project_ids,
                         ready=ready,
+                        diagnostic_startup_sequence=startup_sequence,
+                        diagnostic_log_path=str(log_path) if log_path is not None else None,
+                        effective_log_max_bytes=effective_log_max_bytes,
+                        capture_mode=capture_mode,
                     )
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     pass
@@ -519,7 +692,8 @@ def run_machine_agent_loop(
                         )
                         if idle_shutdown_guard is not None:
                             stop = True
-                            stop_reason = "idle"
+                            if stop_reason is None:
+                                stop_reason = "idle"
                             continue
                         idle_since = None
                 else:
@@ -527,105 +701,285 @@ def run_machine_agent_loop(
                 pending_wait = getattr(machine_runtime, "pending_launch_wait_seconds", None)
                 wait_seconds = pending_wait(loop_interval) if callable(pending_wait) else loop_interval
                 scheduler_wakeup.wait(wait_seconds)
-        finally:
-            recovery_enrollment.stop()
-            background_workers = [
-                worker
-                for worker in (
-                    submission_control_worker,
-                    observation_worker,
-                    discovery_worker,
-                    upgrade_worker,
-                    notification_worker,
-                )
-                if worker is not None
-            ]
-            # These services own disjoint worker threads. Signal and join them
-            # concurrently so their bounded shutdown waits cannot accumulate.
-            with ThreadPoolExecutor(max_workers=max(1, len(background_workers))) as pool:
-                list(pool.map(lambda worker: worker.stop(), background_workers))
-            if control_plane is not None:
-                control_plane.stop()
+        except BaseException as exc:
+            primary_exception = exc
+            primary_traceback = exc.__traceback__
+            stop = True
+            stop_reason = "unhandled_exception"
             try:
-                is_active_identity = _active_machine_identity(machine_runtime) == (
-                    os.getpid(),
-                    instance_id,
-                    start_ticks,
-                )
-                if is_active_identity:
-                    try:
-                        gpu_policy_snapshot = show_gpu_policy(machine_runtime)
-                    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                        gpu_policy_snapshot = None
-                    try:
-                        reservations = list(reservation_snapshot(machine_runtime.root).reservations)
-                        reserved = sorted({gpu_id for item in reservations for gpu_id in item.get("gpu_ids", [])})
-                    except (KeyError, OSError, ValueError):
-                        reserved = []
-                    try:
-                        _, registered = machine_runtime.load_registry()
-                    except (OSError, RuntimeError, ValueError):
-                        registered = []
+                exception_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            except BaseException:
+                exception_text = f"{type(exc).__name__}\n"
+            write_managed_log(exception_text)
+        finally:
+            frozen_stop_reason = stop_reason or "stopped"
+            stop_reason = frozen_stop_reason
+            primary_exception_evidence = safe_error_facts(primary_exception) if primary_exception is not None else None
 
-                    def publish_stop(binding: ProjectBinding) -> None:
-                        try:
-                            cfg = _helpers._binding_config(machine_runtime, binding)
-                            with machine_runtime.binding_write_guard(binding) as is_eligible:
-                                if is_eligible:
-                                    publish_machine_stop_snapshot(
-                                        cfg,
-                                        instance_id=instance_id,
-                                        pid=None,
-                                        agent_mode=load_machine_policy(cfg).agent_mode,
-                                        visible_gpu_ids=(
-                                            gpu_policy_snapshot.get("visible_gpu_ids") or []
-                                            if gpu_policy_snapshot is not None
-                                            else _visible_gpus(cfg)
-                                        ),
-                                        reserved_gpu_ids=reserved,
-                                        heartbeat_interval_seconds=loop_interval,
-                                        started_at=started_at,
-                                        idle_since_at=None if reserved else utc_now(),
-                                        stop_reason=stop_reason or "stopped",
-                                        gpu_policy=gpu_policy_snapshot,
-                                    )
-                        except (OSError, RuntimeError, ValueError):
-                            return
+            def publish_stopping_evidence() -> None:
+                evidence: dict[str, object] = {
+                    "phase": "stopping",
+                    "admitted": False,
+                    "pid": os.getpid(),
+                    "pid_start_time_ticks": start_ticks,
+                    "capture_health": capture_health_state["health"],
+                    "capture_error": capture_health_state["error"],
+                    "log_path": str(log_path) if log_path is not None else None,
+                    "effective_log_max_bytes": effective_log_max_bytes,
+                    "capture_mode": capture_mode,
+                    "stop_reason": frozen_stop_reason,
+                    "cleanup_outcome": "pending",
+                }
+                if handled_signal is not None:
+                    evidence["handled_signal"] = handled_signal
+                if primary_exception_evidence is not None:
+                    evidence["primary_exception"] = primary_exception_evidence
+                require_agent_diagnostic_write(**evidence)
 
-                    # Project snapshots have disjoint roots. Bound shutdown
-                    # latency without changing each snapshot's durable fence.
-                    with ThreadPoolExecutor(max_workers=min(4, max(1, len(registered)))) as pool:
-                        list(pool.map(publish_stop, registered))
-                if is_pid_published:
-                    pid_path.unlink(missing_ok=True)
-                if is_status_published:
-                    atomic_replace(
-                        machine_runtime.paths["agent"] / "status.json",
-                        {
-                            "machine_agent": {
-                                "instance_id": instance_id,
-                                "pid": None,
-                                "pid_start_time_ticks": start_ticks,
-                                "state": "stopped",
-                                "waiting_for_first_registration": False,
-                                "runtime_id": machine_runtime.instance_id,
-                                "configured_agent_mode": agent_config.agent_mode,
-                                "observed_agent_mode": observed_agent_mode,
-                                "policy_revision_requested": policy_revision_requested,
-                                "policy_revision_acknowledged": policy_revision_acknowledged,
-                                "inventory_revision": observed_inventory_revision,
-                                "reconciled_project_ids": reconciled_project_ids,
-                                "ready": False,
-                            }
-                        },
-                    )
-            finally:
+            # Record the transition before stopping any long-lived service.
+            run_cleanup_step("publish_stopping_evidence", publish_stopping_evidence)
+            run_cleanup_step("recovery_enrollment_stop", recovery_enrollment.stop)
+
+            background_workers = {
+                "submission_control_worker_stop": submission_control_worker,
+                "observation_worker_stop": observation_worker,
+                "discovery_worker_stop": discovery_worker,
+                "upgrade_worker_stop": upgrade_worker,
+                "notification_worker_stop": notification_worker,
+            }
+            active_workers = {name: worker for name, worker in background_workers.items() if worker is not None}
+            for name, worker in background_workers.items():
+                if worker is None:
+                    record_cleanup_step(name)
+            if active_workers:
+                worker_pool = None
                 try:
-                    if previous_int is not None:
-                        signal.signal(signal.SIGINT, previous_int)
-                finally:
-                    if previous_term is not None:
-                        signal.signal(signal.SIGTERM, previous_term)
+                    worker_pool = ThreadPoolExecutor(max_workers=len(active_workers))
+                except BaseException as exc:
+                    for name in active_workers:
+                        record_cleanup_step(name, exc)
+                else:
+                    futures = {}
+                    reported_worker_steps: set[str] = set()
+                    for name, worker in active_workers.items():
+                        try:
+                            futures[worker_pool.submit(worker.stop)] = name
+                        except BaseException as exc:
+                            record_cleanup_step(name, exc)
+                            reported_worker_steps.add(name)
+                    try:
+                        for future in as_completed(futures):
+                            name = futures[future]
+                            try:
+                                future.result()
+                            except BaseException as exc:
+                                record_cleanup_step(name, exc)
+                            else:
+                                record_cleanup_step(name)
+                            reported_worker_steps.add(name)
+                    except BaseException as exc:
+                        for name in active_workers.keys() - reported_worker_steps:
+                            record_cleanup_step(name, exc)
+                            reported_worker_steps.add(name)
+                    try:
+                        worker_pool.shutdown(wait=True)
+                    except BaseException as exc:
+                        record_cleanup_step("background_worker_pool_shutdown", exc)
+                    else:
+                        record_cleanup_step("background_worker_pool_shutdown")
+            else:
+                record_cleanup_step("background_worker_pool_shutdown")
+
+            if control_plane is None:
+                record_cleanup_step("control_plane_stop")
+            else:
+                run_cleanup_step("control_plane_stop", control_plane.stop)
+
+            def publish_project_stops() -> None:
+                expected_identity = (os.getpid(), instance_id, start_ticks)
+                if _active_machine_identity(machine_runtime) != expected_identity:
+                    return
+                try:
+                    gpu_policy_snapshot = show_gpu_policy(machine_runtime)
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    gpu_policy_snapshot = None
+                try:
+                    reservations = list(reservation_snapshot(machine_runtime.root).reservations)
+                    reserved = sorted({gpu_id for item in reservations for gpu_id in item.get("gpu_ids", [])})
+                except (KeyError, OSError, ValueError):
+                    reserved = []
+                try:
+                    _, registered = machine_runtime.load_registry()
+                except (OSError, RuntimeError, ValueError):
+                    registered = []
+
+                def publish_stop(binding: ProjectBinding) -> None:
+                    cfg = _helpers._binding_config(machine_runtime, binding)
+                    with machine_runtime.binding_write_guard(binding) as is_eligible:
+                        if is_eligible:
+                            publish_machine_stop_snapshot(
+                                cfg,
+                                instance_id=instance_id,
+                                pid=None,
+                                agent_mode=load_machine_policy(cfg).agent_mode,
+                                visible_gpu_ids=(
+                                    gpu_policy_snapshot.get("visible_gpu_ids") or []
+                                    if gpu_policy_snapshot is not None
+                                    else _visible_gpus(cfg)
+                                ),
+                                reserved_gpu_ids=reserved,
+                                heartbeat_interval_seconds=loop_interval,
+                                started_at=started_at,
+                                idle_since_at=None if reserved else utc_now(),
+                                stop_reason=frozen_stop_reason,
+                                gpu_policy=gpu_policy_snapshot,
+                            )
+
+                errors: list[BaseException] = []
+                with ThreadPoolExecutor(max_workers=min(4, max(1, len(registered)))) as pool:
+                    futures = [pool.submit(publish_stop, binding) for binding in registered]
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except BaseException as exc:
+                            errors.append(exc)
+                if errors:
+                    raise RuntimeError(f"{len(errors)} Project stop publication(s) failed") from errors[0]
+
+            run_cleanup_step("project_stop_publications", publish_project_stops)
+
+            expected_identity = (os.getpid(), instance_id, start_ticks)
+
+            def publish_local_stopped_status() -> None:
+                if not is_status_published or _active_machine_identity(machine_runtime) != expected_identity:
+                    return
+                atomic_replace(
+                    machine_runtime.paths["agent"] / "status.json",
+                    {
+                        "machine_agent": {
+                            "instance_id": instance_id,
+                            "pid": None,
+                            "pid_start_time_ticks": start_ticks,
+                            "state": "stopped",
+                            "waiting_for_first_registration": False,
+                            "runtime_id": machine_runtime.instance_id,
+                            "configured_agent_mode": agent_config.agent_mode,
+                            "observed_agent_mode": observed_agent_mode,
+                            "policy_revision_requested": policy_revision_requested,
+                            "policy_revision_acknowledged": policy_revision_acknowledged,
+                            "inventory_revision": observed_inventory_revision,
+                            "reconciled_project_ids": reconciled_project_ids,
+                            "ready": False,
+                            "stop_reason": frozen_stop_reason,
+                            "diagnostic_startup_sequence": startup_sequence,
+                            "diagnostic_log_path": str(log_path) if log_path is not None else None,
+                            "effective_log_max_bytes": effective_log_max_bytes,
+                            "capture_mode": capture_mode,
+                        }
+                    },
+                )
+
+            run_cleanup_step("local_stopped_status", publish_local_stopped_status)
+
+            def remove_owned_pid() -> None:
+                if not is_pid_published:
+                    return
+                try:
+                    recorded_pid = int(pid_path.read_text(encoding="utf-8").strip())
+                except (OSError, ValueError):
+                    return
+                if recorded_pid != os.getpid():
+                    return
+                if _active_machine_identity(machine_runtime) == expected_identity:
+                    pid_path.unlink(missing_ok=True)
+                    return
+                try:
+                    stopped_status = read_json(machine_runtime.paths["agent"] / "status.json").get("machine_agent", {})
+                except (OSError, RuntimeError, ValueError, TypeError):
+                    return
+                if (
+                    stopped_status.get("state") == "stopped"
+                    and stopped_status.get("instance_id") == instance_id
+                    and stopped_status.get("pid") is None
+                    and stopped_status.get("pid_start_time_ticks") == start_ticks
+                ):
+                    pid_path.unlink(missing_ok=True)
+
+            run_cleanup_step("identity_checked_pid_removal", remove_owned_pid)
+
+            def release_idle_shutdown_guard() -> None:
+                nonlocal idle_shutdown_guard
+                if idle_shutdown_guard is not None:
+                    guard = idle_shutdown_guard
+                    idle_shutdown_guard = None
+                    guard.__exit__(None, None, None)
+
+            run_cleanup_step("idle_shutdown_guard_release", release_idle_shutdown_guard)
+
+            if previous_int is None:
+                record_cleanup_step("restore_sigint_handler")
+            else:
+                run_cleanup_step("restore_sigint_handler", lambda: signal.signal(signal.SIGINT, previous_int))
+            if previous_term is None:
+                record_cleanup_step("restore_sigterm_handler")
+            else:
+                run_cleanup_step("restore_sigterm_handler", lambda: signal.signal(signal.SIGTERM, previous_term))
+
+            if log_service is None:
+                record_cleanup_step("log_service_final_check")
+                record_cleanup_step("log_service_stop")
+            else:
+
+                def final_log_check() -> None:
+                    try:
+                        if not log_service.write(f"machine agent stopping: {frozen_stop_reason}\n"):
+                            raise OSError("final managed log write failed")
+                    except BaseException:
+                        capture_health_state.update(health="degraded", error="final_log_check_failed")
+                        publish_agent_evidence(capture_health="degraded", capture_error="final_log_check_failed")
+                        raise
+
+                def stop_log_service() -> None:
+                    try:
+                        if not log_service.stop():
+                            raise OSError("final managed log rotation or shutdown failed")
+                    except BaseException:
+                        capture_health_state.update(health="degraded", error="log_service_stop_failed")
+                        publish_agent_evidence(capture_health="degraded", capture_error="log_service_stop_failed")
+                        raise
+
+                run_cleanup_step("log_service_final_check", final_log_check)
+                run_cleanup_step("log_service_stop", stop_log_service)
+
+            final_evidence: dict[str, object] = {
+                "phase": "stopped",
+                "admitted": False,
+                "pid": None,
+                "pid_start_time_ticks": start_ticks,
+                "capture_health": capture_health_state["health"],
+                "capture_error": capture_health_state["error"],
+                "log_path": str(log_path) if log_path is not None else None,
+                "effective_log_max_bytes": effective_log_max_bytes,
+                "capture_mode": capture_mode,
+                "stop_reason": frozen_stop_reason,
+                "cleanup_outcome": "failed" if cleanup_failures else "succeeded",
+                "cleanup_steps": dict(cleanup_steps),
+                "finalized_at": utc_now(),
+            }
+            if handled_signal is not None:
+                final_evidence["handled_signal"] = handled_signal
+            if primary_exception_evidence is not None:
+                final_evidence["primary_exception"] = primary_exception_evidence
+            try:
+                if not publish_agent_evidence(**final_evidence):
+                    cleanup_failures.append("final_diagnostic_publication")
+            except BaseException:
+                cleanup_failures.append("final_diagnostic_publication")
+
+        if primary_exception is not None:
+            raise primary_exception.with_traceback(primary_traceback)
+        if cleanup_failures:
+            raise MachineAgentStopError("machine agent cleanup failed in step(s): " + ", ".join(cleanup_failures))
 
 
 def _confirm_idle_shutdown(

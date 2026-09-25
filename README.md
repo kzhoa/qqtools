@@ -161,6 +161,25 @@ Its result can therefore say `Ready: pending`; use the following `agent status` 
 readiness. Status keeps configured `daemon|on_demand` policy distinct from a differing observed
 mode.
 
+Detached agents keep owner-private diagnostic output in a per-instance directory below
+`/tmp/qqtools-qexp-<uid>/`. Configure the rotation trigger for the next agent instance, then restart
+to apply it:
+
+```bash
+qexp config set agent --log-max-size 10MiB
+qexp config show agent
+qexp agent restart
+qexp agent status
+```
+
+The size is a rotation trigger, not a strict cap: concurrent native writes can overshoot it before
+the next one-second check. Rotated `_agent_*.log` files are retained beside `agent.log`; qexp does
+not delete archives or old instance directories. The operating system may clean `/tmp`, including
+on reboot. `agent status` reports the current or latest log path, capture health, effective size,
+and bounded exit evidence without reading log contents. An unexplained disappearance is reported
+as unknown rather than being guessed as an OOM or signal exit. Foreground `agent run` preserves
+terminal output and records only qexp-managed diagnostics in its instance log.
+
 The MachineRuntime also owns one persistent GPU allowlist shared by every registered project.
 Change it while the agent is running; no restart is required:
 

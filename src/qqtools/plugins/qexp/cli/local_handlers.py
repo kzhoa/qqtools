@@ -425,7 +425,11 @@ def dispatch_local(
         elif handler == "config_set":
             values = {
                 key: value
-                for key, value in {"name": args.name, "agent_mode": args.agent_mode}.items()
+                for key, value in {
+                    "name": args.name,
+                    "agent_mode": args.agent_mode,
+                    "log_max_bytes": args.log_max_size,
+                }.items()
                 if value is not None
             }
             result = configuration_commands.set_config(
