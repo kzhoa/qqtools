@@ -138,8 +138,10 @@ def _rank_run(rank: int, directory: str, modes: tuple[str, ...]) -> None:
 def test_rank_zero_connector_and_failures_preserve_collective_path(tmp_path, modes):
     if not sys.platform.startswith("linux"):
         pytest.skip("gloo process-group regression requires Linux")
+    # Each rank needs a fresh autograd runtime; the parent pytest process may
+    # already have active autograd threads that cannot safely cross a fork.
     process_context = mp.start_processes(
-        _rank_run, args=(str(tmp_path), modes), nprocs=2, join=False, start_method="fork"
+        _rank_run, args=(str(tmp_path), modes), nprocs=2, join=False, start_method="spawn"
     )
     try:
         deadline = time.monotonic() + 90
