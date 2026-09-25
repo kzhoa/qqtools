@@ -1,6 +1,12 @@
 import pytest
 
-from qqtools.plugins.qexp.runtime.work_budget import AdaptiveBatchSizer, SliceBudget, WorkBudgetPolicy, bounded_records
+from qqtools.plugins.qexp.runtime.work_budget import (
+    AdaptiveBatchSizer,
+    InvocationLedger,
+    SliceBudget,
+    WorkBudgetPolicy,
+    bounded_records,
+)
 
 
 class _Clock:
@@ -133,3 +139,58 @@ def test_failed_record_does_not_hide_hard_limit_or_cursor_progress() -> None:
     assert visited == [0, 1, 2, 3]
     assert budget.records_used == policy.record_hard_limit
     assert visited[-1] + 1 == 4
+
+
+def test_invocation_ledger_reserves_commit_cost_before_semantic_admission() -> None:
+    ledger = InvocationLedger(semantic_item_limit=1, operation_limit=8)
+
+    reservation = ledger.reserve_operations(maximum_operations=6)
+
+    assert reservation is not None
+    assert ledger.operations_remaining == 2
+    ledger.consume_semantic_item()
+    reservation.commit(actual_operations=4)
+    assert ledger.report() == {
+        "semantic_items_consumed": 1,
+        "operations_consumed": 4,
+        "elapsed_ms": pytest.approx(0, abs=100),
+        "semantic_items_remaining": 0,
+        "operations_remaining": 4,
+        "exhaustion_reason": "semantic_items",
+        "deadline_overrun_ms": 0,
+    }
+
+
+def test_invocation_ledger_releases_unused_reservation_and_rejects_reuse() -> None:
+    ledger = InvocationLedger(semantic_item_limit=2, operation_limit=3)
+    reservation = ledger.reserve_operations(maximum_operations=3)
+
+    assert reservation is not None
+    assert ledger.reserve_operations(maximum_operations=1) is None
+    reservation.release()
+    assert ledger.operations_remaining == 3
+    with pytest.raises(ValueError, match="no longer active"):
+        reservation.release()
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_invocation_ledger_rejects_invalid_reservation_counts(value: int) -> None:
+    ledger = InvocationLedger(semantic_item_limit=1)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        ledger.reserve_operations(maximum_operations=value)
+
+
+def test_invocation_ledger_stops_new_work_after_deadline_and_reports_overrun() -> None:
+    clock = _Clock()
+    ledger = InvocationLedger(semantic_item_limit=2, operation_limit=8, deadline_ms=1, clock_ns=clock)
+    reservation = ledger.reserve_operations(maximum_operations=2)
+    assert reservation is not None
+    ledger.consume_semantic_item()
+    clock.advance(3_000_000)
+    reservation.commit(actual_operations=2)
+
+    assert ledger.reserve_operations(maximum_operations=1) is None
+    report = ledger.report()
+    assert report["exhaustion_reason"] == "deadline"
+    assert report["deadline_overrun_ms"] == 2

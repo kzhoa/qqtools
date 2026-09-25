@@ -668,17 +668,33 @@ def reconcile_availability_operations(
     cfg: RootConfig,
     *,
     include_legacy: bool = True,
+    limit: int = 64,
+    cursor: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("limit must be a positive integer.")
     reconciled: list[dict[str, Any]] = []
-    for path in iter_active_operation_paths(cfg, "availability", include_legacy=include_legacy):
+    for path in iter_active_operation_paths(
+        cfg, "availability", limit=limit, include_legacy=include_legacy, cursor=cursor
+    ):
         control: dict[str, Any] = {}
         try:
-            operation = read_json(path)
+            operation = _read_operation(cfg, path.stem)
             control = operation.get("availability_operation", {})
             if control.get("state") not in {"prepared", "blocked"}:
                 continue
             if control.get("state") == "blocked" and control.get("blocked_reason"):
-                archive_operation(cfg, "availability", control["operation_id"], operation)
+                # Keep unresolved blocked truth in the active lane until a
+                # durable maintenance intervention/retirement protocol owns
+                # its handoff. Archiving here creates a crash window in which
+                # neither active discovery nor the audit descriptor records it.
+                reconciled.append(
+                    {
+                        "operation_id": control["operation_id"],
+                        "state": "blocked",
+                        "blocked_reason": control["blocked_reason"],
+                    }
+                )
                 continue
             request = AvailabilityTransitionRequest(
                 action=control["operation_type"],
@@ -691,13 +707,21 @@ def reconcile_availability_operations(
             result = apply_availability_transition(cfg, request)
             reconciled.append(result.to_dict())
         except Exception as exc:
+            operation_id = control.get("operation_id") or path.stem
             write_diagnostic_event(
                 cfg,
                 "availability_operation_reconcile_failed",
                 task_id=control.get("task_id"),
                 details={
-                    "operation_id": control.get("operation_id") or path.stem,
+                    "operation_id": operation_id,
                     "reason": str(exc),
                 },
+            )
+            reconciled.append(
+                {
+                    "operation_id": operation_id,
+                    "state": "blocked",
+                    "blocked_reason": "availability_reconcile_failed",
+                }
             )
     return reconciled

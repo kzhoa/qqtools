@@ -4,22 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .commands.cleanup import reconcile_cleanup_operations
-from .commands.group import reconcile_group_cancel_operations
 from .commands.task import offer
 from .config_types import RootConfig
 from .events import flush_local_events
 from .runtime.availability import (
     elapsed_offer_is_proven,
     iter_due_deadline_paths,
-    iter_flat_deadline_paths,
-    migrate_legacy_deadline_indexes,
-    reconcile_availability_operations,
     remove_deadline_index,
     sync_deadline_index,
 )
-from .runtime.claims import reconcile_claim_archives
-from .runtime.operation_store import migrate_legacy_active_operations
 from .runtime.paths import attempt_path, shared_paths
 from .runtime.placement import offer_due
 from .runtime.records import AttemptRecord
@@ -29,10 +22,9 @@ from .runtime.resources.reservations import (
     release_if_matches,
     retag_if_matches,
 )
-from .runtime.responsibility_capture import CaptureBusy
 from .runtime.store import iter_json, read_json
 from .runtime.tasks import load_task
-from .runtime.work_budget import diagnostic_increment, diagnostic_span
+from .runtime.work_budget import diagnostic_span
 
 
 def maintain_project(
@@ -48,25 +40,15 @@ def maintain_project(
         if project_id is None and reservation_root != cfg.runtime_root:
             raise ValueError("a shared reservation runtime requires a project_id.")
         flush_local_events(cfg)
-        migrate_legacy_active_operations(cfg)
-        migrate_legacy_deadline_indexes(cfg)
-        reconcile_claim_archives(cfg)
         if should_reconcile_reservations:
             reconcile_project_reservations(
                 cfg,
                 reservation_runtime_root=reservation_root,
                 project_id=project_id,
             )
-        reconcile_group_cancel_operations(cfg, include_legacy=False, reservation_runtime_root=reservation_root)
-        try:
-            reconcile_cleanup_operations(
-                cfg,
-                reservation_runtime_root=reservation_root,
-                include_legacy=False,
-            )
-        except CaptureBusy:
-            diagnostic_increment("cleanup.capture_deferred")
-        reconcile_availability_operations(cfg, include_legacy=False)
+        # Keep due offers ahead of admission, but only consume one durable
+        # deadline partition entry per cycle. Maintenance descriptors own the
+        # remaining recovery work after primary dispatch has had its turn.
         offer_due_tasks(cfg)
 
 
@@ -143,17 +125,7 @@ def reconcile_reservation(
 def offer_due_tasks(cfg: RootConfig) -> None:
     """Move elapsed home-only work into its configured shared queue."""
     with diagnostic_span("offer_due_tasks"):
-        migrate_legacy_deadline_indexes(cfg)
-        for path in iter_flat_deadline_paths(cfg):
-            task_id = path.stem
-            try:
-                task = load_task(cfg, task_id)
-            except FileNotFoundError:
-                remove_deadline_index(cfg, task_id)
-                continue
-            remove_deadline_index(cfg, task_id)
-            sync_deadline_index(cfg, task)
-        for path in iter_due_deadline_paths(cfg):
+        for path in iter_due_deadline_paths(cfg, limit=1):
             task_id = path.stem
             try:
                 task = load_task(cfg, task_id)

@@ -149,6 +149,7 @@ class MachineRuntime:
         self.upgrade_probe_budget = 4
         self.upgrade_next_pass_at = 0.0
         self.notification_next_pass_at = 0.0
+        self.maintenance_retry_deadlines: dict[str, tuple[ProjectBinding, float]] = {}
         self.upgrade_admission_blocked_projects: set[str] = set()
         self.supervisor_generations: dict[str, str | None] = {}
         # A direct runner may need more than one scheduler cycle to publish its
@@ -954,7 +955,34 @@ class MachineRuntime:
         return value if isinstance(value, str) else None
 
     def save_cursor(self, project_id: str | None) -> None:
-        atomic_replace(self.paths["cursor"], {"cursor": {"next_project_id": project_id, "updated_at": utc_now()}})
+        try:
+            value = read_json(self.paths["cursor"])
+            cursor = value.get("cursor", {}) if isinstance(value, dict) else {}
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            cursor = {}
+        if not isinstance(cursor, dict):
+            cursor = {}
+        cursor.update({"next_project_id": project_id, "updated_at": utc_now()})
+        atomic_replace(self.paths["cursor"], {"cursor": cursor})
+
+    def load_maintenance_cursor(self) -> str | None:
+        try:
+            value = read_json(self.paths["cursor"]).get("cursor", {})
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return None
+        cursor = value.get("maintenance_next_project_id") if isinstance(value, dict) else None
+        return cursor if isinstance(cursor, str) else None
+
+    def save_maintenance_cursor(self, project_id: str | None) -> None:
+        try:
+            value = read_json(self.paths["cursor"])
+            cursor = value.get("cursor", {}) if isinstance(value, dict) else {}
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            cursor = {}
+        if not isinstance(cursor, dict):
+            cursor = {}
+        cursor.update({"maintenance_next_project_id": project_id, "updated_at": utc_now()})
+        atomic_replace(self.paths["cursor"], {"cursor": cursor})
 
     def pending_launch_identities(self) -> set[tuple[str, str]]:
         """Return pending ``(project_id, attempt_id)`` handoff identities."""

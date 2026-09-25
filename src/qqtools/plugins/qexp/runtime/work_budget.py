@@ -177,6 +177,166 @@ class SliceBudget:
         self.operations_used += operations
 
 
+@dataclass(slots=True)
+class OperationReservation:
+    """A maximum operation-cost reservation owned by one invocation ledger."""
+
+    ledger: InvocationLedger
+    operations: int
+    _active: bool = True
+
+    def commit(self, *, actual_operations: int) -> None:
+        """Commit actual usage and return any unused reserved operations."""
+        self.ledger.commit(self, actual_operations=actual_operations)
+
+    def release(self) -> None:
+        """Return this reservation without charging operations."""
+        self.ledger.release(self)
+
+
+@dataclass(slots=True)
+class InvocationLedger:
+    """Account one end-to-end maintenance invocation across nested phases.
+
+    Operation reservations are included in admission. Each admitted phase step
+    reserves its worst-case cost before it consumes a semantic item; after the
+    step, callers commit the measured operation count or release the unused
+    reservation. The deadline is cooperative and only prevents later admission.
+    """
+
+    semantic_item_limit: int
+    operation_limit: int = DEFAULT_OPERATION_HARD_LIMIT
+    deadline_ms: int = DEFAULT_SLICE_DEADLINE_MS
+    clock_ns: Callable[[], int] = time.monotonic_ns
+    semantic_items_consumed: int = 0
+    operations_consumed: int = 0
+    operations_reserved: int = 0
+    _started_ns: int = field(init=False)
+    _deadline_ns: int = field(init=False)
+    _exhaustion_reason: str | None = None
+    deadline_overrun_ms: int = 0
+
+    def __post_init__(self) -> None:
+        values = (self.semantic_item_limit, self.operation_limit, self.deadline_ms)
+        if any(type(value) is not int or value <= 0 for value in values):
+            raise ValueError("invocation ledger limits must be positive integers.")
+        self._started_ns = self.clock_ns()
+        self._deadline_ns = self._started_ns + self.deadline_ms * 1_000_000
+
+    @property
+    def semantic_items_remaining(self) -> int:
+        return max(0, self.semantic_item_limit - self.semantic_items_consumed)
+
+    @property
+    def operations_remaining(self) -> int:
+        return max(0, self.operation_limit - self.operations_consumed - self.operations_reserved)
+
+    @property
+    def elapsed_ms(self) -> int:
+        return max(0, (self.clock_ns() - self._started_ns) // 1_000_000)
+
+    @property
+    def exhaustion_reason(self) -> str | None:
+        """Return the first boundary that stopped admission, if any."""
+        if self._exhaustion_reason is not None:
+            return self._exhaustion_reason
+        if self.semantic_items_remaining <= 0:
+            return "semantic_items"
+        if self.operations_remaining <= 0:
+            return "operations"
+        if self.clock_ns() >= self._deadline_ns:
+            return "deadline"
+        return None
+
+    def can_admit(self, *, maximum_operations: int = 1) -> bool:
+        """Return whether one more semantic item can reserve its exit cost."""
+        self._validate_count(maximum_operations, "maximum_operations", positive=True)
+        if self.semantic_items_remaining <= 0:
+            self._exhaustion_reason = self._exhaustion_reason or "semantic_items"
+            return False
+        if self.operations_remaining < maximum_operations:
+            self._exhaustion_reason = self._exhaustion_reason or "operations"
+            return False
+        if self.clock_ns() >= self._deadline_ns:
+            self._exhaustion_reason = self._exhaustion_reason or "deadline"
+            return False
+        return True
+
+    def reserve_operations(self, *, maximum_operations: int) -> OperationReservation | None:
+        """Reserve a step's maximum operation cost before beginning the step."""
+        self._validate_count(maximum_operations, "maximum_operations", positive=True)
+        if not self.can_admit(maximum_operations=maximum_operations):
+            return None
+        self.operations_reserved += maximum_operations
+        return OperationReservation(self, maximum_operations)
+
+    def consume_semantic_item(self) -> None:
+        """Charge one source examination or standalone durable transition."""
+        if self.semantic_items_remaining <= 0:
+            self._exhaustion_reason = self._exhaustion_reason or "semantic_items"
+            raise RuntimeError("invocation semantic-item limit exceeded.")
+        self.semantic_items_consumed += 1
+
+    def charge_operations(self, *, operations: int) -> None:
+        """Charge unreserved setup/report operations against the hard limit."""
+        self._validate_count(operations, "operations", positive=True)
+        if self.operations_remaining < operations:
+            self._exhaustion_reason = self._exhaustion_reason or "operations"
+            raise RuntimeError("invocation operation hard limit exceeded.")
+        self.operations_consumed += operations
+
+    def commit(self, reservation: OperationReservation, *, actual_operations: int) -> None:
+        """Commit usage bounded by a live reservation, releasing its remainder."""
+        self._validate_count(actual_operations, "actual_operations", positive=False)
+        self._validate_reservation(reservation)
+        if actual_operations > reservation.operations:
+            raise ValueError("actual_operations must not exceed the reserved operation count.")
+        self.operations_reserved -= reservation.operations
+        self.operations_consumed += actual_operations
+        reservation._active = False
+        self._record_deadline_overrun()
+
+    def release(self, reservation: OperationReservation) -> None:
+        """Release unused reserved operations without charging the step."""
+        self._validate_reservation(reservation)
+        self.operations_reserved -= reservation.operations
+        reservation._active = False
+        self._record_deadline_overrun()
+
+    def report(self) -> dict[str, int | str | None]:
+        """Return the bounded public counters for this invocation."""
+        self._record_deadline_overrun()
+        return {
+            "semantic_items_consumed": self.semantic_items_consumed,
+            "operations_consumed": self.operations_consumed,
+            "elapsed_ms": self.elapsed_ms,
+            "semantic_items_remaining": self.semantic_items_remaining,
+            "operations_remaining": self.operations_remaining,
+            "exhaustion_reason": self.exhaustion_reason,
+            "deadline_overrun_ms": self.deadline_overrun_ms,
+        }
+
+    def _validate_reservation(self, reservation: OperationReservation) -> None:
+        if not isinstance(reservation, OperationReservation) or reservation.ledger is not self:
+            raise ValueError("operation reservation belongs to another ledger.")
+        if not reservation._active:
+            raise ValueError("operation reservation is no longer active.")
+
+    @staticmethod
+    def _validate_count(value: int, name: str, *, positive: bool) -> None:
+        if type(value) is not int or value < (1 if positive else 0):
+            qualifier = "positive" if positive else "nonnegative"
+            raise ValueError(f"{name} must be a {qualifier} integer.")
+
+    def _record_deadline_overrun(self) -> None:
+        now = self.clock_ns()
+        if now > self._deadline_ns:
+            overrun = (now - self._deadline_ns + 999_999) // 1_000_000
+            self.deadline_overrun_ms = max(self.deadline_overrun_ms, overrun)
+            if self.semantic_items_remaining > 0 and self.operations_remaining > 0:
+                self._exhaustion_reason = self._exhaustion_reason or "deadline"
+
+
 def bounded_records(records: Iterable[T], budget: SliceBudget) -> Iterator[T]:
     """Yield only records admitted before the portable count/deadline boundary."""
     iterator = iter(records)

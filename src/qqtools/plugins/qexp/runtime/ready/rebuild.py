@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..directory_capture import read_directory_entry
 from ..locks import exclusive, schema_lock, schema_writer_lock
 from ..paths import ready_state_path, shared_paths, task_path
 from ..records import TaskRecord, utc_now, validate_identifier
@@ -62,34 +63,83 @@ def _write_build_page(
     )
 
 
-def _capture_build_watermark(cfg: object, record: dict[str, Any]) -> None:
-    """Stream one immutable legacy inventory into bounded durable pages."""
+def _capture_build_watermark(cfg: object, record: dict[str, Any], *, max_entries: int | None) -> None:
+    """Capture one bounded Task-directory page into durable build inventory."""
     build = record["build"]
     build_id = build["build_id"]
-    page = 0
-    task_count = 0
-    task_ids: list[str] = []
     tasks = shared_paths(cfg.shared_root)["tasks"]
-    with os.scandir(tasks) as entries:
-        for entry in entries:
-            if not entry.is_file() or not entry.name.endswith(".json"):
-                continue
-            task_ids.append(entry.name[:-5])
-            task_count += 1
-            if len(task_ids) == READY_BUILD_PAGE_SIZE:
-                _write_build_page(cfg, build_id, page, task_ids)
-                page += 1
-                task_ids = []
-    if task_ids:
+    directory = tasks.stat()
+    watermark = build.get("watermark")
+    if not isinstance(watermark, dict):
+        raise ValueError("ready build watermark is invalid.")
+    capture = watermark.get("capture")
+    if capture is None:
+        capture = {
+            "device": directory.st_dev,
+            "inode": directory.st_ino,
+            "offset": 0,
+            "page": watermark.get("page_count", 0),
+            "pending_task_ids": [],
+            "task_count": watermark.get("task_count", 0),
+        }
+    if (
+        not isinstance(capture, dict)
+        or capture.get("device") != directory.st_dev
+        or capture.get("inode") != directory.st_ino
+        or type(capture.get("offset")) is not int
+        or capture["offset"] < 0
+        or type(capture.get("page")) is not int
+        or capture["page"] < 0
+        or not isinstance(capture.get("pending_task_ids"), list)
+        or len(capture["pending_task_ids"]) >= READY_BUILD_PAGE_SIZE
+        or not all(isinstance(task_id, str) for task_id in capture["pending_task_ids"])
+        or type(capture.get("task_count")) is not int
+        or capture["task_count"] < 0
+    ):
+        raise ValueError("ready build watermark capture cursor is invalid.")
+
+    task_ids = list(capture["pending_task_ids"])
+    page = capture["page"]
+    task_count = capture["task_count"]
+    offset = capture["offset"]
+    scanned = 0
+    complete = False
+    while max_entries is None or scanned < max_entries:
+        name, offset = read_directory_entry(tasks, offset)
+        if name is None:
+            complete = True
+            break
+        scanned += 1
+        if not name.endswith(".json") or not (tasks / name).is_file():
+            continue
+        task_ids.append(name[:-5])
+        task_count += 1
+        if len(task_ids) == READY_BUILD_PAGE_SIZE:
+            _write_build_page(cfg, build_id, page, task_ids)
+            page += 1
+            task_ids = []
+    if complete and task_ids:
         _write_build_page(cfg, build_id, page, task_ids)
         page += 1
+
     build["watermark"] = {
         "page_count": page,
         "task_count": task_count,
-        "captured_at": utc_now(),
-        "is_complete": True,
+        "captured_at": utc_now() if complete else None,
+        "is_complete": complete,
+        "capture": None
+        if complete
+        else {
+            "device": directory.st_dev,
+            "inode": directory.st_ino,
+            "offset": offset,
+            "page": page,
+            "pending_task_ids": task_ids,
+            "task_count": task_count,
+        },
     }
-    build["phase"] = "backfill"
+    if complete:
+        build["phase"] = "backfill"
 
 
 def _reset_ready_projection_for_repair(cfg: object, build_id: str) -> None:
@@ -107,17 +157,53 @@ def _reset_ready_projection_for_repair(cfg: object, build_id: str) -> None:
     }
     for name, target in targets.items():
         archived = archive / name
+        if archived.exists():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
         if target.exists():
             os.replace(target, archived)
         target.mkdir(parents=True, exist_ok=True)
 
 
-def begin_ready_index_build(cfg: object, *, is_repair: bool = False) -> dict[str, Any]:
+def begin_ready_index_build(
+    cfg: object,
+    *,
+    is_repair: bool = False,
+    max_tasks: int = READY_BUILD_PAGE_SIZE,
+    bounded_initialization: bool = False,
+) -> dict[str, Any]:
     """Start or resume the single durable ready-index build."""
+    if type(max_tasks) is not int or not 1 <= max_tasks <= READY_BUILD_PAGE_SIZE:
+        raise ValueError(f"max_tasks must be between 1 and {READY_BUILD_PAGE_SIZE}.")
     state.ensure_ready_layout(cfg)
     current_state = state.read_ready_index_state(cfg)
     if current_state == "active" or (current_state == "degraded" and not is_repair):
         return state.read_ready_index_status(cfg)
+    from ..maintenance_outbox import activate_work, prepare_target_work
+
+    if current_state == "building":
+        with schema_lock(cfg.shared_root):
+            with exclusive(state.state_lock_path(cfg)):
+                path = ready_state_path(cfg.shared_root)
+                value, record = state.read_state_record(cfg)
+                build = record.get("build") if isinstance(record.get("build"), dict) else {}
+                if record.get("state") == "building" and build.get("phase") == "reset-projection":
+                    _reset_ready_projection_for_repair(cfg, build["build_id"])
+                    build["phase"] = "inventory"
+                    state.commit_state_under_lock(path, value, record)
+        existing = state.read_ready_index_status(cfg)
+        build = existing.get("build") if isinstance(existing.get("build"), dict) else {}
+        descriptor = prepare_target_work(
+            cfg,
+            kind="ready_index",
+            target_id="project",
+            phase="build",
+            cursor={"mode": "build", "build_id": build.get("build_id")},
+        )
+        if descriptor["state"] == "prepared":
+            activate_work(cfg, descriptor)
+    initialized = False
+    descriptor = None
     if current_state in {"absent", "degraded"}:
         with schema_lock(cfg.shared_root):
             with exclusive(state.state_lock_path(cfg)):
@@ -131,17 +217,23 @@ def begin_ready_index_build(cfg: object, *, is_repair: bool = False) -> dict[str
                     recorded = record.get("writer_capability")
                     if recorded is not None and recorded not in state.SUPPORTED_READY_WRITERS:
                         raise RuntimeError("ready repair cannot replace an unknown writer capability.")
-                    state.install_writer_capability_gate(cfg)
                     build_id = uuid.uuid4().hex
-                    if current_state == "degraded" and is_repair:
-                        _reset_ready_projection_for_repair(cfg, build_id)
+                    descriptor = prepare_target_work(
+                        cfg,
+                        kind="ready_index",
+                        target_id="project",
+                        phase="build",
+                        cursor={"mode": "build", "build_id": build_id},
+                    )
+                    state.install_writer_capability_gate(cfg)
+                    reset_projection = current_state == "degraded" and is_repair
                     record["state"] = "building"
                     record["writer_capability"] = (
                         floor if floor == state.CURRENT_READY_WRITER_CAPABILITY else recorded or floor
                     )
                     record["build"] = {
                         "build_id": build_id,
-                        "phase": "inventory",
+                        "phase": "reset-projection" if reset_projection else "inventory",
                         "is_repair": is_repair,
                         "watermark": {
                             "page_count": 0,
@@ -158,21 +250,45 @@ def begin_ready_index_build(cfg: object, *, is_repair: bool = False) -> dict[str
                         "completed_at": None,
                     }
                     state.commit_state_under_lock(path, value, record)
-    with exclusive(state.state_lock_path(cfg)):
-        path = ready_state_path(cfg.shared_root)
-        value, record = state.read_state_record(cfg)
-        current_state = record["state"]
-        if current_state == "active":
+                    if reset_projection:
+                        _reset_ready_projection_for_repair(cfg, build_id)
+                        record["build"]["phase"] = "inventory"
+                        state.commit_state_under_lock(path, value, record)
+                    if descriptor["state"] == "prepared":
+                        activate_work(cfg, descriptor)
+                    initialized = True
+    if initialized and bounded_initialization:
+        return state.read_ready_index_status(cfg)
+    # Once inventory capture is complete, advancing the build must acquire the
+    # schema-writer fence directly.  Re-entering the broader schema lock here
+    # would restore the state/schema lock-order inversion this rebuild path is
+    # designed to avoid.
+    _, existing_record = state.read_state_record(cfg)
+    existing_build = existing_record.get("build")
+    if existing_record.get("state") == "active" or (existing_record.get("state") == "degraded" and not is_repair):
+        return existing_record
+    if isinstance(existing_build, dict) and existing_build.get("watermark", {}).get("is_complete"):
+        return existing_record
+    with schema_lock(cfg.shared_root):
+        with exclusive(state.state_lock_path(cfg)):
+            path = ready_state_path(cfg.shared_root)
+            value, record = state.read_state_record(cfg)
+            current_state = record["state"]
+            if current_state == "active":
+                return record
+            if current_state == "degraded" and not is_repair:
+                return record
+            build = record.get("build")
+            if not isinstance(build, dict):
+                raise RuntimeError("ready index build state is missing.")
+            if not build.get("watermark", {}).get("is_complete"):
+                _capture_build_watermark(
+                    cfg,
+                    record,
+                    max_entries=max_tasks if bounded_initialization else None,
+                )
+                state.commit_state_under_lock(path, value, record)
             return record
-        if current_state == "degraded" and not is_repair:
-            return record
-        build = record.get("build")
-        if not isinstance(build, dict):
-            raise RuntimeError("ready index build state is missing.")
-        if not build.get("watermark", {}).get("is_complete"):
-            _capture_build_watermark(cfg, record)
-            state.commit_state_under_lock(path, value, record)
-        return record
 
 
 def rebuild_primary_ready_index(cfg: object) -> None:
@@ -395,11 +511,25 @@ def advance_ready_index_build(
     cfg: object,
     *,
     max_tasks: int = READY_BUILD_PAGE_SIZE,
+    is_repair: bool = False,
+    bounded_initialization: bool = False,
 ) -> dict[str, Any]:
     """Advance at most ``max_tasks`` durable rebuild or audit records."""
     if type(max_tasks) is not int or not 1 <= max_tasks <= READY_BUILD_PAGE_SIZE:
         raise ValueError(f"max_tasks must be between 1 and {READY_BUILD_PAGE_SIZE}.")
-    begin_ready_index_build(cfg)
+    initialized = begin_ready_index_build(
+        cfg,
+        is_repair=is_repair,
+        max_tasks=max_tasks,
+        bounded_initialization=bounded_initialization,
+    )
+    initialized_build = initialized.get("build")
+    if (
+        bounded_initialization
+        and initialized.get("state") == "building"
+        and (not isinstance(initialized_build, dict) or not initialized_build.get("watermark", {}).get("is_complete"))
+    ):
+        return initialized
     # A rebuild can repair Task truth.  Hold the schema fence before the ready
     # state lock so its nested Task writer follows Schema -> state -> Group -> Task.
     with schema_writer_lock(cfg):
@@ -543,7 +673,12 @@ def repair_ready_index(
     cfg: object,
     *,
     max_tasks: int = READY_BUILD_PAGE_SIZE,
+    bounded_initialization: bool = False,
 ) -> dict[str, Any]:
     """Start degraded recovery and advance one bounded repair slice."""
-    begin_ready_index_build(cfg, is_repair=True)
-    return advance_ready_index_build(cfg, max_tasks=max_tasks)
+    return advance_ready_index_build(
+        cfg,
+        max_tasks=max_tasks,
+        is_repair=True,
+        bounded_initialization=bounded_initialization,
+    )

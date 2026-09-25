@@ -28,7 +28,8 @@ from .bindings import ProjectBinding
 if TYPE_CHECKING:
     from .context import MachineRuntime
 
-SERVICE_LANES = ("scheduler", "authority", "group", "observation", "submission")
+SERVICE_LANES = ("scheduler", "authority", "group", "observation", "submission", "maintenance")
+_LEGACY_SERVICE_LANES = frozenset({"scheduler", "authority", "group", "observation", "submission"})
 _RECORD_VERSION = 1
 _MAX_REASON_BYTES = 128
 _MAX_RECORD_BYTES = 16 * 1024
@@ -688,7 +689,7 @@ class BindingWorkingSet:
             if not self._valid_signature(record["checkpoint"]):
                 return False
             acks = record["acknowledgements"]
-            if type(acks) is not dict or set(acks) != set(SERVICE_LANES):
+            if type(acks) is not dict or (set(acks) != set(SERVICE_LANES) and set(acks) != _LEGACY_SERVICE_LANES):
                 return False
             if not all(self._valid_signature(signature) for signature in acks.values()):
                 return False

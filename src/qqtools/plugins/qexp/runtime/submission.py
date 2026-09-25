@@ -68,9 +68,37 @@ def _submission_atomic_writer(path: Path, value: dict[str, Any], **kwargs: Any) 
     return atomic_replace(path, value, **kwargs)
 
 
+def _prepare_submission_work(cfg: object, operation: dict[str, Any]) -> dict[str, Any]:
+    submission = operation.get("submission") if isinstance(operation, dict) else None
+    operation_id = submission.get("operation_id") if isinstance(submission, dict) else None
+    if not isinstance(operation_id, str) or not operation_id:
+        raise ValueError("Submission operation identity is missing.")
+    from .maintenance_outbox import prepare_work
+
+    descriptor = prepare_work(
+        cfg,
+        kind="submission",
+        target_id=operation_id,
+        work_generation=operation_id,
+        phase="operation",
+        cursor={"operation_id": operation_id},
+    )
+    if descriptor["state"] in {"completed", "intervention", "superseded"}:
+        raise RuntimeError("terminal Submission maintenance identity cannot be reopened.")
+    return descriptor
+
+
 def publish_submission(cfg: object, operation: dict[str, Any]) -> None:
     """Publish Submission truth through the control proof protocol."""
+    submission = operation.get("submission") if isinstance(operation, dict) else None
+    operation_id = submission.get("operation_id") if isinstance(submission, dict) else None
+    if not isinstance(operation_id, str) or not operation_id:
+        raise ValueError("Submission operation identity is missing.")
+    from .maintenance_outbox import activate_work
+
+    descriptor = _prepare_submission_work(cfg, operation)
     _publish_submission(cfg, operation, _atomic_writer=_submission_atomic_writer)
+    activate_work(cfg, descriptor)
 
 
 @contextmanager
@@ -346,6 +374,25 @@ def _remove_operation_added_workers(group: dict[str, Any], operation_id: str, pl
     return removed_worker
 
 
+def _persist_group_after_submission_rollback(
+    cfg: Any,
+    group_file: Path,
+    group: dict[str, Any],
+    previous_workers: dict[str, dict[str, Any]],
+    *,
+    workers_changed: bool,
+) -> None:
+    """Commit Submission rollback with the same ready-route fence as worker removal."""
+    group_name = group["group"]["name"]
+    if not workers_changed:
+        _write_group_record(cfg, group_file, group)
+        return
+    routes = primary_projection_routes_for_group(cfg, group_name)
+    with primary_route_update_transaction(cfg, routes):
+        _write_group_record(cfg, group_file, group)
+        sync_primary_ready_group(cfg, group_name, previous_workers=previous_workers)
+
+
 def _finalize_submission_group_locked(cfg: Any, submission: dict[str, Any]) -> None:
     """Finalize a committed submission while the Group writer lock is held."""
     group_name = submission.get("target_group")
@@ -466,12 +513,21 @@ def _cleanup_aborted_submission(
                 if has_pending_commit and plan.create_group and creation_owner == operation_id:
                     group_file.unlink()
                 else:
+                    previous_workers = {
+                        machine: dict(worker) for machine, worker in group["group"]["worker_set"].items()
+                    }
                     removed_worker = _remove_operation_added_workers(group, operation_id, plan)
                     if has_pending_commit or removed_worker:
                         group["group"]["pending_submission_commit"] = None
                         group["meta"]["revision"] += 1
                         group["meta"]["updated_at"] = utc_now()
-                        _write_group_record(cfg, group_file, group)
+                        _persist_group_after_submission_rollback(
+                            cfg,
+                            group_file,
+                            group,
+                            previous_workers,
+                            workers_changed=removed_worker,
+                        )
     for item in resolved:
         task_id = item["task_id"]
         path = task_path(cfg.shared_root, task_id)
@@ -489,6 +545,164 @@ def _cleanup_aborted_submission(
                     pass
                 assert_ready_writer_compatible(cfg)
                 path.unlink(missing_ok=True)
+
+
+def advance_submission_cleanup_step(cfg: Any, operation_id: str) -> dict[str, Any]:
+    """Advance one persisted abort-cleanup stage or one owned Task child."""
+    validate_identifier(operation_id, "operation_id")
+    operation_file = submission_path(cfg.shared_root, operation_id)
+    operation = read_json(operation_file)
+    submission = operation.get("submission")
+    if not isinstance(submission, dict) or submission.get("operation_id") != operation_id:
+        raise RuntimeError("Submission cleanup operation identity is malformed.")
+    key = submission.get("idempotency_key")
+    if not isinstance(key, str) or not key:
+        raise RuntimeError("Submission cleanup operation has no idempotency key.")
+    mapping_digest = semantic_digest({"project": str(cfg.shared_root), "key": key})
+
+    with _submission_protocol_lock(cfg, mapping_digest):
+        operation = read_json(operation_file)
+        submission = operation.get("submission")
+        if not isinstance(submission, dict) or submission.get("operation_id") != operation_id:
+            raise RuntimeError("Submission cleanup operation changed identity.")
+        if submission.get("state") == "committed":
+            _finalize_committed_submission(cfg, submission)
+            return {"state": "completed", "operation_id": operation_id}
+        if submission.get("state") == "blocked":
+            return {
+                "state": "intervention",
+                "operation_id": operation_id,
+                "reason": "submission_authority_blocked",
+            }
+
+        progress = submission.get("maintenance_cleanup")
+        if progress is None:
+            if submission.get("state") not in {"preparing", "committing", "aborted"}:
+                return {
+                    "state": "intervention",
+                    "operation_id": operation_id,
+                    "reason": "submission_state_ambiguous",
+                }
+            submission["state"] = "aborted"
+            submission.setdefault("failure_reason", "incomplete Submission truth requires cleanup")
+            submission["maintenance_cleanup"] = {
+                "state": "pending",
+                "stage": "group",
+                "task_offset": 0,
+                "worker_offset": 0,
+            }
+            publish_submission(cfg, operation)
+            return {"state": "in_progress", "operation_id": operation_id, "stage": "group"}
+
+        if (
+            not isinstance(progress, dict)
+            or progress.get("state") not in {"pending", "completed"}
+            or progress.get("stage") not in {"group", "group_workers", "group_finalize", "tasks", "complete"}
+            or type(progress.get("task_offset")) is not int
+            or progress["task_offset"] < 0
+            or type(progress.get("worker_offset")) is not int
+            or progress["worker_offset"] < 0
+        ):
+            return {
+                "state": "intervention",
+                "operation_id": operation_id,
+                "reason": "submission_cleanup_cursor_invalid",
+            }
+        if progress.get("state") == "completed" or progress.get("stage") == "complete":
+            return {"state": "completed", "operation_id": operation_id}
+
+        plan = decode_submission_plan(operation)
+        group_name = plan.target_group
+        stage = progress["stage"]
+        if stage in {"group", "group_workers", "group_finalize"}:
+            if not group_name:
+                progress["stage"] = "tasks"
+                publish_submission(cfg, operation)
+                return {"state": "in_progress", "operation_id": operation_id, "stage": "tasks"}
+            with group_lock(cfg.shared_root, group_name):
+                group_file = group_path(cfg.shared_root, group_name)
+                if group_file.exists():
+                    group = read_json(group_file)
+                    normalize_group_record(group)
+                    group_control = group["group"]
+                    pending = group_control.get("pending_submission_commit") or {}
+                    owns_pending = pending.get("operation_id") == operation_id
+                    owns_creation = group_control.get("creation_operation_id") == operation_id
+                    if stage == "group":
+                        if owns_creation and (not pending or owns_pending):
+                            group_file.unlink()
+                            progress["stage"] = "tasks"
+                        elif plan.worker_set_additions:
+                            progress["stage"] = "group_workers"
+                        else:
+                            progress["stage"] = "group_finalize"
+                    elif stage == "group_workers":
+                        workers = tuple(dict.fromkeys(plan.worker_set_additions))
+                        index = progress["worker_offset"]
+                        if index >= len(workers):
+                            progress["stage"] = "group_finalize"
+                        else:
+                            machine = workers[index]
+                            worker = group_control.get("worker_set", {}).get(machine)
+                            if worker and worker.get("added_by_operation") == operation_id:
+                                del group_control["worker_set"][machine]
+                                group_control["worker_set_epoch"] += 1
+                                group["meta"]["revision"] += 1
+                                group["meta"]["updated_at"] = utc_now()
+                                _write_group_record(cfg, group_file, group)
+                            progress["worker_offset"] = index + 1
+                            if progress["worker_offset"] >= len(workers):
+                                progress["stage"] = "group_finalize"
+                    else:
+                        if owns_pending:
+                            group_control["pending_submission_commit"] = None
+                            group["meta"]["revision"] += 1
+                            group["meta"]["updated_at"] = utc_now()
+                            _write_group_record(cfg, group_file, group)
+                        progress["stage"] = "tasks"
+                else:
+                    progress["stage"] = "tasks"
+            publish_submission(cfg, operation)
+            return {"state": "in_progress", "operation_id": operation_id, "stage": progress["stage"]}
+
+        plan_items = _plan_specs(plan)
+        index = progress["task_offset"]
+        if index >= len(plan_items):
+            progress.update({"state": "completed", "stage": "complete"})
+            publish_submission(cfg, operation)
+            return {"state": "completed", "operation_id": operation_id}
+
+        item = plan_items[index]
+        task_id = validate_identifier(item.get("task_id"), "submission cleanup task_id")
+        path = task_path(cfg.shared_root, task_id)
+        with task_lock(cfg.shared_root, task_id):
+            try:
+                current = TaskRecord.from_dict(read_json(path))
+            except FileNotFoundError:
+                current = None
+            if current is not None:
+                if current.submission_operation_id != operation_id:
+                    return {
+                        "state": "intervention",
+                        "operation_id": operation_id,
+                        "task_id": task_id,
+                        "reason": "submission_cleanup_task_owner_mismatch",
+                    }
+                remove_deadline_index(cfg, task_id)
+                try:
+                    delete_ready_marker(cfg, task_id, current.ready_generation)
+                except (OSError, KeyError, TypeError, ValueError):
+                    pass
+                assert_ready_writer_compatible(cfg)
+                path.unlink(missing_ok=True)
+        progress["task_offset"] = index + 1
+        publish_submission(cfg, operation)
+        return {
+            "state": "in_progress",
+            "operation_id": operation_id,
+            "task_id": task_id,
+            "stage": "tasks",
+        }
 
 
 def _execute_submission_locked(
@@ -808,12 +1022,21 @@ def _abort_submission_owned(cfg: Any, operation: dict[str, Any], plan: Submissio
                 if own_creation and (not pending or own_pending):
                     group_file.unlink()
                 else:
+                    previous_workers = {
+                        machine: dict(worker) for machine, worker in group["group"]["worker_set"].items()
+                    }
                     removed = _remove_operation_added_workers(group, plan.operation_id, plan)
                     if own_pending or removed:
                         group["group"]["pending_submission_commit"] = None
                         group["meta"]["revision"] += 1
                         group["meta"]["updated_at"] = utc_now()
-                        _write_group_record(cfg, group_file, group)
+                        _persist_group_after_submission_rollback(
+                            cfg,
+                            group_file,
+                            group,
+                            previous_workers,
+                            workers_changed=removed,
+                        )
     for item in _plan_specs(plan):
         path = task_path(cfg.shared_root, item["task_id"])
         with task_lock(cfg.shared_root, item["task_id"]):
@@ -922,6 +1145,7 @@ def submit_specs(
     ):
         policy_snapshot = read_policy_snapshot(cfg.shared_root, request.group_name)
     with _submission_protocol_lock(cfg, mapping_path.stem):
+        work_descriptor = None
         if mapping_path.exists():
             mapping = read_json(mapping_path)
             mapped_operation_id = mapping.get("operation_id") if isinstance(mapping, dict) else None
@@ -959,6 +1183,8 @@ def submit_specs(
                     operation_id=mapped_operation_id,
                     idempotency_key=key,
                 )
+            if submission.get("state") not in {"committed", "aborted"}:
+                work_descriptor = _prepare_submission_work(cfg, operation)
         else:
             plan = prepare_submission_plan(
                 cfg,
@@ -968,6 +1194,13 @@ def submit_specs(
             )
             operation = encode_submission_plan(plan)
             _reject_cleanup_tombstones(cfg, _plan_specs(plan))
+            # The operation outbox is the crash-recovery handoff for this
+            # operation. Persist it before the first Submission truth write.
+            work_descriptor = _prepare_submission_work(cfg, operation)
             create_if_absent(submission_path(cfg.shared_root, plan.operation_id), operation)
             create_if_absent(mapping_path, {"operation_id": plan.operation_id})
+        if work_descriptor is not None:
+            from .maintenance_outbox import activate_work
+
+            activate_work(cfg, work_descriptor)
         return _execute_submission_locked(cfg, operation, plan, on_prepared=on_prepared)

@@ -290,6 +290,19 @@ def mark_ready_index_degraded(cfg: object, reason: ReadyDiagnostic) -> None:
     if not isinstance(reason, ReadyDiagnostic):
         raise TypeError("ready-index degradation requires a typed diagnostic")
     path = ready_state_path(cfg.shared_root)
+    descriptor = None
+    try:
+        from ..maintenance_outbox import activate_work, prepare_target_work
+
+        descriptor = prepare_target_work(
+            cfg,
+            kind="ready_index",
+            target_id="project",
+            phase="damage_repair",
+            cursor={"mode": "build"},
+        )
+    except (AttributeError, FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+        descriptor = None
     try:
         with exclusive(state_lock_path(cfg)):
             value, record = read_state_record(cfg)
@@ -297,6 +310,26 @@ def mark_ready_index_degraded(cfg: object, reason: ReadyDiagnostic) -> None:
             commit_state_under_lock(path, value, record)
     except (AttributeError, FileNotFoundError, KeyError, OSError, TypeError, ValueError):
         return
+    if descriptor is not None:
+        try:
+            from ..maintenance_outbox import activate_work, update_work
+
+            descriptor = update_work(
+                cfg,
+                kind="ready_index",
+                target_id="project",
+                work_generation=descriptor["identity"]["work_generation"],
+                state="pending",
+                phase="damage_repair",
+                cursor={"mode": "build"},
+                meaningful_progress=True,
+                publish_activation=False,
+            )
+            activate_work(cfg, descriptor)
+        except (AttributeError, FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            # The ready gate remains the safety boundary when activation is
+            # unavailable; the descriptor remains durable for recovery.
+            return
 
 
 def degrade_state_record(record: dict[str, Any], reason: ReadyDiagnostic, *, cfg: object) -> None:

@@ -21,6 +21,8 @@ from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
 from qqtools.plugins.qexp.runtime.availability import offer_deadlines
 from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime
 from qqtools.plugins.qexp.runtime.availability.offer_deadlines import rebuild_deadline_indexes
+from qqtools.plugins.qexp.runtime.maintenance import advance_maintenance_work
+from qqtools.plugins.qexp.runtime.maintenance_outbox import read_work
 from qqtools.plugins.qexp.runtime.operation_store import active_operation_path, write_active_operation
 from qqtools.plugins.qexp.runtime.paths import attempt_path, shared_paths
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -48,6 +50,15 @@ def _base_args(cfg) -> list[str]:
 
 def _existing_group(cfg, name: str = "exp") -> None:
     create_group(cfg, name)
+
+
+def _finish_repair(cfg, *, limit: int = 128) -> dict:
+    """Run bounded full-audit slices until the captured audit completes."""
+    for _ in range(limit):
+        result = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root)
+        if result["complete"] or result["outcome"] == "blocked":
+            return result
+    pytest.fail(f"full repair did not complete in {limit} bounded slices")
 
 
 def test_share_now_persists_journal_audit_and_keeps_home_eligible(tmp_path: Path):
@@ -80,7 +91,8 @@ def test_due_deadline_cursor_rotates_past_first_bounded_batch(tmp_path: Path):
     second = list(offer_deadlines.iter_due_deadline_paths(cfg))
 
     assert len(first) == 64
-    assert [path.name for path in second] == ["task-064.json"]
+    assert len(second) == 1
+    assert {path.name for path in first + second} == {f"task-{index:03d}.json" for index in range(65)}
 
 
 def test_share_without_helpers_replaces_stale_private_fallback_with_group(tmp_path: Path):
@@ -287,8 +299,8 @@ def test_share_after_writes_and_repairs_deadline_index(tmp_path: Path, monkeypat
     index_path.unlink()
     issues = {issue["code"] for issue in verify_integrity(cfg)["issues"]}
     assert "offer_deadline_index_missing" in issues
-    repaired = repair_metadata(cfg)
-    assert any(item.startswith("offer_deadline_indexes:") for item in repaired["repaired"])
+    repaired = _finish_repair(cfg)
+    assert repaired["complete"] is True
     assert index_path.exists()
 
 
@@ -328,7 +340,7 @@ def test_doctor_replays_prepared_availability_operation(tmp_path: Path):
         },
     )
 
-    repair_metadata(cfg)
+    _finish_repair(cfg)
 
     stored = load_task(cfg, task.task_id)
     assert stored.placement_policy["sharing_mode"] == "spillover"
@@ -377,12 +389,12 @@ def test_doctor_archives_blocked_availability_operation_with_reason(tmp_path: Pa
     archived_path = shared_paths(cfg.shared_root)["availability"] / f"{operation_id}.json"
     assert archived_path.is_symlink()
 
-    repair_metadata(cfg)
+    repaired = _finish_repair(cfg)
 
-    assert not operation_path.exists()
-    assert archived_path.exists()
-    assert not archived_path.is_symlink()
-    assert read_json(archived_path)["availability_operation"]["state"] == "blocked"
+    assert operation_path.exists()
+    assert archived_path.is_symlink()
+    assert repaired["outcome"] == "blocked"
+    assert any(operation_id in item and "blocked" in item for item in repaired["blocked"])
 
 
 def test_doctor_completes_operation_after_post_task_side_effect_failure(tmp_path: Path, monkeypatch):
@@ -408,9 +420,44 @@ def test_doctor_completes_operation_after_post_task_side_effect_failure(tmp_path
     operation_path = shared_paths(cfg.shared_root)["availability"] / f"{operation_id}.json"
     assert read_json(operation_path)["availability_operation"]["state"] == "prepared"
 
-    repair_metadata(cfg)
+    _finish_repair(cfg)
 
     assert read_json(operation_path)["availability_operation"]["state"] == "completed"
+
+
+def test_resident_recovers_truth_committed_before_descriptor_activation(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "ok"], group="exp")
+
+    def fail_activation(*_args, **_kwargs):
+        raise OSError("activation interrupted")
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(
+            "qqtools.plugins.qexp.runtime.maintenance_outbox.activate_work",
+            fail_activation,
+        )
+        with pytest.raises(OSError, match="activation interrupted"):
+            task_commands.share(cfg, task.task_id)
+
+    [operation_path] = list(shared_paths(cfg.shared_root)["availability_active"].glob("*.json"))
+    operation_id = read_json(operation_path)["availability_operation"]["operation_id"]
+    descriptor = None
+    for _ in range(16):
+        result = advance_maintenance_work(cfg, reservation_runtime_root=cfg.runtime_root)
+        descriptor = read_work(
+            cfg,
+            kind="availability",
+            target_id=operation_id,
+            work_generation=operation_id,
+        )
+        if descriptor is not None and descriptor["state"] == "completed":
+            break
+
+    assert result["maintenance_state"] == "completed"
+    assert load_task(cfg, task.task_id).placement_policy["sharing_mode"] == "spillover"
+    assert descriptor is not None and descriptor["state"] == "completed"
 
 
 def test_share_rejects_claimed_task_without_mutation(tmp_path: Path):
@@ -579,7 +626,7 @@ def test_rebuild_deadline_indexes_removes_stale_index(tmp_path: Path):
     assert not stale.exists()
 
 
-def test_agent_removes_stale_deadline_index_without_skipping_remaining_work(
+def test_agent_ignores_stale_cold_deadline_index_without_skipping_due_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
@@ -592,7 +639,7 @@ def test_agent_removes_stale_deadline_index_without_skipping_remaining_work(
 
     offer_due_tasks(cfg)
 
-    assert not stale.exists()
+    assert stale.exists()
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
 
 

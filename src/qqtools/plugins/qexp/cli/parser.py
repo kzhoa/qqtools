@@ -982,6 +982,11 @@ def build_parser() -> argparse.ArgumentParser:
                 help="Diagnose MachineRuntime identity; automatic restoration is unavailable and --dry-run is required.",
             )
             action.add_argument("--dry-run", action="store_true")
+            action.add_argument(
+                "--retry-intervention",
+                action="store_true",
+                help="Start a new captured full-audit generation after an intervention.",
+            )
         action.add_argument("--strict", action="store_true")
         action.add_argument("--max-work-items", type=int, default=64)
         _add_output_format(action)

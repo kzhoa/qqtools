@@ -72,6 +72,15 @@ def _failed_task(cfg, command: str = "failed", group: str | None = None):
     return task
 
 
+def _finish_repair(cfg) -> dict:
+    """Drive the public bounded repair contract to completion/intervention."""
+    for _ in range(512):
+        result = repair_metadata(cfg)
+        if result["complete"] or result["outcome"] == "blocked":
+            return result
+    raise AssertionError("bounded repair did not converge within 512 slices")
+
+
 def test_verify_integrity_accepts_valid_holder_bound_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
@@ -203,11 +212,10 @@ def test_doctor_finalizes_committed_submission_group(tmp_path: Path, monkeypatch
     assert group["group"]["next_membership_sequence"] == 2
 
 
-def test_doctor_does_not_clear_pending_group_commit_from_a_stale_snapshot(
+def test_doctor_blocks_aborted_submission_until_bounded_cleanup_is_available(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Terminal-operation repair must reread Group truth after taking its fence."""
+    """A legacy aborted operation must not be skipped or certified complete."""
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")
     operation_id = "aborted-submission"
@@ -229,17 +237,12 @@ def test_doctor_does_not_clear_pending_group_commit_from_a_stale_snapshot(
     group["group"]["pending_submission_commit"] = {"operation_id": operation_id}
     atomic_replace(path, group)
 
-    def replace_pending_before_reconcile(*_args, **_kwargs):
-        current = read_json(path)
-        current["group"]["pending_submission_commit"] = {"operation_id": "new-owner"}
-        atomic_replace(path, current)
-        return "blocked"
-
-    monkeypatch.setattr("qqtools.plugins.qexp.doctor.reconcile_submission", replace_pending_before_reconcile)
-    repaired = repair_metadata(cfg)
+    repaired = _finish_repair(cfg)
 
     assert operation_id not in repaired["repaired"]
-    assert read_json(path)["group"]["pending_submission_commit"] == {"operation_id": "new-owner"}
+    assert repaired["outcome"] == "blocked"
+    assert repaired["intervention"]["code"] == "submission_cleanup_invalid"
+    assert read_json(path)["group"]["pending_submission_commit"] == {"operation_id": operation_id}
 
 
 def test_clean_bulk_is_bounded_by_retention_and_limit(tmp_path: Path):
@@ -558,7 +561,7 @@ def test_doctor_finishes_interrupted_cleanup_operation(tmp_path: Path):
     codes = {issue["code"] for issue in verify_integrity(cfg)["issues"]}
     assert "cleanup_operation_incomplete" in codes
     assert "cleaned_task_attempt_residual" in codes
-    repair_metadata(cfg)
+    _finish_repair(cfg)
     assert not attempt_file.exists()
     assert read_json(cleanup_path)["cleanup"]["state"] == "completed"
 

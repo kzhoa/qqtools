@@ -346,25 +346,36 @@ def _degrade_after_publication(cfg: object, state: dict[str, Any]) -> None:
         pass
 
 
-def _prepare_mutation(cfg: object, task_id: str) -> tuple[dict[str, Any], bool, TaskRecord | None]:
+def _prepare_mutation(cfg: object, task_id: str) -> tuple[dict[str, Any], bool, TaskRecord | None, dict[str, Any]]:
+    initialize_state = False
     try:
         state = read_state(cfg)
     except (OSError, TypeError, ValueError):
         state = None
-        degraded = new_state(cfg, state="degraded")
-        write_state(cfg, degraded)
-        state = degraded
+        state = new_state(cfg, state="degraded")
+        initialize_state = True
     if state is None:
         state = new_state(cfg, state="degraded")
-        write_state(cfg, state)
+        initialize_state = True
 
     is_clean = state["state"] in {"active", "building"} and not state["dirty"]
     previous = _load_previous_task(cfg, task_id) if is_clean else None
+    from ..maintenance_outbox import prepare_target_work
+
+    descriptor = prepare_target_work(
+        cfg,
+        kind="task_observation",
+        target_id="project",
+        phase="task_publication",
+        cursor={"projection_generation": state["generation"], "task_id": task_id},
+    )
+    if initialize_state:
+        write_state(cfg, state)
     intent = dict(state)
     intent["revision"] += 1
     intent["dirty"] = True
     write_state(cfg, intent)
-    return intent, is_clean, previous
+    return intent, is_clean, previous, descriptor
 
 
 def _publish(
@@ -381,20 +392,35 @@ def _publish(
         return
 
     with exclusive(_observation_lock_path(cfg)):
-        state, is_clean, previous = _prepare_mutation(cfg, task_id)
+        state, is_clean, previous, descriptor = _prepare_mutation(cfg, task_id)
         # A callback failure leaves the durable dirty intent in place.
         write_truth()
         if not is_clean:
+            from ..maintenance_outbox import activate_work
+
+            activate_work(cfg, descriptor)
             return
         try:
             sync_task(cfg, state, previous, current)
             clean = dict(state)
             clean["dirty"] = False
             write_state(cfg, clean)
+            from ..maintenance_outbox import retire_work
+
+            retire_work(
+                cfg,
+                kind="task_observation",
+                target_id="project",
+                work_generation=descriptor["identity"]["work_generation"],
+                proof={"source": "task_observation_publication", "generation": clean["generation"]},
+            )
         except (OSError, ValueError, TypeError, KeyError, RuntimeError):
             # Truth is committed. Publication failure must never turn a
             # successful scheduler mutation into a failed mutation.
             _degrade_after_publication(cfg, state)
+            from ..maintenance_outbox import activate_work
+
+            activate_work(cfg, descriptor)
 
 
 def publish_task(cfg: object, task: TaskRecord, write_truth: Callable[[], None]) -> None:

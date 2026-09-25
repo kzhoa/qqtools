@@ -6,6 +6,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import dispatch_machine_cycle_locked
+from qqtools.plugins.qexp.doctor import repair_metadata
 from qqtools.plugins.qexp.runtime.resources.reservations import (
     ReservationIdentity,
     active_reservations,
@@ -69,6 +70,38 @@ def test_full_capacity_skips_scheduler_work_but_runs_maintenance(
     assert reserved_gpu_ids(runtime.root) == {0}
     diagnostic = read_json(runtime.paths["diagnostics"] / "scheduler-cycle.json")
     assert diagnostic["scheduler_diagnostic"]["counters"]["scheduler.work.skipped_no_capacity"] == 1
+
+
+def test_full_capacity_advances_resident_resumable_maintenance(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    repair_metadata(cfg, reservation_runtime_root=runtime.root, max_work_items=1)
+    maintenance_root = cfg.shared_root / "operations" / "maintenance-v1"
+    pointer = read_json(maintenance_root / "full-audit.current.json")
+    descriptor_path = maintenance_root / pointer["descriptor_file"]
+    revision_before = read_json(descriptor_path)["progress_revision"]
+    reservation = reserve(
+        runtime.root,
+        "unknown-task",
+        [0],
+        attempt_id="unknown-attempt",
+        fencing_token=1,
+        project_id="unknown-project",
+    )
+    attach(runtime.root, reservation["reservation"]["reservation_id"], "unknown-attempt", 1)
+
+    results = dispatch_machine_cycle_locked(
+        runtime,
+        available_gpus=[0],
+        supervise=False,
+        publish_snapshots=False,
+    )
+
+    assert read_json(descriptor_path)["progress_revision"] > revision_before
+    result = next(result for result in results if result["project_id"] == binding.project_id)
+    assert result["maintenance"]["budget"]["semantic_items_consumed"] == 1
+    assert result["maintenance"]["maintenance_state"] in {"pending", "running"}
 
 
 def test_stale_reservation_is_released_before_capacity_gate(tmp_path: Path) -> None:

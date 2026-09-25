@@ -142,3 +142,105 @@ def cleanup_unmatched_task_evidence(
             blockers.append(f"local_cleanup_pending:{identity}")
         removed.extend(str(path) for path in existing if not is_path_present(path))
     return removed, blockers, identities
+
+
+def cleanup_unmatched_attempt_evidence(
+    cfg: RootConfig,
+    cleanup: dict,
+    attempt_id: str,
+    payload: dict,
+) -> bool:
+    """Handoff one cursor-selected evidence identity through its durable receipt.
+
+    Unlike :func:`cleanup_unmatched_task_evidence`, this routine never builds
+    an inventory of local evidence or Ledger members.  The caller owns the
+    persisted child cursor and supplies the exact identity discovered in that
+    one child.
+    """
+    task_id = validate_identifier(cleanup.get("task_id"), "task_id")
+    operation_id = validate_identifier(cleanup.get("operation_id"), "operation_id")
+    attempt_id = validate_identifier(attempt_id, "attempt_id")
+    if (
+        cleanup.get("state") not in {"preparing", "waiting_ack"}
+        or cleanup.get("terminal_state") not in {"succeeded", "failed", "cancelled"}
+        or cfg.machine_name not in cleanup.get("required_machines", [])
+        or type(payload) is not dict
+        or payload.get("task_id") != task_id
+    ):
+        raise Conflict("unmatched cleanup requires terminal Task ownership")
+    number = payload.get("attempt_number")
+    if number is not None and (type(number) is not int or number < 1):
+        raise Conflict("unmatched cleanup Attempt number is invalid")
+    if is_path_present(task_path(cfg.shared_root, task_id)):
+        task = load_task(cfg, task_id)
+        if (
+            task.control.get("cleanup_operation_id") != operation_id
+            or task.state.get("projection") not in {"succeeded", "failed", "cancelled"}
+            or task.claim_control.get("active_claim")
+        ):
+            raise Conflict("unmatched cleanup operation does not own terminal Task truth")
+
+    paths = local_paths(cfg.runtime_root)
+    found_payload: dict[str, object] | None = None
+    for name, key in RECORD_KEYS.items():
+        evidence_path = (
+            paths[name] / attempt_id / "__maintenance_probe__"
+            if name == "termination_decisions"
+            else (paths[name] / f"{attempt_id}.json")
+        )
+        candidates = (evidence_path,) if name != "termination_decisions" else ()
+        for candidate in candidates:
+            if not validate_evidence_path(candidate, cfg.runtime_root):
+                continue
+            value = read_json(candidate).get(key)
+            if not isinstance(value, dict) or value.get("attempt_id", attempt_id) != attempt_id:
+                raise Conflict("local cleanup evidence does not match its identity")
+            observed = recovery_locator(attempt_id, value)
+            if observed.get("task_id") is not None:
+                if found_payload is not None and found_payload != observed:
+                    raise Conflict("local cleanup evidence has conflicting identity")
+                found_payload = observed
+
+    # The current descriptor child itself is sufficient evidence when the
+    # record was already removed by a previous receipt retry.
+    if found_payload is not None and any(payload.get(key) not in (None, value) for key, value in found_payload.items()):
+        raise Conflict("cleanup child identity changed during receipt handoff")
+    exact_payload = {
+        "task_id": task_id,
+        "attempt_number": number if number is not None else (found_payload or {}).get("attempt_number"),
+    }
+    if exact_payload["attempt_number"] is None:
+        raise Conflict("unmatched local evidence lacks an exact Attempt identity")
+
+    root = responsibility_root(cfg.runtime_root)
+    ledger = Ledger(root) if is_path_present(root) else None
+    entry = ledger.find(attempt_id) if ledger is not None else None
+    request = CleanupRequest.from_entry(entry) if entry is not None else None
+    if entry is not None and entry.get("payload") != exact_payload:
+        if entry.get("stage") != "active" or any(
+            entry.get("payload", {}).get(key) not in (None, value) for key, value in exact_payload.items()
+        ):
+            raise Conflict("cleanup receipt does not match the observed local identity")
+    if request is None:
+        if not has_final_observation(cfg.runtime_root, task_id, attempt_id):
+            return False
+        if not writers_are_quiescent(cfg.runtime_root, task_id, attempt_id):
+            return False
+        request = CleanupRequest(
+            attempt_id,
+            exact_payload,
+            {
+                "format": CLEANUP_FORMAT,
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "basis": "task_cleanup",
+                "operation_id": operation_id,
+            },
+        )
+    elif request.receipt.get("basis") == "task_cleanup" and request.receipt["operation_id"] != operation_id:
+        raise Conflict("cleanup receipt belongs to another Task cleanup operation")
+
+    if ledger is None:
+        with exclusive(cfg.runtime_root / "locks" / "responsibility-initialize.lock"):
+            ledger = Ledger.open_or_create(root)
+    return complete_cleanup(ledger, cfg.runtime_root, request)

@@ -1527,6 +1527,28 @@ def expire_claim(
             return False
         path = attempt_path(cfg.shared_root, task_id, task.attempt_control["current_attempt_number"])
         attempt = AttemptRecord.from_dict(read_json(path))
+        orphan_work = None
+        if claim.get("launch_state") != "claimed":
+            from .runtime.maintenance_outbox import prepare_work
+
+            orphan_work = prepare_work(
+                cfg,
+                kind="orphan_recovery",
+                target_id=attempt_id,
+                work_generation=f"fencing-{fencing_token}",
+                phase="attempt_recovery",
+                cursor={
+                    "stage": "process",
+                    "task_id": task_id,
+                    "attempt_number": attempt.attempt_number,
+                    "attempt_id": attempt_id,
+                    "fencing_token": fencing_token,
+                    "attempt_process_identity": {
+                        key: attempt.process.get(key) for key in ("process_group_id", "process_group_start_time_ticks")
+                    },
+                    "was_terminated": bool(task.control.get("terminate_running")),
+                },
+            )
         with record_task_change(
             cfg,
             task,
@@ -1583,6 +1605,19 @@ def expire_claim(
                     )
                 except OSError:
                     pass
+                if orphan_work is not None and orphan_work["state"] not in {
+                    "completed",
+                    "intervention",
+                    "superseded",
+                }:
+                    try:
+                        from .runtime.maintenance_outbox import activate_work
+
+                        activate_work(cfg, orphan_work)
+                    except (OSError, RuntimeError, ValueError):
+                        # The descriptor is already durable and active; a
+                        # later resident turn can recover this handoff.
+                        pass
             return True
 
 

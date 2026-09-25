@@ -214,6 +214,19 @@ def begin_group_ready_members_build(cfg: object, *, is_repair: bool = False) -> 
             if isinstance(record.get("park"), dict) and record["park"].get("state") == "prepared":
                 return _park_groups_under_lock(cfg, read_json_limited(path, max_bytes=_MAX_GLOBAL_STATE_BYTES))
             if record["state"] in {"active", "building", "degraded"} and not is_repair:
+                if record["state"] == "building":
+                    from ..maintenance_outbox import activate_work, prepare_target_work
+
+                    build = record.get("build") if isinstance(record.get("build"), dict) else {}
+                    descriptor = prepare_target_work(
+                        cfg,
+                        kind="group_ready_members",
+                        target_id="project",
+                        phase="build",
+                        cursor={"build_id": build.get("build_id")},
+                    )
+                    if descriptor["state"] == "prepared":
+                        activate_work(cfg, descriptor)
                 return record
             if record["state"] == "building":
                 return record
@@ -221,6 +234,15 @@ def begin_group_ready_members_build(cfg: object, *, is_repair: bool = False) -> 
             value = read_json_limited(path, max_bytes=_MAX_GLOBAL_STATE_BYTES)
             record = value["group_ready_members"]
             build_id = uuid.uuid4().hex
+            from ..maintenance_outbox import activate_work, prepare_target_work
+
+            descriptor = prepare_target_work(
+                cfg,
+                kind="group_ready_members",
+                target_id="project",
+                phase="park_and_rebuild",
+                cursor={"build_id": build_id},
+            )
             record["state"] = "degraded"
             record["park"] = {
                 "state": "prepared",
@@ -231,8 +253,20 @@ def begin_group_ready_members_build(cfg: object, *, is_repair: bool = False) -> 
             record["revision"] += 1
             record["updated_at"] = utc_now()
             _write_global_state(cfg, value)
+            if descriptor["state"] == "prepared":
+                activate_work(cfg, descriptor)
             return _park_groups_under_lock(cfg, value)
         group_ready_member_groups_root(cfg).mkdir(parents=True, exist_ok=True)
+        build_id = uuid.uuid4().hex
+        from ..maintenance_outbox import activate_work, prepare_target_work
+
+        descriptor = prepare_target_work(
+            cfg,
+            kind="group_ready_members",
+            target_id="project",
+            phase="build",
+            cursor={"build_id": build_id},
+        )
         record = {
             "schema_version": GROUP_READY_MEMBERS_VERSION,
             "required_capability": GROUP_READY_MEMBERS_CAPABILITY,
@@ -244,7 +278,7 @@ def begin_group_ready_members_build(cfg: object, *, is_repair: bool = False) -> 
             "archive_cleanup": None,
             "audit_cleanup": None,
             "build": {
-                "build_id": uuid.uuid4().hex,
+                "build_id": build_id,
                 "cursor": {"page": 0, "offset": 0},
                 "processed": 0,
                 "phase": "backfill",
@@ -255,6 +289,8 @@ def begin_group_ready_members_build(cfg: object, *, is_repair: bool = False) -> 
             "updated_at": utc_now(),
         }
         _write_global_state(cfg, {"group_ready_members": record})
+        if descriptor["state"] == "prepared":
+            activate_work(cfg, descriptor)
         return record
 
 
@@ -286,6 +322,7 @@ def advance_group_ready_members_audit(
     cfg: object,
     *,
     max_work_items: int = GROUP_MEMBER_PAGE_SIZE,
+    bounded_initialization: bool = False,
 ) -> dict[str, Any]:
     """Advance exactly one resumable verification slice for an active projection."""
     if type(max_work_items) is not int or not 1 <= max_work_items <= GROUP_MEMBER_PAGE_SIZE:
@@ -294,7 +331,8 @@ def advance_group_ready_members_audit(
         value = read_json_limited(group_ready_members_state_path(cfg), max_bytes=_MAX_GLOBAL_STATE_BYTES)
         record = value["group_ready_members"]
         if record.get("state") != "active":
-            return record
+            if bounded_initialization:
+                return record
         audit = record.get("audit")
         should_start_new_audit = (
             not isinstance(audit, dict)
@@ -314,6 +352,7 @@ def advance_group_ready_members_audit(
             record["audit"] = audit
             record["revision"] += 1
             _write_global_state(cfg, value)
+            return record
     audit_id = audit["audit_id"]
     try:
         phase = audit["phase"]
@@ -983,11 +1022,19 @@ def advance_group_ready_members_build(
     cfg: object,
     *,
     max_tasks: int = GROUP_MEMBER_PAGE_SIZE,
+    bounded_initialization: bool = False,
 ) -> dict[str, Any]:
     """Advance one bounded backfill, audit, or candidate-rebuild slice."""
     if type(max_tasks) is not int or not 1 <= max_tasks <= GROUP_MEMBER_PAGE_SIZE:
         raise ValueError(f"max_tasks must be between 1 and {GROUP_MEMBER_PAGE_SIZE}.")
+    try:
+        prior = read_group_ready_members_state(cfg)
+        initialize_step = prior.get("state") in {"absent", "degraded"}
+    except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        initialize_step = True
     record = begin_group_ready_members_build(cfg)
+    if initialize_step and bounded_initialization:
+        return record
     if record["state"] != "building":
         return record
     try:
@@ -1191,6 +1238,7 @@ def repair_group_ready_members(
     *,
     max_work_items: int = GROUP_MEMBER_PAGE_SIZE,
     max_tasks: int | None = None,
+    bounded_initialization: bool = False,
 ) -> dict[str, Any]:
     """Rebuild damaged derived membership from durable Task and ready truth."""
     from ...layout import is_group_ready_members_root
@@ -1205,13 +1253,23 @@ def repair_group_ready_members(
     try:
         current = read_group_ready_members_state(cfg)
         if current["state"] == "active":
-            return advance_group_ready_members_audit(cfg, max_work_items=max_work_items)
+            return advance_group_ready_members_audit(
+                cfg,
+                max_work_items=max_work_items,
+                bounded_initialization=bounded_initialization,
+            )
     except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         mark_group_ready_members_degraded(cfg, f"doctor_repair:{type(exc).__name__}")
     else:
         if current["state"] == "building":
-            return advance_group_ready_members_build(cfg, max_tasks=max_work_items)
-    begin_group_ready_members_build(cfg, is_repair=True)
+            return advance_group_ready_members_build(
+                cfg,
+                max_tasks=max_work_items,
+                bounded_initialization=bounded_initialization,
+            )
+    record = begin_group_ready_members_build(cfg, is_repair=True)
+    if bounded_initialization:
+        return record
     return advance_group_ready_members_build(cfg, max_tasks=max_work_items)
 
 

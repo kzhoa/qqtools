@@ -1989,6 +1989,15 @@ retry. It performs direct bounded Task, selected-Attempt, and dependency reads. 
 - `qexp admin migrate schema --project PATH --to-schema 6`
 - `qexp admin migrate schema6 {check|start|status|attest|resume} --project PATH`
 
+Project repair follows the durable full-audit contract in
+[qexp resumable maintenance](qexp_maintenance.md). `admin repair` keeps its
+whole-Project scope and 1--64 `--max-work-items` range, but the limit applies to
+one ledger across the invocation. An incomplete non-strict slice exits
+successfully for compatibility while reporting `complete=false` and requiring a
+rerun; strict mode and genuinely blocked work exit unsuccessfully. Routine
+resident recovery is active-obligation scoped and does not inherit the explicit
+full audit's retained-history traversal.
+
 `agent run` is a foreground debugging stream with no `--format` or finite startup record.
 `agent restart` reports process replacement and current readiness evidence without waiting for
 Project convergence; use `agent status` for the subsequent configured-mode, observed-mode, and

@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, ContextManager
 
@@ -930,6 +931,7 @@ def _dispatch_machine_cycle_locked(
         registry_revision, registered = runtime.load_registry_snapshot()
     runtime.working_set.reconcile(registered, revision=registry_revision)
     runtime.working_set.poll_dormant(limit=4)
+    _activate_due_maintenance_retries(runtime)
     resident_supervised = [
         binding
         for binding in runtime.working_set.resident_bindings()
@@ -960,6 +962,9 @@ def _dispatch_machine_cycle_locked(
     upgrade_blocked: dict[str, dict[str, Any]] = {}
     scheduler_turns = {
         binding.project_id: runtime.working_set.begin_turn(binding, "scheduler") for binding in supervised
+    }
+    maintenance_turns = {
+        binding.project_id: runtime.working_set.begin_turn(binding, "maintenance") for binding in supervised
     }
     for binding in supervised:
         if not binding.enabled and runtime.binding_state(binding) != "draining":
@@ -1237,6 +1242,13 @@ def _dispatch_machine_cycle_locked(
         cursor_effect = reduce_dispatch_cursor(dispatch_plan, last_successful_project_id)
         if cursor_effect is not None:
             runtime.save_cursor(cursor_effect.project_id)
+    _advance_resident_maintenance_turn(
+        runtime,
+        supervised,
+        readable,
+        maintenance_turns,
+        result_by_project,
+    )
     launch_batch.finish(result_by_project)
     if publish_snapshots:
         reservations = list(reservation_snapshot(runtime.root).reservations)
@@ -1321,6 +1333,84 @@ def _acknowledge_scheduler_turns(
             and not has_flag
         )
         runtime.working_set.acknowledge(turn, quiescent=quiescent)
+
+
+def _activate_due_maintenance_retries(runtime: MachineRuntime) -> None:
+    """Wake backoff-delayed Projects when their durable retry becomes due."""
+    now = time.monotonic()
+    for project_id, (binding, due_at) in tuple(runtime.maintenance_retry_deadlines.items()):
+        if now < due_at:
+            continue
+        try:
+            runtime.working_set.activate(binding, "maintenance_retry_due")
+        except ValueError:
+            runtime.maintenance_retry_deadlines.pop(project_id, None)
+        else:
+            runtime.maintenance_retry_deadlines.pop(project_id, None)
+
+
+def _advance_resident_maintenance_turn(
+    runtime: MachineRuntime,
+    bindings: list[ProjectBinding],
+    readable: dict[str, RootConfig],
+    turns: dict[str, Any],
+    results: dict[str, dict[str, Any]],
+) -> None:
+    """Advance one due descriptor after primary admission, regardless of capacity."""
+    candidates = [binding for binding in bindings if binding.project_id in readable]
+    if not candidates:
+        return
+    next_project_id = runtime.load_maintenance_cursor()
+    project_ids = [binding.project_id for binding in candidates]
+    try:
+        start = project_ids.index(next_project_id)
+    except ValueError:
+        start = 0
+    ordered = candidates[start:] + candidates[:start]
+    selected = ordered[0]
+    next_index = (start + 1) % len(candidates)
+    runtime.save_maintenance_cursor(project_ids[next_index])
+
+    from ..runtime.maintenance import advance_maintenance_work
+
+    project_id = selected.project_id
+    runtime.maintenance_retry_deadlines.pop(project_id, None)
+    try:
+        progress = advance_maintenance_work(
+            readable[project_id],
+            reservation_runtime_root=runtime.root,
+        )
+        state = progress.get("maintenance_state")
+        if state not in {"idle", "waiting", "completed"}:
+            result = results.setdefault(
+                project_id,
+                {"project_id": project_id, "launched": [], "status": "dispatched"},
+            )
+            result["maintenance"] = progress
+        if state in {"pending", "running"}:
+            runtime.last_cycle_had_demand = True
+            quiescent = False
+        else:
+            quiescent = state in {"idle", "waiting", "completed", "intervention"}
+            if state == "waiting":
+                due_at = progress.get("next_due_at")
+                if isinstance(due_at, str):
+                    try:
+                        parsed = datetime.fromisoformat(due_at.replace("Z", "+00:00"))
+                    except ValueError:
+                        parsed = None
+                    if parsed is not None and parsed.tzinfo is not None:
+                        delay = max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+                        runtime.maintenance_retry_deadlines[project_id] = (selected, time.monotonic() + delay)
+        turn = turns.get(project_id)
+        if turn is not None:
+            runtime.working_set.acknowledge(turn, quiescent=quiescent)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        result = results.setdefault(project_id, {"project_id": project_id, "launched": [], "status": "dispatched"})
+        result["maintenance"] = {"maintenance_state": "error", "error": str(exc)}
+        turn = turns.get(project_id)
+        if turn is not None:
+            runtime.working_set.acknowledge(turn, quiescent=False)
 
 
 def dispatch_machine_cycle(

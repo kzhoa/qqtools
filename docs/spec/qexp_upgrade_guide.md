@@ -218,8 +218,9 @@ stops new claims intentionally rather than scheduling potentially wrong work.
    ```
 
    A member audit can return `verification.state: building` while its projection remains active.
-   Repeat the same command until verification is `completed` and healthy, or repair reports a
-   degraded gate. Restart the machine agent only after repair reports both projections as active
+   Repeat the same command while `complete=false` and `rerun_required=true`, preserving the
+   returned `scope.work_generation`. Stop and investigate an `outcome=blocked` result. Restart the
+   machine agent only after repair is complete and reports both projections as active
    (or reports the member projection as legacy on a root where that capability is not installed).
 
 4. Restart the machine agent:
@@ -289,9 +290,10 @@ machine runtime is not at qexp's default location.
    qexp --project PROJECT_ROOT admin repair --format json
    ```
 
-   Repeat verify or repair while `group_ready_members.verification.state` is `building`. Continue
-   only after verification is `completed` and healthy; treat `degraded` as a blocker that requires
-   diagnosis. Use `--max-work-items 1` when a deliberately small maintenance slice is required.
+   Repeat verify or repair while `complete=false` or
+   `group_ready_members.verification.state` is `building`. Continue only after verification is
+   completed and healthy; treat `blocked` or `degraded` as a blocker that requires diagnosis. Use
+   `--max-work-items 1` when a deliberately small maintenance slice is required.
 
 8. Restart agents and clients after the activation is complete and the ready index is active.
 

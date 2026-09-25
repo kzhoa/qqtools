@@ -36,6 +36,15 @@ def _finish_build(cfg) -> dict:
     return record
 
 
+def _finish_repair(cfg) -> dict:
+    """Drive the public bounded repair contract to completion/intervention."""
+    for _ in range(512):
+        result = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root)
+        if result["complete"] or result["outcome"] == "blocked":
+            return result
+    raise AssertionError("bounded repair did not converge within 512 slices")
+
+
 def test_doctor_reports_and_repairs_missing_active_marker(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "repair"], task_id="repair-task")
@@ -50,7 +59,7 @@ def test_doctor_reports_and_repairs_missing_active_marker(tmp_path: Path) -> Non
     marker.unlink()
 
     verification = verify_integrity(cfg, reservation_runtime_root=cfg.runtime_root)
-    repaired = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root)
+    repaired = _finish_repair(cfg)
     current = load_task(cfg, task.task_id)
 
     assert any(issue["code"] == "ready_projection_inconsistent" for issue in verification["issues"])
@@ -72,7 +81,7 @@ def test_doctor_rebuilds_corrupt_catalog_from_task_truth(tmp_path: Path) -> None
     )
     atomic_replace(catalog, {"corrupt": {}})
 
-    repaired = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root)
+    repaired = _finish_repair(cfg)
     current = load_task(cfg, task.task_id)
 
     assert repaired["ready_index"]["state"] == "active"
@@ -91,7 +100,7 @@ def test_invalid_ready_reason_list_is_visible_but_not_repaired(tmp_path: Path) -
     assert status["state"] == "degraded"
     assert status["degraded_reasons"][0].startswith("ready_state_invalid;v=1;reason=state_invalid")
 
-    repaired = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root)
+    repaired = _finish_repair(cfg)
 
     assert "ready_index" in repaired["blocked"]
     assert read_json(state_path)["ready_index"]["degraded_reasons"] == ["valid", 7]

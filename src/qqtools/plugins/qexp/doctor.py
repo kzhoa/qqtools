@@ -3,21 +3,17 @@
 from __future__ import annotations
 
 import shlex
-import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .commands.cleanup import reconcile_cleanup_operations
-from .commands.group import reconcile_group_cancel_operations
 from .config_types import RootConfig
 from .layout import validate_root_contract
 from .lease import clock_capability
-from .runtime.availability import rebuild_deadline_indexes, reconcile_availability_operations
+from .runtime.availability import rebuild_deadline_indexes
 from .runtime.group_namespace import group_directory
 from .runtime.locks import schema_lock, schema_reader_lock
-from .runtime.observation.maintenance import ObservationMaintenance, request_rebuild
 from .runtime.observation.projection import inspect_observation, observation_path
 from .runtime.paths import attempt_path, local_paths, shared_paths, task_path
 from .runtime.process_evidence import ProcessEvidence, inspect_group_identity
@@ -28,7 +24,6 @@ from .runtime.ready import (
     read_ready_index_state,
     read_ready_index_status,
     ready_task_projection_issue,
-    repair_ready_index,
 )
 from .runtime.ready.group_members import (
     GROUP_MEMBER_PAGE_SIZE,
@@ -36,10 +31,9 @@ from .runtime.ready.group_members import (
     mark_group_ready_members_degraded,
     read_group_ready_members_state,
 )
-from .runtime.ready.group_members_rebuild import audit_group_ready_members, repair_group_ready_members
+from .runtime.ready.group_members_rebuild import audit_group_ready_members
 from .runtime.records import AttemptRecord, TaskRecord, normalize_group_record, utc_now
 from .runtime.store import atomic_replace, iter_json, read_json
-from .runtime.submission import reconcile_submission
 from .runtime.submission_control import (
     control_paths,
     inspect_submission_control,
@@ -564,170 +558,102 @@ def repair_metadata(
     *,
     reservation_runtime_root: Path | None = None,
     max_work_items: int = GROUP_MEMBER_PAGE_SIZE,
+    retry_intervention: bool = False,
 ) -> dict[str, Any]:
     if type(max_work_items) is not int or not 1 <= max_work_items <= GROUP_MEMBER_PAGE_SIZE:
         raise ValueError(f"max_work_items must be between 1 and {GROUP_MEMBER_PAGE_SIZE}.")
+    from .runtime.maintenance import CONTEXT_RESOLUTION_OPERATIONS, advance_full_audit, create_invocation_ledger
+
+    ledger = create_invocation_ledger(max_work_items)
     if reservation_runtime_root is None:
         from .agent.context import resolve_execution_context
 
-        context = resolve_execution_context(cfg)
-        cfg = context.local_cfg
-        reservation_runtime_root = context.reservation_root
-    repaired: list[str] = []
-    blocked: list[str] = []
-    initial_ready_state = read_ready_index_state(cfg)
-    initial_member_state = group_ready_members_state(cfg)
-    operations = shared_paths(cfg.shared_root)["submissions"]
-    for path in iter_json(operations):
-        operation = read_json(path)["submission"]
-        group_name = operation.get("target_group")
-        if not group_name:
-            continue
-        try:
-            state = reconcile_submission(cfg, operation["operation_id"], abort_incomplete=True)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            blocked.append(operation["operation_id"])
-        else:
-            if state in {"committed", "aborted"}:
-                repaired.append(operation["operation_id"])
-            else:
-                blocked.append(operation["operation_id"])
-    for result in reconcile_cleanup_operations(cfg, reservation_runtime_root=reservation_runtime_root):
-        if result["state"] == "completed":
-            repaired.append(result["operation_id"])
-        else:
-            blocked.append(result["operation_id"])
-    for result in reconcile_availability_operations(cfg):
-        repaired.append(result["operation_id"])
-    rebuilt_deadline_indexes = rebuild_deadline_indexes(cfg)
-    if rebuilt_deadline_indexes:
-        repaired.append(f"offer_deadline_indexes:{rebuilt_deadline_indexes}")
-    for control in reconcile_group_cancel_operations(cfg, reservation_runtime_root=reservation_runtime_root):
-        if control["state"] != "completed":
-            blocked.append(control["operation_id"])
-        elif control["operation_id"] not in repaired:
-            repaired.append(control["operation_id"])
-    orphan_result = repair_orphans(cfg, reservation_runtime_root=reservation_runtime_root)
-    repaired.extend(task_id for task_id in orphan_result["repaired"] if task_id not in repaired)
-    blocked.extend(item["task_id"] for item in orphan_result["blocked"] if item["task_id"] not in blocked)
-    if read_ready_index_state(cfg) == "active":
-        for ready_task_path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
-            issue = ready_task_projection_issue(cfg, ready_task_path.stem)
-            if issue is not None:
-                try:
-                    diagnostic = parse_ready_reason(issue).diagnostic
-                except ValueError:
-                    diagnostic = None
-                if diagnostic is not None:
-                    mark_ready_index_degraded(cfg, diagnostic)
-                break
-    prior_status = read_ready_index_status(cfg)
-    prior_degraded_reasons = list(prior_status.get("degraded_reasons", []))
-    try:
-        # An unreadable state file is itself a fail-closed repair boundary. It
-        # must not be replaced by a newly initialized build state.
-        if read_ready_index_state(cfg) == "degraded":
-            from .runtime.ready.state import read_state_record
-
-            read_state_record(cfg)
-        ready_record = repair_ready_index(cfg, max_tasks=READY_BUILD_PAGE_SIZE)
-        while ready_record.get("state") == "building":
-            time.sleep(0)
-            ready_record = repair_ready_index(cfg, max_tasks=READY_BUILD_PAGE_SIZE)
-    except (AttributeError, FileNotFoundError, KeyError, OSError, TypeError, ValueError, RuntimeError):
-        ready_record = prior_status
-        blocked.append("ready_index")
-    ready_build = ready_record.get("build") or {}
-    if ready_record.get("state") == "active" and initial_ready_state != "active":
-        repaired.append(f"ready_index:{ready_build.get('repaired', 0)}:{ready_build.get('stale_removed', 0)}")
-    elif ready_record.get("state") == "degraded":
-        blocked.append("ready_index")
-    with schema_lock(cfg.shared_root):
-        member_record = repair_group_ready_members(cfg, max_work_items=max_work_items)
-    if member_record.get("state") == "active" and initial_member_state != "active":
-        repaired.append("group_ready_members")
-    elif member_record.get("state") == "degraded":
-        blocked.append("group_ready_members")
-    message = "Submission, Group control, and ready-index operations reconciled."
-    audit = member_record.get("audit") if isinstance(member_record.get("audit"), dict) else {}
-    if member_record.get("state") == "building" or audit.get("state") == "building":
-        message = (
-            "Member projection repair slice completed; rerun 'qexp admin repair --project PATH' "
-            "while group_ready_members.state is building."
-        )
-    task_observation: dict[str, Any] = {
-        "state": "degraded",
-        "generation": None,
-        "dirty": True,
-        "revision": None,
-    }
-    try:
-        task_observation = inspect_observation(cfg)
-        if task_observation.get("state") != "building" and (
-            task_observation.get("state") == "degraded" or task_observation.get("dirty")
-        ):
-            task_observation = request_rebuild(cfg)
-            maintenance = ObservationMaintenance(cfg)
+        context_reservation = ledger.reserve_operations(maximum_operations=CONTEXT_RESOLUTION_OPERATIONS)
+        if context_reservation is not None:
             try:
-                task_observation = maintenance.advance()
+                context = resolve_execution_context(cfg)
+                cfg = context.local_cfg
+                reservation_runtime_root = context.reservation_root
             finally:
-                maintenance.close()
-    except (OSError, ValueError, RuntimeError):
-        blocked.append("task_observation")
-        task_observation = {**task_observation, "state": "degraded"}
-    submission_control = inspect_submission_control(cfg)
-    if submission_control["state"] == "unavailable":
-        try:
-            submission_control = request_control_rebuild(cfg)
-        except (OSError, ValueError, RuntimeError):
-            blocked.append("submission_control")
-        else:
-            if submission_control["state"] == "waiting":
-                blocked.append("submission_control")
-    rerun_required = bool(
-        blocked
-        or ready_record.get("state") == "building"
-        or member_record.get("state") == "building"
-        or audit.get("state") == "building"
-        or submission_control.get("state") == "waiting"
-        or task_observation.get("state") == "building"
+                context_reservation.commit(actual_operations=CONTEXT_RESOLUTION_OPERATIONS)
+
+    # A damaged Submission-control fence blocks all source-backed reads. Fail
+    # closed into a replayable build state before spending this explicit audit
+    # slice on unrelated project records; the outbox descriptor owns the build.
+    if inspect_submission_control(cfg).get("state") == "unavailable":
+        request_control_rebuild(cfg)
+
+    progress = advance_full_audit(
+        cfg,
+        reservation_runtime_root=reservation_runtime_root,
+        max_work_items=max_work_items,
+        ledger=ledger,
+        retry_intervention=retry_intervention,
     )
-    if blocked or rerun_required:
-        outcome = "blocked" if blocked else "partial"
-        next_action = "qexp admin repair --project " + shlex.quote(str(cfg.project_root))
+    repaired = list(progress["repaired"])
+    blocked = list(progress["blocked"])
+    complete = progress["complete"] is True
+    rerun_required = not complete or bool(blocked)
+    if blocked:
+        outcome = "blocked"
+    elif not complete:
+        outcome = "partial"
     elif repaired:
         outcome = "repaired"
-        next_action = None
     else:
         outcome = "no_change"
-        next_action = None
+    next_action = "qexp admin repair --project " + shlex.quote(str(cfg.project_root)) if rerun_required else None
+    if blocked and next_action is not None:
+        next_action += " --retry-intervention"
+    if outcome == "partial":
+        message = f"Full repair slice is incomplete; rerun {next_action!r} to continue."
+    elif outcome == "blocked":
+        message = "Full-project repair is blocked; inspect the intervention evidence before rerunning."
+    else:
+        message = "Full-project repair completed."
+    member_record = progress["group_ready_members"]
+    audit = member_record.get("audit") if isinstance(member_record.get("audit"), dict) else {}
+    member_record = {
+        **member_record,
+        "verification": {
+            "state": "building" if member_record.get("state") == "building" else audit.get("state", "degraded"),
+            "audit_id": audit.get("audit_id"),
+            "projection_id": member_record.get("projection_id"),
+            "phase": audit.get("phase"),
+            "processed": audit.get("processed", 0),
+        },
+    }
     return {
         "repaired": repaired,
         "blocked": blocked,
         "repaired_count": len(repaired),
         "blocked_count": len(blocked),
         "outcome": outcome,
+        "complete": complete,
+        "scope": progress["scope"],
+        "budget": progress["budget"],
+        "phase": progress["phase"],
+        "cursor": progress["cursor"],
+        "deferred_phases": progress["deferred_phases"],
+        "deferred_phase_count": progress["deferred_phase_count"],
+        "next_due_at": progress["next_due_at"],
+        "remaining_work": progress["remaining_work"],
+        "source_capture": progress["source_capture"],
+        "source_revision": progress["source_revision"],
+        "build_identity": progress["build_identity"],
+        "due_at": progress["due_at"],
+        "retry_count": progress["retry_count"],
+        "meaningful_progress_at": progress["meaningful_progress_at"],
+        "failure": progress["failure"],
         "rerun_required": rerun_required,
         "next_action": next_action,
-        "ready_index": {
-            "state": ready_record.get("state"),
-            "build": ready_build,
-            "degraded_reasons": read_ready_index_status(cfg).get("degraded_reasons", []),
-        },
-        "group_ready_members": {
-            **member_record,
-            "verification": {
-                "state": "building" if member_record.get("state") == "building" else audit.get("state", "degraded"),
-                "audit_id": audit.get("audit_id"),
-                "projection_id": member_record.get("projection_id"),
-                "phase": audit.get("phase"),
-                "processed": audit.get("processed", 0),
-            },
-        },
-        "prior_degraded_reasons": prior_degraded_reasons,
-        "task_observation": task_observation,
-        "submission_control": submission_control,
+        "ready_index": progress["ready_index"],
+        "group_ready_members": member_record,
+        "prior_degraded_reasons": progress["prior_degraded_reasons"],
+        "task_observation": progress["task_observation"],
+        "submission_control": progress["submission_control"],
         "message": message,
+        "intervention": progress["intervention"],
     }
 
 

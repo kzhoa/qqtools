@@ -624,6 +624,7 @@ def dispatch_project(
                 context.local_cfg,
                 reservation_runtime_root=context.reservation_root,
                 max_work_items=args.max_work_items,
+                retry_intervention=getattr(args, "retry_intervention", False),
             )
         )
         output_kind = OutputKind.DOCTOR_VERIFY if handler == "admin_check" else OutputKind.DOCTOR_REPAIR

@@ -16,6 +16,8 @@ from qqtools.plugins.qexp.doctor import repair_metadata
 from qqtools.plugins.qexp.project_maintenance import offer_due_tasks, reconcile_project_reservations
 from qqtools.plugins.qexp.runner import run_attempt
 from qqtools.plugins.qexp.runtime.attempt_recovery import recover_running_attempt
+from qqtools.plugins.qexp.runtime.maintenance import advance_maintenance_work
+from qqtools.plugins.qexp.runtime.maintenance_outbox import read_work
 from qqtools.plugins.qexp.runtime.operation_store import active_operation_path, write_active_operation
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
@@ -39,6 +41,30 @@ pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _existing_group(cfg) -> None:
     create_group(cfg, "exp")
+
+
+def _finish_full_repair(cfg, *, reservation_runtime_root=None, limit: int = 256):
+    repaired: list[str] = []
+    blocked: list[str] = []
+    for _ in range(limit):
+        result = repair_metadata(cfg, reservation_runtime_root=reservation_runtime_root)
+        repaired.extend(result["repaired"])
+        blocked.extend(result["blocked"])
+        if result["complete"] or result["outcome"] == "blocked":
+            return {**result, "repaired": repaired, "blocked": blocked}
+    pytest.fail(f"full repair did not finish in {limit} bounded slices")
+
+
+def _repair_until(cfg, predicate, *, reservation_runtime_root=None, limit: int = 256):
+    repaired: list[str] = []
+    blocked: list[str] = []
+    for _ in range(limit):
+        result = repair_metadata(cfg, reservation_runtime_root=reservation_runtime_root)
+        repaired.extend(result["repaired"])
+        blocked.extend(result["blocked"])
+        if predicate():
+            return {**result, "repaired": repaired, "blocked": blocked}
+    pytest.fail(f"repair predicate was not reached in {limit} bounded slices")
 
 
 class RecordingExecutor:
@@ -446,6 +472,60 @@ def test_recovery_cas_issues_new_fencing_token(tmp_path: Path):
     assert recovered.result["reason"] is None
     reconcile_project_reservations(cfg)
     assert reserved_gpu_ids(cfg.runtime_root) == {0}
+
+
+def test_resident_waits_for_complete_orphan_handoff(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    for _ in range(32):
+        drained = advance_maintenance_work(cfg, reservation_runtime_root=cfg.runtime_root)
+        if drained["maintenance_state"] in {"idle", "waiting"}:
+            break
+    target = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    replace = scheduler_module.atomic_replace
+
+    def interrupt_after_attempt(path, value):
+        replace(path, value)
+        if path == target and value["attempt"]["phase"] == "orphaned":
+            raise OSError("after orphan Attempt before Task handoff")
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(scheduler_module, "atomic_replace", interrupt_after_attempt)
+        with pytest.raises(OSError, match="before Task handoff"):
+            expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+
+    generation = f"fencing-{attempt.current_fencing_token}"
+    prepared = read_work(
+        cfg,
+        kind="orphan_recovery",
+        target_id=attempt.attempt_id,
+        work_generation=generation,
+    )
+    assert prepared is not None and prepared["state"] == "prepared"
+    result = advance_maintenance_work(cfg, reservation_runtime_root=cfg.runtime_root)
+    assert result["maintenance_state"] == "waiting"
+    still_prepared = read_work(
+        cfg,
+        kind="orphan_recovery",
+        target_id=attempt.attempt_id,
+        work_generation=generation,
+    )
+    assert still_prepared is not None and still_prepared["state"] == "prepared"
+    interrupted_task = load_task(cfg, task.task_id)
+    assert interrupted_task.state["projection"] == "running"
+    assert interrupted_task.claim_control["active_claim"] is not None
+
+    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    activated = read_work(
+        cfg,
+        kind="orphan_recovery",
+        target_id=attempt.attempt_id,
+        work_generation=generation,
+    )
+    assert activated is not None and activated["state"] == "pending"
 
 
 def test_blocked_orphan_with_missing_process_finalizes_and_releases_gpu(tmp_path: Path, monkeypatch):
@@ -976,7 +1056,10 @@ def test_doctor_restores_terminating_group_cancel_intent(tmp_path: Path):
     operation_data = read_json(operation_path)
     operation_data["group_control"]["state"] = "converging"
     atomic_replace(operation_path, operation_data)
-    repair_metadata(cfg)
+    _repair_until(
+        cfg,
+        lambda: load_task(cfg, task.task_id).control.get("cancellation_operation_id") == operation["operation_id"],
+    )
     repaired = load_task(cfg, task.task_id)
     assert repaired.control["terminate_running"] is True
     assert repaired.control["cancellation_operation_id"] == operation["operation_id"]
@@ -1111,7 +1194,14 @@ def test_group_cancel_replays_after_crash_before_first_task(
         atomic_replace(operation_path, read_json(active))
         active.unlink()
         assert not operation_path.is_symlink()
-        repair_result = repair_metadata(cfg, reservation_runtime_root=reservation_root)
+        if phase == "authorized" and terminate_running:
+            repair_result = _repair_until(
+                cfg,
+                lambda: read_json(operation_path)["group_control"]["state"] == "waiting_ack",
+                reservation_runtime_root=reservation_root,
+            )
+        else:
+            repair_result = _finish_full_repair(cfg, reservation_runtime_root=reservation_root)
     else:
         reconcile_group_cancel_operations(cfg)
 
@@ -1326,7 +1416,6 @@ def test_worker_remove_replays_when_final_group_publication_fails(tmp_path, monk
 
 def test_group_replay_maintenance_uses_explicit_reservation_backend(tmp_path, monkeypatch):
     from qqtools.plugins.qexp.commands import group as group_commands
-    from qqtools.plugins.qexp.project_maintenance import maintain_project
 
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
@@ -1348,7 +1437,10 @@ def test_group_replay_maintenance_uses_explicit_reservation_backend(tmp_path, mo
         with pytest.raises(OSError, match="before member cancellation"):
             group_control(cfg, "exp", "cancel", reservation_runtime_root=root)
 
-    maintain_project(cfg, reservation_runtime_root=root, project_id=project_id, should_reconcile_reservations=False)
+    for _ in range(64):
+        advance_maintenance_work(cfg, reservation_runtime_root=root)
+        if load_task(cfg, task.task_id).state["projection"] == "cancelled":
+            break
 
     assert load_task(cfg, task.task_id).state["projection"] == "cancelled"
     assert not reserved_gpu_ids(root)

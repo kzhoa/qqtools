@@ -231,9 +231,19 @@ def request_control_rebuild(cfg: RootConfig) -> dict[str, Any]:
     with exclusive(paths["locks"] / "maintenance.lock", blocking=False) as acquired:
         if not acquired:
             return {"state": "waiting", "reason": "maintenance_busy"}
+        from .maintenance_outbox import activate_work, prepare_target_work
+
+        descriptor = prepare_target_work(
+            cfg,
+            kind="submission_control",
+            target_id="project",
+            phase="rebuild",
+        )
         write_control_state(
             cfg, {"version": CONTROL_VERSION, "root": str(_root(cfg)), "state": "building", "cursor": None}
         )
+        if descriptor["state"] == "prepared":
+            activate_work(cfg, descriptor)
     return {"state": "building", "reason": "rebuild_requested"}
 
 
@@ -241,10 +251,29 @@ def _create_control_state_if_absent(cfg: RootConfig, state: str) -> None:
     value = {"version": CONTROL_VERSION, "root": str(_root(cfg)), "state": state, "cursor": None}
     _require_size(value, CONTROL_RECORD_LIMIT, "Submission-control state")
     paths = _ensure_control_directories(cfg)
+    descriptor = None
+    if state == "building":
+        try:
+            current = read_control_state(cfg)
+        except SubmissionControlUnavailable:
+            current = None
+        if current is None or current["state"] == "building":
+            from .maintenance_outbox import prepare_target_work
+
+            descriptor = prepare_target_work(
+                cfg,
+                kind="submission_control",
+                target_id="project",
+                phase="bootstrap",
+            )
     try:
         create_if_absent(paths["state"], value)
     except CASConflict:
         pass
+    if descriptor is not None and descriptor["state"] == "prepared":
+        from .maintenance_outbox import activate_work
+
+        activate_work(cfg, descriptor)
 
 
 def initialize_empty(cfg: RootConfig) -> None:
@@ -393,7 +422,18 @@ def request_repair(cfg: RootConfig, operation_id: str) -> bool:
                 return False
             _source_lstat(source)
             _ensure_control_directories(cfg)
+            from .maintenance_outbox import activate_work, prepare_target_work
+
+            descriptor = prepare_target_work(
+                cfg,
+                kind="submission_control",
+                target_id="project",
+                phase="receipt_repair",
+                cursor={"operation_id": operation_id},
+            )
             _ensure_pending(cfg, operation_id, atomic_replace)
+            if descriptor["state"] == "prepared":
+                activate_work(cfg, descriptor)
             return True
     except SubmissionControlUnavailable:
         raise

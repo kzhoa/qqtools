@@ -1,4 +1,73 @@
-next_id = 18
+next_id = 21
+
+[[items]]
+id = "QQTOOLS-COMPAT-0020"
+component = "qexp.maintenance-outbox-v1"
+kind = "runtime_protocol"
+status = "compatibility_active"
+summary = "Introduce operation-backed maintenance descriptors and migrate deadline discovery from lexical filename checkpoints to bounded directory cursors."
+introduced_in = "1.4.0"
+legacy_removed_in = "1.5.0"
+transition_purged_in = "1.6.0"
+marker = "QQTOOLS-COMPAT-0020"
+owner = "qexp.runtime.maintenance_outbox"
+verification = ["tests/integration/qexp/test_resumable_index_maintenance.py", "tests/integration/qexp/test_availability_transitions.py"]
+normal_level = "L1"
+recovery_level = "L1"
+source_versions = ["1.3.23", "1.4.0-stage2"]
+target_version = "1.4.0"
+mixed_version_range = ["1.3.23-1.4.x"]
+normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
+machine_status_command = "qexp agent status"
+recovery_command = "qexp admin repair --project PATH --format json"
+workload_continuity = true
+interruption_budget_seconds = 1.0
+
+[[items]]
+id = "QQTOOLS-COMPAT-0019"
+component = "qexp.full-audit-descriptor-v2"
+kind = "persisted_schema"
+status = "compatibility_active"
+summary = "Migrate Stage 1 full-audit descriptors to capture-bound schema v2 and fail closed when historical capture identity is unknown."
+introduced_in = "1.4.0"
+legacy_removed_in = "1.5.0"
+transition_purged_in = "1.6.0"
+marker = "QQTOOLS-COMPAT-0019"
+owner = "qexp.runtime.maintenance"
+verification = ["tests/integration/qexp/test_resumable_index_maintenance.py"]
+normal_level = "L1"
+recovery_level = "L1"
+source_versions = ["1.4.0-stage1"]
+target_version = "1.4.0"
+mixed_version_range = ["1.4.0-stage1-1.4.x"]
+normal_commands = ["qexp admin repair --project PATH --retry-intervention"]
+machine_status_command = "qexp admin repair --project PATH --format json"
+recovery_command = "qexp admin repair --project PATH --retry-intervention"
+workload_continuity = true
+interruption_budget_seconds = 1.0
+
+[[items]]
+id = "QQTOOLS-COMPAT-0018"
+component = "qexp.resumable-maintenance-descriptors"
+kind = "runtime_protocol"
+status = "compatibility_active"
+summary = "Roll out durable resumable maintenance descriptors while older agents retain their established active-operation recovery paths."
+introduced_in = "1.4.0"
+legacy_removed_in = "1.5.0"
+transition_purged_in = "1.6.0"
+marker = "QQTOOLS-COMPAT-0018"
+owner = "qexp.runtime.maintenance"
+verification = ["tests/integration/qexp/test_resumable_index_maintenance.py"]
+normal_level = "L1"
+recovery_level = "L1"
+source_versions = ["1.3.23"]
+target_version = "1.4.0"
+mixed_version_range = ["1.3.23-1.4.x"]
+normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
+machine_status_command = "qexp agent status"
+recovery_command = "qexp admin repair --format json"
+workload_continuity = true
+interruption_budget_seconds = 1.0
 
 [[items]]
 id = "QQTOOLS-COMPAT-0017"

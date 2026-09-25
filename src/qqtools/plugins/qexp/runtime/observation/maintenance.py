@@ -384,10 +384,20 @@ class ObservationMaintenance:
                     return {"state": "waiting", "reason": "reclaiming_observation_generation"}
                 new_state = projection.new_state(self._cfg, state="building")
                 _initialize_generation(self._cfg, new_state)
+                from ..maintenance_outbox import activate_work, prepare_target_work
+
+                descriptor = prepare_target_work(
+                    self._cfg,
+                    kind="task_observation",
+                    target_id="project",
+                    phase="generation_build",
+                    cursor={"projection_generation": new_state["generation"]},
+                )
                 projection.write_state(self._cfg, new_state)
                 if OBSERVATION_CAPABILITY not in capabilities:
                     value["schema"]["required_capabilities"] = [*capabilities, OBSERVATION_CAPABILITY]
                     atomic_replace(_schema_path(self._cfg), value)
+                activate_work(self._cfg, descriptor)
                 return {"state": "building", "reason": "observation_initialized"}
 
     def _finish_pending_gate(self, state: dict[str, Any]) -> dict[str, Any] | None:
@@ -594,9 +604,19 @@ def request_rebuild(cfg: RootConfig) -> dict[str, Any]:
                 state = projection.new_state(cfg, state="degraded")
             if state is None:
                 return {"state": "waiting", "reason": "observation_activation_deferred"}
+            from ..maintenance_outbox import activate_work, prepare_target_work
+
+            descriptor = prepare_target_work(
+                cfg,
+                kind="task_observation",
+                target_id="project",
+                phase="rebuild_request",
+                cursor={"projection_generation": state["generation"]},
+            )
             with project_activation_transaction(cfg, "observation_rebuild_request"):
                 updated = _revisioned(state, state="degraded", dirty=True, build=None)
                 projection.write_state(cfg, updated)
+            activate_work(cfg, descriptor)
             return {"state": "degraded", "reason": "rebuild_requested", "revision": updated["revision"]}
 
 
@@ -637,7 +657,7 @@ class MachineObservationWorker:
         try:
             while not self._stop.is_set():
                 try:
-                    revision, bindings = self._runtime.load_registry_snapshot()
+                    revision, bindings = self._runtime.load_registry()
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     if self._stop.wait(_WORKER_WAIT_SECONDS):
                         break

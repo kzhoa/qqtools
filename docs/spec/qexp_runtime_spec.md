@@ -2893,6 +2893,14 @@ strict verify exits non-zero for that state. Damage first commits `degraded` in 
 slice. The following repair invocation prepares and resumes one rebuild; it never combines a
 failed audit and rebuild slice.
 
+The end-to-end Project repair and descriptor protocol is specified in
+[qexp resumable maintenance](qexp_maintenance.md). Its invocation ledger wraps
+these projection-local bounds: setup, every repair phase, nested source records,
+and finalization share one semantic-item, operation, byte, and elapsed-time
+budget. Projection-local limits cannot each receive the original command limit.
+The persisted full-audit phase rotation prevents repeated slices from restarting
+the first phase and starving later projections.
+
 Repair parks `groups/` atomically beneath `replaced-groups/<build-id>/` after a durable prepared
 record, creates an empty replacement, fsyncs the fixed parent directories, and then publishes
 `building` with the already selected next projection identity. It does not enumerate or recursively

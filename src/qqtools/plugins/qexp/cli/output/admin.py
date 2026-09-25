@@ -165,6 +165,37 @@ def _render_schema6(result: Mapping[str, Any], _presentation: Mapping[str, objec
 
 
 def _render_doctor(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    if "repaired" in result or "blocked" in result:
+        scope = result.get("scope", {})
+        budget = result.get("budget", {})
+        return _details(
+            (
+                ("Outcome", result.get("outcome")),
+                ("Complete", result.get("complete")),
+                ("Scope", scope.get("kind") if isinstance(scope, Mapping) else None),
+                ("Capture ID", scope.get("capture_id") if isinstance(scope, Mapping) else None),
+                ("Work generation", scope.get("work_generation") if isinstance(scope, Mapping) else None),
+                ("Phase", result.get("phase")),
+                ("Cursor", result.get("cursor")),
+                ("Semantic items", budget.get("semantic_items_consumed") if isinstance(budget, Mapping) else None),
+                ("Operations", budget.get("operations_consumed") if isinstance(budget, Mapping) else None),
+                ("Elapsed ms", budget.get("elapsed_ms") if isinstance(budget, Mapping) else None),
+                (
+                    "Semantic items remaining",
+                    budget.get("semantic_items_remaining") if isinstance(budget, Mapping) else None,
+                ),
+                ("Operations remaining", budget.get("operations_remaining") if isinstance(budget, Mapping) else None),
+                ("Exhaustion reason", budget.get("exhaustion_reason") if isinstance(budget, Mapping) else None),
+                ("Deferred phases", result.get("deferred_phases")),
+                ("Deferred phase count", result.get("deferred_phase_count")),
+                ("Remaining work", result.get("remaining_work")),
+                ("Repaired", result.get("repaired_count", len(result.get("repaired", ())))),
+                ("Blocked", result.get("blocked_count", len(result.get("blocked", ())))),
+                ("Rerun required", result.get("rerun_required")),
+                ("Next action", result.get("next_action")),
+                ("Message", result.get("message")),
+            )
+        )
     if "healthy" in result or "complete" in result:
         issues = result.get("issues", ())
         issue_rows = []
@@ -196,17 +227,6 @@ def _render_doctor(result: Mapping[str, Any], _presentation: Mapping[str, object
             (
                 summary,
                 _table(("Severity", "Issue", "Path", "Message"), issue_rows, empty_message="No issues."),
-            )
-        )
-    if "repaired" in result or "blocked" in result:
-        return _details(
-            (
-                ("Outcome", result.get("outcome")),
-                ("Repaired", result.get("repaired_count", len(result.get("repaired", ())))),
-                ("Blocked", result.get("blocked_count", len(result.get("blocked", ())))),
-                ("Rerun required", result.get("rerun_required")),
-                ("Next action", result.get("next_action")),
-                ("Message", result.get("message")),
             )
         )
     return _render_named_operation(result, "doctor")
@@ -341,10 +361,63 @@ def _validate_doctor_verify(result: Any) -> None:
 
 def _validate_doctor_repair(result: Any) -> None:
     value = _mapping(result, "doctor-repair payload")
-    for key in ("repaired", "blocked", "message"):
+    # Older in-process callers may still construct the pre-resumable payload.
+    # The CLI producer always emits the additive contract below.
+    if "complete" not in value:
+        for key in ("repaired", "blocked", "message"):
+            _required(value, key, "doctor-repair payload")
+        _sequence(value["repaired"], "doctor-repair payload.repaired")
+        _sequence(value["blocked"], "doctor-repair payload.blocked")
+        return
+    for key in (
+        "repaired",
+        "blocked",
+        "message",
+        "complete",
+        "scope",
+        "budget",
+        "phase",
+        "cursor",
+        "deferred_phases",
+        "deferred_phase_count",
+        "next_due_at",
+        "remaining_work",
+    ):
         _required(value, key, "doctor-repair payload")
     _sequence(value["repaired"], "doctor-repair payload.repaired")
     _sequence(value["blocked"], "doctor-repair payload.blocked")
+    _required_bool(value, "complete", "doctor-repair payload")
+    scope = _required_mapping(value, "scope", "doctor-repair payload")
+    for key in ("kind", "capture_id", "work_generation"):
+        _required(scope, key, "doctor-repair payload.scope")
+    if scope["kind"] != "full_audit":
+        raise ValueError("doctor-repair payload.scope.kind must be 'full_audit'")
+    for key in ("capture_id", "work_generation"):
+        if scope[key] is not None and (not isinstance(scope[key], str) or not scope[key]):
+            raise TypeError(f"doctor-repair payload.scope.{key} must be a non-empty string or null")
+    budget = _required_mapping(value, "budget", "doctor-repair payload")
+    for key in (
+        "semantic_items_consumed",
+        "operations_consumed",
+        "elapsed_ms",
+        "semantic_items_remaining",
+        "operations_remaining",
+    ):
+        _required_int(budget, key, "doctor-repair payload.budget")
+    exhaustion_reason = _required(budget, "exhaustion_reason", "doctor-repair payload.budget")
+    if exhaustion_reason not in {None, "semantic_items", "operations", "deadline"}:
+        raise ValueError("doctor-repair payload.budget.exhaustion_reason is invalid")
+    if not isinstance(value["phase"], str) or not value["phase"]:
+        raise TypeError("doctor-repair payload.phase must be a non-empty string")
+    _required_mapping(value, "cursor", "doctor-repair payload")
+    deferred = _required_sequence(value, "deferred_phases", "doctor-repair payload")
+    if not all(isinstance(phase, str) and phase for phase in deferred):
+        raise TypeError("doctor-repair payload.deferred_phases must contain non-empty strings")
+    deferred_count = _required_int(value, "deferred_phase_count", "doctor-repair payload")
+    if deferred_count < len(deferred):
+        raise ValueError("doctor-repair payload.deferred_phase_count is smaller than its detail list")
+    if value["next_due_at"] is not None and not isinstance(value["next_due_at"], str):
+        raise TypeError("doctor-repair payload.next_due_at must be a string or null")
 
 
 def _validate_clean(result: Any) -> None:

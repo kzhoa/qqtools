@@ -60,7 +60,9 @@ def test_binding_retires_only_after_every_lane_acks_one_checkpoint(tmp_path: Pat
 
     scheduler = working_set.begin_turn(binding, "scheduler")
     authority = working_set.begin_turn(binding, "authority")
-    remaining = [working_set.begin_turn(binding, lane) for lane in ("group", "observation", "submission")]
+    remaining = [
+        working_set.begin_turn(binding, lane) for lane in SERVICE_LANES if lane not in {"scheduler", "authority"}
+    ]
     assert working_set.acknowledge(scheduler, quiescent=True)
     assert working_set.acknowledge(authority, quiescent=True)
     assert working_set.resident_bindings([binding]) == [binding]

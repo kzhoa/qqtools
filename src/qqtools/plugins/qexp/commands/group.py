@@ -15,6 +15,7 @@ from ..lifecycle import (
     dispatch_task_lifecycle_hooks_noexcept,
 )
 from ..runtime.claims import archive_claim
+from ..runtime.directory_capture import read_directory_entry
 from ..runtime.group_discovery.changes import record_task_change
 from ..runtime.group_namespace import has_group_authority_cutover, is_group_authority_isolated, read_group
 from ..runtime.locks import group_writer_lock, task_lock
@@ -22,6 +23,7 @@ from ..runtime.operation_store import (
     active_operation_path,
     archive_operation,
     iter_active_operation_paths,
+    locate_operation_path,
     write_active_operation,
 )
 from ..runtime.paths import attempt_path, group_path, shared_paths, submission_path
@@ -324,10 +326,17 @@ def reconcile_group_cancel_operations(
     *,
     include_legacy: bool = True,
     reservation_runtime_root: Path | None = None,
+    limit: int = 64,
+    bounded_only: bool = False,
+    cursor: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Replay unfinished Group control effects and reconcile their status."""
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("limit must be a positive integer.")
     reconciled: list[dict[str, Any]] = []
-    for operation_path in iter_active_operation_paths(cfg, "group_control", include_legacy=include_legacy):
+    for operation_path in iter_active_operation_paths(
+        cfg, "group_control", limit=limit, include_legacy=include_legacy, cursor=cursor
+    ):
         operation = read_json(operation_path)
         control = operation.get("group_control", {})
         operation_type = control.get("operation_type")
@@ -357,6 +366,15 @@ def reconcile_group_cancel_operations(
             result = advance_indexed_cancel(cfg, operation_path, reservation_runtime_root=reservation_runtime_root)
             if result is not None:
                 reconciled.append(result)
+            continue
+        if bounded_only:
+            reconciled.append(
+                {
+                    **control,
+                    "state": "blocked",
+                    "blocked_reason": "group_cancel_requires_indexed_reconstruction",
+                }
+            )
             continue
         post_commit_results = []
         with group_writer_lock(cfg, name):
@@ -485,6 +503,278 @@ def reconcile_group_cancel_operations(
             reconciled.append(control)
         _dispatch_group_terminal_results(cfg, post_commit_results, reservation_runtime_root)
     return reconciled
+
+
+def advance_legacy_cancel_step(
+    cfg: RootConfig,
+    operation_id: str,
+    cursor: dict[str, Any],
+    *,
+    reservation_runtime_root: Path | None = None,
+) -> dict[str, Any]:
+    """Advance one legacy Group-cancel Task or its final completion proof.
+
+    The caller persists ``cursor`` in the shared full-audit descriptor.  This
+    path exists only before Group authority isolation; it uses the established
+    Group-then-Task lock order and never materializes the Task directory.
+    """
+    operation_path = locate_operation_path(cfg, "group_control", operation_id)
+    if not operation_path.exists():
+        return {"state": "intervention", "operation_id": operation_id, "reason": "group_cancel_operation_missing"}
+    operation = read_json(operation_path)
+    control = operation.get("group_control")
+    if not isinstance(control, dict) or control.get("operation_id") != operation_id:
+        return {"state": "intervention", "reason": "group_cancel_operation_identity_mismatch"}
+    if control.get("operation_type") != "cancel":
+        return {"state": "completed", "operation_id": operation_id, "cursor": {}}
+    state = control.get("state")
+    if state == "completed":
+        return {"state": "completed", "operation_id": operation_id, "cursor": {}}
+    if state == "blocked":
+        return {
+            "state": "intervention",
+            "reason": control.get("blocked_reason") or "group_cancel_blocked",
+        }
+    if state not in {"preparing", "converging", "waiting_ack"}:
+        return {"state": "intervention", "reason": "group_cancel_operation_state_unknown"}
+
+    name = control.get("group_name")
+    high_watermark = control.get("membership_high_watermark")
+    terminate_running = control.get("terminate_running")
+    if (
+        not isinstance(name, str)
+        or type(high_watermark) is not int
+        or high_watermark < 0
+        or type(terminate_running) is not bool
+    ):
+        return {"state": "intervention", "reason": "group_cancel_control_invalid"}
+
+    child = dict(cursor) if isinstance(cursor, dict) else {}
+    durable_child = control.get("maintenance_cursor")
+    if isinstance(durable_child, dict) and durable_child.get("operation_id") == operation_id:
+        # Operation truth is committed in the same write as each Task effect's
+        # replay evidence. It therefore wins over a descriptor checkpoint that
+        # may have been interrupted after the operation commit.
+        child = dict(durable_child)
+    if child.get("operation_id") != operation_id:
+        child = {
+            "operation_id": operation_id,
+            "task_offset": 0,
+            "scan_complete": False,
+            "progress": {
+                "target_tasks": 0,
+                "already_terminal": 0,
+                "queued_cancelled": 0,
+                "prelaunch_cancelled": 0,
+                "running_allowed": 0,
+                "termination_pending": 0,
+                "termination_acknowledged": 0,
+                "blocked": 0,
+            },
+            "pending_machine_acknowledgements": {},
+        }
+    offset = child.get("task_offset")
+    if type(offset) is not int or offset < 0:
+        return {"state": "intervention", "reason": "group_cancel_child_cursor_invalid"}
+    progress = child.get("progress")
+    pending = child.get("pending_machine_acknowledgements")
+    if (
+        not isinstance(progress, dict)
+        or any(
+            type(progress.get(key)) is not int or progress[key] < 0
+            for key in (
+                "target_tasks",
+                "already_terminal",
+                "queued_cancelled",
+                "prelaunch_cancelled",
+                "running_allowed",
+                "termination_pending",
+                "termination_acknowledged",
+                "blocked",
+            )
+        )
+        or not isinstance(pending, dict)
+        or any(
+            not isinstance(machine, str)
+            or not isinstance(task_ids, list)
+            or any(not isinstance(task_id, str) for task_id in task_ids)
+            for machine, task_ids in pending.items()
+        )
+    ):
+        return {"state": "intervention", "reason": "group_cancel_child_progress_invalid"}
+
+    from .group_cancel import _has_exact_barrier, _update_group_snapshot
+
+    post_commit_results: list[TerminalCommitResult] = []
+    result: dict[str, Any]
+    with group_writer_lock(cfg, name, blocking=False) as has_group_lock:
+        if not has_group_lock:
+            return {"state": "waiting", "reason": "group_lock_busy", "cursor": child}
+        if not operation_path.exists():
+            return {"state": "completed", "operation_id": operation_id, "cursor": {}}
+        operation = read_json(operation_path)
+        control = operation.get("group_control", {})
+        if control.get("operation_id") != operation_id or control.get("group_name") != name:
+            return {"state": "intervention", "reason": "group_cancel_operation_identity_mismatch"}
+        latest_child = control.get("maintenance_cursor")
+        if (
+            isinstance(latest_child, dict)
+            and latest_child.get("operation_id") == operation_id
+            and latest_child != child
+        ):
+            # Another reconciler committed newer replay evidence after our
+            # optimistic read. Yield that evidence instead of overwriting it.
+            return {"state": "running", "cursor": dict(latest_child)}
+        group_file = group_path(cfg.shared_root, name)
+        if not group_file.exists():
+            return {"state": "intervention", "reason": "group_cancel_group_missing"}
+        group_data = read_json(group_file)
+        normalize_group_record(group_data)
+        if not _has_exact_barrier(group_data, operation_id, high_watermark, terminate_running):
+            return {"state": "intervention", "reason": "group_cancel_barrier_mismatch"}
+
+        task_dir = shared_paths(cfg.shared_root)["tasks"]
+        ack_step = child.get("scan_complete") and bool(pending)
+        if ack_step:
+            machine = sorted(pending)[0]
+            task_ids = pending[machine]
+            if not task_ids:
+                pending.pop(machine, None)
+                entry_name, next_offset = "", offset
+                result = {"state": "running", "cursor": child}
+            else:
+                task_id = task_ids[0]
+                with task_lock(cfg.shared_root, task_id, blocking=False) as has_task_lock:
+                    if not has_task_lock:
+                        result = {"state": "waiting", "reason": "task_lock_busy", "cursor": child}
+                        entry_name, next_offset = "", offset
+                    else:
+                        try:
+                            task = load_task(cfg, task_id)
+                        except FileNotFoundError:
+                            task = None
+                        if (
+                            task is None
+                            or task.control.get("termination_acknowledged_at")
+                            or task.state["projection"] in {"succeeded", "failed", "cancelled"}
+                        ):
+                            pending[machine] = task_ids[1:]
+                            if not pending[machine]:
+                                pending.pop(machine, None)
+                            if task is not None and task.control.get("termination_acknowledged_at"):
+                                child["progress"]["termination_acknowledged"] += 1
+                            else:
+                                child["progress"]["already_terminal"] += 1
+                            entry_name, next_offset = "", offset
+                            result = {"state": "running", "cursor": child}
+                        else:
+                            result = {
+                                "state": "waiting",
+                                "reason": "termination_acknowledgement_pending",
+                                "cursor": child,
+                            }
+                            entry_name, next_offset = "", offset
+        else:
+            entry_name, next_offset = (
+                (None, offset) if child.get("scan_complete") else read_directory_entry(task_dir, offset)
+            )
+        if ack_step:
+            pass
+        elif entry_name is None:
+            child["scan_complete"] = True
+            progress = child["progress"]
+            control["progress"] = {
+                **(control.get("progress") if isinstance(control.get("progress"), dict) else {}),
+                **progress,
+            }
+            control["pending_machine_acknowledgements"] = pending
+            if progress["blocked"]:
+                control.update(
+                    {"state": "blocked", "completed_at": None, "blocked_reason": "orphaned_tasks_require_resolution"}
+                )
+                result = {"state": "intervention", "reason": "orphaned_tasks_require_resolution"}
+            elif pending:
+                control.update({"state": "waiting_ack", "completed_at": None, "blocked_reason": None})
+                result = {"state": "waiting", "reason": "termination_acknowledgement_pending", "cursor": child}
+            else:
+                control.update(
+                    {
+                        "state": "completed",
+                        "completed_at": control.get("completed_at") or utc_now(),
+                        "blocked_reason": None,
+                    }
+                )
+                result = {"state": "completed", "operation_id": operation_id, "cursor": {}}
+        else:
+            child["task_offset"] = next_offset
+            progress = child["progress"]
+            if entry_name.endswith(".json"):
+                task_id = Path(entry_name).stem
+                with task_lock(cfg.shared_root, task_id, blocking=False) as has_task_lock:
+                    if not has_task_lock:
+                        child["task_offset"] = offset
+                        result = {"state": "waiting", "reason": "task_lock_busy", "cursor": child}
+                    else:
+                        try:
+                            task = load_task(cfg, task_id)
+                        except FileNotFoundError:
+                            task = None
+                        if (
+                            task is not None
+                            and task.group_name == name
+                            and (task.group_membership_sequence or 0) <= high_watermark
+                        ):
+                            progress = child["progress"]
+                            progress["target_tasks"] += 1
+                            if task.control.get("cancellation_operation_id") == operation_id:
+                                reason = task.state.get("reason")
+                                if task.state["projection"] == "cancelled" and reason == "group_cancelled":
+                                    progress_key, terminal = "queued_cancelled", None
+                                elif (
+                                    task.state["projection"] == "cancelled"
+                                    and reason == "group_cancelled_before_launch"
+                                ):
+                                    progress_key, terminal = "prelaunch_cancelled", None
+                                elif task.state["projection"] == "running":
+                                    progress_key = "termination_pending" if terminate_running else "running_allowed"
+                                    terminal = None
+                                else:
+                                    progress_key, terminal = "already_terminal", None
+                            else:
+                                progress_key, terminal = _apply_group_cancel_locked(cfg, task, control)
+                            if terminal is not None:
+                                post_commit_results.append(terminal)
+                            if progress_key == "termination_pending":
+                                claim = task.claim_control.get("active_claim") or {}
+                                if task.control.get("termination_acknowledged_at"):
+                                    progress["termination_acknowledged"] += 1
+                                else:
+                                    machine = claim.get("machine_name") or task.placement_policy["home_machine"]
+                                    pending.setdefault(machine, [])
+                                    if task_id not in pending[machine]:
+                                        pending[machine].append(task_id)
+                            elif progress_key in progress and progress_key != "target_tasks":
+                                progress[progress_key] += 1
+                        result = {"state": "running", "cursor": child}
+            else:
+                result = {"state": "running", "cursor": child}
+
+        control["progress"] = {
+            **(control.get("progress") if isinstance(control.get("progress"), dict) else {}),
+            **child["progress"],
+            "termination_pending": sum(len(values) for values in pending.values()),
+        }
+        control["pending_machine_acknowledgements"] = pending
+        control["maintenance_cursor"] = {} if result.get("state") == "completed" else child
+        control["updated_at"] = utc_now()
+        operation.setdefault("meta", {})["revision"] = int(operation.get("meta", {}).get("revision", 0)) + 1
+        operation["meta"]["updated_at"] = control["updated_at"]
+        atomic_replace(operation_path, operation)
+        _update_group_snapshot(cfg, group_data, control, group_file)
+        if control.get("state") == "completed":
+            archive_operation(cfg, "group_control", operation_id, operation)
+    _dispatch_group_terminal_results(cfg, post_commit_results, reservation_runtime_root)
+    return result
 
 
 def _reconcile_worker_remove_operation(
