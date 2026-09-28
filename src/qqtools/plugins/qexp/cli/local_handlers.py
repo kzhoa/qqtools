@@ -420,7 +420,10 @@ def dispatch_local(
             raise CliUsageError(str(exc)) from exc
         except (SetupOperationalError, MachineRuntimeUninitializedError) as exc:
             raise CliOperationalError(str(exc)) from exc
-        return CommandOutcome(0, CliOutput(OutputKind.PROJECT_OPERATION, result))
+        exit_code = 0
+        if handler in {"project_enable", "project_disable"} and result.get("status") != "committed":
+            exit_code = 1
+        return CommandOutcome(exit_code, CliOutput(OutputKind.PROJECT_OPERATION, result))
     if handler in {"config_show", "config_set", "config_reset"} and getattr(args, "section", None) == "agent":
         runtime = MachineRuntime(args.machine_runtime_root)
         if handler == "config_show":
@@ -484,7 +487,15 @@ def dispatch_local(
         try:
             snapshot = capture_readiness_snapshot(runtime)
             _registry_revision, current_bindings = runtime.load_registry()
-        except (MachineAgentStartBlockedError, MachineRuntimeUninitializedError) as exc:
+        except (
+            MachineAgentStartBlockedError,
+            MachineRuntimeUninitializedError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            KeyError,
+            TypeError,
+        ) as exc:
             raise CliOperationalError(str(exc)) from exc
         registered_ids = {binding.project_id for binding in current_bindings if binding.enabled}
         if not snapshot["project_ids"] or not registered_ids.intersection(snapshot["project_ids"]):

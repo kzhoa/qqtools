@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-25
+updated_at: 2026-09-28
 archived_at:
 ---
 
@@ -182,6 +182,16 @@ registration keeps the existing ownership guard.
 remove ID_OR_PATH` removes an inventory-only entry without mounting or reading the Project. A
 current binding retains its existing disable, recovery, reservation, and process-safety checks.
 Removal and pool enrollment serialize so a stale selection cannot recreate a removed entry.
+
+For an existing live binding, the registry's `enabled` value is the effective
+operator decision. The inventory value is a repairable mirror; it remains reusable
+intent only while no live binding exists. Registry and inventory revisions are
+independent clocks. `project list` preserves its existing `enabled` field as the
+stored inventory value and adds `effective_enabled`, `inventory_enabled`,
+`inventory_converged`, `registry_revision`, and `inventory_revision`. An
+inventory-only entry has `effective_enabled=null`. Human output labels the
+registry value as effective and warns on divergence. An unreadable registry is
+an operational failure and never falls back to inventory enablement.
 
 `qexp agent name` reads `agent.name`; `qexp agent name --set-to NAME` and `qexp config set agent
 --name NAME` update the same locked global value without changing the runtime ID or existing
@@ -951,6 +961,16 @@ broaden a private Task, alter a Task's home/fallback policy, reserve capacity, o
 existing Attempt. A primary demand that is runnable now or waiting only for qexp GPU aggregation
 blocks new borrow admission. Existing borrow Attempts continue after primary demand appears;
 only later borrow claims stop.
+
+An enabled Project whose primary demand cannot be established also blocks new
+borrow in that resource lane. Returning failures and bounded maintenance yield
+to other Projects under the scheduler work-slice contract, so healthy primary
+dispatch and supervision continue. A shared-storage call that never returns is
+outside this guarantee and requires execution isolation; a work-slice deadline
+does not interrupt a synchronous syscall. Explicitly disabling the affected
+Project excludes it from later new claims and primary-demand contribution after
+the registry commit, but never removes its reservations or supervision duties.
+All remaining admission checks still apply before another Project borrows.
 
 `gpu_limit_gpus` is `null` or a positive integer for both Worker roles. `null` removes only the
 Group-level GPU limit; visible free qexp GPUs, placement, primary demand, and machine-wide
@@ -1830,6 +1850,45 @@ terminating already running training processes. Late immutable runner evidence i
 the legacy runtime instead of permanently mirrored. Repeating a completed migration preserves
 the binding's current operator-controlled enabled or disabled state.
 
+`qexp project enable` and `qexp project disable` commit the requested value to
+the live registry first, then mirror it to inventory. Their human and JSON
+results expose the same fields:
+
+```text
+action: project_enabled | project_disabled
+status: committed | partially_committed | not_committed | outcome_unknown
+requested_enabled: bool
+effective_enabled: bool | null
+registry_revision: int | null
+inventory_revision: int | null
+inventory_converged: bool
+reason: string | null
+```
+
+`committed` exits 0 only after both durable records agree. The three non-success
+states exit 1. `partially_committed` means registry authority changed but the
+inventory mirror did not converge and uses
+`reason=inventory_mirror_incomplete`; retry repairs the mirror and does not
+invert the committed choice. `not_committed` is allowed only when failure is
+positively known to precede registry replacement and the exact previous binding
+remains visible; it uses `reason=registry_not_committed`.
+`outcome_unknown` covers failure during or after replacement, an unreadable
+result, or any state without positive durability proof; it uses
+`reason=registry_outcome_unknown`, reports `effective_enabled=null`, and never
+claims rollback. A fresh `project list` inspects current visible authority, but
+only an idempotent mutation retry establishes durable convergence after an
+unknown outcome. Usage and pre-commit authority failures keep their established
+CLI error contract. Results do not expose raw exceptions, tracebacks, or private
+paths.
+
+Disable is not cancellation. A claim committed before the disable commit keeps
+its authority and follows existing launch gates; candidate selection and a
+provisional reservation are not committed claim authority. Claims ordered after
+the commit fail the enabled-binding guard. Launch-authorized and running Attempts
+remain supervised, and re-enablement restores only future eligibility. Borrow
+authorization still revalidates current primary demand and cannot reuse a cached
+no-demand result from the disabled interval.
+
 `start`, `run`, `stop`, `restart`, and `status` are global-agent commands. They operate on the
 machine authority and therefore affect every registered Project. Activation-triggering commands
 require their Project to be registered; `submit --no-activate` may still persist work without
@@ -2058,12 +2117,18 @@ owned by the submission cutover. The target CLI also does not promise aliases fo
       own queue and execution truth.
 - [ ] Machine-agent project bindings use stable project identity, canonical roots, and explicit
       enabled/draining/disabled lifecycle semantics.
+- [ ] Live registry enablement is authoritative, inventory is a repairable mirror,
+      and enable/disable reports committed, partial, rejected-before-commit, and
+      unknown publication outcomes without guessing rollback.
 - [ ] The default and environment-overridden machine runtime root produce one global scheduler
       lock for every registered Project.
 - [ ] Machine-managed local execution records use stable project-ID composite identity and one
       unified reservation set.
 - [ ] Within each primary/borrow admission layer, cross-project dispatch is deterministic
       stable-ID round-robin and a blocked project does not prevent scanning later bindings.
+- [ ] Unresolved enabled primary demand blocks later borrow only in its resource
+      lane; explicit disable removes later claim/demand eligibility without
+      cancelling or releasing existing execution authority.
 - [ ] Explicit project migration verifies old PID identity, keeps training processes alive, and
       leaves one global agent process responsible for the migrated Project.
 - [ ] Machine runtime loss cannot assert process termination or cause automatic retry.

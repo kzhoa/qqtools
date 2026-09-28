@@ -84,6 +84,35 @@ class ProjectInventoryEntry:
 InventoryEntry = ProjectInventoryEntry
 
 
+@dataclass(frozen=True, slots=True)
+class InventoryReconciliation:
+    """Observed registry and inventory view after exact-binding repair."""
+
+    registry_revision: int
+    inventory_revision: int
+    entries: tuple[ProjectInventoryEntry, ...]
+    bindings: tuple[Any, ...]
+    blockers: tuple[str, ...]
+    converged: bool
+    changed: bool
+
+
+def exact_binding_for_entry(entry: ProjectInventoryEntry, bindings: Iterable[Any]) -> tuple[Any | None, bool]:
+    """Match one binding only when both Project ID and canonical root agree uniquely."""
+    values = tuple(bindings)
+    id_matches = [binding for binding in values if binding.project_id == entry.project_id]
+    root_matches = [binding for binding in values if binding.shared_root == entry.shared_root]
+    exact_matches = [
+        binding
+        for binding in values
+        if binding.project_id == entry.project_id and binding.shared_root == entry.shared_root
+    ]
+    has_conflict = bool(id_matches or root_matches) and (
+        len(exact_matches) != 1 or len(id_matches) != 1 or len(root_matches) != 1
+    )
+    return (exact_matches[0] if len(exact_matches) == 1 and not has_conflict else None), has_conflict
+
+
 def _as_runtime(runtime: Any):
     if hasattr(runtime, "paths") and hasattr(runtime, "load_registry"):
         return runtime
@@ -171,9 +200,97 @@ def load_inventory(runtime: Any, *, require_initialized: bool = True) -> tuple[i
     return ensure_inventory(runtime, require_initialized=require_initialized)
 
 
-def save_inventory_locked(runtime: Any, revision: int, entries: Iterable[ProjectInventoryEntry]) -> None:
+def save_inventory_locked(runtime: Any, revision: int, entries: Iterable[ProjectInventoryEntry]):
     """Persist an inventory revision while the caller holds inventory_guard."""
-    atomic_replace(_inventory_path(runtime), _encode(revision, entries))
+    machine_runtime = _as_runtime(runtime)
+    try:
+        return atomic_replace(_inventory_path(machine_runtime), _encode(revision, entries))
+    finally:
+        machine_runtime.invalidate_inventory_cache()
+
+
+def reconcile_live_bindings_locked(runtime: Any, *, repair: bool = True) -> InventoryReconciliation:
+    """Inspect or repair exact live mirrors under inventory and registry locks."""
+    machine_runtime = _as_runtime(runtime)
+    if not machine_runtime._inventory_lock_depth or not machine_runtime._registry_guard_depth.get():
+        raise RuntimeError("Project inventory reconciliation requires inventory and registry guards.")
+    inventory_revision, entries = load_inventory(machine_runtime)
+    registry_revision, bindings = machine_runtime.load_registry_uncached()
+    next_entries = list(entries)
+    blockers: list[str] = []
+    runtime_id = machine_runtime.instance_id
+    runtime_root = str(machine_runtime.root)
+
+    for binding in bindings:
+        id_matches = [entry for entry in entries if entry.project_id == binding.project_id]
+        root_matches = [entry for entry in entries if entry.shared_root == binding.shared_root]
+        exact_matches = [
+            entry
+            for entry in entries
+            if entry.project_id == binding.project_id and entry.shared_root == binding.shared_root
+        ]
+        if len(exact_matches) != 1 or len(id_matches) != 1 or len(root_matches) != 1:
+            blockers.append(
+                "inventory_identity_path_conflict" if id_matches or root_matches else "inventory_entry_missing"
+            )
+            continue
+        if (
+            binding.runtime_instance_id != runtime_id
+            or binding.runtime_root not in {None, runtime_root}
+            or not isinstance(binding.registration_generation, str)
+            or not binding.registration_generation
+        ):
+            blockers.append("binding_identity_changed")
+            continue
+        entry = exact_matches[0]
+        if entry.enabled == binding.enabled:
+            continue
+        updated = ProjectInventoryEntry(
+            entry.project_id,
+            entry.shared_root,
+            binding.enabled,
+            entry.name_source,
+            entry.name_override,
+        )
+        next_entries[next_entries.index(entry)] = updated
+
+    changed = next_entries != entries
+    if changed and not repair:
+        blockers.append("enablement_mirror_diverged")
+    elif changed:
+        try:
+            persisted = save_inventory_locked(machine_runtime, inventory_revision + 1, next_entries)
+        except OSError:
+            persisted = None
+        if persisted is not None:
+            inventory_revision += 1
+            entries = next_entries
+        else:
+            blockers.append("inventory_mirror_incomplete")
+            try:
+                inventory_revision, entries = load_inventory(machine_runtime)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                pass
+
+    is_converged = not blockers and all(
+        (binding.project_id, binding.shared_root) in {(entry.project_id, entry.shared_root) for entry in entries}
+        and next(
+            entry.enabled
+            for entry in entries
+            if entry.project_id == binding.project_id and entry.shared_root == binding.shared_root
+        )
+        == binding.enabled
+        for binding in bindings
+    )
+    return InventoryReconciliation(
+        registry_revision=registry_revision,
+        inventory_revision=inventory_revision,
+        entries=tuple(entries),
+        bindings=tuple(bindings),
+        blockers=tuple(sorted(set(blockers))),
+        converged=is_converged,
+        changed=repair and changed and "inventory_mirror_incomplete" not in blockers,
+    )
 
 
 def project_inventory_entry(
@@ -208,19 +325,13 @@ def find_inventory_entries(
 def inventory_status(runtime: Any) -> dict[str, Any]:
     """Classify each inventory item against current effective bindings."""
     machine_runtime = _as_runtime(runtime)
-    revision, entries = load_inventory(machine_runtime)
-    _registry_revision, bindings = machine_runtime.load_registry()
+    with machine_runtime.inventory_guard():
+        with machine_runtime.registry_guard():
+            revision, entries = load_inventory(machine_runtime)
+            registry_revision, bindings = machine_runtime.load_registry_uncached()
     result: list[dict[str, Any]] = []
     for entry in entries:
-        matching = [
-            binding
-            for binding in bindings
-            if binding.project_id == entry.project_id or binding.shared_root == entry.shared_root
-        ]
-        binding = matching[0] if len(matching) == 1 else None
-        conflict = len(matching) > 1 or any(
-            item.project_id == entry.project_id and item.shared_root != entry.shared_root for item in matching
-        )
+        binding, conflict = exact_binding_for_entry(entry, bindings)
         mount_available = entry.shared_root.is_dir()
         if conflict:
             state = "conflicting"
@@ -237,6 +348,11 @@ def inventory_status(runtime: Any) -> dict[str, Any]:
             "machine_name": binding.machine_name if binding is not None else entry.name_override,
             "registration_generation": binding.registration_generation if binding is not None else None,
             "runtime_instance_id": binding.runtime_instance_id if binding is not None else None,
+            "effective_enabled": binding.enabled if binding is not None and not conflict else None,
+            "inventory_enabled": entry.enabled,
+            "inventory_converged": (not conflict and (binding is None or binding.enabled == entry.enabled)),
+            "registry_revision": registry_revision,
+            "inventory_revision": revision,
         }
         if binding is not None:
             try:
@@ -249,21 +365,29 @@ def inventory_status(runtime: Any) -> dict[str, Any]:
             item["eligibility"] = {"state": "unregistered", "write_eligible": False}
             item["write_eligible"] = False
         result.append(item)
-    return {"revision": revision, "projects": result}
+    return {
+        "revision": revision,
+        "inventory_revision": revision,
+        "registry_revision": registry_revision,
+        "projects": result,
+    }
 
 
 __all__ = [
     "INVENTORY_VERSION",
     "NAME_SOURCES",
     "InventoryEntry",
+    "InventoryReconciliation",
     "ProjectInventoryEntry",
     "canonical_shared_root",
     "ensure_inventory",
+    "exact_binding_for_entry",
     "find_inventory_entries",
     "inventory_payload",
     "inventory_status",
     "lexical_shared_root",
     "load_inventory",
     "project_inventory_entry",
+    "reconcile_live_bindings_locked",
     "save_inventory_locked",
 ]

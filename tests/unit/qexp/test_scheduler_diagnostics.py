@@ -6,7 +6,14 @@ from pathlib import Path
 
 import pytest
 
+from qqtools.plugins.qexp.agent.bindings import ProjectBinding
 from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.dispatch_loop import (
+    PrimaryDemandProbe,
+    _enablement_reconciliation_probe,
+    _scheduler_diagnostic_probe,
+)
+from qqtools.plugins.qexp.agent.inventory import InventoryReconciliation, ProjectInventoryEntry
 from qqtools.plugins.qexp.agent.scheduler_diagnostics import SchedulerDiagnosticStore
 
 
@@ -34,6 +41,145 @@ def _observe(store: SchedulerDiagnosticStore, index: int = 1, *, project_id: str
         details={"exception_type": "OSError", "errno": 5},
         observed_at=f"2026-09-28T00:00:{index:02d}Z",
     )
+
+
+def test_unresolved_primary_probe_records_borrow_blocking_decision_without_duplicating_finding(
+    tmp_path: Path,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = ProjectBinding(
+        project_id="project-a",
+        shared_root=tmp_path / "project" / ".qexp",
+        machine_name="gpu-1",
+        registration_generation="registration-1",
+        runtime_instance_id=runtime.instance_id,
+        runtime_root=str(runtime.root),
+    )
+    probe = PrimaryDemandProbe(
+        "unresolved",
+        (
+            {
+                "reason": "ready_index_unreadable",
+                "project_id": binding.project_id,
+                "exception_type": "OSError",
+            },
+        ),
+    )
+
+    diagnostic = _scheduler_diagnostic_probe(
+        runtime,
+        lane="gpu",
+        probe=probe,
+        registry_revision=7,
+        bindings={binding.project_id: binding},
+        covered_project_ids={binding.project_id},
+        available_capacity=2,
+        borrow_denied=True,
+    )
+
+    assert diagnostic["identity"]["reason_code"] == "borrow_blocked_unresolved_primary"
+    assert diagnostic["identity"]["resource_lane"] == "gpu"
+    assert diagnostic["source_revision"] == {"registry_revision": 7}
+    assert diagnostic["coverage"] == "incomplete"
+    assert [item["identity"]["reason_code"] for item in diagnostic["findings"]] == ["ready_index_unreadable"]
+
+
+def test_enablement_reconciliation_finding_coalesces_and_resolves_after_exact_convergence(
+    tmp_path: Path,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    entry = ProjectInventoryEntry("project-a", tmp_path / "project" / ".qexp", enabled=True)
+    binding = ProjectBinding(
+        project_id=entry.project_id,
+        shared_root=entry.shared_root,
+        machine_name="gpu-1",
+        enabled=False,
+        registration_generation="registration-1",
+        runtime_instance_id=runtime.instance_id,
+        runtime_root=str(runtime.root),
+    )
+    incomplete = InventoryReconciliation(
+        registry_revision=7,
+        inventory_revision=3,
+        entries=(entry,),
+        bindings=(binding,),
+        blockers=("inventory_mirror_incomplete",),
+        converged=False,
+        changed=False,
+    )
+    incomplete_probe = _enablement_reconciliation_probe(runtime, incomplete)
+    store = SchedulerDiagnosticStore(runtime)
+
+    store.publish_cycle({}, {}, (incomplete_probe,), {}, observed_at="2026-09-28T00:00:00Z")
+
+    active = store.active_view(producer="enablement_reconciliation")
+    assert active["total"] == 1
+    assert active["items"][0]["identity"]["reason_code"] == "inventory_mirror_incomplete"
+    assert active["items"][0]["details"]["progress"] == "mirror_write_pending"
+
+    mirrored_entry = ProjectInventoryEntry(entry.project_id, entry.shared_root, enabled=False)
+    converged = InventoryReconciliation(
+        registry_revision=7,
+        inventory_revision=4,
+        entries=(mirrored_entry,),
+        bindings=(binding,),
+        blockers=(),
+        converged=True,
+        changed=True,
+    )
+    converged_probe = _enablement_reconciliation_probe(runtime, converged)
+    store.publish_cycle({}, {}, (converged_probe,), {}, observed_at="2026-09-28T00:01:00Z")
+
+    assert store.reconcile_cycle((converged_probe,), resolved_at="2026-09-28T00:01:01Z")
+    assert store.active_view(producer="enablement_reconciliation")["items"] == []
+
+
+def test_unknown_enablement_registry_is_machine_scoped_and_resolves_after_validated_read(
+    tmp_path: Path,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    unknown_probe = _enablement_reconciliation_probe(runtime, None)
+    store = SchedulerDiagnosticStore(runtime)
+    store.publish_cycle({}, {}, (unknown_probe,), {}, observed_at="2026-09-28T00:00:00Z")
+
+    active = store.active_view(producer="enablement_reconciliation")
+    assert active["total"] == 1
+    assert active["items"][0]["identity"]["reason_code"] == "registry_enablement_unknown"
+
+    converged = InventoryReconciliation(1, 1, (), (), (), True, False)
+    converged_probe = _enablement_reconciliation_probe(runtime, converged)
+    assert store.reconcile_cycle((converged_probe,), resolved_at="2026-09-28T00:01:00Z")
+
+
+def test_missing_inventory_entry_is_a_blocked_binding_finding_not_convergence(tmp_path: Path) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = ProjectBinding(
+        project_id="project-a",
+        shared_root=tmp_path / "project" / ".qexp",
+        machine_name="gpu-1",
+        registration_generation="registration-1",
+        runtime_instance_id=runtime.instance_id,
+        runtime_root=str(runtime.root),
+    )
+    reconciliation = InventoryReconciliation(
+        registry_revision=8,
+        inventory_revision=4,
+        entries=(),
+        bindings=(binding,),
+        blockers=("inventory_entry_missing",),
+        converged=False,
+        changed=False,
+    )
+
+    probe = _enablement_reconciliation_probe(runtime, reconciliation)
+
+    assert probe["outcome"] == "blocked"
+    assert probe["identity"]["reason_code"] == "enablement_mirror_diverged"
+    assert len(probe["findings"]) == 1
+    identity = probe["findings"][0]["identity"]
+    assert identity["project_id"] == binding.project_id
+    assert identity["registration_generation"] == binding.registration_generation
+    assert probe["findings"][0]["details"]["progress"] == "blocked"
 
 
 def test_missing_store_reads_are_unknown_and_do_not_create_runtime(tmp_path: Path) -> None:

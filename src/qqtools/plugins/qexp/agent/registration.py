@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import stat
 import uuid
 from collections.abc import Callable, Iterator
@@ -112,6 +113,8 @@ class MachineRegistration:
             try:
                 metadata = path.lstat()
             except FileNotFoundError:
+                if self.paths["inventory"].exists():
+                    raise RuntimeError("machine registry is missing.")
                 witness = None
                 with self._registry_cache_lock:
                     if (
@@ -142,23 +145,7 @@ class MachineRegistration:
                     and self._registry_cache_bindings is not None
                 ):
                     return self._registry_cache_revision, self._registry_cache_bindings
-            value = read_json(path)
-            registry = value.get("registry")
-            if not isinstance(registry, dict) or registry.get("version") != REGISTRY_VERSION:
-                raise RuntimeError("machine registry is malformed or unsupported.")
-            revision = registry.get("revision")
-            bindings = registry.get("bindings")
-            if not isinstance(revision, int) or revision < 0 or not isinstance(bindings, list):
-                raise RuntimeError("machine registry is malformed.")
-            try:
-                parsed = tuple(
-                    sorted(
-                        (ProjectBinding.from_dict(item) for item in bindings),
-                        key=lambda item: item.project_id,
-                    )
-                )
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("machine registry contains a malformed project binding.") from exc
+            revision, parsed = self._decode_registry(read_json(path))
             try:
                 after = path.lstat()
             except FileNotFoundError:
@@ -184,7 +171,62 @@ class MachineRegistration:
                 self._registry_cache_bindings = parsed
             return revision, parsed
 
-    def save_registry_locked(self, revision: int, bindings: list[ProjectBinding]) -> None:
+    @staticmethod
+    def _decode_registry(value: dict[str, Any]) -> tuple[int, tuple[ProjectBinding, ...]]:
+        registry = value.get("registry")
+        if not isinstance(registry, dict) or registry.get("version") != REGISTRY_VERSION:
+            raise RuntimeError("machine registry is malformed or unsupported.")
+        revision = registry.get("revision")
+        bindings = registry.get("bindings")
+        if not isinstance(revision, int) or revision < 0 or not isinstance(bindings, list):
+            raise RuntimeError("machine registry is malformed.")
+        try:
+            parsed = tuple(
+                sorted(
+                    (ProjectBinding.from_dict(item) for item in bindings),
+                    key=lambda item: item.project_id,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("machine registry contains a malformed project binding.") from exc
+        return revision, parsed
+
+    def load_registry_uncached(self) -> tuple[int, list[ProjectBinding]]:
+        """Read and validate the physical registry without consulting process cache."""
+        path = self.paths["registry"]
+        while True:
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                if self.paths["inventory"].exists():
+                    raise RuntimeError("machine registry is missing.")
+                return 0, []
+            if not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError("machine registry must be a regular non-symlink file.")
+            witness = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+            revision, parsed = self._decode_registry(read_json(path))
+            try:
+                after = path.lstat()
+            except FileNotFoundError:
+                continue
+            after_witness = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if not stat.S_ISREG(after.st_mode) or after_witness != witness:
+                continue
+            return revision, list(parsed)
+
+    def save_registry_locked(self, revision: int, bindings: list[ProjectBinding]) -> os.stat_result | None:
         """Persist a registry revision while the caller retains the registry guard."""
         with self._registry_cache_lock:
             self._registry_cache_witness = None
@@ -202,24 +244,18 @@ class MachineRegistration:
             },
         )
         if persisted is None:
-            try:
-                persisted = self.paths["registry"].lstat()
-            except OSError:
-                persisted = None
+            return None
         with self._registry_cache_lock:
             self._registry_cache_witness = (
-                None
-                if persisted is None
-                else (
-                    persisted.st_dev,
-                    persisted.st_ino,
-                    persisted.st_size,
-                    persisted.st_mtime_ns,
-                    persisted.st_ctime_ns,
-                )
+                persisted.st_dev,
+                persisted.st_ino,
+                persisted.st_size,
+                persisted.st_mtime_ns,
+                persisted.st_ctime_ns,
             )
             self._registry_cache_revision = revision
             self._registry_cache_bindings = tuple(sorted(bindings, key=lambda item: item.project_id))
+        return persisted
 
     def _save_registration_transaction(
         self,

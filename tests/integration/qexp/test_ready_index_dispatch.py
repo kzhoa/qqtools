@@ -912,7 +912,7 @@ def test_unprobeable_enabled_project_blocks_borrow_admission(tmp_path: Path, mon
     )
     share(allowed_cfg, allowed_task.task_id)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
-    runtime.add_binding(blocked_cfg.shared_root, blocked_cfg.machine_name)
+    blocked_binding = runtime.add_binding(blocked_cfg.shared_root, blocked_cfg.machine_name)
     allowed_binding = runtime.add_binding(allowed_cfg.shared_root, allowed_cfg.machine_name)
     original_maintenance = __import__(
         "qqtools.plugins.qexp.agent.dispatch_loop", fromlist=["maintain_project"]
@@ -933,6 +933,32 @@ def test_unprobeable_enabled_project_blocks_borrow_admission(tmp_path: Path, mon
     result_by_project = {item["project_id"]: item for item in results}
     assert result_by_project[allowed_binding.project_id]["launched"] == []
     assert executor.launched == []
+
+    runtime.set_enabled(blocked_binding.project_id, False)
+    disabled_results = dispatch_machine_cycle_locked(
+        runtime, available_gpus=[0, 1], executor=executor, supervise=False, publish_snapshots=False
+    )
+    disabled_by_project = {item["project_id"]: item for item in disabled_results}
+    assert disabled_by_project[allowed_binding.project_id]["launched"] == [allowed_task.task_id]
+
+    second_borrow = submit(
+        allowed_cfg,
+        ["echo", "second-borrow"],
+        group="borrow-group",
+        sharing_mode="spillover",
+        working_dir=work,
+    )
+    share(allowed_cfg, second_borrow.task_id)
+    _activate_ready(allowed_cfg)
+    runtime.set_enabled(blocked_binding.project_id, True)
+
+    reenabled_results = dispatch_machine_cycle_locked(
+        runtime, available_gpus=[0, 1], executor=executor, supervise=False, publish_snapshots=False
+    )
+
+    reenabled_by_project = {item["project_id"]: item for item in reenabled_results}
+    assert second_borrow.task_id not in reenabled_by_project[allowed_binding.project_id]["launched"]
+    assert second_borrow.task_id not in executor.launched
 
 
 def test_machine_agent_primary_demand_blocks_new_borrow_claim(

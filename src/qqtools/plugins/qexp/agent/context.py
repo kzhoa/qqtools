@@ -127,6 +127,7 @@ class MachineRuntime:
         self.last_diagnostic_publish_ns: int | None = None
         self.last_scheduler_diagnostics_publish_ns: int | None = None
         self.last_scheduler_diagnostic_probes: tuple[dict[str, object], ...] = ()
+        self.last_enablement_reconciliation_probe: dict[str, object] | None = None
         self.ready_batch_sizers: dict[str, AdaptiveBatchSizer] = {}
         self.primary_probe = PrimaryProbeSession()
         # Set by the most recent bounded dispatch cycle for on-demand idle exit.
@@ -374,6 +375,10 @@ class MachineRuntime:
         revision, snapshot = self.load_registry_snapshot()
         return revision, list(snapshot)
 
+    def load_registry_uncached(self) -> tuple[int, list[ProjectBinding]]:
+        """Read the physical registry for outcome classification under its guard."""
+        return self.registration.load_registry_uncached()
+
     def load_registry_snapshot(self) -> tuple[int, tuple[ProjectBinding, ...]]:
         """Return the cached immutable registry view and recover retirement intents."""
         revision, bindings = self.registration.load_registry_snapshot()
@@ -425,8 +430,15 @@ class MachineRuntime:
                 self._inventory_cache_entries = snapshot
             return revision, snapshot
 
-    def _save_registry(self, revision: int, bindings: list[ProjectBinding]) -> None:
-        self.registration.save_registry_locked(revision, bindings)
+    def invalidate_inventory_cache(self) -> None:
+        """Discard an inventory snapshot after a local inventory publication."""
+        with self._inventory_cache_lock:
+            self._inventory_cache_witness = None
+            self._inventory_cache_revision = None
+            self._inventory_cache_entries = None
+
+    def _save_registry(self, revision: int, bindings: list[ProjectBinding]) -> os.stat_result | None:
+        return self.registration.save_registry_locked(revision, bindings)
 
     def _save_registration_transaction(
         self,

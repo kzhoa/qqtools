@@ -45,19 +45,37 @@ def _render_project_operation(result: Mapping[str, Any], _presentation: Mapping[
         status = "already initialized"
     elif status is None:
         status = "completed"
-    return _operation(
-        action.replace("_", " "),
-        status,
-        (
-            ("Project ID", result.get("project_id")),
-            ("Shared root", result.get("shared_root")),
-            ("Machine", result.get("machine_name")),
-            ("Enabled", result.get("enabled")),
-            ("Source", result.get("name_source")),
-            ("Local only", result.get("local_only")),
-            ("Reason", result.get("reason")),
-        ),
-    )
+    lines = [
+        _operation(
+            action.replace("_", " "),
+            status,
+            (
+                ("Project ID", result.get("project_id")),
+                ("Shared root", result.get("shared_root")),
+                ("Machine", result.get("machine_name")),
+                ("Enabled", result.get("enabled")),
+                ("Requested enabled", result.get("requested_enabled")),
+                ("Effective enabled", result.get("effective_enabled")),
+                ("Registry revision", result.get("registry_revision")),
+                ("Inventory revision", result.get("inventory_revision")),
+                ("Inventory converged", result.get("inventory_converged")),
+                ("Source", result.get("name_source")),
+                ("Local only", result.get("local_only")),
+                ("Reason", result.get("reason")),
+            ),
+        )
+    ]
+    if status == "partially_committed":
+        lines.append(
+            "Next: retry the same project enable/disable command; the registry choice is already effective "
+            "and retry repairs the inventory mirror."
+        )
+    elif status == "outcome_unknown":
+        lines.append(
+            "Next: inspect a fresh qexp project list, then retry the same project enable/disable request "
+            "to establish convergence. Do not issue the inverse request as rollback."
+        )
+    return "\n".join(lines)
 
 
 def _render_project_register(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
@@ -97,13 +115,33 @@ def _render_project_list(result: Mapping[str, Any], _presentation: Mapping[str, 
             project.get("shared_root"),
             project.get("machine_name"),
             project.get("status"),
+            project.get("effective_enabled"),
+            project.get("inventory_enabled"),
+            project.get("inventory_converged"),
             project.get("mount_available"),
         )
         for project in projects
     ]
-    return _table(
-        ("Project ID", "Shared root", "Machine", "Status", "Mount"), rows, empty_message="No enrolled Projects."
-    )
+    lines = [
+        f"Registry revision: {result.get('registry_revision')}; inventory revision: {result.get('inventory_revision')}",
+        _table(
+            (
+                "Project ID",
+                "Shared root",
+                "Machine",
+                "Status",
+                "Effective enabled",
+                "Inventory enabled",
+                "Inventory converged",
+                "Mount",
+            ),
+            rows,
+            empty_message="No enrolled Projects.",
+        ),
+    ]
+    if any(not project.get("inventory_converged", True) for project in projects):
+        lines.append("Warning: registry enablement is authoritative; inventory mirror repair is incomplete or blocked.")
+    return "\n".join(lines)
 
 
 def _render_context(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
@@ -140,9 +178,32 @@ def _validate_machine_init(result: Any) -> None:
 
 def _validate_project_operation(result: Any) -> None:
     value = _mapping(result, "project-operation payload")
-    _required(value, "action", "project-operation payload")
+    action = _required(value, "action", "project-operation payload")
     if "project_id" in value:
         _required(value, "shared_root", "project-operation payload")
+    if action in {"project_enabled", "project_disabled"}:
+        for key in (
+            "status",
+            "requested_enabled",
+            "effective_enabled",
+            "registry_revision",
+            "inventory_revision",
+            "inventory_converged",
+            "reason",
+        ):
+            _required(value, key, "project-operation payload")
+        if value["status"] not in {"committed", "partially_committed", "not_committed", "outcome_unknown"}:
+            raise ValueError("project-operation payload.status is invalid")
+        _required_bool(value, "requested_enabled", "project-operation payload")
+        if value["effective_enabled"] is not None and type(value["effective_enabled"]) is not bool:
+            raise ValueError("project-operation payload.effective_enabled must be a bool or null")
+        for key in ("registry_revision", "inventory_revision"):
+            revision = value[key]
+            if revision is not None and (type(revision) is not int or revision < 0):
+                raise ValueError(f"project-operation payload.{key} must be a nonnegative integer or null")
+        _required_bool(value, "inventory_converged", "project-operation payload")
+        if value["reason"] is not None and not isinstance(value["reason"], str):
+            raise ValueError("project-operation payload.reason must be a string or null")
 
 
 def _validate_project_register(result: Any) -> None:
@@ -158,6 +219,8 @@ def _validate_project_register(result: Any) -> None:
 def _validate_project_list(result: Any) -> None:
     value = _mapping(result, "project-list payload")
     _required_int(value, "revision", "project-list payload")
+    _required_int(value, "registry_revision", "project-list payload")
+    _required_int(value, "inventory_revision", "project-list payload")
     projects = _required_sequence(value, "projects", "project-list payload")
     for index, item in enumerate(projects):
         project = _mapping(item, f"project-list payload.projects[{index}]")
@@ -165,6 +228,14 @@ def _validate_project_list(result: Any) -> None:
             _required(project, key, f"project-list payload.projects[{index}]")
         _required_bool(project, "enabled", f"project-list payload.projects[{index}]")
         _required_bool(project, "mount_available", f"project-list payload.projects[{index}]")
+        if project.get("effective_enabled") is not None and type(project["effective_enabled"]) is not bool:
+            raise ValueError(f"project-list payload.projects[{index}].effective_enabled must be a bool or null")
+        _required_bool(project, "inventory_enabled", f"project-list payload.projects[{index}]")
+        _required_bool(project, "inventory_converged", f"project-list payload.projects[{index}]")
+        for key in ("registry_revision", "inventory_revision"):
+            revision = project.get(key)
+            if type(revision) is not int or revision < 0:
+                raise ValueError(f"project-list payload.projects[{index}].{key} must be a nonnegative integer")
 
 
 def _validate_context(result: Any) -> None:

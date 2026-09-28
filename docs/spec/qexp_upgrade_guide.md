@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-25
+updated_at: 2026-09-28
 archived_at:
 ---
 
@@ -188,6 +188,41 @@ change Project Task/Attempt truth, claims, reservations, scheduling authority, o
 recovery authority. Do not copy `diagnostics/scheduler-v1` between machine
 runtimes, edit its JSON to clear a scheduling blocker, or treat its loss as proof
 that a fault resolved.
+
+### Registry-authoritative Project enablement
+
+The Project enable/disable correction keeps the existing registry and inventory
+formats. It adds no Project schema migration, compatibility reader, dual writer,
+or enablement journal. Upgrade the package and restart each machine's global
+agent while running Attempts continue:
+
+```bash
+python -m pip install --upgrade qqtools
+qexp agent restart
+qexp project list --format json
+```
+
+After restart, a live binding's registry value is effective and its inventory
+value is a repairable mirror. `project list` shows both values and their separate
+revisions. An inventory-only entry still carries reusable intent. Do not edit
+either JSON file or copy MachineRuntime state between machines to resolve a
+disagreement.
+
+If `project enable` or `project disable` exits 1 with
+`status=partially_committed`, the reported registry value is already effective.
+Retry the same command; the retry is idempotent and repairs the inventory mirror.
+If it returns `status=outcome_unknown`, first inspect a fresh `project list`, then
+retry the same requested operation to establish durable convergence. Never issue
+the inverse operation as rollback. `registry_enablement_unknown`, a missing exact
+inventory entry, or an identity/path conflict requires preserving the runtime
+and repairing its local records; inventory is not authority for reconstruction.
+
+The corrected ordering is guaranteed only after the machine-local agent restart.
+Using an older qqtools writer afterward, or downgrading a MachineRuntime already
+operated by the corrected version, is unsupported. There is no version
+negotiation or old-writer adapter. Running and launch-authorized Attempts retain
+their existing authority across the rolling restart and across later explicit
+disablement; disable affects later claims and demand contribution only.
 
 The binding working-set format is disposable machine-local coordination state.
 After installing a release that introduces it, restart each machine agent through

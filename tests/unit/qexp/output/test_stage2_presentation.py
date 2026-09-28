@@ -38,7 +38,10 @@ def test_task_list_prioritizes_daily_fields_and_stays_terminal_width() -> None:
 def test_empty_inventory_messages_are_resource_specific() -> None:
     assert "No Tasks" in _human(OutputKind.TASK_LIST, [])
     assert "No Groups" in _human(OutputKind.GROUP_LIST, [])
-    projects = _human(OutputKind.PROJECT_LIST, {"revision": 0, "projects": []})
+    projects = _human(
+        OutputKind.PROJECT_LIST,
+        {"revision": 0, "inventory_revision": 0, "registry_revision": 0, "projects": []},
+    )
     assert "No enrolled Projects" in projects
     assert "qexp project register PATH" in projects
 

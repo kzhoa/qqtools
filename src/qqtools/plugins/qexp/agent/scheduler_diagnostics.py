@@ -124,6 +124,7 @@ _DETAIL_FIELDS = frozenset(
         "group_limit",
         "group_usage",
         "diagnostic_code",
+        "progress",
         "details_omitted",
     }
 )
@@ -729,7 +730,11 @@ class SchedulerDiagnosticStore:
             raise ValueError("observation_revision must be a nonnegative integer")
         safe_identity, identity_incomplete = _sanitize_identity(identity)
         safe_revision, revision_omitted = _sanitize_revision(source_revision)
-        if identity_incomplete or revision_omitted or not safe_revision:
+        revisionless_unknown_registry = (
+            safe_identity.get("producer") == "enablement_reconciliation"
+            and safe_identity.get("reason_code") == "registry_enablement_unknown"
+        )
+        if identity_incomplete or revision_omitted or (not safe_revision and not revisionless_unknown_registry):
             return False
         safe_time = _validated_timestamp(resolved_at)
         digest = _identity_digest(safe_identity)
@@ -1247,7 +1252,7 @@ class SchedulerDiagnosticStore:
                         complete = False
                         reason = "probe_coverage_incomplete"
                     decision_identity = probe.get("identity")
-                    if isinstance(decision_identity, Mapping) and decisions_written < 2:
+                    if isinstance(decision_identity, Mapping) and decisions_written < 3:
                         try:
                             next_metadata, next_summary = self._record_decision_locked(
                                 identity=decision_identity,
@@ -1350,10 +1355,11 @@ class SchedulerDiagnosticStore:
         *,
         resolved_at: str | None = None,
     ) -> bool:
-        """Resolve at most one stale primary-probe finding with complete scope evidence."""
+        """Resolve at most one stale finding with complete current scope evidence."""
         safe_time = _validated_timestamp(resolved_at)
         normalized = _normalize_probes(probes)
         complete_lanes: dict[str, Mapping[str, object]] = {}
+        complete_enablement: list[Mapping[str, object]] = []
         current_digests: set[str] = set()
         for probe in normalized:
             identity = probe.get("identity")
@@ -1364,6 +1370,12 @@ class SchedulerDiagnosticStore:
             source_revision = probe.get("source_revision")
             if isinstance(lane, str) and isinstance(runtime_id, str) and isinstance(source_revision, Mapping):
                 complete_lanes[lane] = probe
+            if (
+                identity.get("producer") == "enablement_reconciliation"
+                and isinstance(runtime_id, str)
+                and isinstance(source_revision, Mapping)
+            ):
+                complete_enablement.append(probe)
             findings = probe.get("findings")
             if isinstance(findings, Sequence) and not isinstance(findings, (str, bytes)):
                 for finding in findings:
@@ -1372,6 +1384,47 @@ class SchedulerDiagnosticStore:
                         safe_identity, incomplete = _sanitize_identity(finding_identity)
                         if not incomplete:
                             current_digests.add(_identity_digest(safe_identity))
+        if complete_enablement:
+            active_enablement = self.active_view(producer="enablement_reconciliation", limit=MAX_QUERY_LIMIT)
+            if active_enablement.get("coverage") in {"complete", "incomplete"}:
+                for item in active_enablement.get("items", ()):
+                    if not isinstance(item, Mapping):
+                        continue
+                    identity = item.get("identity")
+                    if not isinstance(identity, Mapping) or _identity_digest(identity) in current_digests:
+                        continue
+                    for complete_probe in complete_enablement:
+                        decision_identity = complete_probe.get("identity")
+                        if not isinstance(decision_identity, Mapping):
+                            continue
+                        if identity.get("runtime_id") != decision_identity.get("runtime_id"):
+                            continue
+                        source_revision = item.get("source_revision")
+                        covered_revision = complete_probe.get("source_revision")
+                        if not _revision_covers(covered_revision, source_revision):
+                            continue
+                        project_id = identity.get("project_id")
+                        if isinstance(project_id, str) and not _probe_covers_binding(
+                            complete_probe,
+                            project_id=project_id,
+                            registration_generation=identity.get("registration_generation"),
+                        ):
+                            continue
+                        episode = item.get("episode")
+                        observation_revision = item.get("observation_revision")
+                        if (
+                            not isinstance(episode, str)
+                            or type(observation_revision) is not int
+                            or not isinstance(source_revision, Mapping)
+                        ):
+                            continue
+                        return self.resolve_finding(
+                            identity=identity,
+                            episode=episode,
+                            observation_revision=observation_revision,
+                            source_revision=source_revision,
+                            resolved_at=safe_time,
+                        )
         if not complete_lanes:
             return False
 
@@ -1876,7 +1929,7 @@ def _sanitize_facts(value: Mapping[str, object] | None) -> tuple[dict[str, Any],
             safe[key] = raw
         elif key == "exception_type" and raw in _EXCEPTION_TYPES:
             safe[key] = raw
-        elif key in {"outcome", "probe_state", "coverage", "diagnostic_code"}:
+        elif key in {"outcome", "probe_state", "coverage", "diagnostic_code", "progress"}:
             token = _safe_token(raw)
             if token is None:
                 omitted = True
@@ -2344,8 +2397,8 @@ def _normalize_probes(
     if probes is None:
         return []
     if isinstance(probes, Mapping):
-        return [value for value in probes.values() if isinstance(value, Mapping)][:2]
-    return [value for value in probes if isinstance(value, Mapping)][:2]
+        return [value for value in probes.values() if isinstance(value, Mapping)][:3]
+    return [value for value in probes if isinstance(value, Mapping)][:3]
 
 
 def _revision_covers(

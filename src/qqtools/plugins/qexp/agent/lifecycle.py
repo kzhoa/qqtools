@@ -105,7 +105,7 @@ from .helpers import (
     _publish_project_snapshots,
     _read_pid,
 )
-from .inventory import load_inventory
+from .inventory import exact_binding_for_entry, load_inventory, reconcile_live_bindings_locked
 from .project_admin import _stop_verified_legacy_agent, migrate_project
 from .recovery_capture import inspect_recovery_capture
 from .recovery_enrollment import RecoveryEnrollment
@@ -134,8 +134,13 @@ def get_machine_agent_status(
     identity = _active_machine_identity(machine_runtime)
     pid = identity[0] if identity is not None else _read_pid(machine_runtime)
     running = bool(identity or (pid and not probe_local_pid))
-    revision, bindings = machine_runtime.load_registry()
-    inventory_revision, inventory_entries = load_inventory(machine_runtime)
+    with machine_runtime.inventory_guard():
+        with machine_runtime.registry_guard():
+            reconciliation = reconcile_live_bindings_locked(machine_runtime, repair=False)
+    revision = reconciliation.registry_revision
+    bindings = list(reconciliation.bindings)
+    inventory_revision = reconciliation.inventory_revision
+    inventory_entries = list(reconciliation.entries)
     try:
         process_status = read_json(machine_runtime.paths["agent"] / "status.json").get("machine_agent", {})
     except (OSError, TypeError, ValueError):
@@ -156,14 +161,30 @@ def get_machine_agent_status(
     except (OSError, RuntimeError, ValueError):
         notification_migration = {"state": "unavailable", "pending": True}
     waiting_for_first_registration = bool(process_status.get("waiting_for_first_registration")) if running else False
+    inventory_by_binding = {(entry.project_id, entry.shared_root): entry for entry in inventory_entries}
     projects = []
     for binding in bindings:
+        inventory_entry = inventory_by_binding.get((binding.project_id, binding.shared_root))
+        exact_binding, binding_conflict = (
+            exact_binding_for_entry(inventory_entry, bindings) if inventory_entry is not None else (None, True)
+        )
+        inventory_converged = (
+            exact_binding == binding
+            and not binding_conflict
+            and inventory_entry is not None
+            and inventory_entry.enabled == binding.enabled
+        )
         try:
             eligibility = machine_runtime.registration_status(binding)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
             eligibility = {"state": "invalid", "write_eligible": False, "error": str(exc)}
         project = {
             **binding.to_dict(),
+            "effective_enabled": binding.enabled,
+            "inventory_enabled": inventory_entry.enabled if inventory_entry is not None else None,
+            "inventory_converged": inventory_converged,
+            "registry_revision": revision,
+            "inventory_revision": inventory_revision,
             "state": machine_runtime.binding_state(binding),
             "eligibility": eligibility,
             "recovery_enrollment": inspect_recovery_admission(machine_runtime, binding),
@@ -193,19 +214,25 @@ def get_machine_agent_status(
                 f"The example logical name {replacement_name!r} is illustrative; verify its availability before use."
             )
         projects.append(project)
-    bound_ids = {binding.project_id for binding in bindings}
+    bound_pairs = {(binding.project_id, binding.shared_root) for binding in bindings}
     for inventory_entry in inventory_entries:
-        if inventory_entry.project_id in bound_ids:
+        if (inventory_entry.project_id, inventory_entry.shared_root) in bound_pairs:
             continue
+        _binding, conflict = exact_binding_for_entry(inventory_entry, bindings)
         projects.append(
             {
                 **inventory_entry.to_dict(),
-                "state": "inventory_only" if inventory_entry.shared_root.is_dir() else "inventory_only",
-                "status": "inventory_only",
+                "state": "conflicting" if conflict else "inventory_only",
+                "status": "conflicting" if conflict else "inventory_only",
                 "mount_available": inventory_entry.shared_root.is_dir(),
                 "machine_name": inventory_entry.name_override,
                 "registration_generation": None,
                 "runtime_instance_id": None,
+                "effective_enabled": None,
+                "inventory_enabled": inventory_entry.enabled,
+                "inventory_converged": not conflict,
+                "registry_revision": revision,
+                "inventory_revision": inventory_revision,
                 "eligibility": {"state": "unregistered", "write_eligible": False},
                 "write_eligible": False,
                 "reason": "missing_mount" if not inventory_entry.shared_root.is_dir() else "not_registered",
@@ -239,9 +266,11 @@ def get_machine_agent_status(
         "acknowledged_policy_revision": process_status.get("policy_revision_acknowledged"),
         "policy_revision_requested": process_status.get("policy_revision_requested", agent_config.revision),
         "policy_revision_acknowledged": process_status.get("policy_revision_acknowledged"),
-        "readiness": bool(process_status.get("ready")) and running,
-        "ready": bool(process_status.get("ready")) and running,
+        "readiness": bool(process_status.get("ready")) and running and reconciliation.converged,
+        "ready": bool(process_status.get("ready")) and running and reconciliation.converged,
         "inventory_revision": inventory_revision,
+        "inventory_converged": reconciliation.converged,
+        "enablement_blockers": list(reconciliation.blockers),
         "reconciled_project_ids": process_status.get("reconciled_project_ids", []),
         "agent_state": "active" if running else "stopped",
         "stop_reason": process_status.get("stop_reason"),
@@ -340,6 +369,7 @@ def run_machine_agent_loop(
     reconciled_policy_revision: int | None = None
     enabled_project_ids: set[str] = set()
     enabled_projects_reconciled = False
+    enablement_view_converged = False
     readiness_view_initialized = False
     cycle_completed = False
     idle_since: float | None = None
@@ -608,34 +638,55 @@ def run_machine_agent_loop(
                             emitted_gpu_warning_fingerprint = fingerprint
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     pass
+                enablement_view_converged = False
                 try:
-                    observed_inventory_revision, observed_entries = machine_runtime.load_inventory_snapshot()
+                    reconciliation = None
+                    with machine_runtime.agent_lifecycle_guard(blocking=False) as lifecycle_acquired:
+                        if lifecycle_acquired:
+                            with machine_runtime.inventory_guard():
+                                with machine_runtime.registry_guard():
+                                    reconciliation = reconcile_live_bindings_locked(machine_runtime)
+                    if reconciliation is None:
+                        raise RuntimeError("machine lifecycle is changing; readiness will be retried.")
+                    observed_inventory_revision = reconciliation.inventory_revision
+                    registry_revision = reconciliation.registry_revision
+                    observed_entries = reconciliation.entries
+                    observed_bindings = reconciliation.bindings
+                    enablement_view_converged = reconciliation.converged
+                    machine_runtime.last_enablement_reconciliation_probe = _dispatch._enablement_reconciliation_probe(
+                        machine_runtime, reconciliation
+                    )
                     if cycle_completed:
-                        registry_revision, observed_bindings = machine_runtime.load_registry_snapshot()
-                        if (
+                        view_changed = (
                             not readiness_view_initialized
+                            or not enabled_projects_reconciled
                             or reconciled_inventory_revision != observed_inventory_revision
                             or reconciled_registry_revision != registry_revision
                             or reconciled_policy_revision != policy_revision_requested
-                        ):
-                            if (
-                                not readiness_view_initialized
-                                or reconciled_inventory_revision != observed_inventory_revision
-                            ):
-                                enabled_project_ids = {entry.project_id for entry in observed_entries if entry.enabled}
-                            bindings_by_project_id: dict[str, list[ProjectBinding]] = {}
-                            for binding in observed_bindings:
-                                bindings_by_project_id.setdefault(binding.project_id, []).append(binding)
+                        )
+                        if view_changed:
+                            enabled_project_ids = {
+                                binding.project_id for binding in observed_bindings if binding.enabled
+                            }
+                            for entry in observed_entries:
+                                binding, conflict = exact_binding_for_entry(entry, observed_bindings)
+                                if (binding is None or conflict) and entry.enabled:
+                                    enabled_project_ids.add(entry.project_id)
+                            entry_by_binding = {
+                                (entry.project_id, entry.shared_root): entry for entry in observed_entries
+                            }
                             reconciled_project_ids = [
-                                entry.project_id
-                                for entry in observed_entries
-                                if entry.enabled
-                                and any(
-                                    machine_runtime.registration_status(binding).get("write_eligible", False)
-                                    for binding in bindings_by_project_id.get(entry.project_id, ())
-                                )
+                                binding.project_id
+                                for binding in observed_bindings
+                                if binding.enabled
+                                and (entry := entry_by_binding.get((binding.project_id, binding.shared_root)))
+                                is not None
+                                and not exact_binding_for_entry(entry, observed_bindings)[1]
+                                and machine_runtime.registration_status(binding).get("write_eligible", False)
                             ]
-                            enabled_projects_reconciled = enabled_project_ids.issubset(set(reconciled_project_ids))
+                            enabled_projects_reconciled = enablement_view_converged and enabled_project_ids.issubset(
+                                set(reconciled_project_ids)
+                            )
                             reconciled_inventory_revision = observed_inventory_revision
                             reconciled_registry_revision = registry_revision
                             reconciled_policy_revision = policy_revision_requested
@@ -650,6 +701,7 @@ def run_machine_agent_loop(
                             policy_revision_acknowledged = policy_revision_requested
                     ready = bool(
                         cycle_completed
+                        and enablement_view_converged
                         and enabled_project_ids
                         and policy_revision_acknowledged == policy_revision_requested
                         and enabled_projects_reconciled
@@ -674,7 +726,31 @@ def run_machine_agent_loop(
                         capture_mode=capture_mode,
                     )
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                    pass
+                    machine_runtime.last_enablement_reconciliation_probe = _dispatch._enablement_reconciliation_probe(
+                        machine_runtime, None
+                    )
+                    try:
+                        _publish_process_status(
+                            machine_runtime,
+                            instance_id=instance_id,
+                            pid=os.getpid(),
+                            start_ticks=start_ticks,
+                            waiting_for_first_registration=not has_consumed_binding,
+                            runtime_id=machine_runtime.instance_id,
+                            configured_agent_mode=agent_config.agent_mode,
+                            observed_agent_mode=observed_agent_mode,
+                            policy_revision_requested=policy_revision_requested,
+                            policy_revision_acknowledged=policy_revision_acknowledged,
+                            inventory_revision=observed_inventory_revision,
+                            reconciled_project_ids=reconciled_project_ids,
+                            ready=False,
+                            diagnostic_startup_sequence=startup_sequence,
+                            diagnostic_log_path=str(log_path) if log_path is not None else None,
+                            effective_log_max_bytes=effective_log_max_bytes,
+                            capture_mode=capture_mode,
+                        )
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                        pass
                 try:
                     # Dispatch can take a full multi-project cycle. Consume the
                     # service's latest completion before deciding to stay alive.

@@ -95,6 +95,7 @@ from .helpers import (
     _recover_starting_reservations,
     _working_directory_reason,
 )
+from .inventory import InventoryReconciliation, exact_binding_for_entry
 from .scheduler_diagnostics import SchedulerDiagnosticStore
 
 _SCHEDULER_DIAGNOSTIC_PUBLISH_INTERVAL_NS = 5_000_000_000
@@ -130,6 +131,113 @@ class PrimaryDemandProbe:
     diagnostics: tuple[dict[str, Any], ...] = ()
 
 
+def _enablement_reconciliation_probe(
+    runtime: MachineRuntime,
+    reconciliation: InventoryReconciliation | None,
+) -> dict[str, object]:
+    """Translate one exact registry/inventory observation into derived evidence."""
+    runtime_id = runtime.instance_id
+    base_identity: dict[str, object] = {
+        "producer": "enablement_reconciliation",
+        "component": "scheduler",
+        "stage": "reconciliation",
+        "check": "enablement",
+        "runtime_id": runtime_id,
+    }
+    if reconciliation is None:
+        identity = {
+            **base_identity,
+            "reason_code": "registry_enablement_unknown",
+            "scope_type": "machine",
+        }
+        return {
+            "identity": identity,
+            "outcome": "blocked",
+            "coverage": "unknown",
+            "source_revision": {},
+            "details": {"progress": "blocked"},
+            "findings": (
+                {
+                    "identity": identity,
+                    "severity": "fault",
+                    "source_revision": {},
+                    "details": {"progress": "blocked"},
+                },
+            ),
+            "covered_bindings": [],
+        }
+
+    source_revision = {
+        "registry_revision": reconciliation.registry_revision,
+        "inventory_revision": reconciliation.inventory_revision,
+    }
+    findings: list[dict[str, object]] = []
+    mirror_incomplete = "inventory_mirror_incomplete" in reconciliation.blockers
+    mirror_reason = "inventory_mirror_incomplete" if mirror_incomplete else "enablement_mirror_diverged"
+    entries_by_exact_binding = {(entry.project_id, entry.shared_root): entry for entry in reconciliation.entries}
+    for binding in reconciliation.bindings:
+        entry = entries_by_exact_binding.get((binding.project_id, binding.shared_root))
+        _exact_binding, conflict = (
+            exact_binding_for_entry(entry, reconciliation.bindings) if entry is not None else (None, True)
+        )
+        if entry is not None and not conflict and entry.enabled == binding.enabled:
+            continue
+        identity: dict[str, object] = {
+            **base_identity,
+            "reason_code": mirror_reason,
+            "scope_type": "project",
+            "project_id": binding.project_id,
+            "registry_revision": reconciliation.registry_revision,
+        }
+        if binding.registration_generation is not None:
+            identity["registration_generation"] = binding.registration_generation
+        findings.append(
+            {
+                "identity": identity,
+                "severity": "fault",
+                "source_revision": source_revision,
+                "details": {
+                    "progress": ("mirror_write_pending" if mirror_incomplete and entry is not None else "blocked")
+                },
+            }
+        )
+    if not reconciliation.converged and not findings:
+        findings.append(
+            {
+                "identity": {
+                    **base_identity,
+                    "reason_code": mirror_reason,
+                    "scope_type": "machine",
+                    "registry_revision": reconciliation.registry_revision,
+                },
+                "severity": "fault",
+                "source_revision": source_revision,
+                "details": {"progress": "blocked"},
+            }
+        )
+    decision_identity: dict[str, object] = {
+        **base_identity,
+        "reason_code": "enablement_converged" if reconciliation.converged else mirror_reason,
+        "scope_type": "machine",
+        "registry_revision": reconciliation.registry_revision,
+    }
+    return {
+        "identity": decision_identity,
+        "outcome": "converged" if reconciliation.converged else "blocked",
+        "coverage": "complete",
+        "source_revision": source_revision,
+        "details": {"progress": "converged" if reconciliation.converged else "blocked"},
+        "findings": findings,
+        "covered_bindings": [
+            {
+                "project_id": binding.project_id,
+                "registration_generation": binding.registration_generation,
+            }
+            for binding in reconciliation.bindings
+        ],
+    }
+
+
 def _scheduler_diagnostic_probe(
     runtime: MachineRuntime,
     *,
@@ -139,6 +247,7 @@ def _scheduler_diagnostic_probe(
     bindings: dict[str, ProjectBinding],
     covered_project_ids: set[str],
     available_capacity: int,
+    borrow_denied: bool = False,
 ) -> dict[str, object]:
     """Translate a completed primary probe without carrying rendered errors."""
     runtime_id = runtime.instance_id
@@ -187,18 +296,62 @@ def _scheduler_diagnostic_probe(
             }
         )
         blockers.append(identity)
+    decision_identity: dict[str, object] = {
+        "producer": "primary_probe",
+        "reason_code": "borrow_blocked_unresolved_primary" if borrow_denied else "primary_demand",
+        "component": "scheduler",
+        "stage": "admission",
+        "check": "primary_demand",
+        "scope_type": "machine_lane",
+        "runtime_id": runtime_id,
+        "resource_lane": lane,
+    }
+    decision_project_id = next(
+        (
+            item.get("project_id")
+            for item in probe.diagnostics
+            if isinstance(item.get("project_id"), str) and item.get("project_id") in bindings
+        ),
+        None,
+    )
+    if borrow_denied and decision_project_id is None:
+        decision_project_id = next(
+            (project_id for project_id, binding in sorted(bindings.items()) if binding.enabled),
+            None,
+        )
+    if isinstance(decision_project_id, str):
+        binding = bindings[decision_project_id]
+        decision_identity["scope_type"] = "project_route"
+        decision_identity["project_id"] = decision_project_id
+        if binding.registration_generation is not None:
+            decision_identity["registration_generation"] = binding.registration_generation
+        route_scope = next(
+            (
+                item.get("route_scope")
+                for item in probe.diagnostics
+                if item.get("project_id") == decision_project_id and isinstance(item.get("route_scope"), str)
+            ),
+            None,
+        )
+        if route_scope in {"home", "shared"}:
+            route = runtime.primary_probe.route((decision_project_id, route_scope, lane))
+        else:
+            route = next(
+                (
+                    runtime.primary_probe.route((decision_project_id, scope, lane))
+                    for scope in ("shared", "home")
+                    if runtime.primary_probe.route((decision_project_id, scope, lane)).revision is not None
+                ),
+                None,
+            )
+        if route is not None and route.revision is not None:
+            decision_identity["ready_revision"] = route.revision
+            source_revision["ready_revision"] = route.revision
+    if borrow_denied:
+        decision_identity["registry_revision"] = registry_revision
     return {
-        "identity": {
-            "producer": "primary_probe",
-            "reason_code": "primary_demand",
-            "component": "scheduler",
-            "stage": "admission",
-            "check": "primary_demand",
-            "scope_type": "machine_lane",
-            "runtime_id": runtime_id,
-            "resource_lane": lane,
-        },
-        "outcome": probe.state,
+        "identity": decision_identity,
+        "outcome": "blocked" if borrow_denied else probe.state,
         "coverage": "complete" if probe.state == "no_primary_demand" else "incomplete",
         "capacity_context": {"available": available_capacity},
         "blocker_identities": blockers,
@@ -1356,6 +1509,8 @@ def _dispatch_machine_cycle_locked(
 
     last_successful_project_id: str | None = None
     scheduler_diagnostic_probes: list[dict[str, object]] = []
+    if runtime.last_enablement_reconciliation_probe is not None:
+        scheduler_diagnostic_probes.append(runtime.last_enablement_reconciliation_probe)
     diagnostic_bindings = {binding.project_id: binding for binding in registered}
     # CPU and GPU borrowing are separate admission domains.  A busy primary queue in one
     # lane must never turn the other lane's complete no-demand probe into a denial.
@@ -1404,6 +1559,7 @@ def _dispatch_machine_cycle_locked(
                 bindings=diagnostic_bindings,
                 covered_project_ids=(enabled_ids - set(upgrade_blocked)),
                 available_capacity=(len(free) if lane == "gpu" else free_cpu_slots),
+                borrow_denied=has_capacity and probe.state == "unresolved",
             )
         )
         diagnostic_increment(f"scheduler.primary_probe.{lane}.{probe.state}")

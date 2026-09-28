@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-25
+updated_at: 2026-09-28
 archived_at:
 ---
 
@@ -298,6 +298,50 @@ expansion. Legacy registry bindings become inventory entries with `name_source=u
 current authority remains usable, but re-enrollment requires one-Project source confirmation.
 `project enable` revalidates current registration authority before enabling admission. Legacy
 Project metadata continues to require the distinct migration workflow.
+
+### 3.1 Registry-authoritative enablement convergence
+
+For each exact live binding, registry enablement is authoritative and inventory
+enablement is a mirror. Inventory-only entries retain reusable intent. A missing,
+malformed, unreadable, or unsupported registry never changes a live entry into
+inventory-only intent and never permits inventory fallback.
+
+Enablement mutations serialize in lifecycle -> inventory -> registry lock order.
+The caller validates current runtime identity/generation and registration
+generation, then durably replaces the registry with the requested value and an
+incremented registry revision. This registry replacement is the operation commit
+point and remains under the registry guard that also fences new claims. Enable
+additionally retains shared registration-authority validation; disable does not
+require a successful shared Project read.
+
+After commit, the caller copies only the effective registry value to the exact
+inventory entry matched by both Project ID and canonical shared root. It
+preserves name provenance, all unrelated entries, and advances the independent
+inventory revision only when content changes. Success is reported only after
+both replacements return durably. Inventory failure never rewrites registry.
+
+Before startup consumes inventory enablement, and before registration/pool
+replay, removal, runtime replacement, or another enablement mutation consumes or
+replaces enrollment intent, the same lock order loads fresh records and repairs
+each exact live binding from registry. Reconciliation holds the registry guard
+through comparison and inventory publication. It creates or deletes no inventory
+membership, stores no desired-state journal or recovery payload, and never
+writes registry. A newer registry revision or replacement generation is consumed
+fresh. Missing exact inventory membership, identity/path conflict, or independent
+binding-loss evidence is a blocker rather than permission to reconstruct state.
+
+While a mirror write is pending, existing valid registry-authorized scheduling
+and supervision may continue. Operations that consume or replace stale
+enrollment intent remain blocked. Agent readiness reports incomplete convergence
+and does not accept stale inventory as ready.
+
+Registry publication classifies failures by the atomic primitive's observed
+stage. Positive pre-replace failure plus an uncached validation of the exact old
+revision is `not_committed`. A normally returned durable replace is direct commit
+proof. Failure during or after replacement, directory-fsync failure, unreadable
+state, unexpected revision, or identity/generation drift is `outcome_unknown`.
+An uncached reread may report a visible revision but cannot convert a failed
+parent-directory fsync into durability proof.
 
 ## 4. Runtime Invariants
 
@@ -1360,6 +1404,30 @@ sanitized details. Summary owns the bounded status projections and aggregates.
 History segments own a contiguous ordered list of resolved entries; the index
 owns ordered segment names and their first/last sequence and byte count.
 
+Enablement and borrow observations use this store only as derived evidence:
+
+- an admission decision blocked by unresolved enabled primary demand uses
+  `reason_code=borrow_blocked_unresolved_primary`, the resource lane, known
+  blocking Project ID, probe scope/revision, and coverage; its identity includes
+  runtime identity, binding generation, lane, and observation revision;
+- registry/inventory disagreement uses `producer=enablement_reconciliation` and
+  `reason_code=enablement_mirror_diverged`;
+- a committed registry value whose inventory mirror cannot be durably published
+  uses the same producer and `reason_code=inventory_mirror_incomplete`;
+- malformed, unreadable, unsupported, or publication-unknown registry state uses
+  that producer and `reason_code=registry_enablement_unknown`.
+
+Reconciliation finding identity includes runtime identity/generation, Project
+ID, registration generation, and observed registry revision. It resolves only
+after an exact current reread and durable matching mirror publication; a newer
+registry revision begins fresh reconciliation. Unknown registry state resolves
+only after a validated registry reread establishes authority. Repeated mirror
+failure coalesces into one episode. Recovery progress is one of `detected`,
+`mirror_write_pending`, `converged`, or `blocked`. Persisted detail is limited to
+the scheduler diagnostic allowlist: identifiers, enums, revisions, booleans,
+durations, saturating counts, coverage, and timestamps. Explicit operator
+enable/disable is a bounded latest decision, not a fault or audit stream.
+
 Cursor decoding and all filters are validated before store I/O. The cursor's
 resume position is the last examined sequence: it equals the last returned
 sequence when every examined entry matches, and may advance across examined
@@ -2306,6 +2374,15 @@ A borrow admission linearizes against this trusted capacity snapshot. Primary wo
 offered after the completed probe is observed in the next scheduling decision and does not revoke
 an already-created borrow reservation.
 
+The no-primary-demand result remains valid only through the existing borrow
+authorization boundary. Every enabled binding contributes either established
+demand absence or an unresolved block in its resource lane. Explicit registry
+disablement ordered before claim commit removes that binding from later claim
+and demand eligibility, but not from reservation accounting or supervision.
+Disable ordered after claim commit does not revoke the claim or add a launch
+gate. Re-enable invalidates no-demand evidence from the disabled interval and
+does not preempt an existing borrow Attempt.
+
 Machine-agent recovery of `starting` Attempts is driven only by the final active-reservation
 snapshot. It opens the exact project Task and Attempt and requires the reservation ID, Attempt ID,
 fencing token, machine, claim, and launch state to agree before replaying the existing launch gate.
@@ -3059,6 +3136,10 @@ retention does not change the active projection gate.
 | CW-17 | Recovery races with drain/remove or terminating cancellation | Group-then-Task lock order yields one result; forbidden recovery terminates or quarantines the process |
 | CW-18 | CLI restarts while Group cancellation waits for acknowledgements | Durable Group control operation resumes with the same pending-machine set |
 | CW-19 | Schema/capability mutation races an authoritative Task or Group writer | Exclusive schema mutation waits for the writer; the writer observes one schema protocol for its complete authority section |
+| CW-20 | Enable/disable fails before registry replace | Exact old registry authority remains; inventory is unchanged and the result is `not_committed` only with positive pre-replace proof |
+| CW-21 | Enable/disable fails during or after registry replace | Registry is old or new but never torn; uncertain durability reports `outcome_unknown` and inventory never decides authority |
+| CW-22 | Registry commits before inventory mirror | New registry value is effective; result is partial, and fresh reconciliation repairs inventory without reverting registry |
+| CW-23 | Reconciliation races newer enablement or replacement generation | Fresh registry identity/revision wins; stale work cannot modify the successor binding or replay an old desired value |
 
 ## 22. Verification Requirements
 

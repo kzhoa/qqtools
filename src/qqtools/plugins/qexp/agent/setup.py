@@ -8,6 +8,7 @@ import shlex
 import shutil
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -17,7 +18,7 @@ from ..layout import initialize_shared_root, load_root_config, project_id, valid
 from ..runtime.authority_scan import iter_evidence_files
 from ..runtime.paths import shared_paths
 from ..runtime.process_evidence import inspect_local_group_identity, inspect_wrapper_identity
-from ..runtime.store import atomic_replace, read_json
+from ..runtime.store import AtomicReplaceError, atomic_replace, read_json
 from .config import (
     DEFAULT_AGENT_MODE,
     AgentConfig,
@@ -33,12 +34,14 @@ from .identity import load_identity_record, require_fresh_runtime
 from .inventory import (
     ProjectInventoryEntry,
     canonical_shared_root,
+    exact_binding_for_entry,
     find_inventory_entries,
     inventory_status,
     load_inventory,
+    reconcile_live_bindings_locked,
     save_inventory_locked,
 )
-from .project_admin import enable_project, register_project, set_project_enabled, unregister_project
+from .project_admin import register_project, unregister_project
 
 
 class SetupUsageError(ValueError):
@@ -415,6 +418,11 @@ def initialize_machine(
         if old_id is None and transaction is not None:
             old_id = transaction.get("old_runtime_id")
         reported_old_id = transaction.get("old_runtime_id") if transaction is not None else old_id
+        if transaction is not None and transaction.get("phase") in {"staged", "archived"}:
+            with machine_runtime.inventory_guard():
+                with machine_runtime.registry_guard():
+                    reconciliation = _reconcile_inventory_for_intent(machine_runtime)
+                _require_unblocked_reconciliation(reconciliation)
         if old_id is None and transaction is None:
             require_fresh_runtime(machine_runtime.root)
             # Empty detachment is intentionally a no-op and is never persisted.
@@ -467,6 +475,10 @@ def initialize_machine(
             if not confirmed:
                 facts.update({"requested_name": target_name, "requested_agent_mode": selected_mode})
                 raise MachineResetConfirmationRequired(facts)
+            with machine_runtime.inventory_guard():
+                with machine_runtime.registry_guard():
+                    reconciliation = _reconcile_inventory_for_intent(machine_runtime)
+                _require_unblocked_reconciliation(reconciliation)
             if selected_mode is None:
                 try:
                     current = load_agent_config(machine_runtime)
@@ -615,10 +627,59 @@ def initialize_project(shared_root: str | Path | None = None) -> dict[str, Any]:
 def _entry_by_identity(
     entries: list[ProjectInventoryEntry], stable_id: str, root: Path
 ) -> ProjectInventoryEntry | None:
-    for entry in entries:
-        if entry.project_id == stable_id or entry.shared_root == root:
-            return entry
-    return None
+    matches = [entry for entry in entries if entry.project_id == stable_id or entry.shared_root == root]
+    if len(matches) > 1 or any(entry.project_id != stable_id or entry.shared_root != root for entry in matches):
+        raise SetupOperationalError("Project inventory identity and shared path conflict.")
+    return matches[0] if matches else None
+
+
+def _reconcile_inventory_for_intent(machine_runtime: MachineRuntime):
+    try:
+        result = reconcile_live_bindings_locked(machine_runtime)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        raise SetupOperationalError(
+            "machine registry or Project inventory is unavailable; preserve local state and retry."
+        ) from exc
+    return result
+
+
+def _require_unblocked_reconciliation(result: Any) -> None:
+    if not result.converged:
+        blockers = ", ".join(result.blockers) or "inventory_mirror_incomplete"
+        raise SetupOperationalError(f"Project inventory reconciliation is incomplete: {blockers}.")
+
+
+def _enablement_result(
+    entry: ProjectInventoryEntry,
+    binding: Any,
+    *,
+    requested_enabled: bool,
+    status: str,
+    registry_revision: int | None,
+    inventory_revision: int | None,
+    inventory_converged: bool,
+    reason: str | None,
+) -> dict[str, Any]:
+    result = _result_for_binding(
+        entry,
+        binding,
+        status=status,
+        reason=reason,
+    )
+    result.update(
+        {
+            "action": "project_enabled" if requested_enabled else "project_disabled",
+            "requested_enabled": requested_enabled,
+            "effective_enabled": binding.enabled if status != "outcome_unknown" else None,
+            "registry_revision": registry_revision,
+            "inventory_revision": inventory_revision,
+            "inventory_converged": inventory_converged,
+            "reason": reason,
+        }
+    )
+    if status == "outcome_unknown":
+        result["enabled"] = None
+    return result
 
 
 def _result_for_binding(
@@ -740,7 +801,11 @@ def register_projects(
     config = load_agent_config(machine_runtime)
     with machine_runtime.agent_lifecycle_guard():
         with machine_runtime.inventory_guard():
-            revision, entries = load_inventory(machine_runtime)
+            with machine_runtime.registry_guard():
+                reconciliation = _reconcile_inventory_for_intent(machine_runtime)
+            _require_unblocked_reconciliation(reconciliation)
+            revision = reconciliation.inventory_revision
+            entries = list(reconciliation.entries)
             selection_failures: list[dict[str, Any]] = []
             if from_pool:
                 selected_entries = list(entries)
@@ -771,17 +836,10 @@ def register_projects(
                         )
                         continue
                     current = _entry_by_identity(entries, stable_id, root)
-                    try:
-                        binding = next(
-                            (
-                                item
-                                for item in machine_runtime.load_registry()[1]
-                                if item.project_id == stable_id or item.shared_root == root
-                            ),
-                            None,
-                        )
-                    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                        binding = None
+                    exact_entry = current or ProjectInventoryEntry(stable_id, root)
+                    binding, binding_conflict = exact_binding_for_entry(exact_entry, reconciliation.bindings)
+                    if binding_conflict:
+                        raise SetupOperationalError("Project registry identity and shared path conflict.")
                     effective, source, override = _name_intent(
                         machine_runtime,
                         config,
@@ -804,14 +862,9 @@ def register_projects(
             results: list[dict[str, Any]] = list(selection_failures)
             for selected in selected_entries:
                 entry = next((item for item in entries if item.project_id == selected.project_id), selected)
-                binding = next(
-                    (
-                        item
-                        for item in machine_runtime.load_registry()[1]
-                        if item.project_id == entry.project_id or item.shared_root == entry.shared_root
-                    ),
-                    None,
-                )
+                binding, binding_conflict = exact_binding_for_entry(entry, reconciliation.bindings)
+                if binding_conflict:
+                    raise SetupOperationalError("Project registry identity and shared path conflict.")
                 if from_pool and entry.name_source == "unresolved":
                     results.append(
                         _result_for_binding(entry, binding, status="conflicting", reason="name_source_unresolved")
@@ -874,7 +927,12 @@ def register_projects(
 
 def list_projects(runtime: MachineRuntime | str | Path | None) -> dict[str, Any]:
     machine_runtime = _runtime(runtime)
-    return inventory_status(machine_runtime)
+    try:
+        return inventory_status(machine_runtime)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        raise SetupOperationalError(
+            "machine Project registry or inventory is unavailable; registry enablement cannot fall back to inventory."
+        ) from exc
 
 
 def _selected_entry(
@@ -895,19 +953,25 @@ def remove_project(runtime: MachineRuntime | str | Path | None, selector: str | 
     machine_runtime.require_initialized()
     with machine_runtime.agent_lifecycle_guard():
         with machine_runtime.inventory_guard():
-            revision, entries, entry = _selected_entry(machine_runtime, selector)
+            with machine_runtime.registry_guard():
+                _selected_entry(machine_runtime, selector)
+                reconciliation = _reconcile_inventory_for_intent(machine_runtime)
+            _require_unblocked_reconciliation(reconciliation)
+            revision = reconciliation.inventory_revision
+            entries = list(reconciliation.entries)
+            matches = find_inventory_entries(entries, selector)
+            if len(matches) != 1:
+                if not matches:
+                    raise SetupUsageError(f"machine Project inventory has no entry for {selector!r}.")
+                raise SetupUsageError(f"machine Project inventory selector {selector!r} is ambiguous.")
+            entry = matches[0]
             if machine_runtime.paths["replacement_transaction"].exists():
                 raise SetupOperationalError("Project removal is blocked by a pending machine replacement.")
             if machine_runtime.paths["registration_transaction"].exists():
                 raise SetupOperationalError("Project removal is blocked by pending registration recovery.")
-            binding = next(
-                (
-                    item
-                    for item in machine_runtime.load_registry()[1]
-                    if item.project_id == entry.project_id or item.shared_root == entry.shared_root
-                ),
-                None,
-            )
+            binding, binding_conflict = exact_binding_for_entry(entry, reconciliation.bindings)
+            if binding_conflict:
+                raise SetupOperationalError("Project registry identity and shared path conflict.")
             if binding is not None:
                 unregister_project(machine_runtime, binding.project_id)
             entries = [item for item in entries if item != entry]
@@ -926,45 +990,184 @@ def set_project_enablement(
     selector: str | Path,
     enabled: bool,
 ) -> dict[str, Any]:
+    if type(enabled) is not bool:
+        raise SetupUsageError("project enablement must be a bool.")
     machine_runtime = _runtime(runtime)
     machine_runtime.require_initialized()
     with machine_runtime.agent_lifecycle_guard():
         with machine_runtime.inventory_guard():
-            revision, entries, entry = _selected_entry(machine_runtime, selector)
-            binding = next(
-                (
-                    item
-                    for item in machine_runtime.load_registry()[1]
-                    if item.project_id == entry.project_id or item.shared_root == entry.shared_root
-                ),
-                None,
-            )
-            if binding is None:
-                raise SetupUsageError(f"Project {entry.project_id!r} is not registered.")
-            updated_binding = (
-                enable_project(machine_runtime, binding.project_id)
-                if enabled
-                else set_project_enabled(machine_runtime, binding.project_id, False)
-            )
-            updated_entry = ProjectInventoryEntry(
-                entry.project_id,
-                entry.shared_root,
-                enabled,
-                entry.name_source,
-                entry.name_override,
-            )
-            save_inventory_locked(
-                machine_runtime,
-                revision + 1,
-                [updated_entry if item == entry else item for item in entries],
-            )
-            result = _result_for_binding(
-                updated_entry,
-                updated_binding,
-                status="registered" if enabled else "disabled",
-            )
-            result["action"] = "project_enabled" if enabled else "project_disabled"
-            return result
+            with machine_runtime.registry_guard():
+                _selected_entry(machine_runtime, selector)
+                reconciliation = _reconcile_inventory_for_intent(machine_runtime)
+                entries = list(reconciliation.entries)
+                matches = find_inventory_entries(entries, selector)
+                if len(matches) != 1:
+                    if not matches:
+                        raise SetupUsageError(f"machine Project inventory has no entry for {selector!r}.")
+                    raise SetupUsageError(f"machine Project inventory selector {selector!r} is ambiguous.")
+                entry = matches[0]
+                binding, binding_conflict = exact_binding_for_entry(entry, reconciliation.bindings)
+                if binding_conflict:
+                    raise SetupOperationalError("Project registry identity and shared path conflict.")
+                if binding is None:
+                    raise SetupUsageError(f"Project {entry.project_id!r} is not registered.")
+                if (
+                    binding.runtime_instance_id != machine_runtime.instance_id
+                    or binding.runtime_root not in {None, str(machine_runtime.root)}
+                    or not isinstance(binding.registration_generation, str)
+                    or not binding.registration_generation
+                ):
+                    raise SetupOperationalError("Project binding belongs to a different runtime generation.")
+                structural_blockers = [
+                    blocker for blocker in reconciliation.blockers if blocker != "inventory_mirror_incomplete"
+                ]
+                if structural_blockers:
+                    raise SetupOperationalError(
+                        "Project inventory reconciliation is blocked: " + ", ".join(structural_blockers) + "."
+                    )
+                if "inventory_mirror_incomplete" in reconciliation.blockers:
+                    if binding.enabled == enabled:
+                        return _enablement_result(
+                            entry,
+                            binding,
+                            requested_enabled=enabled,
+                            status="partially_committed",
+                            registry_revision=reconciliation.registry_revision,
+                            inventory_revision=reconciliation.inventory_revision,
+                            inventory_converged=False,
+                            reason="inventory_mirror_incomplete",
+                        )
+                    raise SetupOperationalError(
+                        "Project inventory mirror repair is incomplete; retry before changing enablement."
+                    )
+                if enabled and not machine_runtime.binding_write_eligible(binding, renew=True):
+                    authority = machine_runtime.registration_status(binding)
+                    raise SetupOperationalError(
+                        f"cannot enable project {binding.project_id!r}: registration is "
+                        f"{authority.get('state', 'unavailable')}; resolve registration authority first."
+                    )
+
+                registry_revision = reconciliation.registry_revision
+                inventory_revision = reconciliation.inventory_revision
+                updated_binding = replace(binding, enabled=enabled)
+                updated_bindings = [updated_binding if item == binding else item for item in reconciliation.bindings]
+                try:
+                    persisted_registry = machine_runtime.registration.save_registry_locked(
+                        registry_revision + 1,
+                        updated_bindings,
+                    )
+                except OSError as exc:
+                    atomic_error = exc if isinstance(exc, AtomicReplaceError) else None
+                    reread_revision: int | None = None
+                    reread_binding = None
+                    try:
+                        reread_revision, reread_bindings = machine_runtime.load_registry_uncached()
+                        reread_binding, reread_conflict = exact_binding_for_entry(entry, reread_bindings)
+                        if reread_conflict:
+                            reread_binding = None
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                        reread_revision = None
+                        reread_binding = None
+                    same_runtime = machine_runtime.instance_id == binding.runtime_instance_id
+                    prior_is_visible = (
+                        atomic_error is not None
+                        and atomic_error.stage == "pre_replace"
+                        and reread_revision == registry_revision
+                        and reread_binding == binding
+                        and same_runtime
+                    )
+                    if prior_is_visible:
+                        return _enablement_result(
+                            entry,
+                            binding,
+                            requested_enabled=enabled,
+                            status="not_committed",
+                            registry_revision=registry_revision,
+                            inventory_revision=inventory_revision,
+                            inventory_converged=True,
+                            reason="registry_not_committed",
+                        )
+                    return _enablement_result(
+                        entry,
+                        binding,
+                        requested_enabled=enabled,
+                        status="outcome_unknown",
+                        registry_revision=reread_revision,
+                        inventory_revision=inventory_revision,
+                        inventory_converged=False,
+                        reason="registry_outcome_unknown",
+                    )
+                if persisted_registry is None:
+                    reread_revision = None
+                    try:
+                        reread_revision, _reread_bindings = machine_runtime.load_registry_uncached()
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                        pass
+                    return _enablement_result(
+                        entry,
+                        binding,
+                        requested_enabled=enabled,
+                        status="outcome_unknown",
+                        registry_revision=reread_revision,
+                        inventory_revision=inventory_revision,
+                        inventory_converged=False,
+                        reason="registry_outcome_unknown",
+                    )
+
+                committed_revision = registry_revision + 1
+                if entry.enabled == enabled:
+                    return _enablement_result(
+                        entry,
+                        updated_binding,
+                        requested_enabled=enabled,
+                        status="committed",
+                        registry_revision=committed_revision,
+                        inventory_revision=inventory_revision,
+                        inventory_converged=True,
+                        reason=None,
+                    )
+                updated_entry = ProjectInventoryEntry(
+                    entry.project_id,
+                    entry.shared_root,
+                    enabled,
+                    entry.name_source,
+                    entry.name_override,
+                )
+                updated_entries = [updated_entry if item == entry else item for item in entries]
+                try:
+                    persisted_inventory = save_inventory_locked(
+                        machine_runtime,
+                        inventory_revision + 1,
+                        updated_entries,
+                    )
+                except OSError:
+                    persisted_inventory = None
+                if persisted_inventory is None:
+                    observed_inventory_revision: int | None = None
+                    try:
+                        observed_inventory_revision, _observed_entries = load_inventory(machine_runtime)
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                        pass
+                    return _enablement_result(
+                        updated_entry,
+                        updated_binding,
+                        requested_enabled=enabled,
+                        status="partially_committed",
+                        registry_revision=committed_revision,
+                        inventory_revision=observed_inventory_revision,
+                        inventory_converged=False,
+                        reason="inventory_mirror_incomplete",
+                    )
+                return _enablement_result(
+                    updated_entry,
+                    updated_binding,
+                    requested_enabled=enabled,
+                    status="committed",
+                    registry_revision=committed_revision,
+                    inventory_revision=inventory_revision + 1,
+                    inventory_converged=True,
+                    reason=None,
+                )
 
 
 def get_agent_config(runtime: MachineRuntime | str | Path | None) -> dict[str, Any]:

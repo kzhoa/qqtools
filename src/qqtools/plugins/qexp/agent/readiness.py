@@ -12,21 +12,44 @@ from ..runtime.store import read_json
 from .config import load_agent_config
 from .context import MachineRuntime
 from .helpers import _active_machine_identity
-from .inventory import ProjectInventoryEntry, load_inventory
+from .inventory import ProjectInventoryEntry, exact_binding_for_entry, reconcile_live_bindings_locked
 
 DEFAULT_START_TIMEOUT_SECONDS = 30.0
 
 
 def capture_readiness_snapshot(runtime: MachineRuntime | str | Path | None) -> dict[str, Any]:
-    """Freeze the enabled inventory revision selected by one start request."""
+    """Freeze effective enabled bindings selected by one start request."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     machine_runtime.require_initialized()
-    revision, entries = load_inventory(machine_runtime)
-    enabled = [entry for entry in entries if entry.enabled]
+    try:
+        with machine_runtime.agent_lifecycle_guard():
+            with machine_runtime.inventory_guard():
+                with machine_runtime.registry_guard():
+                    reconciliation = reconcile_live_bindings_locked(machine_runtime)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return {
+            "inventory_revision": None,
+            "registry_revision": None,
+            "project_ids": [],
+            "entries": [],
+            "reconciliation_blockers": ["registry_enablement_unknown"],
+            "inventory_converged": False,
+        }
+    bindings = reconciliation.bindings
+    enabled_ids = {binding.project_id for binding in bindings if binding.enabled}
+    for entry in reconciliation.entries:
+        binding, conflict = exact_binding_for_entry(entry, bindings)
+        if conflict and entry.enabled:
+            enabled_ids.add(entry.project_id)
+        elif binding is None and entry.enabled:
+            enabled_ids.add(entry.project_id)
     return {
-        "inventory_revision": revision,
-        "project_ids": [entry.project_id for entry in enabled],
-        "entries": [entry.to_dict() for entry in enabled],
+        "inventory_revision": reconciliation.inventory_revision,
+        "registry_revision": reconciliation.registry_revision,
+        "project_ids": sorted(enabled_ids),
+        "entries": [entry.to_dict() for entry in reconciliation.entries],
+        "reconciliation_blockers": list(reconciliation.blockers),
+        "inventory_converged": reconciliation.converged,
     }
 
 
@@ -65,10 +88,32 @@ def evaluate_readiness(runtime: MachineRuntime | str | Path | None, snapshot: di
             "error": str(exc),
             "projects": [],
             "inventory_revision": None,
+            "registry_revision": None,
+            "inventory_converged": False,
             "captured_inventory_revision": snapshot.get("inventory_revision"),
         }
-    revision, entries = load_inventory(machine_runtime)
+    try:
+        with machine_runtime.agent_lifecycle_guard():
+            with machine_runtime.inventory_guard():
+                with machine_runtime.registry_guard():
+                    reconciliation = reconcile_live_bindings_locked(machine_runtime)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return {
+            "machine_runtime_root": str(machine_runtime.root),
+            "ready": False,
+            "reason": "registry_enablement_unknown",
+            "reasons": ["registry_enablement_unknown"],
+            "runtime_id": machine_runtime.instance_id,
+            "inventory_revision": None,
+            "registry_revision": None,
+            "captured_inventory_revision": snapshot.get("inventory_revision"),
+            "captured_registry_revision": snapshot.get("registry_revision"),
+            "inventory_converged": False,
+            "projects": [],
+        }
+    revision, entries = reconciliation.inventory_revision, list(reconciliation.entries)
     captured_revision = snapshot.get("inventory_revision")
+    captured_registry_revision = snapshot.get("registry_revision")
     entry_map = {entry.project_id: entry for entry in entries}
     status = _status(machine_runtime)
     identity = _active_machine_identity(machine_runtime)
@@ -78,6 +123,12 @@ def evaluate_readiness(runtime: MachineRuntime | str | Path | None, snapshot: di
         reasons.append("no_enabled_projects")
     if revision != captured_revision:
         reasons.append("concurrent_inventory_change")
+    if reconciliation.registry_revision != captured_registry_revision:
+        reasons.append("concurrent_registry_change")
+    if not reconciliation.converged:
+        reasons.extend(reconciliation.blockers or ("inventory_mirror_incomplete",))
+    if snapshot.get("reconciliation_blockers"):
+        reasons.append("captured_enablement_reconciliation_incomplete")
     if identity is None:
         reasons.append("agent_not_ready")
     if status.get("runtime_id") != machine_runtime.instance_id:
@@ -90,16 +141,37 @@ def evaluate_readiness(runtime: MachineRuntime | str | Path | None, snapshot: di
     if not isinstance(reconciled, list):
         reconciled = []
     reconciled_ids = set(item for item in reconciled if isinstance(item, str))
-    bindings = machine_runtime.load_registry()[1]
+    bindings = reconciliation.bindings
+    bindings_by_project = {binding.project_id: binding for binding in bindings}
     for project_id in snapshot.get("project_ids", []):
         entry = entry_map.get(project_id)
-        binding = next((item for item in bindings if item.project_id == project_id), None)
+        binding = bindings_by_project.get(project_id)
         project: dict[str, Any] = {"project_id": project_id, "status": "unknown", "reason": None}
         if entry is None:
             project.update(status="conflicting", reason="inventory_entry_removed")
         elif binding is None:
-            project.update(status="inventory_only", reason="not_registered")
+            _binding, conflict = exact_binding_for_entry(entry, bindings)
+            project.update(
+                status="conflicting" if conflict else "inventory_only",
+                reason="identity_path_conflict" if conflict else "not_registered",
+            )
         else:
+            exact_binding, conflict = exact_binding_for_entry(entry, bindings)
+            if conflict or exact_binding != binding:
+                project.update(status="conflicting", reason="identity_path_conflict")
+                projects.append(project)
+                reasons.append(f"{project_id}:{project['reason']}")
+                continue
+            if not binding.enabled:
+                project.update(status="disabled", reason="registry_disabled_after_capture")
+                projects.append(project)
+                reasons.append(f"{project_id}:{project['reason']}")
+                continue
+            if entry.enabled != binding.enabled:
+                project.update(status="registered", reason="inventory_mirror_incomplete")
+                projects.append(project)
+                reasons.append(f"{project_id}:{project['reason']}")
+                continue
             try:
                 if is_legacy_agent_project(binding.root_config()):
                     project.update(status="conflicting", reason="legacy_project_requires_migration")
@@ -137,7 +209,11 @@ def evaluate_readiness(runtime: MachineRuntime | str | Path | None, snapshot: di
         "requested_policy_revision": config.revision,
         "observed_policy_revision": status.get("policy_revision_acknowledged"),
         "inventory_revision": revision,
+        "registry_revision": reconciliation.registry_revision,
         "captured_inventory_revision": captured_revision,
+        "captured_registry_revision": captured_registry_revision,
+        "inventory_converged": reconciliation.converged,
+        "enablement_blockers": list(reconciliation.blockers),
         "projects": projects,
     }
 

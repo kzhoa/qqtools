@@ -8,7 +8,7 @@ import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterator, Literal, TypeVar
 
 from .work_budget import diagnostic_increment, diagnostic_span
 
@@ -29,6 +29,24 @@ class JSONRecordSizeError(ValueError):
         self.record_type = record_type
         self.actual_bytes = actual_bytes
         self.limit_bytes = limit_bytes
+
+
+AtomicReplaceStage = Literal["pre_replace", "replace_unknown", "post_replace"]
+AtomicReplaceOutcome = Literal["not_replaced", "replacement_unknown", "durability_unknown"]
+
+
+class AtomicReplaceError(OSError):
+    """An OS failure classified by its position in an atomic replacement."""
+
+    def __init__(self, stage: AtomicReplaceStage, cause: OSError) -> None:
+        super().__init__(*cause.args)
+        self.stage = stage
+        self.outcome: AtomicReplaceOutcome = {
+            "pre_replace": "not_replaced",
+            "replace_unknown": "replacement_unknown",
+            "post_replace": "durability_unknown",
+        }[stage]
+        self.original_exception = cause
 
 
 @contextmanager
@@ -65,11 +83,17 @@ def atomic_replace(
     io_step_observer: Callable[[str], None] | None = None,
 ) -> os.stat_result | None:
     _require_migration_json_io_authorization()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary: str | None = None
     temporary_stat: os.stat_result | None = None
+    replace_started = False
+    replace_completed = False
+    result: os.stat_result | None = None
+    failure: BaseException | None = None
+    failure_traceback = None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         with os.fdopen(fd, "wb") as handle:
             if io_step_observer is not None:
                 io_step_observer("temp_write")
@@ -84,7 +108,9 @@ def atomic_replace(
             before_replace(temporary_stat)
         if io_step_observer is not None:
             io_step_observer("replace")
+        replace_started = True
         os.replace(temporary, path)
+        replace_completed = True
         if io_step_observer is not None:
             io_step_observer("directory_fsync")
         directory_fd = os.open(path.parent, os.O_DIRECTORY)
@@ -96,13 +122,33 @@ def atomic_replace(
         try:
             post_stat = os.lstat(path)
         except OSError:
-            return None
-        if temporary_stat is None or not _same_inode_witness(temporary_stat, post_stat):
-            return None
-        return post_stat
+            result = None
+        else:
+            if temporary_stat is None or not _same_inode_witness(temporary_stat, post_stat):
+                result = None
+            else:
+                result = post_stat
+    except BaseException as exc:
+        failure = exc
+        failure_traceback = exc.__traceback__
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        try:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
+        except OSError as exc:
+            if failure is None:
+                failure = exc
+                failure_traceback = exc.__traceback__
+            elif isinstance(failure, OSError):
+                failure.add_note(f"temporary-file cleanup also failed with {type(exc).__name__}.")
+    if failure is not None:
+        if isinstance(failure, OSError):
+            stage: AtomicReplaceStage = (
+                "pre_replace" if not replace_started else "post_replace" if replace_completed else "replace_unknown"
+            )
+            raise AtomicReplaceError(stage, failure).with_traceback(failure_traceback) from failure
+        raise failure.with_traceback(failure_traceback)
+    return result
 
 
 def _same_inode_witness(first: os.stat_result, second: os.stat_result) -> bool:
