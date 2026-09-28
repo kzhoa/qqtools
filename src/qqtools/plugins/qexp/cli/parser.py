@@ -683,6 +683,31 @@ def build_parser() -> argparse.ArgumentParser:
                 ),
             )
     agent_sub.choices["start"].add_argument("--timeout", type=float, default=30.0)
+    agent_diagnostics = agent_sub.add_parser("diagnostics", help="Inspect bounded machine-local scheduler diagnostics.")
+    diagnostics_sub = agent_diagnostics.add_subparsers(dest="agent_diagnostics_action", required=True)
+    for name in ("active", "history"):
+        diagnostic = diagnostics_sub.add_parser(
+            name,
+            help=(
+                "List current scheduler findings." if name == "active" else "List retained resolved scheduler findings."
+            ),
+        )
+        diagnostic.add_argument("--project-id")
+        if name == "active":
+            diagnostic.add_argument("--reason")
+            diagnostic.add_argument("--producer")
+            diagnostic.add_argument("--scope")
+        diagnostic.add_argument("--limit", type=int, default=32)
+        if name == "history":
+            diagnostic.add_argument("--cursor")
+        _add_output_format(diagnostic)
+        bind_command(
+            diagnostic,
+            handler=f"agent_diagnostics_{name}",
+            context=ContextKind.MACHINE,
+            modes=OutputMode.FINITE,
+            output_kinds=OutputKind.SCHEDULER_DIAGNOSTICS,
+        )
     agent_name = agent_sub.add_parser("name", help="Show or change the machine-global agent name.")
     agent_name.add_argument("--set-to", dest="set_to")
     _add_output_format(agent_name)

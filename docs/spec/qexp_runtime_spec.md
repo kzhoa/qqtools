@@ -1239,6 +1239,134 @@ Migration progress and the operator-controlled binding state are independent: re
 `active` migration never re-enables a disabled binding. The operation never automatically
 discovers, stops, or registers sibling projects.
 
+### 9.6 MachineRuntime scheduler diagnostic store
+
+Scheduler diagnostics use the existing MachineRuntime lock and same-filesystem
+durable atomic-JSON replacement contract. The container filesystem is not assumed
+to be a private physical disk; this format adds no filesystem guarantee beyond
+the MachineRuntime contract already required by qexp. SQLite, shared-database
+coordination, dual writes, and Project-root diagnostic copies are not used.
+
+The version-1 layout is:
+
+```text
+<MachineRuntime>/diagnostics/scheduler-v1/
+  metadata.json
+  summary.json
+  active/<identity-digest>.json
+  decisions/<decision-key-digest>.json
+  history/index.json
+  history/segments/<first-seq>-<last-seq>.json
+  pending/<transition-id>.json
+```
+
+One writer serializes publication with
+`locks/scheduler-diagnostics.lock` and never holds that lock while acquiring a
+Project truth lock. Active/decision records, metadata, summary, and the history
+index use durable atomic replace. History segments are immutable and become
+committed only when the atomic index references them. Digests select paths only;
+records validate the complete canonical identity. `summary.json` materializes
+status data, so status never enumerates active or decision directories.
+
+Each envelope has `diagnostics.schema_version=1`. New records contain only typed,
+allowlisted identifiers and facts, allowlisted exception type, numeric errno, and
+numeric JSON location. They never persist a rendered reason, traceback, raw
+exception message, path, command, environment value, or hash of a new unknown
+error. Sanitization failure becomes a constant unavailable summary. The existing
+bounded `degraded_reasons` digest rendering remains unchanged and is not imported
+into this store.
+
+Canonical finding identity begins with `(producer, reason_code, component,
+stage, check, scope_type)` and adds the producer's exact runtime/binding,
+work/build, Task generation, lane, route, or wake fence. Applicable keys are
+required; incomplete input remains `identity_incomplete`. A recurrence after
+resolution starts a new episode. Resolution names the identity, episode, captured
+observation revision, and covered source revision; stale success cannot clear a
+new observation or replacement generation.
+
+Resolution is fail-closed across files: publish a bounded pending transition,
+publish and index immutable history, remove only the matching active revision,
+refresh summary/metadata, then delete pending last. A pre-commit crash leaves the
+finding active; a post-history crash may show both records and incomplete
+coverage until bounded recovery validates and finishes the transition. If
+history capacity is unavailable, retain active evidence and incomplete coverage.
+
+Machine-wide hard limits are 4 KiB per finding/decision, 256 active findings or
+1 MiB, 1,024 resolved entries or 4 MiB or 30 days, 64 decision samples or
+256 KiB, 64 KiB per immutable history segment, 8 MiB live store, and 9 MiB
+physical peak including atomic temporaries. One coalesced batch is admitted per
+5 seconds, with at most 64 KiB newly encoded data, 16 storage operations, and
+10 ms cooperative admission work. Active overflow reserves an incomplete marker
+and cannot clear until each omitted producer scope is reconciled through its
+captured watermark. History evicts oldest complete segments and never treats
+eviction as resolution.
+
+An active query holds the shared diagnostic lock, examines at most 256 records /
+1 MiB plus metadata, and returns at most 128 KiB. History reads at most four
+files / 512 KiB and returns at most 128 KiB including envelope and cursor. Its
+versioned cursor is at most 1 KiB and contains store epoch, exact Project filter,
+captured maximum sequence, and last examined sequence. Appends beyond the maximum
+do not affect the traversal. Epoch replacement or eviction of a required range
+expires the cursor explicitly. Output-budget omission never advances past the
+omitted matching entry; filtering may advance only past examined nonmatches.
+
+`scheduler_diagnostics` summaries use `schema_version`, `status`, `coverage`,
+`observed_at`, `snapshot_revision`, `truncated`, and `reason`. Project status may
+include at most eight selected-binding findings/samples within the existing 32
+reads / 256 KiB per record / 2 MiB total budget. Agent status uses at most four
+reads / 512 KiB and includes at most sixteen machine samples. Diagnostic reads
+never open historical Project truth, create a scheduling obligation, or change a
+command's otherwise successful exit status.
+
+The active command's JSON object has exactly these required top-level fields;
+scope-specific aggregate and item objects may add documented fields:
+
+```text
+schema_version: 1
+action: diagnostics_active
+machine_runtime_root: string
+project_id: string | null
+coverage: complete | incomplete | unknown
+observed_at: RFC-3339 timestamp | null
+snapshot_revision: nonnegative integer | null
+total: nonnegative integer | null
+aggregates: object
+items: list
+truncated: boolean
+reason: stable reason code | null
+```
+
+The history object retains the common identity, coverage, items, truncation, and
+reason fields, sets `action=diagnostics_history`, omits `total` and `aggregates`,
+and requires:
+
+```text
+captured_at: RFC-3339 timestamp | null
+captured_max_sequence: nonnegative integer | null
+end_of_capture: boolean
+next_cursor: opaque string | null
+retention: object
+```
+
+Every persisted object has a top-level `diagnostics` object containing
+`schema_version=1`, a record `kind`, the store `epoch`, and kind-specific data.
+Metadata owns the monotonically increasing `snapshot_revision`, next history
+sequence, coverage/reason, overflow and eviction counters, and retained sequence
+window. Active records own canonical identity, episode, severity, first/last
+observation times, saturating observation count, source revision evidence, and
+sanitized details. Decision records own canonical decision identity, observation
+time, lane/route, outcome, capacity context, blocker identities, coverage, and
+sanitized details. Summary owns the bounded status projections and aggregates.
+History segments own a contiguous ordered list of resolved entries; the index
+owns ordered segment names and their first/last sequence and byte count.
+
+Cursor decoding and all filters are validated before store I/O. The cursor's
+resume position is the last examined sequence: it equals the last returned
+sequence when every examined entry matches, and may advance across examined
+nonmatching entries. It never advances across a matching entry withheld by the
+output budget. A supplied Project filter must equal the cursor filter; omitting
+it reuses the cursor filter.
+
 ## 10. Submission Protocol
 
 ### 10.1 Common Submission Pipeline

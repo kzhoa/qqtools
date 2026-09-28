@@ -22,6 +22,7 @@ from ..agent.lifecycle import (
 )
 from ..agent.project_admin import migrate_project, project_migration_state
 from ..agent.readiness import capture_readiness_snapshot, evaluate_readiness, wait_for_readiness
+from ..agent.scheduler_diagnostics import SchedulerDiagnosticStore
 from ..agent.setup import (
     SetupOperationalError,
     SetupUsageError,
@@ -66,6 +67,8 @@ LOCAL_HANDLERS = frozenset(
         "agent_run",
         "agent_name",
         "agent_status",
+        "agent_diagnostics_active",
+        "agent_diagnostics_history",
         "agent_stop",
         "agent_restart",
         "agent_config_gpus_show",
@@ -553,6 +556,29 @@ def dispatch_local(
                 },
             ),
         )
+    if handler in {"agent_diagnostics_active", "agent_diagnostics_history"}:
+        runtime = MachineRuntime(args.machine_runtime_root)
+        try:
+            runtime.require_initialized()
+            store = SchedulerDiagnosticStore(runtime)
+            filters = {
+                "project_id": args.project_id,
+                "limit": args.limit,
+            }
+            if handler == "agent_diagnostics_active":
+                payload = store.active_view(
+                    reason=args.reason,
+                    producer=args.producer,
+                    scope=args.scope,
+                    **filters,
+                )
+            else:
+                payload = store.history_view(cursor=args.cursor, **filters)
+        except MachineRuntimeUninitializedError as exc:
+            raise CliOperationalError(str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise CliUsageError(str(exc)) from exc
+        return CommandOutcome(0, CliOutput(OutputKind.SCHEDULER_DIAGNOSTICS, payload))
     if handler in {"agent_status", "agent_stop", "agent_restart"}:
         runtime = MachineRuntime(args.machine_runtime_root)
         if handler == "agent_status":

@@ -109,6 +109,7 @@ from .inventory import load_inventory
 from .project_admin import _stop_verified_legacy_agent, migrate_project
 from .recovery_capture import inspect_recovery_capture
 from .recovery_enrollment import RecoveryEnrollment
+from .scheduler_diagnostics import SchedulerDiagnosticStore, unavailable_summary
 
 
 class MachineAgentStartBlockedError(RuntimeError):
@@ -256,6 +257,10 @@ def get_machine_agent_status(
     }
     if diagnostics is not None:
         result["diagnostics"] = diagnostics
+    try:
+        result["scheduler_diagnostics"] = SchedulerDiagnosticStore(machine_runtime).summary_view()
+    except Exception:
+        result["scheduler_diagnostics"] = unavailable_summary(machine_runtime.root, reason="summary_unavailable")
     return result
 
 

@@ -95,12 +95,125 @@ from .helpers import (
     _recover_starting_reservations,
     _working_directory_reason,
 )
+from .scheduler_diagnostics import SchedulerDiagnosticStore
+
+_SCHEDULER_DIAGNOSTIC_PUBLISH_INTERVAL_NS = 5_000_000_000
+_PRIMARY_PROBE_FAULT_REASONS = frozenset(
+    {
+        "registry_unreadable",
+        "project_not_probeable",
+        "ready_index_unreadable",
+        "ready_index_unresolved",
+        "group_ready_members_unresolved",
+        "index_unreadable",
+        "marker_unreadable",
+        "task_truth_unreadable",
+        "group_unreadable",
+        "task_invalid",
+        "route_mismatch",
+        "marker_invalid",
+        "marker_identity_invalid",
+        "submission_identity_missing",
+        "submission_missing",
+        "submission_invalid",
+        "submission_state_invalid",
+        "group_missing",
+        "group_invalid",
+        "dependency_invalid",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
 class PrimaryDemandProbe:
     state: str
-    diagnostics: tuple[dict[str, str], ...] = ()
+    diagnostics: tuple[dict[str, Any], ...] = ()
+
+
+def _scheduler_diagnostic_probe(
+    runtime: MachineRuntime,
+    *,
+    lane: str,
+    probe: PrimaryDemandProbe,
+    registry_revision: int,
+    bindings: dict[str, ProjectBinding],
+    covered_project_ids: set[str],
+    available_capacity: int,
+) -> dict[str, object]:
+    """Translate a completed primary probe without carrying rendered errors."""
+    runtime_id = runtime.instance_id
+    source_revision = {"registry_revision": registry_revision}
+    findings: list[dict[str, object]] = []
+    blockers: list[dict[str, object]] = []
+    for diagnostic in probe.diagnostics:
+        reason = diagnostic.get("reason")
+        if not isinstance(reason, str) or reason not in _PRIMARY_PROBE_FAULT_REASONS:
+            continue
+        project_id = diagnostic.get("project_id")
+        binding = bindings.get(project_id) if isinstance(project_id, str) else None
+        identity: dict[str, object] = {
+            "producer": "primary_probe",
+            "reason_code": reason,
+            "component": "scheduler",
+            "stage": "admission",
+            "check": "primary_demand",
+            "scope_type": "project_route" if project_id is not None else "machine_lane",
+            "runtime_id": runtime_id,
+            "resource_lane": lane,
+        }
+        if isinstance(project_id, str):
+            identity["project_id"] = project_id
+        if binding is not None and binding.registration_generation is not None:
+            identity["registration_generation"] = binding.registration_generation
+        task_id = diagnostic.get("task_id")
+        if isinstance(task_id, str):
+            identity["task_id"] = task_id
+        task_generation = diagnostic.get("task_generation")
+        if type(task_generation) is int:
+            identity["task_generation"] = task_generation
+        route_scope = diagnostic.get("route_scope")
+        if isinstance(route_scope, str):
+            identity["route_scope"] = route_scope
+        details: dict[str, object] = {}
+        exception_type = diagnostic.get("exception_type")
+        if isinstance(exception_type, str):
+            details["exception_type"] = exception_type
+        findings.append(
+            {
+                "identity": identity,
+                "severity": "fault",
+                "source_revision": source_revision,
+                "details": details,
+            }
+        )
+        blockers.append(identity)
+    return {
+        "identity": {
+            "producer": "primary_probe",
+            "reason_code": "primary_demand",
+            "component": "scheduler",
+            "stage": "admission",
+            "check": "primary_demand",
+            "scope_type": "machine_lane",
+            "runtime_id": runtime_id,
+            "resource_lane": lane,
+        },
+        "outcome": probe.state,
+        "coverage": "complete" if probe.state == "no_primary_demand" else "incomplete",
+        "capacity_context": {"available": available_capacity},
+        "blocker_identities": blockers,
+        "source_revision": source_revision,
+        "details": {"probe_state": probe.state},
+        "findings": findings,
+        "covered_bindings": [
+            {
+                "project_id": project_id,
+                "registration_generation": bindings[project_id].registration_generation,
+            }
+            for project_id in sorted(covered_project_ids)
+            if project_id in bindings
+        ],
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,7 +509,10 @@ def _probe_primary_demand(
     try:
         _, bindings = runtime.load_registry()
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-        return PrimaryDemandProbe("unresolved", ({"reason": f"registry_unreadable:{exc}"},))
+        return PrimaryDemandProbe(
+            "unresolved",
+            ({"reason": "registry_unreadable", "exception_type": type(exc).__name__},),
+        )
     enabled_ids = {binding.project_id for binding in bindings if binding.enabled} - set(excluded_project_ids)
     unavailable = sorted(
         project_id for project_id in enabled_ids if project_id not in readable or project_id not in dispatchable
@@ -425,7 +541,13 @@ def _probe_primary_demand(
         try:
             ready_state = read_ready_index_state(cfg)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-            diagnostics.append({"project_id": project_id, "reason": f"ready_index_unreadable:{exc}"})
+            diagnostics.append(
+                {
+                    "project_id": project_id,
+                    "reason": "ready_index_unreadable",
+                    "exception_type": type(exc).__name__,
+                }
+            )
             return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
         if ready_state != "active":
             diagnostics.append({"project_id": project_id, "reason": "ready_index_unresolved"})
@@ -456,7 +578,14 @@ def _probe_primary_demand(
                     diagnostics.append({"project_id": project_id, "reason": "probe_budget_exhausted"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    diagnostics.append({"project_id": project_id, "reason": f"index_unreadable:{exc}"})
+                    diagnostics.append(
+                        {
+                            "project_id": project_id,
+                            "route_scope": scope,
+                            "reason": "index_unreadable",
+                            "exception_type": type(exc).__name__,
+                        }
+                    )
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 decision = runtime.primary_probe.begin_route(cursor_key, current_revision)
                 if decision.has_index_changed:
@@ -473,7 +602,14 @@ def _probe_primary_demand(
                     diagnostics.append({"project_id": project_id, "reason": "probe_budget_exhausted"})
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    diagnostics.append({"project_id": project_id, "reason": f"index_unreadable:{exc}"})
+                    diagnostics.append(
+                        {
+                            "project_id": project_id,
+                            "route_scope": scope,
+                            "reason": "index_unreadable",
+                            "exception_type": type(exc).__name__,
+                        }
+                    )
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 runtime.primary_probe.begin_route(cursor_key, observed_revision)
                 route = runtime.primary_probe.route(cursor_key)
@@ -484,7 +620,14 @@ def _probe_primary_demand(
                     peek = peek_primary_ready_marker(cfg, project_id, scope, cursor, budget)
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                     runtime.primary_probe.record_progress(cursor_key, cursor_before)
-                    diagnostics.append({"project_id": project_id, "reason": f"index_unreadable:{exc}"})
+                    diagnostics.append(
+                        {
+                            "project_id": project_id,
+                            "route_scope": scope,
+                            "reason": "index_unreadable",
+                            "exception_type": type(exc).__name__,
+                        }
+                    )
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 if peek.exhausted or peek.unresolved:
                     runtime.primary_probe.record_progress(cursor_key, cursor_before)
@@ -523,17 +666,29 @@ def _probe_primary_demand(
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                     runtime.primary_probe.record_progress(cursor_key, cursor_before)
                     diagnostics.append(
-                        {"project_id": project_id, "task_id": reference.task_id, "reason": f"marker_unreadable:{exc}"}
-                    )
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                if result.classification == "corrupt":
-                    diagnostics.append(
                         {
                             "project_id": project_id,
                             "task_id": reference.task_id,
-                            "reason": result.reason,
+                            "task_generation": reference.generation,
+                            "route_scope": scope,
+                            "reason": "marker_unreadable",
+                            "exception_type": type(exc).__name__,
                         }
                     )
+                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
+                if result.classification == "corrupt":
+                    corrupt_diagnostic: dict[str, Any] = {
+                        "project_id": project_id,
+                        "task_id": reference.task_id,
+                        "task_generation": reference.generation,
+                        "route_scope": scope,
+                        "reason": result.reason,
+                    }
+                    if result.diagnostic is not None:
+                        exception_type = result.diagnostic.as_dict().get("exception_type")
+                        if isinstance(exception_type, str):
+                            corrupt_diagnostic["exception_type"] = exception_type
+                    diagnostics.append(corrupt_diagnostic)
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 if result.classification == "temporarily_unavailable":
                     if result.diagnostic is not None:
@@ -572,7 +727,14 @@ def _probe_primary_demand(
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                     runtime.primary_probe.record_progress(cursor_key, cursor_before)
                     diagnostics.append(
-                        {"project_id": project_id, "task_id": task.task_id, "reason": f"task_truth_unreadable:{exc}"}
+                        {
+                            "project_id": project_id,
+                            "task_id": task.task_id,
+                            "task_generation": task.ready_generation,
+                            "route_scope": scope,
+                            "reason": "task_truth_unreadable",
+                            "exception_type": type(exc).__name__,
+                        }
                     )
                     return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                 if not is_eligible:
@@ -592,7 +754,14 @@ def _probe_primary_demand(
                     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                         runtime.primary_probe.record_progress(cursor_key, cursor_before)
                         diagnostics.append(
-                            {"project_id": project_id, "task_id": task.task_id, "reason": f"group_unreadable:{exc}"}
+                            {
+                                "project_id": project_id,
+                                "task_id": task.task_id,
+                                "task_generation": task.ready_generation,
+                                "route_scope": scope,
+                                "reason": "group_unreadable",
+                                "exception_type": type(exc).__name__,
+                            }
                         )
                         return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
                     worker = group["group"]["worker_set"].get(cfg.machine_name)
@@ -652,7 +821,14 @@ def _probe_primary_demand(
                 diagnostics.append({"project_id": project_id, "reason": "probe_budget_exhausted"})
                 return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
             except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                diagnostics.append({"project_id": project_id, "reason": f"index_unreadable:{exc}"})
+                diagnostics.append(
+                    {
+                        "project_id": project_id,
+                        "route_scope": scope,
+                        "reason": "index_unreadable",
+                        "exception_type": type(exc).__name__,
+                    }
+                )
                 return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
             decision = runtime.primary_probe.finish_route(cursor_key, end_revision)
             if decision.has_index_changed:
@@ -780,6 +956,24 @@ def dispatch_machine_cycle_locked(
             publish_snapshots=publish_snapshots,
         )
     now_ns = time.monotonic_ns()
+    should_publish_scheduler_diagnostics = (
+        runtime.last_scheduler_diagnostics_publish_ns is None
+        or now_ns - runtime.last_scheduler_diagnostics_publish_ns >= _SCHEDULER_DIAGNOSTIC_PUBLISH_INTERVAL_NS
+    )
+    if should_publish_scheduler_diagnostics:
+        try:
+            store = SchedulerDiagnosticStore(runtime)
+            store.recover()
+            store.publish_cycle(
+                counters=diagnostics.snapshot(),
+                timings=None,
+                probes=runtime.last_scheduler_diagnostic_probes,
+                working_set=runtime.working_set.snapshot(),
+            )
+            store.reconcile_cycle(runtime.last_scheduler_diagnostic_probes)
+            runtime.last_scheduler_diagnostics_publish_ns = now_ns
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
     publish_interval_ns = DIAGNOSTIC_PUBLISH_INTERVAL_SECONDS * 1_000_000_000
     should_publish_diagnostic = (
         runtime.last_diagnostic_publish_ns is None or now_ns - runtime.last_diagnostic_publish_ns >= publish_interval_ns
@@ -919,6 +1113,7 @@ def _dispatch_machine_cycle_locked(
 ) -> list[dict[str, Any]]:
     executor = executor or Executor()
     launch_batch = _LaunchHandoffBatch(executor, runtime)
+    runtime.last_scheduler_diagnostic_probes = ()
     runtime.last_cycle_had_demand = False
     runtime.last_cycle_consumed_binding = False
     # Poll handoffs before registry/recovery work, including the no-binding
@@ -1160,6 +1355,8 @@ def _dispatch_machine_cycle_locked(
         batch_sizers[binding.project_id] = sizer
 
     last_successful_project_id: str | None = None
+    scheduler_diagnostic_probes: list[dict[str, object]] = []
+    diagnostic_bindings = {binding.project_id: binding for binding in registered}
     # CPU and GPU borrowing are separate admission domains.  A busy primary queue in one
     # lane must never turn the other lane's complete no-demand probe into a denial.
     for lane, has_capacity in (("gpu", bool(free)), ("cpu", bool(free_cpu_slots))):
@@ -1196,6 +1393,17 @@ def _dispatch_machine_cycle_locked(
                 cursor_project_id=cursor_project_id,
                 has_free_capacity=has_capacity,
                 primary_demand_state=probe.state,
+            )
+        )
+        scheduler_diagnostic_probes.append(
+            _scheduler_diagnostic_probe(
+                runtime,
+                lane=lane,
+                probe=probe,
+                registry_revision=registry_revision,
+                bindings=diagnostic_bindings,
+                covered_project_ids=(enabled_ids - set(upgrade_blocked)),
+                available_capacity=(len(free) if lane == "gpu" else free_cpu_slots),
             )
         )
         diagnostic_increment(f"scheduler.primary_probe.{lane}.{probe.state}")
@@ -1242,6 +1450,7 @@ def _dispatch_machine_cycle_locked(
         cursor_effect = reduce_dispatch_cursor(dispatch_plan, last_successful_project_id)
         if cursor_effect is not None:
             runtime.save_cursor(cursor_effect.project_id)
+    runtime.last_scheduler_diagnostic_probes = tuple(scheduler_diagnostic_probes)
     _advance_resident_maintenance_turn(
         runtime,
         supervised,

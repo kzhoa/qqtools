@@ -112,6 +112,17 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
     warnings = result.get("warnings") or []
     if warnings:
         sections.append((("Warnings", warnings),))
+    scheduler = result.get("scheduler_diagnostics")
+    if isinstance(scheduler, Mapping):
+        sections.append(
+            (
+                ("Scheduling diagnostics", scheduler.get("status")),
+                ("Scheduling coverage", scheduler.get("coverage")),
+                ("Scheduling observed", scheduler.get("observed_at")),
+                ("Active scheduling findings", scheduler.get("active_count")),
+                ("Scheduling reason", scheduler.get("reason")),
+            )
+        )
     return _details(*sections)
 
 
@@ -147,6 +158,8 @@ def _validate_status(result: Any) -> None:
     value = _mapping(result, "status payload")
     for key in ("project", "local_participation", "local_agent", "task_observation", "next_actions"):
         _required(value, key, "status payload")
+    if "scheduler_diagnostics" in value:
+        _mapping(value["scheduler_diagnostics"], "status payload.scheduler_diagnostics")
 
 
 def _validate_machine_show(result: Any) -> None:

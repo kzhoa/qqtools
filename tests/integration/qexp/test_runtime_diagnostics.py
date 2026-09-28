@@ -42,3 +42,9 @@ def test_runtime_diagnostics_count_task_reads_and_machine_stages(tmp_path: Path)
     assert "run_dispatch_cycle.calls" not in cycle["counters"]
     assert cycle["counters"].get("task_json_read.records", 0) == 0
     assert "reservation_enumeration" in cycle["timings"]
+    scheduler = read_json(runtime.paths["scheduler_diagnostics_summary"])["diagnostics"]
+    assert scheduler["schema_version"] == 1
+    assert scheduler["coverage"] == "incomplete"
+    assert scheduler["reason"] == "probe_coverage_incomplete"
+    assert len(scheduler["decision_samples"]) == 2
+    assert scheduler["counters"]["maintain_project.calls"] == 1

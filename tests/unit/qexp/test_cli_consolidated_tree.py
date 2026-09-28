@@ -179,6 +179,16 @@ def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
         ("agent", "run"): ("agent_run", "machine", "agent-operation"),
         ("agent", "restart"): ("agent_restart", "machine", "agent-operation"),
         ("agent", "status"): ("agent_status", "machine", "agent-status"),
+        ("agent", "diagnostics", "active"): (
+            "agent_diagnostics_active",
+            "machine",
+            "scheduler-diagnostics",
+        ),
+        ("agent", "diagnostics", "history"): (
+            "agent_diagnostics_history",
+            "machine",
+            "scheduler-diagnostics",
+        ),
         ("agent", "stop"): ("agent_stop", "machine", "agent-operation"),
         ("agent", "name"): ("agent_name", "machine", "agent-config"),
         ("agent", "add-project"): ("retired_add-project", "none", "diagnostic"),
@@ -251,7 +261,7 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     )
 
     assert (
-        hashlib.sha256(text.encode()).hexdigest() == "dd3bc352a50d918905fd7826bd62ae4a851d9fa44737233e173e3a23c8c766db"
+        hashlib.sha256(text.encode()).hexdigest() == "046c175182a379d3c2c9bfa0e486ba4915256b91cf525d731594f83b373159fe"
     )
 
 

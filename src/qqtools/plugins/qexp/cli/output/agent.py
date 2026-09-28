@@ -125,7 +125,56 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
         )
         if diagnostic_details:
             rendered = f"{rendered}\n\n{diagnostic_details}" if rendered else diagnostic_details
+    scheduler = result.get("scheduler_diagnostics")
+    if isinstance(scheduler, Mapping):
+        scheduler_details = _details(
+            (
+                ("Scheduling diagnostics", scheduler.get("status")),
+                ("Scheduling coverage", scheduler.get("coverage")),
+                ("Scheduling observed", scheduler.get("observed_at")),
+                ("Active scheduling findings", scheduler.get("active_count")),
+                ("Scheduling reason", scheduler.get("reason")),
+            )
+        )
+        if scheduler_details:
+            rendered = f"{rendered}\n\n{scheduler_details}" if rendered else scheduler_details
     return rendered
+
+
+def _render_scheduler_diagnostics(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    rows = []
+    for item in result.get("items", []):
+        if not isinstance(item, Mapping):
+            continue
+        identity = item.get("identity")
+        identity = identity if isinstance(identity, Mapping) else {}
+        rows.append(
+            (
+                identity.get("producer"),
+                identity.get("reason_code"),
+                identity.get("project_id"),
+                identity.get("scope_type"),
+                item.get("last_observed_at", item.get("resolved_at")),
+            )
+        )
+    rendered = _details(
+        (
+            ("Action", str(result.get("action", "scheduler diagnostics")).replace("_", " ")),
+            ("Coverage", result.get("coverage")),
+            ("Observed", result.get("observed_at")),
+            ("Snapshot revision", result.get("snapshot_revision")),
+            ("Total", result.get("total")),
+            ("Reason", result.get("reason")),
+            ("End of capture", result.get("end_of_capture")),
+            ("Next cursor", result.get("next_cursor")),
+        )
+    )
+    table = _table(
+        ("Producer", "Reason", "Project", "Scope", "Observed/resolved"),
+        rows,
+        empty_message="No scheduler diagnostics.",
+    )
+    return f"{rendered}\n\n{table}" if rendered else table
 
 
 def _render_agent_config(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
@@ -316,6 +365,35 @@ def _validate_agent_status(result: Any) -> None:
         for key in ("summary", "last_exit", "coverage"):
             if key in diagnostics and diagnostics[key] is not None:
                 _mapping(diagnostics[key], f"agent-status payload.diagnostics.{key}")
+    if "scheduler_diagnostics" in value:
+        scheduler = _mapping(
+            value["scheduler_diagnostics"],
+            "agent-status payload.scheduler_diagnostics",
+        )
+        for key in ("schema_version", "status", "coverage", "truncated", "reason"):
+            _required(scheduler, key, "agent-status payload.scheduler_diagnostics")
+
+
+def _validate_scheduler_diagnostics(result: Any) -> None:
+    value = _mapping(result, "scheduler-diagnostics payload")
+    action = _required(value, "action", "scheduler-diagnostics payload")
+    if action not in {"diagnostics_active", "diagnostics_history"}:
+        raise ValueError("scheduler-diagnostics payload.action is invalid")
+    for key in (
+        "schema_version",
+        "machine_runtime_root",
+        "coverage",
+        "items",
+        "truncated",
+    ):
+        _required(value, key, "scheduler-diagnostics payload")
+    _required_int(value, "schema_version", "scheduler-diagnostics payload")
+    _required_sequence(value, "items", "scheduler-diagnostics payload")
+    _required_bool(value, "truncated", "scheduler-diagnostics payload")
+    if value["coverage"] not in {"complete", "incomplete", "unknown"}:
+        raise ValueError("scheduler-diagnostics payload.coverage is invalid")
+    if action == "diagnostics_history":
+        _required_bool(value, "end_of_capture", "scheduler-diagnostics payload")
 
 
 def _validate_cpu_lane(result: Any) -> None:
@@ -386,6 +464,7 @@ CONTRACTS = {
     OutputKind.AGENT_STATUS: OutputContract(_validate_agent_status, _render_agent_status),
     OutputKind.AGENT_CONFIG: OutputContract(_validate_agent_config, _render_agent_config),
     OutputKind.AGENT_READINESS: OutputContract(_validate_agent_readiness, _render_agent_readiness),
+    OutputKind.SCHEDULER_DIAGNOSTICS: OutputContract(_validate_scheduler_diagnostics, _render_scheduler_diagnostics),
     OutputKind.CPU_LANE: OutputContract(_validate_cpu_lane, _render_cpu_lane),
     OutputKind.GPU_POLICY: OutputContract(_validate_gpu_policy_payload, _render_gpu_policy),
 }

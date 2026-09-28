@@ -163,6 +163,32 @@ long as any Group refers to it.
 
 ## Do not treat every qqtools upgrade as an agent restart
 
+### Scheduler diagnostics v1
+
+The scheduler diagnostic store is a forward-only, machine-local derived format.
+Upgrade the qqtools package and restart that machine's global agent:
+
+```bash
+python -m pip install --upgrade qqtools
+qexp agent restart
+qexp agent diagnostics active --format json
+```
+
+There is no Project schema migration, legacy-counter import, Task-history
+backfill, dual write, or old-format adapter. Before the restarted writer produces
+evidence, status and diagnostic commands report `coverage=unknown`; they do not
+infer a healthy empty store. Existing `degraded_reasons` behavior remains
+available through its established readers and is not copied into scheduler-v1.
+
+Upgrade and restart machines one at a time. An older running process does not
+produce scheduler-v1 evidence. Invoking an older writer, or downgrading a
+MachineRuntime after the new writer has operated it, is unsupported. Rollback may
+lose or stop updating the new diagnostic history, but it does not reinterpret or
+change Project Task/Attempt truth, claims, reservations, scheduling authority, or
+recovery authority. Do not copy `diagnostics/scheduler-v1` between machine
+runtimes, edit its JSON to clear a scheduling blocker, or treat its loss as proof
+that a fault resolved.
+
 The binding working-set format is disposable machine-local coordination state.
 After installing a release that introduces it, restart each machine agent through
 the normal rolling procedure. Every current registration generation starts

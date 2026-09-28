@@ -125,6 +125,8 @@ class MachineRuntime:
         self._config_lock_depth = 0
         self.paths = machine_runtime_paths(self.root)
         self.last_diagnostic_publish_ns: int | None = None
+        self.last_scheduler_diagnostics_publish_ns: int | None = None
+        self.last_scheduler_diagnostic_probes: tuple[dict[str, object], ...] = ()
         self.ready_batch_sizers: dict[str, AdaptiveBatchSizer] = {}
         self.primary_probe = PrimaryProbeSession()
         # Set by the most recent bounded dispatch cycle for on-demand idle exit.

@@ -12,6 +12,7 @@ from ..agent.bindings import ProjectBinding
 from ..agent.config import AgentConfig
 from ..agent.context import MachineRuntime
 from ..agent.inventory import ProjectInventoryEntry
+from ..agent.scheduler_diagnostics import SchedulerDiagnosticStore
 from ..config_types import RootConfig
 from ..layout import machine_path, project_id
 from ..runtime.observation.projection import _validate_state, observation_path
@@ -354,6 +355,12 @@ def project_status(
     if local_agent["state"] == "unavailable" and not any("local agent status" in item for item in warnings):
         warnings.append("local agent status unavailable (record_malformed).")
 
+    scheduler_diagnostics = SchedulerDiagnosticStore(machine_runtime).summary_view(
+        project_id=selected_project_id,
+        limit=8,
+        read_json=reader.read_json,
+    )
+
     return {
         "schema_version": STATUS_SCHEMA_VERSION,
         "status": "partial" if warnings else "complete",
@@ -366,6 +373,7 @@ def project_status(
         "local_agent": local_agent,
         "configured_agent_mode": configured_agent_mode,
         "task_observation": task_observation,
+        "scheduler_diagnostics": scheduler_diagnostics,
         "totals": {"tasks": None, "machines": None, "reason": "not_available"},
         "next_actions": _follow_up_actions(cfg, participation_state),
         "budget": reader.as_dict(),

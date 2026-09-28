@@ -1643,6 +1643,29 @@ concurrent tmux clients, viewer kill/stop/recreation, and unchanged training
 identity, outcome, and FDs under observer faults. A selected observer may lose
 snapshots but must never hold training waiting for its reader or renderer.
 
+### Scheduling diagnostics and retained execution history
+
+User-visible execution history remains Project-owned shared truth. Task and Attempt
+identity, assigned Machine and GPUs, claim/lease/fencing evidence, lifecycle
+timestamps, terminal result, progress, and shared log references stay below the
+Project shared root so an operator can investigate them from another machine or
+after the scheduling container has been replaced.
+
+MachineRuntime scheduling diagnostics are a separate bounded, derived view. They
+may record current scheduling faults, normal waits, incomplete probes, service
+cost, residency/wake state, and sampled CPU/GPU admission decisions. They are not
+an audit log or scheduling authority: loss, corruption, staleness, overflow, or a
+failed write cannot authorize or prevent a claim, recovery, or execution-state
+transition. Viewing diagnostics never activates a dormant Project or starts
+repair. Missing evidence is `unknown`, not an empty or healthy result.
+
+`qexp status` and `qexp agent status` may add an optional
+`scheduler_diagnostics` object. It is distinct from the existing agent process/log
+`diagnostics` object, does not change existing exit status, and is rendered as a
+separate `Scheduling diagnostics` section. Project status reads only the selected
+binding summary within its existing bounded-read budget. Agent status reads only
+the machine summary and never enumerates dormant Project truth.
+
 ## 15. Product Boundaries
 
 ### 15.1 One Shared Root Per Project
@@ -1973,6 +1996,8 @@ retry. It performs direct bounded Task, selected-Attempt, and dependency reads. 
 - `qexp agent restart`
 - `qexp agent stop`
 - `qexp agent status`
+- `qexp agent diagnostics active [--project-id ID] [--reason CODE] [--producer NAME] [--scope TYPE] [--limit N]`
+- `qexp agent diagnostics history [--project-id ID] [--cursor TOKEN] [--limit N]`
 - `qexp agent name [--set-to NAME]`
 - `qexp config show agent`
 - `qexp config set agent [--name NAME] [--agent-mode daemon|on_demand] [--log-max-size SIZE]`
@@ -2002,6 +2027,18 @@ full audit's retained-history traversal.
 `agent restart` reports process replacement and current readiness evidence without waiting for
 Project convergence; use `agent status` for the subsequent configured-mode, observed-mode, and
 readiness view.
+
+The diagnostics commands are finite machine-local reads and support human or JSON
+output. `--limit` defaults to 32 and accepts 1--32. `active` is one live top-N
+view ordered by severity, first observation, and canonical identity; it has no
+cursor and reports `truncated=true` when filters must be narrowed. Only immutable
+resolved `history` is paginated. Its opaque cursor binds the store epoch, optional
+exact Project-ID filter, captured maximum sequence, and last examined sequence;
+later appends do not enter or invalidate that traversal. Invalid input exits 2.
+An absent, unreadable, corrupt, unsupported, or not-yet-produced store returns a
+successful empty result with `coverage=unknown` and a stable reason. An evicted
+cursor returns a successful incomplete page with `reason=cursor_expired` and no
+continuation.
 
 The 1.3.22 CLI consolidation is an approved direct cutover. Retired `top`, `machines`, `doctor`,
 `clean`, `lease-policy`, `task keep-local`, `group retry-failed`, `group machines`, flat agent
